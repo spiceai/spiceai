@@ -33,6 +33,34 @@ use super::context::CayenneContext;
 use super::table::CayenneTableProvider;
 
 /// A [`DataSink`] implementation that writes data to a Cayenne table.
+///
+/// Supports two write modes via [`InsertOp`]:
+/// - **Append**: Adds data to the current (or a new) snapshot, with PK on-conflict
+///   handling, retention filters, and optional sorting.
+/// - **Overwrite**: Replaces all data by writing to a fresh snapshot and atomically
+///   updating the catalog.
+///
+/// # Size-Based File Chunking
+///
+/// Data is chunked into separate Vortex files based on a target file size
+/// (configurable via `VortexConfig.target_vortex_file_size_mb`, default 128 MB):
+/// - Batches are accumulated until the target file size is reached
+/// - Each chunk is written as a separate Vortex file in parallel
+/// - Each file maintains proper statistics for `DataFusion` pushdown and pruning
+///
+/// # Performance
+///
+/// - **Streaming**: Processes chunks as they're formed, avoiding buffering all data
+/// - **Parallel writes**: Multiple chunks written concurrently with bounded parallelism
+///   (configurable via `VortexConfig.upload_concurrency`, default 4)
+/// - **Zero-copy**: Reuses `RecordBatch` Arc references, no data copying
+///
+/// # Concurrency
+///
+/// A per-table write lock (acquired in [`DataSink::write_all`]) serializes all write
+/// operations. Multiple concurrent `insert_into()` calls on the same table will block,
+/// ensuring only one write runs at a time. **Within** a single write, chunks are
+/// written in parallel for I/O throughput.
 pub struct CayenneDataSink {
     /// The Cayenne table provider to write to.
     table: CayenneTableProvider,
@@ -118,6 +146,10 @@ impl DataSink for CayenneDataSink {
         data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        // Acquire write lock to serialize all writes (append and overwrite) and
+        // prevent concurrent races on catalog state, snapshot IDs, and listing table.
+        let _write_guard = self.table.write_lock().lock().await;
+
         if self.overwrite == InsertOp::Overwrite {
             self.write_all_overwrite(data).await
         } else {
@@ -127,12 +159,187 @@ impl DataSink for CayenneDataSink {
 }
 
 impl CayenneDataSink {
-    /// Handles append mode writes by delegating to `CayenneTableProvider::insert()`.
+    /// Append data from a record batch stream into the Cayenne table.
+    ///
+    /// Writes data to the current snapshot (via [`CayenneTableProvider::chunk_and_write_parallel`])
+    /// or a new snapshot (via [`CayenneTableProvider::insert_to_new_snapshot_with_sequence`])
+    /// when deletion isolation is needed.
+    ///
+    /// # Write Pipeline
+    ///
+    /// 1. Checks for pending PK-based deletions
+    /// 2. Validates primary key on-conflict constraints via `prepare_stream_for_insert`
+    /// 3. Writes data to a new snapshot (if PK-based deletions pending or on-conflict
+    ///    deletions exist) or the current snapshot
+    /// 4. Applies on-conflict deletion vectors
+    /// 5. Applies retention filters
+    /// 6. Sorts and rewrites data if configured
+    /// 7. Refreshes the listing table
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be inserted.
     async fn write_all_append(&self, data: SendableRecordBatchStream) -> DFResult<u64> {
-        self.table
-            .insert(data)
+        // Check for pending PK-based deletions (from explicit DELETE operations).
+        //
+        // POSITION-BASED STRATEGY: No compaction/new snapshot needed on insert.
+        // Deletion vectors are tracked per-file (HashMap<file_path, RoaringBitmap>), so each
+        // file's deletion bitmap is independent. Adding new files doesn't affect existing
+        // deletion vectors — the new files simply have no entries in the deletion cache.
+        //
+        // PK-BASED STRATEGIES (Int64Pk, RowConverterBased): Write to a new snapshot with a
+        // higher sequence number, ensuring proper Iceberg-style ordering:
+        // - Deletions apply to snapshots with sequence <= delete_sequence
+        // - New data in snapshots with sequence > delete_sequence is visible
+        // This avoids compaction by using "anti-deletions" — the new snapshot isolates
+        // new data from existing deletion vectors.
+        let needs_new_snapshot_for_pending_deletions =
+            !self.table.pk_deletion_strategy().is_position_based()
+                && self.table.has_pending_deletions().map_err(to_df_exec_err)?;
+
+        if needs_new_snapshot_for_pending_deletions {
+            tracing::debug!(
+                "Table {} has pending PK-based deletions, will write to new snapshot",
+                self.table.table_name()
+            );
+        }
+
+        // Validate primary key on-conflict constraints and prepare the stream.
+        // For tables without PKs, this is a pass-through with empty deletion specs.
+        //
+        // NOTE: Even when pending PK-based deletions exist, we still need to run
+        // validate_on_conflict() (via prepare_stream_for_insert) on the incoming stream
+        // to handle upserts for PKs that already exist in the table. Without this,
+        // duplicate PKs would appear in query results.
+        let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) = self
+            .table
+            .prepare_stream_for_insert(data)
             .await
-            .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))
+            .map_err(to_df_exec_err)?;
+
+        let has_on_conflict_deletions = !delete_specs.is_empty();
+
+        tracing::debug!(
+            "write_all_append: delete_specs={} files, deleted_pk_i64={} keys, \
+             pending_deletions={}, on_conflict_deletions={}",
+            delete_specs.len(),
+            deleted_pk_i64.len(),
+            needs_new_snapshot_for_pending_deletions,
+            has_on_conflict_deletions
+        );
+
+        // Determine write target: new snapshot (for deletion isolation) or current snapshot.
+        //
+        // New snapshot is required when:
+        // - Pending PK-based deletions exist (from explicit DELETE operations) — ensures
+        //   Iceberg-style sequence ordering so deletions don't affect new data.
+        // - On-conflict deletions exist (from INSERT upserts) — the deletion vectors
+        //   target rows in the current snapshot
+        let needs_new_snapshot =
+            needs_new_snapshot_for_pending_deletions || has_on_conflict_deletions;
+
+        let total_rows = if needs_new_snapshot {
+            // Apply on-conflict deletion vectors BEFORE creating the protected snapshot.
+            self.table
+                .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
+                .await
+                .map_err(to_df_exec_err)?;
+
+            // Write to a NEW snapshot with a higher sequence number so that:
+            // - Old data filtered by deletions (delete_seq >= old_snapshot_seq)
+            // - New data visible (new_snapshot_seq > delete_seq)
+            let new_sequence = self
+                .table
+                .catalog()
+                .increment_sequence_number(self.table.table_id())
+                .await
+                .map_err(to_df_exec_err)?;
+
+            self.table
+                .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
+                .await
+                .map_err(to_df_exec_err)?
+        } else {
+            // Write chunks to the current snapshot.
+            let target_size_bytes = self.context.target_file_size_bytes();
+            let (rows, chunk_count) = self
+                .table
+                .chunk_and_write_parallel(prepared_stream, target_size_bytes)
+                .await
+                .map_err(to_df_exec_err)?;
+
+            tracing::debug!(
+                "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
+                rows,
+                chunk_count
+            );
+
+            // Apply deletion vectors generated by on-conflict handling (no-op if empty).
+            self.table
+                .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
+                .await
+                .map_err(to_df_exec_err)?;
+
+            rows
+        };
+
+        // Apply retention filters, sort, and refresh listing table.
+        self.apply_retention_if_configured().await?;
+
+        // Sort operates on the listing table data (the complete corpus after retention),
+        // ensuring optimal zone maps with non-overlapping min/max ranges.
+        // Uses DataFusion's SortExec with automatic disk spilling for large datasets,
+        // streaming external merge sort, and SIMD-optimized kernels.
+        self.sort_if_configured().await?;
+
+        // Refresh the listing table to pick up new/rewritten files and update statistics,
+        // so subsequent query plans see the latest data.
+        self.table.refresh_listing_table().map_err(to_df_exec_err)?;
+
+        // Write lock is released when `_write_guard` drops (in write_all).
+
+        Ok(total_rows)
+    }
+
+    /// Apply retention filters if configured on the table.
+    async fn apply_retention_if_configured(&self) -> DFResult<()> {
+        if !self.table.has_retention_filters() {
+            return Ok(());
+        }
+
+        match self.table.apply_retention_filters().await {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    tracing::info!(
+                        "Retention filters deleted {} row(s) for table {}",
+                        deleted,
+                        self.table.table_name()
+                    );
+                } else {
+                    tracing::debug!(
+                        "Retention filters found no rows to delete for table {}",
+                        self.table.table_name()
+                    );
+                }
+                Ok(())
+            }
+            Err(err) => Err(datafusion_common::DataFusionError::Execution(format!(
+                "Failed to apply retention filters after insert: {err}"
+            ))),
+        }
+    }
+
+    /// Sort and rewrite data if `sort_columns` is configured.
+    async fn sort_if_configured(&self) -> DFResult<()> {
+        if !self.context.has_sort_columns() {
+            return Ok(());
+        }
+
+        let target_size_bytes = self.context.target_file_size_bytes();
+        self.table
+            .sort_and_rewrite_data(target_size_bytes)
+            .await
+            .map_err(to_df_exec_err)
     }
 
     /// Handles overwrite mode writes by creating a new snapshot:
@@ -233,4 +440,11 @@ impl CayenneDataSink {
 
         Ok(total_rows)
     }
+}
+
+/// Convert a `CatalogError` to a `DataFusionError::External`.
+fn to_df_exec_err<E: std::error::Error + Send + Sync + 'static>(
+    err: E,
+) -> datafusion_common::DataFusionError {
+    datafusion_common::DataFusionError::External(Box::new(err))
 }
