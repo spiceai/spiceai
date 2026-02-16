@@ -134,7 +134,6 @@ macro_rules! handle_primitive_type {
         }
     };
 }
-
 pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<RecordBatch> {
     let mut arrow_columns_builders = vec![];
     for field in schema.fields() {

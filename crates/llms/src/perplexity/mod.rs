@@ -29,7 +29,10 @@ use types::{
 use crate::config::{GenericAuthMechanism, HostedModelConfig};
 
 pub mod chat;
+mod list_models;
 pub mod types;
+
+pub use list_models::PerplexityModelLister;
 
 pub struct PerplexitySonar {
     client: Client<HostedModelConfig>,

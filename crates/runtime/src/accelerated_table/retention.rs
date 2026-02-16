@@ -16,6 +16,15 @@ limitations under the License.
 
 use std::{sync::Arc, time::SystemTime};
 
+use crate::{
+    accelerated_table::{DataRetentionFilter, Retention, refresh},
+    component::dataset::TimeFormat,
+    datafusion::{
+        builder::get_df_default_config,
+        filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert},
+        is_spice_internal_dataset,
+    },
+};
 use arrow::array::UInt64Array;
 use cache::Caching;
 use data_components::delete::get_deletion_provider;
@@ -26,17 +35,9 @@ use datafusion::{
     prelude::{Expr, SessionContext},
     sql::TableReference,
 };
-use tokio::runtime::Handle;
-
-use crate::{
-    accelerated_table::{DataRetentionFilter, Retention, refresh},
-    component::dataset::TimeFormat,
-    datafusion::{
-        builder::get_df_default_config, filter_converter::TimestampFilterConvert,
-        is_spice_internal_dataset,
-    },
-};
 use runtime_object_store::registry::default_runtime_env;
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
 impl super::AcceleratedTable {
     #[expect(clippy::cast_possible_truncation)]
@@ -46,11 +47,15 @@ impl super::AcceleratedTable {
         retention: Retention,
         caching: Option<Arc<Caching>>,
         io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
         loop {
             interval_timer.tick().await;
+
+            // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
+            let _lock_guard = accelerator_write_mutex.lock().await;
 
             if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
                 let mut exprs = Vec::new();
@@ -113,7 +118,19 @@ impl super::AcceleratedTable {
                     continue;
                 };
 
-                tracing::trace!("[retention] Expr {expr:?}");
+                tracing::trace!("[retention] Expr before simplification: {expr:?}");
+
+                let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
+                    Ok(simplified) => simplified,
+                    Err(e) => {
+                        tracing::error!(
+                            "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
+                        );
+                        continue;
+                    }
+                };
+
+                tracing::debug!("[retention] Expr: {expr:?}");
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),
@@ -178,7 +195,7 @@ fn create_timestamp_filter_converter(
                 .map(|(_, f)| f)
         });
 
-    TimestampFilterConvert::create(
+    create_timestamp_filter_convert(
         field.cloned(),
         Some(time_column.to_string()),
         time_format,
@@ -325,6 +342,7 @@ mod tests {
             retention,
             caching,
             Handle::current(),
+            Arc::new(Mutex::new(())),
         ));
 
         // Wait for retention to run

@@ -51,6 +51,7 @@ use runtime_table_partition::{
 };
 use snafu::{OptionExt, prelude::*};
 
+use crate::dataaccelerator::{BootstrapStatus, upsert_dedup::UpsertDedupTableProvider};
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
@@ -143,7 +144,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(acceleration_settings) = source.acceleration() {
             ensure!(
                 matches!(acceleration_settings.mode, Mode::File),
@@ -176,7 +177,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             }
             self.get_shared_pool(source).await?;
         }
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     async fn create_external_table(
@@ -273,11 +274,7 @@ impl DuckDBPartitionCreator {
             .ok_or("Expected PolyTableProvider but got different table provider type")?;
 
         let writer = poly_table.writer();
-
-        let writer = writer
-            .as_any()
-            .downcast_ref::<DuckDBTableWriter>()
-            .ok_or("Expected DuckDBTableWriter but got different writer type")?;
+        let writer = extract_duckdb_writer(&writer)?;
 
         // Extract UpsertOptions from cmd options
         let upsert_options = Self::extract_upsert_options(&cmd);
@@ -357,7 +354,7 @@ impl DuckDBPartitionCreator {
 impl PartitionCreator for DuckDBPartitionCreator {
     async fn create_partition(
         &self,
-        _partition_value: ScalarValue,
+        _partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
         Err(creator::Error::CreatePartition {
             source: "Table-based partitions must not be manually created".into(),
@@ -412,7 +409,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
             partitions.push(Partition {
-                partition_value,
+                partition_values: vec![partition_value],
                 table_provider,
             });
         }
@@ -438,6 +435,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 }
             })
             .collect())
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        if self.cmd.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.cmd.constraints)
+        }
     }
 }
 
@@ -465,6 +470,28 @@ async fn get_pool(
             .get_or_init_instance_with_builder(pool_builder)
             .await?,
     ))
+}
+
+/// Extracts the `DuckDBTableWriter` from a table provider, handling the case where
+/// it may be wrapped in an `UpsertDedupTableProvider` when upsert options are enabled.
+fn extract_duckdb_writer(
+    writer: &Arc<dyn TableProvider>,
+) -> std::result::Result<&DuckDBTableWriter, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(w) = writer.as_any().downcast_ref::<DuckDBTableWriter>() {
+        Ok(w)
+    } else if let Some(upsert_provider) = writer.as_any().downcast_ref::<UpsertDedupTableProvider>()
+    {
+        upsert_provider
+            .inner()
+            .as_any()
+            .downcast_ref::<DuckDBTableWriter>()
+            .ok_or_else(|| "UpsertDedupTableProvider inner is not DuckDBTableWriter".into())
+    } else {
+        Err(
+            "Expected DuckDBTableWriter or UpsertDedupTableProvider but got different writer type"
+                .into(),
+        )
+    }
 }
 
 register_data_accelerator!(
@@ -540,6 +567,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,

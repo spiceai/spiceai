@@ -81,7 +81,6 @@ impl TursoMetastore {
         }
 
         let db = Builder::new_local(db_path)
-            .with_mvcc(false) // Enable MVCC when Turso supports it with indexes: https://github.com/spiceai/spiceai/issues/8526
             .build()
             .await
             .map_err(|e| CatalogError::Database {
@@ -95,9 +94,18 @@ impl TursoMetastore {
     /// Get a connection from the database.
     async fn get_conn(&self) -> CatalogResult<Connection> {
         let db = self.get_db().await?;
-        db.connect().map_err(|e| CatalogError::Database {
+        let conn = db.connect().map_err(|e| CatalogError::Database {
             message: format!("Failed to connect to Turso database: {e}"),
-        })
+        })?;
+
+        // Set busy timeout to wait for locks instead of immediately returning SQLITE_BUSY.
+        // This fixes issue #8826 where concurrent transactions to the same database fail.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set busy timeout: {e}"),
+            })?;
+
+        Ok(conn)
     }
 
     /// Schema for the `cayenne_table` table.
@@ -135,18 +143,23 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    ///
+    /// Supports composite partition keys by storing column names and values as JSON arrays.
+    /// The `partition_key` column stores a unique composite key (slash-separated values)
+    /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_id INTEGER NOT NULL,
-            partition_column TEXT NOT NULL,
-            partition_value TEXT NOT NULL,
+            partition_columns_json TEXT NOT NULL,
+            partition_values_json TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
-            UNIQUE(table_id, partition_column, partition_value)
+            UNIQUE(table_id, partition_key)
         )
     ";
 
@@ -276,6 +289,19 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
     }
 }
 
+/// Convert Turso errors to `CatalogError`, distinguishing constraint violations.
+fn convert_turso_error(e: turso::Error) -> CatalogError {
+    match e {
+        // turso 0.4.x uses dedicated Constraint variant for constraint violations
+        turso::Error::Constraint(ref msg) => CatalogError::ConstraintViolation {
+            message: msg.clone(),
+        },
+        other => CatalogError::Database {
+            message: format!("Failed to execute statement: {other}"),
+        },
+    }
+}
+
 #[async_trait]
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
@@ -322,6 +348,59 @@ impl MetastoreBackend for TursoMetastore {
             )
             .await;
 
+        // Validate that existing tables match the expected schema.
+        // This catches incompatible metadata databases from previous versions.
+        // We query table_info for each expected table using a fresh connection per table
+        // since turso::Connection is not Clone.
+        for expected in super::EXPECTED_TABLES {
+            let table_conn = self.get_conn().await?;
+            let mut rows = table_conn
+                .query(&format!("PRAGMA table_info('{}')", expected.name), ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to read table schema for validation: {e}"),
+                })?;
+
+            let mut actual_columns = Vec::new();
+            loop {
+                match rows.next().await {
+                    Ok(Some(row)) => {
+                        // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+                        // Column name is at index 1.
+                        if let Ok(turso::Value::Text(name)) = row.get_value(1) {
+                            actual_columns.push(name);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(CatalogError::Database {
+                            message: format!("Failed to read table schema for validation: {e}"),
+                        });
+                    }
+                }
+            }
+
+            // Skip validation for freshly created tables (no columns = table didn't exist before).
+            if actual_columns.is_empty() {
+                continue;
+            }
+
+            let expected_columns: Vec<&str> = expected.columns.to_vec();
+            let actual_refs: Vec<&str> = actual_columns.iter().map(String::as_str).collect();
+
+            if expected_columns != actual_refs {
+                tracing::debug!(
+                    "Cayenne schema mismatch for '{}': expected columns [{}], found [{}]",
+                    expected.name,
+                    expected_columns.join(", "),
+                    actual_refs.join(", ")
+                );
+                return Err(CatalogError::SchemaMismatch {
+                    table: expected.name.to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -332,9 +411,7 @@ impl MetastoreBackend for TursoMetastore {
 
         conn.execute(params.sql, turso_params)
             .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to execute statement: {e}"),
-            })?;
+            .map_err(convert_turso_error)?;
 
         Ok(())
     }

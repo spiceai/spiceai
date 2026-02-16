@@ -21,6 +21,8 @@ use std::{
 };
 
 pub mod fibonacci_backoff;
+pub mod home_dir;
+pub mod levenshtein;
 pub mod retry_strategy;
 pub mod security;
 pub use backoff::Error as RetryError;
@@ -30,8 +32,10 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+pub mod expr;
 pub mod stream_utils;
 pub mod time_format;
+pub mod timestamp_filter;
 
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::cast_sign_loss)]
@@ -205,6 +209,25 @@ pub fn distribute_nulls<T>(data: Vec<T>, null_idxs: Vec<usize>) -> Vec<Option<T>
     }
 
     result
+}
+
+// Construct constant array by concatenating two input arrays.
+pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
+    a: [T; N],
+    b: [T; M],
+) -> [T; S] {
+    let mut out = [a[0]; S];
+    let mut i = 0;
+    while i < N {
+        out[i] = a[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < M {
+        out[N + j] = b[j];
+        j += 1;
+    }
+    out
 }
 
 #[cfg(test)]

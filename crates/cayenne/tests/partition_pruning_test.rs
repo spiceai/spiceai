@@ -21,11 +21,17 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Int64Array, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::CayenneTableProvider;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend

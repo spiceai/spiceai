@@ -20,6 +20,7 @@ use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
+    opentelemetry_sdk::Resource,
     queries::QuerySet,
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
@@ -37,21 +38,29 @@ pub(crate) mod evals;
 pub(crate) mod load;
 pub(crate) mod query;
 pub(crate) mod search;
+pub(crate) mod streaming;
 pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
+/// Create telemetry with resource attributes known upfront.
+///
+/// This ensures the `SdkMeterProvider` is created with the correct resource,
+/// so metrics recorded after this call will have the proper resource attributes.
 #[must_use]
-pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
+pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Resource) -> Telemetry {
     if let Some(endpoint) = &common.otlp_endpoint {
-        return Telemetry::with_otlp(OtlpExporterConfig {
-            endpoint: endpoint.clone().into(),
-            headers: common.otlp_header.clone(),
-            timeout: Duration::from_secs(10),
-        });
+        return Telemetry::with_otlp_resource(
+            OtlpExporterConfig {
+                endpoint: endpoint.clone().into(),
+                headers: common.otlp_header.clone(),
+                timeout: Duration::from_secs(10),
+            },
+            resource,
+        );
     }
 
-    Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY")
+    Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY")
 }
 
 /// Build a test configuration with validation data if applicable
@@ -63,7 +72,7 @@ pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
 /// 4. Adds reference schema for validation against known good tables
 ///
 /// # Returns
-/// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
+/// Tuple of (`QuerySet`, `NotStarted` builder)
 pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
@@ -125,10 +134,8 @@ pub(crate) async fn run_or_connect_spiced(
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    if !args.metrics {
-        // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
-        test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
-    }
+    // When metrics are disabled, no Telemetry is created, so METER_PROVIDER_ONCE
+    // remains unset and all metric operations are no-ops.
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
     let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());
@@ -136,7 +143,7 @@ pub(crate) async fn get_app_and_start_request(
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
             let dependent_spicepod = Spicepod::load(&dependencies_root.join(dependency)).await?;
-            app_builder = app_builder.with_spicepod(dependent_spicepod);
+            app_builder = app_builder.with_spicepod_dependency(dependent_spicepod);
         }
     }
     // After we've loaded dependencies, remove.

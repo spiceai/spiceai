@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::parameters::{ParamLookup, Parameters};
 use aws_config::ConfigLoader;
+#[cfg(feature = "dynamodb")]
 use aws_sdk_credential_bridge::{
     initiate_config_auth_iam_env, initiate_config_auth_iam_metadata, initiate_config_auth_key,
     initiate_config_default_auth,
@@ -63,16 +64,20 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid endpoint: {endpoint}"))]
+    #[snafu(display("Invalid endpoint URL '{endpoint}'. Provide a valid HTTP or HTTPS URL."))]
     InvalidEndpoint { endpoint: String },
 
-    #[snafu(display("Insecure endpoint without allow_http: {endpoint}"))]
+    #[snafu(display(
+        "Insecure HTTP endpoint '{endpoint}' requires 'allow_http: true' in the dataset parameters."
+    ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 
-    #[snafu(display("Invalid region: {region}"))]
+    #[snafu(display(
+        "Invalid AWS region '{region}'. Specify a valid AWS region (e.g., 'us-east-1')."
+    ))]
     InvalidRegion { region: String },
 
-    #[snafu(display("Invalid region corrected: {region}"))]
+    #[snafu(display("Invalid AWS region corrected to '{region}'."))]
     InvalidRegionCorrected { region: String },
 
     #[snafu(display(
@@ -80,19 +85,23 @@ pub enum Error {
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
-    #[snafu(display("No region specified using {region}"))]
+    #[snafu(display("No AWS region specified; defaulting to '{region}'."))]
     NoRegionSpecified { region: String },
 
-    #[snafu(display("No auth specified using {auth_name}"))]
+    #[snafu(display("No auth method specified; defaulting to '{auth_name}'."))]
     NoAuthSpecified { auth_name: String },
 
-    #[snafu(display("Missing access key"))]
+    #[snafu(display("Missing required AWS access key. Set the 'aws_access_key_id' parameter."))]
     NoAccessKey,
 
-    #[snafu(display("Missing access secret"))]
+    #[snafu(display(
+        "Missing required AWS secret access key. Set the 'aws_secret_access_key' parameter."
+    ))]
     NoAccessSecret,
 
-    #[snafu(display("Unsupported authentication method: {method}"))]
+    #[snafu(display(
+        "Unsupported authentication method '{method}'. Supported methods: 'key', 'iam_role', 'public'."
+    ))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display("Invalid {key}: {method}. Valid values are 'auto', 'metadata' and 'env'"))]
@@ -251,6 +260,7 @@ pub async fn initiate_config_with_credentials(
 /// - `key`: Explicit access key credentials
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
+#[cfg(feature = "dynamodb")]
 #[expect(clippy::too_many_arguments)]
 pub async fn initiate_config_with_auth_method(
     provider_name: &'static str,

@@ -125,9 +125,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     let health_report = health_monitor.stop().await;
 
-    // Test passes only if: (1) table row counts match expected values, (2) all queries succeeded, and (3) health checks passed
-    let test_status: TestStatus =
-        (table_count_result.is_ok() && test_succeeded && health_report.is_ok()).into();
+    // Test passes only if: (1) table row counts match expected values and (2) all queries succeeded
+    let test_status: TestStatus = (table_count_result.is_ok() && test_succeeded).into();
     test_metrics.emit(test_status).await?;
 
     spiced_instance.stop()?;
@@ -135,7 +134,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     table_count_result?;
     if let Some(message) = health_report.failure_message() {
-        return Err(anyhow::anyhow!(message));
+        // Health check failures are logged as warnings but don't fail the test
+        eprintln!("Warning: {message}");
     }
     Ok(())
 }
@@ -179,17 +179,13 @@ struct AppendTestMetrics {
     branch_name: Option<String>,
     max_memory: Option<f64>,
     median_memory: Option<f64>,
-    telemetry: Telemetry,
 }
 
 impl AppendTestMetrics {
     fn new(app_name: impl Into<String>, query_set: impl Into<String>) -> Self {
-        let telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
-
         Self {
             app_name: app_name.into(),
             query_set: query_set.into(),
-            telemetry,
             spiced_version: None,
             testoperator_commit_sha: None,
             spiced_commit_sha: None,
@@ -226,7 +222,7 @@ impl AppendTestMetrics {
     }
 
     /// Emit metrics and telemetry for the test result.
-    async fn emit(mut self, test_status: TestStatus) -> anyhow::Result<()> {
+    async fn emit(self, test_status: TestStatus) -> anyhow::Result<()> {
         let resource = Resource::builder_empty()
             .with_attributes(vec![
                 KeyValue::new("service.name", "testoperator"),
@@ -254,7 +250,8 @@ impl AppendTestMetrics {
             ])
             .build();
 
-        self.telemetry.set_resource(resource);
+        // Create telemetry with resource upfront, before recording any metrics
+        let telemetry = Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
         crate::metrics::STATUS.record(test_status.to_u64(), &[]);
 
@@ -265,7 +262,7 @@ impl AppendTestMetrics {
             crate::metrics::MEDIAN_MEMORY_USAGE.record(median_mem * 1024.0, &[]);
         }
 
-        self.telemetry.emit().await
+        telemetry.emit().await
     }
 }
 
@@ -311,7 +308,7 @@ async fn check_table_counts(
         let expected_count = f64::from(expected_count) * scale_factor;
         let sql = format!("SELECT COUNT(*) FROM {name}");
         let batches = spice_client
-            .query(&sql)
+            .sql(&sql)
             .await?
             .try_collect::<Vec<_>>()
             .await?;

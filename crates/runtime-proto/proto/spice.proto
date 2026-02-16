@@ -15,6 +15,27 @@ service ClusterService {
     // Expand a secret value from the scheduler's secret store.
     // Called by executors when they need to resolve secrets.
     rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
+
+    // Get the scheduler membership list.
+    // Called by executors during initialization.
+    rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
+
+    // Query task history from this scheduler.
+    // Used for federated task history queries across the cluster.
+    rpc GetTaskHistory(GetTaskHistoryRequest) returns (GetTaskHistoryResponse);
+
+    // Get OTLP metrics from this scheduler.
+    // Used for cluster-wide metrics collection.
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+
+    // Bidirectional control stream for executor-scheduler communication.
+    // Initiated by executors, allows schedulers to request metrics on-demand.
+    rpc ControlStream(stream ExecutorControlMessage) returns (stream SchedulerControlMessage);
+
+    // Get an initial allocation of accelerated table partitions.
+    // Called by executors when they first register to get initial Accelerated Table partitions.
+    // Allows schedulers to subsequently query executors over FlightSQL for accelerated table data.
+    rpc AllocateInitialPartitions(AllocateInitialPartitionsRequest) returns (AllocateInitialPartitionsResponse);
 }
 
 // Request message for GetAppDefinition RPC.
@@ -40,9 +61,226 @@ message ExpandSecretResponse {
     string value = 2;
 }
 
+// Request message for GetSchedulers RPC.
+message GetSchedulersRequest {}
+
+// Scheduler instance information.
+message SchedulerInstance {
+    string advertise_address = 1;
+    map<string, string> labels = 2;
+}
+
+// Response message for GetSchedulers RPC.
+message GetSchedulersResponse {
+    repeated SchedulerInstance schedulers = 1;
+}
+
+// Request message for GetTaskHistory RPC.
+message GetTaskHistoryRequest {
+    // SQL query to execute against the local task_history table.
+    string sql = 1;
+}
+
+// Response message for GetTaskHistory RPC.
+message GetTaskHistoryResponse {
+    // Arrow IPC-encoded RecordBatch containing the query results.
+    bytes arrow_ipc = 1;
+}
+
+// Request message for GetMetrics RPC.
+message GetMetricsRequest {}
+
+// Response message for GetMetrics RPC.
+message GetMetricsResponse {
+    // OTLP ExportMetricsServiceRequest protobuf-encoded metrics.
+    bytes otlp_metrics = 1;
+}
+
+// Message sent from executor to scheduler on the control stream.
+message ExecutorControlMessage {
+    // Executor's advertise address (used as identifier).
+    string executor_id = 1;
+    oneof message {
+        ExecutorHeartbeat heartbeat = 2;
+        MetricsResponse metrics = 3;
+        ExecutorShutdown shutdown = 4;
+    }
+}
+
+// Message sent from scheduler to executor on the control stream.
+message SchedulerControlMessage {
+    oneof message {
+        MetricsRequest request_metrics = 1;
+        PollNowCommand poll_now = 2;
+        CancelTasksCommand cancel_tasks = 3;
+    }
+}
+
+// Request message for AllocateInitialPartitions RPC.
+message AllocateInitialPartitionsRequest {
+  // Executor's advertise address (used as identifier).
+  string executor_id = 1;
+}
+
+message BytesArray {
+  repeated bytes items = 1;
+}
+
+// Response message for AllocateInitialPartitions RPC.
+message AllocateInitialPartitionsResponse {
+  // Map of table name to list of partition expressions.
+  map<string, BytesArray> table_partitions = 1;
+}
+
+
+// Command sent from scheduler to executor to immediately poll for new work.
+// This allows the scheduler to notify executors when new tasks are available,
+// reducing latency compared to waiting for the next poll interval.
+message PollNowCommand {
+    // Optional reason for the immediate poll (for debugging/logging).
+    string reason = 1;
+}
+
+// Command sent from scheduler to executor to cancel running tasks.
+message CancelTasksCommand {
+    repeated TaskCancelInfo tasks = 1;
+}
+
+// Identifies a single running task that should be cancelled.
+message TaskCancelInfo {
+    uint32 task_id = 1;
+    string job_id = 2;
+    uint32 stage_id = 3;
+    uint32 partition_id = 4;
+}
+
+// Heartbeat message sent by executor to scheduler.
+message ExecutorHeartbeat {
+    int64 timestamp_ms = 1;
+}
+
+// Executor shutdown notification sent by executor to scheduler.
+message ExecutorShutdown {
+    // Ballista executor ID to deregister from the scheduler.
+    string ballista_executor_id = 1;
+    // Optional reason for shutdown (for debugging/logging).
+    string reason = 2;
+}
+
+// Request for metrics from an executor.
+message MetricsRequest {
+    // Unique identifier for this request, used to correlate responses.
+    string request_id = 1;
+}
+
+// Metrics response from an executor.
+message MetricsResponse {
+    // Request ID this response corresponds to.
+    string request_id = 1;
+    // OTLP ExportMetricsServiceRequest protobuf-encoded metrics.
+    bytes otlp_metrics = 2;
+}
+
 // Physical plan
 message SchemaCastScanExecNode {
     bytes schema = 1;
 }
 
 message BytesProcessedExecNode {}
+
+message CayenneAccelerationExecNode {}
+
+// Execution plan node for UDTFs.
+// This allows UDTF results to be distributed across a cluster by serializing
+// the UDTF arguments and re-invoking the UDTF on remote executors.
+message UdtfExecNode {
+    // The UDTF arguments needed to reconstruct the results.
+    UdtfArgs args = 1;
+    // The schema of the UDTF results (Arrow IPC-encoded Schema).
+    bytes schema = 2;
+}
+
+// UDTF (User-Defined Table Function) serialization for distributed execution.
+// These messages enable serializing UDTF-produced TableProviders so they can
+// be reconstructed on remote executors in a Ballista cluster.
+
+// Top-level enum for all supported UDTF argument types.
+message UdtfArgs {
+    oneof args {
+        ListUdfsArgs list_udfs = 1;
+        TextSearchArgs text_search = 2;
+        VectorSearchArgs vector_search = 3;
+        RrfArgs rrf = 4;
+    }
+}
+
+// Arguments for list_udfs() - no arguments needed, marker message only.
+message ListUdfsArgs {}
+
+// Arguments for text_search(tbl, query, [col], [limit], [include_score]).
+message TextSearchArgs {
+    // The table reference as a string (e.g., "catalog.schema.table" or just "table").
+    string table = 1;
+    // The search query string.
+    string query = 2;
+    // Optional column to search on (if table has multiple searchable columns).
+    optional string column = 3;
+    // Optional limit on number of results.
+    optional uint64 limit = 4;
+    // Whether to include the score column in results (default: true).
+    optional bool include_score = 5;
+}
+
+// Arguments for vector_search(tbl, query, [col], [limit], [include_score]).
+message VectorSearchArgs {
+    // The table reference as a string.
+    string table = 1;
+    // The search query string (will be embedded).
+    string query = 2;
+    // Optional column containing embeddings to search.
+    optional string column = 3;
+    // Optional limit on number of results.
+    optional uint64 limit = 4;
+    // Whether to include the score column in results (default: true).
+    optional bool include_score = 5;
+}
+
+// Arguments for rrf(query1, query2, ..., [k], [join_key], [time_column], ...).
+message RrfArgs {
+    // Nested UDTF invocations (text_search or vector_search only).
+    repeated RrfNestedQuery queries = 1;
+    // RRF smoothing parameter (default: 60.0).
+    optional double k = 2;
+    // Column name to use for joining results instead of auto-generated row ID.
+    optional string join_key = 3;
+    // Column name containing timestamps for recency boosting.
+    optional string time_column = 4;
+    // Type of decay function: "linear" or "exponential" (default: "exponential").
+    optional string recency_decay = 5;
+    // Decay rate constant for exponential decay (default: 0.01).
+    optional double decay_constant = 6;
+    // Time scale in seconds for decay calculation (default: 86400).
+    optional double decay_scale_secs = 7;
+    // Window size for linear decay function (default: 86400).
+    optional double decay_window_secs = 8;
+}
+
+// A nested query within an RRF invocation.
+message RrfNestedQuery {
+    oneof query {
+        RrfTextSearchQuery text_search = 1;
+        RrfVectorSearchQuery vector_search = 2;
+    }
+}
+
+// A nested text_search invocation with optional rank weight.
+message RrfTextSearchQuery {
+    TextSearchArgs args = 1;
+    optional double rank_weight = 2;
+}
+
+// A nested vector_search invocation with optional rank weight.
+message RrfVectorSearchQuery {
+    VectorSearchArgs args = 1;
+    optional double rank_weight = 2;
+}

@@ -3,7 +3,7 @@ additionalLabels: {}
 
 image:
   repository: ghcr.io/spiceai/spiceai-nightly
-  tag: latest-models # 1.10.0-unstable
+  tag: latest-models # 1.11.0-unstable
 replicaCount: 1
 
 service:
@@ -33,6 +33,16 @@ serviceAccount:
 #   requests:
 #     cpu: 500m
 #     memory: 1Gi
+
+# Override the default command for spiced
+# command:
+#   - /usr/local/bin/spiced
+#   - --http
+#   - 0.0.0.0:8090
+#   - --metrics
+#   - 0.0.0.0:9090
+#   - --flight
+#   - 0.0.0.0:50051
 
 # Additional environment variables
 # additionalEnv:

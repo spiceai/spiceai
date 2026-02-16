@@ -31,8 +31,8 @@ pub struct DispatchArgs {
     #[arg(long)]
     pub(crate) workflow: Workflow,
 
-    #[arg(long, env = "GH_TOKEN")]
-    pub(crate) github_token: String,
+    #[arg(long, env = "GH_TOKEN", required_if_eq("dry_run", "false"))]
+    pub(crate) github_token: Option<String>,
 
     #[arg(long, env = "SPICED_COMMIT", default_value = "")]
     pub(crate) spiced_commit: String,
@@ -43,12 +43,13 @@ pub struct DispatchArgs {
     #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
 
-    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
-    pub(crate) validate: bool,
-
     /// Maximum number of concurrent workflow runs allowed
     #[arg(long)]
     pub(crate) max_concurrent: Option<usize>,
+
+    /// Dry run mode - print the workflow dispatch request without sending it
+    #[arg(long, default_value = "false")]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -195,6 +196,8 @@ pub struct LoadArgs {
     pub random_param_set_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_clients: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distributed: Option<bool>,
 }
 
 /// Append workflow arguments, defined in the test files
@@ -229,6 +232,7 @@ impl<'de> Deserialize<'de> for LoadArgs {
             concurrency: Option<u64>,
             random_param_set_count: Option<usize>,
             http_clients: Option<bool>,
+            distributed: Option<bool>,
         }
 
         let mut helper = LoadArgsHelper::deserialize(deserializer)?;
@@ -253,6 +257,7 @@ impl<'de> Deserialize<'de> for LoadArgs {
             concurrency: helper.concurrency,
             random_param_set_count: helper.random_param_set_count,
             http_clients: helper.http_clients,
+            distributed: helper.distributed,
         })
     }
 }
@@ -288,6 +293,10 @@ pub struct TextToSqlArgs {
     /// Unique name for the configured testoperator run. Used to identify/group runs in telemetry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration_name: Option<String>,
+
+    /// Include evidence in the question for bird-bench querysets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_evidence: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -311,15 +320,15 @@ pub enum BenchmarkQueryset {
     BirdBenchSmallCaliforniaSchools,
     #[serde(rename = "bird-bench-small[card_games]")]
     BirdBenchSmallCardGames,
-    #[serde(rename = "bird-bench-small[community]")]
-    BirdBenchSmallCommunity,
+    #[serde(rename = "bird-bench-small[codebase_community]")]
+    BirdBenchSmallCodebaseCommunity,
     #[serde(rename = "bird-bench-small[debit_card_specializing]")]
     BirdBenchSmallDebitCardSpecializing,
-    #[serde(rename = "bird-bench-small[european_football2]")]
+    #[serde(rename = "bird-bench-small[european_football_2]")]
     BirdBenchSmallEuropeanFootball2,
     #[serde(rename = "bird-bench-small[financial]")]
     BirdBenchSmallFinancial,
-    #[serde(rename = "bird-bench-small[formula1]")]
+    #[serde(rename = "bird-bench-small[formula_1]")]
     BirdBenchSmallFormula1,
     #[serde(rename = "bird-bench-small[superhero]")]
     BirdBenchSmallSuperhero,
@@ -365,8 +374,7 @@ tests:
     random_param_set_count: 1000
 ";
 
-        let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
 
         // Verify bench section (single item becomes vec with one element)
         assert_eq!(test_file.tests.bench.len(), 1);
@@ -424,8 +432,7 @@ tests:
       random_param_set_count: 500
 ";
 
-        let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
 
         // Verify we have 3 load sections
         assert_eq!(test_file.tests.load.len(), 3);
@@ -483,8 +490,7 @@ tests:
 tests: {}
 ";
 
-        let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
 
         // All sections should default to empty vectors
         assert_eq!(test_file.tests.bench.len(), 0);

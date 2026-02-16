@@ -16,16 +16,21 @@ limitations under the License.
 
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
+use crate::cluster::partition::executor_request_initial_partitions;
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
+use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
-    FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
+    CLUSTER_INTERNAL_SERVER, CLUSTER_SCHEDULER_REGISTRY, FailedToStartClusterExecutorSnafu,
+    FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
+use ::datafusion::sql::TableReference;
 use app::App;
+use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
@@ -38,42 +43,367 @@ use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
-use ballista_executor::metrics::LoggingMetricsCollector;
-use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::SchedulerConfig;
+use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
+use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
+use ballista_scheduler::state::execution_graph::RunningTaskInfo;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
-use runtime_proto::GetAppDefinitionRequest;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
+use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest, TaskCancelInfo};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, RwLock, oneshot};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
-use uuid::Uuid;
+use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use x509_certificate::CapturedX509Certificate;
+const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+pub enum DistributedNode {
+    Scheduler {
+        peers: Arc<RwLock<SchedulerPeers>>,
+
+        /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
+        job_executor: Arc<RwLock<Option<Arc<JobExecutor>>>>,
+
+        /// Registry of connected executors for `FlightSQL`.
+        executor_registry: Arc<ExecutorRegistry>,
+
+        /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
+        partition_manager: Arc<RwLock<Option<Arc<PartitionManager>>>>,
+    },
+    Executor {
+        /// Partition assignments for this runtime (executor) for each table.
+        ///
+        /// This is populated during startup when the executor registers with the scheduler.
+        /// It contains the list of partition filters (expressions) that this executor is responsible for.
+        partition_assignments: Arc<RwLock<HashMap<TableReference, Vec<Expr>>>>,
+    },
+}
+
+impl DistributedNode {
+    #[must_use]
+    pub fn is_scheduler(&self) -> bool {
+        matches!(self, DistributedNode::Scheduler { .. })
+    }
+
+    #[must_use]
+    pub fn is_executor(&self) -> bool {
+        matches!(self, DistributedNode::Executor { .. })
+    }
+}
 
 type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
 
+struct SchedulerPollHandle {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        return address.to_string();
+    }
+
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format!("{scheme}://{address}")
+}
+
+/// Represents the connection state machine for the scheduler poll loop.
+///
+/// This enum tracks progress through connection establishment, avoiding redundant
+/// work when only later stages fail (e.g., retrying `connect()` without recreating
+/// the endpoint).
+#[expect(clippy::large_enum_variant)]
+enum SchedulerConnectionState {
+    /// Initial state: need to create endpoint URL and gRPC endpoint
+    NeedsEndpoint,
+    /// Endpoint created and TLS configured, ready to connect
+    ReadyToConnect {
+        endpoint: Endpoint,
+        endpoint_url: String,
+    },
+}
+
+fn spawn_scheduler_poll_loop(
+    scheduler_address: String,
+    client_tls_config: Option<ClientTlsConfig>,
+    executor: Arc<Executor>,
+    codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
+    readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    poll_now_notify: Option<Arc<Notify>>,
+    available_task_slots: Arc<tokio::sync::Semaphore>,
+) -> SchedulerPollHandle {
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let tls_enabled = client_tls_config.is_some();
+
+    let task = tokio::spawn(async move {
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(SCHEDULER_BACKOFF_MAX))
+            .build();
+
+        let mut state = SchedulerConnectionState::NeedsEndpoint;
+
+        loop {
+            if token.is_cancelled() {
+                tracing::debug!("Stopping scheduler poll loop for {scheduler_address} (cancelled)");
+                break;
+            }
+
+            // Build the endpoint if we don't have one yet
+            let (endpoint, endpoint_url) = match state {
+                SchedulerConnectionState::NeedsEndpoint => {
+                    let endpoint_url =
+                        normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
+                    let scheduler_endpoint = match create_grpc_client_endpoint(endpoint_url.clone())
+                    {
+                        Ok(endpoint) => endpoint,
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to create scheduler endpoint {endpoint_url}: {err}"
+                            );
+                            if let Some(delay) = backoff.next_duration() {
+                                tokio::select! {
+                                    () = token.cancelled() => break,
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
+                        match scheduler_endpoint.tls_config(tls_config) {
+                            Ok(endpoint) => endpoint,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to configure TLS for scheduler endpoint {endpoint_url}: {err}"
+                                );
+                                if let Some(delay) = backoff.next_duration() {
+                                    tokio::select! {
+                                        () = token.cancelled() => break,
+                                        () = tokio::time::sleep(delay) => {}
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        scheduler_endpoint
+                    };
+
+                    // Cache the endpoint for future retries
+                    state = SchedulerConnectionState::ReadyToConnect {
+                        endpoint: scheduler_endpoint.clone(),
+                        endpoint_url: endpoint_url.clone(),
+                    };
+                    (scheduler_endpoint, endpoint_url)
+                }
+                SchedulerConnectionState::ReadyToConnect {
+                    ref endpoint,
+                    ref endpoint_url,
+                } => (endpoint.clone(), endpoint_url.clone()),
+            };
+
+            let scheduler_connection = match endpoint.connect().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    tracing::warn!("Unable to connect to scheduler at {endpoint_url}: {err}");
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::select! {
+                            () = token.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            backoff.reset();
+            let scheduler = SchedulerGrpcClient::new(scheduler_connection)
+                .max_encoding_message_size(usize::MAX)
+                .max_decoding_message_size(usize::MAX);
+
+            let (tx_ready, rx_ready) = oneshot::channel();
+            let readiness_sender = Arc::clone(&readiness_sender);
+            let readiness_task = tokio::spawn(async move {
+                if let Ok(executor_id) = rx_ready.await {
+                    let sender = if let Ok(mut sender) = readiness_sender.lock() {
+                        sender.take()
+                    } else {
+                        tracing::warn!(
+                            "Readiness sender lock poisoned while handling executor readiness"
+                        );
+                        None
+                    };
+                    if let Some(sender) = sender {
+                        let _ = sender.send(executor_id);
+                    }
+                }
+            });
+
+            let poll_future = execution_loop::poll_loop(
+                scheduler,
+                Arc::clone(&executor),
+                codec.clone(),
+                Some(tx_ready),
+                poll_now_notify.clone(),
+                Some(Arc::clone(&available_task_slots)),
+            );
+
+            tokio::select! {
+                () = token.cancelled() => {
+                    readiness_task.abort();
+                    tracing::debug!(
+                        "Stopping scheduler poll loop for {scheduler_address} (cancelled)"
+                    );
+                    break;
+                }
+                result = poll_future => {
+                    readiness_task.abort();
+                    if let Err(err) = result {
+                        tracing::warn!(
+                            "Scheduler poll loop ended for {scheduler_address}: {err}"
+                        );
+                    }
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::select! {
+                            () = token.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    SchedulerPollHandle { cancel, task }
+}
+
+async fn fetch_scheduler_membership(
+    scheduler_url: &Url,
+    client_tls_config: Option<ClientTlsConfig>,
+) -> Option<Vec<String>> {
+    let mut cluster_client =
+        match create_cluster_service_client(scheduler_url, client_tls_config.clone()).await {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!("Failed to create scheduler membership client: {err}");
+                return None;
+            }
+        };
+
+    match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
+        Ok(response) => {
+            let schedulers = response.into_inner().schedulers;
+            let scheduler_addresses = schedulers
+                .iter()
+                .map(|scheduler| scheduler.advertise_address.clone())
+                .collect::<Vec<_>>();
+            Some(scheduler_addresses)
+        }
+        Err(status) => {
+            tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
+            None
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn update_scheduler_pollers(
+    pollers: &mut HashMap<String, SchedulerPollHandle>,
+    known_schedulers: &mut HashSet<String>,
+    addresses: Vec<String>,
+    client_tls_config: Option<&ClientTlsConfig>,
+    executor: &Arc<Executor>,
+    codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
+    readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    poll_now_notify: Option<&Arc<Notify>>,
+    available_task_slots: &Arc<tokio::sync::Semaphore>,
+) {
+    let next_schedulers: HashSet<String> = addresses.into_iter().collect();
+
+    let added: Vec<String> = next_schedulers
+        .difference(known_schedulers)
+        .cloned()
+        .collect();
+    let removed: Vec<String> = known_schedulers
+        .difference(&next_schedulers)
+        .cloned()
+        .collect();
+
+    if !added.is_empty() || !removed.is_empty() {
+        let added_list = added.join(",");
+        let removed_list = removed.join(",");
+        tracing::debug!(
+            "Scheduler membership updated; added=[{added_list}], removed=[{removed_list}]"
+        );
+    }
+
+    for address in added {
+        let handle = spawn_scheduler_poll_loop(
+            address.clone(),
+            client_tls_config.cloned(),
+            Arc::clone(executor),
+            codec.clone(),
+            Arc::clone(readiness_sender),
+            poll_now_notify.cloned(),
+            Arc::clone(available_task_slots),
+        );
+        pollers.insert(address, handle);
+    }
+
+    for address in removed {
+        if let Some(handle) = pollers.remove(&address) {
+            handle.cancel.cancel();
+            tokio::spawn(async move {
+                let _ = handle.task.await;
+            });
+        }
+    }
+
+    *known_schedulers = next_schedulers;
+}
+
+mod composite_flight_service;
+mod control_stream_client;
 pub mod datafusion;
+mod executor_registry;
+pub mod metrics_collector;
+pub mod partition;
+mod scheduler_registry;
 mod servers;
 mod service;
 
+pub use control_stream_client::ControlStreamManager;
+pub use executor_registry::ExecutorRegistry;
+pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
+pub use scheduler_registry::start_scheduler_registry;
+pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::ClusterServiceImpl;
+pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
 /// mTLS configuration for cluster communications.
 ///
@@ -187,6 +517,8 @@ pub struct ResolvedClusterConfig {
     scheduler_url: Option<String>,
     /// Resolved scheduler address URL (with scheme inferred if omitted).
     scheduler_address_url: Option<Url>,
+    /// Advertise address with port stripped (if present in the original input).
+    node_advertise_host: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -251,10 +583,10 @@ impl ResolvedClusterConfig {
         };
 
         // Pre-compute scheduler URL from advertise address
-        let bind_port = config.node_bind_address.port();
-        let scheduler_url = config.node_advertise_address.as_ref().map(|addr| {
+        let bind_port = config.node_port();
+        let node_advertise_host = config.node_advertise_address.as_ref().map(|addr| {
             // Extract just the host, ignoring any port - always use bind_port
-            let host = if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
                 // Full socket address - strip the port with deprecation warning
                 tracing::warn!("Port in --node-advertise-address will be ignored. Using port {bind_port} from --node-bind-address.");
                 socket_addr.ip().to_string()
@@ -270,9 +602,11 @@ impl ResolvedClusterConfig {
             } else {
                 // No colon - just a hostname
                 addr.clone()
-            };
-            format!("{inferred_scheme}://{host}:{bind_port}")
+            }
         });
+        let scheduler_url = node_advertise_host
+            .as_ref()
+            .map(|host| format!("{inferred_scheme}://{host}:{bind_port}"));
 
         // Resolve scheduler address URL, inferring scheme if omitted and default port if not provided
         let scheduler_address_url = config
@@ -311,6 +645,7 @@ impl ResolvedClusterConfig {
             tls_config,
             scheduler_url,
             scheduler_address_url,
+            node_advertise_host,
         })
     }
 
@@ -318,6 +653,19 @@ impl ResolvedClusterConfig {
     #[must_use]
     pub fn role(&self) -> Option<&ClusterRole> {
         self.config.role.as_ref()
+    }
+
+    /// Returns the fully qualified URL that this node advertises to other cluster nodes.
+    fn node_advertise_url(&self) -> String {
+        let port = self.config.node_bind_address.port();
+        let protocol = if self.tls_enabled() { "https" } else { "http" };
+        format!(
+            "{}://{}:{}",
+            protocol,
+            self.node_advertise_address()
+                .unwrap_or(&self.config.node_bind_address.ip().to_string()),
+            port
+        )
     }
 
     /// Returns the effective cluster role.
@@ -358,10 +706,10 @@ impl ResolvedClusterConfig {
         self.scheduler_url.as_deref()
     }
 
-    /// Returns the advertise address.
+    /// Returns the advertise address (host only, with any port stripped).
     #[must_use]
     pub fn node_advertise_address(&self) -> Option<&str> {
-        self.config.node_advertise_address.as_deref()
+        self.node_advertise_host.as_deref()
     }
 
     /// Returns the cluster TLS config if configured.
@@ -387,14 +735,27 @@ impl ResolvedClusterConfig {
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
         self.tls_config.as_ref().map(|t| &t.client_tls_config)
     }
+
+    /// Get the node's advertise address for node identification
+    pub fn node_id(&self) -> String {
+        self.scheduler_url_string()
+            .or_else(|| self.node_advertise_address())
+            .map_or_else(|| self.node_bind_address().to_string(), str::to_string)
+    }
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
-    let scheduler = create_scheduler_server(rt).await?;
+    let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
         .bind_scheduler_server(Arc::new(scheduler))
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+    rt.df
+        .bind_executor_stream_registry(executor_stream_registry)
         .map_err(|e| FailedToStartClusterScheduler {
             source: Box::new(e),
         })?;
@@ -405,10 +766,102 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
     Ok(())
 }
 
+pub(crate) async fn initialize_cluster_scheduler_future(
+    rt: &Arc<Runtime>,
+    scheduler_executor_registry: Arc<ExecutorRegistry>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
+    initialize_cluster_scheduler(rt).await?;
+    // Start internal cluster server for scheduler on separate port
+    let internal_server_shutdown = CancellationToken::new();
+    let cloned_shutdown = internal_server_shutdown.clone();
+    let internal_server_rt = Arc::clone(rt);
+    let internal_server_peers = Arc::clone(&scheduler_peers);
+    let internal_server_fut = async move {
+        start_internal_cluster_server(
+            internal_server_rt,
+            Some(cloned_shutdown),
+            Arc::clone(&scheduler_executor_registry),
+            internal_server_peers,
+        )
+        .await
+        .context(UnableToStartClusterServerSnafu)
+    };
+    let self_for_task = Arc::clone(rt);
+    let internal_server_future = self_for_task
+        .start_runtime_task(
+            CLUSTER_INTERNAL_SERVER,
+            Some(internal_server_shutdown),
+            internal_server_fut,
+        )
+        .await;
+
+    let scheduler_registry_future = {
+        let app = rt.app.read().await;
+        let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
+        if let Some(config) = config {
+            // Initialize partition manager with the configured object store
+            match partition::build_partition_metadata_store(rt, &config).await {
+                Ok(store) => {
+                    let partition_manager = Arc::new(PartitionManager::new(store));
+                    rt.set_partition_manager(Arc::clone(&partition_manager))
+                        .await;
+
+                    // Initialize partition metadata for all accelerated tables
+                    if let Err(err) =
+                        partition::initialize_partition_metadata(rt, &partition_manager).await
+                    {
+                        tracing::warn!(
+                            "Failed to initialize partition metadata during scheduler startup: {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("Failed to build partition metadata store: {err}");
+                }
+            }
+
+            let registry_shutdown = CancellationToken::new();
+            let registry_shutdown_for_task = registry_shutdown.clone();
+            let peers = Arc::clone(&scheduler_peers);
+            let self_ref = Arc::clone(rt);
+            let registry_task = async move {
+                start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)
+                    .await
+                    .map_err(|err| crate::Error::FailedToRegisterScheduler {
+                        source: Box::new(err),
+                    })
+            };
+            Some(
+                self_for_task
+                    .start_runtime_task(
+                        CLUSTER_SCHEDULER_REGISTRY,
+                        Some(registry_shutdown_for_task),
+                        registry_task,
+                    )
+                    .await,
+            )
+        } else {
+            None
+        }
+    };
+
+    let cluster_future = async move {
+        if let Some(registry_future) = scheduler_registry_future {
+            tokio::try_join!(internal_server_future, registry_future).map(|_| ())
+        } else {
+            internal_server_future.await
+        }
+    };
+
+    Ok(Some(Box::pin(cluster_future)))
+}
+
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
+    shutdown_token: CancellationToken,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
     let runtime_handle = Arc::clone(&rt);
 
@@ -426,82 +879,6 @@ pub async fn initialize_cluster_executor(
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let tls_enabled = client_tls_config.is_some();
-    let config_producer_tls = client_tls_config.clone();
-
-    // Configure mTLS for executor-to-executor gRPC connections (e.g., shuffle fetch)
-    let config_producer: ConfigProducer = Arc::new(move || {
-        let mut config = SessionConfig::new_with_ballista()
-            .with_option_extension(SpiceClusterConfig::default())
-            .with_ballista_use_tls(tls_enabled);
-
-        if let Some(tls_config) = config_producer_tls.clone() {
-            config = config.with_ballista_override_create_grpc_client_endpoint({
-                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
-            });
-        }
-
-        config
-    });
-
-    // Generate executor_id early so we can use it for both the app definition request and executor registration
-    let executor_id = Uuid::new_v4().to_string();
-
-    // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
-    // This ensures shuffle files are written to the configured directory.
-    let mut cluster_client =
-        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
-
-    let app_definition_request = GetAppDefinitionRequest {
-        executor_id: executor_id.clone(),
-    };
-
-    let response = cluster_client
-        .get_app_definition(app_definition_request)
-        .await
-        .map_err(|status| FailedToStartClusterExecutor {
-            source: format!("Failed to get app definition from scheduler: {status}").into(),
-        })?;
-
-    let app_json = response.into_inner().app_json;
-
-    let app_def: App = serde_json::from_str(&app_json)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-
-    // Extract temp_directory from the app definition for the executor's work_dir
-    let work_dir = app_def
-        .runtime
-        .query
-        .as_ref()
-        .and_then(|q| q.temp_directory.clone())
-        .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
-
-    let app_def = Arc::new(app_def);
-
-    let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
-        scheduler_endpoint
-            .tls_config(tls_config)
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            })?
-    } else {
-        scheduler_endpoint
-    };
-
-    let scheduler_connection =
-        scheduler_endpoint
-            .connect()
-            .await
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: format!("Unable to connect to scheduler at {scheduler_url}: {e}").into(),
-            })?;
-
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
-        .max_encoding_message_size(usize::MAX)
-        .max_decoding_message_size(usize::MAX);
 
     // Use the configured node_bind_address for the executor flight server.
     // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
@@ -528,6 +905,148 @@ pub async fn initialize_cluster_executor(
         });
     };
 
+    // Determine the advertise host and port for executor registration
+    // node_advertise_address() returns host-only (port already stripped during config resolution)
+    let (advertise_host, advertise_port) =
+        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
+            (advertise_host.to_string(), bind_addr.port())
+        } else {
+            // Fall back to hostname and bind_addr port
+            let hostname = gethostname::gethostname().into_string().map_err(|_| {
+                FailedToStartClusterExecutor {
+                    source: "Unable to determine executor hostname".to_string().into(),
+                }
+            })?;
+            (hostname, bind_addr.port())
+        };
+
+    let executor_id = format!("{advertise_host}:{advertise_port}");
+
+    // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
+    // This ensures shuffle files are written to the configured directory.
+    let mut cluster_client =
+        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
+
+    let initial_scheduler_addresses =
+        match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
+            Ok(response) => {
+                let schedulers = response.into_inner().schedulers;
+                let scheduler_addresses = schedulers
+                    .iter()
+                    .map(|scheduler| scheduler.advertise_address.clone())
+                    .collect::<Vec<_>>();
+                tracing::info!("Scheduler membership: {:?}", scheduler_addresses);
+                scheduler_addresses
+            }
+            Err(status) => {
+                tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
+                Vec::new()
+            }
+        };
+
+    let app_definition_request = GetAppDefinitionRequest {
+        executor_id: executor_id.clone(),
+    };
+
+    let response = cluster_client
+        .get_app_definition(app_definition_request)
+        .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to get app definition from scheduler: {status}").into(),
+        })?;
+
+    let app_json = response.into_inner().app_json;
+
+    let app_def: App = serde_json::from_str(&app_json)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
+    // Otherwise fall back to temp_directory from query config or system temp dir
+    // Note: shuffle_memory_mode and object store config is set via the scheduler's override_session_builder
+    let shuffle_location = app_def.runtime.params.get("shuffle_location");
+
+    // Determine work_dir for executor:
+    // - For "memory" mode or object store paths (s3://, abfs://), use temp_directory as fallback
+    // - For local disk paths, use the specified path
+    let work_dir = match shuffle_location.map(String::as_str) {
+        Some("memory") => {
+            // Memory mode: use temp_directory as fallback for any local work
+            app_def
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.temp_directory.clone())
+                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+        }
+        Some(loc)
+            if loc.starts_with("s3://")
+                || loc.starts_with("abfs://")
+                || loc.starts_with("az://") =>
+        {
+            // Object store mode: shuffle data goes to object store, but executor still needs local work_dir
+            app_def
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.temp_directory.clone())
+                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+        }
+        Some(loc) => {
+            // Local disk mode with explicit path
+            // Validate the path exists or can be created
+            let path = std::path::Path::new(loc);
+            if !path.exists() {
+                tracing::warn!(
+                    "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
+                    loc
+                );
+            }
+            loc.to_string()
+        }
+        None => {
+            // Default: use temp_directory
+            app_def
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.temp_directory.clone())
+                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+        }
+    };
+
+    // Log shuffle configuration
+    // Normalize shuffle_format based on feature availability
+    let raw_shuffle_format = app_def
+        .runtime
+        .params
+        .get("shuffle_format")
+        .map_or("arrow_ipc", String::as_str);
+
+    #[cfg(feature = "vortex")]
+    let shuffle_format = raw_shuffle_format;
+
+    #[cfg(not(feature = "vortex"))]
+    let shuffle_format = {
+        if raw_shuffle_format == "vortex" {
+            tracing::warn!(
+                "Vortex shuffle format requested but 'vortex' feature is not enabled. Executor will use ArrowIpc."
+            );
+            "arrow_ipc"
+        } else {
+            raw_shuffle_format
+        }
+    };
+    let shuffle_location_display = shuffle_location.map_or("disk (temp_directory)", String::as_str);
+    tracing::info!(
+        "Executor shuffle configuration: shuffle_format={}, shuffle_location={}, work_dir={}",
+        shuffle_format,
+        shuffle_location_display,
+        work_dir
+    );
+
+    let app_def = Arc::new(app_def);
+
     let Some(concurrent_tasks) = std::thread::available_parallelism()
         .ok()
         .and_then(|nz| u32::try_from(nz.get()).ok())
@@ -539,50 +1058,10 @@ pub async fn initialize_cluster_executor(
         });
     };
 
-    // Determine the advertise host and port for executor registration
-    let (advertise_host, advertise_port) = if let Some(advertise_addr) =
-        rt.df.cluster_config.node_advertise_address()
-    {
-        // Extract just the host, ignoring any port - always use bind_addr port
-        let host = if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
-            // Full socket address - strip the port with deprecation warning
-            tracing::warn!(
-                "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
-                bind_addr.port()
-            );
-            socket_addr.ip().to_string()
-        } else if let Some((host_part, port_part)) = advertise_addr.rsplit_once(':') {
-            // Check if this looks like host:port
-            if port_part.parse::<u16>().is_ok() && !host_part.is_empty() {
-                tracing::warn!(
-                    "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
-                    bind_addr.port()
-                );
-                host_part.trim_matches(['[', ']']).to_string()
-            } else {
-                // Not a valid port, use as-is (e.g. IPv6 without brackets)
-                advertise_addr.to_string()
-            }
-        } else {
-            // No colon - just a hostname
-            advertise_addr.to_string()
-        };
-        (host, bind_addr.port())
-    } else {
-        // Fall back to hostname and bind_addr port
-        let hostname =
-            gethostname::gethostname()
-                .into_string()
-                .map_err(|_| FailedToStartClusterExecutor {
-                    source: "Unable to determine executor hostname".to_string().into(),
-                })?;
-        (hostname, bind_addr.port())
-    };
-
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
-        host: Some(advertise_host),
+        host: Some(advertise_host.clone()),
         port: u32::from(advertise_port),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,
@@ -593,13 +1072,49 @@ pub async fn initialize_cluster_executor(
         }),
     };
 
+    // Use advertise address as node_id for metrics
+    let metrics_node_id = format!("{advertise_host}:{advertise_port}");
+
+    // Configure executor session config with shuffle locality metrics callback
+    let config_producer_tls = client_tls_config.clone();
+    let config_producer_node_id = metrics_node_id.clone();
+    let config_producer: ConfigProducer = Arc::new(move || {
+        let mut config = SessionConfig::new_with_ballista()
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_use_tls(tls_enabled)
+            // Use 100MB max message size to match other gRPC configurations in the codebase.
+            // The default Ballista config is 16MB which is too small for shuffle operations
+            // with large batches.
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
+            // Enable shuffle locality metrics callback to track local vs remote shuffle reads
+            .with_ballista_shuffle_read_metrics_callback(
+                metrics_collector::OtelShuffleReadMetricsCallback::new_arc(
+                    config_producer_node_id.clone(),
+                ),
+            );
+
+        if let Some(tls_config) = config_producer_tls.clone() {
+            config = config.with_ballista_override_create_grpc_client_endpoint({
+                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
+            });
+        }
+
+        config
+    });
+
+    let metrics_collector =
+        metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id.clone());
+
+    // Record task slots capacity for utilization metrics
+    crate::metrics::cluster::set_executor_task_slots(&metrics_node_id, u64::from(concurrent_tasks));
+
     let executor = Arc::new(Executor::new(
         executor_meta,
         &work_dir,
         runtime_producer,
         config_producer,
         Arc::new(BallistaFunctionRegistry::default()),
-        Arc::new(LoggingMetricsCollector::default()),
+        Arc::new(metrics_collector),
         concurrent_tasks as usize,
         None,
     ));
@@ -617,20 +1132,144 @@ pub async fn initialize_cluster_executor(
         .context(FailedToStartClusterExecutorSnafu)?;
 
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
+    let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
-    let executor_poll_loop = tokio::spawn(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, Some(tx_ready)).map_err(
-            |e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            },
-        ),
-    );
+    // Create the shared semaphore for task slot management across all scheduler poll loops.
+    // This semaphore will be passed to each poll loop so the busy state can be tracked
+    // and shared across nodes in the scheduler shared state location metadata.
+    let available_task_slots = Arc::new(tokio::sync::Semaphore::new(concurrent_tasks as usize));
+
+    let scheduler_url_for_manager = scheduler_url.clone();
+    let client_tls_config_for_manager = client_tls_config.clone();
+    let executor_for_manager = Arc::clone(&executor);
+    let codec_for_manager = codec;
+    let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+    let available_task_slots_for_manager = Arc::clone(&available_task_slots);
+
+    let control_stream_executor_id = executor_id.clone();
+    let control_stream_ballista_id = executor_id.clone();
+    let control_stream_tls_config = client_tls_config.clone();
+    let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
+    let control_stream_metrics_reader = rt.metrics_reader().cloned();
+    let shutdown_token_for_manager = shutdown_token.clone();
+
+    // Thread to handle:
+    //  - periodic refresh of scheduler membership
+    //  - spawning/stopping scheduler poll loops as membership changes
+    //  - managing control streams for metrics and PollNow commands
+    let poll_manager = tokio::spawn(async move {
+        let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
+        let mut known_schedulers: HashSet<String> = HashSet::new();
+
+        // Initialize control stream manager for metrics collection
+        let mut control_stream_manager = ControlStreamManager::new(
+            control_stream_executor_id,
+            control_stream_ballista_id,
+            control_stream_tls_config,
+            control_stream_metrics_reader,
+            Some(Arc::clone(&executor_for_manager)),
+        );
+
+        // Get the shared poll_now notify handle from the control stream manager.
+        // When any scheduler sends a PollNow command, this will wake the poll loops.
+        let poll_now_notify = control_stream_manager.poll_now_notify();
+
+        let mut current_addresses = initial_scheduler_addresses_for_manager;
+        if current_addresses.is_empty() {
+            current_addresses.push(scheduler_url_for_manager.to_string());
+        }
+
+        let control_stream_addresses = if control_stream_initial_schedulers.is_empty() {
+            vec![scheduler_url_for_manager.to_string()]
+        } else {
+            control_stream_initial_schedulers
+        };
+        control_stream_manager.update_schedulers(control_stream_addresses);
+
+        update_scheduler_pollers(
+            &mut pollers,
+            &mut known_schedulers,
+            current_addresses,
+            client_tls_config_for_manager.as_ref(),
+            &executor_for_manager,
+            &codec_for_manager,
+            &readiness_sender,
+            Some(&poll_now_notify),
+            &available_task_slots_for_manager,
+        );
+
+        let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
+        loop {
+            tokio::select! {
+                () = shutdown_token_for_manager.cancelled() => {
+                    control_stream_manager
+                        .notify_shutdown("runtime shutdown")
+                        .await;
+                    control_stream_manager.shutdown();
+                    for (_, handle) in pollers.drain() {
+                        handle.cancel.cancel();
+                        let _ = handle.task.await;
+                    }
+                    break;
+                }
+                _ = refresh.tick() => {
+                    if let Some(addresses) = fetch_scheduler_membership(
+                        &scheduler_url_for_manager,
+                        client_tls_config_for_manager.clone(),
+                    )
+                    .await
+                    {
+                        if addresses.is_empty() {
+                            tracing::warn!(
+                                "Scheduler membership refresh returned empty list; keeping existing schedulers"
+                            );
+                            continue;
+                        }
+                        // Update control streams with new scheduler membership
+                        control_stream_manager.update_schedulers(addresses.clone());
+
+                        update_scheduler_pollers(
+                            &mut pollers,
+                            &mut known_schedulers,
+                            addresses,
+                            client_tls_config_for_manager.as_ref(),
+                            &executor_for_manager,
+                            &codec_for_manager,
+                            &readiness_sender,
+                            Some(&poll_now_notify),
+                            &available_task_slots_for_manager,
+                        );
+                    }
+                }
+            }
+        }
+    });
 
     Ok(async move {
         let _ = rx_ready
             .await
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
+
+        // Get initial allocation of Accelerated table partitions.
+        // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
+        //
+        // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
+        let initial_partitions = executor_request_initial_partitions(
+            cluster_client.clone(),
+            rt.datafusion().cluster_config.node_advertise_url(),
+        )
+        .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to allocate initial partitions from scheduler: {status}")
+                .into(),
+        })?;
+        tracing::debug!(
+            "For executor={:?}, initial accelerated table partitions={:?}",
+            rt.datafusion().cluster_config.node_advertise_url(),
+            initial_partitions.clone()
+        );
+        rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
@@ -639,26 +1278,255 @@ pub async fn initialize_cluster_executor(
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);
 
-        executor_poll_loop
+        poll_manager
             .await
             .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        Ok(())
     })
 }
 
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
-) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+) -> crate::Result<(
+    SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
+    ExecutorControlStreamRegistry,
+)> {
     let bind_addr = rt.df.cluster_config.node_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
+    // Get shuffle format from spicepod runtime params
+    let shuffle_format: String = {
+        let app_ref = rt.app();
+        let app_guard = app_ref.read().await;
+        app_guard
+            .as_ref()
+            .and_then(|app| app.runtime.params.get("shuffle_format"))
+            .cloned()
+            .unwrap_or_else(|| "arrow_ipc".to_string())
+    };
+
+    // Get shuffle_location from spicepod runtime params
+    // "memory" = in-memory shuffle, otherwise path for disk shuffle (defaults to temp_directory)
+    let shuffle_location: Option<String> = {
+        let app_ref = rt.app();
+        let app_guard = app_ref.read().await;
+        app_guard
+            .as_ref()
+            .and_then(|app| app.runtime.params.get("shuffle_location"))
+            .cloned()
+    };
+    let shuffle_memory_mode = shuffle_location.as_deref() == Some("memory");
+
+    // Determine shuffle storage type and URL from shuffle_location
+    // - "memory" -> in-memory shuffle (no storage_type/storage_url needed)
+    // - "s3://..." -> S3 object store
+    // - "abfs://..." or "az://..." -> Azure object store
+    // - other path or None -> local disk storage
+    let (shuffle_storage_type, shuffle_storage_url): (Option<String>, Option<String>) =
+        match shuffle_location.as_deref() {
+            Some("memory") | None => (None, None), // Memory mode or default - handled separately
+            Some(loc) if loc.starts_with("s3://") => {
+                (Some("s3".to_string()), Some(loc.to_string()))
+            }
+            Some(loc) if loc.starts_with("abfs://") || loc.starts_with("az://") => {
+                (Some("azure".to_string()), Some(loc.to_string()))
+            }
+            Some(loc) => (Some("local".to_string()), Some(loc.to_string())), // Explicit local path
+        };
+
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
         .clone()
         .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+
+    // Convert shuffle_format param to ballista ShuffleFormat
+    #[cfg(feature = "vortex")]
+    let ballista_shuffle_format = match shuffle_format.as_str() {
+        "vortex" => BallistaShuffleFormat::Vortex,
+        _ => BallistaShuffleFormat::ArrowIpc,
+    };
+
+    #[cfg(not(feature = "vortex"))]
+    let ballista_shuffle_format = {
+        if shuffle_format.as_str() == "vortex" {
+            tracing::warn!(
+                "Vortex shuffle format requested but 'vortex' feature is not enabled. Falling back to ArrowIpc."
+            );
+        }
+        BallistaShuffleFormat::ArrowIpc
+    };
+
+    // Create metrics collector with the scheduler's advertise address as node_id
+    let metrics_node_id = rt
+        .df
+        .cluster_config
+        .scheduler_url_string()
+        .map_or_else(|| bind_addr.to_string(), ToString::to_string);
+    let scheduler_metrics_collector = Arc::new(
+        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id.clone()),
+    );
+
+    // Create the executor stream registry for PollNow broadcasts.
+    // This registry will be shared with the ClusterServiceImpl.
+    let executor_stream_registry = ExecutorControlStreamRegistry::new();
+
+    // Create callback that broadcasts PollNow to all connected executors when work is available.
+    let registry_for_callback = executor_stream_registry.clone();
+    let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
+        Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
+
+    let registry_for_cancel = executor_stream_registry.clone();
+    let on_cancel_tasks: OnCancelTasksFn =
+        Arc::new(move |executor_id: &str, tasks: Vec<RunningTaskInfo>| {
+            let tasks_to_cancel = tasks
+                .into_iter()
+                .filter_map(|task| {
+                    let Ok(task_id) = u32::try_from(task.task_id) else {
+                        tracing::warn!(
+                            executor_id,
+                            task_id = task.task_id,
+                            "Skipping cancel task with out-of-range task_id"
+                        );
+                        return None;
+                    };
+
+                    let Ok(stage_id) = u32::try_from(task.stage_id) else {
+                        tracing::warn!(
+                            executor_id,
+                            stage_id = task.stage_id,
+                            "Skipping cancel task with out-of-range stage_id"
+                        );
+                        return None;
+                    };
+
+                    let Ok(partition_id) = u32::try_from(task.partition_id) else {
+                        tracing::warn!(
+                            executor_id,
+                            partition_id = task.partition_id,
+                            "Skipping cancel task with out-of-range partition_id"
+                        );
+                        return None;
+                    };
+
+                    Some(TaskCancelInfo {
+                        task_id,
+                        job_id: task.job_id,
+                        stage_id,
+                        partition_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            if !registry_for_cancel.send_cancel_tasks(executor_id, tasks_to_cancel) {
+                tracing::warn!(
+                    "Failed to send cancel tasks to executor {executor_id}: no control stream"
+                );
+            }
+        });
+
+    // Create InMemoryClusterState first so we can reference it in the config_producer
+    let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
+
+    // Create an atomic counter for total executor slots, updated by a background task
+    // This allows session_builder to read the value synchronously without blocking
+    let total_executor_slots = Arc::new(AtomicUsize::new(0));
+
+    // Spawn background task to periodically update total executor slots from cluster state
+    let cluster_state_for_slots = Arc::clone(&cluster_state);
+    let slots_counter = Arc::clone(&total_executor_slots);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let metadata = cluster_state_for_slots.registered_executor_metadata().await;
+            let total: usize = metadata
+                .iter()
+                .map(|m| m.specification.task_slots as usize)
+                .sum();
+            let prev = slots_counter.swap(total, Ordering::Relaxed);
+            if total != prev {
+                tracing::info!(
+                    executor_count = metadata.len(),
+                    total_slots = total,
+                    "Cluster executor slots updated"
+                );
+            }
+        }
+    });
+
+    // Create the session builder that will build SessionState from SessionConfig
+    // Uses the dynamic total_executor_slots to set target_partitions
+    let slots_for_session = Arc::clone(&total_executor_slots);
+    let session_builder: ballista_scheduler::scheduler_server::SessionBuilder =
+        Arc::new(move |_cfg| {
+            // Get dynamic target_partitions based on cluster capacity
+            let total_slots = slots_for_session.load(Ordering::Relaxed);
+            let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+            tracing::debug!(
+                total_slots,
+                target_partitions,
+                "Cluster session_builder: setting target_partitions based on cluster capacity"
+            );
+
+            let mut cfg = current_context
+                .copied_config()
+                .with_target_partitions(target_partitions)
+                .with_option_extension(SpiceClusterConfig::default())
+                .with_ballista_shuffle_format(ballista_shuffle_format)
+                .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
+
+            // Apply object store shuffle configuration if specified
+            if let Some(ref storage_type) = shuffle_storage_type {
+                cfg = cfg.with_ballista_shuffle_storage_type(storage_type);
+            }
+            if let Some(ref storage_url) = shuffle_storage_url {
+                cfg = cfg.with_ballista_shuffle_storage_url(storage_url);
+            }
+
+            Ok(
+                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
+                    .with_config(cfg)
+                    .with_runtime_env(default_runtime_env(io_runtime.clone()))
+                    .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
+                    .build(),
+            )
+        });
+
+    // Create config_producer that dynamically sets target_partitions based on cluster capacity
+    // Reads from the atomic counter updated by the background task above
+    let slots_for_config = Arc::clone(&total_executor_slots);
+    let config_producer: ConfigProducer = Arc::new(move || {
+        let total_slots = slots_for_config.load(Ordering::Relaxed);
+
+        // Use total slots if executors have registered, otherwise fall back to default
+        let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+        tracing::debug!(
+            total_slots,
+            target_partitions,
+            "Cluster config_producer: setting target_partitions based on cluster capacity"
+        );
+
+        SessionConfig::new_with_ballista()
+            .with_target_partitions(target_partitions)
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_shuffle_format(ballista_shuffle_format)
+            .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
+    });
+
+    // Manually create the BallistaCluster with our custom config_producer
+    let job_state = Arc::new(InMemoryJobState::new(
+        metrics_node_id,
+        session_builder,
+        config_producer,
+    ));
+    let cluster = BallistaCluster::new(cluster_state, job_state);
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -674,40 +1542,38 @@ async fn create_scheduler_server(
         grpc_server_max_decoding_message_size: u32::MAX,
         grpc_server_max_encoding_message_size: u32::MAX,
 
-        override_session_builder: Some(Arc::new(move |_cfg| {
-            let cfg = current_context
-                .copied_config()
-                .with_option_extension(SpiceClusterConfig::default());
-
-            Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
-                    .with_config(cfg)
-                    .with_runtime_env(default_runtime_env(io_runtime.clone()))
-                    .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
-                    .build(),
-            )
-        })),
         override_create_grpc_client_endpoint,
+        override_metrics_collector: Some(scheduler_metrics_collector),
+        on_work_available: Some(on_work_available),
+        on_cancel_tasks: Some(on_cancel_tasks),
+
+        // Faster failure detection: 30s timeout with 10s heartbeat interval
+        executor_timeout_seconds: 30,
         ..Default::default()
     };
-
-    let cluster = BallistaCluster::new_from_config(&scheduler_config)
-        .await
-        .boxed()
-        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
 
-    tracing::info!("Starting Ballista scheduler on {}", bind_addr);
+    let shuffle_location_display = shuffle_location
+        .as_deref()
+        .unwrap_or("disk (temp_directory)");
+    tracing::info!(
+        "Starting Ballista scheduler on {} (shuffle_format={}, shuffle_location={})",
+        bind_addr,
+        shuffle_format,
+        shuffle_location_display
+    );
 
-    scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
+    let scheduler = scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
         cluster,
         scheduler_config.into(),
     )
     .await
     .boxed()
-    .context(FailedToStartClusterSchedulerSnafu)
+    .context(FailedToStartClusterSchedulerSnafu)?;
+
+    Ok((scheduler, executor_stream_registry))
 }
 
 /// Creates a gRPC client for the scheduler's internal cluster service.
@@ -801,6 +1667,7 @@ async fn executor_bind_app(
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
+    Arc::clone(rt).load_datasets().await;
 
     Ok(())
 }
@@ -843,6 +1710,14 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
         // Not all connectors have the same parameter structures for S3 -- this makes all fragment
         // keys match the spec expected by the S3 connector and `SpiceObjectRegistry`.
         params.parameters.canonicalize_s3_fragments();
+
+        // Canonicalize Azure parameters (e.g., `azure_storage_account_name` -> `account`)
+        // for Delta Lake and other connectors that use Azure-prefixed parameter names.
+        params.parameters.canonicalize_azure_fragments();
+
+        // Canonicalize GCS parameters (e.g., `google_service_account` -> `service_account`)
+        // for Delta Lake and other connectors that use GCS-prefixed parameter names.
+        params.parameters.canonicalize_gcs_fragments();
 
         let unprefixed = params
             .parameters

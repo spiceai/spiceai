@@ -13,12 +13,14 @@ snapshot_kind: text
       },
       "dataset": "item",
       "matches": {
-        "i_item_desc": "Patient"
+        "i_item_desc": [
+          "Patient"
+        ]
       },
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": 4.284
+      "_score": 4.284
     }
   ]
 }

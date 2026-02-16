@@ -19,17 +19,19 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::{self, AcceleratedTableBuilderError};
+use crate::accelerated_table::{
+    self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
+};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{self};
-use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
+use crate::dataaccelerator::{self, BootstrapStatus};
+use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -46,7 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::ResolvedClusterConfig,
+    crate::cluster::{ExecutorControlStreamRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -62,6 +64,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
@@ -72,18 +75,35 @@ use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
+use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::AccelerationLayout;
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
+use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::acceleration::SnapshotsTrigger;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
@@ -98,6 +118,7 @@ pub mod dialect;
 pub mod error;
 pub mod filter_converter;
 pub mod flight_session_extension;
+pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
@@ -105,6 +126,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
+pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
 
@@ -246,8 +268,11 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
-    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    #[snafu(display("Unable to acquire lock for cluster executor state"))]
     UnableToLockWritableExecutorHandle {},
+
+    #[snafu(display("Unable to acquire lock for executor stream registry"))]
+    UnableToLockWritableExecutorStreamRegistry {},
 
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
@@ -310,7 +335,37 @@ pub enum Error {
         dataset_name: String,
         index_type: String,
     },
+
+    #[snafu(display("Invalid snapshots_trigger_threshold value: expected time interval"))]
+    InvalidSnapshotCreationInterval { source: fundu::ParseError },
+
+    #[snafu(display("Invalid snapshots_trigger_threshold value: expected integer"))]
+    InvalidSnapshotCreationBatches { source: std::num::ParseIntError },
+
+    #[snafu(display("snapshots_trigger_threshold value should be positive integer"))]
+    SnapshotCreationBatchesShouldBePositive,
+
+    #[snafu(display(
+        "'stream_batches' is not supported for batch-backed datasets. Use 'refresh_complete' or 'time_interval' instead"
+    ))]
+    UnsupportedStreamBatchesForBatchRefresh,
+
+    #[snafu(display(
+        "'refresh_complete' is not supported for stream-backed datasets. Use 'time_interval' or 'stream_batches' instead"
+    ))]
+    UnsupportedRefreshCompleteForStream,
+
+    #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
+    UnsupportedSnapshotTriggerForCaching,
+
+    #[snafu(display(
+        "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
+    ))]
+    UnsupportedAccelerationEngineForSnapshots,
 }
+
+const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
+const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
 pub enum Table {
     Accelerated {
@@ -318,6 +373,7 @@ pub enum Table {
         federated_read_table: FederatedTable,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -362,6 +418,9 @@ pub struct DataFusion {
     pub cluster_config: Arc<ResolvedClusterConfig>,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub executor: RwLock<Option<Arc<Executor>>>,
+    /// Registry of connected executor control streams for `PollNow` broadcasts.
+    /// Only used in scheduler mode.
+    pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -510,6 +569,7 @@ impl DataFusion {
                 federated_read_table,
                 accelerated_table,
                 secrets,
+                bootstrap_status,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -537,8 +597,14 @@ impl DataFusion {
                         });
                     None
                 } else {
-                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
-                        .await?
+                    self.register_accelerated_table(
+                        dataset,
+                        source,
+                        federated_read_table,
+                        secrets,
+                        bootstrap_status,
+                    )
+                    .await?
                 }
             }
             Table::Federated {
@@ -774,6 +840,7 @@ impl DataFusion {
             sink_connector,
             federated_table,
             Arc::clone(&pending_registration.secrets),
+            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
         )
         .await?;
 
@@ -911,7 +978,7 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        Ok(Schema::from(data_frame.schema()))
+        Ok(data_frame.schema().as_arrow().clone())
     }
 
     #[must_use]
@@ -975,6 +1042,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1087,9 +1155,11 @@ impl DataFusion {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
+            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled();
+                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
+                || matches!(refresh_mode, RefreshMode::Changes);
 
             if !delay_initial_ready {
                 self.runtime_status
@@ -1140,16 +1210,21 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
+        // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
+        let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
         let mut accelerated_table_builder = AcceleratedTable::builder(
             Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
             dataset.source().to_string(),
-            accelerated_table_provider,
+            Arc::clone(&accelerated_table_provider),
             refresh,
             self.io_runtime.clone(),
         );
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
+        accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
+        accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1178,7 +1253,8 @@ impl DataFusion {
 
         accelerated_table_builder.retention(retention);
 
-        accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
+        accelerated_table_builder
+            .zero_results_action(acceleration_settings.on_zero_results.clone());
 
         accelerated_table_builder.refresh_on_startup(acceleration_settings.refresh_on_startup);
 
@@ -1210,15 +1286,39 @@ impl DataFusion {
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
-        if acceleration_settings.snapshot_behavior.create_enabled()
-            && let Ok(snapshot_path) = acceleration_file_path(dataset).await
-        {
-            accelerated_table_builder.snapshot_behavior(
-                acceleration_settings.snapshot_behavior.clone(),
-                Some(snapshot_path),
-                acceleration_settings.snapshots_trigger_threshold,
-                acceleration_settings.snapshots_create_interval,
-            );
+        // Get the acceleration layout (used for snapshots and size metrics)
+        let acceleration_layout = get_acceleration_layout(dataset).await.ok();
+
+        if acceleration_settings.snapshot_behavior.create_enabled() {
+            if let Some(ref layout) = acceleration_layout {
+                if layout.is_enabled() {
+                    if let Some(snapshot_config) = build_snapshot_creation_config(
+                        dataset,
+                        &acceleration_settings,
+                        refresh_mode,
+                        layout.clone(),
+                    )
+                    .await?
+                    {
+                        accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+                    }
+                } else {
+                    tracing::warn!(
+                        "Dataset {} accelerator does not support snapshots.",
+                        dataset.name
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "Dataset {} is not file accelerated. Snapshot creation is not supported.",
+                    dataset.name
+                );
+            }
+        }
+
+        // Pass the acceleration layout for size metrics
+        if let Some(layout) = acceleration_layout {
+            accelerated_table_builder.acceleration_layout(layout);
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -1254,7 +1354,12 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            let changes_stream = source.changes_stream(
+                Arc::clone(&source_table_provider),
+                dataset,
+                Arc::clone(&accelerated_table_provider),
+                Arc::clone(&accelerator_write_mutex),
+            );
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -1287,6 +1392,23 @@ impl DataFusion {
         if has_on_conflict {
             accelerated_table_builder.write_to_accelerator_only();
         }
+
+        accelerated_table_builder.bootstrap_status(bootstrap_status);
+
+        // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
+        // This is used for better error messages when S3 Express upload fails
+        #[cfg(not(windows))]
+        let is_s3_express_acceleration = acceleration_settings.engine == Engine::Cayenne
+            && (acceleration_settings
+                .params
+                .get("cayenne_file_path")
+                .is_some_and(|path| crate::dataaccelerator::cayenne::s3::is_s3_express_path(path))
+                || acceleration_settings
+                    .params
+                    .contains_key("cayenne_s3_zone_ids"));
+        #[cfg(windows)]
+        let is_s3_express_acceleration = false;
+        accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         accelerated_table_builder
             .build()
@@ -1380,9 +1502,16 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
-            .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
+            .create_accelerated_table(
+                &dataset,
+                Arc::clone(&source),
+                federated_read_table,
+                secrets,
+                bootstrap_status,
+            )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
 
@@ -1753,6 +1882,7 @@ impl DataFusion {
             self.io_runtime.clone(),
         );
         builder.cpu_runtime(self.refresh_runtime().cloned());
+        builder.cluster_role(self.cluster_config.effective_role());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
@@ -1966,6 +2096,26 @@ impl DataFusion {
         Ok(())
     }
 
+    pub fn bind_executor_stream_registry(
+        &self,
+        registry: ExecutorControlStreamRegistry,
+    ) -> Result<()> {
+        let mut executor_stream_registry = self
+            .executor_stream_registry
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorStreamRegistry {})?;
+        *executor_stream_registry = Some(registry);
+        Ok(())
+    }
+
+    /// Returns the executor stream registry if one is bound.
+    ///
+    /// Returns `None` if no registry is bound or if the read lock cannot be acquired.
+    #[must_use]
+    pub fn executor_stream_registry(&self) -> Option<ExecutorControlStreamRegistry> {
+        self.executor_stream_registry.read().ok()?.clone()
+    }
+
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor
@@ -1973,6 +2123,23 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableExecutorHandle {})?;
         *executor_handle = Some(executor);
         Ok(())
+    }
+
+    /// Parse a given [`Expr`] from a SQL string.
+    ///
+    /// The entire `expr` must only contain expressions from the provided [`TableReference`], which itself should be a registered table (i.e. [`DataFusion::register_table`]).
+    pub async fn try_parse_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        let Some(tbl_provider) = self.get_table(tbl).await else {
+            return Err(DataFusionError::Plan(format!(
+                "Table {tbl} not found when parsing expression"
+            )));
+        };
+        self.ctx
+            .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
     }
 }
 
@@ -2053,6 +2220,148 @@ async fn wait_until_dependent_tables_are_ready(
     .await;
 }
 
+async fn build_snapshot_creation_config(
+    dataset: &Dataset,
+    acceleration_settings: &Acceleration,
+    refresh_mode: RefreshMode,
+    acceleration_layout: AccelerationLayout,
+) -> Result<Option<SnapshotCreationConfig>> {
+    let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
+        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
+    let snapshot_trigger = &acceleration_settings.snapshots_trigger;
+    let snapshot_threshold: Option<String> =
+        acceleration_settings.snapshots_trigger_threshold.clone();
+
+    let parse_interval = |threshold: &Option<String>| -> Result<Duration> {
+        match threshold {
+            Some(s) => {
+                // Check if string contains a valid time unit
+                if !s.chars().any(char::is_alphabetic) {
+                    return Err(Error::InvalidSnapshotCreationInterval {
+                        source: fundu::ParseError::InvalidInput(
+                            "duration must include a unit (e.g., ms, s, m, h)".into(),
+                        ),
+                    });
+                }
+                fundu::parse_duration(s).context(InvalidSnapshotCreationIntervalSnafu)
+            }
+            None => Ok(DEFAULT_SNAPSHOT_CREATION_INTERVAL),
+        }
+    };
+
+    let parse_batches = |threshold: &Option<String>| -> Result<i64> {
+        match threshold {
+            Some(s) => {
+                let batches = s
+                    .parse::<i64>()
+                    .context(InvalidSnapshotCreationBatchesSnafu)?;
+                if batches <= 0 {
+                    SnapshotCreationBatchesShouldBePositiveSnafu.fail()
+                } else {
+                    Ok(batches)
+                }
+            }
+            None => Ok(DEFAULT_SNAPSHOT_CREATION_BATCHES),
+        }
+    };
+
+    // Caching mode only supports time_interval - no "refresh complete" or "stream_batches" events.
+    let is_caching = matches!(refresh_mode, RefreshMode::Caching);
+
+    let snapshot_creation_trigger = if is_caching {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::RefreshComplete | SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedSnapshotTriggerForCaching);
+            }
+        }
+    } else if is_streaming_refresh {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::RefreshComplete) => {
+                return Err(Error::UnsupportedRefreshCompleteForStream);
+            }
+            Some(SnapshotsTrigger::StreamBatches) => {
+                let batches = parse_batches(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Batches(batches)
+            }
+        }
+    } else {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::RefreshComplete) => {
+                SnapshotCreateTrigger::RefreshComplete
+            }
+            Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
+            }
+        }
+    };
+
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
+    let acceleration_engine = match acceleration_settings.engine {
+        #[cfg(feature = "duckdb")]
+        Engine::DuckDB => AccelerationEngine::DuckDB,
+        #[cfg(feature = "duckdb")]
+        Engine::TableModePartitionedDuckDB => AccelerationEngine::DuckDB,
+        #[cfg(feature = "sqlite")]
+        Engine::Sqlite => AccelerationEngine::Sqlite,
+        #[cfg(feature = "turso")]
+        Engine::Turso => AccelerationEngine::Turso,
+        #[cfg(not(windows))]
+        Engine::Cayenne => AccelerationEngine::Cayenne,
+        _ => {
+            // This code is unreachable since build_snapshot_creation_config is
+            // only called iff acceleration_file_path returned Some(<file_path>)
+            return Err(Error::UnsupportedAccelerationEngineForSnapshots);
+        }
+    };
+
+    #[cfg(not(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    )))]
+    {
+        let _ = acceleration_layout;
+        let _ = snapshot_creation_trigger;
+        return Err(Error::UnsupportedAccelerationEngineForSnapshots);
+    }
+
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
+    Ok(SnapshotManager::try_new(
+        dataset.name.to_string(),
+        acceleration_settings.snapshot_behavior.clone(),
+        acceleration_layout,
+        acceleration_engine,
+    )
+    .await
+    .map(|sm| {
+        let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use cache::{SimpleCache, key::CacheKey};
@@ -2110,5 +2419,388 @@ mod tests {
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
         assert_eq!(cache_provider.item_count().await, 1);
+    }
+
+    #[cfg(all(feature = "duckdb", feature = "snapshots",))]
+    mod build_snapshot_creation_config_tests {
+        use super::*;
+        use crate::component::dataset::Dataset;
+        use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
+        use spicepod::component::snapshot::Snapshots;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        async fn create_test_dataset(time_column: Option<String>) -> Dataset {
+            let runtime = crate::Runtime::builder().build().await;
+            Dataset {
+                from: "test".to_string(),
+                name: TableReference::bare("test_dataset"),
+                access: AccessMode::Read,
+                params: HashMap::new(),
+                metadata: HashMap::new(),
+                columns: vec![],
+                has_metadata_table: false,
+                replication: None,
+                time_column,
+                time_format: None,
+                time_partition_column: None,
+                time_partition_format: None,
+                acceleration: None,
+                embeddings: vec![],
+                app: Arc::new(app::App::default()),
+                unsupported_type_action: None,
+                ready_state: ReadyState::OnRegistration,
+                metrics: Metrics::default(),
+                runtime: Arc::new(runtime),
+                vectors: None,
+                check_availability: crate::component::dataset::CheckAvailability::Disabled,
+            }
+        }
+
+        fn create_snapshots_behavior(
+            location: Option<String>,
+            secrets: &Arc<TokioRwLock<Secrets>>,
+        ) -> SnapshotBehavior {
+            SnapshotBehavior::enabled(
+                Arc::new(Snapshots {
+                    location,
+                    enabled: true,
+                    ..Snapshots::default()
+                }),
+                Arc::downgrade(secrets),
+                Handle::current(),
+                SnapshotsCompaction::Enabled,
+            )
+        }
+
+        fn create_acceleration_with_trigger(
+            snapshot_location: Option<String>,
+            engine: Engine,
+            trigger: Option<SnapshotsTrigger>,
+            threshold: Option<String>,
+            secrets: &Arc<TokioRwLock<Secrets>>,
+        ) -> Acceleration {
+            Acceleration {
+                snapshot_behavior: create_snapshots_behavior(snapshot_location, secrets),
+                engine,
+                snapshots_trigger: trigger,
+                snapshots_trigger_threshold: threshold,
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn test_default() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                None,
+                Engine::DuckDB,
+                None,
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Full,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            assert!(result.expect("config should exist").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_stream_batches_for_append_streaming_mode() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("25".to_string()),
+                &dataset.runtime().secrets(),
+            );
+
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Append,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            // StreamBatches should work for streaming mode
+            assert!(
+                result.is_ok(),
+                "Expected Ok for streaming with StreamBatches, got: {result:?}",
+            );
+            let config = result
+                .expect("config should exist")
+                .expect("config should be Some");
+            match config.create_trigger {
+                SnapshotCreateTrigger::Batches(count) => {
+                    assert_eq!(count, 25, "Expected 25 batches");
+                }
+                other => panic!("Expected Batches trigger, got: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_stream_batches_for_changes_streaming_mode() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("25".to_string()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Changes,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            // StreamBatches should work for streaming mode
+            assert!(
+                result.is_ok(),
+                "Expected Ok for streaming with StreamBatches, got: {result:?}",
+            );
+            let config = result
+                .expect("config should exist")
+                .expect("config should be Some");
+            match config.create_trigger {
+                SnapshotCreateTrigger::Batches(count) => {
+                    assert_eq!(count, 25, "Expected 25 batches");
+                }
+                other => panic!("Expected Batches trigger, got: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_stream_batches_unsupported_for_full_refresh_mode() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Full,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            // RefreshComplete should fail for streaming mode
+            assert!(
+                result.is_err(),
+                "Expected error: Full + time_column should be streaming"
+            );
+            assert!(
+                matches!(result, Err(Error::UnsupportedStreamBatchesForBatchRefresh)),
+                "Expected UnsupportedRefreshCompleteForStream error, got: {result:?}",
+            );
+        }
+
+        #[tokio::test]
+        async fn test_stream_batches_unsupported_for_batch_append_refresh_mode() {
+            let dataset = create_test_dataset(Some("created_at".to_string())).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Append,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            // RefreshComplete should fail for streaming mode
+            assert!(
+                result.is_err(),
+                "Expected error: Full + time_column should be streaming"
+            );
+            assert!(
+                matches!(result, Err(Error::UnsupportedStreamBatchesForBatchRefresh)),
+                "Expected UnsupportedRefreshCompleteForStream error, got: {result:?}",
+            );
+        }
+
+        #[tokio::test]
+        async fn test_stream_batches_for_stream_append_refresh_mode() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Append,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            let config = result
+                .expect("config should exist")
+                .expect("config should be Some");
+            match config.create_trigger {
+                SnapshotCreateTrigger::Batches(count) => {
+                    assert_eq!(count, 100, "Expected 25 batches");
+                }
+                other => panic!("Expected Batches trigger, got: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_negative_batch_count() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                None,
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("-10".to_string()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Append,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            assert!(result.is_err(), "Empty string should fail interval parsing");
+            assert!(
+                matches!(result, Err(Error::SnapshotCreationBatchesShouldBePositive)),
+                "Expected SnapshotCreationBatchesShouldBePositive error, got: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_zero_batch_count() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                None,
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("0".to_string()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Append,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            assert!(result.is_err(), "Empty string should fail interval parsing");
+            assert!(
+                matches!(result, Err(Error::SnapshotCreationBatchesShouldBePositive)),
+                "Expected SnapshotCreationBatchesShouldBePositive error, got: {result:?}",
+            );
+        }
+
+        #[tokio::test]
+        async fn test_empty_string_threshold_for_interval() {
+            let dataset = create_test_dataset(Some("ts".to_string())).await;
+            let acceleration = create_acceleration_with_trigger(
+                None,
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::TimeInterval),
+                Some(String::new()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Full,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            assert!(result.is_err(), "Empty string should fail interval parsing");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::InvalidSnapshotCreationInterval { source: _ })
+                ),
+                "Expected InvalidSnapshotCreationInterval error, got: {result:?}",
+            );
+        }
+
+        #[tokio::test]
+        async fn test_empty_string_threshold_for_batches() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                None,
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some(String::new()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Changes,
+                AccelerationLayout::file(snapshot_path),
+            )
+            .await;
+
+            assert!(result.is_err(), "Empty string should fail batch parsing");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::InvalidSnapshotCreationBatches { source: _ })
+                ),
+                "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
+            );
+        }
     }
 }

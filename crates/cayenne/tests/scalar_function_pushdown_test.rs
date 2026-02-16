@@ -25,11 +25,17 @@ limitations under the License.
 mod common;
 
 use arrow::array::TimestampSecondArray;
+
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend

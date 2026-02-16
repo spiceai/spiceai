@@ -258,13 +258,17 @@ mod param_values_serde {
                 let fields: Vec<Field> = values
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| Field::new(format!("${}", i + 1), v.data_type(), v.is_null()))
+                    .map(|(i, v)| {
+                        Field::new(
+                            format!("${}", i + 1),
+                            v.value().data_type(),
+                            v.value().is_null(),
+                        )
+                    })
                     .collect();
 
-                let arrays: Result<Vec<ArrayRef>, _> = values
-                    .iter()
-                    .map(datafusion::scalar::ScalarValue::to_array)
-                    .collect();
+                let arrays: Result<Vec<ArrayRef>, _> =
+                    values.iter().map(|v| v.value().to_array()).collect();
 
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
             }
@@ -274,11 +278,13 @@ mod param_values_serde {
 
                 let fields: Vec<Field> = entries
                     .iter()
-                    .map(|(name, v)| Field::new(name.as_str(), v.data_type(), v.is_null()))
+                    .map(|(name, v)| {
+                        Field::new(name.as_str(), v.value().data_type(), v.value().is_null())
+                    })
                     .collect();
 
                 let arrays: Result<Vec<ArrayRef>, _> =
-                    entries.iter().map(|(_, v)| v.to_array()).collect();
+                    entries.iter().map(|(_, v)| v.value().to_array()).collect();
 
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
             }
@@ -929,9 +935,7 @@ mod tests {
         let expected =
             "SELECT a, b FROM t WHERE x = $1 AND y = $2 GROUP BY a ORDER BY b DESC LIMIT $3";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -941,9 +945,7 @@ mod tests {
         let input = "INSERT INTO users (name, age) VALUES (?, ?)";
         let expected = "INSERT INTO users (name, age) VALUES ($1, $2)";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -953,9 +955,7 @@ mod tests {
         let input = "UPDATE users SET age = ? WHERE name = ?";
         let expected = "UPDATE users SET age = $1 WHERE name = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -965,9 +965,7 @@ mod tests {
         let input = "DELETE FROM users WHERE id = ?";
         let expected = "DELETE FROM users WHERE id = $1";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -977,9 +975,7 @@ mod tests {
         let input = "SELECT COUNT(*) FROM users WHERE created_at > ? AND status = ?";
         let expected = "SELECT COUNT(*) FROM users WHERE created_at > $1 AND status = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -989,9 +985,7 @@ mod tests {
         let input = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = ?) AND stock > ?";
         let expected = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = $1) AND stock > $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -1011,9 +1005,7 @@ mod tests {
         let input = "SELECT '?', name FROM users WHERE id = ? AND notes LIKE '%??%'";
         let expected = "SELECT '?', name FROM users WHERE id = $1 AND notes LIKE '%??%'";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -1106,7 +1098,7 @@ mod tests {
         let sql = "SELECT CAST($1 AS BIGINT) + CAST($2 AS BIGINT) AS sum, CAST($1 AS BIGINT) * CAST($2 AS BIGINT) AS product";
 
         // Execute the query with first set of parameters (2, 3)
-        let params1 = ParamValues::List(vec![
+        let params1 = ParamValues::from(vec![
             ScalarValue::Int64(Some(2)),
             ScalarValue::Int64(Some(3)),
         ]);
@@ -1144,7 +1136,7 @@ mod tests {
         assert_eq!(product1.value(0), 6, "2 * 3 should equal 6");
 
         // Execute the same query with different parameters (4, 5)
-        let params2 = ParamValues::List(vec![
+        let params2 = ParamValues::from(vec![
             ScalarValue::Int64(Some(4)),
             ScalarValue::Int64(Some(5)),
         ]);
@@ -1179,7 +1171,7 @@ mod tests {
         assert_eq!(product2.value(0), 20, "4 * 5 should equal 20");
 
         // Execute the same query with third set of parameters (10, 20)
-        let params3 = ParamValues::List(vec![
+        let params3 = ParamValues::from(vec![
             ScalarValue::Int64(Some(10)),
             ScalarValue::Int64(Some(20)),
         ]);

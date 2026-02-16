@@ -35,6 +35,7 @@ pub enum Error {
     #[snafu(display("Unable to load secrets: {source}"))]
     UnableToLoadSecrets { source: Box<dyn std::error::Error> },
 
+    #[cfg(feature = "aws-secrets-manager")]
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
     UnableToInitializeAwsSecretsManager {
         source: Box<stores::aws_secrets_manager::Error>,

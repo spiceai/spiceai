@@ -14,17 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "schemars")]
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Display};
-
 use crate::{
     component::dataset::ReadyState,
     metric::Metrics,
     param::Params,
     partitioning::{PartitionedBy, deserialize_partition_by},
 };
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{collections::HashMap, fmt::Display};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -145,9 +144,81 @@ pub enum SnapshotBehavior {
     CreateOnly,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsResetExpiryOnLoad {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsCreationPolicy {
+    Always,
+    #[default]
+    OnChange,
+}
+
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
-    *b == SnapshotBehavior::Disabled
+    *b == SnapshotBehavior::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshot_compaction(c: &SnapshotsCompaction) -> bool {
+    *c == SnapshotsCompaction::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> bool {
+    *c == SnapshotsResetExpiryOnLoad::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
+    *c == SnapshotsCreationPolicy::default()
+}
+
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsTrigger {
+    /// After each refresh is complete (default).
+    RefreshComplete,
+    // Periodically based on time interval
+    TimeInterval,
+    // Periodically based on stream batch processing
+    StreamBatches,
+}
+
+fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(serde_json::Number),
+    }
+
+    match Option::<StringOrNumber>::deserialize(deserializer)? {
+        Some(StringOrNumber::String(s)) => Ok(Some(s)),
+        Some(StringOrNumber::Number(n)) => Ok(Some(n.to_string())),
+        None => Ok(None),
+    }
+}
+
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsCompaction {
+    #[default]
+    Disabled,
+    Enabled,
 }
 
 #[expect(clippy::struct_excessive_bools)]
@@ -248,6 +319,28 @@ pub struct Acceleration {
     /// `create_only` will only create snapshots, it won't attempt to bootstrap from one.
     #[serde(default, skip_serializing_if = "is_default_snapshot_behavior")]
     pub snapshots: SnapshotBehavior,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_trigger: Option<SnapshotsTrigger>,
+
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_string_or_number"
+    )]
+    pub snapshots_trigger_threshold: Option<String>,
+
+    #[serde(default, skip_serializing_if = "is_default_snapshot_compaction")]
+    pub snapshots_compaction: SnapshotsCompaction,
+
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_snapshots_reset_expiry_on_load"
+    )]
+    pub snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad,
+
+    #[serde(default, skip_serializing_if = "is_default_snapshots_creation_policy")]
+    pub snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -290,6 +383,11 @@ impl Default for Acceleration {
             metrics: None,
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
+            snapshots_trigger: None,
+            snapshots_trigger_threshold: None,
+            snapshots_compaction: SnapshotsCompaction::Disabled,
+            snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad::Disabled,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
         }
     }
 }
@@ -297,7 +395,7 @@ impl Default for Acceleration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_acceleration_on_conflict_string() {
@@ -306,7 +404,7 @@ mod tests {
                   foo: upsert
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Upsert)
@@ -320,7 +418,7 @@ mod tests {
                   foo: upsert_dedup
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedup)
@@ -334,7 +432,7 @@ mod tests {
                   foo: upsert_dedup_by_row_id
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedupByRowId)
@@ -348,7 +446,7 @@ mod tests {
                   foo: drop
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)

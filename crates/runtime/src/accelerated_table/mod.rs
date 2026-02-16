@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
+use crate::config::ClusterRole;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
-use crate::dataaccelerator::get_primary_keys_from_constraints;
+use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use ::cache::Caching;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -44,7 +46,6 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
@@ -64,31 +65,33 @@ pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
-mod sink;
+pub(crate) mod sink;
+mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 
 pub use refresh_task_runner::RefreshTaskRunner;
+pub use snapshots::SnapshotCreationConfig;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to fetch data from the data connector: {source}. Ensure the dataset source path and connector configuration are valid, and try again."
     ))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to refresh dataset from the data connector: {source}. Verify the dataset configuration and data connector status, and try again."
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to scan the dataset from the data connector: {source}. Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToScanTableProvider { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to apply data update to the accelerated dataset: {source}. Ensure the dataset schema is compatible, and try again."
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
@@ -100,7 +103,9 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("Failed to refresh the dataset. {source}"))]
+    #[snafu(display(
+        "Failed to trigger dataset refresh: the refresh worker is no longer running. {source}"
+    ))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
@@ -123,10 +128,10 @@ pub enum Error {
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
 
-    #[snafu(display("Failed to filter update data. {source}"))]
+    #[snafu(display("Failed to filter update data for the accelerated dataset: {source}"))]
     FailedToFilterUpdates { source: ArrowError },
 
-    #[snafu(display("Failed to write data into accelerated table. {source}"))]
+    #[snafu(display("Failed to write data into the accelerated dataset: {source}"))]
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
@@ -156,13 +161,13 @@ pub enum Error {
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Invalid time column format: {source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
-    #[snafu(display("Failed to start refresh task. The task was already started."))]
+    #[snafu(display("Failed to start dataset refresh: the refresh task was already started."))]
     RefreshTaskAlreadyStarted {},
 
-    #[snafu(display("Failed to create RecordBatch: {source}"))]
+    #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
@@ -241,6 +246,12 @@ pub struct AcceleratedTable {
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,
+    /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
+    /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
+    /// Shared with `RefreshTask`
+    last_updated_at: Arc<AtomicI64>,
+    /// Sender for batched cache writes. Only used in caching refresh mode.
+    batch_write_tx: Option<caching::CacheWriteSender>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -278,6 +289,13 @@ fn validate_refresh_data_window(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotCreateTrigger {
+    RefreshComplete,
+    Interval(Duration),
+    Batches(i64),
+}
+
 #[expect(clippy::struct_excessive_bools)]
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
@@ -299,10 +317,7 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
-    snapshot_behavior: SnapshotBehavior,
-    snapshot_local_path: Option<PathBuf>,
-    snapshots_trigger_threshold: Option<i64>,
-    snapshots_create_interval: Option<Duration>,
+    snapshot_creation_config: Option<SnapshotCreationConfig>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -310,6 +325,12 @@ pub struct Builder {
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    bootstrap_status: BootstrapStatus,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
+    acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
+    cluster_role: Option<ClusterRole>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
 }
 
 impl Builder {
@@ -342,10 +363,7 @@ impl Builder {
             write_to_accelerator_only: false,
             initial_load_complete: false,
             refresh_semaphore: None,
-            snapshot_behavior: SnapshotBehavior::default(),
-            snapshot_local_path: None,
-            snapshots_trigger_threshold: None,
-            snapshots_create_interval: None,
+            snapshot_creation_config: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -353,7 +371,25 @@ impl Builder {
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
             resource_monitor: None,
+            bootstrap_status: BootstrapStatus::none(),
+            acceleration_layout: None,
+            is_s3_express_acceleration: false,
+            cluster_role: None,
+            accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
         }
+    }
+
+    pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
+        self.cluster_role = role;
+        self
+    }
+
+    pub fn acceleration_layout(
+        &mut self,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) -> &mut Self {
+        self.acceleration_layout = Some(layout);
+        self
     }
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
@@ -488,17 +524,11 @@ impl Builder {
     }
 
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
-    pub fn snapshot_behavior(
+    pub fn snapshot_creation_config(
         &mut self,
-        snapshot_behavior: SnapshotBehavior,
-        snapshot_path: Option<PathBuf>,
-        snapshots_trigger_threshold: Option<i64>,
-        snapshots_create_interval: Option<Duration>,
+        snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
-        self.snapshot_behavior = snapshot_behavior;
-        self.snapshot_local_path = snapshot_path;
-        self.snapshots_trigger_threshold = snapshots_trigger_threshold;
-        self.snapshots_create_interval = snapshots_create_interval;
+        self.snapshot_creation_config = snapshot_config;
         self
     }
 
@@ -520,6 +550,28 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Set whether the dataset was bootstrapped from a snapshot.
+    pub fn bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+        self.bootstrap_status = bootstrap_status;
+        self
+    }
+
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    pub fn s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
+    /// Shared with `DataConnector`, `Refresher` and `CachingAccelerationScanExec`.
+    pub fn accelerator_write_mutex(
+        &mut self,
+        accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> &mut Self {
+        self.accelerator_write_mutex = accelerator_write_mutex;
         self
     }
 
@@ -559,14 +611,51 @@ impl Builder {
                 }
 
                 let schema = self.accelerator.schema();
-                let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
-                    !get_primary_keys_from_constraints(constraints, &schema).is_empty()
-                });
+                let primary_keys = self
+                    .accelerator
+                    .constraints()
+                    .map_or_else(Vec::new, |constraints| {
+                        get_primary_keys_from_constraints(constraints, &schema)
+                    });
+                let has_primary_key = !primary_keys.is_empty();
                 let has_time_column = self.refresh.time_column.is_some();
                 let has_append_stream = self.append_stream.is_some();
 
                 let append_mode =
                     AppendMode::try_new(has_time_column, has_primary_key, has_append_stream)?;
+
+                // Log append mode configuration for debugging
+                match (has_primary_key, has_time_column, has_append_stream) {
+                    (_, _, true) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            "Append mode: using changes stream"
+                        );
+                    }
+                    (true, true, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            ?primary_keys,
+                            "Append mode: using time_column for incremental queries and primary_key for deduplication"
+                        );
+                    }
+                    (true, false, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            ?primary_keys,
+                            "Append mode: using primary_key for deduplication (full fetch each refresh)"
+                        );
+                    }
+                    (false, true, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            "Append mode: using time_column for incremental queries"
+                        );
+                    }
+                    (false, false, false) => {
+                        // This case is handled by AppendMode::try_new returning an error
+                    }
+                }
 
                 match append_mode {
                     AppendMode::ChangesStream => {
@@ -619,11 +708,16 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        // Create the accelerator write mutex early so it can be shared between the Refresher and the AcceleratedTable.
-        let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
+        // Initialize from bootstrap metadata if available.
+        let last_updated_at = Arc::new(
+            self.bootstrap_status
+                .last_updated_at()
+                .map_or(AtomicI64::new(0), AtomicI64::new),
+        );
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -633,14 +727,15 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
-            Arc::clone(&accelerator_write_mutex),
+            Arc::clone(&self.accelerator_write_mutex),
         );
+        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
-        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
@@ -648,24 +743,45 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(
-            self.snapshot_behavior,
-            self.snapshot_local_path.clone(),
-            self.snapshots_trigger_threshold,
-            self.snapshots_create_interval,
-        );
+
+        refresher.with_snapshot_creation_config(self.snapshot_creation_config);
+        refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
         }
 
-        let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
+        refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        let refresh_handle = if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            None
+        } else {
+            refresher.start(acceleration_refresh_mode).await?
+        };
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
         }
+
+        // For caching mode, create the batched write channel and spawn consumer task.
+        let batch_write_tx = if refresh_mode == RefreshMode::Caching {
+            let (tx, rx) = caching::create_cache_write_channel();
+            let consumer_handle = caching::spawn_batched_cache_write_task(
+                rx,
+                Arc::clone(&self.accelerator),
+                self.dataset_name.to_string(),
+                Arc::clone(&self.accelerator_write_mutex),
+                Arc::clone(&in_flight_revalidations),
+                Arc::clone(&last_updated_at),
+            );
+            // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
+            handlers.push(consumer_handle);
+            Some(tx)
+        } else {
+            None
+        };
 
         if let Some(retention) = self.retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
@@ -674,8 +790,20 @@ impl Builder {
                 retention,
                 self.caching.clone(),
                 self.io_runtime.clone(),
+                Arc::clone(&self.accelerator_write_mutex),
             ));
             handlers.push(retention_check_handle);
+        }
+
+        // Spawn size metrics task for file-based accelerators
+        if let Some(ref layout) = self.acceleration_layout
+            && layout.is_enabled()
+        {
+            let size_metrics_handle = tokio::spawn(AcceleratedTable::start_size_metrics_task(
+                self.dataset_name.clone(),
+                layout.clone(),
+            ));
+            handlers.push(size_metrics_handle);
         }
 
         // If the table should be ready immediately, mark it as ready.
@@ -753,8 +881,10 @@ impl Builder {
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             cache_stale_if_error: self.caching_stale_if_error,
             io_runtime: self.io_runtime,
-            accelerator_write_mutex,
+            accelerator_write_mutex: self.accelerator_write_mutex,
             in_flight_revalidations,
+            last_updated_at,
+            batch_write_tx,
         })
     }
 }
@@ -778,6 +908,21 @@ impl AcceleratedTable {
             refresh,
             io_runtime,
         )
+    }
+
+    /// Periodically emits the `dataset_acceleration_size_bytes` metric for file-based accelerators.
+    pub(crate) async fn start_size_metrics_task(
+        dataset_name: TableReference,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+
+            let size = layout.total_size();
+            metrics::SIZE_BYTES.record(size, &[KeyValue::new("dataset", dataset_name.to_string())]);
+        }
     }
 
     #[must_use]
@@ -887,6 +1032,21 @@ impl AcceleratedTable {
 
         Ok(filters_to_reapply)
     }
+
+    fn update_last_updated_at(&self) {
+        Self::set_timestamp_to_now(&self.last_updated_at);
+    }
+
+    /// Sets an `AtomicI64` timestamp to the current time in milliseconds.
+    /// Used by both `AcceleratedTable` instance methods and the caching background task.
+    #[expect(clippy::cast_possible_truncation)]
+    pub(crate) fn set_timestamp_to_now(last_updated_at: &AtomicI64) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        last_updated_at.store(now_ms, Ordering::Release);
+    }
 }
 
 impl Drop for AcceleratedTable {
@@ -966,11 +1126,18 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // In caching mode, pass filters to accelerator so it can check for cached data.
-        // If accelerator returns 0 rows → cache miss → fetch from source.
+        // For caching mode with filters, extend projection to include fetched_at for freshness checking if needed.
+        // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
+        // fallback-to-source on cache miss where results return all columns.
+        let extended_projection = if is_caching_mode && !filters.is_empty() {
+            extend_projection_for_caching(projection, &self.accelerator.schema())
+        } else {
+            None
+        };
+        let scan_projection = extended_projection.as_ref().or(projection);
         let input = self
             .accelerator
-            .scan(state, projection, filters, limit)
+            .scan(state, scan_projection, filters, limit)
             .await?;
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -992,6 +1159,10 @@ impl TableProvider for AcceleratedTable {
                 };
 
                 let federated_provider = self.federated.table_provider().await;
+                // SAFETY: batch_write_tx is always Some in caching mode (set in start())
+                let batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
+                    DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
+                })?;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
@@ -1007,6 +1178,7 @@ impl TableProvider for AcceleratedTable {
                     Arc::clone(&self.accelerator_write_mutex),
                     Arc::clone(&self.in_flight_revalidations),
                     Arc::clone(&self.synchronized_children),
+                    batch_write_tx,
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,
@@ -1018,7 +1190,25 @@ impl TableProvider for AcceleratedTable {
             )),
         };
 
-        Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
+        // Compute the target schema based on user's original projection.
+        // SchemaCastScanExec strips extra columns (like fetched_at added for caching)
+        // and casts types. The schema should match what the user requested.
+        let target_schema = match projection {
+            Some(indices) => {
+                let full_schema = self.schema();
+                let projected_fields: Vec<_> = indices
+                    .iter()
+                    .filter_map(|&i| full_schema.fields().get(i).cloned())
+                    .collect();
+                Arc::new(Schema::new_with_metadata(
+                    projected_fields,
+                    full_schema.metadata().clone(),
+                ))
+            }
+            None => self.schema(),
+        };
+
+        Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))
     }
 
     async fn insert_into(
@@ -1027,6 +1217,8 @@ impl TableProvider for AcceleratedTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.update_last_updated_at();
+
         // When on_conflict is configured, writes go only to the accelerator
         // (the federated source may not support writes, e.g., file connector).
         if self.write_to_accelerator_only {
@@ -1055,15 +1247,31 @@ impl TableProvider for AcceleratedTable {
             .await?;
 
         // Return the equivalent of a UNION ALL that inserts both into the acceleration and federated source tables.
-        let union_plan = Arc::new(UnionExec::new(vec![
-            accelerated_insert_plan,
-            federated_insert_plan,
-        ]));
+        let union_plan: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![accelerated_insert_plan, federated_insert_plan])?;
 
         self.refresher().set_initial_load_completed(true);
 
         Ok(union_plan)
     }
+}
+
+/// Extends projection to include `fetched_at` column for cache freshness checking.
+/// Returns `Some(extended_projection)` if extension was needed,
+/// or `None` if no extension needed (projection already includes it or is None).
+fn extend_projection_for_caching(
+    projection: Option<&Vec<usize>>,
+    schema: &SchemaRef,
+) -> Option<Vec<usize>> {
+    let proj = projection?;
+    let idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
+    if proj.contains(&idx) {
+        return None;
+    }
+    // User projection doesn't include fetched_at - add it as last column
+    let mut extended = proj.clone();
+    extended.push(idx);
+    Some(extended)
 }
 
 #[derive(Debug)]
@@ -1220,5 +1428,70 @@ impl Retention {
     #[must_use]
     pub fn builder() -> RetentionBuilder {
         RetentionBuilder::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    fn schema_with_fetched_at() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(
+                caching::CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    #[test]
+    fn test_extend_projection_none_returns_none() {
+        let schema = schema_with_fetched_at();
+        let result = extend_projection_for_caching(None, &schema);
+        assert!(result.is_none(), "None projection should return None");
+    }
+
+    #[test]
+    fn test_extend_projection_already_includes_fetched_at() {
+        let schema = schema_with_fetched_at();
+        // Projection includes fetched_at (index 3)
+        let projection = vec![0, 1, 3];
+        let result = extend_projection_for_caching(Some(&projection), &schema);
+        assert!(
+            result.is_none(),
+            "Projection already including fetched_at should return None"
+        );
+    }
+
+    #[test]
+    fn test_extend_projection_adds_fetched_at() {
+        let schema = schema_with_fetched_at();
+        // Projection does NOT include fetched_at
+        let projection = vec![0, 2]; // id, content
+        let extended = extend_projection_for_caching(Some(&projection), &schema)
+            .expect("Should extend projection");
+        assert_eq!(
+            extended,
+            vec![0, 2, 3],
+            "Should add fetched_at index at end"
+        );
+    }
+
+    #[test]
+    fn test_extend_projection_single_column() {
+        let schema = schema_with_fetched_at();
+        let projection = vec![2]; // just content
+        let extended = extend_projection_for_caching(Some(&projection), &schema)
+            .expect("Should extend projection");
+        assert_eq!(
+            extended,
+            vec![2, 3],
+            "Should add fetched_at to single column"
+        );
     }
 }

@@ -20,9 +20,10 @@ use subtle::ConstantTimeEq;
 
 use super::{
     caching::{Caching, ResultsCache},
-    default_true, is_default, is_default_or_none,
+    default_true, is_default,
 };
 use crate::metric::Metrics;
+use crate::param::Params;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,8 +35,6 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[serde(deny_unknown_fields)]
 #[serde(try_from = "RuntimeDeserializer")]
 pub struct Runtime {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
-    pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub caching: Caching,
 
@@ -83,12 +82,15 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<Scheduler>,
 }
 
 impl Runtime {
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
-            let duration = fundu::parse_duration(timeout_str)
+            let duration = duration_parse::parse_duration(timeout_str)
                 .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
 
             if duration.is_zero() {
@@ -237,7 +239,7 @@ impl OtelExporterConfig {
     pub fn push_interval_duration(
         &self,
     ) -> Result<std::time::Duration, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(&self.push_interval).map_err(|e| {
+        let duration = duration_parse::parse_duration(&self.push_interval).map_err(|e| {
             format!(
                 "Failed to parse 'push_interval' value '{}': {e}",
                 self.push_interval
@@ -402,7 +404,7 @@ impl TaskHistory {
         value: &str,
         field: &str,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(value).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(value).map_err(|e| e.to_string())?;
 
         if duration.as_secs() < TASK_HISTORY_RETENTION_MINIMUM {
             return Err(format!(
@@ -432,7 +434,7 @@ impl TaskHistory {
         };
 
         let duration =
-            fundu::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
+            duration_parse::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -447,8 +449,8 @@ impl TaskHistory {
             return Ok(None);
         };
 
-        let duration =
-            fundu::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(min_plan_duration.as_ref())
+            .map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -650,15 +652,28 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Scheduler {
+    /// Root URI for shared cluster state.
+    pub state_location: String,
+
+    /// Optional object store params for the shared cluster state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDeserializer {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
+    #[serde(default)]
+    #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub caching: Caching,
+    #[serde(default)]
+    pub caching: Option<Caching>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
     /// If set, the runtime will configure all endpoints to use TLS
@@ -701,6 +716,8 @@ pub struct RuntimeDeserializer {
     pub query: Option<Query>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<Scheduler>,
 }
 
 #[expect(deprecated)]
@@ -740,9 +757,25 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             (None, None) => None,
         };
 
+        // Convert deprecated runtime.results_cache to runtime.caching.sql_results
+        let caching_was_explicit = deserializer.caching.is_some();
+        let mut caching = deserializer.caching.unwrap_or_default();
+        if let Some(results_cache) = deserializer.results_cache {
+            tracing::warn!(
+                "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
+            );
+            // Only apply the deprecated value if `caching.sql_results` wasn't explicitly set.
+            // When `caching` is absent from YAML, `caching_was_explicit` is false, so we
+            // apply the deprecated value. When `caching` IS in the YAML, we check whether
+            // `sql_results` was also present (non-None) — if so, the new field takes priority.
+            let sql_results_explicit = caching_was_explicit && caching.sql_results.is_some();
+            if !sql_results_explicit {
+                caching.sql_results = Some(results_cache.into());
+            }
+        }
+
         Ok(Runtime {
-            results_cache: deserializer.results_cache,
-            caching: deserializer.caching,
+            caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
             tls: deserializer.tls,
             tracing: deserializer.tracing,
@@ -760,6 +793,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
                 Some(query)
             },
             metrics: deserializer.metrics,
+            scheduler: deserializer.scheduler,
         })
     }
 }
@@ -767,7 +801,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_api_keys() {
@@ -780,7 +814,7 @@ mod tests {
                 - api-key-3:rw
         ";
 
-        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
 
         let api_key = parsed.api_key.expect("api_key section exists");
 
@@ -813,7 +847,7 @@ mod tests {
                 - api-key-1
         ";
 
-        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
 
         let api_key = parsed.api_key.expect("api_key section exists");
 
@@ -901,7 +935,7 @@ mod tests {
         let yaml = r"
             memory_limit: 100MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -916,7 +950,7 @@ mod tests {
             query:
                 memory_limit: 200MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -932,7 +966,7 @@ mod tests {
             query:
                 memory_limit: 200MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -945,7 +979,7 @@ mod tests {
         // Test when neither is present
         let yaml = r"
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
     }
 
@@ -955,7 +989,7 @@ mod tests {
         let yaml = r"
             temp_directory: '/foo'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -970,7 +1004,7 @@ mod tests {
             query:
                 temp_directory: '/bar'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -986,7 +1020,7 @@ mod tests {
             query:
                 temp_directory: '/bar'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -999,7 +1033,7 @@ mod tests {
         // Test when neither is present
         let yaml = r"
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
     }
 
@@ -1073,7 +1107,7 @@ mod tests {
                 retention_check_interval: 15m
                 min_sql_duration: 10ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
         assert_eq!(
             runtime
@@ -1088,7 +1122,7 @@ mod tests {
             task_history:
                 enabled: true
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
     }
 
@@ -1232,7 +1266,7 @@ mod tests {
                 captured_plan: explain analyze
                 min_plan_duration: 100ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.task_history.captured_plan,
             Some("explain analyze".into())
@@ -1264,7 +1298,7 @@ mod tests {
                 captured_plan: explain
                 min_plan_duration: 50ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
         assert_eq!(runtime.task_history.captured_plan, Some("explain".into()));
         assert_eq!(runtime.task_history.min_plan_duration, Some("50ms".into()));
@@ -1279,7 +1313,7 @@ mod tests {
                     endpoint: otel-collector:4317
                     push_interval: 30s
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
@@ -1299,7 +1333,7 @@ mod tests {
                     endpoint: http://localhost:4318/v1/metrics
                     push_interval: 1m
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
@@ -1318,7 +1352,7 @@ mod tests {
                 otel_exporter:
                     endpoint: otel-collector
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
@@ -1411,7 +1445,7 @@ mod tests {
             telemetry:
                 enabled: true
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert!(runtime.telemetry.otel_exporter.is_none());
     }
 
@@ -1500,7 +1534,7 @@ mod tests {
                 otel_exporter:
                     endpoint: otel-collector
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1516,7 +1550,7 @@ mod tests {
                     enabled: false
                     endpoint: otel-collector
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1535,7 +1569,7 @@ mod tests {
                         - request_duration_seconds
                         - active_connections
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1561,7 +1595,7 @@ mod tests {
                 otel_exporter:
                     endpoint: otel-collector:4317
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1581,7 +1615,7 @@ mod tests {
                     endpoint: otel-collector:4317
                     push_interval: 45s
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         assert!(runtime.telemetry.enabled);
         assert_eq!(
@@ -1599,5 +1633,43 @@ mod tests {
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.endpoint, "otel-collector:4317");
         assert_eq!(otel_config.push_interval, "45s");
+    }
+
+    #[test]
+    fn test_results_cache_backward_compat_migration() {
+        // Test that deprecated `results_cache` is migrated to `caching.sql_results`
+        let yaml = r"
+            results_cache:
+                enabled: true
+                item_ttl: 5s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be migrated from results_cache");
+        assert!(sql_results.enabled);
+        assert_eq!(sql_results.item_ttl, Some("5s".to_string()));
+
+        // Test that `caching.sql_results` takes priority over deprecated `results_cache`
+        let yaml = r"
+            results_cache:
+                enabled: false
+                item_ttl: 10s
+            caching:
+                sql_results:
+                    enabled: true
+                    item_ttl: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be present");
+        assert!(
+            sql_results.enabled,
+            "caching.sql_results should take priority"
+        );
+        assert_eq!(sql_results.item_ttl, Some("30s".to_string()));
     }
 }

@@ -18,7 +18,7 @@ use std::fmt::{self, Display, Formatter};
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{Service, flightsql::prepared_statement_query, metrics, to_tonic_err},
+    flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
     timing::TimedStream,
 };
 
@@ -31,6 +31,11 @@ use arrow_flight::{
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
+    // Async query actions
+    SubmitAsyncQuery,
+    GetAsyncQueryStatus,
+    GetAsyncQueryResult,
+    CancelAsyncQuery,
     Unknown,
 }
 
@@ -39,6 +44,10 @@ impl ActionType {
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
+            async_actions::action_types::SUBMIT_ASYNC_QUERY => ActionType::SubmitAsyncQuery,
+            async_actions::action_types::GET_ASYNC_QUERY_STATUS => ActionType::GetAsyncQueryStatus,
+            async_actions::action_types::GET_ASYNC_QUERY_RESULT => ActionType::GetAsyncQueryResult,
+            async_actions::action_types::CANCEL_ASYNC_QUERY => ActionType::CancelAsyncQuery,
             _ => ActionType::Unknown,
         }
     }
@@ -47,6 +56,10 @@ impl ActionType {
         match self {
             ActionType::CreatePreparedStatement => "CreatePreparedStatement",
             ActionType::ClosePreparedStatement => "ClosePreparedStatement",
+            ActionType::SubmitAsyncQuery => async_actions::action_types::SUBMIT_ASYNC_QUERY,
+            ActionType::GetAsyncQueryStatus => async_actions::action_types::GET_ASYNC_QUERY_STATUS,
+            ActionType::GetAsyncQueryResult => async_actions::action_types::GET_ASYNC_QUERY_RESULT,
+            ActionType::CancelAsyncQuery => async_actions::action_types::CANCEL_ASYNC_QUERY,
             ActionType::Unknown => "Unknown",
         }
     }
@@ -75,9 +88,44 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: N/A"
             .into(),
     };
+
+    // Async query actions
+    let submit_async_query_action_type = FlightActionType {
+        r#type: async_actions::action_types::SUBMIT_ASYNC_QUERY.to_string(),
+        description: "Submits a SQL query for async execution.\n
+            Request Message: JSON {sql: string, parameters?: object}\n
+            Response Message: JSON {query_id: string, status: string}"
+            .into(),
+    };
+    let get_async_query_status_action_type = FlightActionType {
+        r#type: async_actions::action_types::GET_ASYNC_QUERY_STATUS.to_string(),
+        description: "Gets the status of an async query.\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, status: string, error?: object, result?: object}"
+            .into(),
+    };
+    let get_async_query_result_action_type = FlightActionType {
+        r#type: async_actions::action_types::GET_ASYNC_QUERY_RESULT.to_string(),
+        description: "Gets the result of a completed async query as Arrow IPC.\n
+            Request Message: JSON {query_id: string, chunk_index?: number}\n
+            Response Message: Arrow IPC stream"
+            .into(),
+    };
+    let cancel_async_query_action_type = FlightActionType {
+        r#type: async_actions::action_types::CANCEL_ASYNC_QUERY.to_string(),
+        description: "Cancels a running async query.\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, cancelled: boolean, status: string}"
+            .into(),
+    };
+
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
+        Ok(submit_async_query_action_type),
+        Ok(get_async_query_status_action_type),
+        Ok(get_async_query_result_action_type),
+        Ok(cancel_async_query_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);
@@ -112,6 +160,28 @@ pub(crate) async fn do_action(
         ActionType::ClosePreparedStatement => {
             tracing::trace!("do_action: ClosePreparedStatement");
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
+        }
+        ActionType::SubmitAsyncQuery => {
+            tracing::trace!("do_action: SubmitAsyncQuery");
+            let body = async_actions::handle_submit_async_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::GetAsyncQueryStatus => {
+            tracing::trace!("do_action: GetAsyncQueryStatus");
+            let body =
+                async_actions::handle_get_async_query_status(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::GetAsyncQueryResult => {
+            tracing::trace!("do_action: GetAsyncQueryResult");
+            let body =
+                async_actions::handle_get_async_query_result(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::CancelAsyncQuery => {
+            tracing::trace!("do_action: CancelAsyncQuery");
+            let body = async_actions::handle_cancel_async_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
         }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };

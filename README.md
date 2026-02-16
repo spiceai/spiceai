@@ -36,10 +36,10 @@ Spice provides four industry standard APIs in a lightweight, portable runtime (s
 
 Spice's primary features include:
 
-- **Data Federation**: SQL query across any database, data warehouse, or data lake. Deploy with single-node or distributed multi-node query execution. [Learn More](https://spiceai.org/docs/features/query-federation).
-- **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries with Arrow, DuckDB, SQLite, PostgreSQL, or Cayenne (Vortex+SQLite) for simplified multi-file acceleration. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
-- **Hybrid Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and petabyte-scale vector similarity search via Amazon S3 Vectors or pgvector for structured and unstructured data.
-- **SQL LLM Inference**: Call LLMs directly from SQL. Generate, summarize, and enrich data using the Spice SQL AI function or Text-to-SQL. Use Spice as an AI-database powering retrieval-augmented generation (RAG) and intelligent agents with OpenAI-compatible APIs and MCP integration. [Learn More](https://spiceai.org/docs/use-cases/rag).
+- **Data Federation**: SQL query across any database, data warehouse, or data lake. Scale from single-node to distributed multi-node query execution. [Learn More](https://spiceai.org/docs/features/query-federation).
+- **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries with Arrow, DuckDB, SQLite, PostgreSQL, or Spice Cayenne (Vortex). [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
+- **Enterprise Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and petabyte-scale vector similarity search via Amazon S3 Vectors or pgvector for structured and unstructured data.
+- **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents with OpenAI-compatible APIs and MCP integration. [Learn More](https://spiceai.org/docs/use-cases/rag).
 
 If you want to build with DataFusion, DuckDB, or Vortex, Spice provides a simple, flexible, and production-ready engine you can just use.
 
@@ -72,8 +72,8 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 
 ### Latest Capabilities
 
-- **Spice Cayenne Data Accelerator (Beta)**: Simplified multi-file acceleration using the [Vortex columnar format](https://github.com/vortex-data/vortex) + SQLite metadata. Delivers DuckDB-comparable performance without single-file scaling limitations.
-- **Multi-Node Distributed Query (Preview)**: Scale query execution across multiple nodes with Apache Ballista integration for improved performance on large datasets.
+- **Spice Cayenne Data Accelerator**: Simplified multi-file acceleration using the [Vortex columnar format](https://github.com/vortex-data/vortex) + SQLite metadata. Delivers DuckDB-comparable performance without single-file scaling limitations.
+- **Multi-Node Distributed Query**: Scale query execution across multiple nodes with Apache Ballista integration for improved performance on large datasets.
 - **Acceleration Snapshots**: Bootstrap accelerations from S3 for fast cold starts (seconds vs. minutes). Supports ephemeral storage with persistent recovery.
 - **Iceberg Table Writes**: Write to Iceberg tables using standard SQL `INSERT INTO` for data ingestion and transformation—no Spark required.
 - **Petabyte-Scale Vector Search**: Native Amazon S3 Vectors integration manages the full vector lifecycle from ingestion to embedding to querying. SQL-integrated hybrid search with RRF.
@@ -94,32 +94,32 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 
 ### Data Query and Analytics
 
-| Feature                          | **Spice**                              | Trino / Presto       | Dremio                | ClickHouse          | Materialize          |
-| -------------------------------- | -------------------------------------- | -------------------- | --------------------- | ------------------- | -------------------- |
-| **Primary Use-Case**             | Data & AI apps/agents                  | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics  |
-| **Primary deployment model**     | Sidecar                                | Cluster              | Cluster               | Cluster             | Cluster              |
-| **Federated Query Support**      | ✅                                     | ✅                   | ✅                    | ―                   | ―                    |
+| Feature                          | **Spice**                             | Trino / Presto       | Dremio                | ClickHouse          | Materialize         |
+| -------------------------------- | ------------------------------------- | -------------------- | --------------------- | ------------------- | ------------------- |
+| **Primary Use-Case**             | Data & AI apps/agents                 | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics |
+| **Primary deployment model**     | Sidecar                               | Cluster              | Cluster               | Cluster             | Cluster             |
+| **Federated Query Support**      | ✅                                     | ✅                    | ✅                     | ―                   | ―                   |
 | **Acceleration/Materialization** | ✅ (Arrow, SQLite, DuckDB, PostgreSQL) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue)  | ✅                   | ✅                    | ―                   | ―                    |
-| **Query Result Caching**         | ✅                                     | ✅                   | ✅                    | ✅                  | Limited              |
-| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP)                       | ―                    | ―                     | ―                   | ―                    |
+| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue)  | ✅                    | ✅                     | ―                   | ―                   |
+| **Query Result Caching**         | ✅                                     | ✅                    | ✅                     | ✅                   | Limited             |
+| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP)                       | ―                    | ―                     | ―                   | ―                   |
 | **Change Data Capture (CDC)**    | ✅ (Debezium)                          | ―                    | ―                     | ―                   | ✅ (Debezium)        |
 
 ### AI Apps and Agents
 
-| Feature                       | **Spice**                                | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
-| ----------------------------- | ---------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
-| **Primary Use-Case**          | Data & AI apps                           | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
-| **Programming Language**      | Any language (HTTP interface)            | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
+| Feature                       | **Spice**                               | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
+| ----------------------------- | --------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
+| **Primary Use-Case**          | Data & AI apps                          | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
+| **Programming Language**      | Any language (HTTP interface)           | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
 | **Unified Data + AI Runtime** | ✅                                       | ―                  | ―          | ―                | ―                             |
 | **Federated Data Query**      | ✅                                       | ―                  | ―          | ―                | ―                             |
 | **Accelerated Data Access**   | ✅                                       | ―                  | ―          | ―                | ―                             |
-| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                 | ✅         | Limited          | Limited                       |
-| **LLM Memory**                | ✅                                       | ✅                 | ―          | ✅               | ―                             |
+| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                  | ✅          | Limited          | Limited                       |
+| **LLM Memory**                | ✅                                       | ✅                  | ―          | ✅                | ―                             |
 | **Evaluations (Evals)**       | ✅                                       | Limited            | ―          | Limited          | ―                             |
-| **Hybrid Search**             | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                 | ✅         | Limited          | Limited                       |
+| **Hybrid Search**             | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                  | ✅          | Limited          | Limited                       |
 | **Caching**                   | ✅ (Query and results caching)           | Limited            | ―          | ―                | ―                             |
-| **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                 | ✅         | Limited          | ―                             |
+| **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                  | ✅          | Limited          | ―                             |
 
 ✅ = Fully supported
 ❌ = Not supported
@@ -131,7 +131,7 @@ Limited = Partial or restricted support
 
 - **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI, Amazon Bedrock) or deploy locally (Llama, NVIDIA NIM) with OpenAI Responses API support for advanced interactions. [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval. Scale to distributed multi-node query execution with Apache Ballista. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
-- **Hybrid Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. Native Amazon S3 Vectors integration for petabyte-scale vector search. Full-text search (FTS) via Tantivy-powered BM25 and vector similarity search (VSS) integrated into SQL via `text_search` and `vector_search` UDTFs. Reciprocal rank fusion (RRF) for hybrid search. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
+- **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. Native Amazon S3 Vectors integration for petabyte-scale vector search. Full-text search (FTS) via Tantivy-powered BM25 and vector similarity search (VSS) integrated into SQL via `text_search` and `vector_search` UDTFs. Reciprocal rank fusion (RRF) for hybrid search. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability & Monitoring Features Documentation](https://spiceai.org/docs/features/observability)
 
 ### Database CDN and Query Mesh
@@ -143,7 +143,7 @@ Limited = Partial or restricted support
 
 ### Retrieval-Augmented Generation (RAG)
 
-- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources with native Amazon S3 Vectors integration for petabyte-scale vector storage and querying. The Spice runtime manages the vector lifecycle: ingesting data, embedding it using AWS Bedrock (Amazon Titan, Cohere), HuggingFace models, or Model2Vec (500x faster static embeddings), and storing in S3 Vector buckets or pgvector. Supports cosine similarity, Euclidean distance, or dot product. SQL-integrated search via `vector_search` and `text_search` UDTFs with hybrid search using reciprocal rank fusion (RRF). Example: `SELECT * FROM vector_search(my_table, 'search query', 10) WHERE condition ORDER BY score;`. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
+- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources with native Amazon S3 Vectors integration for petabyte-scale vector storage and querying. The Spice runtime manages the vector lifecycle: ingesting data, embedding it using AWS Bedrock (Amazon Titan, Cohere), HuggingFace models, or Model2Vec (500x faster static embeddings), and storing in S3 Vector buckets or pgvector. Supports cosine similarity, Euclidean distance, or dot product. SQL-integrated search via `vector_search` and `text_search` UDTFs with hybrid search using reciprocal rank fusion (RRF). Example: `SELECT * FROM vector_search(my_table, 'search query', 10) WHERE condition ORDER BY _score;`. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://spiceai.org/docs/features/semantic-model)
 - **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
 - **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
@@ -189,6 +189,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
+| `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
 | `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
@@ -197,10 +198,13 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `mongodb`                          | MongoDB                               | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
+| `scylladb`                         | ScyllaDB                              | Alpha             |                              |
+| `smb`                              | SMB (Server Message Block)            | Alpha             | SMB                          |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
+[gcs]: docs/features/gcs-connector.md
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
 [dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme
@@ -211,13 +215,13 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Accelerators
 
-| Name       | Description                       | Status              | Engine Modes     |
-| ---------- | --------------------------------- | ------------------- | ---------------- |
-| `arrow`    | [In-Memory Arrow Records][arrow]  | Stable              | `memory`         |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Beta (v1.9.0-rc.2+) | `file`           |
-| `duckdb`   | Embedded [DuckDB][duckdb]         | Stable              | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate   | N/A              |
-| `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate   | `memory`, `file` |
+| Name       | Description                       | Status            | Engine Modes     |
+| ---------- | --------------------------------- | ----------------- | ---------------- |
+| `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `file`           |
+| `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate | N/A              |
+| `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate | `memory`, `file` |
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne

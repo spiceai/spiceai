@@ -25,7 +25,7 @@ use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
-use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
+use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, PutResult, SchemaResult};
@@ -60,6 +60,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
+mod async_actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
@@ -68,7 +69,7 @@ mod get_flight_info;
 mod get_schema;
 mod handshake;
 mod metrics;
-mod middleware;
+pub mod middleware;
 mod session;
 mod session_auth;
 mod util;
@@ -91,6 +92,12 @@ impl Service {
             basic_auth,
             session_store: SessionStore::new(),
         }
+    }
+
+    /// Returns a clone of the session store.
+    #[must_use]
+    pub fn session_store(&self) -> SessionStore {
+        self.session_store.clone()
     }
 }
 
@@ -206,7 +213,6 @@ impl Service {
         query.get_schema().await.map_err(handle_datafusion_error)
     }
 
-    #[expect(clippy::result_large_err)]
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()
@@ -234,6 +240,7 @@ impl Service {
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
+        let mut compression_context = CompressionContext::default();
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
@@ -263,7 +270,7 @@ impl Service {
                 match batch_result {
                     Ok(batch) => {
                         let (dicts, batch_data) = encoder
-                            .encoded_batch(&batch, &mut dict_tracker, &options)
+                            .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
                             .map_err(|e| Status::internal(e.to_string()))?;
 
                         // Yield dictionaries first
@@ -518,13 +525,14 @@ pub async fn start(
     // Create the OpenTelemetry MetricsService
     let otel_service = create_metrics_service(rt.datafusion());
 
+    // Get job executor if available (cluster mode)
+    let job_executor = rt.job_executor();
+
     let mut server = server
-        .layer(RequestContextLayer::new(
-            app,
-            rt.datafusion(),
-            session_store,
-            rt.secrets(),
-        ))
+        .layer(
+            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+                .with_job_executor(job_executor),
+        )
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

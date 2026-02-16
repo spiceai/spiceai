@@ -107,6 +107,9 @@ pub enum CatalogError {
     #[snafu(display("The function '{function}' is not implemented"))]
     NotImplemented { function: String },
 
+    #[snafu(display("Cayenne metadata schema mismatch for table '{table}'. The metadata database format has changed and is incompatible with this version. To continue, clear your acceleration data (delete the Cayenne metadata directory) so it can be recreated. Existing accelerated data will be re-synced from the source."))]
+    SchemaMismatch { table: String },
+
     #[snafu(display(
         "Deletion vectors require non-negative row IDs, found negative values: {row_ids}"
     ))]
@@ -160,6 +163,22 @@ pub enum CatalogError {
         "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso"
     ))]
     TursoNotEnabled,
+
+    /// Constraint violation (e.g., unique constraint, foreign key constraint)
+    /// Used for handling concurrent insert conflicts.
+    #[snafu(display("Constraint violation: {message}"))]
+    ConstraintViolation {
+        /// Details about the constraint that was violated
+        message: String,
+    },
+
+    /// Invalid partition metadata (e.g., mismatched columns/values count, empty partition)
+    /// This prevents persisting malformed partition data that could cause incorrect query results.
+    #[snafu(display("Invalid partition metadata: {message}"))]
+    InvalidPartitionMetadata {
+        /// Description of why the partition metadata is invalid
+        message: String,
+    },
 }
 
 /// Result type for catalog operations.

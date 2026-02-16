@@ -12,12 +12,14 @@ snapshot_kind: text
       },
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends conv"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 8.124
+      "_score": 8.124
     }
   ]
 }

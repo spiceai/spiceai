@@ -1,27 +1,26 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
   {
     "id": 495,
     "question": "If \\( b^\\circ \\) and \\( 50^\\circ \\) are vertical angles, what is the value of \\( b \\)?",
-    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.934
+    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.934
   },
   {
     "id": 494,
     "question": "If \\( b^\\circ \\) and \\( 30^\\circ \\) are vertical angles, what is the value of \\( b \\)?",
-    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.934
+    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.934
   },
   {
     "id": 499,
     "question": "If \\( m \\) and \\( n \\) are two angles that lie on a straight line, what is the value of \\( m + n \\)?",
-    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.245
+    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.245
   },
   {
     "id": 1175,
     "question": "What is the sum of the angles \\( a + b + c + d + e + f + g + h \\) around a point in the diagram?",
-    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.129
+    "trunc(text_search(qs, Utf8(\"angles\"), question)._score,Int64(3))": 4.129
   }
 ]

@@ -25,11 +25,17 @@ limitations under the License.
 mod common;
 
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::prelude::*;
+
 use datafusion_physical_plan::collect;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend

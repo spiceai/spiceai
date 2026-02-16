@@ -92,6 +92,15 @@ impl MetastoreImpl {
             MetastoreImpl::Turso(m) => m.query(params, f).await,
         }
     }
+
+    /// Shutdown the metastore, performing any necessary cleanup.
+    pub(crate) async fn shutdown(&self) -> CatalogResult<()> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.shutdown().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.shutdown().await,
+        }
+    }
 }
 
 /// Metadata catalog for Cayenne with pluggable metastore backends.
@@ -169,45 +178,7 @@ impl CayenneCatalog {
     /// Returns [`CatalogError`] if the catalog cannot be opened or if the
     /// maintenance pragma statements fail to execute.
     pub async fn shutdown(&self) -> CatalogResult<()> {
-        // Only SQLite supports WAL checkpoint and optimize pragmas
-        // Turso handles optimization automatically
-        match &self.metastore {
-            MetastoreImpl::Sqlite(_) => {
-                let db_path_owned = self.db_path().to_string();
-
-                tokio::task::spawn_blocking(move || {
-                    let conn = rusqlite::Connection::open(&db_path_owned)?;
-
-                    // Check if WAL mode is enabled
-                    let journal_mode: String =
-                        conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-
-                    if journal_mode.eq_ignore_ascii_case("wal") {
-                        tracing::info!("Truncating Cayenne catalog WAL log");
-                        // Truncate the WAL log to persist changes and reduce file size
-                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
-                    }
-
-                    // Run optimize to improve query performance for future connections
-                    tracing::info!("Running optimize on Cayenne catalog");
-                    conn.execute("PRAGMA optimize", [])?;
-
-                    Ok::<(), CatalogError>(())
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Catalog shutdown task panicked.".to_string(),
-                    source: Box::new(e),
-                })??;
-            }
-            #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(_) => {
-                // Turso handles optimization automatically, no action needed
-                tracing::debug!("Turso backend handles optimization automatically");
-            }
-        }
-
-        Ok(())
+        self.metastore.shutdown().await
     }
 }
 
@@ -523,18 +494,14 @@ impl MetadataCatalog for CayenneCatalog {
             .await;
 
         match insert_result {
-            Err(CatalogError::Sqlite {
-                source: rusqlite::Error::SqliteFailure(err, _),
-            }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
-                // Another concurrent operation inserted the same delete file
-                // Retrieve the existing delete_file_id by falling through
-            }
+            // Success or constraint violation (another concurrent operation inserted first)
+            // Either way, retrieve the delete_file_id by falling through
+            Ok(()) | Err(CatalogError::ConstraintViolation { .. }) => {}
             Err(e) => {
                 return Err(CatalogError::FailedToAddDeleteFile {
                     source: Box::new(e),
                 })
             }
-            Ok(()) => {}
         }
 
         // Retrieve the assigned delete_file_id
@@ -878,7 +845,9 @@ impl MetadataCatalog for CayenneCatalog {
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
         // 2. Clear insert records - they correspond to the cleared delete files
-        // 3. Update snapshot pointer - commits the new snapshot as active
+        // 3. Clear snapshot sequences - protected snapshots are no longer needed
+        //    after compaction since all data is merged into the new snapshot
+        // 4. Update snapshot pointer - commits the new snapshot as active
         //
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
@@ -887,6 +856,7 @@ impl MetadataCatalog for CayenneCatalog {
             "BEGIN TRANSACTION; \
              DELETE FROM cayenne_delete_file WHERE table_id = {table_id}; \
              DELETE FROM cayenne_insert_record WHERE table_id = {table_id}; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id}; \
              UPDATE cayenne_table SET current_snapshot_id = '{new_snapshot_id}' WHERE table_id = {table_id}; \
              COMMIT;"
         );
@@ -902,14 +872,50 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64> {
-        // Check if partition already exists
-        let existing_partition = self.metastore.query_row_helper(
+        // Validate partition metadata invariants before persisting
+        // Without this, invalid metadata could cause incorrect partition lookups at query time
+        if partition.partition_columns.is_empty() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "partition_columns cannot be empty".to_string(),
+            });
+        }
+        if partition.partition_values.is_empty() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "partition_values cannot be empty".to_string(),
+            });
+        }
+        if partition.partition_columns.len() != partition.partition_values.len() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: format!(
+                    "partition_columns count ({}) does not match partition_values count ({})",
+                    partition.partition_columns.len(),
+                    partition.partition_values.len()
+                ),
+            });
+        }
+
+        // Serialize partition columns and values as JSON arrays for storage
+        let columns_json = serde_json::to_string(&partition.partition_columns).map_err(|e| {
+            CatalogError::Database {
+                message: format!("Failed to serialize partition columns: {e}"),
+            }
+        })?;
+        let values_json = serde_json::to_string(&partition.partition_values).map_err(|e| {
+            CatalogError::Database {
+                message: format!("Failed to serialize partition values: {e}"),
+            }
+        })?;
+        let partition_key = partition.composite_key();
+
+        // Check if partition already exists using the composite key
+        let existing_partition = self
+            .metastore
+            .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_column = ?2 AND partition_value = ?3",
+                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
                     params: vec![
                         MetastoreValue::Integer(partition.table_id),
-                        MetastoreValue::Text(partition.partition_column.clone()),
-                        MetastoreValue::Text(partition.partition_value.clone()),
+                        MetastoreValue::Text(partition_key.clone()),
                     ],
                 },
                 |row| row.get_i64(0),
@@ -921,18 +927,21 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(id);
         }
 
-        // Insert partition metadata
-        let insert_result = self.metastore.execute_helper(ExecuteParams {
+        // Insert partition metadata with composite key support
+        let insert_result = self
+            .metastore
+            .execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_partition (
-                    table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                    table_id, partition_columns_json, partition_values_json, partition_key, path, path_is_relative, record_count, file_size_bytes
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
                 )",
                 params: vec![
                     MetastoreValue::Integer(partition.table_id),
-                    MetastoreValue::Text(partition.partition_column.clone()),
-                    MetastoreValue::Text(partition.partition_value.clone()),
+                    MetastoreValue::Text(columns_json.clone()),
+                    MetastoreValue::Text(values_json.clone()),
+                    MetastoreValue::Text(partition_key.clone()),
                     MetastoreValue::Text(partition.path.clone()),
                     MetastoreValue::Bool(partition.path_is_relative),
                     MetastoreValue::Integer(partition.record_count),
@@ -942,29 +951,25 @@ impl MetadataCatalog for CayenneCatalog {
             .await;
 
         match insert_result {
-            Err(CatalogError::Sqlite {
-                source: rusqlite::Error::SqliteFailure(err, _),
-            }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
-                // Another concurrent operation inserted the same partition
-                // Retrieve the existing partition ID by falling through
-            }
+            // Success or constraint violation (another concurrent operation inserted first)
+            // Either way, retrieve the partition ID by falling through
+            Ok(()) | Err(CatalogError::ConstraintViolation { .. }) => {}
             Err(e) => {
                 return Err(CatalogError::FailedToAddPartition {
                     source: Box::new(e),
                 })
             }
-            Ok(()) => {}
         }
 
-        // Retrieve the assigned partition ID
-        let partition_id: i64 = self.metastore
+        // Retrieve the assigned partition ID using composite key
+        let partition_id: i64 = self
+            .metastore
             .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_column = ?2 AND partition_value = ?3",
+                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
                     params: vec![
                         MetastoreValue::Integer(partition.table_id),
-                        MetastoreValue::Text(partition.partition_column.clone()),
-                        MetastoreValue::Text(partition.partition_value.clone()),
+                        MetastoreValue::Text(partition_key),
                     ],
                 },
                 |row| row.get_i64(0),
@@ -978,32 +983,46 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn get_partitions(&self, table_id: i64) -> CatalogResult<Vec<PartitionMetadata>> {
-        self.metastore.query_helper(
-            QueryParams {
-                sql: r"
-                    SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT partition_id, table_id, partition_columns_json, partition_values_json, path, path_is_relative, record_count, file_size_bytes
                     FROM cayenne_partition
                     WHERE table_id = ?1
                     ORDER BY partition_id
                 ",
-                params: vec![MetastoreValue::Integer(table_id)],
-            },
-            |row| {
-                Ok(PartitionMetadata {
-                    partition_id: row.get_i64(0)?,
-                    table_id: row.get_i64(1)?,
-                    partition_column: row.get_string(2)?,
-                    partition_value: row.get_string(3)?,
-                    path: row.get_string(4)?,
-                    path_is_relative: row.get_bool(5)?,
-                    record_count: row.get_i64(6)?,
-                    file_size_bytes: row.get_i64(7)?,
-                })
-            },
-        )
-        .await.map_err(|e| CatalogError::FailedToGetPartitions {
-            source: Box::new(e),
-        })
+                    params: vec![MetastoreValue::Integer(table_id)],
+                },
+                |row| {
+                    let columns_json = row.get_string(2)?;
+                    let values_json = row.get_string(3)?;
+
+                    let partition_columns: Vec<String> =
+                        serde_json::from_str(&columns_json).map_err(|e| CatalogError::Database {
+                            message: format!("Failed to deserialize partition columns: {e}"),
+                        })?;
+                    let partition_values: Vec<String> =
+                        serde_json::from_str(&values_json).map_err(|e| CatalogError::Database {
+                            message: format!("Failed to deserialize partition values: {e}"),
+                        })?;
+
+                    Ok(PartitionMetadata {
+                        partition_id: row.get_i64(0)?,
+                        table_id: row.get_i64(1)?,
+                        partition_columns,
+                        partition_values,
+                        path: row.get_string(4)?,
+                        path_is_relative: row.get_bool(5)?,
+                        record_count: row.get_i64(6)?,
+                        file_size_bytes: row.get_i64(7)?,
+                    })
+                },
+            )
+            .await
+            .map_err(|e| CatalogError::FailedToGetPartitions {
+                source: Box::new(e),
+            })
     }
 
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
@@ -1218,8 +1237,8 @@ mod tests {
                 let partition = PartitionMetadata {
                     partition_id: 0, // Will be assigned by catalog
                     table_id,
-                    partition_column: "date".to_string(),
-                    partition_value: "2024-01-01".to_string(),
+                    partition_columns: vec!["date".to_string()],
+                    partition_values: vec!["2024-01-01".to_string()],
                     path: "/tmp/cayenne_test_partition/partition_20240101".to_string(),
                     path_is_relative: false,
                     record_count: 100,
@@ -1258,7 +1277,7 @@ mod tests {
 
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].partition_id, partition_ids[0]);
-        assert_eq!(partitions[0].partition_value, "2024-01-01");
+        assert_eq!(partitions[0].partition_values, vec!["2024-01-01"]);
 
         // Cleanup test database
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
@@ -1363,6 +1382,526 @@ mod tests {
 
         // Cleanup test database
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test that shutdown properly flushes WAL and data persists across catalog restarts.
+    #[tokio::test]
+    async fn test_shutdown_wal_checkpoint_and_reload() {
+        // Create a unique test database
+        let test_db = format!(
+            "sqlite://./.test_shutdown_reload_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
+
+        // Create test schema
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        let table_name = "test_shutdown_table";
+        let base_path = "/tmp/cayenne_shutdown_test";
+
+        // Phase 1: Create catalog, add data, shutdown
+        let table_id;
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+            catalog.init().await.expect("Failed to initialize catalog");
+
+            // Create a table
+            let options = CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: base_path.to_string(),
+                partition_column: Some("name".to_string()),
+                vortex_config: crate::metadata::VortexConfig::default(),
+            };
+
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
+
+            // Add a partition
+            let partition = PartitionMetadata {
+                partition_id: 0,
+                table_id,
+                partition_columns: vec!["name".to_string()],
+                partition_values: vec!["test_value".to_string()],
+                path: format!("{base_path}/partition_test"),
+                path_is_relative: false,
+                record_count: 100,
+                file_size_bytes: 2048,
+            };
+            catalog
+                .add_partition(partition)
+                .await
+                .expect("Failed to add partition");
+
+            // Add a delete file
+            let delete_file = DeleteFile {
+                delete_file_id: 0,
+                table_id,
+                source_data_file_path: None,
+                path: format!("{base_path}/delete_file.parquet"),
+                path_is_relative: false,
+                format: "parquet".to_string(),
+                delete_count: 5,
+                file_size_bytes: 256,
+                deletion_type: DeletionType::default(),
+                sequence_number: 1,
+            };
+            catalog
+                .add_delete_file(delete_file)
+                .await
+                .expect("Failed to add delete file");
+
+            // Increment sequence number
+            let seq = catalog
+                .increment_sequence_number(table_id)
+                .await
+                .expect("Failed to increment sequence");
+            assert_eq!(seq, 1);
+
+            // Perform graceful shutdown - this checkpoints the WAL
+            catalog
+                .shutdown()
+                .await
+                .expect("Failed to shutdown catalog");
+
+            // Catalog goes out of scope here, connection is dropped
+        }
+
+        // Phase 2: Reopen catalog and verify all data persisted correctly
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen catalog");
+            catalog
+                .init()
+                .await
+                .expect("Failed to reinitialize catalog");
+
+            // Verify table exists with correct metadata
+            let table = catalog
+                .get_table(table_name)
+                .await
+                .expect("Table should exist after restart");
+
+            assert_eq!(table.table_id, table_id);
+            assert_eq!(table.table_name, table_name);
+            assert_eq!(table.primary_key, vec!["id".to_string()]);
+            assert_eq!(table.partition_column, Some("name".to_string()));
+            assert_eq!(table.current_sequence_number, 1);
+
+            // Verify partition persisted
+            let partitions = catalog
+                .get_partitions(table_id)
+                .await
+                .expect("Failed to get partitions");
+            assert_eq!(partitions.len(), 1);
+            assert_eq!(partitions[0].partition_values, vec!["test_value"]);
+            assert_eq!(partitions[0].record_count, 100);
+
+            // Verify delete file persisted
+            let delete_files = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .expect("Failed to get delete files");
+            assert_eq!(delete_files.len(), 1);
+            assert_eq!(delete_files[0].delete_count, 5);
+            assert_eq!(delete_files[0].sequence_number, 1);
+
+            // Verify sequence number persisted
+            let seq = catalog
+                .get_sequence_number(table_id)
+                .await
+                .expect("Failed to get sequence number");
+            assert_eq!(seq, 1);
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test multiple shutdown/reload cycles to ensure repeated restarts maintain integrity.
+    #[tokio::test]
+    async fn test_multiple_shutdown_reload_cycles() {
+        let test_db = format!(
+            "sqlite://./.test_multi_shutdown_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let table_name = "cycle_test_table";
+        let base_path = "/tmp/cayenne_cycle_test";
+
+        // Cycle 1: Create table
+        let table_id;
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+            catalog.init().await.expect("Failed to init");
+
+            let options = CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            };
+
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cycle 2: Add delete files
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
+            catalog.init().await.expect("Failed to init");
+
+            for i in 0..5 {
+                let delete_file = DeleteFile {
+                    delete_file_id: 0,
+                    table_id,
+                    source_data_file_path: None,
+                    path: format!("{base_path}/delete_{i}.parquet"),
+                    path_is_relative: false,
+                    format: "parquet".to_string(),
+                    delete_count: i + 1,
+                    file_size_bytes: 100,
+                    deletion_type: DeletionType::default(),
+                    sequence_number: i + 1,
+                };
+                catalog
+                    .add_delete_file(delete_file)
+                    .await
+                    .expect("Failed to add delete file");
+            }
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cycle 3: Verify and modify
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
+            catalog.init().await.expect("Failed to init");
+
+            let delete_files = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .expect("Failed to get delete files");
+            assert_eq!(delete_files.len(), 5, "All 5 delete files should persist");
+
+            // Increment sequence number multiple times
+            for _ in 0..3 {
+                catalog
+                    .increment_sequence_number(table_id)
+                    .await
+                    .expect("Failed to increment");
+            }
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cycle 4: Final verification
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
+            catalog.init().await.expect("Failed to init");
+
+            let table = catalog
+                .get_table(table_name)
+                .await
+                .expect("Table should exist");
+            assert_eq!(
+                table.current_sequence_number, 3,
+                "Sequence number should be 3 after 3 increments"
+            );
+
+            let delete_files = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .expect("Failed to get delete files");
+            assert_eq!(delete_files.len(), 5);
+
+            // Verify delete file sequence numbers
+            let mut seq_nums: Vec<i64> = delete_files.iter().map(|f| f.sequence_number).collect();
+            seq_nums.sort_unstable();
+            assert_eq!(seq_nums, vec![1, 2, 3, 4, 5]);
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test that data persists even without explicit shutdown (WAL should still be readable).
+    #[tokio::test]
+    async fn test_data_persists_without_explicit_shutdown() {
+        let test_db = format!("sqlite://./.test_no_shutdown_{}.db", uuid::Uuid::now_v7());
+        let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let table_name = "no_shutdown_table";
+
+        // Create and populate without explicit shutdown
+        let table_id;
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+            catalog.init().await.expect("Failed to init");
+
+            let options = CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/no_shutdown_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            };
+
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
+
+            // Add some data
+            catalog
+                .increment_sequence_number(table_id)
+                .await
+                .expect("Failed to increment");
+            catalog
+                .increment_sequence_number(table_id)
+                .await
+                .expect("Failed to increment");
+
+            // NO explicit shutdown - catalog just drops
+        }
+
+        // Reopen and verify data is still accessible (SQLite WAL recovery)
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
+            catalog.init().await.expect("Failed to init");
+
+            let table = catalog
+                .get_table(table_name)
+                .await
+                .expect("Table should exist");
+            assert_eq!(table.table_id, table_id);
+            assert_eq!(table.current_sequence_number, 2, "Sequence should be 2");
+
+            // Now do proper shutdown
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test insert records persist across shutdown/reload.
+    #[tokio::test]
+    async fn test_insert_records_persist_across_restart() {
+        let test_db = format!(
+            "sqlite://./.test_insert_records_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        // Create and add insert records
+        let table_id;
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+            catalog.init().await.expect("Failed to init");
+
+            let options = CreateTableOptions {
+                table_name: "insert_record_test".to_string(),
+                schema,
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: "/tmp/insert_record_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            };
+
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
+
+            // Add individual insert records
+            catalog
+                .add_insert_record(table_id, vec![1, 2, 3, 4], 1)
+                .await
+                .expect("Failed to add insert record");
+            catalog
+                .add_insert_record(table_id, vec![5, 6, 7, 8], 2)
+                .await
+                .expect("Failed to add insert record");
+
+            // Add batch insert records
+            catalog
+                .add_insert_records_batch(
+                    table_id,
+                    vec![vec![9, 10], vec![11, 12], vec![13, 14]],
+                    3,
+                )
+                .await
+                .expect("Failed to add batch insert records");
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Reopen and verify
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
+            catalog.init().await.expect("Failed to init");
+
+            let records = catalog
+                .get_insert_records(table_id)
+                .await
+                .expect("Failed to get insert records");
+
+            assert_eq!(records.len(), 5, "Should have 5 insert records");
+
+            // Verify specific records by converting to Box<[u8]> for lookup
+            let key1: Box<[u8]> = vec![1u8, 2, 3, 4].into_boxed_slice();
+            let key2: Box<[u8]> = vec![5u8, 6, 7, 8].into_boxed_slice();
+            let key3: Box<[u8]> = vec![9u8, 10].into_boxed_slice();
+            let key4: Box<[u8]> = vec![11u8, 12].into_boxed_slice();
+            let key5: Box<[u8]> = vec![13u8, 14].into_boxed_slice();
+
+            assert_eq!(records.get(&key1), Some(&1i64));
+            assert_eq!(records.get(&key2), Some(&2i64));
+            assert_eq!(records.get(&key3), Some(&3i64));
+            assert_eq!(records.get(&key4), Some(&3i64));
+            assert_eq!(records.get(&key5), Some(&3i64));
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test snapshot sequences persist across restart.
+    #[tokio::test]
+    async fn test_snapshot_sequences_persist_across_restart() {
+        let test_db = format!("sqlite://./.test_snapshot_seq_{}.db", uuid::Uuid::now_v7());
+        let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let snapshot_1 = uuid::Uuid::now_v7().to_string();
+        let snapshot_2 = uuid::Uuid::now_v7().to_string();
+        let snapshot_3 = uuid::Uuid::now_v7().to_string();
+
+        // Create and set snapshot sequences
+        let table_id;
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+            catalog.init().await.expect("Failed to init");
+
+            let options = CreateTableOptions {
+                table_name: "snapshot_seq_test".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/snapshot_seq_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            };
+
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
+
+            catalog
+                .set_snapshot_sequence(table_id, &snapshot_1, 10)
+                .await
+                .expect("Failed to set snapshot seq");
+            catalog
+                .set_snapshot_sequence(table_id, &snapshot_2, 20)
+                .await
+                .expect("Failed to set snapshot seq");
+            catalog
+                .set_snapshot_sequence(table_id, &snapshot_3, 30)
+                .await
+                .expect("Failed to set snapshot seq");
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Reopen and verify
+        {
+            let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
+            catalog.init().await.expect("Failed to init");
+
+            let seq_1 = catalog
+                .get_snapshot_sequence(table_id, &snapshot_1)
+                .await
+                .expect("Failed to get seq");
+            let seq_2 = catalog
+                .get_snapshot_sequence(table_id, &snapshot_2)
+                .await
+                .expect("Failed to get seq");
+            let seq_3 = catalog
+                .get_snapshot_sequence(table_id, &snapshot_3)
+                .await
+                .expect("Failed to get seq");
+
+            assert_eq!(seq_1, Some(10));
+            assert_eq!(seq_2, Some(20));
+            assert_eq!(seq_3, Some(30));
+
+            let all_seqs = catalog
+                .get_all_snapshot_sequences(table_id)
+                .await
+                .expect("Failed to get all seqs");
+            assert_eq!(all_seqs.len(), 3);
+
+            catalog.shutdown().await.expect("Shutdown failed");
+        }
+
+        // Cleanup
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));

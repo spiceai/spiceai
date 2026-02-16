@@ -43,37 +43,33 @@ pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
 pub mod error_code;
+mod handle;
 mod metrics;
 mod tracker;
 
+pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
+
 use {
-    crate::config::ClusterRole,
-    crate::datafusion::builder::default_extension_planners,
-    ballista_core::extension::{SessionConfigExt, SessionStateExt},
-    ballista_core::planner::BallistaQueryPlanner,
-    datafusion::execution::SessionStateBuilder,
-    datafusion::physical_planner::DefaultPhysicalPlanner,
-    datafusion_proto::protobuf::LogicalPlanNode,
+    ballista_core::extension::SessionConfigExt,
+    ballista_scheduler::scheduler_server::SchedulerServer,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
 use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
-use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
@@ -109,6 +105,15 @@ pub enum Error {
         Either remove 'stale-while-revalidate' from the Cache-Control header or change cache_key_type to 'sql'."
     ))]
     UnsupportedStaleWhileRevalidate { cache_key_type: String },
+
+    #[snafu(display("Distributed query scheduler is not available"))]
+    SchedulerUnavailable,
+
+    #[snafu(display("Failed to create session for distributed query: {message}"))]
+    SessionCreationFailed { message: String },
+
+    #[snafu(display("Failed to submit job to distributed scheduler: {message}"))]
+    JobSubmissionFailed { message: String },
 }
 
 impl Error {
@@ -159,82 +164,21 @@ macro_rules! handle_error {
 }
 
 impl Query {
-    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> Result<SessionState> {
+    /// Returns the session state for local query execution.
+    ///
+    /// For Flight SQL sessions, returns the session-specific context to preserve
+    /// prepared statements. Otherwise, returns the default local context.
+    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> SessionState {
         // Check if there's a Flight SQL session-specific context
         if let Some(flight_session) =
             request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
         {
-            // For cluster mode with session context, we don't apply cluster modifications
-            // since the session state should remain local to preserve prepared statements
-            return Ok(flight_session.session_context().state());
+            // Use session-specific context to preserve prepared statements
+            return flight_session.session_context().state();
         }
 
-        if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
-            return Ok(self.df.ctx.state());
-        }
-
-        let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
-            return Err(Error::UnableToExecuteQuery {
-                source: datafusion::error::DataFusionError::Configuration(
-                    "Scheduler mode requires --node-advertise-address".to_string(),
-                ),
-            });
-        };
-
-        let client_tls_config = self.df.cluster_config.client_tls_config().cloned();
-        let tls_enabled = client_tls_config.is_some();
-
-        let mut cfg = self
-            .df
-            .ctx
-            .copied_config()
-            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_use_tls(tls_enabled);
-
-        if let Some(tls_config) = client_tls_config {
-            cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
-                ep.tls_config(tls_config.clone()).boxed()
-            }));
-        }
-
-        let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
-            BallistaQueryPlanner::with_local_planner(
-                scheduler_url.to_string(),
-                cfg.ballista_config(),
-                SpiceLogicalCodec::new_codec(),
-                DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
-            );
-
-        SessionStateBuilder::new_from_existing(self.df.ctx.state())
-            .with_config(
-                cfg.with_ballista_query_planner(Arc::new(query_planner))
-                    .with_option_extension(SpiceClusterConfig::default()),
-            )
-            .build()
-            .upgrade_for_ballista(scheduler_url.to_string())
-            .map_err(|e| Error::UnableToExecuteQuery { source: e })
-    }
-
-    fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
-        let mut should_distribute = true;
-
-        let _ = plan.apply(|p| {
-            if let LogicalPlan::DescribeTable(_) = p {
-                should_distribute = false;
-            } else if let LogicalPlan::TableScan(scan) = p
-                && matches!(scan.table_name.schema(), Some(SPICE_RUNTIME_SCHEMA))
-            {
-                should_distribute = false;
-            }
-
-            if should_distribute {
-                Ok(TreeNodeRecursion::Continue)
-            } else {
-                Ok(TreeNodeRecursion::Stop)
-            }
-        })?;
-
-        Ok(should_distribute)
+        // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
+        self.df.ctx.state()
     }
 
     /// Run a query and return the result.
@@ -251,6 +195,234 @@ impl Query {
         }
 
         self.run_internal(request_context).await
+    }
+
+    /// Submit a query for distributed execution via Ballista and return a handle.
+    ///
+    /// This method submits a job to the Ballista scheduler and returns a `QueryHandle`
+    /// that can be used to poll for status and retrieve results.
+    /// This method returns immediately after job submission without waiting for completion.
+    ///
+    /// The returned `QueryHandle` provides methods for:
+    /// - Polling job status (`poll_status`)
+    /// - Cancelling the job (`cancel`)
+    /// - Waiting for completion and retrieving results (`into_stream`)
+    ///
+    /// Results are cached based on the input cache key when retrieved.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - A unique identifier for this job, used as the Ballista session/job ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The scheduler server is not available
+    /// - Session creation fails
+    /// - The query plan cannot be created
+    /// - Job submission fails
+    pub async fn submit_distributed(self, job_id: &str) -> Result<QueryHandle> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        self.submit_distributed_internal(job_id, request_context)
+            .await
+    }
+
+    /// Internal implementation for submitting a distributed query.
+    async fn submit_distributed_internal(
+        self,
+        job_id: &str,
+        request_context: Arc<RequestContext>,
+    ) -> Result<QueryHandle> {
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
+
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query",
+            input = %self.sql,
+            runtime_query = false,
+            distributed = true,
+            job_id = %job_id
+        );
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        // Get the scheduler server
+        let scheduler = Self::get_scheduler_server(&self.df)?;
+        let tracker = self.tracker;
+
+        // Create session for this job
+        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        let session_ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session(job_id, &session_config)
+            .await
+            .map_err(|e| Error::SessionCreationFailed {
+                message: e.to_string(),
+            })?;
+
+        // Get the session state for planning
+        let session = session_ctx.state();
+
+        // Get logical plan and cache key, reusing existing cache infrastructure
+        let (plan, mut tracker, cache_key) = match &self.sql {
+            QueryMethod::Text {
+                sql, parameters, ..
+            } => {
+                // Use the existing get_plan_or_cached which handles all cache control,
+                // stale-while-revalidate, and query tracking
+                match Query::get_plan_or_cached(
+                    &self.df,
+                    &session,
+                    Arc::clone(&request_context),
+                    sql,
+                    parameters.clone(),
+                    tracker,
+                )
+                .await?
+                {
+                    cache::PlanOrCached::Cached(cached_result) => {
+                        tracing::debug!(job_id, "Returning cached result for distributed query");
+                        // Return a QueryHandle with cached results
+                        let schema = cached_result.data.schema();
+                        return Ok(QueryHandle::new_with_cached_result(
+                            job_id.to_string(),
+                            schema,
+                            Arc::clone(&self.df),
+                            None, // Cache key already used for lookup
+                            cached_result.data,
+                            Arc::clone(&request_context),
+                        ));
+                    }
+                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                        // Plan needs execution - cache_manager contains the raw cache key for storing results
+                        let cache_key = if cache_manager.should_cache_results() {
+                            Some(cache_manager.raw_cache_key)
+                        } else {
+                            None
+                        };
+                        (*plan, tracker, cache_key)
+                    }
+                }
+            }
+            QueryMethod::Plan(logical_plan) => {
+                // For direct plan submission, compute cache key and check cache
+                let plan_cache_key =
+                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+
+                // Check for cached results using the standard cache lookup
+                if let Some(cache_provider) = self.df.results_cache_provider()
+                    && let Ok(Some(cached_result)) =
+                        cache_provider.get_raw_key(&plan_cache_key).await
+                {
+                    let ttl = cache_provider.ttl();
+                    let now = std::time::Instant::now();
+                    if !cached_result.is_stale(ttl, now)
+                        && let Ok(records) = cached_result.records().await
+                    {
+                        tracing::debug!(
+                            job_id,
+                            cache_key = plan_cache_key.as_u64(),
+                            "Returning cached result for distributed query (plan)"
+                        );
+                        let stream = ::cache::result::query::CachedStream::new(
+                            Arc::new(records),
+                            cached_result.schema,
+                        );
+                        return Ok(QueryHandle::new_with_cached_result(
+                            job_id.to_string(),
+                            Arc::clone(logical_plan.schema().inner()),
+                            Arc::clone(&self.df),
+                            None,
+                            Box::pin(stream),
+                            Arc::clone(&request_context),
+                        ));
+                    }
+                }
+
+                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
+            }
+        };
+
+        // Validate query operations
+        if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            return Err(Error::UnableToExecuteQuery { source: e });
+        }
+
+        // Get the schema from the logical plan
+        let schema = Arc::new(plan.schema().as_arrow().clone());
+
+        let input_tables = get_logical_plan_input_tables(&plan);
+        if input_tables
+            .iter()
+            .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+        {
+            span.record("runtime_query", true);
+        }
+
+        // If any of the input tables are accelerated, mark the query as accelerated
+        let mut is_accelerated = false;
+        for tr in &input_tables {
+            if self.df.is_accelerated(tr).await {
+                is_accelerated = true;
+                break;
+            }
+        }
+        if is_accelerated {
+            tracker = tracker.map(|mut t| {
+                t.is_accelerated = Some(true);
+                t
+            });
+        }
+
+        let datasets = Arc::new(input_tables);
+        let tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
+
+        // Start the timer for the query execution
+        let tracker = tracker.map(|mut t| {
+            t.query_execution_duration_timer = Instant::now();
+            t
+        });
+
+        // Submit the job to the Ballista scheduler
+        let ballista_job_id = scheduler
+            .submit_job(job_id, session_ctx, &plan)
+            .await
+            .map_err(|e| Error::JobSubmissionFailed {
+                message: e.to_string(),
+            })?;
+
+        tracing::debug!(
+            job_id,
+            ballista_job_id = %ballista_job_id,
+            "Job submitted to Ballista scheduler"
+        );
+
+        Ok(QueryHandle::new(
+            ballista_job_id,
+            scheduler,
+            schema,
+            datasets,
+            Arc::clone(&self.df),
+            cache_key,
+            tracker,
+            request_context,
+        ))
+    }
+
+    /// Returns the scheduler server if available.
+    fn get_scheduler_server(
+        df: &DataFusion,
+    ) -> Result<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>> {
+        df.scheduler_server
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or(Error::SchedulerUnavailable)
     }
 
     async fn run_with_managed_runtime(
@@ -300,7 +472,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.get_session_state(&request_context)?;
+            let mut session = self.get_session_state(&request_context);
 
             let ctx = self;
             let tracker = ctx.tracker;
@@ -434,16 +606,6 @@ impl Query {
                 t
             });
 
-            // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
-            let should_distribute =
-                Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
-
-            let session_for_execution = if should_distribute {
-                session
-            } else {
-                ctx.df.ctx.state()
-            };
-
             // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
             // They modify session state rather than producing query results, so must be
             // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
@@ -504,7 +666,7 @@ impl Query {
                         }
                     };
 
-                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                    let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream(Arc::clone(&df_plan), task_ctx) {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -522,23 +684,22 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
-                    let physical_plan =
-                        match session_for_execution.create_physical_plan(&plan).await {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                let e = find_datafusion_root(e);
-                                let error_code = ErrorCode::from(&e);
-                                handle_error!(
-                                    tracker,
-                                    &request_context,
-                                    error_code,
-                                    e,
-                                    UnableToExecuteQuery
-                                )
-                            }
-                        };
+                    let physical_plan = match session.create_physical_plan(&plan).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
 
-                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                    let task_ctx = Arc::new(TaskContext::from(&session));
 
                     let stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
                         Ok(stream) => stream,

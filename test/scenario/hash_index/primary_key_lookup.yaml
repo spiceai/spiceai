@@ -1,0 +1,40 @@
+# Scenario queries for testing primary key hash index lookups
+# These queries filter on primary key columns and should use IndexedLookupExec
+name: hash_index_primary_key_lookup
+
+queries:
+  # Customer table: primary key is c_custkey
+  - name: customer_pk_lookup
+    sql: SELECT * FROM customer WHERE c_custkey = 1
+    expected_results:
+      row_count: 1
+
+  # Orders table: primary key is o_orderkey
+  - name: orders_pk_lookup
+    sql: SELECT * FROM orders WHERE o_orderkey = 1
+    expected_results:
+      row_count: 1
+
+  # Part table: primary key is p_partkey
+  - name: part_pk_lookup
+    sql: SELECT * FROM part WHERE p_partkey = 1
+    expected_results:
+      row_count: 1
+
+  # Supplier table: primary key is s_suppkey
+  - name: supplier_pk_lookup
+    sql: SELECT * FROM supplier WHERE s_suppkey = 1
+    expected_results:
+      row_count: 1
+
+  # Nation table: primary key is n_nationkey
+  - name: nation_pk_lookup
+    sql: SELECT * FROM nation WHERE n_nationkey = 1
+    expected_results:
+      row_count: 1
+
+  # Region table: primary key is r_regionkey
+  - name: region_pk_lookup
+    sql: SELECT * FROM region WHERE r_regionkey = 1
+    expected_results:
+      row_count: 1

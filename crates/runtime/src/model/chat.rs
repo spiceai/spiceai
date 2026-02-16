@@ -133,8 +133,18 @@ pub async fn construct_model(
     })?;
 
     let model = match prefix {
+        #[cfg(feature = "models")]
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
+        #[cfg(not(feature = "models"))]
+        ModelSource::HuggingFace => Err(LlmError::UnknownModelSource {
+            from: "huggingface".into(),
+        }),
+        #[cfg(feature = "models")]
         ModelSource::File => file(component, params).await,
+        #[cfg(not(feature = "models"))]
+        ModelSource::File => Err(LlmError::UnknownModelSource {
+            from: "file".into(),
+        }),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Google => google(model_id.as_deref(), params),
         ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
@@ -144,6 +154,10 @@ pub async fn construct_model(
         ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => bedrock(model_id, params).await,
+        #[cfg(not(feature = "bedrock"))]
+        ModelSource::Bedrock => Err(LlmError::UnknownModelSource {
+            from: "bedrock".into(),
+        }),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -265,6 +279,7 @@ fn google(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, 
     Ok(Arc::new(google) as Arc<dyn Chat>)
 }
 
+#[cfg(feature = "models")]
 async fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
@@ -504,6 +519,7 @@ fn azure(
     )) as Arc<dyn Chat>)
 }
 
+#[cfg(feature = "models")]
 async fn file(
     component: &spicepod::component::model::Model,
     params: &Parameters,

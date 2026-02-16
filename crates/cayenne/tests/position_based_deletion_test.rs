@@ -42,17 +42,27 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
+mod common;
+
 use arrow::array::{Int64Array, RecordBatch, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider,
     CayenneTableProviderBuilder, MetadataCatalog,
 };
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -62,11 +72,9 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 // =============================================================================
 
 async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<u64> {
-    let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.map_err(Into::into)
+    common::insert_batch(table.as_ref(), batch)
+        .await
+        .map_err(Into::into)
 }
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {

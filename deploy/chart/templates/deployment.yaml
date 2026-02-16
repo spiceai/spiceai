@@ -57,6 +57,9 @@ spec:
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: Always
           workingDir: /app
+          {{- if .Values.command }}
+          command: {{ toYaml .Values.command | nindent 12 }}
+          {{- else }}
           command:
             [
               "/usr/local/bin/spiced",
@@ -67,6 +70,7 @@ spec:
               "--flight",
               "0.0.0.0:50051"
             ]
+          {{- end }}
           env:
             {{- if .Values.additionalEnv }}
             {{- .Values.additionalEnv | toYaml | nindent 12 }}

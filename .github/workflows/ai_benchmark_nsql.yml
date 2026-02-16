@@ -10,12 +10,11 @@ on:
         type: choice
         options:
           - 'all'
-          - 'gpt-5.1'
-          - 'gpt-5-mini'
+          - 'gpt-5.2'
           - 'o3-mini'
           - 'llama3-3B-Instruct'
-          - 'claude-sonnet-4-5'
-          - 'grok4'
+          - 'claude-3-5-haiku'
+          - 'grok-4-fast'
         default: 'all'
   schedule:
     - cron: '0 5 * * 2,5' # Every Monday and Thursday at 10pm PST (5am UTC next day)
@@ -55,23 +54,14 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
-
-      - name: make spiced executable
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: ./.github/actions/build-spiced
         with:
-          name: spiced
-          path: spiced
+          features: 'models'
+          upload_artifact: 'true'
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -82,12 +72,11 @@ jobs:
         with:
           script: |
             const matrix = [
-              { name: "gpt-5.1" },
-              { name: "gpt-5-mini" },
+              { name: "gpt-5.2" },
               { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
-              { name: "claude-sonnet-4-5" },
-              { name: "grok4" },
+              { name: "claude-3-5-haiku" },
+              { name: "grok-4-fast" },
             ];
 
             const model_option = context.payload.inputs?.model_option || 'all';

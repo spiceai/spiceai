@@ -306,10 +306,11 @@ impl DeltaTable {
             .with_predicate(Arc::clone(physical_expr));
 
         // Matches keying used by `ObjectStoreRegistry::get_url_key`
+        // Use BeforeUsername to preserve userinfo (e.g., container name in abfss://container@account.dfs.core.windows.net/)
         let object_store_url = ObjectStoreUrl::parse(format!(
             "{}://{}",
             self.table_url.scheme(),
-            &self.table_url[url::Position::BeforeHost..url::Position::AfterPort]
+            &self.table_url[url::Position::BeforeUsername..url::Position::AfterPort]
         ))
         .context(DeltaTableExecutionSnafu)?;
 
@@ -319,7 +320,7 @@ impl DeltaTable {
             Arc::new(parquet_source),
         )
         .with_limit(limit)
-        .with_projection(new_projections)
+        .with_projection_indices(new_projections)
         .with_table_partition_cols(partition_cols.to_vec())
         .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 
@@ -1081,7 +1082,9 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
         | ScalarValue::DurationMicrosecond(_)
         | ScalarValue::DurationNanosecond(_)
         | ScalarValue::Union(_, _, _)
-        | ScalarValue::Dictionary(_, _) => None,
+        | ScalarValue::Dictionary(_, _)
+        | ScalarValue::Decimal32(_, _, _)
+        | ScalarValue::Decimal64(_, _, _) => None,
     }
 }
 

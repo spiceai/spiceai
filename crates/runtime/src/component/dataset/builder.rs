@@ -54,6 +54,7 @@ pub struct DatasetBuilder {
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
+    pub acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -85,6 +86,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             .as_ref()
             .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
                 a.snapshots
+            });
+
+        let acceleration_snapshot_compaction = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotsCompaction::Disabled, |a| {
+                a.snapshots_compaction
             });
 
         let acceleration = dataset
@@ -133,6 +141,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             embeddings: dataset.embeddings,
             acceleration,
             acceleration_snapshot_behavior,
+            acceleration_snapshot_compaction,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -164,6 +173,7 @@ impl DatasetBuilder {
             time_partition_format: None,
             acceleration: None,
             acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior::Disabled,
+            acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -243,6 +253,7 @@ impl DatasetBuilder {
                 self.acceleration_snapshot_behavior,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
+                self.acceleration_snapshot_compaction,
             );
         }
 

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 //! Tests for caching mode acceleration behavior.
 //!
 //! This module contains tests for the caching acceleration mode, which allows HTTP
@@ -45,7 +47,7 @@ limitations under the License.
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
 
 use app::AppBuilder;
-use arrow::array::{Array, StringArray, TimestampNanosecondArray};
+use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt16Array};
 use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
@@ -57,7 +59,7 @@ use std::sync::Arc;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 /// Test that caching mode properly propagates filters to the HTTP connector on cache miss.
@@ -416,6 +418,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
     ));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -633,6 +636,7 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
     ));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -868,7 +872,8 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 vec![(
                     "allowed_request_paths".to_string(),
                     "/search/people".to_string(),
-                )]
+                ),
+                 ("request_query_filters".to_string(), "enabled".to_string()),]
                 .into_iter()
                 .collect(),
             ));
@@ -903,7 +908,30 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&status).await;
 
-            // Query without filters - should still cache based on request metadata
+            // Query empty cache - should return no rows
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .limit(0, Some(1))?;
+            let empty_batches = df.collect().await?;
+            let empty_row_count: usize = empty_batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+            assert_eq!(empty_row_count, 0, "Empty cache should return no rows");
+
+            // Populate the cache with a filtered query
+            let sql = "SELECT * FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=test'";
+            let df = status.datafusion().ctx.sql(sql).await?;
+            let initial_batches = df.collect().await?;
+            assert!(
+                !initial_batches.is_empty(),
+                "Should have results from HTTP request"
+            );
+
+            // Wait for batched cache write to flush (500ms interval + buffer)
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+            // Query cache again - should now return cached data
             let df = status
                 .datafusion()
                 .ctx
@@ -915,6 +943,32 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
             assert!(
                 !batches.is_empty(),
                 "Should have results from cache with no filters"
+            );
+
+            // Query with specific projection (only 'content' column) and no filters
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .select(vec![col("content")])?
+                .limit(0, Some(1))?;
+
+            let batches = df.collect().await?;
+            assert!(
+                !batches.is_empty(),
+                "Should have results from cache with projection and no filters"
+            );
+            // Verify only the 'content' column is returned
+            assert_eq!(
+                batches[0].num_columns(),
+                1,
+                "Should only return the projected column"
+            );
+            assert_eq!(
+                batches[0].schema().field(0).name(),
+                "content",
+                "Should return the 'content' column"
             );
 
             Ok(())
@@ -1077,6 +1131,60 @@ async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> 
             assert!(
                 !batches2.is_empty(),
                 "Second query with different projection should return cached data"
+            );
+
+            // Third query - select content, request_path (different column order)
+            let df3 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=smith")))?
+                .select(vec![col("content"), col("request_path")])?
+                .limit(0, Some(1))?;
+
+            let batches3 = df3.collect().await?;
+            assert!(
+                !batches3.is_empty(),
+                "Third query with content,request_path projection should return cached data"
+            );
+            assert_eq!(
+                batches3[0].schema().field(0).name(),
+                "content",
+                "First column should be content"
+            );
+            assert_eq!(
+                batches3[0].schema().field(1).name(),
+                "request_path",
+                "Second column should be request_path"
+            );
+
+            // Fourth query - select request_path, content (standard order)
+            let df4 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=smith")))?
+                .select(vec![col("request_path"), col("content")])?
+                .limit(0, Some(1))?;
+
+            let batches4 = df4.collect().await?;
+            assert!(
+                !batches4.is_empty(),
+                "Fourth query with request_path,content projection should return cached data"
+            );
+            assert_eq!(
+                batches4[0].schema().field(0).name(),
+                "request_path",
+                "First column should be request_path"
+            );
+            assert_eq!(
+                batches4[0].schema().field(1).name(),
+                "content",
+                "Second column should be content"
             );
 
             Ok(())
@@ -1973,6 +2081,9 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             let parent_row_count = parent_results[0].num_rows();
             eprintln!("TEST: Parent cache populated with {parent_row_count} rows");
 
+            // Wait for background cache write to complete
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
             // Get the parent's accelerator reference for later verification
             let parent_accelerator = runtime_phase1
                 .datafusion()
@@ -2101,4 +2212,400 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             Ok(())
         })
         .await
+}
+
+/// Test that queries with explicit column selection work correctly in caching mode.
+///
+/// This verifies that:
+/// 1. Queries selecting specific columns return only those columns
+/// 2. Internal columns used for cache management are not exposed
+/// 3. Data integrity is maintained for the columns users did request
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("300s".to_string()), // Long TTL to ensure no expiry during test
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_projection")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // STEP 1: First query to populate the cache (SELECT content - cache miss)
+            eprintln!("TEST: Step 1 - Populating cache with SELECT content...");
+            let df_populate = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=lauren")))?
+                .select(vec![col("content")])?;
+
+            let populate_results = df_populate.collect().await?;
+            assert!(
+                !populate_results.is_empty() && populate_results[0].num_rows() > 0,
+                "Should have fetched data from HTTP source"
+            );
+            assert_column_has_data(&populate_results, "content");
+
+            // Verify Step 1 returns only the requested column
+            let schema_step1 = populate_results[0].schema();
+            assert!(
+                schema_step1.column_with_name("content").is_some(),
+                "content should be in results"
+            );
+            assert_eq!(
+                schema_step1.fields().len(),
+                1,
+                "Should only have 1 column (content)"
+            );
+
+            // STEP 2: Query with same projection (cache hit)
+            eprintln!("TEST: Step 2 - Querying with SELECT content (should hit cache)...");
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=lauren")))?
+                .select(vec![col("content")])?;
+
+            let results = df.collect().await?;
+
+            assert!(
+                !results.is_empty() && results[0].num_rows() > 0,
+                "Should have data from cache"
+            );
+            assert_column_has_data(&results, "content");
+
+            let schema = results[0].schema();
+
+            // Verify only the requested column is present
+            assert!(
+                schema.column_with_name("content").is_some(),
+                "content should be in results"
+            );
+
+            // Verify we only have the 1 column we requested
+            assert_eq!(
+                schema.fields().len(),
+                1,
+                "Should only have 1 column (content)"
+            );
+
+            eprintln!("\nTEST SUMMARY:");
+            eprintln!("✅ Step 1: SELECT content (cache miss) - populated cache, content has data");
+            eprintln!("✅ Step 2: SELECT content (cache hit) - content has data");
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test that query parameters in different orders both work correctly.
+///
+/// This test verifies that both `q=michael&page=1` and `page=1&q=michael` return data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_param_order")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Query with params in one order
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=michael&page=1")))?
+                .select(vec![col("content")])?;
+
+            let batches1 = df1.collect().await?;
+            assert_column_has_data(&batches1, "content");
+
+            // Query with params in different order
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("page=1&q=michael")))?
+                .select(vec![col("content")])?;
+
+            let batches2 = df2.collect().await?;
+            assert_column_has_data(&batches2, "content");
+
+            Ok(())
+        })
+        .await
+}
+
+/// 4xx responses (like 404 "Not Found") represent valid business responses (e.g., "user not found",
+/// "resource doesn't exist") and should be returned to user and cached.
+///
+/// This test:
+/// 1. Queries an invalid path that returns 404
+/// 2. Verifies user receives the 404 response with status code
+/// 3. Queries same path again (should be cache hit)
+/// 4. Verifies cached data is returned
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::caching=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/invalid_404_test".to_string(), // Invalid path that returns 404
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_404")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching to test acceleration caching specifically
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // STEP 1: Query invalid path (cache miss) - should fetch from HTTP and return 404
+            eprintln!("TEST: Step 1 - Cache miss: querying invalid path that returns 404...");
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/invalid_404_test")))?
+                .select(vec![
+                    col("request_path"),
+                    col("response_status"),
+                    col("content"),
+                ])?;
+
+            let batches1 = df1.collect().await?;
+            assert!(!batches1.is_empty(), "Should have results even for 404");
+            assert_eq!(batches1[0].num_rows(), 1, "Should have exactly 1 row");
+
+            // Verify response_status is 404
+            let status_col = batches1[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                status_col.value(0),
+                404,
+                "Invalid path should return 404 status"
+            );
+
+            // Verify content contains 404 error message
+            let content_col = batches1[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("content should be StringArray");
+            let content = content_col.value(0);
+            assert!(
+                content.contains("Not Found"),
+                "404 response body should contain 'Not Found'"
+            );
+
+            // Small delay to allow cache write to complete
+            tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+
+            // STEP 2: Same query again (cache hit) - should return cached 404 response
+            eprintln!("TEST: Step 2 - Cache hit: same query should return cached 404 response...");
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/invalid_404_test")))?
+                .select(vec![
+                    col("request_path"),
+                    col("response_status"),
+                    col("content"),
+                ])?;
+
+            let batches2 = df2.collect().await?;
+            assert!(!batches2.is_empty(), "Should have cached results");
+            assert_eq!(batches2[0].num_rows(), 1, "Cached result should have 1 row");
+
+            // Verify cached response still has 404 status
+            let status_col2 = batches2[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                status_col2.value(0),
+                404,
+                "Cached response should still have 404 status"
+            );
+
+            // Verify cached content still contains error message
+            let content_col2 = batches2[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("content should be StringArray");
+            let cached_content = content_col2.value(0);
+            assert!(
+                cached_content.contains("Not Found"),
+                "Cached 404 response should contain 'Not Found'"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Asserts that the specified column in the given record batches contains non-empty string data.
+fn assert_column_has_data(batches: &[arrow::array::RecordBatch], column_name: &str) {
+    assert!(!batches.is_empty(), "expected at least one batch");
+
+    let total_len: usize = batches
+        .iter()
+        .filter_map(|b| b.schema().index_of(column_name).ok().map(|i| b.column(i)))
+        .map(|col| {
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column should be StringArray")
+                .iter()
+                .flatten()
+                .map(str::len)
+                .sum::<usize>()
+        })
+        .sum();
+
+    assert!(total_len > 0, "'{column_name}' column has no data");
 }

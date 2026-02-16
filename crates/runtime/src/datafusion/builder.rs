@@ -55,7 +55,9 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -66,6 +68,7 @@ use datafusion_optimizer_rules::{
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
+    url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
@@ -88,7 +91,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+    df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
         .execution
@@ -123,6 +126,9 @@ pub struct DataFusionBuilder {
     metrics: Option<Metrics>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    url_tables_enabled: bool,
+    /// Arbitrary additional analyzer rules.
+    additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -165,6 +171,8 @@ impl DataFusionBuilder {
             metrics: None,
             io_runtime,
             resource_monitor: None,
+            url_tables_enabled: false,
+            additional_analyzer_rules: vec![],
         }
     }
 
@@ -234,6 +242,30 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Enable URL-based table resolution (e.g., `SELECT * FROM 's3://bucket/data.parquet'`).
+    ///
+    /// When enabled, queries can directly reference object store URLs as table names.
+    /// This feature is opt-in and disabled by default.
+    ///
+    /// Enable via spicepod.yml:
+    /// ```yaml
+    /// runtime:
+    ///   params:
+    ///     url_tables: enabled
+    /// ```
+    #[must_use]
+    pub fn with_url_tables(mut self, enabled: bool) -> Self {
+        self.url_tables_enabled = enabled;
+        self
+    }
+
+    /// Adds additional analyzer rules to the `DataFusion` instance.
+    #[must_use]
+    pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
+        self.additional_analyzer_rules = rules;
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -259,6 +291,10 @@ impl DataFusionBuilder {
                 self.io_runtime.clone(),
             ))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        for rule in self.additional_analyzer_rules {
+            state = state.with_analyzer_rule(rule);
+        }
 
         #[cfg(feature = "duckdb")]
         {
@@ -353,6 +389,21 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
+        // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
+        // This is opt-in via `runtime.params.url_tables=enabled`
+        if self.url_tables_enabled {
+            let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
+            let current_catalog_list = Arc::clone(ctx.state().catalog_list());
+            let dynamic_catalog_list = Arc::new(DynamicUrlCatalogList::new(
+                current_catalog_list,
+                Arc::clone(&url_table_factory),
+            ));
+            ctx.register_catalog_list(dynamic_catalog_list);
+
+            // Register the session state with the factory so it can infer schemas
+            url_table_factory.with_state(ctx.state_weak_ref());
+        }
+
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         DataFusion {
@@ -377,6 +428,7 @@ impl DataFusionBuilder {
             cluster_config: self.cluster_config.unwrap_or_default(),
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
+            executor_stream_registry: RwLock::new(None),
         }
     }
 }

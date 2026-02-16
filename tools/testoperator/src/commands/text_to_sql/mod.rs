@@ -39,9 +39,28 @@ type SpicedMemoryUsageMonitor = (
 );
 
 pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
-    let telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
-
     let (app, spiced_instance) = run_or_connect_spiced(&args.common).await?;
+    let run_name = args.get_configuration_name(&app.name);
+
+    // Build resource with attributes known upfront, before creating telemetry.
+    let telemetry = Telemetry::new_with_resource(
+        &Resource::builder_empty()
+            .with_attributes(vec![
+                KeyValue::new("service.name", "testoperator"),
+                KeyValue::new("type", "text_to_sql"),
+                KeyValue::new("name", run_name.clone()),
+                KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+                KeyValue::new(
+                    "spiced_commit_sha",
+                    std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+                ),
+                KeyValue::new("model_name", args.model.clone()),
+                KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+                KeyValue::new("branch_name", git::get_branch_name()),
+            ])
+            .build(),
+        "SPICEAI_BENCHMARK_METRICS_KEY",
+    );
 
     // If we are running `spiced`, monitor its memory usage.
     let memory_handle_opt: Option<SpicedMemoryUsageMonitor> =
@@ -52,11 +71,13 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
         });
 
     let test = SpiceTest::new(
-        args.get_configuration_name(&app.name),
-        NotStarted::new().with_config(
-            args.construct_requests()
-                .context("Cannot make text-to-SQL test cases")?,
-        ),
+        run_name,
+        NotStarted::new()
+            .with_config(
+                args.construct_requests()
+                    .context("Cannot make text-to-SQL test cases")?,
+            )
+            .with_parallel_count(args.common.concurrency),
     )
     .with_spiced_instance(spiced_instance)
     .start()
@@ -97,23 +118,10 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
 #[expect(clippy::cast_sign_loss)]
 #[expect(clippy::cast_possible_truncation)]
 async fn emit_telemetry(
-    mut telemetry: Telemetry,
+    telemetry: Telemetry,
     metrics: &QueryMetrics<TextToSqlMetric, TextToSqlRunMetric>,
     memory_usage: Option<(f64, f64)>,
 ) -> Result<(), anyhow::Error> {
-    telemetry.set_resource(
-        Resource::builder_empty()
-            .with_attributes(vec![
-                KeyValue::new("service.name", "testoperator"),
-                KeyValue::new("type", "text_to_sql"),
-                KeyValue::new("name", metrics.run_name.clone()),
-                KeyValue::new("spiced_version", metrics.spiced_version.clone()),
-                KeyValue::new("spiced_commit_sha", metrics.commit_sha.clone()),
-                KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
-                KeyValue::new("branch_name", git::get_branch_name()),
-            ])
-            .build(),
-    );
     crate::metrics::TEST_DURATION.record(
         u64::try_from(metrics.finished_at - metrics.started_at)?,
         &[],

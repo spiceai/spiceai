@@ -21,6 +21,7 @@ use test_framework::{
     TestType, anyhow,
     app::AppBuilder,
     arrow::util::pretty::print_batches,
+    git,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus, StatisticsCollector},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
@@ -36,6 +37,7 @@ use test_framework::{
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     if args.test_args.common.concurrency < 2 {
         return Err(anyhow::anyhow!(
@@ -65,9 +67,49 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
 
-    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
-    // Resource will be set later with set_resource() before emit()
-    let mut telemetry = super::create_telemetry(&args.test_args.common);
+    // Build resource with attributes known upfront, before creating telemetry.
+    // This ensures the SdkMeterProvider is created with the correct resource,
+    // so all metrics (including HealthMonitor) have proper resource attributes.
+    let spiced_version = spiced_instance.version().to_string();
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let testoperator_commit_sha = git::get_commit_sha();
+    let branch_name = git::get_branch_name();
+    let spicepod = args.test_args.common.spicepod_path.display().to_string();
+
+    let query_set = args.test_args.load_query_set()?;
+    let load_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "load_test"),
+            KeyValue::new("name", app.name.clone()),
+            KeyValue::new("spiced_version", spiced_version),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", branch_name),
+            KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
+            KeyValue::new("spicepod", spicepod),
+            KeyValue::new(
+                "param_set_variants",
+                args.test_args
+                    .random_param_set_count
+                    .unwrap_or(1)
+                    .to_string(),
+            ),
+            KeyValue::new(
+                "protocol",
+                if args.test_args.http_clients {
+                    "http"
+                } else {
+                    "flight"
+                },
+            ),
+        ])
+        .build();
+
+    // Create telemetry with resource upfront, before any metrics calls
+    let telemetry = super::create_telemetry_with_resource(&args.test_args.common, load_resource);
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -87,7 +129,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
+            .with_http_client(args.test_args.http_clients)
+            .with_distributed_mode(args.test_args.distributed),
     )
     .await?;
 
@@ -108,13 +151,14 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // baseline run
     println!("Running baseline throughput test for {baseline_duration_secs}s",);
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
+    let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
+            .with_http_client(args.test_args.http_clients)
+            .with_distributed_mode(args.test_args.distributed),
     )
     .await?;
 
@@ -161,6 +205,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_end_condition(load_end_condition)
         .with_disable_caching(args.test_args.disable_caching)
         .with_http_client(args.test_args.http_clients)
+        .with_distributed_mode(args.test_args.distributed)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
 
     // Add streaming metrics sender if exporter is configured
@@ -218,48 +263,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         (0.0, 0.0)
     };
 
-    // Set up telemetry for load test metrics
-    let commit_sha = metrics.commit_sha.clone();
-    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
-    let spiced_version = metrics.spiced_version.clone();
-    let spicepod = args.test_args.common.spicepod_path.display().to_string();
-    let app_name = app.name.clone();
-
-    let attributes = vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "load_test"),
-        KeyValue::new("name", app_name.clone()),
-        KeyValue::new("spiced_version", spiced_version),
-        KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("testoperator_commit_sha", commit_sha),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("branch_name", metrics.branch_name.clone()),
-        KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
-        KeyValue::new("spicepod", spicepod),
-        // If not specified, default to 1 meaning single fixed params set was used
-        KeyValue::new(
-            "param_set_variants",
-            args.test_args
-                .random_param_set_count
-                .unwrap_or(1)
-                .to_string(),
-        ),
-        KeyValue::new(
-            "protocol",
-            if args.test_args.http_clients {
-                "http"
-            } else {
-                "flight"
-            },
-        ),
-    ];
-
-    telemetry.set_resource(
-        Resource::builder_empty()
-            .with_attributes(attributes.clone())
-            .build(),
-    );
-
     // Record per-query metrics for load test
     for query in &metrics.metrics {
         let query_name = &query.query_name;
@@ -308,8 +311,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let health_report = health_monitor.stop().await;
 
     // Stop and process metrics scraper if enabled
-    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
-        .await;
+    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &[]).await;
 
     // Shutdown streaming exporter before emitting final telemetry
     if let Some(exporter) = streaming_exporter {

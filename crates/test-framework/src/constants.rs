@@ -37,6 +37,9 @@ pub const SQL_ENDPOINT: &str = "/v1/sql";
 /// Search endpoint path (relative to `HTTP_BASE_URL`)
 pub const SEARCH_ENDPOINT: &str = "/v1/search";
 
+/// Async queries endpoint path for distributed query mode (relative to `HTTP_BASE_URL`)
+pub const QUERIES_ENDPOINT: &str = "/v1/queries";
+
 /// Evals endpoint path template (relative to `HTTP_BASE_URL`)
 /// Use `format!("{HTTP_BASE_URL}/v1/evals/{eval_name}")`
 pub const EVALS_ENDPOINT_PREFIX: &str = "/v1/evals";

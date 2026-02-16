@@ -163,6 +163,7 @@ impl Criterion for DataTypeCriterion {
             matches!(
                 data_type,
                 DataType::Utf8
+                    | DataType::LargeUtf8
                     | DataType::Int8
                     | DataType::Int16
                     | DataType::Int32

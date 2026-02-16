@@ -20,7 +20,7 @@ use crate::configure_test_datafusion;
 use crate::{
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 use std::{sync::Arc, time::Duration};
 
@@ -67,7 +67,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 
     tracing::debug!("INSERT INTO lineitem...");
     let insert_stmt =
-        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
+        InsertBuilder::new(&TableReference::from("lineitem"), &tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 
@@ -145,6 +145,8 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
 
 #[tokio::test]
 async fn mysql_refresh_retries() -> Result<(), String> {
+    register_test_connectors().await;
+
     test_request_context()
         .scope(async {
             let running_container = prepare_test_environment().await?;

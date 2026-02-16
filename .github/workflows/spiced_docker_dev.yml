@@ -27,7 +27,7 @@ on:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       dev_label: ${{ steps.set_version.outputs.dev_label }}
@@ -205,7 +205,7 @@ jobs:
   publish:
     needs: [setup, build-amd64, build-arm64]
     if: always() && (needs.build-amd64.result == 'success' || needs.build-arm64.result == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -226,7 +226,7 @@ jobs:
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
       - name: Login to GitHub Package Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

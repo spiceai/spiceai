@@ -1902,6 +1902,12 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                     name: "region".to_string(),
                     expression: "region".to_string(),
                 }],
+                // Add retention SQL to trigger deletes
+                retention_sql: Some(
+                    "DELETE FROM partitioned_delete_test WHERE value > 400".to_string(),
+                ),
+                retention_check_interval: Some("1s".to_string()),
+                retention_check_enabled: true,
                 ..Acceleration::default()
             });
 
@@ -1937,6 +1943,31 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                 "| region | cnt |",
                 "+--------+-----+",
                 "| asia   | 2   |",
+                "| eu     | 2   |",
+                "| us     | 2   |",
+                "+--------+-----+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            // Wait for retention to delete rows where value > 400
+            // Retention check interval is 1s, so wait a bit for it to run
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Verify data after retention deletion - should have 4 rows remaining
+            let result =
+                execute_sql(&rt, "SELECT COUNT(*) as cnt FROM partitioned_delete_test").await?;
+            let expected = ["+-----+", "| cnt |", "+-----+", "| 4   |", "+-----+"];
+            assert_batches_eq!(expected, &result);
+
+            let result = execute_sql(
+                &rt,
+                "SELECT region, COUNT(*) as cnt FROM partitioned_delete_test GROUP BY region ORDER BY region",
+            )
+            .await?;
+            let expected = [
+                "+--------+-----+",
+                "| region | cnt |",
+                "+--------+-----+",
                 "| eu     | 2   |",
                 "| us     | 2   |",
                 "+--------+-----+",

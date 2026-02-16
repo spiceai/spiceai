@@ -74,11 +74,11 @@ pub type ODBCDbConnectionPool<'a> =
 pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ArrowError { source: arrow::error::ArrowError },
-    #[snafu(display("arrow_odbc error: {source}"))]
+    #[snafu(display("ODBC driver error: {source}"))]
     ArrowODBCError { source: arrow_odbc::Error },
-    #[snafu(display("odbc_api Error: {source}"))]
+    #[snafu(display("ODBC connection error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
-    #[snafu(display("odbc_api Error: {message}"))]
+    #[snafu(display("ODBC connection error: {message}"))]
     ODBCAPIErrorNoSource { message: String },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     TryFromError { source: std::num::TryFromIntError },
@@ -382,12 +382,21 @@ mod tests {
 
     use super::*;
 
-    // This test crudely validates that parameters are being received by the ODBC driver
+    // This test crudely validates that parameters are being received by the ODBC driver.
+    // Requires SQLite ODBC driver to be installed: `apt install libsqliteodbc` or equivalent.
+    #[ignore = "Requires SQLite ODBC driver"]
     #[cfg(feature = "odbc")]
     #[tokio::test]
     async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(HashMap::new()).expect("Must create ODBC pool");
+        // We provide a dummy connection_string since ODBCPool::new requires it,
+        // but we use driver_connect directly which ignores it
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            secrecy::SecretString::from("Driver={SQLite}"),
+        );
+        let pool = ODBCPool::new(params).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(

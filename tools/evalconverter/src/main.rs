@@ -98,7 +98,7 @@ fn main() -> Result<()> {
 
     let pod = spicepod_definition(datasets, evals);
 
-    serde_yaml::to_writer(std::fs::File::create(cli.spicepod_output.as_path())?, &pod)?;
+    yaml::to_writer(std::fs::File::create(cli.spicepod_output.as_path())?, &pod)?;
     println!("Spicepod written to {}", cli.spicepod_output.display());
     Ok(())
 }

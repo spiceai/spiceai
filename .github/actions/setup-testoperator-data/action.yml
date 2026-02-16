@@ -15,37 +15,71 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Prepare file-based data directory
+    - name: Prepare file-based data directory (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         sudo rm -rf /opt/spiced/data
         sudo mkdir -p /opt/spiced/data
-        sudo chown runner:runner -R /opt/spiced/data
+        sudo chown "$(whoami):$(id -gn)" -R /opt/spiced/data
 
-    - name: Download DuckDB TPCH Data
+    - name: Prepare file-based data directory (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $dataDir = "C:\spiced\data"
+        if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
+        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+    - name: Download DuckDB TPCH Data (Linux/macOS)
       shell: bash
-      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
 
-    - name: Download DuckDB TPCDS Data
+    - name: Download DuckDB TPCH Data (Windows)
+      shell: pwsh
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os == 'Windows'
+      run: |
+        $ErrorActionPreference = 'Stop'
+        cd C:\spiced\data
+        mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
+
+    - name: Download DuckDB TPCDS Data (Linux/macOS)
       shell: bash
-      if: inputs.query_set == 'tpcds'
+      if: inputs.query_set == 'tpcds' && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
 
-    - name: Download File Connector TPCH Data
+    - name: Download DuckDB TPCDS Data (Windows)
+      shell: pwsh
+      if: inputs.query_set == 'tpcds' && runner.os == 'Windows'
+      run: |
+        $ErrorActionPreference = 'Stop'
+        cd C:\spiced\data
+        mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
+
+    - name: Download File Connector TPCH Data (Linux/macOS)
       shell: bash
-      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
         mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
 
-    - name: Download File Connector TPCDS Data
+    - name: Download File Connector TPCH Data (Windows)
+      shell: pwsh
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os == 'Windows'
+      run: |
+        $ErrorActionPreference = 'Stop'
+        cd C:\spiced\data
+        mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
+
+    - name: Download File Connector TPCDS Data (Linux/macOS)
       shell: bash
-      if: inputs.query_set == 'tpcds'
+      if: inputs.query_set == 'tpcds' && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
         mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
@@ -53,10 +87,30 @@ runs:
         cd ./sf0_01
         mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./
 
-    - name: Download File Connector ClickBench Data
+    - name: Download File Connector TPCDS Data (Windows)
+      shell: pwsh
+      if: inputs.query_set == 'tpcds' && runner.os == 'Windows'
+      run: |
+        $ErrorActionPreference = 'Stop'
+        cd C:\spiced\data
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
+        New-Item -ItemType Directory -Force -Path .\sf0_01 | Out-Null
+        cd .\sf0_01
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./
+
+    - name: Download File Connector ClickBench Data (Linux/macOS)
       shell: bash
-      if: inputs.query_set == 'clickbench'
+      if: inputs.query_set == 'clickbench' && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
+        mc cp spice-minio/benchmarks/clickbench/hits.parquet ./
+
+    - name: Download File Connector ClickBench Data (Windows)
+      shell: pwsh
+      if: inputs.query_set == 'clickbench' && runner.os == 'Windows'
+      run: |
+        $ErrorActionPreference = 'Stop'
+        cd C:\spiced\data
         mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
         mc cp spice-minio/benchmarks/clickbench/hits.parquet ./

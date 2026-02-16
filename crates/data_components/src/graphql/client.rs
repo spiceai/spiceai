@@ -824,6 +824,7 @@ impl GraphQLClient {
         })
     }
 
+    #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &GraphQLQuery,
@@ -1490,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, clippy::needless_raw_string_hashes)]
+    #[expect(clippy::needless_raw_string_hashes)]
     fn test_pagination_parse() {
         let test_cases = vec![
             TestPaginationParseCase {
@@ -1973,7 +1974,7 @@ mod tests {
         let err = result.expect_err("Failed to unnest JSON object");
         assert_eq!(
             err.to_string(),
-            "Invalid object access. Column 'a' already exists in the object."
+            "Invalid GraphQL object access: Column 'a' already exists in the object."
         );
     }
 

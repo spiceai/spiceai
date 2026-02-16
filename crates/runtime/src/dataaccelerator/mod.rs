@@ -32,6 +32,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
+use runtime_acceleration::snapshot::{AccelerationLayout, SnapshotDownloadInfo};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -46,7 +47,7 @@ pub mod cayenne;
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -58,6 +59,7 @@ pub mod spice_sys;
 pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
+pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
@@ -202,10 +204,15 @@ impl AcceleratorEngineRegistry {
 
     pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.clear();
+        // Shutdown each accelerator before clearing the registry
+        for (engine, accelerator) in registry.drain() {
+            if let Err(e) = accelerator.shutdown().await {
+                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
+            }
+        }
     }
 
-    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -370,12 +377,30 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
+    /// Returns the storage layout configuration for this accelerator.
+    ///
+    /// Returns the appropriate `AccelerationLayout` for this engine type:
+    /// - File-based accelerators (`DuckDB`, `SQLite`) return `AccelerationLayout::file`
+    /// - Directory-based accelerators (Cayenne) return `AccelerationLayout::cayenne`
+    ///
+    /// This is used for snapshots and size metrics.
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
+        // Default: use file-based layout if file_path is available
+        if let Ok(path) = self.file_path(source) {
+            AccelerationLayout::file(PathBuf::from(path))
+        } else {
+            AccelerationLayout::default()
+        }
+    }
+
     /// Initialize the accelerator for a component
+    /// Returns `WasBootstrapped::yes()` if the accelerator was initialized from existing data,
+    /// `WasBootstrapped::no()` otherwise.
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(BootstrapStatus::none())
     }
 
     /// Check if the accelerator is initialized for a component
@@ -566,6 +591,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -624,6 +650,29 @@ pub async fn acceleration_file_path(
     Ok(PathBuf::from(file))
 }
 
+/// Gets the storage layout for the given acceleration source.
+///
+/// This function retrieves the registered accelerator for the source's engine
+/// and returns the engine-specific layout. Different engines use
+/// different layout types:
+/// - File-based engines (`DuckDB`, `SQLite`): `AccelerationLayout::file`
+/// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
+///
+/// This is used for snapshots and size metrics.
+pub async fn get_acceleration_layout(
+    source: &dyn AccelerationSource,
+) -> Result<AccelerationLayout, FilePathError> {
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
+
+    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+        .await
+        .context(AcceleratorEngineUnavailableSnafu {
+            engine: acceleration_settings.engine,
+        })?;
+
+    Ok(accelerator.acceleration_layout(source))
+}
+
 pub(crate) fn get_primary_keys_from_constraints(
     constraints: &Constraints,
     schema: &SchemaRef,
@@ -654,6 +703,39 @@ async fn get_registered_accelerator(
         .accelerator_engine_registry()
         .get_accelerator_engine(engine)
         .await
+}
+
+/// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
+/// during initialization, and carries any metadata from the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapStatus {
+    Bootstrapped(SnapshotDownloadInfo),
+    None,
+}
+
+impl BootstrapStatus {
+    #[must_use]
+    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
+        Self::Bootstrapped(info)
+    }
+
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::None
+    }
+
+    #[must_use]
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, Self::Bootstrapped { .. })
+    }
+
+    #[must_use]
+    pub const fn last_updated_at(&self) -> Option<i64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => info.last_updated_at,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1022,7 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -2196,6 +2279,7 @@ mod accelerator_compat_tests {
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,
+                    or_replace: false,
                     definition: None,
                     order_exprs: vec![],
                     unbounded: false,

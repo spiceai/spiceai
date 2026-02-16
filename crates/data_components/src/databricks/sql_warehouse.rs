@@ -21,11 +21,8 @@ use arrow::{
 };
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider,
-    error::DataFusionError,
-    execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter,
-    sql::{TableReference, unparser::dialect},
+    datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -54,7 +51,7 @@ mod datatypes;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Not implemented"))]
+    #[snafu(display("This Databricks SQL Warehouse operation is not implemented"))]
     NotImplemented,
 
     #[snafu(display("HTTP client build failed: {source}"))]
@@ -740,11 +737,8 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     }
 }
 
-fn databricks_dialect() -> dialect::CustomDialect {
-    dialect::CustomDialectBuilder::new()
-        .with_identifier_quote_style('`')
-        .with_interval_style(dialect::IntervalStyle::MySQL)
-        .build()
+fn databricks_dialect() -> super::dialect::DatabricksDialect {
+    super::dialect::DatabricksDialect::new()
 }
 
 #[async_trait]

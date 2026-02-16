@@ -14,6 +14,7 @@ arrow-buffer.workspace = true
 async-trait.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+tracing.workspace = true
 
 [features]
 dev = []

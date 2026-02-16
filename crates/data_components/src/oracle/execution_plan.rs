@@ -86,7 +86,9 @@ impl OracleExecPlan {
         CustomDialectBuilder::new()
             .with_identifier_quote_style('"')
             // There is no 'DOUBLE' SQL type in Oracle: it can use 'FLOAT' for both single and double precision float values
-            .with_float64_ast_dtype(sqlparser::ast::DataType::Float(None))
+            .with_float64_ast_dtype(sqlparser::ast::DataType::Float(
+                sqlparser::ast::ExactNumberInfo::None,
+            ))
             .build()
     }
 

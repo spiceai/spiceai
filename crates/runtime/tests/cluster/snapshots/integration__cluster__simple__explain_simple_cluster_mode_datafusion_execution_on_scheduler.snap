@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/cluster/simple.rs
+expression: "pretty.replace(temp_path.as_str().split_once('/').expect(\"should have leading /\").1,\n\"<TEMP_PATH>\")"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: names.id ASC NULLS LAST                                                                                                                                       |
+|               |   TableScan: names projection=[id, name, age, city, score]                                                                                                          |
+| physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                 |
+|               |   BytesProcessedExec                                                                                                                                                |
+|               |     DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/test_simple_cluster_mode.csv]]}, projection=[id, name, age, city, score], file_type=csv, has_header=true |
+|               |                                                                                                                                                                     |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+

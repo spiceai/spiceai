@@ -39,6 +39,26 @@ pub struct SqliteMetastore {
     conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
+/// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
+fn convert_tokio_rusqlite_error(
+    e: tokio_rusqlite::Error<rusqlite::Error>,
+    context: &str,
+) -> CatalogError {
+    match e {
+        tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(err, msg))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            CatalogError::ConstraintViolation {
+                message: msg.unwrap_or_else(|| "Constraint violation".to_string()),
+            }
+        }
+        tokio_rusqlite::Error::Error(sqlite_err) => CatalogError::Sqlite { source: sqlite_err },
+        other => CatalogError::Database {
+            message: format!("{context}: {other}"),
+        },
+    }
+}
+
 impl std::fmt::Debug for SqliteMetastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteMetastore")
@@ -169,18 +189,23 @@ impl SqliteMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    ///
+    /// Supports composite partition keys by storing column names and values as JSON arrays.
+    /// The `partition_key` column stores a unique composite key (slash-separated values)
+    /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_id INTEGER NOT NULL,
-            partition_column TEXT NOT NULL,
-            partition_value TEXT NOT NULL,
+            partition_columns_json TEXT NOT NULL,
+            partition_values_json TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
-            UNIQUE(table_id, partition_column, partition_value)
+            UNIQUE(table_id, partition_key)
         )
     ";
 
@@ -344,6 +369,29 @@ impl MetastoreBackend for SqliteMetastore {
             },
         )?;
 
+        // Validate that existing tables match the expected schema.
+        // This catches incompatible metadata databases from previous versions.
+        let validate_conn = self.get_conn().await?;
+        super::validate_existing_schema(|table_name| {
+            let conn = validate_conn.clone();
+            async move {
+                conn.call(move |conn| {
+                    let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table_name}')"))?;
+                    let columns: Vec<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<Vec<String>, rusqlite::Error>(columns)
+                })
+                .await
+                .map_err(
+                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                        message: format!("Failed to read table schema for validation: {e}"),
+                    },
+                )
+            }
+        })
+        .await?;
+
         Ok(())
     }
 
@@ -362,11 +410,7 @@ impl MetastoreBackend for SqliteMetastore {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to execute statement: {e}"),
-            },
-        )?;
+        .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
 
         Ok(())
     }
@@ -497,12 +541,19 @@ impl MetastoreBackend for SqliteMetastore {
                 if journal_mode.eq_ignore_ascii_case("wal") {
                     tracing::info!("Truncating Cayenne catalog WAL log");
                     // Truncate the WAL log to persist changes and reduce file size
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+                    // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
+                    let _: (i32, i32, i32) =
+                        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?;
                 }
 
                 // Run optimize to improve query performance for future connections
+                // PRAGMA optimize may return rows indicating what was optimized
                 tracing::info!("Running optimize on Cayenne catalog");
-                conn.execute("PRAGMA optimize", [])?;
+                let mut stmt = conn.prepare("PRAGMA optimize")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -512,6 +563,12 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to shutdown catalog: {e}"),
                 },
             )?;
+
+            // Note: We intentionally do not explicitly close the connection here.
+            // Closing a cloned handle would leave a closed connection stored in the
+            // OnceCell, and any subsequent use of the metastore would see a closed
+            // connection and fail. Instead, we rely on normal drop semantics to
+            // clean up the background connection when the metastore is dropped.
         }
 
         Ok(())

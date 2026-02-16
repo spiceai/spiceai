@@ -17,9 +17,11 @@ limitations under the License.
 use crate::{
     datafusion::{
         DataFusion, flight_session_extension::FlightSessionExtension,
+        job_executor_context_extension::JobExecutorContextExtension,
         request_context_extension::DataFusionContextExtension,
     },
     flight::SessionStore,
+    jobs::JobExecutor,
     model::ModelContextExtension,
     secrets,
 };
@@ -45,6 +47,7 @@ pub struct RequestContextLayer {
     df: Arc<DataFusion>,
     session_store: SessionStore,
     secrets: Arc<RwLock<secrets::Secrets>>,
+    job_executor: Option<Arc<JobExecutor>>,
 }
 
 impl RequestContextLayer {
@@ -60,7 +63,15 @@ impl RequestContextLayer {
             df,
             session_store,
             secrets,
+            job_executor: None,
         }
+    }
+
+    /// Sets the job executor for async query operations (cluster mode only).
+    #[must_use]
+    pub fn with_job_executor(mut self, executor: Option<Arc<JobExecutor>>) -> Self {
+        self.job_executor = executor;
+        self
     }
 }
 
@@ -74,6 +85,7 @@ impl<S> Layer<S> for RequestContextLayer {
             df: Arc::clone(&self.df),
             session_store: self.session_store.clone(),
             secrets: Arc::clone(&self.secrets),
+            job_executor: self.job_executor.clone(),
         }
     }
 }
@@ -85,6 +97,7 @@ pub struct RequestContextMiddleware<S> {
     df: Arc<DataFusion>,
     session_store: SessionStore,
     secrets: Arc<RwLock<secrets::Secrets>>,
+    job_executor: Option<Arc<JobExecutor>>,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for RequestContextMiddleware<S>
@@ -120,6 +133,12 @@ where
             .with_extension(ModelContextExtension::new())
             .with_extension(AppContextExtension::new(self.app.clone()))
             .with_extension(SecretsContextExtension::new(Arc::clone(&self.secrets)));
+
+        // Add job executor extension if available (cluster mode)
+        if let Some(ref executor) = self.job_executor {
+            builder =
+                builder.with_extension(JobExecutorContextExtension::new(Arc::clone(executor)));
+        }
 
         // Add session extension if we have one
         if let Some(session_ext) = session_ext {

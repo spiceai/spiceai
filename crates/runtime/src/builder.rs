@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::DistributedNode;
+use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
+use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
+use crate::metrics_reader::MetricsReader;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -32,6 +36,8 @@ use crate::{
     tracers,
 };
 use app::App;
+use datafusion::optimizer::AnalyzerRule;
+use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 use spicepod::component::caching::Caching;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
@@ -49,6 +55,7 @@ pub struct RuntimeBuilder {
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    metrics_reader: Option<MetricsReader>,
     runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
     io_runtime: Option<Handle>,
@@ -68,6 +75,7 @@ impl RuntimeBuilder {
             datasets_health_monitor_enabled: false,
             metrics_endpoint: None,
             prometheus_registry: None,
+            metrics_reader: None,
             autoload_extensions: HashMap::new(),
             runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
@@ -157,6 +165,16 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the metrics reader for on-demand OTLP metrics collection in cluster mode.
+    ///
+    /// This reader is used by:
+    /// - `GetMetrics` RPC to return local metrics to peer schedulers
+    /// - Executors responding to metrics requests from schedulers via control stream
+    pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
+        self.metrics_reader = Some(metrics_reader);
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -193,22 +211,15 @@ impl RuntimeBuilder {
             .as_ref()
             .is_none_or(|app| app.runtime.task_history.enabled);
 
-        let mut caching_config = self
+        // URL tables are opt-in via `runtime.params.url_tables=enabled`
+        let url_tables_enabled = App::get_runtime_param_opt::<String>(&self.app, "url_tables")
+            .as_deref()
+            == Some("enabled");
+
+        let caching_config = self
             .app
             .as_ref()
             .map_or(Caching::default(), |app| app.runtime.caching.clone());
-        if let Some(results_cache) = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.results_cache.clone())
-        {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release. Use `caching.sql_results` instead. For more information, visit: https://spiceai.org/docs/features/caching"
-                );
-            });
-            caching_config.sql_results = Some(results_cache.into());
-        }
 
         let caching = Runtime::init_caching(Some(&caching_config));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
@@ -216,6 +227,23 @@ impl RuntimeBuilder {
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
 
+        let distributed = match self
+            .resolved_cluster_config
+            .as_ref()
+            .and_then(ResolvedClusterConfig::effective_role)
+        {
+            Some(ClusterRole::Scheduler) => Some(DistributedNode::Scheduler {
+                peers: Arc::new(RwLock::new(HashMap::new())),
+                // Initialized later when scheduler registry starts
+                job_executor: Arc::new(RwLock::new(None)),
+                executor_registry: Arc::new(ExecutorRegistry::new()),
+                partition_manager: Arc::new(RwLock::new(None)),
+            }),
+            Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
+                partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+            }),
+            None => None, // No cluster config means we're running in standalone mode
+        };
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -227,7 +255,19 @@ impl RuntimeBuilder {
         .with_task_history(task_history)
         .with_caching(caching)
         .with_metrics(metrics)
-        .with_resource_monitor(resource_monitor.clone());
+        .with_resource_monitor(resource_monitor.clone())
+        .with_url_tables(url_tables_enabled);
+
+        if let Some(DistributedNode::Scheduler {
+            executor_registry, ..
+        }) = distributed.as_ref()
+        {
+            df_builder =
+                df_builder.with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(
+                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                ))
+                    as Arc<dyn AnalyzerRule + Send + Sync>]);
+        }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
             df_builder = df_builder.with_cluster_config(resolved_cluster_config);
@@ -286,6 +326,7 @@ impl RuntimeBuilder {
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
+            metrics_reader: self.metrics_reader,
             rate_limits: self.rate_limits.unwrap_or_default(),
             io_runtime,
             status: self.runtime_status,
@@ -293,6 +334,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

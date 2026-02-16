@@ -15,14 +15,18 @@ limitations under the License.
 */
 
 use super::ClusterTlsConfig;
-use crate::cluster::ClusterServiceImpl;
-use crate::flight::{Error, is_address_in_use_error};
+use super::composite_flight_service::CompositeFlightService;
+use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
+use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
+use crate::flight::{Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
-use ballista_executor::flight_service::BallistaFlightService;
+use governor::RateLimiter;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Server, ServerTlsConfig};
 
@@ -53,6 +57,8 @@ fn server_with_cluster_mtls(
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
+    executor_registry: Arc<ExecutorRegistry>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> ClusterServerResult<()> {
     let bind_address = rt.df.cluster_config.node_bind_address();
 
@@ -88,7 +94,48 @@ pub async fn start_internal_cluster_server(
         .max_decoding_message_size(usize::MAX)
         .max_encoding_message_size(usize::MAX);
 
-    let cluster_service = ClusterServiceImpl::new(Arc::clone(&rt.app), Arc::clone(&rt.secrets));
+    let advertise_address = rt
+        .df
+        .cluster_config
+        .scheduler_url_string()
+        .map(str::to_string)
+        .or_else(|| {
+            rt.df
+                .cluster_config
+                .node_advertise_address()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| bind_address.to_string());
+
+    // Get partition manager if available (scheduler only)
+    let partition_manager = rt.partition_manager();
+
+    // Use the shared executor stream registry if available (created during scheduler init).
+    // This allows the scheduler callback to broadcast PollNow to connected executors.
+    let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {
+        ClusterServiceImpl::with_executor_streams(
+            Arc::clone(&rt.app),
+            Arc::clone(&rt.secrets),
+            advertise_address,
+            scheduler_peers,
+            Arc::clone(&rt.df),
+            Arc::clone(&executor_registry),
+            rt.metrics_reader().cloned(),
+            partition_manager,
+            executor_streams,
+        )
+    } else {
+        ClusterServiceImpl::new(
+            Arc::clone(&rt.app),
+            Arc::clone(&rt.secrets),
+            advertise_address,
+            scheduler_peers,
+            Arc::clone(&rt.df),
+            Arc::clone(&executor_registry),
+            rt.metrics_reader().cloned(),
+            partition_manager,
+        )
+    };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server
@@ -118,7 +165,11 @@ pub async fn start_internal_cluster_server(
     Ok(())
 }
 
-/// Starts the executor Ballista Flight server used for receiving query fragments.
+/// Starts the executor Flight server for both Ballista shuffle data and Spice SQL queries.
+///
+/// This server uses a composite Flight service that routes:
+/// - Ballista-format requests (`FetchPartition`, `IO_BLOCK_TRANSPORT`) to `BallistaFlightService`
+/// - SQL and `FlightSQL` requests to Spice's Flight service
 ///
 /// mTLS is optional when `--allow-insecure-connections` is used.
 pub async fn start_executor_flight_server(
@@ -144,10 +195,29 @@ pub async fn start_executor_flight_server(
         );
     }
 
-    // Executor: serve only BallistaFlightService for receiving query fragments.
-    // No OTel service needed on executors.
+    // Create composite Flight service that handles both Ballista and Spice protocols
+    let spice_service = SpiceFlightService::new(None);
+    let session_store = spice_service.session_store();
+    let composite_service = CompositeFlightService::new(spice_service);
+
+    // Get app for request context
+    let app = rt.app.read().await.as_ref().map(Arc::clone);
+
+    // Get job executor if available (cluster mode)
+    let job_executor = rt.job_executor();
+
+    // Add middleware layers for request context and rate limiting
+    let mut server = server
+        .layer(
+            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+                .with_job_executor(job_executor),
+        )
+        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
+            RateLimits::default().flight_write_limit,
+        )));
+
     let server = server.add_service(
-        arrow_flight::flight_service_server::FlightServiceServer::new(BallistaFlightService::new())
+        arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
     );

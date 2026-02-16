@@ -18,16 +18,26 @@ limitations under the License.
 //!
 //! These tests verify that deletion vector filtering is applied during reads.
 
+mod common;
+
 use arrow::array::{Int64Array, RecordBatch, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
 };
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -95,16 +105,7 @@ async fn insert_test_data(table_provider: &Arc<CayenneTableProvider>) -> TestRes
         ],
     )?;
 
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-
-    table_provider
-        .insert(boxed_stream)
+    common::insert_batch(table_provider.as_ref(), batch)
         .await
         .map_err(Into::into)
 }

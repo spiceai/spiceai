@@ -11,7 +11,6 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
-# required until DF update to resolve dependency conflicts. See: https://github.com/apache/datafusion/issues/15342
 async-compression = { version = "=0.4.19", features = [
     "tokio",
     "zstd",
@@ -19,24 +18,37 @@ async-compression = { version = "=0.4.19", features = [
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-blake3 = "1.8"
+blake3 = "1.5"
 byte-unit.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
-moka.workspace = true
+moka = { workspace = true, features = ["future"] }
 opentelemetry.workspace = true
+parking_lot.workspace = true
+pingora-lru = { workspace = true, optional = true }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
-twox-hash.workspace = true
+twox-hash = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.7"
+blake3 = "1.8"
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
+rand = "0.8"
 rstest = "0.25.0"
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+twox-hash = { workspace = true }
+
+[features]
+default = []
+pingora = ["dep:pingora-lru"]
+
+[[bench]]
+harness = false
+name = "cache_throughput"
 
 [[bench]]
 harness = false

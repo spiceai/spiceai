@@ -349,8 +349,8 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_permit_waits() {
         let rate_controller = RateControllerBuilder::new()
-            .add_quota(Quota::per_minute(
-                NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
+            .add_quota(Quota::per_second(
+                NonZeroU32::new(2).expect("NonZeroU32 should be non-zero"),
             ))
             .build();
 
@@ -362,24 +362,23 @@ mod tests {
         );
         let permit = permit.expect("should be Ok");
 
-        // Make 9 more waits to full the quota from the permit
-        futures::future::join_all(
-            (0..9).map(async |_| permit.until_ready().await.expect("should wait until ready")),
-        )
-        .await;
+        // Make 1 more wait to fill the quota from the permit (2 per second)
+        permit.until_ready().await.expect("should wait until ready");
 
-        // The next request should wait until the rate limit is reset
+        // The next request should wait until the rate limit is reset (quota exhausted)
         tokio::select! {
             _ = permit.until_ready() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
-            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            // 2/second means 1 every 500ms, wait less than that
+            () = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
 
         // permit should be able to be ready after the rate limit resets
         tokio::select! {
             _ = permit.until_ready() => {}
-            () = tokio::time::sleep(Duration::from_secs(1)) => {
+            // Give plenty of time for the 500ms reset
+            () = tokio::time::sleep(Duration::from_millis(800)) => {
                 panic!("Expected to be able to acquire a permit after rate limit reset, but timed out.");
             }
         }
@@ -426,14 +425,14 @@ mod tests {
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
             ))
-            .add_quota(Quota::per_minute(
-                // should result in per minute quota being hit
-                NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
+            .add_quota(Quota::per_second(
+                // should result in this quota being hit (2 per second = 1 every 500ms)
+                NonZeroU32::new(2).expect("NonZeroU32 should be non-zero"),
             ))
             .build();
 
-        // acquire all 10 permits at once, which should exhaust the per-minute rate limit
-        futures::future::try_join_all((0..10).map(|_| rate_controller.acquire()))
+        // acquire both permits at once, which should exhaust the stricter rate limit
+        futures::future::try_join_all((0..2).map(|_| rate_controller.acquire()))
             .await
             .expect("Should acquire all permits");
 
@@ -442,8 +441,8 @@ mod tests {
             _ = rate_controller.acquire() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
-            // 10/minute is 1 every 6 seconds
-            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            // 2/second is 1 every 500ms, wait less than that
+            () = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
 
         // next permit should occur after the next reset
@@ -453,7 +452,8 @@ mod tests {
                 let permit = permit.expect("should be Ok");
                 assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
-            () = tokio::time::sleep(Duration::from_secs(1)) => {
+            // Give plenty of time for the 500ms reset
+            () = tokio::time::sleep(Duration::from_millis(800)) => {
                 panic!("Expected to acquire a permit after rate limit reset, but timed out.");
             }
         }

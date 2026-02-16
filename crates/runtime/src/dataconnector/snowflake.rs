@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to create Snowflake connection pool: {source}"))]
     UnableToCreateSnowflakeConnectionPool {
         source: db_connection_pool::snowflakepool::Error,
     },
@@ -69,6 +69,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("private_key_path").secret(),
+    ParameterSpec::component("private_key").secret(),
     ParameterSpec::component("private_key_passphrase").secret(),
     ParameterSpec::component("account").secret(),
     ParameterSpec::component("warehouse").secret(),

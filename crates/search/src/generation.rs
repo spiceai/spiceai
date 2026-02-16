@@ -26,16 +26,16 @@ pub mod util;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Error occured during search: {source}"))]
+    #[snafu(display("An internal error occurred during search: {source}"))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("A query engine error occured during search: {source}"))]
+    #[snafu(display("Failed to execute search query: {source}"))]
     QueryError { source: DataFusionError },
 
     #[cfg(feature = "text_search")]
-    #[snafu(display("Error occured performing full text search: {source}"))]
+    #[snafu(display("Failed to perform full text search: {source}"))]
     TextSearchError { source: text_search::Error },
 }
 

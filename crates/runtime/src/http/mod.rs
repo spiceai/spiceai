@@ -54,6 +54,64 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Starts a minimal HTTP server that only serves the `/health` endpoint.
+///
+/// This is used by cluster executors which need a health endpoint for Kubernetes
+/// probes but don't require the full HTTP API.
+pub(crate) async fn start_health_only<A>(
+    bind_address: A,
+    shutdown_signal: Option<CancellationToken>,
+) -> Result<()>
+where
+    A: ToSocketAddrs + Debug,
+{
+    use axum::routing::get;
+
+    let routes = Router::new().route("/health", get(|| async { "ok\n" }));
+
+    let listener = TcpListener::bind(&bind_address)
+        .await
+        .context(UnableToBindServerToPortSnafu)?;
+    tracing::info!("Spice Runtime HTTP health endpoint listening on {bind_address:?}");
+
+    let shutdown_signal = shutdown_signal.unwrap_or_default();
+
+    let (shutdown_notify, _) = watch::channel(());
+
+    loop {
+        tokio::select! {
+            conn = listener.accept() => {
+                let stream = match conn {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        tracing::debug!("Error accepting connection to serve HTTP request: {e}");
+                        continue;
+                    }
+                };
+
+                process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
+            },
+            () = shutdown_signal.cancelled() => {
+                tracing::debug!("Health HTTP server received shutdown signal");
+                drop(listener);
+                let num_active = shutdown_notify.receiver_count();
+                if num_active > 0 {
+                    tracing::info!(
+                        "Detected {num_active} active health check requests. Waiting for completion before shutting down..."
+                    );
+                }
+                shutdown_notify.send(()).ok();
+                shutdown_notify.closed().await;
+                break;
+            }
+        }
+    }
+
+    tracing::debug!("Health HTTP server stopped");
+
+    Ok(())
+}
+
 pub(crate) async fn start<A>(
     bind_address: A,
     rt: Arc<Runtime>,

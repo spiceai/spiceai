@@ -17,6 +17,9 @@ limitations under the License.
 
 pub mod chat;
 pub mod embed;
+mod list_models;
+
+pub use list_models::BedrockModelLister;
 
 use std::sync::Arc;
 

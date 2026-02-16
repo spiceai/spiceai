@@ -54,6 +54,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix
@@ -119,7 +127,7 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GOVER }}
           cache: false
@@ -144,39 +152,23 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build spiced
+      - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models"
-
-      - name: Build spiced (macOS)
-        if: matrix.target.target_os == 'darwin'
-        env:
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
-        if: matrix.target.target_os != 'windows'
+        uses: ./.github/actions/build-spiced
         with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
+          features: 'tpc-extension,models,postgres-accel'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+
+      - name: Build spiced and spice CLI (macOS)
+        if: matrix.target.target_os == 'darwin'
+        uses: ./.github/actions/build-spiced
+        with:
+          features: 'tpc-extension,models,postgres-accel,metal'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -452,7 +444,6 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
@@ -639,7 +630,6 @@ jobs:
         if: matrix.acceleration.engine == 'postgres'
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Install MySQL (Linux)
@@ -1030,7 +1020,6 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Check PostgreSQL

@@ -23,11 +23,14 @@ use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::{
-    component::{caching::ResultsCache, dataset::Dataset},
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
     param::Params,
 };
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
@@ -46,16 +49,17 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
 #[tokio::test]
 async fn results_cache_system_queries() -> Result<(), String> {
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
-            let results_cache = ResultsCache {
+            let sql_results_cache = SQLResultsCacheConfig {
                 item_ttl: Some("60s".to_string()),
                 ..Default::default()
             };
 
             let app = AppBuilder::new("cache_test")
-                .with_results_cache(results_cache)
+                .with_sql_cache(sql_results_cache)
                 .with_dataset(make_s3_tpch_dataset("customer"))
                 .build();
 

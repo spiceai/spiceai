@@ -33,7 +33,6 @@ limitations under the License.
 
 use anyhow::Context;
 use app::{App, AppBuilder};
-use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use http::{
     HeaderValue,
@@ -59,17 +58,20 @@ use std::{
 };
 
 use super::models::sort_json_keys;
+#[cfg(feature = "s3_vectors")]
+use crate::search::s3_vectors::prepare_for_aws_tests;
 use crate::{
     DEFAULT_TRACING_MODELS, configure_test_datafusion, init_tracing,
     models::{create_api_bindings_config, http_post, search::replace_s3_vector_index_names},
-    search::{
-        s3_vectors::prepare_for_aws_tests,
-        tables::{SearchTable, enrich_table},
+    search::tables::{SearchTable, enrich_table},
+    utils::{
+        init_tracing_with_task_history, register_test_connectors, runtime_ready_check,
+        test_request_context,
     },
-    utils::{init_tracing_with_task_history, runtime_ready_check, test_request_context},
 };
 
 pub mod megascience;
+#[cfg(feature = "s3_vectors")]
 mod s3_vectors;
 mod tables;
 
@@ -150,7 +152,7 @@ impl AccelerationOptions {
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
                 params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
-                    "duckdb_file_path".to_string(),
+                    "duckdb_file".to_string(),
                     format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
                 )]))),
                 ..Default::default()
@@ -280,6 +282,8 @@ async fn test_megascience_permutations(
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
+    use runtime::spice_data_base_path;
+
     let slug =
         format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
     if let Err(e) = validate_combination(
@@ -297,6 +301,7 @@ async fn test_megascience_permutations(
     // use some hash of slug
     let mut z = DefaultHasher::new();
     slug.hash(&mut z);
+    std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
     let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
 
     let mut app = AppBuilder::new(slug);
@@ -320,6 +325,7 @@ async fn test_megascience_permutations(
             )),
         );
     }
+    #[cfg(feature = "s3_vectors")]
     prepare_for_aws_tests(&vector_store, vector_store.enabled)
         .await
         .expect("could not prepare vector store for tests");
@@ -464,13 +470,13 @@ fn normalize_search_response(mut json: Value) -> String {
         // To avoid inconsistent snapshots when scores are equal (common when using RRF),
         // we also order based on primary key.
         matches.sort_by(|a, b| {
-            let Some(Value::Number(num_a)) = a.get("score") else {
+            let Some(Value::Number(num_a)) = a.get("_score") else {
                 return Ordering::Greater;
             };
             let Some(score_a) = num_a.as_f64() else {
                 return Ordering::Greater;
             };
-            let Some(Value::Number(num_b)) = b.get("score") else {
+            let Some(Value::Number(num_b)) = b.get("_score") else {
                 return Ordering::Less;
             };
             let Some(score_b) = num_b.as_f64() else {
@@ -494,13 +500,13 @@ fn normalize_search_response(mut json: Value) -> String {
         });
         for m in matches {
             if let Some(obj) = m.as_object_mut()
-                && let Some(Value::Number(n)) = obj.get("score")
+                && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
                 && let Some(truncated_score) =
                     serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
             // Keep 4 decimals
             {
-                obj.insert("score".to_string(), Value::Number(truncated_score));
+                obj.insert("_score".to_string(), Value::Number(truncated_score));
             }
         }
     }
@@ -511,6 +517,7 @@ fn normalize_search_response(mut json: Value) -> String {
 }
 
 pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+    register_test_connectors().await;
     configure_test_datafusion();
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -549,6 +556,7 @@ pub(crate) async fn run_search(
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let client = spiceai::ClientBuilder::new()
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .http_url(http_base_url.as_str())
                 .build()
                 .await
                 .unwrap_or_else(|_| {
@@ -606,9 +614,11 @@ pub(crate) async fn run_search(
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
                         // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
                         let mut disp =
-                            if let Ok(c) = client.query(format!("EXPLAIN {sql}").as_str()).await {
-                                let z = c.try_collect::<Vec<RecordBatch>>().await?;
-                                arrow::util::pretty::pretty_format_batches(&z)?.to_string()
+                            if let Ok(stream) = client.sql(format!("EXPLAIN {sql}").as_str()).await {
+                                match stream.try_collect::<Vec<arrow::record_batch::RecordBatch>>().await {
+                                    Ok(c) => arrow::util::pretty::pretty_format_batches(&c)?.to_string(),
+                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
+                                }
                             } else {
                                 format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
                             };
