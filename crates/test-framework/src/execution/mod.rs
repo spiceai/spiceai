@@ -172,25 +172,10 @@ impl QueryExecutor for FlightExecutor {
         let mut batches = Vec::new();
         let mut row_count = 0;
 
-        loop {
-            match result_stream.try_next().await {
-                Ok(None) => break,
-                Err(e) => {
-                    // Handle connection reset errors by resetting state
-                    // This preserves the behavior from the original execute_flight implementation
-                    if let Some(spiceai::ClientError::ConnectionReset { .. }) = e.downcast_ref::<spiceai::ClientError>() {
-                        row_count = 0;
-                        batches.clear();
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-                Ok(Some(batch)) => {
-                    let batch_rows = batch.num_rows();
-                    row_count += batch_rows;
-                    batches.push(batch);
-                }
-            }
+        while let Some(batch) = result_stream.try_next().await? {
+            let batch_rows = batch.num_rows();
+            row_count += batch_rows;
+            batches.push(batch);
         }
 
         Ok(ExecutionResult {
