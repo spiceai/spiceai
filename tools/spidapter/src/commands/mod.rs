@@ -41,6 +41,7 @@ pub(crate) mod evals;
 pub(crate) mod load;
 pub(crate) mod query;
 pub(crate) mod search;
+pub(crate) mod secrets;
 pub(crate) mod streaming;
 pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
@@ -111,7 +112,6 @@ struct CloudRegion {
     #[serde(default)]
     disabled: bool,
 }
-
 
 #[derive(Debug, Deserialize)]
 struct CloudDeployment {
@@ -214,11 +214,7 @@ async fn resolve_default_cname(
     if let Some(default_region) = &regions.default
         && !default_region.is_empty()
     {
-        if let Some(region) = regions
-            .regions
-            .iter()
-            .find(|r| r.region == *default_region)
-        {
+        if let Some(region) = regions.regions.iter().find(|r| r.region == *default_region) {
             if let Some(cname) = &region.cname {
                 return Ok(cname.clone());
             }
@@ -268,31 +264,6 @@ async fn apply_spicepod_to_app(
         .send()
         .await?
         .error_for_status()?;
-
-    Ok(())
-}
-
-async fn set_secret(
-    client: &Client,
-    base_url: &str,
-    token: &str,
-    app_id: i64,
-    name: &str,
-    value: &str,
-) -> anyhow::Result<()> {
-    let secrets_url = format!("{base_url}/v1/apps/{app_id}/secrets");
-
-    let response = client
-        .post(&secrets_url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "name": name,
-            "value": value,
-        }))
-        .send()
-        .await?;
-
-    response.error_for_status()?;
 
     Ok(())
 }
@@ -381,7 +352,9 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
             )
         })?;
 
-        let client = Client::builder().timeout(Duration::from_secs(600)).build()?;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()?;
 
         let cname = resolve_default_cname(&client, &base_url, &token).await?;
         let flight_url = flight_url_from_cname(&cname);
@@ -408,18 +381,16 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
         println!("Spicepod uploaded");
 
+        println!("Setting secrets from spicepod...");
+        secrets::set_spicepod_secrets(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
+        println!("Spicepod secrets set");
+
         println!("Setting RUNNER secret...");
-        set_secret(&client, &base_url, &token, app_id, "RUNNER", "spidapter").await?;
+        secrets::set_secret(&client, &base_url, &token, app_id, "RUNNER", "spidapter").await?;
         println!("RUNNER secret set");
 
         println!("Creating deployment...");
-        create_deployment(
-            &client,
-            &base_url,
-            &token,
-            app_id,
-        )
-        .await?;
+        create_deployment(&client, &base_url, &token, app_id).await?;
 
         let api_key_for_poll = app_api_key.clone().ok_or_else(|| {
             anyhow::anyhow!("App API key is required to poll deployment readiness")
@@ -439,7 +410,10 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
             "Spice Cloud deployment ready for app '{app_name}'. Connecting to Flight endpoint: {flight_url}",
         );
 
-        Ok((SpicedInstance::external_with_http(&flight_url, &http_base_url), app_api_key))
+        Ok((
+            SpicedInstance::external_with_http(&flight_url, &http_base_url),
+            app_api_key,
+        ))
     }
 }
 
