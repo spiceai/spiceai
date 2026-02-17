@@ -56,10 +56,7 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .with_parallel_count(1)
         .with_end_condition(EndCondition::QuerySetCompleted(5))
         .with_validate(args.validate)
-        .with_disable_caching(args.disable_caching)
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
-        .with_http_client(args.http_clients)
-        .with_distributed_mode(args.distributed)
         .with_query_set(queries)
         .with_query_set_type(query_set.clone())
         .with_query_overrides(query_overrides);
@@ -77,8 +74,7 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
 
     let benchmark_test = SpiceTest::new("local".to_string(), test)
         .with_spiced_instance(spiced_instance)
-        .start()
-        .await?;
+        .start()?;
 
     let test = benchmark_test.wait().await?;
     let row_counts = test.validate_returned_row_counts()?;

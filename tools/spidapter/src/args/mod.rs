@@ -123,7 +123,7 @@ pub struct CommonArgs {
     pub(crate) spiced_start_api_url: Option<String>,
 
     /// The number of seconds to wait for the spiced instance to become ready
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "600")]
     pub(crate) ready_wait: u64,
 
     /// The duration of the test in seconds

@@ -51,10 +51,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         args,
         NotStarted::new()
             .with_parallel_count(1)
-            .with_end_condition(EndCondition::QuerySetCompleted(6))
-            .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients)
-            .with_distributed_mode(args.distributed),
+            .with_end_condition(EndCondition::QuerySetCompleted(6)),
     )
     .await?;
 
@@ -62,8 +59,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .with_api_key(api_key.clone())
         .with_progress_bars(!args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end()?;
@@ -77,10 +73,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         args,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
-            .with_end_condition(EndCondition::QuerySetCompleted(2))
-            .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients)
-            .with_distributed_mode(args.distributed),
+            .with_end_condition(EndCondition::QuerySetCompleted(2)),
     )
     .await?;
 
@@ -88,8 +81,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .with_api_key(api_key)
         .with_progress_bars(!args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;

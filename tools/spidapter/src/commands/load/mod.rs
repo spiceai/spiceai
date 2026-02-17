@@ -104,10 +104,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_condition(EndCondition::QuerySetCompleted(1))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients)
-            .with_distributed_mode(args.test_args.distributed),
+            .with_end_condition(EndCondition::QuerySetCompleted(1)),
     )
     .await?;
 
@@ -115,8 +112,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .with_api_key(api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let spiced_instance = warm_up.wait().await?.end()?;
 
@@ -133,10 +129,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_condition(EndCondition::Duration(baseline_duration))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients)
-            .with_distributed_mode(args.test_args.distributed),
+            .with_end_condition(EndCondition::Duration(baseline_duration)),
     )
     .await?;
 
@@ -144,8 +137,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .with_api_key(api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
@@ -182,9 +174,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let mut test_builder = NotStarted::new()
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
-        .with_disable_caching(args.test_args.disable_caching)
-        .with_http_client(args.test_args.http_clients)
-        .with_distributed_mode(args.test_args.distributed)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
 
     // Add streaming metrics sender if exporter is configured
@@ -207,8 +196,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .with_api_key(api_key)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
     let shutdown_token = throughput_test.cancellation_token();
     let test_future = throughput_test.wait();
     tokio::pin!(test_future);

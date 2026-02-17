@@ -104,21 +104,18 @@ struct CloudRegionsResponse {
 #[derive(Debug, Deserialize)]
 struct CloudRegion {
     region: String,
-    #[serde(rename = "isDefault")]
+    #[serde(default)]
+    cname: Option<String>,
+    #[serde(rename = "isDefault", default)]
     is_default: bool,
+    #[serde(default)]
     disabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CloudDeploymentsResponse {
-    deployments: Vec<CloudDeployment>,
-}
 
 #[derive(Debug, Deserialize)]
 struct CloudDeployment {
     id: i64,
-    status: String,
-    error_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,7 +186,18 @@ async fn ensure_spice_cloud_app(
         }
     }
 
-    let app: CloudApp = create_response.error_for_status()?.json().await?;
+    let status = create_response.status();
+    if status.is_client_error() || status.is_server_error() {
+        let body = create_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read body>".to_string());
+        return Err(anyhow::anyhow!(
+            "Failed to create Spice Cloud app '{app_name}' ({status}): {body}"
+        ));
+    }
+
+    let app: CloudApp = create_response.json().await?;
     Ok((app.id, app.api_key))
 }
 
@@ -202,10 +210,21 @@ async fn resolve_default_cname(
     let response = client.get(&regions_url).bearer_auth(token).send().await?;
     let regions: CloudRegionsResponse = response.error_for_status()?.json().await?;
 
-    if let Some(default_region) = regions.default
+    // Find the region matching the `default` field, then return its cname
+    if let Some(default_region) = &regions.default
         && !default_region.is_empty()
     {
-        return Ok(default_region);
+        if let Some(region) = regions
+            .regions
+            .iter()
+            .find(|r| r.region == *default_region)
+        {
+            if let Some(cname) = &region.cname {
+                return Ok(cname.clone());
+            }
+        }
+        // Fall back to the default value itself if no matching region found
+        return Ok(default_region.clone());
     }
 
     if let Some(region) = regions
@@ -213,11 +232,17 @@ async fn resolve_default_cname(
         .iter()
         .find(|region| region.is_default && !region.disabled)
     {
-        return Ok(region.region.clone());
+        return Ok(region
+            .cname
+            .clone()
+            .unwrap_or_else(|| region.region.clone()));
     }
 
     if let Some(region) = regions.regions.iter().find(|region| !region.disabled) {
-        return Ok(region.region.clone());
+        return Ok(region
+            .cname
+            .clone()
+            .unwrap_or_else(|| region.region.clone()));
     }
 
     Err(anyhow::anyhow!(
@@ -247,12 +272,36 @@ async fn apply_spicepod_to_app(
     Ok(())
 }
 
-async fn create_and_wait_for_deployment(
+async fn set_secret(
     client: &Client,
     base_url: &str,
     token: &str,
     app_id: i64,
-    timeout: Duration,
+    name: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let secrets_url = format!("{base_url}/v1/apps/{app_id}/secrets");
+
+    let response = client
+        .post(&secrets_url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "name": name,
+            "value": value,
+        }))
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+
+    Ok(())
+}
+
+async fn create_deployment(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    app_id: i64,
 ) -> anyhow::Result<()> {
     let deployments_url = format!("{base_url}/v1/apps/{app_id}/deployments");
 
@@ -264,52 +313,53 @@ async fn create_and_wait_for_deployment(
         .await?;
 
     let created: CloudDeployment = response.error_for_status()?.json().await?;
+    println!("Deployment {} created", created.id);
+    Ok(())
+}
+
+/// Wait for a Spice Cloud deployment to become ready by polling the SQL endpoint.
+///
+/// Sends `SELECT 1` to `https://{cname}.spiceai.io/v1/sql` until it returns a successful response.
+async fn wait_for_deployment_ready(
+    client: &Client,
+    cname: &str,
+    api_key: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
+    println!("Waiting for deployment to become ready at {sql_url}...");
 
     let started = tokio::time::Instant::now();
     loop {
         if started.elapsed() > timeout {
             return Err(anyhow::anyhow!(
-                "Timed out waiting for Spice Cloud deployment {} to become ready",
-                created.id
+                "Timed out after {}s waiting for deployment to become ready at {sql_url}",
+                timeout.as_secs(),
             ));
         }
 
-        let status_response = client
-            .get(format!("{deployments_url}?limit=1"))
-            .bearer_auth(token)
+        let elapsed = started.elapsed().as_secs();
+
+        match client
+            .post(&sql_url)
+            .header("X-API-Key", api_key)
+            .body("SELECT 1")
             .send()
-            .await?;
-
-        let deployments: CloudDeploymentsResponse =
-            status_response.error_for_status()?.json().await?;
-        let Some(latest) = deployments.deployments.first() else {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        };
-
-        let normalized = latest.status.to_ascii_lowercase();
-        if matches!(
-            normalized.as_str(),
-            "running" | "ready" | "active" | "completed" | "success" | "succeeded"
-        ) {
-            return Ok(());
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                println!("  Deployment ready ({elapsed}s elapsed)");
+                return Ok(());
+            }
+            Ok(response) => {
+                println!("  Not ready: {} ({elapsed}s elapsed)", response.status());
+            }
+            Err(e) => {
+                println!("  Not ready: {e} ({elapsed}s elapsed)");
+            }
         }
 
-        if matches!(
-            normalized.as_str(),
-            "failed" | "error" | "cancelled" | "canceled"
-        ) {
-            return Err(anyhow::anyhow!(
-                "Spice Cloud deployment {} failed: {}",
-                latest.id,
-                latest
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| latest.status.clone())
-            ));
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -320,16 +370,10 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         args: &CommonArgs,
         _start_request: StartRequest,
     ) -> anyhow::Result<(SpicedInstance, Option<String>)> {
-        if !args.is_external_instance() {
-            return Err(anyhow::anyhow!(
-                "--spiced-path must be a Flight endpoint URL when --spiced-start-mode=spice-cloud"
-            ));
-        }
-
         let base_url = spice_cloud_base_url(args);
         let token = spice_cloud_token()?;
         let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
-        let app_name = spicepod.name.clone();
+        let app_name = sanitize_app_name(&spicepod.name);
         let spicepod_yaml = std::fs::read_to_string(&args.spicepod_path).map_err(|source| {
             anyhow::anyhow!(
                 "Failed to read spicepod file at {}: {source}",
@@ -337,29 +381,94 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
             )
         })?;
 
-        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+        let client = Client::builder().timeout(Duration::from_secs(600)).build()?;
+
+        let cname = resolve_default_cname(&client, &base_url, &token).await?;
+        let flight_url = flight_url_from_cname(&cname);
+
+        println!("Spice Cloud API: {base_url}");
+        println!("Region cname: {cname}");
+        println!("Flight endpoint: {flight_url}");
+        println!("App name: {app_name}");
 
         let (app_id, app_api_key) =
             ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
 
-        apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
+        println!("App ID: {app_id}");
+        println!(
+            "App API key: {}",
+            if app_api_key.is_some() {
+                "<present>"
+            } else {
+                "<not returned>"
+            }
+        );
 
-        create_and_wait_for_deployment(
+        println!("Uploading spicepod to app...");
+        apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
+        println!("Spicepod uploaded");
+
+        println!("Setting RUNNER secret...");
+        set_secret(&client, &base_url, &token, app_id, "RUNNER", "spidapter").await?;
+        println!("RUNNER secret set");
+
+        println!("Creating deployment...");
+        create_deployment(
             &client,
             &base_url,
             &token,
             app_id,
+        )
+        .await?;
+
+        let api_key_for_poll = app_api_key.clone().ok_or_else(|| {
+            anyhow::anyhow!("App API key is required to poll deployment readiness")
+        })?;
+
+        wait_for_deployment_ready(
+            &client,
+            &cname,
+            &api_key_for_poll,
             Duration::from_secs(args.ready_wait),
         )
         .await?;
 
+        let http_base_url = format!("https://{cname}.spiceai.io");
+
         println!(
-            "Spice Cloud deployment ready for app '{app_name}'. Connecting to Flight endpoint: {}",
-            args.spiced_path,
+            "Spice Cloud deployment ready for app '{app_name}'. Connecting to Flight endpoint: {flight_url}",
         );
 
-        Ok((SpicedInstance::external(&args.spiced_path), app_api_key))
+        Ok((SpicedInstance::external_with_http(&flight_url, &http_base_url), app_api_key))
     }
+}
+
+/// Derive the Flight endpoint URL from a Spice Cloud cname.
+///
+/// Replaces the `-data` suffix with `-flight` and constructs `https://{flight_cname}.spiceai.io`.
+/// For example, `us-east-1-dev-aws-data` becomes `https://us-east-1-dev-aws-flight.spiceai.io`.
+fn flight_url_from_cname(cname: &str) -> String {
+    let flight_cname = if let Some(prefix) = cname.strip_suffix("-data") {
+        format!("{prefix}-flight")
+    } else {
+        cname.to_string()
+    };
+    format!("https://{flight_cname}.spiceai.io")
+}
+
+/// Sanitize a spicepod name for use as a Spice Cloud app name.
+///
+/// App names can only contain letters, numbers, and hyphens.
+fn sanitize_app_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn spiced_starter(mode: SpicedStartMode) -> Box<dyn SpicedStarter + Send + Sync> {
