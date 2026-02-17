@@ -585,7 +585,10 @@ datasets:
 
         let refs = super::extract_secret_references(yaml);
         assert_eq!(refs.len(), 4);
-        assert_eq!(refs.get("SPICE_OPENAI_API_KEY"), Some(&"secrets".to_string()));
+        assert_eq!(
+            refs.get("SPICE_OPENAI_API_KEY"),
+            Some(&"secrets".to_string())
+        );
         assert_eq!(refs.get("QS_SCHEMA_PATH"), Some(&"env".to_string()));
         assert_eq!(refs.get("PG_USER"), Some(&"env".to_string()));
         assert_eq!(refs.get("ANOTHER_SECRET"), Some(&"secrets".to_string()));
