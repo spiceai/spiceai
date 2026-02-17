@@ -125,7 +125,12 @@ fn spice_cloud_token() -> anyhow::Result<String> {
         })
 }
 
-async fn ensure_spice_cloud_app(client: &Client, base_url: &str, token: &str, app_name: &str) -> anyhow::Result<i64> {
+async fn ensure_spice_cloud_app(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    app_name: &str,
+) -> anyhow::Result<i64> {
     let apps_url = format!("{base_url}/v1/apps");
     let response = client.get(&apps_url).bearer_auth(token).send().await?;
 
@@ -195,22 +200,32 @@ async fn create_and_wait_for_deployment(
             .send()
             .await?;
 
-        let deployments: CloudDeploymentsResponse = status_response.error_for_status()?.json().await?;
+        let deployments: CloudDeploymentsResponse =
+            status_response.error_for_status()?.json().await?;
         let Some(latest) = deployments.deployments.first() else {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         };
 
         let normalized = latest.status.to_ascii_lowercase();
-        if matches!(normalized.as_str(), "running" | "ready" | "active" | "completed" | "success" | "succeeded") {
+        if matches!(
+            normalized.as_str(),
+            "running" | "ready" | "active" | "completed" | "success" | "succeeded"
+        ) {
             return Ok(());
         }
 
-        if matches!(normalized.as_str(), "failed" | "error" | "cancelled" | "canceled") {
+        if matches!(
+            normalized.as_str(),
+            "failed" | "error" | "cancelled" | "canceled"
+        ) {
             return Err(anyhow::anyhow!(
                 "Spice Cloud deployment {} failed: {}",
                 latest.id,
-                latest.error_message.clone().unwrap_or_else(|| latest.status.clone())
+                latest
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| latest.status.clone())
             ));
         }
 
@@ -236,9 +251,7 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
         let app_name = spicepod.name.clone();
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         let app_id = ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
 
