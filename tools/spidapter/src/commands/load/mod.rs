@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use super::run_or_connect_spiced;
-use crate::{args::{LoadTestArgs, SpicedStartMode}, health::HealthMonitor, spiced_metrics::MetricsScraper};
+use crate::{
+    args::{LoadTestArgs, SpicedStartMode},
+    health::HealthMonitor,
+    spiced_metrics::MetricsScraper,
+};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
