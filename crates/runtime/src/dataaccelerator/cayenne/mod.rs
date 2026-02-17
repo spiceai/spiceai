@@ -95,7 +95,7 @@ pub enum Error {
     ))]
     PartitionByRequired,
 
-    #[snafu(display("Cayenne acceleration S3 storage error: {source}"))]
+    #[snafu(display("Cayenne S3 acceleration error: {source}"))]
     S3Error { source: s3::Error },
 }
 
@@ -1394,7 +1394,6 @@ impl PartitionCreator for CayennePartitionCreator {
         std::fs::create_dir_all(&partition_dir)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
         let partition_column_names = self.partition_column_labels();
 
         // Create composite key for table naming (slash-separated values)

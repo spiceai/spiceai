@@ -2112,12 +2112,14 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
             // Build the runtime - the validation happens during dataset loading
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
 
-            // Give the runtime time to attempt dataset loading
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Trigger dataset loading (which runs snapshot consistency validation).
+            // load_components() awaits all spawned loading tasks, so after it returns
+            // we know validation has completed and failed datasets were not registered.
+            Arc::clone(&runtime).load_components().await;
 
-            // The datasets should NOT be registered because validation failed
+            // The datasets should NOT be registered because validation failed.
             // Check that neither dataset is available (the validation rejects all datasets
-            // with inconsistent configuration)
+            // with inconsistent configuration).
             let taxi_trips_1_result = runtime
                 .datafusion()
                 .query_builder("SELECT COUNT(*) FROM taxi_trips_1")
@@ -2134,9 +2136,9 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
             // Both queries should fail because the datasets were not loaded
             // due to the validation error
             assert!(
-                taxi_trips_1_result.is_err() || taxi_trips_2_result.is_err(),
-                "Expected at least one dataset to be unavailable due to validation failure. \
-                 taxi_trips_1: {:?}, taxi_trips_2: {:?}",
+                taxi_trips_1_result.is_err() && taxi_trips_2_result.is_err(),
+                "Expected both datasets to be unavailable due to validation failure. \
+                 taxi_trips_1_ok: {}, taxi_trips_2_ok: {}",
                 taxi_trips_1_result.is_ok(),
                 taxi_trips_2_result.is_ok()
             );
@@ -2158,7 +2160,7 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
 /// This test verifies that multiple cayenne datasets can bootstrap from snapshots
 /// without conflicting on shared metadata files.
 #[tokio::test]
-async fn snapshot_int_test11_cayenne_multiple_datasets_bootstrap() -> Result<()> {
+async fn snapshot_int_test14_cayenne_multiple_datasets_bootstrap() -> Result<()> {
     let _guard = init_tracing(Some(
         "integration=debug,runtime_acceleration::snapshot=debug,info",
     ));

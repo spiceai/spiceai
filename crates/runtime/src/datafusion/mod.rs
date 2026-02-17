@@ -265,6 +265,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[snafu(display("Unable to acquire lock for DDL-enabled catalogs"))]
+    UnableToLockDdlEnabledCatalogs {},
+
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
@@ -396,6 +399,8 @@ pub struct DataFusion {
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     writable_catalogs: RwLock<HashSet<String>>,
+    /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
+    ddl_enabled_catalogs: RwLock<HashSet<String>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
@@ -544,7 +549,9 @@ impl DataFusion {
         } else {
             self.ctx.register_catalog(name, catalog);
 
-            if matches!(access, AccessMode::ReadWrite) {
+            if access.allows_ddl() {
+                self.mark_catalog_ddl_enabled(name)?;
+            } else if access.allows_write() {
                 self.mark_catalog_writable(name)?;
             }
         }
@@ -633,7 +640,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_access_mode, AccessMode::ReadWrite) {
+        if dataset_access_mode.allows_write() {
             self.mark_dataset_writable(&dataset_table_ref)?;
         }
 
@@ -662,6 +669,32 @@ impl DataFusion {
         tracing::warn!(
             "Access mode 'read_write' is enabled for catalog {catalog_name}. This feature is currently in preview."
         );
+        self.writable_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    /// Returns true if the catalog allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
+    #[must_use]
+    pub fn is_catalog_ddl_enabled(&self, catalog_name: &str) -> bool {
+        if let Ok(ddl_catalogs) = self.ddl_enabled_catalogs.read() {
+            ddl_catalogs.contains(catalog_name)
+        } else {
+            false
+        }
+    }
+
+    /// Marks a catalog as DDL-enabled, allowing CREATE TABLE, DROP TABLE, etc. operations.
+    pub fn mark_catalog_ddl_enabled(&self, catalog_name: &str) -> Result<()> {
+        tracing::warn!(
+            "Access mode 'read_write_create' is enabled for catalog {catalog_name}. DDL operations are allowed. This feature is currently in preview."
+        );
+        self.ddl_enabled_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
+            .insert(catalog_name.to_string());
         self.writable_catalogs
             .write()
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
@@ -791,7 +824,9 @@ impl DataFusion {
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
-                if matches!(access, AccessMode::ReadWrite) {
+                if access.allows_ddl() {
+                    self.mark_catalog_ddl_enabled(name)?;
+                } else if access.allows_write() {
                     self.mark_catalog_writable(name)?;
                 }
             }
@@ -1054,7 +1089,7 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access() == AccessMode::ReadWrite && !has_on_conflict;
+        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -1650,7 +1685,7 @@ impl DataFusion {
 
         let source_table_provider = match dataset.access() {
             AccessMode::Read => federated_table_provider,
-            AccessMode::ReadWrite => source
+            AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
                 .await
                 .ok_or_else(|| {
