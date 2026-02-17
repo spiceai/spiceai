@@ -120,16 +120,17 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
+    // Create the appropriate query executor based on args
+    let executor = super::create_query_executor(args, &spiced_instance).await?;
+
     let (_, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
             .with_validate(args.validate)
-            .with_disable_caching(args.disable_caching)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
-            .with_http_client(args.http_clients)
-            .with_distributed_mode(args.distributed),
+            .with_query_executor(executor),
     )
     .await?;
 
@@ -138,8 +139,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .with_explain_plan_snapshot()
         .with_results_snapshot(snapshot_predicate)
         .with_progress_bars(!args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 
