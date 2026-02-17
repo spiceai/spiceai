@@ -100,9 +100,12 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // warm up run
     println!("Performing warm up");
 
+    let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
+
     let (baseline_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
+            .with_query_executor(executor)
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1)),
     )
@@ -125,9 +128,12 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // baseline run
     println!("Running baseline throughput test for {baseline_duration_secs}s",);
 
+    let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
+
     let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
+            .with_query_executor(executor)
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration)),
     )
@@ -171,7 +177,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .as_ref()
         .map(|endpoint| StreamingOtlpExporter::spawn(endpoint.clone()));
 
+    let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
+
     let mut test_builder = NotStarted::new()
+        .with_query_executor(executor)
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);

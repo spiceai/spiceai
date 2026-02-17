@@ -119,9 +119,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
+    let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
+
     let (_, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
+            .with_query_executor(executor)
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
             .with_validate(args.validate)

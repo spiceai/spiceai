@@ -498,6 +498,17 @@ pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Reso
     Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY")
 }
 
+/// Create a Flight-based query executor for the given spiced instance.
+pub(crate) async fn create_query_executor(
+    spiced_instance: &test_framework::spiced::SpicedInstance,
+    api_key: Option<String>,
+) -> anyhow::Result<Box<dyn test_framework::execution::QueryExecutor>> {
+    let spice_client = spiced_instance.spice_client(api_key, false).await?;
+    Ok(Box::new(test_framework::execution::FlightExecutor::new(
+        std::sync::Arc::new(spice_client),
+    )))
+}
+
 /// Build a test configuration with validation data if applicable
 ///
 /// This is a common helper for bench, throughput, and load tests that:

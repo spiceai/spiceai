@@ -47,9 +47,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     // baseline run
     println!("Running baseline test");
 
+    let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
+
     let (_query_set, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
+            .with_query_executor(executor)
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(6)),
     )
@@ -69,9 +72,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     // throughput test
     println!("Running throughput test");
 
+    let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
+
     let (_query_set, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
+            .with_query_executor(executor)
             .with_parallel_count(args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(2)),
     )

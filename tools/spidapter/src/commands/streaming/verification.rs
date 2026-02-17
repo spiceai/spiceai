@@ -82,8 +82,11 @@ pub async fn run_verification(
         iterations
     );
 
+    let executor = crate::commands::create_query_executor(&spiced_instance, None).await?;
+
     // Create SpiceTest state
     let state = NotStarted::new()
+        .with_query_executor(executor)
         .with_parallel_count(1)
         .with_query_set(queries)
         .with_end_condition(EndCondition::QuerySetCompleted(iterations))

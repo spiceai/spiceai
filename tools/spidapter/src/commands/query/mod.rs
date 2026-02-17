@@ -52,7 +52,10 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .get_queries(query_overrides, Some(&spiced_instance), None)
         .await?;
 
+    let executor = super::create_query_executor(&spiced_instance, None).await?;
+
     let mut test = NotStarted::new()
+        .with_query_executor(executor)
         .with_parallel_count(1)
         .with_end_condition(EndCondition::QuerySetCompleted(5))
         .with_validate(args.validate)
