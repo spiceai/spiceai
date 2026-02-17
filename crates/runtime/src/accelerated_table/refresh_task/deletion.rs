@@ -96,7 +96,12 @@ fn balanced_binary(conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -> Option<
 fn balanced_binary_impl(mut conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -> Option<Expr> {
     match conditions.len() {
         0 => None,
-        1 => Some(conditions.into_iter().next().unwrap()),
+        1 => Some(
+            conditions
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("len checked")),
+        ),
         _ => {
             let mid = conditions.len() / 2;
             let right_exprs = conditions.split_off(mid);
