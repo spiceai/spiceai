@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_extract_secret_references() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 kind: Spicepod
 name: test
@@ -581,7 +581,7 @@ datasets:
       schema_source_path: ${ env:QS_SCHEMA_PATH }
       pg_user: ${env:PG_USER}
       api_key: ${ secrets:ANOTHER_SECRET }
-"#;
+";
 
         let refs = super::extract_secret_references(yaml);
         assert_eq!(refs.len(), 4);
@@ -596,11 +596,11 @@ datasets:
 
     #[test]
     fn test_extract_secret_references_empty() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 kind: Spicepod
 name: test
-"#;
+";
 
         let refs = super::extract_secret_references(yaml);
         assert_eq!(refs.len(), 0);
@@ -608,11 +608,11 @@ name: test
 
     #[test]
     fn test_extract_secret_references_duplicates() {
-        let yaml = r#"
+        let yaml = r"
 param1: ${ env:MY_VAR }
 param2: ${ env:MY_VAR }
 param3: ${ secrets:MY_VAR }
-"#;
+";
 
         let refs = super::extract_secret_references(yaml);
         // MY_VAR appears with different stores, but since we use a HashMap keyed by secret key,

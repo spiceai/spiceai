@@ -96,7 +96,7 @@ pub fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
         };
 
         let is_notification = request.id.is_none();
-        let response = handle_request(request, args.verbose);
+        let response = handle_request(&request, args.verbose);
 
         if is_notification {
             continue;
@@ -118,7 +118,7 @@ fn write_response(
     Ok(())
 }
 
-fn handle_request(request: JsonRpcRequest, verbose: bool) -> JsonRpcResponse {
+fn handle_request(request: &JsonRpcRequest, verbose: bool) -> JsonRpcResponse {
     let id = request.id.clone().unwrap_or(Value::Null);
 
     if request.jsonrpc != JSONRPC_VERSION {
@@ -129,12 +129,11 @@ fn handle_request(request: JsonRpcRequest, verbose: bool) -> JsonRpcResponse {
         return ok_response(id, json!({ "methods": supported_methods() }));
     }
 
-    let method_args = match command_prefix(&request.method) {
-        Some(command) => command,
-        None => return error_response(id, METHOD_NOT_FOUND, "Method not found", None),
+    let Some(method_args) = command_prefix(&request.method) else {
+        return error_response(id, METHOD_NOT_FOUND, "Method not found", None);
     };
 
-    let rpc_args = match parse_args(&request.params) {
+    let rpc_args = match parse_args(request.params.as_ref()) {
         Ok(args) => args,
         Err(message) => {
             return error_response(
@@ -203,7 +202,7 @@ fn error_response(id: Value, code: i64, message: &str, data: Option<Value>) -> J
     }
 }
 
-fn parse_args(params: &Option<Value>) -> Result<Vec<String>, String> {
+fn parse_args(params: Option<&Value>) -> Result<Vec<String>, String> {
     let Some(params) = params else {
         return Ok(Vec::new());
     };

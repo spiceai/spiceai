@@ -214,10 +214,10 @@ async fn resolve_default_cname(
     if let Some(default_region) = &regions.default
         && !default_region.is_empty()
     {
-        if let Some(region) = regions.regions.iter().find(|r| r.region == *default_region) {
-            if let Some(cname) = &region.cname {
-                return Ok(cname.clone());
-            }
+        if let Some(region) = regions.regions.iter().find(|r| r.region == *default_region)
+            && let Some(cname) = &region.cname
+        {
+            return Ok(cname.clone());
         }
         // Fall back to the default value itself if no matching region found
         return Ok(default_region.clone());
