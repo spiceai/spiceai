@@ -51,7 +51,7 @@ pub enum Commands {
     Export(TestCommands),
     /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
-    /// Run spiceman as a newline-delimited JSON-RPC server over stdio
+    /// Run spidapter as a newline-delimited JSON-RPC server over stdio
     Stdio(StdioArgs),
 }
 

@@ -1,10 +1,10 @@
-# spiceman
+# spidapter
 
 ## Overview
 
-`spiceman` is a command-line tool for running and exporting Spicepod environments for testing purposes.
+`spidapter` is a command-line tool for running and exporting Spicepod environments for testing purposes.
 
-While a test is executing, `spiceman` continuously probes the `/health` and `/v1/ready` endpoints on the running `spiced` instance. Responses that fail or take longer than 5 ms are recorded and surfaced after the test run; any such issues will cause the test to fail with a summary that includes the number of failures and the worst latency observed.
+While a test is executing, `spidapter` continuously probes the `/health` and `/v1/ready` endpoints on the running `spiced` instance. Responses that fail or take longer than 5 ms are recorded and surfaced after the test run; any such issues will cause the test to fail with a summary that includes the number of failures and the worst latency observed.
 
 ## Common Options
 
@@ -17,16 +17,16 @@ While a test is executing, `spiceman` continuously probes the `/health` and `/v1
 
 ## Stdio JSON-RPC Mode
 
-`spiceman` can run as a local newline-delimited JSON-RPC 2.0 server over stdio:
+`spidapter` can run as a local newline-delimited JSON-RPC 2.0 server over stdio:
 
 ```sh
-spiceman stdio
+spidapter stdio
 ```
 
 or:
 
 ```sh
-cargo run -p spiceman -- stdio
+cargo run -p spidapter -- stdio
 ```
 
 ### Protocol
@@ -102,7 +102,7 @@ Request:
 Equivalent CLI command executed by stdio mode:
 
 ```sh
-spiceman run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
+spidapter run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
 ```
 
 ### Example: export environment
@@ -134,7 +134,7 @@ Failed command execution returns JSON-RPC error code `-32001` with `data` contai
 
 ### Running Benchmarks
 
-Run standard benchmarks using the `spiceman run bench [OPTIONS]` command. In addition to the common options, this command supports the following options:
+Run standard benchmarks using the `spidapter run bench [OPTIONS]` command. In addition to the common options, this command supports the following options:
 
 - `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`, `integration[http]`, `scenario`.
 - `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
@@ -148,7 +148,7 @@ Running a benchmark test will always generate snapshots for the query explain pl
 
 Snapshots can be automatically re-generated using the [`INSTA_UPDATE`](https://docs.rs/insta/latest/insta/#updating-snapshots) environment variable.
 
-`spiceman run bench [OPTIONS]`
+`spidapter run bench [OPTIONS]`
 
 #### Benchmark Test Examples
 
@@ -157,13 +157,13 @@ Snapshots can be automatically re-generated using the [`INSTA_UPDATE`](https://d
 This assumes that the provided `-d` data directory contains the required data file specified in the spicepod. In this case, `./.data/tpch.db`.
 
 ```sh
-spiceman run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
+spidapter run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
 ```
 
 or:
 
 ```sh
-cargo run -p spiceman -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
+cargo run -p spidapter -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
 ```
 
 ##### Run the Postgres spicepod with an override
@@ -171,13 +171,13 @@ cargo run -p spiceman -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb
 Because PostgreSQL uses a server and requires no local files, the `-d` data directory value can be omitted.
 
 ```sh
-spiceman run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
+spidapter run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
 ```
 
 or:
 
 ```sh
-cargo run -p spiceman -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
+cargo run -p spidapter -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
 ```
 
 ##### Run a custom scenario query set with validation
@@ -185,7 +185,7 @@ cargo run -p spiceman -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb
 Scenario query sets allow you to define custom queries in a YAML file. This is useful for ad-hoc testing or when you need custom validation that doesn't fit the standard integration test pattern.
 
 ```sh
-spiceman run bench \
+spidapter run bench \
   -p test/spicepods/http/post_requests.yaml \
   -s spiced \
   --query-set scenario \
@@ -234,7 +234,7 @@ A throughput test replicates a benchmark test, but runs with multiple concurrent
 
 A throughput test can specify both `--validate` and `--metrics`, but the effects of these options are ignored. Throughput tests disable snapshotting functionality, and do not support data validation.
 
-`spiceman run throughput [OPTIONS]`
+`spidapter run throughput [OPTIONS]`
 
 #### Throughput Test Examples
 
@@ -243,13 +243,13 @@ A throughput test can specify both `--validate` and `--metrics`, but the effects
 This assumes that the provided `-d` data directory contains the required data file specified in the spicepod. In this case, `./.data/tpch.db`.
 
 ```sh
-spiceman run throughput -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --concurrency 25
+spidapter run throughput -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --concurrency 25
 ```
 
 #### Running a TPCH Throughput Test on the File Connector
 
 ```sh
-spiceman run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data --query-set tpch
+spidapter run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data --query-set tpch
 ```
 
 ### Running Load Tests
@@ -264,7 +264,7 @@ A load test will match the specified duration as a best-effort. A load test will
 
 Similar to throughput tests, load tests do not support validation, snapshotting, or metrics.
 
-`spiceman run load [OPTIONS]`
+`spidapter run load [OPTIONS]`
 
 #### Load Test Examples
 
@@ -273,7 +273,7 @@ Similar to throughput tests, load tests do not support validation, snapshotting,
 This assumes that the provided `-d` data directory contains the required data file specified in the spicepod. In this case, `./.data/tpch.db`.
 
 ```sh
-spiceman run load -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --concurrency 8 --duration 600
+spidapter run load -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --concurrency 8 --duration 600
 ```
 
 ### Running Data Consistency tests
@@ -286,7 +286,7 @@ A data consistency test supports the same options as a benchmark test, with the 
 
 Data consistency tests **do** support nested `--validate` options, as well as `--metrics` and snapshotting. Internally, the data consistency test runs two benchmark tests. This means that results from a data consistency test will emit metrics if the `--metrics` option is supplied with a valid API key in the environment variable.
 
-`spiceman run data-consistency [OPTIONS]`
+`spidapter run data-consistency [OPTIONS]`
 
 ### Running HTTP Consistency tests
 
@@ -300,14 +300,14 @@ Runs a test to compare the latency performance of a HTTP enabled component as th
 - `--warmup <SECONDS>`: How long to wait before collecting results, as a warmup period. Defaults to `0`.
 - `--increase-threshold <RATE>`: The threshold for the increase in percentile latency between the first and last bucket of the test. Defaults to `1.1`.
 
-`spiceman run http-consistency [OPTIONS]`
+`spidapter run http-consistency [OPTIONS]`
 
 #### HTTP Consistency Test Examples
 
 ##### Run a HTTP consistency test against an embedding model
 
 ```sh
-spiceman run http-consistency \
+spidapter run http-consistency \
     --duration 300 \
     --buckets 5 \
     --embedding openai-ada \
@@ -324,7 +324,7 @@ Note: The `.model` field in the payload will be overridden.
 ##### Run a HTTP consistency test against an LLM model
 
 ```sh
-spiceman run http-consistency \
+spidapter run http-consistency \
     --duration 300 \
     --buckets 5 \
     --model openai-gpt5 \
@@ -346,14 +346,14 @@ Runs a test to ensure the P50 & p90 latencies do not increase by some threshold 
 - `--base-payload-file <PAYLOAD FILE>`: The path to a file containing request body to use in testing the baseline component. Expects a request body compatible payloads. Cannot not be used in conjunction with `base_payload`.
 - `--base-payload <PAYLOADS>`: The request body(s) to use in testing. Expects a request body compatible payloads.Cannot not be used in conjunction with `base_payload_file`.
 
-`spiceman run http-overhead [OPTIONS]`
+`spidapter run http-overhead [OPTIONS]`
 
 #### HTTP Overhead Test Examples
 
 ##### Run a HTTP overhead test against an embedding model
 
 ```sh
-spiceman run http-overhead \
+spidapter run http-overhead \
   --duration 10 \
   --embedding oai \
   --base-url "https://api.openai.com/v1" \
@@ -404,27 +404,27 @@ Run model evaluations (evals) test. In addition to the common options, supports 
 - `--model <MODEL NAME>`: The language model (as named in Spicepod) to test against. If not specified, the first model from the Spicepod definition will be used.
 - `--eval <EVAL NAME>`: The eval name (as named in Spicepod) to test against. If not specified, the first eval from the Spicepod definition will be used.
 
-`spiceman run evals [OPTIONS]`
+`spidapter run evals [OPTIONS]`
 
 ### Running Vector Search Tests
 
-Running search tests with the spiceman is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Running search tests with the spidapter is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
 
-`spiceman run search [OPTIONS]`
+`spidapter run search [OPTIONS]`
 
 ### Running Text-to-SQL tests
 
-Running text to sql tests with the spiceman is still experimental.
+Running text to sql tests with the spidapter is still experimental.
 
 ```bash
-spiceman run text-to-sql [OPTIONS]
+spidapter run text-to-sql [OPTIONS]
 ```
 Where options are:
 - `--model <MODEL NAME>`: The language model (named in spicepod) to perform text-to-sql.
 - `--queryset-file <FILE_PATH>`: File path to a JSONL of test questions and expected SQL (see `--queryset` for format). Cannot be used in conjunction with `--queryset`
 - `--queryset`: inline JSON array of test questions and expected SQL. Example:
   ```bash
-    spiceman run text-to-sql --queryset '[ 
+    spidapter run text-to-sql --queryset '[ 
       {"question": "how many sales have I made", "sql": "select count(1) from sales"},
       {"question": "Who has the most sales?", "sql": "select sold_by from sales group by sold_by order by count(1) desc limit 1"}
     ]'
@@ -435,28 +435,28 @@ Where options are:
 
 ### Running Append Tests
 
-Append tests with the spiceman are similar to load tests, but operate with a changing data source over time to test the behavior of append-mode acceleration. Append tests support the same options as load tests. Append test sources are only supported for the file connector, but are supported for any `tpch`, `tpcds` or `clickbench` source.
+Append tests with the spidapter are similar to load tests, but operate with a changing data source over time to test the behavior of append-mode acceleration. Append tests support the same options as load tests. Append test sources are only supported for the file connector, but are supported for any `tpch`, `tpcds` or `clickbench` source.
 
 Results validation, snapshotting and metrics are not supported with append tests.
 
-Append tests are not built by default, as the File connector source generation relies on the `duckdb` crate to generate the source data. Because of this, the append test can significantly increase the spiceman build time. To build with append support, use the `append` feature flag: `cargo build -p spiceman --release --features append`.
+Append tests are not built by default, as the File connector source generation relies on the `duckdb` crate to generate the source data. Because of this, the append test can significantly increase the spidapter build time. To build with append support, use the `append` feature flag: `cargo build -p spidapter --release --features append`.
 
 ### Other Examples
 
 #### Using a Non-System Wide Spiced Binary Path
 
 ```sh
-spiceman run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
+spidapter run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
 ```
 
 ### Running queries on existing `spiced` instances
 
-spiceman supports running query sets against `spiced` instances that are already running. This option is useful for running spiceman quickly, locally, for development or performance comparisons (e.g. between versions, changes, etc).
+spidapter supports running query sets against `spiced` instances that are already running. This option is useful for running spidapter quickly, locally, for development or performance comparisons (e.g. between versions, changes, etc).
 
-To run queries on an existing `spiced` instance, ensure your `spiced` instance is running and ready. Then, run spiceman with:
+To run queries on an existing `spiced` instance, ensure your `spiced` instance is running and ready. Then, run spidapter with:
 
 ```sh
-spiceman run query --query-set tpch --query-overrides duckdb
+spidapter run query --query-set tpch --query-overrides duckdb
 ```
 
-spiceman will run without explain plan or result snapshotting. Result validation is supported with `--validate`. Telemetry and metrics emission is not supported.
+spidapter will run without explain plan or result snapshotting. Result validation is supported with `--validate`. Telemetry and metrics emission is not supported.

@@ -120,6 +120,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn run_stdio_mode(args: StdioArgs) -> anyhow::Result<()> {
-    eprintln!("Starting spiceman stdio JSON-RPC server");
+    eprintln!("Starting spidapter stdio JSON-RPC server");
     stdio_server::run_stdio_server(&args)
 }

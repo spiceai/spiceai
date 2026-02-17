@@ -148,7 +148,7 @@ fn handle_request(request: JsonRpcRequest, verbose: bool) -> JsonRpcResponse {
 
     if verbose {
         eprintln!(
-            "[stdio] executing: spiceman {} {}",
+            "[stdio] executing: spidapter {} {}",
             method_args.join(" "),
             rpc_args.join(" ")
         );
