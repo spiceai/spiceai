@@ -15,6 +15,121 @@ While a test is executing, `spiceman` continuously probes the `/health` and `/v1
 - `--disable-progress-bars`: Disable progress bars during the test.
 - `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
+## Stdio JSON-RPC Mode
+
+`spiceman` can run as a local newline-delimited JSON-RPC 2.0 server over stdio:
+
+```sh
+spiceman stdio
+```
+
+or:
+
+```sh
+cargo run -p spiceman -- stdio
+```
+
+### Protocol
+
+- Transport: stdio
+- Framing: one JSON object per line (newline-delimited)
+- Input: client writes requests to server stdin
+- Output: server writes JSON-RPC responses to server stdout
+- Logging: server writes logs to stderr only
+- Constraint: stdout must contain only valid JSON-RPC messages
+
+### Request shape
+
+Each request must be valid JSON-RPC 2.0 with:
+
+- `jsonrpc: "2.0"`
+- `method: <string>`
+- optional `id` (notifications omit `id`)
+- optional `params`
+
+`params` supports either:
+
+- `{"args": ["..."]}`
+- `[...]` (array of CLI argument strings)
+
+The `args` are appended to the mapped CLI command.
+
+### Supported methods
+
+- `rpc.methods` (returns all available methods)
+- `dispatch`
+- `run.throughput`
+- `run.load`
+- `run.bench`
+- `run.data_consistency`
+- `run.evals`
+- `run.search`
+- `run.query`
+- `run.text_to_sql`
+- `run.streaming_dynamodb`
+- `run.streaming_dynamodb_dispatch`
+- `export.throughput`
+- `export.load`
+- `export.bench`
+- `export.data_consistency`
+- `export.evals`
+- `export.search`
+- `export.text_to_sql`
+- `run.append` / `export.append` (only when built with `append` feature)
+
+### Example: list methods
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"rpc.methods"}
+```
+
+Response:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"methods":["rpc.methods","dispatch","run.throughput","..."]}}
+```
+
+### Example: run benchmark
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"run.bench","params":{"args":["-p","./test/spicepods/tpch/sf1/federated/duckdb.yaml","-s","spiced","-d","./.data","--query-set","tpch","--validate"]}}
+```
+
+Equivalent CLI command executed by stdio mode:
+
+```sh
+spiceman run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
+```
+
+### Example: export environment
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"export.bench","params":["-p","./test/spicepods/tpch/sf1/federated/duckdb.yaml","-s","spiced"]}
+```
+
+### Response payloads
+
+Successful responses include:
+
+- `success` (boolean)
+- `exit_code`
+- `stdout` (captured command output)
+- `stderr` (captured command output)
+
+Failed command execution returns JSON-RPC error code `-32001` with `data` containing:
+
+- `exit_code`
+- `stdout`
+- `stderr`
+- `command`
+- `args`
+
 ## Use cases
 
 ### Running Benchmarks

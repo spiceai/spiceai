@@ -22,10 +22,11 @@ mod commands;
 mod health;
 mod metrics;
 mod spiced_metrics;
+mod stdio_server;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
-    TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, StdioArgs,
+    TestCommands, TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -45,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
+        Commands::Stdio(args) => return run_stdio_mode(args),
         Commands::Export(
             TestCommands::Throughput(DatasetTestArgs { common, .. })
             | TestCommands::Bench(DatasetTestArgs { common, .. })
@@ -115,4 +117,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_stdio_mode(args: StdioArgs) -> anyhow::Result<()> {
+    eprintln!("Starting spiceman stdio JSON-RPC server");
+    stdio_server::run_stdio_server(&args)
 }

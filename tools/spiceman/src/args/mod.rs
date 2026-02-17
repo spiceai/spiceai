@@ -51,6 +51,15 @@ pub enum Commands {
     Export(TestCommands),
     /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
+    /// Run spiceman as a newline-delimited JSON-RPC server over stdio
+    Stdio(StdioArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct StdioArgs {
+    /// Log received requests and child-command execution details to stderr
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand)]
