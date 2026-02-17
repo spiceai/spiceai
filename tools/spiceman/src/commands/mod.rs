@@ -18,6 +18,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use crate::args::{CommonArgs, DatasetTestArgs, SpicedStartMode};
 use async_trait::async_trait;
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
@@ -68,6 +70,154 @@ impl SpicedStarter for LocalSpicedStarter {
 
 struct SpiceCloudSpicedStarter;
 
+#[derive(Debug, Deserialize)]
+struct CloudAppsResponse {
+    apps: Vec<CloudApp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudApp {
+    id: i64,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudCreateAppRequest {
+    name: String,
+    visibility: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudDeploymentsResponse {
+    deployments: Vec<CloudDeployment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudDeployment {
+    id: i64,
+    status: String,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudCreateDeploymentRequest {
+    debug: bool,
+}
+
+fn spice_cloud_base_url(args: &CommonArgs) -> String {
+    args.spiced_start_api_url
+        .clone()
+        .or_else(|| std::env::var("SPICE_CLOUD_API_URL").ok())
+        .unwrap_or_else(|| "https://api.spice.ai".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn spice_cloud_token() -> anyhow::Result<String> {
+    std::env::var("SPICEAI_API_KEY")
+        .or_else(|_| std::env::var("SPICE_API_KEY"))
+        .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
+        .or_else(|_| std::env::var("SPICE_SPICEAI_TOKEN"))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "No Spice Cloud token found. Set one of SPICEAI_API_KEY, SPICE_API_KEY, SPICE_SPICEAI_API_KEY, or SPICE_SPICEAI_TOKEN"
+            )
+        })
+}
+
+async fn ensure_spice_cloud_app(client: &Client, base_url: &str, token: &str, app_name: &str) -> anyhow::Result<i64> {
+    let apps_url = format!("{base_url}/v1/apps");
+    let response = client.get(&apps_url).bearer_auth(token).send().await?;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Err(anyhow::anyhow!(
+            "Spice Cloud authentication failed (401). Verify your token scopes for apps:read/apps:write"
+        ));
+    }
+
+    let apps: CloudAppsResponse = response.error_for_status()?.json().await?;
+    if let Some(app) = apps.apps.into_iter().find(|a| a.name == app_name) {
+        return Ok(app.id);
+    }
+
+    let create_response = client
+        .post(&apps_url)
+        .bearer_auth(token)
+        .json(&CloudCreateAppRequest {
+            name: app_name.to_string(),
+            visibility: "private".to_string(),
+        })
+        .send()
+        .await?;
+
+    if create_response.status() == StatusCode::CONFLICT {
+        let retry = client.get(&apps_url).bearer_auth(token).send().await?;
+        let apps: CloudAppsResponse = retry.error_for_status()?.json().await?;
+        if let Some(app) = apps.apps.into_iter().find(|a| a.name == app_name) {
+            return Ok(app.id);
+        }
+    }
+
+    let app: CloudApp = create_response.error_for_status()?.json().await?;
+    Ok(app.id)
+}
+
+async fn create_and_wait_for_deployment(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    app_id: i64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deployments_url = format!("{base_url}/v1/apps/{app_id}/deployments");
+
+    let response = client
+        .post(&deployments_url)
+        .bearer_auth(token)
+        .json(&CloudCreateDeploymentRequest { debug: false })
+        .send()
+        .await?;
+
+    let created: CloudDeployment = response.error_for_status()?.json().await?;
+
+    let started = tokio::time::Instant::now();
+    loop {
+        if started.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for Spice Cloud deployment {} to become ready",
+                created.id
+            ));
+        }
+
+        let status_response = client
+            .get(format!("{deployments_url}?limit=1"))
+            .bearer_auth(token)
+            .send()
+            .await?;
+
+        let deployments: CloudDeploymentsResponse = status_response.error_for_status()?.json().await?;
+        let Some(latest) = deployments.deployments.first() else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+
+        let normalized = latest.status.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "running" | "ready" | "active" | "completed" | "success" | "succeeded") {
+            return Ok(());
+        }
+
+        if matches!(normalized.as_str(), "failed" | "error" | "cancelled" | "canceled") {
+            return Err(anyhow::anyhow!(
+                "Spice Cloud deployment {} failed: {}",
+                latest.id,
+                latest.error_message.clone().unwrap_or_else(|| latest.status.clone())
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 #[async_trait]
 impl SpicedStarter for SpiceCloudSpicedStarter {
     async fn start(
@@ -75,21 +225,35 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         args: &CommonArgs,
         _start_request: StartRequest,
     ) -> anyhow::Result<SpicedInstance> {
-        let Some(api_url) = &args.spiced_start_api_url else {
-            return Err(anyhow::anyhow!(
-                "--spiced-start-api-url is required when --spiced-start-mode=spice-cloud"
-            ));
-        };
-
         if !args.is_external_instance() {
             return Err(anyhow::anyhow!(
                 "--spiced-path must be a Flight endpoint URL when --spiced-start-mode=spice-cloud"
             ));
         }
 
+        let base_url = spice_cloud_base_url(args);
+        let token = spice_cloud_token()?;
+        let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
+        let app_name = spicepod.name.clone();
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        let app_id = ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
+
+        create_and_wait_for_deployment(
+            &client,
+            &base_url,
+            &token,
+            app_id,
+            Duration::from_secs(args.ready_wait),
+        )
+        .await?;
+
         println!(
-            "Spice Cloud startup selected (stub): would call {api_url} to start spiced at {}",
-            args.spiced_path
+            "Spice Cloud deployment ready for app '{app_name}'. Connecting to Flight endpoint: {}",
+            args.spiced_path,
         );
 
         Ok(SpicedInstance::external(&args.spiced_path))
