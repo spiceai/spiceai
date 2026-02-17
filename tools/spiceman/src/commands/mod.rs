@@ -190,7 +190,11 @@ async fn ensure_spice_cloud_app(
     Ok(app.id)
 }
 
-async fn resolve_default_cname(client: &Client, base_url: &str, token: &str) -> anyhow::Result<String> {
+async fn resolve_default_cname(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+) -> anyhow::Result<String> {
     let regions_url = format!("{base_url}/v1/regions");
     let response = client.get(&regions_url).bearer_auth(token).send().await?;
     let regions: CloudRegionsResponse = response.error_for_status()?.json().await?;
