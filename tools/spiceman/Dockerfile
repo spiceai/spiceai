@@ -4,14 +4,14 @@ ARG BASE_IMAGE=debian:trixie-slim
 
 FROM ${BASE_IMAGE}
 
-ARG TESTOPERATOR_BIN=testoperator
+ARG SPICEMAN_BIN=spiceman
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
-COPY --chmod=0755 ${TESTOPERATOR_BIN} /usr/local/bin/testoperator
+COPY --chmod=0755 ${SPICEMAN_BIN} /usr/local/bin/spiceman
 
 WORKDIR /app
 
-ENTRYPOINT ["/usr/local/bin/testoperator"]
+ENTRYPOINT ["/usr/local/bin/spiceman"]
