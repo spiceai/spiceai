@@ -108,7 +108,10 @@ pub fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_response(stdout: &mut io::BufWriter<io::Stdout>, response: &JsonRpcResponse) -> anyhow::Result<()> {
+fn write_response(
+    stdout: &mut io::BufWriter<io::Stdout>,
+    response: &JsonRpcResponse,
+) -> anyhow::Result<()> {
     let line = serde_json::to_string(response)?;
     writeln!(stdout, "{line}")?;
     stdout.flush()?;
@@ -133,16 +136,31 @@ fn handle_request(request: JsonRpcRequest, verbose: bool) -> JsonRpcResponse {
 
     let rpc_args = match parse_args(&request.params) {
         Ok(args) => args,
-        Err(message) => return error_response(id, INVALID_PARAMS, "Invalid params", Some(json!({"details": message}))),
+        Err(message) => {
+            return error_response(
+                id,
+                INVALID_PARAMS,
+                "Invalid params",
+                Some(json!({"details": message})),
+            );
+        }
     };
 
     if verbose {
-        eprintln!("[stdio] executing: spiceman {} {}", method_args.join(" "), rpc_args.join(" "));
+        eprintln!(
+            "[stdio] executing: spiceman {} {}",
+            method_args.join(" "),
+            rpc_args.join(" ")
+        );
     }
 
     match execute_child(&method_args, &rpc_args) {
         Ok(output) => ok_response(id, output),
-        Err(CommandExecutionError::Failed { exit_code, stdout, stderr }) => error_response(
+        Err(CommandExecutionError::Failed {
+            exit_code,
+            stdout,
+            stderr,
+        }) => error_response(
             id,
             COMMAND_FAILED,
             "Command failed",
@@ -219,7 +237,9 @@ fn parse_args(params: &Option<Value>) -> Result<Vec<String>, String> {
                 })
                 .collect()
         }
-        _ => Err("params must be an object with optional args array or a raw args array".to_string()),
+        _ => {
+            Err("params must be an object with optional args array or a raw args array".to_string())
+        }
     }
 }
 
@@ -299,7 +319,8 @@ enum CommandExecutionError {
 }
 
 fn execute_child(command: &[String], args: &[String]) -> Result<Value, CommandExecutionError> {
-    let current_exe = std::env::current_exe().map_err(|e| CommandExecutionError::System(e.into()))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| CommandExecutionError::System(e.into()))?;
 
     let output = Command::new(current_exe)
         .args(command)
