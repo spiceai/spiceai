@@ -37,8 +37,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     }
 
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let (mut spiced_instance, api_key) =
-        start_spiced_instance(&args.common, start_request).await?;
+    let (mut spiced_instance, api_key) = start_spiced_instance(&args.common, start_request).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))

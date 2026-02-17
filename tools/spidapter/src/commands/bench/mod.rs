@@ -68,8 +68,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let (mut spiced_instance, api_key) =
-        start_spiced_instance(&args.common, start_request).await?;
+    let (mut spiced_instance, api_key) = start_spiced_instance(&args.common, start_request).await?;
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();

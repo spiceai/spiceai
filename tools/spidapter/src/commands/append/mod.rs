@@ -78,13 +78,14 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         }
     };
 
-    let (mut spiced_instance, _api_key) = match start_spiced_instance(&args.test_args.common, start_request).await {
-        Ok(result) => result,
-        Err(e) => {
-            test_metrics.emit(TestStatus::Failed).await?;
-            return Err(e);
-        }
-    };
+    let (mut spiced_instance, _api_key) =
+        match start_spiced_instance(&args.test_args.common, start_request).await {
+            Ok(result) => result,
+            Err(e) => {
+                test_metrics.emit(TestStatus::Failed).await?;
+                return Err(e);
+            }
+        };
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
