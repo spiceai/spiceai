@@ -42,26 +42,9 @@ pub enum Error {
     ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to create DuckDB connection pool: {source}"))]
-    UnableToCreatePool {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Failed to get DuckDB connection: {source}"))]
-    UnableToGetConnection {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Failed to initialize DuckLake: {source}"))]
     UnableToInitializeDuckLake { source: duckdb::Error },
-
-    #[snafu(display("Failed to refresh DuckLake catalog: {source}"))]
-    UnableToRefreshCatalog {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")

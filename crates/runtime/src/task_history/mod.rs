@@ -396,11 +396,12 @@ impl TaskSpan {
 pub(crate) fn downcast_builder<T: ArrayBuilder>(
     builder: &mut dyn ArrayBuilder,
 ) -> Result<&mut T, Error> {
-    let builder = builder
+    builder
         .as_any_mut()
         .downcast_mut::<T>()
-        .context(DowncastBuilderSnafu)?;
-    Ok(builder)
+        .ok_or_else(|| Error::DowncastBuilder {
+            expected: std::any::type_name::<T>(),
+        })
 }
 
 #[derive(Debug, Snafu)]
@@ -438,8 +439,8 @@ pub enum Error {
     #[snafu(display("The `task_history` table was not found"))]
     TableNotFound,
 
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
-    DowncastBuilder,
+    #[snafu(display("Unable to downcast ArrayBuilder to expected type {expected}"))]
+    DowncastBuilder { expected: &'static str },
 
     #[snafu(display("Invalid `task_history` configuration: {source}"))]
     InvalidConfiguration {

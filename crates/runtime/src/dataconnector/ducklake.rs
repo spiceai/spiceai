@@ -47,11 +47,6 @@ pub enum Error {
     ))]
     MissingConnectionString,
 
-    #[snafu(display("Failed to create DuckDB connection pool: {source}"))]
-    UnableToCreatePool {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Failed to initialize DuckLake extension: {source}"))]
     UnableToInitializeDuckLake { source: duckdb::Error },
 

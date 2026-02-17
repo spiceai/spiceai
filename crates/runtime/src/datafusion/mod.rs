@@ -695,8 +695,10 @@ impl DataFusion {
             .write()
             .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
             .insert(catalog_name.to_string());
-        // DDL-enabled catalogs are also writable
-        self.mark_catalog_writable(catalog_name)?;
+        self.writable_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .insert(catalog_name.to_string());
         Ok(())
     }
 

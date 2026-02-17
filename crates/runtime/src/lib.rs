@@ -1052,12 +1052,6 @@ impl Runtime {
             None => (None, None),
         };
 
-        if self.df.cluster_config.effective_role().is_some() {
-            tracing::warn!(
-                "Distributed Query (Alpha) is in preview and should not be used in production."
-            );
-        }
-
         // Start Flight server
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);

@@ -1280,8 +1280,7 @@ impl CacheRefreshHelper {
                 // Return ALL data to user (including 5xx responses)
                 let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
                 let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                let stream: SendableRecordBatchStream = Box::pin(adapter);
-                stream
+                Box::pin(adapter)
             }
             Ok(_) => {
                 // Source returned empty data (no error, just no rows)
@@ -1291,8 +1290,7 @@ impl CacheRefreshHelper {
                 );
                 let empty_stream =
                     RecordBatchStreamAdapter::new(fallback_schema, futures::stream::empty());
-                let stream: SendableRecordBatchStream = Box::pin(empty_stream);
-                stream
+                Box::pin(empty_stream)
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
@@ -1308,8 +1306,7 @@ impl CacheRefreshHelper {
                     let batch_schema = batches[0].schema();
                     let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
                     let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                    let stream: SendableRecordBatchStream = Box::pin(adapter);
-                    return stream;
+                    return Box::pin(adapter);
                 }
 
                 tracing::error!(
@@ -1321,8 +1318,7 @@ impl CacheRefreshHelper {
                     fallback_schema,
                     futures::stream::once(async move { Err(e) }),
                 );
-                let stream: SendableRecordBatchStream = Box::pin(error_stream);
-                stream
+                Box::pin(error_stream)
             }
         }
     }

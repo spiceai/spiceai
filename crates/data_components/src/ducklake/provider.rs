@@ -35,11 +35,6 @@ use crate::RefreshableCatalogProvider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get DuckDB table provider: {source}"))]
-    TableProviderFailed {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Failed to execute DuckDB query: {source}"))]
     QueryFailed { source: duckdb::Error },
 
@@ -49,32 +44,9 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Write operations are not allowed on this catalog (access mode is read-only)"
-    ))]
-    WriteNotAllowed,
-
-    #[snafu(display(
         "DDL operations are not allowed on this catalog (access mode does not include create)"
     ))]
     DdlNotAllowed,
-
-    #[snafu(display("Schema '{schema_name}' not found in catalog '{catalog_name}'"))]
-    SchemaNotFound {
-        catalog_name: String,
-        schema_name: String,
-    },
-
-    #[snafu(display("Schema '{schema_name}' already exists in catalog '{catalog_name}'"))]
-    SchemaAlreadyExists {
-        catalog_name: String,
-        schema_name: String,
-    },
-
-    #[snafu(display("Table '{table_name}' not found in schema '{schema_name}'"))]
-    TableNotFound {
-        table_name: String,
-        schema_name: String,
-    },
 
     #[snafu(display("Table '{table_name}' already exists in schema '{schema_name}'"))]
     TableAlreadyExists {
