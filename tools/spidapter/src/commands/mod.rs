@@ -562,9 +562,14 @@ pub(crate) async fn run_or_connect_spiced(
             (app, instance, api_key)
         }
     };
-    instance
-        .wait_for_ready(std::time::Duration::from_secs(args.ready_wait))
-        .await?;
+
+    // Skip wait_for_ready for Spice Cloud — readiness was already verified
+    // by polling the SQL endpoint during deployment.
+    if !matches!(args.spiced_start_mode, SpicedStartMode::SpiceCloud) {
+        instance
+            .wait_for_ready(std::time::Duration::from_secs(args.ready_wait))
+            .await?;
+    }
 
     Ok((app, instance, api_key))
 }
