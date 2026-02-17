@@ -46,14 +46,22 @@ pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
 #[async_trait]
 trait SpicedStarter {
-    async fn start(&self, args: &CommonArgs, start_request: StartRequest) -> anyhow::Result<SpicedInstance>;
+    async fn start(
+        &self,
+        args: &CommonArgs,
+        start_request: StartRequest,
+    ) -> anyhow::Result<SpicedInstance>;
 }
 
 struct LocalSpicedStarter;
 
 #[async_trait]
 impl SpicedStarter for LocalSpicedStarter {
-    async fn start(&self, _args: &CommonArgs, start_request: StartRequest) -> anyhow::Result<SpicedInstance> {
+    async fn start(
+        &self,
+        _args: &CommonArgs,
+        start_request: StartRequest,
+    ) -> anyhow::Result<SpicedInstance> {
         SpicedInstance::start(start_request).await
     }
 }
