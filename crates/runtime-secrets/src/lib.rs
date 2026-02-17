@@ -242,6 +242,40 @@ impl Default for Secrets {
     }
 }
 
+/// Extract all secret references from a string (e.g., spicepod YAML content).
+///
+/// Returns a map where keys are secret keys and values are the store names they reference.
+/// For example, `${ env:MY_VAR }` returns `("MY_VAR", "env")` and
+/// `${ secrets:API_KEY }` returns `("API_KEY", "secrets")`.
+///
+/// # Example
+/// ```
+/// use runtime_secrets::extract_secret_references;
+///
+/// let yaml = r#"
+/// params:
+///   api_key: ${ secrets:OPENAI_KEY }
+///   user: ${ env:DB_USER }
+/// "#;
+///
+/// let refs = extract_secret_references(yaml);
+/// assert_eq!(refs.get("OPENAI_KEY"), Some(&"secrets".to_string()));
+/// assert_eq!(refs.get("DB_USER"), Some(&"env".to_string()));
+/// ```
+#[must_use]
+pub fn extract_secret_references(content: &str) -> std::collections::HashMap<String, String> {
+    let mut references = std::collections::HashMap::new();
+
+    for secret_replacement in SecretReplacementMatcher::new(content) {
+        references.insert(
+            secret_replacement.key.clone(),
+            secret_replacement.store_name.clone(),
+        );
+    }
+
+    references
+}
+
 pub enum SecretStoreType {
     Env,
     EnvCustomPath(String),
@@ -525,5 +559,62 @@ mod tests {
             )
             .await;
         assert_eq!("This is a secret: ! 🫡", result.expose_secret());
+    }
+
+    #[test]
+    fn test_extract_secret_references() {
+        let yaml = r#"
+version: v1
+kind: Spicepod
+name: test
+
+models:
+  - from: openai:gpt-4o-mini
+    name: openai-gpt
+    params:
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+
+datasets:
+  - from: file:///path/to/data.jsonl
+    name: qs
+    params:
+      schema_source_path: ${ env:QS_SCHEMA_PATH }
+      pg_user: ${env:PG_USER}
+      api_key: ${ secrets:ANOTHER_SECRET }
+"#;
+
+        let refs = super::extract_secret_references(yaml);
+        assert_eq!(refs.len(), 4);
+        assert_eq!(refs.get("SPICE_OPENAI_API_KEY"), Some(&"secrets".to_string()));
+        assert_eq!(refs.get("QS_SCHEMA_PATH"), Some(&"env".to_string()));
+        assert_eq!(refs.get("PG_USER"), Some(&"env".to_string()));
+        assert_eq!(refs.get("ANOTHER_SECRET"), Some(&"secrets".to_string()));
+    }
+
+    #[test]
+    fn test_extract_secret_references_empty() {
+        let yaml = r#"
+version: v1
+kind: Spicepod
+name: test
+"#;
+
+        let refs = super::extract_secret_references(yaml);
+        assert_eq!(refs.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_secret_references_duplicates() {
+        let yaml = r#"
+param1: ${ env:MY_VAR }
+param2: ${ env:MY_VAR }
+param3: ${ secrets:MY_VAR }
+"#;
+
+        let refs = super::extract_secret_references(yaml);
+        // MY_VAR appears with different stores, but since we use a HashMap keyed by secret key,
+        // only the last occurrence is kept
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs.get("MY_VAR"), Some(&"secrets".to_string()));
     }
 }
