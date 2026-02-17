@@ -78,8 +78,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         }
     };
 
-    let mut spiced_instance = match start_spiced_instance(&args.test_args.common, start_request).await {
-        Ok(instance) => instance,
+    let (mut spiced_instance, _api_key) = match start_spiced_instance(&args.test_args.common, start_request).await {
+        Ok(result) => result,
         Err(e) => {
             test_metrics.emit(TestStatus::Failed).await?;
             return Err(e);

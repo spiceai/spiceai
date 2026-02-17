@@ -37,7 +37,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     }
 
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
+    let (mut spiced_instance, api_key) =
+        start_spiced_instance(&args.common, start_request).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -60,6 +61,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(api_key.clone())
         .with_progress_bars(!args.common.disable_progress_bars)
         .start()
         .await?;
@@ -85,6 +87,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(api_key)
         .with_progress_bars(!args.common.disable_progress_bars)
         .start()
         .await?;

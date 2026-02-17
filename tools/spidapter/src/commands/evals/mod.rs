@@ -93,7 +93,8 @@ impl EvalMetrics {
 
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
+    let (mut spiced_instance, _api_key) =
+        start_spiced_instance(&args.common, start_request).await?;
 
     let eval = args
         .eval

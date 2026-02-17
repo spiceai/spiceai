@@ -68,7 +68,8 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
+    let (mut spiced_instance, api_key) =
+        start_spiced_instance(&args.common, start_request).await?;
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();
@@ -134,6 +135,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(api_key)
         .with_explain_plan_snapshot()
         .with_results_snapshot(snapshot_predicate)
         .with_progress_bars(!args.common.disable_progress_bars)

@@ -52,7 +52,7 @@ trait SpicedStarter {
         &self,
         args: &CommonArgs,
         start_request: StartRequest,
-    ) -> anyhow::Result<SpicedInstance>;
+    ) -> anyhow::Result<(SpicedInstance, Option<String>)>;
 }
 
 struct LocalSpicedStarter;
@@ -63,8 +63,8 @@ impl SpicedStarter for LocalSpicedStarter {
         &self,
         _args: &CommonArgs,
         start_request: StartRequest,
-    ) -> anyhow::Result<SpicedInstance> {
-        SpicedInstance::start(start_request).await
+    ) -> anyhow::Result<(SpicedInstance, Option<String>)> {
+        Ok((SpicedInstance::start(start_request).await?, None))
     }
 }
 
@@ -79,6 +79,7 @@ struct CloudAppsResponse {
 struct CloudApp {
     id: i64,
     name: String,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +87,7 @@ struct CloudCreateAppRequest {
     name: String,
     cname: String,
     visibility: String,
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,7 +152,7 @@ async fn ensure_spice_cloud_app(
     base_url: &str,
     token: &str,
     app_name: &str,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<(i64, Option<String>)> {
     let apps_url = format!("{base_url}/v1/apps");
     let response = client.get(&apps_url).bearer_auth(token).send().await?;
 
@@ -162,7 +164,7 @@ async fn ensure_spice_cloud_app(
 
     let apps: CloudAppsResponse = response.error_for_status()?.json().await?;
     if let Some(app) = apps.apps.into_iter().find(|a| a.name == app_name) {
-        return Ok(app.id);
+        return Ok((app.id, app.api_key));
     }
 
     let cname = resolve_default_cname(client, base_url, token).await?;
@@ -174,6 +176,7 @@ async fn ensure_spice_cloud_app(
             name: app_name.to_string(),
             cname,
             visibility: "private".to_string(),
+            tags: BTreeMap::from([("kind".to_string(), "cluster".to_string())]),
         })
         .send()
         .await?;
@@ -182,12 +185,12 @@ async fn ensure_spice_cloud_app(
         let retry = client.get(&apps_url).bearer_auth(token).send().await?;
         let apps: CloudAppsResponse = retry.error_for_status()?.json().await?;
         if let Some(app) = apps.apps.into_iter().find(|a| a.name == app_name) {
-            return Ok(app.id);
+            return Ok((app.id, app.api_key));
         }
     }
 
     let app: CloudApp = create_response.error_for_status()?.json().await?;
-    Ok(app.id)
+    Ok((app.id, app.api_key))
 }
 
 async fn resolve_default_cname(
@@ -316,7 +319,7 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         &self,
         args: &CommonArgs,
         _start_request: StartRequest,
-    ) -> anyhow::Result<SpicedInstance> {
+    ) -> anyhow::Result<(SpicedInstance, Option<String>)> {
         if !args.is_external_instance() {
             return Err(anyhow::anyhow!(
                 "--spiced-path must be a Flight endpoint URL when --spiced-start-mode=spice-cloud"
@@ -336,7 +339,8 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
 
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
-        let app_id = ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
+        let (app_id, app_api_key) =
+            ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
 
         apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
 
@@ -354,7 +358,7 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
             args.spiced_path,
         );
 
-        Ok(SpicedInstance::external(&args.spiced_path))
+        Ok((SpicedInstance::external(&args.spiced_path), app_api_key))
     }
 }
 
@@ -429,8 +433,8 @@ pub(crate) async fn build_test_with_validation(
 
 pub(crate) async fn run_or_connect_spiced(
     args: &CommonArgs,
-) -> anyhow::Result<(App, SpicedInstance)> {
-    let (app, mut instance) = match args.spiced_start_mode {
+) -> anyhow::Result<(App, SpicedInstance, Option<String>)> {
+    let (app, mut instance, api_key) = match args.spiced_start_mode {
         SpicedStartMode::Local if args.is_external_instance() => {
             println!(
                 "Connecting to external spiced instance at: {}",
@@ -441,25 +445,25 @@ pub(crate) async fn run_or_connect_spiced(
                 .with_spicepod(spicepod)
                 .build();
             let instance = SpicedInstance::external(&args.spiced_path);
-            (app, instance)
+            (app, instance, None)
         }
         _ => {
             let (app, start_request) = get_app_and_start_request(args).await?;
-            let instance = start_spiced_instance(args, start_request).await?;
-            (app, instance)
+            let (instance, api_key) = start_spiced_instance(args, start_request).await?;
+            (app, instance, api_key)
         }
     };
     instance
         .wait_for_ready(std::time::Duration::from_secs(args.ready_wait))
         .await?;
 
-    Ok((app, instance))
+    Ok((app, instance, api_key))
 }
 
 pub(crate) async fn start_spiced_instance(
     args: &CommonArgs,
     start_request: StartRequest,
-) -> anyhow::Result<SpicedInstance> {
+) -> anyhow::Result<(SpicedInstance, Option<String>)> {
     spiced_starter(args.spiced_start_mode)
         .start(args, start_request)
         .await

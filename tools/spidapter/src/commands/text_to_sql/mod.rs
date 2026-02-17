@@ -39,7 +39,7 @@ type SpicedMemoryUsageMonitor = (
 );
 
 pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
-    let (app, spiced_instance) = run_or_connect_spiced(&args.common).await?;
+    let (app, spiced_instance, _api_key) = run_or_connect_spiced(&args.common).await?;
     let run_name = args.get_configuration_name(&app.name);
 
     // Build resource with attributes known upfront, before creating telemetry.

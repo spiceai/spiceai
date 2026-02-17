@@ -42,7 +42,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    let (app, spiced_instance) = run_or_connect_spiced(&args.test_args.common).await?;
+    let (app, spiced_instance, api_key) = run_or_connect_spiced(&args.test_args.common).await?;
 
     // Build resource with attributes known upfront, before creating telemetry.
     // This ensures the SdkMeterProvider is created with the correct resource,
@@ -113,6 +113,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;
@@ -141,6 +142,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;
@@ -203,6 +205,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(api_key)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;

@@ -62,7 +62,8 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
-    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
+    let (mut spiced_instance, _api_key) =
+        start_spiced_instance(&args.common, start_request).await?;
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
