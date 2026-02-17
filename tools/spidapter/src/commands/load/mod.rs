@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::run_or_connect_spiced;
-use crate::{args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
+use crate::{args::{LoadTestArgs, SpicedStartMode}, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -88,7 +88,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Create telemetry with resource upfront, before any metrics calls
     let telemetry = super::create_telemetry_with_resource(&args.test_args.common, load_resource);
 
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = if args.test_args.common.spiced_start_mode == SpicedStartMode::SpiceCloud {
+        None
+    } else {
+        Some(HealthMonitor::spawn()?)
+    };
 
     // Start metrics scraper if enabled
     let metrics_scraper = if args.test_args.common.scrape_spiced_metrics {
@@ -285,7 +289,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
-    let health_report = health_monitor.stop().await;
+    let health_report = match health_monitor {
+        Some(monitor) => Some(monitor.stop().await),
+        None => None,
+    };
 
     // Stop and process metrics scraper if enabled
     super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &[]).await;
@@ -298,7 +305,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     telemetry.emit().await?;
 
     spiced_instance.stop()?;
-    let health_report = health_report?;
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
@@ -358,8 +364,12 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     if !args.no_error && !test_passed {
         failure_messages.push("Load test failed.".to_string());
     }
-    if let Some(message) = health_report.failure_message() {
-        failure_messages.push(message);
+
+    if let Some(health_report) = health_report {
+        let health_report = health_report?;
+        if let Some(message) = health_report.failure_message() {
+            failure_messages.push(message);
+        }
     }
 
     if !failure_messages.is_empty() {
