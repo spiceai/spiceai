@@ -84,7 +84,27 @@ struct CloudApp {
 #[derive(Debug, Serialize)]
 struct CloudCreateAppRequest {
     name: String,
+    cname: String,
     visibility: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudUpdateAppRequest {
+    spicepod: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudRegionsResponse {
+    regions: Vec<CloudRegion>,
+    default: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudRegion {
+    region: String,
+    #[serde(rename = "isDefault")]
+    is_default: bool,
+    disabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,11 +165,14 @@ async fn ensure_spice_cloud_app(
         return Ok(app.id);
     }
 
+    let cname = resolve_default_cname(client, base_url, token).await?;
+
     let create_response = client
         .post(&apps_url)
         .bearer_auth(token)
         .json(&CloudCreateAppRequest {
             name: app_name.to_string(),
+            cname,
             visibility: "private".to_string(),
         })
         .send()
@@ -165,6 +188,56 @@ async fn ensure_spice_cloud_app(
 
     let app: CloudApp = create_response.error_for_status()?.json().await?;
     Ok(app.id)
+}
+
+async fn resolve_default_cname(client: &Client, base_url: &str, token: &str) -> anyhow::Result<String> {
+    let regions_url = format!("{base_url}/v1/regions");
+    let response = client.get(&regions_url).bearer_auth(token).send().await?;
+    let regions: CloudRegionsResponse = response.error_for_status()?.json().await?;
+
+    if let Some(default_region) = regions.default
+        && !default_region.is_empty()
+    {
+        return Ok(default_region);
+    }
+
+    if let Some(region) = regions
+        .regions
+        .iter()
+        .find(|region| region.is_default && !region.disabled)
+    {
+        return Ok(region.region.clone());
+    }
+
+    if let Some(region) = regions.regions.iter().find(|region| !region.disabled) {
+        return Ok(region.region.clone());
+    }
+
+    Err(anyhow::anyhow!(
+        "Unable to determine a default Spice Cloud region (cname) for app creation"
+    ))
+}
+
+async fn apply_spicepod_to_app(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    app_id: i64,
+    spicepod_yaml: &str,
+) -> anyhow::Result<()> {
+    let app_url = format!("{base_url}/v1/apps/{app_id}");
+
+    client
+        .put(app_url)
+        .bearer_auth(token)
+        .json(&CloudUpdateAppRequest {
+            spicepod: spicepod_yaml.to_string(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+
+    Ok(())
 }
 
 async fn create_and_wait_for_deployment(
@@ -250,10 +323,18 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         let token = spice_cloud_token()?;
         let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
         let app_name = spicepod.name.clone();
+        let spicepod_yaml = std::fs::read_to_string(&args.spicepod_path).map_err(|source| {
+            anyhow::anyhow!(
+                "Failed to read spicepod file at {}: {source}",
+                args.spicepod_path.display()
+            )
+        })?;
 
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         let app_id = ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
+
+        apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
 
         create_and_wait_for_deployment(
             &client,
