@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
@@ -78,6 +78,14 @@ pub enum TestCommands {
     StreamingDynamodb(StreamingDynamodbTestArgs),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SpicedStartMode {
+    /// Start a local `spiced` process from `--spiced-path`.
+    Local,
+    /// Start a Spice Cloud instance through a start API.
+    SpiceCloud,
+}
+
 /// Arguments Common to all [`TestCommands`].
 #[derive(Parser, Debug, Clone)]
 pub struct CommonArgs {
@@ -96,6 +104,14 @@ pub struct CommonArgs {
     /// (e.g., `http://localhost:50051` to connect to an external instance)
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: String,
+
+    /// How to provision a `spiced` instance for the test.
+    #[arg(long, value_enum, default_value_t = SpicedStartMode::Local)]
+    pub(crate) spiced_start_mode: SpicedStartMode,
+
+    /// Base URL for Spice Cloud start API calls (used only with `--spiced-start-mode spice-cloud`).
+    #[arg(long, requires = "spiced_start_mode")]
+    pub(crate) spiced_start_api_url: Option<String>,
 
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]

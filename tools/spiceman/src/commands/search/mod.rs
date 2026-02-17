@@ -16,6 +16,7 @@ limitations under the License.
 
 mod mteb_quora;
 use super::get_app_and_start_request;
+use super::start_spiced_instance;
 use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::{Duration, SystemTime};
 use test_framework::{
@@ -25,7 +26,6 @@ use test_framework::{
     metrics::{MetricCollector, QueryMetrics},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
         search::{NotStarted, SearchRunMetric},
@@ -62,7 +62,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 

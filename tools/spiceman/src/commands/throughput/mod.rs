@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
+use super::{get_app_and_start_request, start_spiced_instance};
 use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
-    spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
@@ -38,7 +37,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     }
 
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))

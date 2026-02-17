@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{RowCounts, get_app_and_start_request};
+use super::{RowCounts, get_app_and_start_request, start_spiced_instance};
 use crate::{
     args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper,
     wait_test_and_memory,
@@ -31,7 +31,6 @@ use test_framework::{
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    spiced::SpicedInstance,
     spicepod::acceleration::Mode,
     spicetest::{
         SpiceTest,
@@ -69,7 +68,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();

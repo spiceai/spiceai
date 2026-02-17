@@ -16,7 +16,8 @@ limitations under the License.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use crate::args::{CommonArgs, DatasetTestArgs};
+use crate::args::{CommonArgs, DatasetTestArgs, SpicedStartMode};
+use async_trait::async_trait;
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
@@ -42,6 +43,57 @@ pub(crate) mod streaming;
 pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
+
+#[async_trait]
+trait SpicedStarter {
+    async fn start(&self, args: &CommonArgs, start_request: StartRequest) -> anyhow::Result<SpicedInstance>;
+}
+
+struct LocalSpicedStarter;
+
+#[async_trait]
+impl SpicedStarter for LocalSpicedStarter {
+    async fn start(&self, _args: &CommonArgs, start_request: StartRequest) -> anyhow::Result<SpicedInstance> {
+        SpicedInstance::start(start_request).await
+    }
+}
+
+struct SpiceCloudSpicedStarter;
+
+#[async_trait]
+impl SpicedStarter for SpiceCloudSpicedStarter {
+    async fn start(
+        &self,
+        args: &CommonArgs,
+        _start_request: StartRequest,
+    ) -> anyhow::Result<SpicedInstance> {
+        let Some(api_url) = &args.spiced_start_api_url else {
+            return Err(anyhow::anyhow!(
+                "--spiced-start-api-url is required when --spiced-start-mode=spice-cloud"
+            ));
+        };
+
+        if !args.is_external_instance() {
+            return Err(anyhow::anyhow!(
+                "--spiced-path must be a Flight endpoint URL when --spiced-start-mode=spice-cloud"
+            ));
+        }
+
+        println!(
+            "Spice Cloud startup selected (stub): would call {api_url} to start spiced at {}",
+            args.spiced_path
+        );
+
+        Ok(SpicedInstance::external(&args.spiced_path))
+    }
+}
+
+fn spiced_starter(mode: SpicedStartMode) -> Box<dyn SpicedStarter + Send + Sync> {
+    match mode {
+        SpicedStartMode::Local => Box::new(LocalSpicedStarter),
+        SpicedStartMode::SpiceCloud => Box::new(SpiceCloudSpicedStarter),
+    }
+}
 
 /// Create telemetry with resource attributes known upfront.
 ///
@@ -108,27 +160,39 @@ pub(crate) async fn build_test_with_validation(
 pub(crate) async fn run_or_connect_spiced(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, SpicedInstance)> {
-    let (app, mut instance) = if args.is_external_instance() {
-        println!(
-            "Connecting to external spiced instance at: {}",
-            args.spiced_path
-        );
-        let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
-        let app = AppBuilder::new(spicepod.name.clone())
-            .with_spicepod(spicepod)
-            .build();
-        let instance = SpicedInstance::external(&args.spiced_path);
-        (app, instance)
-    } else {
-        let (app, start_request) = get_app_and_start_request(args).await?;
-        let instance = SpicedInstance::start(start_request).await?;
-        (app, instance)
+    let (app, mut instance) = match args.spiced_start_mode {
+        SpicedStartMode::Local if args.is_external_instance() => {
+            println!(
+                "Connecting to external spiced instance at: {}",
+                args.spiced_path
+            );
+            let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
+            let app = AppBuilder::new(spicepod.name.clone())
+                .with_spicepod(spicepod)
+                .build();
+            let instance = SpicedInstance::external(&args.spiced_path);
+            (app, instance)
+        }
+        _ => {
+            let (app, start_request) = get_app_and_start_request(args).await?;
+            let instance = start_spiced_instance(args, start_request).await?;
+            (app, instance)
+        }
     };
     instance
         .wait_for_ready(std::time::Duration::from_secs(args.ready_wait))
         .await?;
 
     Ok((app, instance))
+}
+
+pub(crate) async fn start_spiced_instance(
+    args: &CommonArgs,
+    start_request: StartRequest,
+) -> anyhow::Result<SpicedInstance> {
+    spiced_starter(args.spiced_start_mode)
+        .start(args, start_request)
+        .await
 }
 
 pub(crate) async fn get_app_and_start_request(

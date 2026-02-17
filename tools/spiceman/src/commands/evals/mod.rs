@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::args::EvalsTestArgs;
 
-use super::get_app_and_start_request;
+use super::{get_app_and_start_request, start_spiced_instance};
 use crate::health::HealthMonitor;
 use serde_json::json;
 use spiceai::Client as SpiceClient;
@@ -32,7 +32,6 @@ use test_framework::{
     git,
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    spiced::SpicedInstance,
     telemetry::Telemetry,
 };
 
@@ -94,7 +93,7 @@ impl EvalMetrics {
 
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let mut spiced_instance = start_spiced_instance(&args.common, start_request).await?;
 
     let eval = args
         .eval

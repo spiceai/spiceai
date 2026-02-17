@@ -14,19 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
+use super::run_or_connect_spiced;
 use crate::{args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
-    app::AppBuilder,
     arrow::util::pretty::print_batches,
     git,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus, StatisticsCollector},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    spiced::SpicedInstance,
-    spicepod::Spicepod,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
@@ -45,27 +42,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    // Check if connecting to an external instance or starting a new one
-    let (app, mut spiced_instance) = if args.test_args.common.is_external_instance() {
-        println!(
-            "Connecting to external spiced instance at: {}",
-            args.test_args.common.spiced_path
-        );
-        let spicepod = Spicepod::load_exact(args.test_args.common.spicepod_path.clone()).await?;
-        let app = AppBuilder::new(spicepod.name.clone())
-            .with_spicepod(spicepod)
-            .build();
-        let instance = SpicedInstance::external(&args.test_args.common.spiced_path);
-        (app, instance)
-    } else {
-        let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
-        let instance = SpicedInstance::start(start_request).await?;
-        (app, instance)
-    };
-
-    spiced_instance
-        .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
-        .await?;
+    let (app, spiced_instance) = run_or_connect_spiced(&args.test_args.common).await?;
 
     // Build resource with attributes known upfront, before creating telemetry.
     // This ensures the SdkMeterProvider is created with the correct resource,

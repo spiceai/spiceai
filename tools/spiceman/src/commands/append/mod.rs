@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
+use super::{get_app_and_start_request, start_spiced_instance};
 use crate::{args::AppendTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
@@ -78,7 +78,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         }
     };
 
-    let mut spiced_instance = match SpicedInstance::start(start_request).await {
+    let mut spiced_instance = match start_spiced_instance(&args.test_args.common, start_request).await {
         Ok(instance) => instance,
         Err(e) => {
             test_metrics.emit(TestStatus::Failed).await?;
