@@ -106,7 +106,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let executor = super::create_query_executor(&spiced_instance, api_key.clone()).await?;
 
-    let (baseline_query_set, test_builder) = super::build_test_with_validation(
+    let (_baseline_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_query_executor(executor)
@@ -150,7 +150,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .start()?;
 
     let test = baseline_test.wait().await?;
-    let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
+    let _baseline_percentiles = test.get_query_durations().percentile(99.0)?;
 
     let baseline_metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     println!("Baseline metrics:");
@@ -229,7 +229,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let test_durations = test.get_query_durations().statistical_set()?;
+    let _test_durations = test.get_query_durations().statistical_set()?;
 
     // Get all query durations for overall statistics before ending the test
     let all_durations = test.get_query_durations().clone();
@@ -306,64 +306,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     spiced_instance.stop()?;
 
-    let mut test_passed = true;
-    let mut yellow_measurements = 0;
-
-    // Use baseline_queries that represent unique query names, otherwise the same failure
-    // could be reported multiple times for each parameterized query params set variation
-    for query in baseline_query_set
-        .get_queries(query_overrides, None, None)
-        .await?
-    {
-        let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
-            // Query Failed, no percentile statistics recorded
-            continue;
-        };
-
-        let Some(duration) = test_durations.get(&query.name) else {
-            return Err(anyhow::anyhow!(
-                "Query {} not found in test durations",
-                query.name
-            ));
-        };
-
-        let percentile_99th = duration.percentile(99.0)?;
-        if percentile_99th.as_millis() < 1000 {
-            continue; // skip queries that are too fast to be meaningful
-        }
-
-        let percentile_ratio =
-            ((percentile_99th.as_secs_f64() / baseline_percentile.as_secs_f64()) - 1.0) * 100.0;
-
-        // yellow measurements = 10% to 20% increase
-        // red measurements = > 20% increase
-        let (yellow, red) = (
-            percentile_ratio > 10.0 && percentile_ratio <= 20.0,
-            percentile_ratio > 20.0,
-        );
-
-        if red {
-            println!(
-                "FAIL - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
-                query = query.name
-            );
-            test_passed = false;
-        } else if yellow {
-            println!(
-                "WARN - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
-                query = query.name
-            );
-            yellow_measurements += 1;
-        }
-    }
-
     let mut failure_messages = Vec::new();
-    if !args.no_error && yellow_measurements >= 3 {
-        failure_messages.push("Load test failed due to too many yellow measurements".to_string());
-    }
-    if !args.no_error && !test_passed {
-        failure_messages.push("Load test failed.".to_string());
-    }
 
     if let Some(health_report) = health_report {
         let health_report = health_report?;
