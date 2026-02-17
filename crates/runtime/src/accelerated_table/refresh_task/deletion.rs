@@ -56,7 +56,7 @@ where
             let row_data = get_row_data(row);
             let exprs = get_delete_where_expr(&row_data, primary_keys)?;
             // Use balanced AND for composite keys (typically small, but consistent)
-            balanced_and(exprs).ok_or_else(|| {
+            balanced_binary(exprs, |l, r| l.and(r)).ok_or_else(|| {
                 crate::accelerated_table::Error::NoPrimaryKeysDefined {
                     dataset_name: dataset_name.to_string(),
                 }
@@ -65,7 +65,7 @@ where
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
 
     // Use balanced OR tree instead of reduce(Expr::or) to avoid O(n) depth
-    Ok(balanced_or(row_conditions))
+    Ok(balanced_binary(row_conditions, |l, r| l.or(r)))
 }
 
 /// Simplified version that works directly with `ChangeBatch`
@@ -82,58 +82,31 @@ pub fn build_batch_delete_expr_from_change_batch(
     )
 }
 
-/// Builds a balanced binary tree of OR expressions to avoid deep nesting.
+/// Builds a balanced binary tree of expressions to avoid deep nesting.
 ///
-/// Instead of creating a right-associative chain like `OR(a, OR(b, OR(c, d)))` which
+/// Instead of creating a right-associative chain like `OP(a, OP(b, OP(c, d)))` which
 /// has O(n) depth and causes stack overflow when cloned, this creates a balanced tree
 /// with O(log n) depth.
 ///
 /// For 975 rows, depth goes from 975 to ~10.
-fn balanced_or(conditions: Vec<Expr>) -> Option<Expr> {
-    match conditions.len() {
-        0 => None,
-        1 => Some(
-            conditions
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("len checked")),
-        ),
-        _ => {
-            let mid = conditions.len() / 2;
-            let (left_exprs, right_exprs) = conditions.split_at(mid);
-            let left_exprs = left_exprs.to_vec();
-            let right_exprs = right_exprs.to_vec();
-
-            match (balanced_or(left_exprs), balanced_or(right_exprs)) {
-                (Some(l), Some(r)) => Some(l.or(r)),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            }
-        }
-    }
+fn balanced_binary(conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -> Option<Expr> {
+    balanced_binary_impl(conditions, op)
 }
 
-/// Builds a balanced binary tree of AND expressions to avoid deep nesting.
-fn balanced_and(conditions: Vec<Expr>) -> Option<Expr> {
+fn balanced_binary_impl(mut conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -> Option<Expr> {
     match conditions.len() {
         0 => None,
-        1 => Some(
-            conditions
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("len checked")),
-        ),
+        1 => Some(conditions.into_iter().next().unwrap()),
         _ => {
             let mid = conditions.len() / 2;
-            let (left_exprs, right_exprs) = conditions.split_at(mid);
-            let left_exprs = left_exprs.to_vec();
-            let right_exprs = right_exprs.to_vec();
+            let right_exprs = conditions.split_off(mid);
 
-            match (balanced_and(left_exprs), balanced_and(right_exprs)) {
-                (Some(l), Some(r)) => Some(l.and(r)),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
+            match (
+                balanced_binary_impl(conditions, op),
+                balanced_binary_impl(right_exprs, op),
+            ) {
+                (Some(l), Some(r)) => Some(op(l, r)),
+                (Some(s), None) | (None, Some(s)) => Some(s),
                 (None, None) => None,
             }
         }
@@ -541,19 +514,19 @@ mod tests {
     }
 
     // ============================================================
-    // Tests for balanced_or function
+    // Tests for balanced_binary function (OR operation)
     // ============================================================
 
     #[test]
     fn test_balanced_or_empty() {
-        let result = balanced_or(vec![]);
+        let result = balanced_binary(vec![], |l, r| l.or(r));
         assert!(result.is_none());
     }
 
     #[test]
     fn test_balanced_or_single() {
         let expr = col("a").eq(datafusion::logical_expr::lit(1));
-        let result = balanced_or(vec![expr.clone()]);
+        let result = balanced_binary(vec![expr.clone()], |l, r| l.or(r));
         assert!(result.is_some());
         // Single element should be returned as-is
         assert_eq!(
@@ -566,7 +539,8 @@ mod tests {
     fn test_balanced_or_two_elements() {
         let expr1 = col("a").eq(datafusion::logical_expr::lit(1));
         let expr2 = col("b").eq(datafusion::logical_expr::lit(2));
-        let result = balanced_or(vec![expr1, expr2]).expect("expected Some for two elements");
+        let result = balanced_binary(vec![expr1, expr2], |l, r| l.or(r))
+            .expect("expected Some for two elements");
 
         // Should be a single OR
         if let Expr::BinaryExpr(binary) = &result {
@@ -582,7 +556,8 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_or(exprs).expect("expected Some for three elements");
+        let result =
+            balanced_binary(exprs, |l, r| l.or(r)).expect("expected Some for three elements");
 
         // Collect all OR conditions - should get 3 leaf nodes
         let conditions = collect_or_conditions(&result);
@@ -595,7 +570,8 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_or(exprs).expect("expected Some for four elements");
+        let result =
+            balanced_binary(exprs, |l, r| l.or(r)).expect("expected Some for four elements");
 
         // For 4 elements, should be perfectly balanced: OR(OR(a,b), OR(c,d))
         // Depth should be 2 (log2(4) = 2)
@@ -614,7 +590,8 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_or(exprs).expect("expected Some for multiple elements");
+        let result =
+            balanced_binary(exprs, |l, r| l.or(r)).expect("expected Some for multiple elements");
 
         // All original expressions should be in the tree
         let conditions = collect_or_conditions(&result);
@@ -641,19 +618,19 @@ mod tests {
     }
 
     // ============================================================
-    // Tests for balanced_and function
+    // Tests for balanced_binary function (AND operation)
     // ============================================================
 
     #[test]
     fn test_balanced_and_empty() {
-        let result = balanced_and(vec![]);
+        let result = balanced_binary(vec![], |l, r| l.and(r));
         assert!(result.is_none());
     }
 
     #[test]
     fn test_balanced_and_single() {
         let expr = col("a").eq(datafusion::logical_expr::lit(1));
-        let result = balanced_and(vec![expr.clone()]);
+        let result = balanced_binary(vec![expr.clone()], |l, r| l.and(r));
         assert!(result.is_some());
         assert_eq!(
             format!("{}", result.expect("expected Some")),
@@ -665,7 +642,8 @@ mod tests {
     fn test_balanced_and_two_elements() {
         let expr1 = col("a").eq(datafusion::logical_expr::lit(1));
         let expr2 = col("b").eq(datafusion::logical_expr::lit(2));
-        let result = balanced_and(vec![expr1, expr2]).expect("expected Some for two elements");
+        let result = balanced_binary(vec![expr1, expr2], |l, r| l.and(r))
+            .expect("expected Some for two elements");
 
         if let Expr::BinaryExpr(binary) = &result {
             assert_eq!(binary.op, Operator::And);
@@ -680,7 +658,8 @@ mod tests {
             .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_and(exprs).expect("expected Some for four elements");
+        let result =
+            balanced_binary(exprs, |l, r| l.and(r)).expect("expected Some for four elements");
 
         // For 4 elements, should be perfectly balanced: AND(AND(a,b), AND(c,d))
         let depth = measure_and_depth(&result);
@@ -698,7 +677,8 @@ mod tests {
             .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_and(exprs).expect("expected Some for multiple elements");
+        let result =
+            balanced_binary(exprs, |l, r| l.and(r)).expect("expected Some for multiple elements");
 
         let conditions = collect_and_conditions(&result);
         assert_eq!(
@@ -978,7 +958,8 @@ mod tests {
                 .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
                 .collect();
 
-            let result = balanced_or(exprs).expect("expected Some for multiple elements");
+            let result = balanced_binary(exprs, |l, r| l.or(r))
+                .expect("expected Some for multiple elements");
             let actual_depth = measure_expr_depth(&result);
 
             assert!(
@@ -997,7 +978,8 @@ mod tests {
                 .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
                 .collect();
 
-            let result = balanced_and(exprs).expect("expected Some for multiple elements");
+            let result = balanced_binary(exprs, |l, r| l.and(r))
+                .expect("expected Some for multiple elements");
             let actual_depth = measure_and_depth(&result);
 
             assert!(
