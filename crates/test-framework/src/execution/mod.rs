@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,7 +48,7 @@ limitations under the License.
 //!
 //! # Adding Support for New Databases
 //!
-//! To add support for a new database (e.g., PostgreSQL, MySQL), implement the [`QueryExecutor`] trait:
+//! To add support for a new database (e.g., `PostgreSQL`, `MySQL`), implement the [`QueryExecutor`] trait:
 //!
 //! ```rust,ignore
 //! use async_trait::async_trait;
@@ -111,14 +111,14 @@ pub trait QueryExecutor: Send + Sync {
     async fn execute(&self, query: &Query) -> Result<ExecutionResult>;
 
     /// Name of this executor for logging/metrics
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Whether this executor supports validation (returns batches)
     fn supports_validation(&self) -> bool {
         true
     }
 
-    /// Get the underlying SpiceClient if this is a Flight executor
+    /// Get the underlying `SpiceClient` if this is a Flight executor
     /// Used for Flight-specific features like explain plan snapshots
     fn as_spice_client(&self) -> Option<Arc<spiceai::Client>> {
         None
@@ -185,7 +185,7 @@ impl QueryExecutor for FlightExecutor {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "flight"
     }
 
@@ -268,7 +268,7 @@ impl QueryExecutor for HttpExecutor {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "http"
     }
 
@@ -427,7 +427,7 @@ impl QueryExecutor for DistributedExecutor {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "distributed"
     }
 

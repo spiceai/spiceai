@@ -138,8 +138,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let spiced_instance = warm_up.wait().await?.end()?;
 
@@ -164,8 +163,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
@@ -224,8 +222,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
     let shutdown_token = throughput_test.cancellation_token();
     let test_future = throughput_test.wait();
     tokio::pin!(test_future);

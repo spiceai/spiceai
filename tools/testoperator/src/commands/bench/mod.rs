@@ -139,8 +139,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .with_explain_plan_snapshot()
         .with_results_snapshot(snapshot_predicate)
         .with_progress_bars(!args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 

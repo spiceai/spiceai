@@ -41,7 +41,6 @@ use crate::{
 
 use super::EndCondition;
 
-#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
@@ -128,11 +127,6 @@ impl SpiceTestQueryWorker {
             streaming_metrics_sender: None,
             query_duration_threshold: None,
         }
-    }
-
-    pub fn with_executor(mut self, executor: Box<dyn QueryExecutor>) -> Self {
-        self.executor = executor;
-        self
     }
 
     pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
@@ -504,14 +498,15 @@ impl SpiceTestQueryWorker {
             Err(e) => {
                 // Check if this is a connection error using typed error checking
                 // This is more reliable than string matching
-                let is_connection_error = e.downcast_ref::<flight_client::Error>()
-                    .is_some_and(|flight_err| {
-                        matches!(
-                            flight_err,
-                            flight_client::Error::UnableToConnectToServer { .. }
-                                | flight_client::Error::UnableToPerformHandshake { .. }
-                        )
-                    });
+                let is_connection_error =
+                    e.downcast_ref::<flight_client::Error>()
+                        .is_some_and(|flight_err| {
+                            matches!(
+                                flight_err,
+                                flight_client::Error::UnableToConnectToServer { .. }
+                                    | flight_client::Error::UnableToPerformHandshake { .. }
+                            )
+                        });
 
                 if is_connection_error {
                     eprintln!(
@@ -541,7 +536,6 @@ impl SpiceTestQueryWorker {
         }
     }
 
-
     async fn execute_query(
         &self,
         query: &Query,
@@ -554,155 +548,154 @@ impl SpiceTestQueryWorker {
         let result = self.executor.execute(query).await?;
 
         // Handle validation if supported and requested
-        if validate && self.executor.supports_validation() {
-            if let Some(batches) = &result.batches {
-                // Execute reference query if reference_schema is provided
-                if let Some(ref_schema) = &self.reference_schema {
-                    if let Some(spice_client) = self.executor.as_spice_client() {
-                        let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
-                        println!(
-                            "Worker {} - Query '{}' - Executing reference query against {}.* tables",
-                            self.id, query.name, ref_schema
-                        );
+        if validate
+            && self.executor.supports_validation()
+            && let Some(batches) = &result.batches
+        {
+            // Execute reference query if reference_schema is provided
+            if let Some(ref_schema) = &self.reference_schema
+                && let Some(spice_client) = self.executor.as_spice_client()
+            {
+                let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
+                println!(
+                    "Worker {} - Query '{}' - Executing reference query against {}.* tables",
+                    self.id, query.name, ref_schema
+                );
 
-                        let mut ref_result_stream = spice_client
-                            .sql_with_params(
-                                &reference_query.sql,
-                                reference_query.get_parameters_batch().transpose()?,
-                            )
-                            .await?;
+                let mut ref_result_stream = spice_client
+                    .sql_with_params(
+                        &reference_query.sql,
+                        reference_query.get_parameters_batch().transpose()?,
+                    )
+                    .await?;
 
-                        let mut ref_batches = vec![];
-                        while let Some(batch) = ref_result_stream.try_next().await? {
-                            ref_batches.push(batch);
-                        }
-
-                        // Validate against reference query results
-                        let validation_result = validation::validate_with_expected_batches(
-                            &query.name,
-                            batches,
-                            &ref_batches,
-                        )?;
-
-                        if let QueryValidationResult::Fail(validation_reason) = validation_result {
-                            eprintln!(
-                                "\n{} FAIL - Worker {} - Query '{}' reference validation failed",
-                                chrono::Utc::now(),
-                                self.id,
-                                query.name
-                            );
-                            eprintln!("Query SQL: {}", query.sql);
-                            eprintln!("Validation failure reason: {validation_reason:?}");
-                            eprintln!("\nExpected results (from reference schema):");
-                            match arrow::util::pretty::pretty_format_batches(&ref_batches) {
-                                Ok(pretty) => eprintln!("{pretty}"),
-                                Err(e) => eprintln!("Failed to format expected batches: {e}"),
-                            }
-                            eprintln!("\nActual results:");
-                            match arrow::util::pretty::pretty_format_batches(batches) {
-                                Ok(pretty) => eprintln!("{pretty}"),
-                                Err(e) => eprintln!("Failed to format actual batches: {e}"),
-                            }
-                            eprintln!();
-                            return Err(anyhow::anyhow!(
-                                "Query reference validation failed: {validation_reason:?}"
-                            ));
-                        }
-                    }
+                let mut ref_batches = vec![];
+                while let Some(batch) = ref_result_stream.try_next().await? {
+                    ref_batches.push(batch);
                 }
 
-                // Also validate using existing validation logic (TPCH or custom validation data)
-                let validation_result = self.validate_query_results(query, batches)?;
+                // Validate against reference query results
+                let validation_result =
+                    validation::validate_with_expected_batches(&query.name, batches, &ref_batches)?;
 
                 if let QueryValidationResult::Fail(validation_reason) = validation_result {
                     eprintln!(
-                        "\n{} FAIL - Worker {} - Query '{}' validation failed",
+                        "\n{} FAIL - Worker {} - Query '{}' reference validation failed",
                         chrono::Utc::now(),
                         self.id,
                         query.name
                     );
                     eprintln!("Query SQL: {}", query.sql);
                     eprintln!("Validation failure reason: {validation_reason:?}");
-
-                    // Print expected results based on validation source
-                    if let Some(validation_data) = &self.validation_data
-                        && let Some(expected_batches) = validation_data.get(&query.name)
-                    {
-                        eprintln!("\nExpected results (from custom validation data):");
-                        match arrow::util::pretty::pretty_format_batches(expected_batches) {
-                            Ok(pretty) => eprintln!("{pretty}"),
-                            Err(e) => eprintln!("Failed to format expected batches: {e}"),
-                        }
-                    } else {
-                        eprintln!(
-                            "\nExpected results: See TPCH specification for query {}",
-                            query.name
-                        );
+                    eprintln!("\nExpected results (from reference schema):");
+                    match arrow::util::pretty::pretty_format_batches(&ref_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
                     }
-
                     eprintln!("\nActual results:");
                     match arrow::util::pretty::pretty_format_batches(batches) {
                         Ok(pretty) => eprintln!("{pretty}"),
                         Err(e) => eprintln!("Failed to format actual batches: {e}"),
                     }
                     eprintln!();
-
                     return Err(anyhow::anyhow!(
-                        "Query validation failed: {validation_reason:?}"
+                        "Query reference validation failed: {validation_reason:?}"
                     ));
                 }
+            }
+
+            // Also validate using existing validation logic (TPCH or custom validation data)
+            let validation_result = self.validate_query_results(query, batches)?;
+
+            if let QueryValidationResult::Fail(validation_reason) = validation_result {
+                eprintln!(
+                    "\n{} FAIL - Worker {} - Query '{}' validation failed",
+                    chrono::Utc::now(),
+                    self.id,
+                    query.name
+                );
+                eprintln!("Query SQL: {}", query.sql);
+                eprintln!("Validation failure reason: {validation_reason:?}");
+
+                // Print expected results based on validation source
+                if let Some(validation_data) = &self.validation_data
+                    && let Some(expected_batches) = validation_data.get(&query.name)
+                {
+                    eprintln!("\nExpected results (from custom validation data):");
+                    match arrow::util::pretty::pretty_format_batches(expected_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                } else {
+                    eprintln!(
+                        "\nExpected results: See TPCH specification for query {}",
+                        query.name
+                    );
+                }
+
+                eprintln!("\nActual results:");
+                match arrow::util::pretty::pretty_format_batches(batches) {
+                    Ok(pretty) => eprintln!("{pretty}"),
+                    Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                }
+                eprintln!();
+
+                return Err(anyhow::anyhow!(
+                    "Query validation failed: {validation_reason:?}"
+                ));
             }
         }
 
         // Handle result snapshots if requested
-        if results_snapshot {
-            if let Some(batches) = &result.batches {
-                let query_name = Arc::clone(&query.name);
-                let name = self.name.clone();
-                let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
-                    format!("{name}_{query_name}")
+        if results_snapshot && let Some(batches) = &result.batches {
+            let query_name = Arc::clone(&query.name);
+            let name = self.name.clone();
+            let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
+                format!("{name}_{query_name}")
+            } else {
+                format!("{name}_{query_name}_sf{}", self.scale_factor)
+            };
+
+            // Limit to first 10 rows for snapshot
+            let mut limited_records = vec![];
+            for batch in batches {
+                if limited_records.len() >= 10 {
+                    break;
+                }
+                let required_rows = 10 - limited_records.len();
+                let end = if batch.num_rows() > required_rows {
+                    required_rows
                 } else {
-                    format!("{name}_{query_name}_sf{}", self.scale_factor)
+                    batch.num_rows()
                 };
-
-                // Limit to first 10 rows for snapshot
-                let mut limited_records = vec![];
-                for batch in batches {
-                    if limited_records.len() >= 10 {
-                        break;
-                    }
-                    let required_rows = 10 - limited_records.len();
-                    let end = if batch.num_rows() > required_rows {
-                        required_rows
-                    } else {
-                        batch.num_rows()
-                    };
-                    for i in 0..end {
-                        limited_records.push(batch.slice(i, 1));
-                    }
+                for i in 0..end {
+                    limited_records.push(batch.slice(i, 1));
                 }
+            }
 
-                let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
-                let result = panic::catch_unwind(|| {
-                    insta::with_settings!({
-                         description => format!("Query: {query_name}"),
-                                             omit_expression => true,
-                        snapshot_path => "../../snapshot/snapshots/results"
-                    }, {
-                        insta::assert_snapshot!(snapshot_name, records_pretty);
-                    });
+            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
+            let result = panic::catch_unwind(|| {
+                insta::with_settings!({
+                     description => format!("Query: {query_name}"),
+                                         omit_expression => true,
+                    snapshot_path => "../../snapshot/snapshots/results"
+                }, {
+                    insta::assert_snapshot!(snapshot_name, records_pretty);
                 });
-                if result.is_err() {
-                    let error_str =
-                        format!("Query `{name}` `{query_name}` snapshot assertion failed",);
-                    eprintln!("{error_str}");
-                    return Err(anyhow::anyhow!(error_str));
-                }
+            });
+            if result.is_err() {
+                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
+                eprintln!("{error_str}");
+                return Err(anyhow::anyhow!(error_str));
             }
         }
 
         // Check for zero row count if not in skip list
-        if !self.skip_row_count_validation.contains(&query.name.to_string()) && result.row_count == 0 {
+        if !self
+            .skip_row_count_validation
+            .contains(&query.name.to_string())
+            && result.row_count == 0
+        {
             eprintln!(
                 "{} FAIL - Worker {} - Query '{}' returned 0 rows",
                 chrono::Utc::now(),

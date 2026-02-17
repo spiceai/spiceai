@@ -15,10 +15,7 @@ limitations under the License.
 */
 
 use super::RowCounts;
-use crate::{
-    args::{QueryArgs, QuerySetLoader},
-    health::HealthMonitor,
-};
+use crate::{args::DatasetTestArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -31,7 +28,7 @@ use test_framework::{
     },
 };
 
-pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let mut spiced_instance = SpicedInstance::empty();
 
     spiced_instance
@@ -78,8 +75,7 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
 
     let benchmark_test = SpiceTest::new("local".to_string(), test)
         .with_spiced_instance(spiced_instance)
-        .start()
-        .await?;
+        .start()?;
 
     let test = benchmark_test.wait().await?;
     let row_counts = test.validate_returned_row_counts()?;

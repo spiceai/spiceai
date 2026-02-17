@@ -63,8 +63,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end()?;
@@ -86,8 +85,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;

@@ -213,10 +213,9 @@ impl SpiceTest<AppendStarted> {
             .spice_client(self.api_key.clone(), false)
             .await?;
 
-        let executor: Box<dyn crate::execution::QueryExecutor> =
-            Box::new(crate::execution::FlightExecutor::new(Arc::new(
-                spice_client,
-            )));
+        let executor: Box<dyn crate::execution::QueryExecutor> = Box::new(
+            crate::execution::FlightExecutor::new(Arc::new(spice_client)),
+        );
 
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {

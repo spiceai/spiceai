@@ -63,7 +63,6 @@ impl EndCondition {
     }
 }
 
-#[expect(clippy::struct_excessive_bools)]
 pub struct NotStarted {
     query_set: Vec<Query>,
     end_condition: EndCondition,
@@ -107,7 +106,10 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_query_executor(mut self, executor: Box<dyn crate::execution::QueryExecutor>) -> Self {
+    pub fn with_query_executor(
+        mut self,
+        executor: Box<dyn crate::execution::QueryExecutor>,
+    ) -> Self {
         self.query_executor = Some(executor);
         self
     }
@@ -237,7 +239,7 @@ impl SpiceTest<NotStarted> {
         }
     }
 
-    pub async fn start(mut self) -> Result<SpiceTest<Running>> {
+    pub fn start(mut self) -> Result<SpiceTest<Running>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
