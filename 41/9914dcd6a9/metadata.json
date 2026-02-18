@@ -3,7 +3,7 @@
   "checkpoint_id": "419914dcd6a9",
   "strategy": "manual-commit",
   "branch": "jeadie/26-02-18/accel",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "crates/spice-cloud-client/src/client.rs",
     "tools/spidapter/src/commands/mod.rs"
@@ -15,13 +15,20 @@
       "context": "/41/9914dcd6a9/0/context.md",
       "content_hash": "/41/9914dcd6a9/0/content_hash.txt",
       "prompt": "/41/9914dcd6a9/0/prompt.txt"
+    },
+    {
+      "metadata": "/41/9914dcd6a9/1/metadata.json",
+      "transcript": "/41/9914dcd6a9/1/full.jsonl",
+      "context": "/41/9914dcd6a9/1/context.md",
+      "content_hash": "/41/9914dcd6a9/1/content_hash.txt",
+      "prompt": "/41/9914dcd6a9/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 9,
-    "cache_creation_tokens": 4172,
-    "cache_read_tokens": 147690,
-    "output_tokens": 305,
-    "api_call_count": 7
+    "input_tokens": 19,
+    "cache_creation_tokens": 131348,
+    "cache_read_tokens": 1180146,
+    "output_tokens": 519,
+    "api_call_count": 15
   }
 }

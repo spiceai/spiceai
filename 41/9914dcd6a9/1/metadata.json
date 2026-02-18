@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "419914dcd6a9",
+  "session_id": "8e0a6a61-ad3b-49df-b36c-3688634c3aa7",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-18T20:42:50.987483Z",
+  "branch": "jeadie/26-02-18/accel",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/spice-cloud-client/src/client.rs",
+    "tools/spidapter/src/commands/mod.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "18cb39acffc1",
+  "transcript_identifier_at_start": "9a9fbb6d-21ca-4fa3-82df-a59eaeb0679b",
+  "checkpoint_transcript_start": 406,
+  "transcript_lines_at_start": 406,
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 127176,
+    "cache_read_tokens": 1032456,
+    "output_tokens": 214,
+    "api_call_count": 8
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-18T20:42:50.443356Z",
+    "agent_lines": 8,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 8,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-jeadie-Github-spiceai/8e0a6a61-ad3b-49df-b36c-3688634c3aa7.jsonl"
+}
