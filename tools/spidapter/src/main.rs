@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Commands::Stdio(args) => return run_stdio_mode(&args),
+        Commands::Stdio(args) => return run_stdio_mode(&args).await,
         Commands::Export(
             TestCommands::Throughput(DatasetTestArgs { common, .. })
             | TestCommands::Bench(DatasetTestArgs { common, .. })
@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_stdio_mode(args: &StdioArgs) -> anyhow::Result<()> {
+async fn run_stdio_mode(args: &StdioArgs) -> anyhow::Result<()> {
     eprintln!("Starting spidapter stdio JSON-RPC server");
-    stdio_server::run_stdio_server(args)
+    stdio_server::run_stdio_server(args).await
 }
