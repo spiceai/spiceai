@@ -719,8 +719,10 @@ impl Query {
                 };
 
             // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE)
-            // as their logical plan schema may differ from the actual execution result
-            if !matches!(&*plan, LogicalPlan::Statement(_)) {
+            // and DDL plans (CREATE TABLE/DROP TABLE) as their logical plan schema may
+            // differ from the actual execution result (DDL plans may be rewritten by
+            // analyzer rules into extension nodes with different output schemas)
+            if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_)) {
                 let plan_schema = Arc::clone(plan.schema().inner());
                 let res_schema = res_stream.schema();
 

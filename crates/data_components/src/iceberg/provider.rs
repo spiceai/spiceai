@@ -1,19 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 //! Implementation of the `DataFusion` Catalog/Schema providers for Iceberg.
 
@@ -72,12 +71,8 @@ impl IcebergCatalogProvider {
         root_namespace: Option<NamespaceIdent>,
         includes: Option<&GlobSet>,
     ) -> Result<Self> {
-        let schemas = Self::load_schemas(
-            Arc::clone(&client),
-            root_namespace.as_ref(),
-            includes,
-        )
-        .await?;
+        let schemas =
+            Self::load_schemas(Arc::clone(&client), root_namespace.as_ref(), includes).await?;
 
         Ok(IcebergCatalogProvider {
             catalog: client,
@@ -234,13 +229,8 @@ impl IcebergSchemaProvider {
         load_semaphore: Arc<Semaphore>,
         include: Option<&GlobSet>,
     ) -> Result<Self> {
-        let tables = Self::load_tables(
-            Arc::clone(&client),
-            &namespace,
-            load_semaphore,
-            include,
-        )
-        .await?;
+        let tables =
+            Self::load_tables(Arc::clone(&client), &namespace, load_semaphore, include).await?;
 
         Ok(IcebergSchemaProvider {
             catalog: client,

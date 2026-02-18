@@ -60,10 +60,10 @@ pub fn validate_sql_query_operations(
                 }
 
                 // Check if attempting to write into a catalog.
-                if let Some(catalog) = dml.table_name.catalog() {
-                    if df.is_catalog_writable(catalog) {
-                        return Ok(TreeNodeRecursion::Continue);
-                    }
+                if let Some(catalog) = dml.table_name.catalog()
+                    && df.is_catalog_writable(catalog)
+                {
+                    return Ok(TreeNodeRecursion::Continue);
                 }
 
                 // Fall back to per-table writable check
@@ -717,8 +717,7 @@ mod tests {
 
         // Register a test table to INSERT into
         let mem_table = Arc::new(
-            MemTable::try_new(create_test_schema(), vec![])
-                .expect("mem table should be created"),
+            MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
         df.ctx
             .register_table("catalog_table", mem_table)
