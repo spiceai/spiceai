@@ -129,6 +129,7 @@ pub mod secrets_context_extension;
 pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
+pub mod composed_catalog;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
