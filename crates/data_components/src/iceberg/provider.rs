@@ -1,24 +1,25 @@
-/*
-Copyright 2024-2025 The Spice.ai OSS Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Implementation of the `DataFusion` Catalog/Schema providers for Iceberg.
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
@@ -41,10 +42,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// multiple [`SchemaProvider`], each associated with distinct namespaces.
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
-    /// A `HashMap` where keys are namespace names
+    /// The underlying Iceberg catalog client.
+    catalog: Arc<dyn Catalog>,
+    /// Optional root namespace to scope namespace discovery.
+    root_namespace: Option<NamespaceIdent>,
+    /// Optional glob patterns for filtering tables.
+    include: Option<GlobSet>,
+    /// A `RwLock`-protected `HashMap` where keys are namespace names
     /// and values are dynamic references to objects implementing the
     /// [`SchemaProvider`] trait.
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
 
 impl IcebergCatalogProvider {
@@ -65,10 +72,43 @@ impl IcebergCatalogProvider {
         root_namespace: Option<NamespaceIdent>,
         includes: Option<&GlobSet>,
     ) -> Result<Self> {
+        let schemas = Self::load_schemas(
+            Arc::clone(&client),
+            root_namespace.as_ref(),
+            includes,
+        )
+        .await?;
+
+        Ok(IcebergCatalogProvider {
+            catalog: client,
+            root_namespace,
+            include: includes.cloned(),
+            schemas: RwLock::new(schemas),
+        })
+    }
+
+    /// Returns a reference to the underlying Iceberg catalog client.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// Returns the root namespace, if any.
+    #[must_use]
+    pub fn root_namespace(&self) -> Option<&NamespaceIdent> {
+        self.root_namespace.as_ref()
+    }
+
+    /// Load all schemas (namespaces) from the Iceberg catalog.
+    async fn load_schemas(
+        client: Arc<dyn Catalog>,
+        root_namespace: Option<&NamespaceIdent>,
+        includes: Option<&GlobSet>,
+    ) -> Result<HashMap<String, Arc<dyn SchemaProvider>>> {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
 
-        let schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
+        let schema_names: Vec<_> = match client.list_namespaces(root_namespace).await {
             Ok(namespaces) => namespaces
                 .iter()
                 .flat_map(|ns| ns.as_ref().clone())
@@ -113,7 +153,7 @@ impl IcebergCatalogProvider {
             })
             .collect();
 
-        Ok(IcebergCatalogProvider { schemas })
+        Ok(schemas)
     }
 }
 
@@ -123,18 +163,39 @@ impl CatalogProvider for IcebergCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        self.schemas.keys().cloned().collect()
+        self.schemas
+            .read()
+            .map(|schemas| schemas.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas.get(name).cloned()
+        self.schemas
+            .read()
+            .ok()
+            .and_then(|schemas| schemas.get(name).cloned())
     }
 }
 
 #[async_trait]
 impl RefreshableCatalogProvider for IcebergCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Will be implemented in a future enhancement.
+        let new_schemas = Self::load_schemas(
+            Arc::clone(&self.catalog),
+            self.root_namespace.as_ref(),
+            self.include.as_ref(),
+        )
+        .await?;
+
+        match self.schemas.write() {
+            Ok(mut schemas) => {
+                *schemas = new_schemas;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = new_schemas;
+            }
+        }
+
         Ok(())
     }
 }
@@ -142,11 +203,15 @@ impl RefreshableCatalogProvider for IcebergCatalogProvider {
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
 #[derive(Debug)]
-pub(crate) struct IcebergSchemaProvider {
-    /// A `HashMap` where keys are table names
+pub struct IcebergSchemaProvider {
+    /// The underlying Iceberg catalog client.
+    catalog: Arc<dyn Catalog>,
+    /// The namespace this schema provider manages.
+    namespace: NamespaceIdent,
+    /// A `RwLock`-protected `HashMap` where keys are table names
     /// and values are dynamic references to objects implementing the
     /// [`TableProvider`] trait.
-    tables: HashMap<String, Arc<dyn TableProvider>>,
+    tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
 
 impl IcebergSchemaProvider {
@@ -169,8 +234,42 @@ impl IcebergSchemaProvider {
         load_semaphore: Arc<Semaphore>,
         include: Option<&GlobSet>,
     ) -> Result<Self> {
+        let tables = Self::load_tables(
+            Arc::clone(&client),
+            &namespace,
+            load_semaphore,
+            include,
+        )
+        .await?;
+
+        Ok(IcebergSchemaProvider {
+            catalog: client,
+            namespace,
+            tables: RwLock::new(tables),
+        })
+    }
+
+    /// Returns a reference to the underlying Iceberg catalog client.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// Returns the namespace this schema provider manages.
+    #[must_use]
+    pub fn namespace(&self) -> &NamespaceIdent {
+        &self.namespace
+    }
+
+    /// Load all tables from the Iceberg catalog for this namespace.
+    async fn load_tables(
+        client: Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        load_semaphore: Arc<Semaphore>,
+        include: Option<&GlobSet>,
+    ) -> Result<HashMap<String, Arc<dyn TableProvider>>> {
         let table_names: Vec<_> = client
-            .list_tables(&namespace)
+            .list_tables(namespace)
             .await
             .map_err(handle_iceberg_error)?
             .into_iter()
@@ -212,7 +311,7 @@ impl IcebergSchemaProvider {
             }
         }
 
-        Ok(IcebergSchemaProvider { tables })
+        Ok(tables)
     }
 
     async fn load_table(
@@ -260,15 +359,47 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
+        self.tables
+            .read()
+            .map(|tables| tables.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.tables.contains_key(name)
+        self.tables
+            .read()
+            .map(|tables| tables.contains_key(name))
+            .unwrap_or(false)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.get(name).cloned())
+        Ok(self
+            .tables
+            .read()
+            .ok()
+            .and_then(|tables| tables.get(name).cloned()))
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        match self.tables.write() {
+            Ok(mut tables) => Ok(tables.insert(name, table)),
+            Err(_) => Err(datafusion::error::DataFusionError::Internal(
+                "Failed to acquire write lock on tables".to_string(),
+            )),
+        }
+    }
+
+    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        match self.tables.write() {
+            Ok(mut tables) => Ok(tables.remove(name)),
+            Err(_) => Err(datafusion::error::DataFusionError::Internal(
+                "Failed to acquire write lock on tables".to_string(),
+            )),
+        }
     }
 }
 
