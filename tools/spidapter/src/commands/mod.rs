@@ -455,8 +455,11 @@ pub(crate) fn flight_url_from_cname(cname: &str) -> String {
 /// Sanitize a spicepod name for use as a Spice Cloud app name.
 ///
 /// App names can only contain letters, numbers, and hyphens.
+/// Truncated to 42 characters to leave room for Kubernetes name prefixes
+/// and suffixes (e.g. `spicepod-{name}-scheduler-0` must be ≤63 chars).
 pub(crate) fn sanitize_app_name(name: &str) -> String {
-    name.chars()
+    let sanitized: String = name
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
                 c
@@ -464,7 +467,9 @@ pub(crate) fn sanitize_app_name(name: &str) -> String {
                 '-'
             }
         })
-        .collect()
+        .take(42)
+        .collect();
+    sanitized.trim_end_matches('-').to_string()
 }
 
 fn spiced_starter(mode: SpicedStartMode) -> Box<dyn SpicedStarter + Send + Sync> {

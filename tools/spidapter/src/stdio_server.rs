@@ -170,7 +170,9 @@ async fn provision_spice_cloud_app(
 
     let cname = commands::resolve_default_cname(&client, &base_url, &token).await?;
     let flight_url = commands::flight_url_from_cname(&cname);
-    let app_name = commands::sanitize_app_name(&format!("spidapter-{run_id}"));
+    let run_id_str = run_id.to_string();
+    let short_id = run_id_str.split('-').next().unwrap_or_default();
+    let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
 
     eprintln!("[stdio] Spice Cloud API: {base_url}");
     eprintln!("[stdio] Region cname: {cname}");
@@ -230,7 +232,9 @@ async fn provision_spice_cloud_app(
 fn generate_spicepod_yaml(run_id: &Uuid, datasets: &HashMap<String, DatasetConfig>) -> String {
     use std::fmt::Write;
 
-    let mut yaml = format!("version: v1beta1\nkind: Spicepod\nname: spidapter-{run_id}\n");
+    let run_id_str = run_id.to_string();
+    let short_id = run_id_str.split('-').next().unwrap_or_default();
+    let mut yaml = format!("version: v1beta1\nkind: Spicepod\nname: spidapter-{short_id}\n");
 
     if datasets.is_empty() {
         return yaml;
