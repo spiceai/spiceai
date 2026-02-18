@@ -1,0 +1,545 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! HTTP client for the Spice Cloud API.
+
+use std::time::Duration;
+
+use reqwest::Client;
+use snafu::ResultExt;
+
+use crate::error::{self, HttpRequestSnafu, Result};
+use crate::types::{
+    ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
+    CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
+    RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret,
+    SecretsResponse, SetSecretRequest, UpdateAppRequest,
+};
+
+const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// HTTP client for the Spice Cloud API.
+pub struct CloudClient {
+    base_url: String,
+    client: Client,
+    token: Option<String>,
+}
+
+impl CloudClient {
+    /// Create a new client with the given base URL.
+    ///
+    /// Use [`Self::with_token`] to set an authentication token, and
+    /// [`Self::with_timeout`] to override the default 30-second timeout.
+    pub fn new(base_url: &str) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: Client::builder()
+                .timeout(DEFAULT_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            token: None,
+        }
+    }
+
+    /// Create a new client pointing at the default production API.
+    pub fn default_url() -> Self {
+        Self::new(DEFAULT_BASE_URL)
+    }
+
+    /// Set the bearer token used for authentication.
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Override the HTTP request timeout (default: 30 s).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        self
+    }
+
+    /// Return the configured base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    // ========================================================================
+    // Auth
+    // ========================================================================
+
+    /// Build the browser auth URL for the device login flow.
+    pub fn get_auth_url(&self, auth_code: &str) -> String {
+        format!(
+            "{}/v1/auth/device?code={}",
+            self.base_url.replace("api.", ""),
+            auth_code
+        )
+    }
+
+    /// Exchange a device auth code for an access token.
+    ///
+    /// Returns `Ok(None)` while the user has not yet completed the browser flow.
+    pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
+        let url = format!(
+            "{}/v1/auth/device/exchange?code={}",
+            self.base_url, auth_code
+        );
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        if response.status() == reqwest::StatusCode::ACCEPTED || !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
+        Ok(Some(body))
+    }
+
+    /// Get the authentication context for the current token.
+    pub async fn get_auth_context(&self) -> Result<AuthContext> {
+        let url = format!("{}/v1/auth/context", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
+    // Apps
+    // ========================================================================
+
+    /// List all apps visible to the current token.
+    pub async fn list_apps(&self) -> Result<Vec<App>> {
+        let url = format!("{}/v1/apps", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        let apps: AppsResponse = self.handle_response(response).await?;
+        Ok(apps.apps)
+    }
+
+    /// Get a single app by numeric ID.
+    pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
+        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Create a new app.
+    pub async fn create_app(&self, request: &CreateAppRequest) -> Result<App> {
+        let url = format!("{}/v1/apps", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.token_str())
+            .json(request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Update an existing app.
+    pub async fn update_app(&self, app_id: i64, request: &UpdateAppRequest) -> Result<App> {
+        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+        let response = self
+            .client
+            .put(&url)
+            .bearer_auth(self.token_str())
+            .json(request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Delete (soft-delete) an app.
+    pub async fn delete_app(&self, app_id: i64) -> Result<()> {
+        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_empty_response(response).await
+    }
+
+    // ========================================================================
+    // Deployments
+    // ========================================================================
+
+    /// List deployments for an app.
+    pub async fn list_deployments(
+        &self,
+        app_id: i64,
+        limit: usize,
+        status: Option<&str>,
+    ) -> Result<Vec<Deployment>> {
+        use std::fmt::Write;
+
+        let mut url = format!(
+            "{}/v1/apps/{}/deployments?limit={}",
+            self.base_url, app_id, limit
+        );
+        if let Some(s) = status {
+            let _ = write!(url, "&status={s}");
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        let resp: DeploymentsResponse = self.handle_response(response).await?;
+        Ok(resp.deployments)
+    }
+
+    /// Create a new deployment.
+    pub async fn create_deployment(
+        &self,
+        app_id: i64,
+        request: &CreateDeploymentRequest,
+    ) -> Result<Deployment> {
+        let url = format!("{}/v1/apps/{}/deployments", self.base_url, app_id);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.token_str())
+            .json(request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Get deployment logs.
+    pub async fn get_deployment_logs(
+        &self,
+        app_id: i64,
+        deployment_id: i64,
+        limit: usize,
+        since: Option<&str>,
+    ) -> Result<LogsResponse> {
+        use std::fmt::Write;
+
+        let mut url = format!(
+            "{}/v1/apps/{}/deployments/{}/logs?limit={}",
+            self.base_url, app_id, deployment_id, limit
+        );
+        if let Some(s) = since {
+            let _ = write!(url, "&since={s}");
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Rollback to a previous deployment.
+    pub async fn rollback(&self, app_id: i64, target_deployment_id: i64) -> Result<Deployment> {
+        let url = format!("{}/v1/apps/{}/rollback", self.base_url, app_id);
+        let request = RollbackRequest {
+            target_deployment_id,
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.token_str())
+            .json(&request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
+    // Regions & Images
+    // ========================================================================
+
+    /// List available deployment regions.
+    pub async fn list_regions(&self, env: Option<&str>) -> Result<RegionsResponse> {
+        use std::fmt::Write;
+
+        let mut url = format!("{}/v1/regions", self.base_url);
+        if let Some(e) = env {
+            let _ = write!(url, "?env={e}");
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// List available container images.
+    pub async fn list_container_images(
+        &self,
+        channel: Option<&str>,
+    ) -> Result<ContainerImagesResponse> {
+        use std::fmt::Write;
+
+        let mut url = format!("{}/v1/container-images", self.base_url);
+        if let Some(c) = channel {
+            let _ = write!(url, "?channel={c}");
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
+    // Secrets
+    // ========================================================================
+
+    /// List secrets for an app.
+    pub async fn list_secrets(&self, app_id: i64) -> Result<Vec<Secret>> {
+        let url = format!("{}/v1/apps/{}/secrets", self.base_url, app_id);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        let resp: SecretsResponse = self.handle_response(response).await?;
+        Ok(resp.secrets)
+    }
+
+    /// Get a single secret by name.
+    pub async fn get_secret(&self, app_id: i64, name: &str) -> Result<Secret> {
+        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, app_id, name);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Create or update a secret.
+    pub async fn set_secret(&self, app_id: i64, name: &str, value: &str) -> Result<Secret> {
+        let url = format!("{}/v1/apps/{}/secrets", self.base_url, app_id);
+        let request = SetSecretRequest {
+            name: name.to_string(),
+            value: value.to_string(),
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.token_str())
+            .json(&request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Delete a secret.
+    pub async fn delete_secret(&self, app_id: i64, name: &str) -> Result<()> {
+        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, app_id, name);
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_empty_response(response).await
+    }
+
+    // ========================================================================
+    // API Keys
+    // ========================================================================
+
+    /// Get API keys for an app.
+    pub async fn get_api_keys(&self, app_id: i64) -> Result<ApiKeysResponse> {
+        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, app_id);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Regenerate an API key.
+    pub async fn regenerate_api_key(
+        &self,
+        app_id: i64,
+        key_number: u8,
+    ) -> Result<RegenerateApiKeyResponse> {
+        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, app_id);
+        let request = RegenerateApiKeyRequest { key_number };
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.token_str())
+            .json(&request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
+    // Response handling
+    // ========================================================================
+
+    async fn handle_response<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<T> {
+        let status = response.status();
+        let body = response.text().await.context(HttpRequestSnafu)?;
+
+        match status.as_u16() {
+            200..=202 => {
+                serde_json::from_str(&body).map_err(|source| error::Error::JsonParse { source })
+            }
+            401 => error::UnauthorizedSnafu {
+                message: body_or("invalid or expired token", &body),
+            }
+            .fail(),
+            403 => error::ForbiddenSnafu {
+                message: body_or("insufficient permissions", &body),
+            }
+            .fail(),
+            404 => error::NotFoundSnafu {
+                message: body_or("resource not found", &body),
+            }
+            .fail(),
+            409 => error::ConflictSnafu {
+                message: body_or("conflict", &body),
+            }
+            .fail(),
+            _ => error::ApiSnafu {
+                status: status.as_u16(),
+                message: body,
+            }
+            .fail(),
+        }
+    }
+
+    async fn handle_empty_response(&self, response: reqwest::Response) -> Result<()> {
+        let status = response.status();
+        let body = response.text().await.context(HttpRequestSnafu)?;
+
+        match status.as_u16() {
+            200..=204 => Ok(()),
+            401 => error::UnauthorizedSnafu {
+                message: body_or("invalid or expired token", &body),
+            }
+            .fail(),
+            403 => error::ForbiddenSnafu {
+                message: body_or("insufficient permissions", &body),
+            }
+            .fail(),
+            404 => error::NotFoundSnafu {
+                message: body_or("resource not found", &body),
+            }
+            .fail(),
+            409 => error::ConflictSnafu {
+                message: body_or("conflict", &body),
+            }
+            .fail(),
+            _ => error::ApiSnafu {
+                status: status.as_u16(),
+                message: body,
+            }
+            .fail(),
+        }
+    }
+
+    fn token_str(&self) -> &str {
+        self.token.as_deref().unwrap_or("")
+    }
+}
+
+fn body_or<'a>(fallback: &'a str, body: &'a str) -> &'a str {
+    if body.trim().is_empty() {
+        fallback
+    } else {
+        body
+    }
+}
