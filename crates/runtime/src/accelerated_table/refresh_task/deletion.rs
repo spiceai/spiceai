@@ -628,14 +628,14 @@ mod tests {
 
     #[test]
     fn test_balanced_and_empty() {
-        let result = balanced_binary(vec![], |l, r| l.and(r));
+        let result = balanced_binary(vec![], Expr::and);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_balanced_and_single() {
         let expr = col("a").eq(datafusion::logical_expr::lit(1));
-        let result = balanced_binary(vec![expr.clone()], |l, r| l.and(r));
+        let result = balanced_binary(vec![expr.clone()], Expr::and);
         assert!(result.is_some());
         assert_eq!(
             format!("{}", result.expect("expected Some")),
@@ -647,8 +647,8 @@ mod tests {
     fn test_balanced_and_two_elements() {
         let expr1 = col("a").eq(datafusion::logical_expr::lit(1));
         let expr2 = col("b").eq(datafusion::logical_expr::lit(2));
-        let result = balanced_binary(vec![expr1, expr2], |l, r| l.and(r))
-            .expect("expected Some for two elements");
+        let result =
+            balanced_binary(vec![expr1, expr2], Expr::and).expect("expected Some for two elements");
 
         if let Expr::BinaryExpr(binary) = &result {
             assert_eq!(binary.op, Operator::And);
@@ -663,8 +663,7 @@ mod tests {
             .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result =
-            balanced_binary(exprs, |l, r| l.and(r)).expect("expected Some for four elements");
+        let result = balanced_binary(exprs, Expr::and).expect("expected Some for four elements");
 
         // For 4 elements, should be perfectly balanced: AND(AND(a,b), AND(c,d))
         let depth = measure_and_depth(&result);
@@ -683,7 +682,7 @@ mod tests {
             .collect();
 
         let result =
-            balanced_binary(exprs, |l, r| l.and(r)).expect("expected Some for multiple elements");
+            balanced_binary(exprs, Expr::and).expect("expected Some for multiple elements");
 
         let conditions = collect_and_conditions(&result);
         assert_eq!(
@@ -983,8 +982,8 @@ mod tests {
                 .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
                 .collect();
 
-            let result = balanced_binary(exprs, |l, r| l.and(r))
-                .expect("expected Some for multiple elements");
+            let result =
+                balanced_binary(exprs, Expr::and).expect("expected Some for multiple elements");
             let actual_depth = measure_and_depth(&result);
 
             assert!(
