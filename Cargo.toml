@@ -64,6 +64,7 @@ members = [
     "tools/spicepodschema/",
     "tools/spiceschema",
     "tools/spicepod-validator",
+    "tools/spidapter",
     "tools/testoperator",
     "tools/parsley",
     "tools/pr-builds"

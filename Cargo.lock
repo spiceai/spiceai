@@ -18144,6 +18144,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "spidapter"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "bollard",
+ "clap",
+ "duckdb",
+ "futures",
+ "hf-hub",
+ "itertools 0.14.0",
+ "rand 0.9.2",
+ "reqwest 0.12.24",
+ "runtime-secrets",
+ "serde",
+ "serde_json",
+ "spiceai",
+ "spicepod",
+ "test-framework",
+ "tokio",
+ "tokio-util",
+ "yaml",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
