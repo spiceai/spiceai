@@ -101,7 +101,7 @@ pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Resu
     let token = spice_cloud_token()?;
     Ok(CloudClient::new(&base_url)
         .with_token(token)
-        .with_timeout(Duration::from_secs(600)))
+        .with_timeout(Duration::from_secs(600))?)
 }
 
 pub(crate) async fn ensure_spice_cloud_app(

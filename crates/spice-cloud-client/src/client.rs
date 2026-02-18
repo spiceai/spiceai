@@ -68,13 +68,16 @@ impl CloudClient {
     }
 
     /// Override the HTTP request timeout (default: 30 s).
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be rebuilt with the given timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.client = Client::builder()
             .timeout(timeout)
             .build()
-            .unwrap_or_else(|_| Client::new());
-        self
+            .context(HttpRequestSnafu)?;
+        Ok(self)
     }
 
     /// Return the configured base URL.
