@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "f5ce118fa528",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-18/accel",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/spidapter/build_docker.sh",
+    "tools/spidapter/src/args/mod.rs",
+    "tools/spidapter/src/commands/mod.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/f5/ce118fa528/0/metadata.json",
+      "transcript": "/f5/ce118fa528/0/full.jsonl",
+      "context": "/f5/ce118fa528/0/context.md",
+      "content_hash": "/f5/ce118fa528/0/content_hash.txt",
+      "prompt": "/f5/ce118fa528/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 9,
+    "cache_creation_tokens": 4172,
+    "cache_read_tokens": 147690,
+    "output_tokens": 305,
+    "api_call_count": 7
+  }
+}
