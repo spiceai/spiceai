@@ -21,7 +21,6 @@ on:
           - 'load'
           - 'throughput'
           - 'append'
-          - 'ducklake'
           - 'http-consistency'
           - 'nas'
           - 'text-to-sql'
@@ -223,7 +222,6 @@ jobs:
           done
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF1
-        if: ${{ github.event.inputs.workflow_type != 'ducklake' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -234,7 +232,6 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS
-        if: ${{ github.event.inputs.workflow_type != 'ducklake' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -245,7 +242,6 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - ClickBench
-        if: ${{ github.event.inputs.workflow_type != 'ducklake' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -256,7 +252,6 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
-        if: ${{ github.event.inputs.workflow_type != 'ducklake' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -267,7 +262,6 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Text to SQL
-        if: ${{ github.event.inputs.workflow_type != 'ducklake' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/text_to_sql \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -276,14 +270,3 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
-
-      - name: Dispatch DuckLake TPCH E2E workflow
-        if: ${{ github.event.inputs.workflow_type == 'ducklake' }}
-        run: |
-          curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/testoperator_run_ducklake.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
