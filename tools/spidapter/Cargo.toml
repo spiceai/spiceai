@@ -1,0 +1,61 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "spidapter"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-json.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-dynamodb.workspace = true
+bollard = "0.18.1"
+clap.workspace = true
+duckdb = { workspace = true, features = ["bundled"] }
+futures.workspace = true
+itertools.workspace = true
+hf-hub = { workspace = true }
+reqwest.workspace = true
+runtime-secrets = { path = "../../crates/runtime-secrets" }
+serde.workspace = true
+serde_json.workspace = true
+yaml = { path = "../../crates/yaml" }
+spiceai.workspace = true
+spicepod = { path = "../../crates/spicepod" }
+test-framework = { path = "../../crates/test-framework" }
+rand.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[features]
+default = ["append"]
+anonymous_telemetry = []
+aws-secrets-manager = []
+clickhouse = []
+databricks = []
+debezium = []
+delta_lake = []
+dremio = []
+duckdb = []
+flightsql = []
+ftp = []
+imap = []
+keyring-secret-store = []
+models = []
+mssql = []
+mysql = []
+odbc = []
+postgres = []
+sharepoint = []
+snowflake = []
+spark = []
+sqlite = []
+turso = []
+
+append = ["test-framework/file_append"]

@@ -1,0 +1,125 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use clap::Parser;
+use test_framework::{anyhow, rustls};
+
+mod args;
+mod commands;
+mod health;
+mod metrics;
+mod spiced_metrics;
+mod stdio_server;
+
+use args::{
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, StdioArgs,
+    TestCommands, TextToSqlArgs,
+};
+
+use crate::args::SearchTestArgs;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    subcommand: Commands,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let cli = Cli::parse();
+
+    match cli.subcommand {
+        Commands::Stdio(args) => return run_stdio_mode(&args),
+        Commands::Export(
+            TestCommands::Throughput(DatasetTestArgs { common, .. })
+            | TestCommands::Bench(DatasetTestArgs { common, .. })
+            | TestCommands::Load(LoadTestArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::Evals(EvalsTestArgs { common, .. })
+            | TestCommands::Search(SearchTestArgs { common, .. })
+            | TestCommands::TextToSql(TextToSqlArgs { common, .. })
+            | TestCommands::DataConsistency(DataConsistencyArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            }),
+        ) => {
+            commands::env_export(&common).await?;
+        }
+        Commands::Run(TestCommands::Throughput(args)) => commands::throughput::run(&args).await?,
+        Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
+        Commands::Run(TestCommands::Bench(args)) => {
+            commands::bench::run(&args).await?;
+        }
+        Commands::Run(TestCommands::Query(args)) => {
+            commands::query::run(&args).await?;
+        }
+        Commands::Run(TestCommands::DataConsistency(args)) => {
+            commands::data_consistency::run(&args).await?;
+        }
+        Commands::Dispatch(args) => {
+            commands::dispatch::dispatch(args).await?;
+        }
+        Commands::Run(TestCommands::Evals(args)) => {
+            commands::evals::run(&args).await?;
+        }
+        #[cfg(feature = "append")]
+        Commands::Run(TestCommands::Append(args)) => {
+            commands::append::run(&args).await?;
+        }
+        #[cfg(feature = "append")]
+        Commands::Export(TestCommands::Append(args)) => {
+            commands::env_export(&args.test_args.common).await?;
+        }
+        Commands::Run(TestCommands::Search(args)) => {
+            commands::search::run(&args).await?;
+        }
+        Commands::Run(TestCommands::TextToSql(args)) => {
+            commands::text_to_sql::run(&args).await?;
+        }
+        Commands::Run(TestCommands::StreamingDynamodb(args)) => {
+            commands::streaming::run_dynamodb(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodb(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for streaming-dynamodb (spicepods are transformed at runtime)"
+            ));
+        }
+        Commands::Run(TestCommands::StreamingDynamodbDispatch(args)) => {
+            commands::streaming::run_dispatch(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodbDispatch(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for dispatch-dynamodb (spicepods are transformed at runtime)"
+            ));
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unsupported command"));
+        }
+    }
+
+    Ok(())
+}
+
+fn run_stdio_mode(args: &StdioArgs) -> anyhow::Result<()> {
+    eprintln!("Starting spidapter stdio JSON-RPC server");
+    stdio_server::run_stdio_server(args)
+}
