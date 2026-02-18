@@ -56,7 +56,7 @@ where
             let row_data = get_row_data(row);
             let exprs = get_delete_where_expr(&row_data, primary_keys)?;
             // Use balanced AND for composite keys (typically small, but consistent)
-            balanced_binary(exprs, |l, r| l.and(r)).ok_or_else(|| {
+            balanced_binary(exprs, Expr::and).ok_or_else(|| {
                 crate::accelerated_table::Error::NoPrimaryKeysDefined {
                     dataset_name: dataset_name.to_string(),
                 }
@@ -65,7 +65,7 @@ where
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
 
     // Use balanced OR tree instead of reduce(Expr::or) to avoid O(n) depth
-    Ok(balanced_binary(row_conditions, |l, r| l.or(r)))
+    Ok(balanced_binary(row_conditions, Expr::or))
 }
 
 /// Simplified version that works directly with `ChangeBatch`
