@@ -524,14 +524,14 @@ mod tests {
 
     #[test]
     fn test_balanced_or_empty() {
-        let result = balanced_binary(vec![], |l, r| l.or(r));
+        let result = balanced_binary(vec![], datafusion_expr::Expr::or);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_balanced_or_single() {
         let expr = col("a").eq(datafusion::logical_expr::lit(1));
-        let result = balanced_binary(vec![expr.clone()], |l, r| l.or(r));
+        let result = balanced_binary(vec![expr.clone()], datafusion_expr::Expr::or);
         assert!(result.is_some());
         // Single element should be returned as-is
         assert_eq!(
@@ -544,7 +544,7 @@ mod tests {
     fn test_balanced_or_two_elements() {
         let expr1 = col("a").eq(datafusion::logical_expr::lit(1));
         let expr2 = col("b").eq(datafusion::logical_expr::lit(2));
-        let result = balanced_binary(vec![expr1, expr2], |l, r| l.or(r))
+        let result = balanced_binary(vec![expr1, expr2], datafusion_expr::Expr::or)
             .expect("expected Some for two elements");
 
         // Should be a single OR
@@ -561,8 +561,8 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result =
-            balanced_binary(exprs, |l, r| l.or(r)).expect("expected Some for three elements");
+        let result = balanced_binary(exprs, datafusion_expr::Expr::or)
+            .expect("expected Some for three elements");
 
         // Collect all OR conditions - should get 3 leaf nodes
         let conditions = collect_or_conditions(&result);
@@ -575,8 +575,8 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result =
-            balanced_binary(exprs, |l, r| l.or(r)).expect("expected Some for four elements");
+        let result = balanced_binary(exprs, datafusion_expr::Expr::or)
+            .expect("expected Some for four elements");
 
         // For 4 elements, should be perfectly balanced: OR(OR(a,b), OR(c,d))
         // Depth should be 2 (log2(4) = 2)
@@ -595,8 +595,8 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result =
-            balanced_binary(exprs, |l, r| l.or(r)).expect("expected Some for multiple elements");
+        let result = balanced_binary(exprs, datafusion_expr::Expr::or)
+            .expect("expected Some for multiple elements");
 
         // All original expressions should be in the tree
         let conditions = collect_or_conditions(&result);
@@ -963,7 +963,7 @@ mod tests {
                 .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
                 .collect();
 
-            let result = balanced_binary(exprs, |l, r| l.or(r))
+            let result = balanced_binary(exprs, datafusion_expr::Expr::or)
                 .expect("expected Some for multiple elements");
             let actual_depth = measure_expr_depth(&result);
 
