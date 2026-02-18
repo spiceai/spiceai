@@ -47,6 +47,8 @@ struct SpidapterHandler {
     api_url_override: Option<String>,
     /// Timeout in seconds for deployment readiness.
     ready_wait: u64,
+    /// Override the spice.ai runtime image tag for deployments.
+    image_tag: Option<String>,
 }
 
 impl SpidapterHandler {
@@ -55,6 +57,7 @@ impl SpidapterHandler {
             runs: HashMap::new(),
             api_url_override: args.spice_cloud_api_url.clone(),
             ready_wait: args.ready_wait,
+            image_tag: args.image_tag.clone(),
         }
     }
 }
@@ -76,6 +79,7 @@ impl Handler for SpidapterHandler {
             &datasets,
             self.api_url_override.as_deref(),
             self.ready_wait,
+            self.image_tag.as_deref(),
         )
         .await
         .map_err(|e| format!("Setup failed: {e}"))?;
@@ -159,6 +163,7 @@ async fn provision_spice_cloud_app(
     datasets: &HashMap<String, DatasetConfig>,
     api_url_override: Option<&str>,
     ready_wait: u64,
+    image_tag: Option<&str>,
 ) -> anyhow::Result<RunState> {
     let cloud = commands::build_cloud_client(api_url_override)?;
 
@@ -199,7 +204,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] RUNNER secret set");
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id).await?;
+    commands::create_deployment(&cloud, app_id, image_tag).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))

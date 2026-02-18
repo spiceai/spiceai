@@ -69,6 +69,10 @@ pub struct StdioArgs {
     /// Timeout in seconds to wait for a Spice Cloud deployment to become ready.
     #[arg(long, default_value = "600")]
     pub ready_wait: u64,
+
+    /// Override the spice.ai runtime image tag for deployments.
+    #[arg(long)]
+    pub image_tag: Option<String>,
 }
 
 #[derive(Subcommand)]

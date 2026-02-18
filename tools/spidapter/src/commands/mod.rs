@@ -206,12 +206,16 @@ pub(crate) async fn apply_spicepod_to_app(
     Ok(())
 }
 
-pub(crate) async fn create_deployment(cloud: &CloudClient, app_id: i64) -> anyhow::Result<()> {
+pub(crate) async fn create_deployment(
+    cloud: &CloudClient,
+    app_id: i64,
+    image_tag: Option<&str>,
+) -> anyhow::Result<()> {
     let created = cloud
         .create_deployment(
             app_id,
             &CreateDeploymentRequest {
-                image_tag: None,
+                image_tag: image_tag.map(String::from),
                 replicas: None,
                 branch: None,
                 commit_sha: None,
@@ -326,7 +330,7 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         println!("RUNNER secret set");
 
         println!("Creating deployment...");
-        create_deployment(&cloud, app_id).await?;
+        create_deployment(&cloud, app_id, None).await?;
 
         let api_key_for_poll = app_api_key.clone().ok_or_else(|| {
             anyhow::anyhow!("App API key is required to poll deployment readiness")
