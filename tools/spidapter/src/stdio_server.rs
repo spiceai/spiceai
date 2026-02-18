@@ -1,350 +1,298 @@
-/*
-Copyright 2026 The Spice.ai OSS Authors
+// Copyright 2026 Spice AI, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+use std::collections::HashMap;
+use std::time::Duration;
 
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-use std::io::{self, BufRead, Write};
-use std::process::{Command, Stdio};
-
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use async_trait::async_trait;
+use system_adapter_protocol::{
+    AdbcDriver, DatasetConfig, EtlType, Handler, QueryMethodResponse, Server, SetupResponse,
+    TeardownResponse,
+};
 use test_framework::anyhow;
+use uuid::Uuid;
 
 use crate::args::StdioArgs;
+use crate::commands;
 
-const JSONRPC_VERSION: &str = "2.0";
-
-const PARSE_ERROR: i64 = -32700;
-const INVALID_REQUEST: i64 = -32600;
-const METHOD_NOT_FOUND: i64 = -32601;
-const INVALID_PARAMS: i64 = -32602;
-const INTERNAL_ERROR: i64 = -32603;
-const COMMAND_FAILED: i64 = -32001;
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    method: String,
-    #[serde(default)]
-    params: Option<Value>,
-    #[serde(default)]
-    id: Option<Value>,
+/// State for an active benchmark run provisioned via `setup`.
+struct RunState {
+    /// Spice Cloud app ID.
+    app_id: i64,
+    /// API key for the app (used for Flight SQL authentication).
+    api_key: String,
+    /// Flight SQL endpoint URL derived from the cname.
+    flight_url: String,
+    /// Spice Cloud API base URL used during provisioning.
+    base_url: String,
+    /// Spice Cloud API token used during provisioning.
+    token: String,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
+/// System adapter handler that provisions Spice Cloud apps.
+struct SpidapterHandler {
+    /// Active runs keyed by run ID.
+    runs: HashMap<Uuid, RunState>,
+    /// Spice Cloud API URL override (from CLI args).
+    api_url_override: Option<String>,
+    /// Timeout in seconds for deployment readiness.
+    ready_wait: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
-
-pub fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::BufWriter::new(io::stdout());
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let line = line.trim();
-
-        if line.is_empty() {
-            continue;
+impl SpidapterHandler {
+    fn new(args: &StdioArgs) -> Self {
+        Self {
+            runs: HashMap::new(),
+            api_url_override: args.spice_cloud_api_url.clone(),
+            ready_wait: args.ready_wait,
         }
+    }
+}
 
-        if args.verbose {
-            eprintln!("[stdio] <= {line}");
-        }
+#[async_trait]
+impl Handler for SpidapterHandler {
+    async fn setup(
+        &mut self,
+        run_id: Uuid,
+        datasets: HashMap<String, DatasetConfig>,
+    ) -> Result<SetupResponse, String> {
+        eprintln!(
+            "[stdio] setup: run_id={run_id}, datasets={:?}",
+            datasets.keys().collect::<Vec<_>>()
+        );
 
-        let parsed = serde_json::from_str::<JsonRpcRequest>(line);
-        let request = match parsed {
-            Ok(request) => request,
-            Err(error) => {
-                let response = JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION,
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: PARSE_ERROR,
-                        message: "Parse error".to_string(),
-                        data: Some(json!({"details": error.to_string()})),
-                    }),
-                };
-                write_response(&mut stdout, &response)?;
-                continue;
-            }
+        let state = provision_spice_cloud_app(
+            run_id,
+            &datasets,
+            self.api_url_override.as_deref(),
+            self.ready_wait,
+        )
+        .await
+        .map_err(|e| format!("Setup failed: {e}"))?;
+
+        self.runs.insert(run_id, state);
+        Ok(SetupResponse { ok: true })
+    }
+
+    async fn query_method(&mut self, run_id: Uuid) -> Result<QueryMethodResponse, String> {
+        eprintln!("[stdio] query_method: run_id={run_id}");
+
+        let state = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
+
+        Ok(QueryMethodResponse {
+            driver: AdbcDriver::Flightsql,
+            db_kwargs: HashMap::from([
+                (
+                    "uri".to_string(),
+                    serde_json::Value::String(state.flight_url.clone()),
+                ),
+                (
+                    "adbc.flight.sql.rpc.call_header.x-api-key".to_string(),
+                    serde_json::Value::String(state.api_key.clone()),
+                ),
+            ]),
+        })
+    }
+
+    async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
+        eprintln!("[stdio] teardown: run_id={run_id}");
+
+        let Some(state) = self.runs.remove(&run_id) else {
+            eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
+            return Ok(TeardownResponse { ok: true });
         };
 
-        let is_notification = request.id.is_none();
-        let response = handle_request(&request, args.verbose);
-
-        if is_notification {
-            continue;
-        }
-
-        write_response(&mut stdout, &response)?;
-    }
-
-    Ok(())
-}
-
-fn write_response(
-    stdout: &mut io::BufWriter<io::Stdout>,
-    response: &JsonRpcResponse,
-) -> anyhow::Result<()> {
-    let line = serde_json::to_string(response)?;
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn handle_request(request: &JsonRpcRequest, verbose: bool) -> JsonRpcResponse {
-    let id = request.id.clone().unwrap_or(Value::Null);
-
-    if request.jsonrpc != JSONRPC_VERSION {
-        return error_response(id, INVALID_REQUEST, "Invalid Request", None);
-    }
-
-    if request.method == "rpc.methods" {
-        return ok_response(id, json!({ "methods": supported_methods() }));
-    }
-
-    let Some(method_args) = command_prefix(&request.method) else {
-        return error_response(id, METHOD_NOT_FOUND, "Method not found", None);
-    };
-
-    let rpc_args = match parse_args(request.params.as_ref()) {
-        Ok(args) => args,
-        Err(message) => {
-            return error_response(
-                id,
-                INVALID_PARAMS,
-                "Invalid params",
-                Some(json!({"details": message})),
-            );
-        }
-    };
-
-    if verbose {
         eprintln!(
-            "[stdio] executing: spidapter {} {}",
-            method_args.join(" "),
-            rpc_args.join(" ")
+            "[stdio] teardown: deleting app {} at {}",
+            state.app_id, state.base_url
         );
-    }
 
-    match execute_child(&method_args, &rpc_args) {
-        Ok(output) => ok_response(id, output),
-        Err(CommandExecutionError::Failed {
-            exit_code,
-            stdout,
-            stderr,
-        }) => error_response(
-            id,
-            COMMAND_FAILED,
-            "Command failed",
-            Some(json!({
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "command": method_args,
-                "args": rpc_args,
-            })),
-        ),
-        Err(CommandExecutionError::System(error)) => error_response(
-            id,
-            INTERNAL_ERROR,
-            "Internal error",
-            Some(json!({"details": error.to_string()})),
-        ),
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+        commands::delete_app(&client, &state.base_url, &state.token, state.app_id)
+            .await
+            .map_err(|e| format!("Failed to delete app {}: {e}", state.app_id))?;
+
+        eprintln!("[stdio] teardown: app {} deleted", state.app_id);
+        Ok(TeardownResponse { ok: true })
     }
 }
 
-fn ok_response(id: Value, result: Value) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: JSONRPC_VERSION,
-        id,
-        result: Some(result),
-        error: None,
-    }
+pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
+    let handler = SpidapterHandler::new(args);
+    let mut server = Server::new(handler);
+    server
+        .run_stdio()
+        .await
+        .map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
 }
 
-fn error_response(id: Value, code: i64, message: &str, data: Option<Value>) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: JSONRPC_VERSION,
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.to_string(),
-            data,
-        }),
-    }
-}
+// ── Spice Cloud provisioning ─────────────────────────────────────────
 
-fn parse_args(params: Option<&Value>) -> Result<Vec<String>, String> {
-    let Some(params) = params else {
-        return Ok(Vec::new());
-    };
+/// Provision a Spice Cloud app from the setup request.
+///
+/// Follows the same flow as `SpiceCloudSpicedStarter::start()`:
+/// 1. Resolve the default cname / region
+/// 2. Create or find the SCP app
+/// 3. Generate and upload the spicepod from the dataset configs
+/// 4. Set secrets (RUNNER + any env-based secrets)
+/// 5. Create a deployment
+/// 6. Wait for the deployment to become ready
+async fn provision_spice_cloud_app(
+    run_id: Uuid,
+    datasets: &HashMap<String, DatasetConfig>,
+    api_url_override: Option<&str>,
+    ready_wait: u64,
+) -> anyhow::Result<RunState> {
+    let base_url = commands::spice_cloud_base_url(api_url_override);
+    let token = commands::spice_cloud_token()?;
 
-    match params {
-        Value::Array(values) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(ToString::to_string)
-                    .ok_or_else(|| "params array must contain only strings".to_string())
-            })
-            .collect(),
-        Value::Object(object) => {
-            let Some(args) = object.get("args") else {
-                return Ok(Vec::new());
-            };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()?;
 
-            let Value::Array(values) = args else {
-                return Err("params.args must be an array of strings".to_string());
-            };
+    let cname = commands::resolve_default_cname(&client, &base_url, &token).await?;
+    let flight_url = commands::flight_url_from_cname(&cname);
+    let app_name = commands::sanitize_app_name(&format!("spidapter-{run_id}"));
 
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(ToString::to_string)
-                        .ok_or_else(|| "params.args must contain only strings".to_string())
-                })
-                .collect()
-        }
-        _ => {
-            Err("params must be an object with optional args array or a raw args array".to_string())
-        }
-    }
-}
+    eprintln!("[stdio] Spice Cloud API: {base_url}");
+    eprintln!("[stdio] Region cname: {cname}");
+    eprintln!("[stdio] Flight endpoint: {flight_url}");
+    eprintln!("[stdio] App name: {app_name}");
 
-fn command_prefix(method: &str) -> Option<Vec<String>> {
-    let command = match method {
-        "dispatch" => vec!["dispatch"],
+    let (app_id, app_api_key) =
+        commands::ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
 
-        "run.throughput" => vec!["run", "throughput"],
-        "run.load" => vec!["run", "load"],
-        "run.bench" => vec!["run", "bench"],
-        "run.data_consistency" => vec!["run", "data-consistency"],
-        "run.evals" => vec!["run", "evals"],
-        "run.search" => vec!["run", "search"],
-        "run.query" => vec!["run", "query"],
-        "run.text_to_sql" => vec!["run", "text-to-sql"],
-        "run.streaming_dynamodb" => vec!["run", "streaming-dynamodb"],
-        "run.streaming_dynamodb_dispatch" => vec!["run", "streaming-dynamodb-dispatch"],
+    let api_key = app_api_key.ok_or_else(|| {
+        anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
+    })?;
 
-        "export.throughput" => vec!["export", "throughput"],
-        "export.load" => vec!["export", "load"],
-        "export.bench" => vec!["export", "bench"],
-        "export.data_consistency" => vec!["export", "data-consistency"],
-        "export.evals" => vec!["export", "evals"],
-        "export.search" => vec!["export", "search"],
-        "export.text_to_sql" => vec!["export", "text-to-sql"],
+    eprintln!("[stdio] App ID: {app_id}");
 
-        #[cfg(feature = "append")]
-        "run.append" => vec!["run", "append"],
-        #[cfg(feature = "append")]
-        "export.append" => vec!["export", "append"],
+    // Generate spicepod YAML from the dataset configs
+    let spicepod_yaml = generate_spicepod_yaml(&run_id, datasets);
+    eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
-        _ => return None,
-    };
+    eprintln!("[stdio] Uploading spicepod to app...");
+    commands::apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
+    eprintln!("[stdio] Spicepod uploaded");
 
-    Some(command.into_iter().map(ToString::to_string).collect())
-}
+    // Set secrets from environment for any secret references in the spicepod
+    eprintln!("[stdio] Setting secrets from spicepod...");
+    commands::secrets::set_spicepod_secrets(&client, &base_url, &token, app_id, &spicepod_yaml)
+        .await?;
+    eprintln!("[stdio] Spicepod secrets set");
 
-fn supported_methods() -> Vec<&'static str> {
-    let mut methods = vec![
-        "rpc.methods",
-        "dispatch",
-        "run.throughput",
-        "run.load",
-        "run.bench",
-        "run.data_consistency",
-        "run.evals",
-        "run.search",
-        "run.query",
-        "run.text_to_sql",
-        "run.streaming_dynamodb",
-        "run.streaming_dynamodb_dispatch",
-        "export.throughput",
-        "export.load",
-        "export.bench",
-        "export.data_consistency",
-        "export.evals",
-        "export.search",
-        "export.text_to_sql",
-    ];
+    eprintln!("[stdio] Setting RUNNER secret...");
+    commands::secrets::set_secret(&client, &base_url, &token, app_id, "RUNNER", "spidapter")
+        .await?;
+    eprintln!("[stdio] RUNNER secret set");
 
-    #[cfg(feature = "append")]
-    {
-        methods.push("run.append");
-        methods.push("export.append");
-    }
+    eprintln!("[stdio] Creating deployment...");
+    commands::create_deployment(&client, &base_url, &token, app_id).await?;
 
-    methods
-}
+    commands::wait_for_deployment_ready(&client, &cname, &api_key, Duration::from_secs(ready_wait))
+        .await?;
 
-enum CommandExecutionError {
-    Failed {
-        exit_code: i32,
-        stdout: String,
-        stderr: String,
-    },
-    System(anyhow::Error),
-}
+    eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
-fn execute_child(command: &[String], args: &[String]) -> Result<Value, CommandExecutionError> {
-    let current_exe =
-        std::env::current_exe().map_err(|e| CommandExecutionError::System(e.into()))?;
-
-    let output = Command::new(current_exe)
-        .args(command)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| CommandExecutionError::System(e.into()))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        return Ok(json!({
-            "exit_code": output.status.code().unwrap_or(0),
-            "stdout": stdout,
-            "stderr": stderr,
-            "success": true,
-        }));
-    }
-
-    Err(CommandExecutionError::Failed {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout,
-        stderr,
+    Ok(RunState {
+        app_id,
+        api_key,
+        flight_url,
+        base_url,
+        token,
     })
+}
+
+/// Generate a spicepod YAML document from the datasets in a `SetupRequest`.
+///
+/// Each dataset entry in the map becomes a spicepod dataset. For S3 datasets
+/// the `from` param becomes the dataset `from` field, and remaining params
+/// are passed through as dataset-level params.
+fn generate_spicepod_yaml(run_id: &Uuid, datasets: &HashMap<String, DatasetConfig>) -> String {
+    use std::fmt::Write;
+
+    let mut yaml = format!("version: v1beta1\nkind: Spicepod\nname: spidapter-{run_id}\n");
+
+    if datasets.is_empty() {
+        return yaml;
+    }
+
+    yaml.push_str("datasets:\n");
+
+    for (name, config) in datasets {
+        let from = dataset_from_field(config);
+        let _ = write!(yaml, "  - from: {from}\n    name: {name}\n");
+
+        // Collect non-`from` params to emit as dataset params
+        let other_params: Vec<_> = config
+            .params
+            .iter()
+            .filter(|(k, _)| {
+                k.as_str() != "from" && k.as_str() != "bucket" && k.as_str() != "prefix"
+            })
+            .collect();
+
+        if !other_params.is_empty() {
+            yaml.push_str("    params:\n");
+            for (key, value) in other_params {
+                let value_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let _ = writeln!(yaml, "      {key}: \"{value_str}\"");
+            }
+        }
+    }
+
+    yaml
+}
+
+/// Derive the spicepod `from` field from a `DatasetConfig`.
+///
+/// Supports two styles:
+/// - `params.from` — used directly (e.g. `s3://bucket/path/file.parquet`)
+/// - `params.bucket` + optional `params.prefix` — composed into `s3://bucket/prefix`
+fn dataset_from_field(config: &DatasetConfig) -> String {
+    // Direct `from` takes precedence
+    if let Some(from) = config.params.get("from").and_then(|v| v.as_str()) {
+        return from.to_string();
+    }
+
+    // Compose from bucket + prefix for S3
+    if config.etl_type == EtlType::S3
+        && let Some(bucket) = config.params.get("bucket").and_then(|v| v.as_str())
+    {
+        let prefix = config
+            .params
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prefix = prefix.trim_start_matches('/');
+        return if prefix.is_empty() {
+            format!("s3://{bucket}/")
+        } else {
+            format!("s3://{bucket}/{prefix}")
+        };
+    }
+
+    "unknown://source".to_string()
 }

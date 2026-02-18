@@ -60,6 +60,15 @@ pub struct StdioArgs {
     /// Log received requests and child-command execution details to stderr
     #[arg(long)]
     pub verbose: bool,
+
+    /// Base URL for Spice Cloud API calls.
+    /// Falls back to `SPICE_CLOUD_API_URL` env var, then `https://api.spice.ai`.
+    #[arg(long)]
+    pub spice_cloud_api_url: Option<String>,
+
+    /// Timeout in seconds to wait for a Spice Cloud deployment to become ready.
+    #[arg(long, default_value = "600")]
+    pub ready_wait: u64,
 }
 
 #[derive(Subcommand)]

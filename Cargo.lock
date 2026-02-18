@@ -18166,9 +18166,11 @@ dependencies = [
  "serde_json",
  "spiceai",
  "spicepod",
+ "system-adapter-protocol",
  "test-framework",
  "tokio",
  "tokio-util",
+ "uuid 1.20.0",
  "yaml",
 ]
 
@@ -18818,6 +18820,19 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "system-adapter-protocol"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/spicebench.git?rev=6ae0474665d0f2bed4492277c9e8ed73f70b75fb#6ae0474665d0f2bed4492277c9e8ed73f70b75fb"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid 1.20.0",
 ]
 
 [[package]]
