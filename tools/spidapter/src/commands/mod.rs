@@ -123,16 +123,16 @@ struct CloudCreateDeploymentRequest {
     debug: bool,
 }
 
-fn spice_cloud_base_url(args: &CommonArgs) -> String {
-    args.spiced_start_api_url
-        .clone()
+pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
+    api_url_override
+        .map(ToString::to_string)
         .or_else(|| std::env::var("SPICE_CLOUD_API_URL").ok())
         .unwrap_or_else(|| "https://api.spice.ai".to_string())
         .trim_end_matches('/')
         .to_string()
 }
 
-fn spice_cloud_token() -> anyhow::Result<String> {
+pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
     std::env::var("SPICEAI_API_KEY")
         .or_else(|_| std::env::var("SPICE_API_KEY"))
         .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
@@ -144,7 +144,7 @@ fn spice_cloud_token() -> anyhow::Result<String> {
         })
 }
 
-async fn ensure_spice_cloud_app(
+pub(crate) async fn ensure_spice_cloud_app(
     client: &Client,
     base_url: &str,
     token: &str,
@@ -201,7 +201,7 @@ async fn ensure_spice_cloud_app(
     Ok((app.id, app.api_key))
 }
 
-async fn resolve_default_cname(
+pub(crate) async fn resolve_default_cname(
     client: &Client,
     base_url: &str,
     token: &str,
@@ -246,7 +246,7 @@ async fn resolve_default_cname(
     ))
 }
 
-async fn apply_spicepod_to_app(
+pub(crate) async fn apply_spicepod_to_app(
     client: &Client,
     base_url: &str,
     token: &str,
@@ -268,7 +268,7 @@ async fn apply_spicepod_to_app(
     Ok(())
 }
 
-async fn create_deployment(
+pub(crate) async fn create_deployment(
     client: &Client,
     base_url: &str,
     token: &str,
@@ -284,21 +284,43 @@ async fn create_deployment(
         .await?;
 
     let created: CloudDeployment = response.error_for_status()?.json().await?;
-    println!("Deployment {} created", created.id);
+    eprintln!("Deployment {} created", created.id);
+    Ok(())
+}
+
+/// Delete (soft-delete) a Spice Cloud app.
+///
+/// Calls `DELETE /v1/apps/{appId}` which sets `deleted_at`, stops the app,
+/// and releases its resources.
+pub(crate) async fn delete_app(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    app_id: i64,
+) -> anyhow::Result<()> {
+    let app_url = format!("{base_url}/v1/apps/{app_id}");
+
+    client
+        .delete(&app_url)
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?;
+
     Ok(())
 }
 
 /// Wait for a Spice Cloud deployment to become ready by polling the SQL endpoint.
 ///
 /// Sends `SELECT 1` to `https://{cname}.spiceai.io/v1/sql` until it returns a successful response.
-async fn wait_for_deployment_ready(
+pub(crate) async fn wait_for_deployment_ready(
     client: &Client,
     cname: &str,
     api_key: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
-    println!("Waiting for deployment to become ready at {sql_url}...");
+    eprintln!("Waiting for deployment to become ready at {sql_url}...");
 
     let started = tokio::time::Instant::now();
     loop {
@@ -319,14 +341,14 @@ async fn wait_for_deployment_ready(
             .await
         {
             Ok(response) if response.status().is_success() => {
-                println!("  Deployment ready ({elapsed}s elapsed)");
+                eprintln!("  Deployment ready ({elapsed}s elapsed)");
                 return Ok(());
             }
             Ok(response) => {
-                println!("  Not ready: {} ({elapsed}s elapsed)", response.status());
+                eprintln!("  Not ready: {} ({elapsed}s elapsed)", response.status());
             }
             Err(e) => {
-                println!("  Not ready: {e} ({elapsed}s elapsed)");
+                eprintln!("  Not ready: {e} ({elapsed}s elapsed)");
             }
         }
 
@@ -341,7 +363,7 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
         args: &CommonArgs,
         _start_request: StartRequest,
     ) -> anyhow::Result<(SpicedInstance, Option<String>)> {
-        let base_url = spice_cloud_base_url(args);
+        let base_url = spice_cloud_base_url(args.spiced_start_api_url.as_deref());
         let token = spice_cloud_token()?;
         let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
         let app_name = sanitize_app_name(&spicepod.name);
@@ -421,7 +443,7 @@ impl SpicedStarter for SpiceCloudSpicedStarter {
 ///
 /// Replaces the `-data` suffix with `-flight` and constructs `https://{flight_cname}.spiceai.io`.
 /// For example, `us-east-1-dev-aws-data` becomes `https://us-east-1-dev-aws-flight.spiceai.io`.
-fn flight_url_from_cname(cname: &str) -> String {
+pub(crate) fn flight_url_from_cname(cname: &str) -> String {
     let flight_cname = if let Some(prefix) = cname.strip_suffix("-data") {
         format!("{prefix}-flight")
     } else {
@@ -433,8 +455,11 @@ fn flight_url_from_cname(cname: &str) -> String {
 /// Sanitize a spicepod name for use as a Spice Cloud app name.
 ///
 /// App names can only contain letters, numbers, and hyphens.
-fn sanitize_app_name(name: &str) -> String {
-    name.chars()
+/// Truncated to 42 characters to leave room for Kubernetes name prefixes
+/// and suffixes (e.g. `spicepod-{name}-scheduler-0` must be ≤63 chars).
+pub(crate) fn sanitize_app_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
                 c
@@ -442,7 +467,9 @@ fn sanitize_app_name(name: &str) -> String {
                 '-'
             }
         })
-        .collect()
+        .take(42)
+        .collect();
+    sanitized.trim_end_matches('-').to_string()
 }
 
 fn spiced_starter(mode: SpicedStartMode) -> Box<dyn SpicedStarter + Send + Sync> {

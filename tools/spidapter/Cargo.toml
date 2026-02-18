@@ -25,6 +25,8 @@ reqwest.workspace = true
 runtime-secrets = { path = "../../crates/runtime-secrets" }
 serde.workspace = true
 serde_json.workspace = true
+system-adapter-protocol.workspace = true
+uuid.workspace = true
 yaml = { path = "../../crates/yaml" }
 spiceai.workspace = true
 spicepod = { path = "../../crates/spicepod" }
