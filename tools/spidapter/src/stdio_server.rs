@@ -101,7 +101,11 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String(state.flight_url.clone()),
                 ),
                 (
-                    "adbc.flight.sql.rpc.call_header.x-api-key".to_string(),
+                    "username".to_string(),
+                    serde_json::Value::String(String::new()),
+                ),
+                (
+                    "password".to_string(),
                     serde_json::Value::String(state.api_key.clone()),
                 ),
             ]),
