@@ -56,7 +56,7 @@ pub(crate) async fn set_spicepod_secrets(
 ) -> anyhow::Result<()> {
     let secret_refs = runtime_secrets::extract_secret_references(spicepod_yaml);
 
-    println!(
+    eprintln!(
         "Found {} secret reference(s) in spicepod",
         secret_refs.len()
     );
@@ -84,12 +84,12 @@ pub(crate) async fn set_spicepod_secrets(
                 .await?;
             }
             Ok(None) => {
-                println!(
+                eprintln!(
                     "Warning: Secret '{secret_key}' (referenced from store: {store_name}) not found, skipping"
                 );
             }
             Err(e) => {
-                println!(
+                eprintln!(
                     "Warning: Failed to get secret '{secret_key}' (from store: {store_name}): {e}, skipping"
                 );
             }

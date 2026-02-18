@@ -284,7 +284,7 @@ pub(crate) async fn create_deployment(
         .await?;
 
     let created: CloudDeployment = response.error_for_status()?.json().await?;
-    println!("Deployment {} created", created.id);
+    eprintln!("Deployment {} created", created.id);
     Ok(())
 }
 
@@ -320,7 +320,7 @@ pub(crate) async fn wait_for_deployment_ready(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
-    println!("Waiting for deployment to become ready at {sql_url}...");
+    eprintln!("Waiting for deployment to become ready at {sql_url}...");
 
     let started = tokio::time::Instant::now();
     loop {
@@ -341,14 +341,14 @@ pub(crate) async fn wait_for_deployment_ready(
             .await
         {
             Ok(response) if response.status().is_success() => {
-                println!("  Deployment ready ({elapsed}s elapsed)");
+                eprintln!("  Deployment ready ({elapsed}s elapsed)");
                 return Ok(());
             }
             Ok(response) => {
-                println!("  Not ready: {} ({elapsed}s elapsed)", response.status());
+                eprintln!("  Not ready: {} ({elapsed}s elapsed)", response.status());
             }
             Err(e) => {
-                println!("  Not ready: {e} ({elapsed}s elapsed)");
+                eprintln!("  Not ready: {e} ({elapsed}s elapsed)");
             }
         }
 
