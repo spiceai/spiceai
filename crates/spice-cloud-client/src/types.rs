@@ -39,6 +39,7 @@ pub struct App {
 }
 
 impl App {
+    #[must_use]
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.org, self.name)
     }
@@ -90,6 +91,7 @@ pub struct Deployment {
     pub updated_at: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    pub image: Option<String>,
     pub image_tag: Option<String>,
     pub replicas: Option<i32>,
     pub branch: Option<String>,
@@ -107,6 +109,8 @@ pub struct DeploymentsResponse {
 
 #[derive(Debug, Serialize)]
 pub struct CreateDeploymentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

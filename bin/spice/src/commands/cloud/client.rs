@@ -176,6 +176,7 @@ impl CloudClient {
     ) -> Result<Deployment> {
         let app = self.get_app(org_app).await?;
         let request = CreateDeploymentRequest {
+            image: None,
             image_tag: image_tag.map(String::from),
             replicas,
             branch: None,

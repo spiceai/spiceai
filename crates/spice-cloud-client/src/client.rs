@@ -39,11 +39,16 @@ pub struct CloudClient {
     token: Option<String>,
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "All public methods return Result with self-describing error types"
+)]
 impl CloudClient {
     /// Create a new client with the given base URL.
     ///
     /// Use [`Self::with_token`] to set an authentication token, and
     /// [`Self::with_timeout`] to override the default 30-second timeout.
+    #[must_use]
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -56,6 +61,7 @@ impl CloudClient {
     }
 
     /// Create a new client pointing at the default production API.
+    #[must_use]
     pub fn default_url() -> Self {
         Self::new(DEFAULT_BASE_URL)
     }
@@ -81,6 +87,7 @@ impl CloudClient {
     }
 
     /// Return the configured base URL.
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -90,6 +97,7 @@ impl CloudClient {
     // ========================================================================
 
     /// Build the browser auth URL for the device login flow.
+    #[must_use]
     pub fn get_auth_url(&self, auth_code: &str) -> String {
         format!(
             "{}/v1/auth/device?code={}",
