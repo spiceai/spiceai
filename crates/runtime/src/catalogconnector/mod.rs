@@ -88,6 +88,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
 pub mod glue;
 pub mod iceberg;
 pub mod spice_cloud;
@@ -163,6 +165,16 @@ pub async fn register_all() {
             spice_cloud::SpiceCloudPlatformCatalog::new_connector,
             "spiceai",
             spice_cloud::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "duckdb")]
+    registry.insert(
+        ducklake::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            ducklake::DuckLakeCatalog::new_connector,
+            ducklake::PREFIX,
+            ducklake::PARAMETERS,
         ),
     );
 }

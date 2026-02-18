@@ -33,6 +33,8 @@ pub mod debezium_kafka;
 pub mod delta_lake;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod flight;

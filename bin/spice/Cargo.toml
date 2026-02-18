@@ -102,7 +102,6 @@ opentelemetry.workspace = true
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
-
 [build-dependencies]
 # None needed - we use include_str! for version
 
