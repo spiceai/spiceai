@@ -1,0 +1,139 @@
+name: ducklake tpch e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/testoperator_run_ducklake.yml'
+      - 'crates/runtime/src/dataconnector/ducklake.rs'
+      - 'crates/runtime/src/catalogconnector/ducklake.rs'
+      - 'crates/data_components/src/ducklake/**'
+      - 'test/spicepods/tpch/sf1/federated/ducklake*.yaml'
+
+jobs:
+  run-ducklake-tpch:
+    name: Run DuckLake TPCH E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Install PostgreSQL
+        uses: ./.github/actions/install-postgres
+        with:
+          pg-db: ducklake_catalog
+
+      - name: Start local MinIO server
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data --console-address ':9001'
+
+      - name: Wait for MinIO
+        run: |
+          for _ in {1..30}; do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'MinIO did not become ready in time.'
+          docker logs minio
+          exit 1
+
+      - name: Install MinIO client
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: http://127.0.0.1:9000
+          minio_access_key: minioadmin
+          minio_secret_key: minioadmin
+
+      - name: Create MinIO bucket for DuckLake data
+        run: mc mb --ignore-existing spice-minio/ducklake
+
+      - name: Install DuckDB Python package
+        run: python3 -m pip install --upgrade duckdb
+
+      - name: Build DuckLake with TPCH SF1 data
+        run: |
+          python3 <<'PY'
+          import duckdb
+
+          tables = [
+              "customer",
+              "lineitem",
+              "nation",
+              "orders",
+              "part",
+              "partsupp",
+              "region",
+              "supplier",
+          ]
+
+          con = duckdb.connect()
+          con.execute("INSTALL ducklake; LOAD ducklake;")
+          con.execute("INSTALL postgres; LOAD postgres;")
+          con.execute("INSTALL httpfs; LOAD httpfs;")
+          con.execute("INSTALL tpch; LOAD tpch;")
+
+          con.execute(
+              """
+              CREATE OR REPLACE SECRET minio_secret (
+                TYPE s3,
+                PROVIDER config,
+                KEY_ID 'minioadmin',
+                SECRET 'minioadmin',
+                REGION 'us-east-1',
+                ENDPOINT '127.0.0.1:9000',
+                URL_STYLE 'path',
+                USE_SSL false
+              );
+              """
+          )
+
+          con.execute(
+              """
+              ATTACH 'ducklake:postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' AS ducklake
+                (DATA_PATH 's3://ducklake/tpch_sf1/');
+              """
+          )
+
+          con.execute("CALL dbgen(sf=1);")
+
+          for table in tables:
+              con.execute(f"CREATE TABLE ducklake.main.{table} AS SELECT * FROM memory.main.{table};")
+
+          con.execute("SELECT COUNT(*) FROM ducklake.main.customer;")
+          con.close()
+          PY
+
+      - name: Build spiced and testoperator
+        run: cargo build -p spiced -p testoperator --features models
+
+      - name: Run TPCH suite against DuckLake
+        run: |
+          mkdir -p /opt/spiced/data
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./target/debug/testoperator run bench \
+            -s ./target/debug/spiced \
+            -p './test/spicepods/tpch/sf1/federated/ducklake[postgres+s3].yaml' \
+            -d /opt/spiced/data \
+            --query-set tpch \
+            --ready-wait 45 \
+            --disable-progress-bars \
+            --validate=true
+        env:
+          DUCKLAKE_CONNECTION_STRING: postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://127.0.0.1:9000
+          AWS_ALLOW_HTTP: true
+
+      - name: Print service logs on failure
+        if: failure()
+        run: |
+          docker logs minio || true
