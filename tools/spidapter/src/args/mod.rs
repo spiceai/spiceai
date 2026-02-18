@@ -70,13 +70,9 @@ pub struct StdioArgs {
     #[arg(long, default_value = "600")]
     pub ready_wait: u64,
 
-    /// Override the spice.ai runtime image name for deployments (e.g. `spiceai-enterprise`).
+    /// Release channel for the spice.ai runtime image (stable, preview, nightly, internal).
     #[arg(long)]
-    pub image: Option<String>,
-
-    /// Override the spice.ai runtime image tag for deployments (e.g. `1.5.0-enterprise-models`).
-    #[arg(long)]
-    pub image_tag: Option<String>,
+    pub channel: Option<String>,
 }
 
 #[derive(Subcommand)]

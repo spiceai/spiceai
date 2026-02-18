@@ -182,6 +182,7 @@ impl CloudClient {
             branch: None,
             commit_sha: None,
             commit_message: None,
+            updated_channel: None,
             debug,
         };
         self.inner
