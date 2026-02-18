@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "9bc0066df1b4",
+  "session_id": "2c036424-da60-4992-9f6a-16c8d0559801",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-18T17:31:44.548281Z",
+  "branch": "jeadie/26-02-16/binary",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/runtime/src/accelerated_table/refresh_task/deletion.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "c0013571f727",
+  "token_usage": {
+    "input_tokens": 9,
+    "cache_creation_tokens": 4172,
+    "cache_read_tokens": 147690,
+    "output_tokens": 305,
+    "api_call_count": 7
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-18T17:31:44.51219Z",
+    "agent_lines": 0,
+    "human_added": 0,
+    "human_modified": 5,
+    "human_removed": 1,
+    "total_committed": 5,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-jeadie-Github-spiceai/2c036424-da60-4992-9f6a-16c8d0559801.jsonl"
+}
