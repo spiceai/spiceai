@@ -225,7 +225,6 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     ))
                 })?,
             );
-
             // Register in the DataFusion catalog's schema provider
             let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
                 return Err(DataFusionError::Execution(format!(
@@ -316,7 +315,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
 /// `acceleration`.
 async fn create_accelerated_iceberg_table(
     datafusion: &Weak<DataFusion>,
-    source_provider: Arc<dyn datafusion::catalog::TableProvider>,
+    source_provider: Arc<dyn datafusion::datasource::TableProvider>,
     acceleration: &Acceleration,
     catalog_name: &str,
     schema_name: &str,
