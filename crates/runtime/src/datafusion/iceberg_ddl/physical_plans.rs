@@ -230,18 +230,11 @@ impl ExecutionPlan for IcebergCreateTableExec {
             // Some catalogs (e.g. AWS Glue) require an explicit `location` when
             // creating tables.  We look up the namespace's `location` property
             // and, if present, derive `{namespace_location}/{table_name}`.
-            let table_location: Option<String> = match catalog
-                .get_namespace(&namespace)
-                .await
-            {
-                Ok(ns) => {
-                    ns.properties()
-                        .get("location")
-                        .map(|loc| {
-                            let base = loc.trim_end_matches('/');
-                            format!("{base}/{table_name}")
-                        })
-                }
+            let table_location: Option<String> = match catalog.get_namespace(&namespace).await {
+                Ok(ns) => ns.properties().get("location").map(|loc| {
+                    let base = loc.trim_end_matches('/');
+                    format!("{base}/{table_name}")
+                }),
                 Err(e) => {
                     tracing::debug!(
                         "Could not fetch namespace properties for '{}' \
