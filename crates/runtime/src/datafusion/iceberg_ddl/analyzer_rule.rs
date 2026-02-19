@@ -32,7 +32,7 @@ use datafusion::optimizer::AnalyzerRule;
 
 use data_components::iceberg::provider::IcebergCatalogProvider;
 
-use super::acceleration_options::SharedDdlOptionsStore;
+use super::acceleration_options::{DatasetOptions, SharedDdlOptionsStore};
 use super::composed_catalog_to_iceberg;
 use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -143,7 +143,7 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     })?;
                     match store.remove(&acceleration_key) {
                         Some(opts) => (opts.acceleration, opts.dataset),
-                        None => (None, Default::default()),
+                        None => (None, DatasetOptions::default()),
                     }
                 };
 
