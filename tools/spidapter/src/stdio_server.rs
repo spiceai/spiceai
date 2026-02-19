@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
@@ -37,6 +38,10 @@ struct RunState {
     flight_url: String,
     /// Cloud client used during provisioning (reused for teardown).
     cloud: CloudClient,
+    /// Region cname (used to build the SQL endpoint URL).
+    cname: String,
+    /// Table names created for this run (for cleanup during teardown).
+    created_tables: Vec<String>,
 }
 
 /// System adapter handler that provisions Spice Cloud apps.
@@ -108,16 +113,49 @@ impl Handler for SpidapterHandler {
     async fn create_tables(
         &mut self,
         run_id: Uuid,
-        _datasets: HashMap<String, DatasetConfig>,
+        datasets: HashMap<String, DatasetConfig>,
     ) -> Result<CreateTablesResponse, String> {
         eprintln!("[stdio] create_tables: run_id={run_id}");
 
-        let _state = self
+        let state = self
             .runs
-            .get(&run_id)
+            .get_mut(&run_id)
             .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
 
-        // Tables are created by Spice Cloud during deployment
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+        let sql_url = sql_url_from_cname(&state.cname);
+
+        for (table_name, config) in &datasets {
+            let ddl = create_table_ddl(table_name, config);
+            eprintln!("[stdio] create_tables: executing DDL: {ddl}");
+
+            let response = client
+                .post(&sql_url)
+                .header("X-API-Key", &state.api_key)
+                .body(ddl.clone())
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send DDL for table '{table_name}': {e}"))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<failed to read body>".to_string());
+                return Err(format!(
+                    "DDL for table '{table_name}' failed ({status}): {body}"
+                ));
+            }
+
+            state.created_tables.push(table_name.clone());
+            eprintln!("[stdio] create_tables: table '{table_name}' created");
+        }
+
         Ok(CreateTablesResponse { ok: true })
     }
 
@@ -128,6 +166,48 @@ impl Handler for SpidapterHandler {
             eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
             return Ok(TeardownResponse { ok: true });
         };
+
+        // Drop tables via DDL before deleting the app
+        if !state.created_tables.is_empty() {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+            let sql_url = sql_url_from_cname(&state.cname);
+
+            for table_name in &state.created_tables {
+                let ddl = format!("DROP TABLE IF EXISTS \"{table_name}\"");
+                eprintln!("[stdio] teardown: executing DDL: {ddl}");
+
+                match client
+                    .post(&sql_url)
+                    .header("X-API-Key", &state.api_key)
+                    .body(ddl)
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        eprintln!("[stdio] teardown: table '{table_name}' dropped");
+                    }
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "<failed to read body>".to_string());
+                        eprintln!(
+                            "[stdio] teardown: failed to drop table '{table_name}' ({status}): {body}"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[stdio] teardown: failed to drop table '{table_name}': {e}"
+                        );
+                    }
+                }
+            }
+        }
 
         eprintln!(
             "[stdio] teardown: deleting app {} at {}",
@@ -229,12 +309,84 @@ async fn provision_spice_cloud_app(
         api_key,
         flight_url,
         cloud,
+        cname,
+        created_tables: Vec::new(),
     })
 }
 
-/// Generate a minimal initial spicepod YAML with no datasets.
+/// Build the SQL endpoint URL from a Spice Cloud cname.
+fn sql_url_from_cname(cname: &str) -> String {
+    format!("https://{cname}.spiceai.io/v1/sql")
+}
+
+/// Generate a `CREATE TABLE IF NOT EXISTS` DDL statement from a dataset's Arrow schema.
+fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
+    let columns: Vec<String> = config
+        .schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let sql_type = sql_type_for_arrow(f.data_type());
+            let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
+            format!("\"{}\" {sql_type}{nullable}", f.name())
+        })
+        .collect();
+
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"{table_name}\" ({})",
+        columns.join(", ")
+    )
+}
+
+/// Map Arrow data types to SQL type names for DDL.
+fn sql_type_for_arrow(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "BOOLEAN",
+        DataType::Int8 => "TINYINT",
+        DataType::Int16 => "SMALLINT",
+        DataType::Int32 => "INT",
+        DataType::Int64 => "BIGINT",
+        DataType::UInt8 => "TINYINT",
+        DataType::UInt16 => "SMALLINT",
+        DataType::UInt32 => "INT",
+        DataType::UInt64 => "BIGINT",
+        DataType::Float32 => "FLOAT",
+        DataType::Float64 => "DOUBLE",
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
+        DataType::Date32 | DataType::Date64 => "DATE",
+        DataType::Timestamp(TimeUnit::Second, _) => "TIMESTAMP",
+        DataType::Timestamp(TimeUnit::Millisecond, _) => "TIMESTAMP",
+        DataType::Timestamp(TimeUnit::Microsecond, _) => "TIMESTAMP",
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => "TIMESTAMP",
+        DataType::Decimal128(p, s) => {
+            // Leak a formatted string for the static lifetime — only called at table creation
+            // time with a small number of distinct precision/scale pairs.
+            let formatted = format!("DECIMAL({p}, {s})");
+            Box::leak(formatted.into_boxed_str())
+        }
+        DataType::Binary | DataType::LargeBinary => "BINARY",
+        _ => "VARCHAR", // fallback
+    }
+}
+
+/// Generate the initial spicepod YAML with an Iceberg Glue catalog as the default catalog.
 fn generate_initial_spicepod(run_id: &Uuid) -> String {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
-    format!("version: v1beta1\nkind: Spicepod\nname: spidapter-{short_id}\n")
+    format!(
+        r#"version: v1beta1
+kind: Spicepod
+name: spidapter-{short_id}
+
+catalogs:
+  - from: iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522
+    name: spice
+    access: read_write_create
+    params:
+      iceberg_sigv4_enabled: true
+      iceberg_s3_access_key_id: ${{secrets:AWS_ACCESS_KEY_ID}}
+      iceberg_s3_secret_access_key: ${{secrets:AWS_SECRET_ACCESS_KEY}}
+      iceberg_s3_region: us-east-1
+"#
+    )
 }
