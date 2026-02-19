@@ -279,11 +279,15 @@ impl DataFusionBuilder {
             config = config.with_spill_compression(spill_compression);
         }
 
+        let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
+
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
+                    Arc::clone(&datafusion_ref),
+                )),
             ))
             .with_runtime_env(runtime_env(
                 self.memory_limit,
@@ -407,6 +411,8 @@ impl DataFusionBuilder {
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
+        let acceleration_options_store =
+            super::iceberg_ddl::acceleration_options::new_shared_store();
 
         // Add the Iceberg DDL analyzer rule after context creation so it can
         // reference the catalog list and DDL-enabled catalogs.
@@ -416,6 +422,7 @@ impl DataFusionBuilder {
             super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
+                Arc::clone(&acceleration_options_store),
             ),
         ));
 
@@ -425,6 +432,8 @@ impl DataFusionBuilder {
             data_writers: RwLock::new(HashSet::new()),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
+            acceleration_options_store,
+            datafusion_ref,
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
@@ -576,12 +585,14 @@ pub(crate) fn runtime_env(
     }
 }
 
-pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+pub(crate) fn default_extension_planners(
+    datafusion_ref: super::iceberg_ddl::SharedDataFusionRef,
+) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
-        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new()),
+        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]
