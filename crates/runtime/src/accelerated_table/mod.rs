@@ -37,7 +37,6 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::union::UnionExec;
 use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -49,7 +48,7 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
-    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec, wrap_with_filter,
+    schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -1233,29 +1232,10 @@ impl TableProvider for AcceleratedTable {
             return Ok(accelerated_insert_plan);
         }
 
-        // Duplicate the input into two streams
-        let tee_input: Arc<dyn ExecutionPlan> = Arc::new(TeeExec::new(input, 2));
-
-        // Slice the duplicated stream by partition to get separate streams for the accelerated & federated inserts.
-        let accelerated_input = Arc::new(SliceExec::new(Arc::clone(&tee_input), 0));
-        let accelerated_insert_plan = self
-            .accelerator
-            .insert_into(state, accelerated_input, overwrite)
-            .await?;
-
-        let federated_input = Arc::new(SliceExec::new(tee_input, 1));
+        // Writes go to the federated source. The acceleration refresh
+        // mechanism will pick up the new data on its next cycle.
         let federated_table = self.federated.table_provider().await;
-        let federated_insert_plan = federated_table
-            .insert_into(state, federated_input, overwrite)
-            .await?;
-
-        // Return the equivalent of a UNION ALL that inserts both into the acceleration and federated source tables.
-        let union_plan: Arc<dyn ExecutionPlan> =
-            UnionExec::try_new(vec![accelerated_insert_plan, federated_insert_plan])?;
-
-        self.refresher().set_initial_load_completed(true);
-
-        Ok(union_plan)
+        federated_table.insert_into(state, input, overwrite).await
     }
 }
 
