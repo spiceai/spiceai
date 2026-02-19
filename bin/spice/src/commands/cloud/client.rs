@@ -20,7 +20,8 @@ limitations under the License.
 //! constructor logic (base URL selection, token resolution) and converts errors
 //! into the CLI error type.
 
-use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
+use crate::error::{HttpRequestFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, Result};
+use snafu::ResultExt;
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
@@ -45,15 +46,17 @@ impl CloudClient {
     pub fn new() -> Result<Self> {
         let token = get_auth_token()?;
         Ok(Self {
-            inner: InnerCloudClient::new(&get_base_url()).with_token(token),
+            inner: InnerCloudClient::new(&get_base_url())
+                .context(HttpRequestFailedSnafu)?
+                .with_token(token),
         })
     }
 
     /// Create a new unauthenticated cloud client (for the login flow).
-    pub fn new_unauthenticated() -> Self {
-        Self {
-            inner: InnerCloudClient::new(&get_base_url()),
-        }
+    pub fn new_unauthenticated() -> Result<Self> {
+        Ok(Self {
+            inner: InnerCloudClient::new(&get_base_url()).context(HttpRequestFailedSnafu)?,
+        })
     }
 
     /// Get the auth URL for the login flow.

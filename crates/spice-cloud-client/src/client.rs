@@ -48,21 +48,21 @@ impl CloudClient {
     ///
     /// Use [`Self::with_token`] to set an authentication token, and
     /// [`Self::with_timeout`] to override the default 30-second timeout.
-    #[must_use]
-    pub fn new(base_url: &str) -> Self {
-        Self {
+    pub fn new(base_url: &str) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .context(HttpRequestSnafu)?;
+
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::builder()
-                .timeout(DEFAULT_TIMEOUT)
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
             token: None,
-        }
+        })
     }
 
     /// Create a new client pointing at the default production API.
-    #[must_use]
-    pub fn default_url() -> Self {
+    pub fn default_url() -> Result<Self> {
         Self::new(DEFAULT_BASE_URL)
     }
 
@@ -121,8 +121,17 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        if response.status() == reqwest::StatusCode::ACCEPTED || !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::ACCEPTED {
             return Ok(None);
+        }
+
+        if !status.is_success() {
+            self.handle_empty_response(response).await?;
+            return Err(error::Error::Api {
+                status: status.as_u16(),
+                message: "Unexpected non-success status while exchanging auth code".to_string(),
+            });
         }
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;

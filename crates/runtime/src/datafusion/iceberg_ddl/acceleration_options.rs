@@ -215,16 +215,14 @@ mod tests {
             "value".to_string(),
         )];
         let result = parse_acceleration_options(&options);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("should return an error").to_string();
         assert!(err.contains("Unknown acceleration option"));
     }
 
     #[test]
     fn test_parse_invalid_mode_errors() {
         let options = vec![("acceleration.mode".to_string(), "invalid".to_string())];
-        let result = parse_acceleration_options(&options);
-        assert!(result.is_err());
+        let _ = parse_acceleration_options(&options).expect_err("should return an error");
     }
 
     #[test]
@@ -233,22 +231,19 @@ mod tests {
             "acceleration.refresh_mode".to_string(),
             "invalid".to_string(),
         )];
-        let result = parse_acceleration_options(&options);
-        assert!(result.is_err());
+        let _ = parse_acceleration_options(&options).expect_err("should return an error");
     }
 
     #[test]
     fn test_parse_missing_prefix_errors() {
         let options = vec![("engine".to_string(), "arrow".to_string())];
-        let result = parse_acceleration_options(&options);
-        assert!(result.is_err());
+        let _ = parse_acceleration_options(&options).expect_err("should return an error");
     }
 
     #[test]
     fn test_store_insert_and_remove() {
         let mut store = AccelerationOptionsStore::default();
-        let accel = Acceleration::default();
-        store.insert("my_table".to_string(), accel.clone());
+        store.insert("my_table".to_string(), Acceleration::default());
 
         assert!(store.remove("my_table").is_some());
         assert!(store.remove("my_table").is_none()); // consumed

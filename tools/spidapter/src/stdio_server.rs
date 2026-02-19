@@ -176,7 +176,7 @@ impl Handler for SpidapterHandler {
             let sql_url = sql_url_from_cname(&state.cname);
 
             for table_name in &state.created_tables {
-                let ddl = format!("DROP TABLE IF EXISTS \"{table_name}\"");
+                let ddl = format!("DROP TABLE IF EXISTS {}", quote_ident(table_name));
                 eprintln!("[stdio] teardown: executing DDL: {ddl}");
 
                 match client
@@ -269,7 +269,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] App ID: {app_id}");
 
     // Generate initial spicepod YAML (tables created later via create_tables)
-    let spicepod_yaml = generate_initial_spicepod(&run_id);
+    let spicepod_yaml = generate_initial_spicepod(&run_id)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -325,60 +325,84 @@ fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
         .map(|f| {
             let sql_type = sql_type_for_arrow(f.data_type());
             let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
-            format!("\"{}\" {sql_type}{nullable}", f.name())
+            format!("{} {sql_type}{nullable}", quote_ident(f.name()))
         })
         .collect();
 
     format!(
-        "CREATE TABLE IF NOT EXISTS \"{table_name}\" ({})",
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        quote_ident(table_name),
         columns.join(", ")
     )
 }
 
 /// Map Arrow data types to SQL type names for DDL.
-fn sql_type_for_arrow(data_type: &DataType) -> &'static str {
+fn sql_type_for_arrow(data_type: &DataType) -> String {
     match data_type {
-        DataType::Boolean => "BOOLEAN",
-        DataType::Int8 | DataType::UInt8 => "TINYINT",
-        DataType::Int16 | DataType::UInt16 => "SMALLINT",
-        DataType::Int32 | DataType::UInt32 => "INT",
-        DataType::Int64 | DataType::UInt64 => "BIGINT",
-        DataType::Float32 => "FLOAT",
-        DataType::Float64 => "DOUBLE",
-        DataType::Date32 | DataType::Date64 => "DATE",
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::UInt8 => "SMALLINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::UInt16 => "INT".to_string(),
+        DataType::Int32 => "INT".to_string(),
+        DataType::UInt32 => "BIGINT".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt64 => "DECIMAL(20, 0)".to_string(),
+        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(
             TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
             _,
-        ) => "TIMESTAMP",
-        DataType::Decimal128(p, s) => {
-            // Leak a formatted string for the static lifetime — only called at table creation
-            // time with a small number of distinct precision/scale pairs.
-            let formatted = format!("DECIMAL({p}, {s})");
-            Box::leak(formatted.into_boxed_str())
-        }
-        DataType::Binary | DataType::LargeBinary => "BINARY",
-        _ => "VARCHAR", // fallback
+        ) => "TIMESTAMP".to_string(),
+        DataType::Decimal128(p, s) => format!("DECIMAL({p}, {s})"),
+        DataType::Binary | DataType::LargeBinary => "BINARY".to_string(),
+        _ => "VARCHAR".to_string(),
     }
 }
 
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
 /// Generate the initial spicepod YAML with an Iceberg Glue catalog as the default catalog.
-fn generate_initial_spicepod(run_id: &Uuid) -> String {
+fn generate_initial_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
-    format!(
-        r"version: v1beta1
+    let region = std::env::var("SPIDAPTER_ICEBERG_REGION")
+        .or_else(|_| std::env::var("AWS_REGION"))
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    let catalog_from = if let Ok(from) = std::env::var("SPIDAPTER_ICEBERG_CATALOG_FROM") {
+        from
+    } else {
+        let account_id = std::env::var("SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID")
+            .or_else(|_| std::env::var("AWS_ICEBERG_ACCOUNT_ID"))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Missing Iceberg catalog account id. Set SPIDAPTER_ICEBERG_CATALOG_FROM or SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID (or AWS_ICEBERG_ACCOUNT_ID)."
+                )
+            })?;
+
+        format!(
+            "iceberg:https://glue.{region}.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"
+        )
+    };
+
+    Ok(format!(
+        "version: v1beta1
 kind: Spicepod
 name: spidapter-{short_id}
 
 catalogs:
-  - from: iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces
+  - from: {catalog_from}
     name: spice
     access: read_write_create
     params:
       iceberg_sigv4_enabled: true
       iceberg_s3_access_key_id: ${{secrets:AWS_ACCESS_KEY_ID}}
       iceberg_s3_secret_access_key: ${{secrets:AWS_SECRET_ACCESS_KEY}}
-      iceberg_s3_region: us-east-1
+      iceberg_s3_region: {region}
 "
-    )
+    ))
 }
