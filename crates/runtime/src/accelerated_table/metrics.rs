@@ -54,7 +54,7 @@ pub(crate) static REFRESH_PROCESSED_ROWS: LazyLock<Counter<u64>> = LazyLock::new
 
 pub(crate) static REFRESH_PROCESSED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("dataset_acceleration_refresh_updated_rows")
+        .u64_counter("dataset_acceleration_refresh_processed_bytes")
         .with_description("Number of bytes processed during dataset refresh.")
         .build()
 });
