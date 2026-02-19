@@ -333,7 +333,7 @@ fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
         })
         .collect();
 
-    let with_opts = vec![
+    let with_opts = [
         "\"acceleration.engine\" = 'cayenne'".to_string(),
         "\"acceleration.mode\" = 'file'".to_string(),
         "\"acceleration.refresh_mode\" = 'full'".to_string(),
