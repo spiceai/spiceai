@@ -862,14 +862,28 @@ impl Query {
 
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
-            QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
-                Ok(plan) => Box::new(plan),
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    self.handle_schema_error(&request_context, &e);
-                    return Err(e);
+            QueryMethod::Text { ref sql, .. } => {
+                // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning
+                let preprocessed =
+                    super::iceberg_ddl::preprocess::preprocess_create_table_acceleration(
+                        sql,
+                        self.df.acceleration_options_store(),
+                    );
+                let effective_sql = match &preprocessed {
+                    Ok(super::iceberg_ddl::preprocess::PreprocessResult::Modified(modified)) => {
+                        modified.as_str()
+                    }
+                    _ => sql.as_ref(),
+                };
+                match session.create_logical_plan(effective_sql).await {
+                    Ok(plan) => Box::new(plan),
+                    Err(e) => {
+                        let e = find_datafusion_root(e);
+                        self.handle_schema_error(&request_context, &e);
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
 
         // Verify the plan against the restricted options

@@ -398,18 +398,23 @@ struct DeferredTableRegistration {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    runtime_status: Arc<status::RuntimeStatus>,
+    pub(crate) runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
+    /// Shared store for acceleration options from `CREATE TABLE ... WITH (acceleration.*)`.
+    acceleration_options_store: iceberg_ddl::acceleration_options::SharedAccelerationOptionsStore,
+    /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
+    /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
+    datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
-    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
@@ -417,7 +422,7 @@ pub struct DataFusion {
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
-    io_runtime: Handle,
+    pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
@@ -750,6 +755,32 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
             .insert(catalog_name.to_string());
         Ok(())
+    }
+
+    /// Returns a reference to the shared acceleration options store.
+    ///
+    /// Used by the query execution path to insert options extracted from
+    /// `CREATE TABLE ... WITH (acceleration.*)` statements, which are then
+    /// consumed by the `IcebergDdlAnalyzerRule`.
+    #[must_use]
+    pub fn acceleration_options_store(
+        &self,
+    ) -> &iceberg_ddl::acceleration_options::SharedAccelerationOptionsStore {
+        &self.acceleration_options_store
+    }
+
+    /// Returns the shared weak self-reference holder.
+    ///
+    /// The extension planner uses this to obtain a `Weak<DataFusion>` for physical plans.
+    #[must_use]
+    pub fn datafusion_ref(&self) -> &iceberg_ddl::SharedDataFusionRef {
+        &self.datafusion_ref
+    }
+
+    /// Populate the shared weak self-reference. Must be called once after
+    /// wrapping `DataFusion` in `Arc`.
+    pub fn set_self_ref(self: &Arc<Self>) {
+        let _ = self.datafusion_ref.set(Arc::downgrade(self));
     }
 
     pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
@@ -2121,8 +2152,20 @@ impl DataFusion {
         key: &RawCacheKey,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning.
+        // This extracts acceleration options, stores them for the analyzer rule,
+        // and returns modified SQL without the WITH clause.
+        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_acceleration(
+            sql,
+            &self.acceleration_options_store,
+        )?;
+        let effective_sql = match &preprocessed {
+            iceberg_ddl::preprocess::PreprocessResult::Modified(modified) => modified.as_str(),
+            iceberg_ddl::preprocess::PreprocessResult::Unchanged => sql,
+        };
+
         let Some(plans_cache) = self.plans_cache_provider() else {
-            return session.create_logical_plan(sql).await;
+            return session.create_logical_plan(effective_sql).await;
         };
 
         if let Some(plan) = plans_cache.get_raw_key(&key.as_u64()).await {
@@ -2130,7 +2173,7 @@ impl DataFusion {
             return Ok(plan);
         }
 
-        let plan = session.create_logical_plan(sql).await?;
+        let plan = session.create_logical_plan(effective_sql).await?;
 
         tracing::trace!("caching plan for {sql}");
         plans_cache.put_raw_key(&key.as_u64(), plan.clone()).await;

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2025, Spice AI, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -30,7 +30,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
+use spicepod::acceleration::Acceleration;
 
+use crate::accelerated_table::AcceleratedTable;
+use crate::datafusion::DataFusion;
 use datafusion::catalog::CatalogProviderList;
 
 /// Creates a result schema for DDL operations (single "result" column).
@@ -53,6 +56,8 @@ pub struct IcebergCreateTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
+    acceleration: Option<Acceleration>,
+    datafusion: Weak<DataFusion>,
     properties: PlanProperties,
 }
 
@@ -64,6 +69,7 @@ impl fmt::Debug for IcebergCreateTableExec {
             .field("df_catalog_name", &self.df_catalog_name)
             .field("df_schema_name", &self.df_schema_name)
             .field("if_not_exists", &self.if_not_exists)
+            .field("acceleration", &self.acceleration.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -81,6 +87,8 @@ impl IcebergCreateTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
+        acceleration: Option<Acceleration>,
+        datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -99,6 +107,8 @@ impl IcebergCreateTableExec {
             df_catalog_name,
             df_schema_name,
             catalog_list,
+            acceleration,
+            datafusion,
             properties,
         }
     }
@@ -152,6 +162,8 @@ impl ExecutionPlan for IcebergCreateTableExec {
         let df_schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let result_schema = ddl_result_schema();
+        let acceleration = self.acceleration.clone();
+        let datafusion = Weak::<DataFusion>::clone(&self.datafusion);
 
         let stream = futures::stream::once(async move {
             // Convert Arrow schema to Iceberg schema
@@ -199,44 +211,92 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     DataFusionError::Execution(format!("Failed to create Iceberg table: {e}"))
                 })?;
 
-            // Create an IcebergTableProvider for the new table and register it
-            let provider = IcebergTableProvider::try_new(
-                Arc::clone(&catalog),
-                namespace.clone(),
-                table_name.clone(),
-            )
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to create table provider for new Iceberg table: {e}"
-                ))
-            })?;
+            // Create an IcebergTableProvider for the new table
+            let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
+                IcebergTableProvider::try_new(
+                    Arc::clone(&catalog),
+                    namespace.clone(),
+                    table_name.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to create table provider for new Iceberg table: {e}"
+                    ))
+                })?,
+            );
 
-            // Register in the DataFusion catalog's schema provider.
-            // Wrap in IcebergDeletionProvider + DeletionTableProviderAdapter so the
-            // table supports DELETE FROM via equality delete files.
-            if let Some(df_catalog) = catalog_list.catalog(&df_catalog_name)
-                && let Some(schema_provider) = df_catalog.schema(&df_schema_name)
-            {
-                let deletion_provider =
-                    data_components::iceberg::delete::IcebergDeletionProvider::new(
-                        Arc::clone(&catalog),
-                        namespace.clone(),
-                        table_name.clone(),
-                        Arc::new(provider),
+            // Register in the DataFusion catalog's schema provider
+            let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
+                return Err(DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' not found"
+                )));
+            };
+            let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
+                )));
+            };
+
+            let register_raw_provider =
+                |raw_provider: Arc<dyn datafusion::datasource::TableProvider>| -> DFResult<()> {
+                    let deletion_provider =
+                        data_components::iceberg::delete::IcebergDeletionProvider::new(
+                            Arc::clone(&catalog),
+                            namespace.clone(),
+                            table_name.clone(),
+                            raw_provider,
+                        );
+                    let adapted: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
+                        data_components::delete::DeletionTableProviderAdapter::new(Arc::new(
+                            deletion_provider,
+                        )),
                     );
-                let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                    Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
-                        Arc::new(deletion_provider),
-                    ));
-                schema_provider.register_table(table_name.clone(), adapted)?;
-            }
+                    schema_provider.register_table(table_name.clone(), adapted)?;
+                    Ok(())
+                };
+
+            let message = if let Some(ref accel) = acceleration
+                && accel.enabled
+            {
+                // Wrap in AcceleratedTable
+                match create_accelerated_iceberg_table(
+                    &datafusion,
+                    Arc::clone(&provider),
+                    accel,
+                    &df_catalog_name,
+                    &df_schema_name,
+                    &table_name,
+                )
+                .await
+                {
+                    Ok(accel_table) => {
+                        schema_provider
+                            .register_table(table_name.clone(), Arc::new(accel_table))?;
+                        format!(
+                            "Table '{table_name}' created with acceleration (engine={})",
+                            accel.engine.as_deref().unwrap_or("arrow")
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to create accelerated table '{table_name}', \
+                             falling back to direct Iceberg reads: {e}"
+                        );
+                        // Fall back to registering the raw provider
+                        register_raw_provider(Arc::clone(&provider))?;
+                        format!("Table '{table_name}' created (acceleration failed: {e})")
+                    }
+                }
+            } else {
+                // No acceleration — register raw IcebergTableProvider
+                register_raw_provider(provider)?;
+                format!("Table '{table_name}' created")
+            };
 
             let batch = RecordBatch::try_new(
                 result_schema,
-                vec![Arc::new(StringArray::from(vec![format!(
-                    "Table '{table_name}' created"
-                )]))],
+                vec![Arc::new(StringArray::from(vec![message]))],
             )?;
             Ok(batch)
         });
@@ -248,6 +308,92 @@ impl ExecutionPlan for IcebergCreateTableExec {
     }
 }
 
+/// Create an [`AcceleratedTable`] wrapping an Iceberg table provider.
+///
+/// This is a streamlined version of `DataFusion::create_accelerated_table` for
+/// DDL-created tables. It only supports full-refresh mode (the common case for
+/// ad-hoc CREATE TABLE).
+async fn create_accelerated_iceberg_table(
+    datafusion: &Weak<DataFusion>,
+    source_provider: Arc<dyn datafusion::catalog::TableProvider>,
+    acceleration: &Acceleration,
+    catalog_name: &str,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<AcceleratedTable, DataFusionError> {
+    use crate::accelerated_table::refresh::Refresh;
+    use crate::component::dataset::acceleration::{
+        Acceleration as RuntimeAcceleration, RefreshMode,
+    };
+    use crate::federated_table::FederatedTable;
+    use datafusion::common::TableReference;
+
+    let df = datafusion.upgrade().ok_or_else(|| {
+        DataFusionError::Execution(
+            "DataFusion runtime is no longer available for accelerated table creation".to_string(),
+        )
+    })?;
+
+    // Convert spicepod Acceleration → runtime Acceleration (parses durations, engine, etc.)
+    let runtime_accel = RuntimeAcceleration::try_from(acceleration.clone()).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to parse acceleration settings for table '{table_name}': {e}"
+        ))
+    })?;
+
+    let dataset_name = TableReference::full(
+        catalog_name.to_string(),
+        schema_name.to_string(),
+        table_name.to_string(),
+    );
+    let source_string = format!("{catalog_name}.{schema_name}.{table_name}");
+
+    let source_schema = source_provider.schema();
+    let federated_source = Arc::new(FederatedTable::new_unchecked(source_provider));
+
+    // Determine refresh mode from the acceleration settings
+    let refresh_mode = runtime_accel.refresh_mode.unwrap_or(RefreshMode::Full);
+
+    // Create the accelerator engine table (Arrow/DuckDB/SQLite in-memory or file)
+    let accelerated_table_provider = df
+        .accelerator_engine_registry
+        .create_accelerator_table(
+            dataset_name.clone(),
+            Arc::clone(&source_schema),
+            None, // no constraints for DDL tables
+            &runtime_accel,
+            Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::default())),
+            None, // no AccelerationSource
+            Arc::clone(&df.ctx),
+        )
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!("Failed to create acceleration engine table: {e}"))
+        })?;
+
+    // Build refresh configuration
+    let mut refresh = Refresh::new(refresh_mode);
+    if let Some(check_interval) = runtime_accel.refresh_check_interval {
+        refresh = refresh.check_interval(check_interval);
+    }
+
+    // Build the AcceleratedTable
+    let accelerated_table = AcceleratedTable::builder(
+        Arc::clone(&df.runtime_status),
+        dataset_name,
+        federated_source,
+        source_string,
+        accelerated_table_provider,
+        refresh,
+        df.io_runtime.clone(),
+    )
+    .build()
+    .await
+    .map_err(|e| DataFusionError::Execution(format!("Failed to build accelerated table: {e}")))?;
+
+    Ok(accelerated_table)
+}
+
 /// Physical plan for dropping an Iceberg table.
 pub struct IcebergDropTableExec {
     catalog: Arc<dyn Catalog>,
@@ -257,6 +403,7 @@ pub struct IcebergDropTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
+    _datafusion: Weak<DataFusion>,
     properties: PlanProperties,
 }
 
@@ -274,6 +421,7 @@ impl fmt::Debug for IcebergDropTableExec {
 
 impl IcebergDropTableExec {
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -282,6 +430,7 @@ impl IcebergDropTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
+        datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -298,6 +447,7 @@ impl IcebergDropTableExec {
             df_catalog_name,
             df_schema_name,
             catalog_list,
+            _datafusion: datafusion,
             properties,
         }
     }
@@ -375,17 +525,18 @@ impl ExecutionPlan for IcebergDropTableExec {
                 )));
             }
 
-            // Drop from Iceberg catalog
-            catalog.drop_table(&table_ident).await.map_err(|e| {
-                DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
-            })?;
-
-            // Deregister from DataFusion catalog
+            // Deregister from DataFusion catalog — this drops the table provider,
+            // which for AcceleratedTable will abort its background refresh handlers.
             if let Some(df_catalog) = catalog_list.catalog(&df_catalog_name)
                 && let Some(schema_provider) = df_catalog.schema(&df_schema_name)
             {
                 let _ = schema_provider.deregister_table(&table_name);
             }
+
+            // Drop from Iceberg catalog
+            catalog.drop_table(&table_ident).await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
+            })?;
 
             let batch = RecordBatch::try_new(
                 result_schema,

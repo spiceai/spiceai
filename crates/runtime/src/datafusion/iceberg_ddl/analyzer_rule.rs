@@ -31,6 +31,7 @@ use datafusion::optimizer::AnalyzerRule;
 
 use data_components::iceberg::provider::IcebergCatalogProvider;
 
+use super::acceleration_options::SharedAccelerationOptionsStore;
 use super::composed_catalog_to_iceberg;
 use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -47,6 +48,8 @@ pub struct IcebergDdlAnalyzerRule {
     catalog_list: Weak<dyn CatalogProviderList>,
     /// Weak reference to the set of DDL-enabled catalog names.
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
+    /// Shared store for acceleration options extracted from `WITH` clauses.
+    acceleration_options: SharedAccelerationOptionsStore,
 }
 
 impl fmt::Debug for IcebergDdlAnalyzerRule {
@@ -61,10 +64,12 @@ impl IcebergDdlAnalyzerRule {
     pub fn new(
         catalog_list: &Arc<dyn CatalogProviderList>,
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
+        acceleration_options: SharedAccelerationOptionsStore,
     ) -> Self {
         Self {
             catalog_list: Arc::downgrade(catalog_list),
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
+            acceleration_options,
         }
     }
 
@@ -127,6 +132,13 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
 
                 let namespace = iceberg::NamespaceIdent::new(schema_name.clone());
 
+                // Look up acceleration options from the store (consumed on use)
+                let acceleration = self
+                    .acceleration_options
+                    .write()
+                    .ok()
+                    .and_then(|mut store| store.remove(&table_name));
+
                 let node = IcebergCreateTableNode::new(
                     iceberg_catalog,
                     namespace,
@@ -136,6 +148,7 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     create.or_replace,
                     catalog_name,
                     schema_name,
+                    acceleration,
                 );
 
                 Ok(LogicalPlan::Extension(Extension {
