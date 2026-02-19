@@ -16,9 +16,11 @@ limitations under the License.
 
 use std::{collections::BTreeMap, time::Duration};
 
-
-use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use reqwest::Client;
+use spice_cloud_client::{
+    CloudClient,
+    types::{CreateAppRequest, CreateDeploymentRequest, UpdateAppRequest},
+};
 use test_framework::anyhow;
 
 pub(crate) mod secrets;
