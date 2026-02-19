@@ -40,4 +40,9 @@ pub struct StdioArgs {
     /// Release channel for the spice.ai runtime image (stable, preview, nightly, internal).
     #[arg(long)]
     pub channel: Option<String>,
+
+    /// AWS region for the Iceberg Glue catalog and S3 storage.
+    /// Defaults to us-east-1 if not specified.
+    #[arg(long)]
+    pub data_region: Option<String>,
 }

@@ -54,6 +54,8 @@ struct SpidapterHandler {
     ready_wait: u64,
     /// Release channel for the spice.ai runtime image.
     channel: Option<String>,
+    /// AWS region for the Iceberg Glue catalog and S3 storage.
+    data_region: String,
 }
 
 impl SpidapterHandler {
@@ -63,6 +65,10 @@ impl SpidapterHandler {
             api_url_override: args.spice_cloud_api_url.clone(),
             ready_wait: args.ready_wait,
             channel: args.channel.clone(),
+            data_region: args
+                .data_region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string()),
         }
     }
 }
@@ -84,6 +90,7 @@ impl Handler for SpidapterHandler {
             self.api_url_override.as_deref(),
             self.ready_wait,
             self.channel.as_deref(),
+            &self.data_region,
         )
         .await
         .map_err(|e| format!("Setup failed: {e}"))?;
@@ -246,6 +253,7 @@ async fn provision_spice_cloud_app(
     api_url_override: Option<&str>,
     ready_wait: u64,
     channel: Option<&str>,
+    data_region: &str,
 ) -> anyhow::Result<RunState> {
     let cloud = commands::build_cloud_client(api_url_override)?;
 
@@ -269,7 +277,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] App ID: {app_id}");
 
     // Generate initial spicepod YAML (tables created later via create_tables)
-    let spicepod_yaml = generate_initial_spicepod(&run_id);
+    let spicepod_yaml = generate_initial_spicepod(&run_id, data_region);
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -362,7 +370,7 @@ fn sql_type_for_arrow(data_type: &DataType) -> &'static str {
 }
 
 /// Generate the initial spicepod YAML with an Iceberg Glue catalog as the default catalog.
-fn generate_initial_spicepod(run_id: &Uuid) -> String {
+fn generate_initial_spicepod(run_id: &Uuid, data_region: &str) -> String {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     format!(
@@ -371,14 +379,14 @@ kind: Spicepod
 name: spidapter-{short_id}
 
 catalogs:
-  - from: iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces
+  - from: iceberg:https://glue.{data_region}.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces
     name: spice
     access: read_write_create
     params:
       iceberg_sigv4_enabled: true
       iceberg_s3_access_key_id: ${{secrets:AWS_ACCESS_KEY_ID}}
       iceberg_s3_secret_access_key: ${{secrets:AWS_SECRET_ACCESS_KEY}}
-      iceberg_s3_region: us-east-1
+      iceberg_s3_region: {data_region}
 "
     )
 }
