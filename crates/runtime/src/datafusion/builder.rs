@@ -411,7 +411,7 @@ impl DataFusionBuilder {
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
-        let acceleration_options_store =
+        let ddl_options_store =
             super::iceberg_ddl::acceleration_options::new_shared_store();
 
         // Add the Iceberg DDL analyzer rule after context creation so it can
@@ -422,7 +422,7 @@ impl DataFusionBuilder {
             super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
-                Arc::clone(&acceleration_options_store),
+                Arc::clone(&ddl_options_store),
             ),
         ));
 
@@ -432,7 +432,7 @@ impl DataFusionBuilder {
             data_writers: RwLock::new(HashSet::new()),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
-            acceleration_options_store,
+            ddl_options_store,
             datafusion_ref,
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),

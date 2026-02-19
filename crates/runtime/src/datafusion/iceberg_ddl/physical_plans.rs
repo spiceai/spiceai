@@ -32,6 +32,7 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use spicepod::acceleration::Acceleration;
 
+use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::DataFusion;
 use datafusion::catalog::CatalogProviderList;
@@ -77,6 +78,7 @@ pub struct IcebergCreateTableExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     acceleration: Option<Acceleration>,
+    dataset_options: DatasetOptions,
     datafusion: Weak<DataFusion>,
     properties: PlanProperties,
 }
@@ -108,6 +110,7 @@ impl IcebergCreateTableExec {
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
         acceleration: Option<Acceleration>,
+        dataset_options: DatasetOptions,
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
@@ -128,6 +131,7 @@ impl IcebergCreateTableExec {
             df_schema_name,
             catalog_list,
             acceleration,
+            dataset_options,
             datafusion,
             properties,
         }
@@ -183,6 +187,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
         let catalog_list = Arc::clone(&self.catalog_list);
         let result_schema = ddl_result_schema();
         let acceleration = self.acceleration.clone();
+        let dataset_options = self.dataset_options.clone();
         let datafusion = Weak::<DataFusion>::clone(&self.datafusion);
 
         let stream = futures::stream::once(async move {
@@ -311,6 +316,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     &datafusion,
                     Arc::clone(&provider),
                     accel,
+                    &dataset_options,
                     &df_catalog_name,
                     &df_schema_name,
                     &table_name,
@@ -365,6 +371,7 @@ async fn create_accelerated_iceberg_table(
     datafusion: &Weak<DataFusion>,
     source_provider: Arc<dyn datafusion::datasource::TableProvider>,
     acceleration: &Acceleration,
+    dataset_options: &DatasetOptions,
     catalog_name: &str,
     schema_name: &str,
     table_name: &str,
@@ -373,6 +380,7 @@ async fn create_accelerated_iceberg_table(
     use crate::component::dataset::acceleration::{
         Acceleration as RuntimeAcceleration, RefreshMode,
     };
+    use crate::component::dataset::TimeFormat;
     use crate::federated_table::FederatedTable;
     use datafusion::common::TableReference;
 
@@ -419,6 +427,12 @@ async fn create_accelerated_iceberg_table(
     let mut refresh = Refresh::new(refresh_mode);
     if let Some(check_interval) = runtime_accel.refresh_check_interval {
         refresh = refresh.check_interval(check_interval);
+    }
+    if let Some(ref time_column) = dataset_options.time_column {
+        refresh = refresh.time_column(time_column.clone());
+    }
+    if let Some(ref time_format) = dataset_options.time_format {
+        refresh = refresh.time_format(TimeFormat::from(time_format.clone()));
     }
 
     // Build the AcceleratedTable

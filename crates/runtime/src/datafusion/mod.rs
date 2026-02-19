@@ -403,8 +403,8 @@ pub struct DataFusion {
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
-    /// Shared store for acceleration options from `CREATE TABLE ... WITH (acceleration.*)`.
-    acceleration_options_store: iceberg_ddl::acceleration_options::SharedAccelerationOptionsStore,
+    /// Shared store for DDL table options from `CREATE TABLE ... WITH (acceleration.*, dataset.*)`.
+    ddl_options_store: iceberg_ddl::acceleration_options::SharedDdlOptionsStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -757,16 +757,16 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns a reference to the shared acceleration options store.
+    /// Returns a reference to the shared DDL options store.
     ///
     /// Used by the query execution path to insert options extracted from
-    /// `CREATE TABLE ... WITH (acceleration.*)` statements, which are then
-    /// consumed by the `IcebergDdlAnalyzerRule`.
+    /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
+    /// are then consumed by the `IcebergDdlAnalyzerRule`.
     #[must_use]
-    pub fn acceleration_options_store(
+    pub fn ddl_options_store(
         &self,
-    ) -> &iceberg_ddl::acceleration_options::SharedAccelerationOptionsStore {
-        &self.acceleration_options_store
+    ) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
+        &self.ddl_options_store
     }
 
     /// Returns the shared weak self-reference holder.
@@ -2161,12 +2161,12 @@ impl DataFusion {
             return Ok(plan);
         }
 
-        // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning.
-        // This extracts acceleration options, stores them for the analyzer rule,
+        // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning.
+        // This extracts DDL table options, stores them for the analyzer rule,
         // and returns modified SQL without the WITH clause.
-        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_acceleration(
+        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_with_options(
             sql,
-            &self.acceleration_options_store,
+            &self.ddl_options_store,
         )?;
         let (effective_sql, store_key) = match &preprocessed {
             iceberg_ddl::preprocess::PreprocessResult::Modified {
@@ -2180,8 +2180,8 @@ impl DataFusion {
             Ok(plan) => plan,
             Err(e) => {
                 if let Some(store_key) = store_key {
-                    iceberg_ddl::preprocess::cleanup_preprocessed_acceleration_option(
-                        &self.acceleration_options_store,
+                    iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
+                        &self.ddl_options_store,
                         store_key,
                     )?;
                 }

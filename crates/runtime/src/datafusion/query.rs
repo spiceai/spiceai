@@ -863,11 +863,11 @@ impl Query {
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
-                // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning
+                // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning
                 let preprocessed =
-                    match super::iceberg_ddl::preprocess::preprocess_create_table_acceleration(
+                    match super::iceberg_ddl::preprocess::preprocess_create_table_with_options(
                         sql,
-                        self.df.acceleration_options_store(),
+                        self.df.ddl_options_store(),
                     ) {
                         Ok(preprocessed) => preprocessed,
                         Err(e) => {
@@ -892,8 +892,8 @@ impl Query {
                     Err(e) => {
                         if let Some(store_key) = store_key
                             && let Err(cleanup_err) =
-                                super::iceberg_ddl::preprocess::cleanup_preprocessed_acceleration_option(
-                                    self.df.acceleration_options_store(),
+                                super::iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
+                                    self.df.ddl_options_store(),
                                     store_key,
                                 )
                         {
