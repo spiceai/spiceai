@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "f5b4a196a646",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-19/metrics-2",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "bin/spice/src/commands/cloud/client.rs",
+    "bin/spice/src/commands/cloud/mod.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/f5/b4a196a646/0/metadata.json",
+      "transcript": "/f5/b4a196a646/0/full.jsonl",
+      "context": "/f5/b4a196a646/0/context.md",
+      "content_hash": "/f5/b4a196a646/0/content_hash.txt",
+      "prompt": "/f5/b4a196a646/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 37,
+    "cache_creation_tokens": 166759,
+    "cache_read_tokens": 1578983,
+    "output_tokens": 1450,
+    "api_call_count": 29
+  }
+}
