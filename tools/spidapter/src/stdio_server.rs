@@ -339,22 +339,17 @@ fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
 fn sql_type_for_arrow(data_type: &DataType) -> &'static str {
     match data_type {
         DataType::Boolean => "BOOLEAN",
-        DataType::Int8 => "TINYINT",
-        DataType::Int16 => "SMALLINT",
-        DataType::Int32 => "INT",
-        DataType::Int64 => "BIGINT",
-        DataType::UInt8 => "TINYINT",
-        DataType::UInt16 => "SMALLINT",
-        DataType::UInt32 => "INT",
-        DataType::UInt64 => "BIGINT",
+        DataType::Int8 | DataType::UInt8 => "TINYINT",
+        DataType::Int16 | DataType::UInt16 => "SMALLINT",
+        DataType::Int32 | DataType::UInt32 => "INT",
+        DataType::Int64 | DataType::UInt64 => "BIGINT",
         DataType::Float32 => "FLOAT",
         DataType::Float64 => "DOUBLE",
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
         DataType::Date32 | DataType::Date64 => "DATE",
-        DataType::Timestamp(TimeUnit::Second, _) => "TIMESTAMP",
-        DataType::Timestamp(TimeUnit::Millisecond, _) => "TIMESTAMP",
-        DataType::Timestamp(TimeUnit::Microsecond, _) => "TIMESTAMP",
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => "TIMESTAMP",
+        DataType::Timestamp(
+            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+            _,
+        ) => "TIMESTAMP",
         DataType::Decimal128(p, s) => {
             // Leak a formatted string for the static lifetime — only called at table creation
             // time with a small number of distinct precision/scale pairs.
