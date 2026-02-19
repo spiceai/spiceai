@@ -379,7 +379,7 @@ kind: Spicepod
 name: spidapter-{short_id}
 
 catalogs:
-  - from: iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522
+  - from: iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces
     name: spice
     access: read_write_create
     params:
