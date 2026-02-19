@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025, Spice AI, Inc.
+Copyright 2026, Spice AI, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -78,11 +78,7 @@ pub fn parse_acceleration_options(options: &[(String, String)]) -> DFResult<Acce
 
         match field {
             "enabled" => {
-                accel.enabled = value.parse().map_err(|_| {
-                    DataFusionError::Plan(format!(
-                        "Invalid value for 'acceleration.enabled': '{value}'. Expected 'true' or 'false'."
-                    ))
-                })?;
+                accel.enabled = parse_bool(value, "acceleration.enabled")?;
             }
             "engine" => {
                 accel.engine = Some(value.clone());
@@ -112,11 +108,8 @@ pub fn parse_acceleration_options(options: &[(String, String)]) -> DFResult<Acce
                 accel.retention_check_interval = Some(value.clone());
             }
             "retention_check_enabled" => {
-                accel.retention_check_enabled = value.parse().map_err(|_| {
-                    DataFusionError::Plan(format!(
-                        "Invalid value for 'acceleration.retention_check_enabled': '{value}'. Expected 'true' or 'false'."
-                    ))
-                })?;
+                accel.retention_check_enabled =
+                    parse_bool(value, "acceleration.retention_check_enabled")?;
             }
             unknown => {
                 return Err(DataFusionError::Plan(format!(
@@ -133,6 +126,19 @@ pub fn parse_acceleration_options(options: &[(String, String)]) -> DFResult<Acce
     }
 
     Ok(accel)
+}
+
+fn parse_bool(value: &str, field: &str) -> DFResult<bool> {
+    if value.eq_ignore_ascii_case("true") {
+        return Ok(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Ok(false);
+    }
+
+    Err(DataFusionError::Plan(format!(
+        "Invalid value for '{field}': '{value}'. Expected 'true' or 'false'."
+    )))
 }
 
 fn parse_mode(value: &str) -> DFResult<acceleration::Mode> {
@@ -186,6 +192,21 @@ mod tests {
         let options = vec![("acceleration.enabled".to_string(), "false".to_string())];
         let accel = parse_acceleration_options(&options).expect("should parse");
         assert!(!accel.enabled);
+    }
+
+    #[test]
+    fn test_parse_uppercase_booleans() {
+        let options = vec![
+            ("acceleration.enabled".to_string(), "TRUE".to_string()),
+            (
+                "acceleration.retention_check_enabled".to_string(),
+                "FALSE".to_string(),
+            ),
+        ];
+
+        let accel = parse_acceleration_options(&options).expect("should parse");
+        assert!(accel.enabled);
+        assert!(!accel.retention_check_enabled);
     }
 
     #[test]

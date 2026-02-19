@@ -311,8 +311,9 @@ impl ExecutionPlan for IcebergCreateTableExec {
 /// Create an [`AcceleratedTable`] wrapping an Iceberg table provider.
 ///
 /// This is a streamlined version of `DataFusion::create_accelerated_table` for
-/// DDL-created tables. It only supports full-refresh mode (the common case for
-/// ad-hoc CREATE TABLE).
+/// DDL-created tables. It is typically used with full-refresh mode (the common
+/// case for ad-hoc CREATE TABLE) but honors the refresh mode configured in
+/// `acceleration`.
 async fn create_accelerated_iceberg_table(
     datafusion: &Weak<DataFusion>,
     source_provider: Arc<dyn datafusion::catalog::TableProvider>,
@@ -525,18 +526,18 @@ impl ExecutionPlan for IcebergDropTableExec {
                 )));
             }
 
-            // Deregister from DataFusion catalog — this drops the table provider,
-            // which for AcceleratedTable will abort its background refresh handlers.
+            // Drop from Iceberg catalog
+            catalog.drop_table(&table_ident).await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
+            })?;
+
+            // Deregister from DataFusion catalog after successful Iceberg drop.
+            // This preserves consistency if Iceberg drop fails.
             if let Some(df_catalog) = catalog_list.catalog(&df_catalog_name)
                 && let Some(schema_provider) = df_catalog.schema(&df_schema_name)
             {
                 let _ = schema_provider.deregister_table(&table_name);
             }
-
-            // Drop from Iceberg catalog
-            catalog.drop_table(&table_ident).await.map_err(|e| {
-                DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
-            })?;
 
             let batch = RecordBatch::try_new(
                 result_schema,

@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock, Weak};
 
 use datafusion::catalog::CatalogProviderList;
 use datafusion::config::ConfigOptions;
+use datafusion::error::DataFusionError;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::DdlStatement;
 use datafusion::logical_expr::{Extension, LogicalPlan};
@@ -126,6 +127,7 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     .unwrap_or(SPICE_DEFAULT_SCHEMA)
                     .to_string();
                 let table_name = create.name.table().to_string();
+                let acceleration_key = create.name.to_string();
 
                 // Extract the Arrow schema from the logical plan's input
                 let arrow_schema = Arc::new(create.input.schema().inner().as_ref().clone());
@@ -133,11 +135,14 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                 let namespace = iceberg::NamespaceIdent::new(schema_name.clone());
 
                 // Look up acceleration options from the store (consumed on use)
-                let acceleration = self
-                    .acceleration_options
-                    .write()
-                    .ok()
-                    .and_then(|mut store| store.remove(&table_name));
+                let acceleration = {
+                    let mut store = self.acceleration_options.write().map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to acquire acceleration options store lock: {e}"
+                        ))
+                    })?;
+                    store.remove(&acceleration_key)
+                };
 
                 let node = IcebergCreateTableNode::new(
                     iceberg_catalog,

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025, Spice AI, Inc.
+Copyright 2026, Spice AI, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,8 +41,33 @@ pub enum PreprocessResult {
     /// SQL was not a `CREATE TABLE ... WITH (acceleration.*)` — pass through unchanged.
     Unchanged,
     /// SQL was modified: `WITH` clause stripped, acceleration options stored.
-    /// Contains the rewritten SQL string.
-    Modified(String),
+    Modified {
+        /// The rewritten SQL string without the `WITH` clause.
+        sql: String,
+        /// The store key used for the inserted acceleration options.
+        store_key: String,
+    },
+}
+
+/// Remove a previously inserted acceleration option entry from the shared store.
+///
+/// Intended for error paths where preprocessing has inserted options but logical
+/// planning failed before the analyzer could consume the entry.
+///
+/// # Errors
+///
+/// Returns an error if the store lock cannot be acquired.
+pub fn cleanup_preprocessed_acceleration_option(
+    accel_store: &SharedAccelerationOptionsStore,
+    store_key: &str,
+) -> DFResult<()> {
+    let mut store = accel_store.write().map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to acquire acceleration options store lock: {e}"
+        ))
+    })?;
+    let _ = store.remove(store_key);
+    Ok(())
 }
 
 /// Pre-process a SQL string to extract `CREATE TABLE ... WITH (acceleration.*)` options.
@@ -154,7 +179,10 @@ pub fn preprocess_create_table_acceleration(
     modified.table_options = CreateTableOptions::None;
     let modified_sql = Statement::CreateTable(modified).to_string();
 
-    Ok(PreprocessResult::Modified(modified_sql))
+    Ok(PreprocessResult::Modified {
+        sql: modified_sql,
+        store_key: table_name,
+    })
 }
 
 #[cfg(test)]
@@ -186,7 +214,10 @@ mod tests {
         let result = preprocess_create_table_acceleration(sql, &store).expect("should succeed");
 
         match result {
-            PreprocessResult::Modified(modified_sql) => {
+            PreprocessResult::Modified {
+                sql: modified_sql,
+                store_key,
+            } => {
                 // The modified SQL should not contain acceleration options
                 assert!(
                     !modified_sql.contains("acceleration."),
@@ -194,6 +225,7 @@ mod tests {
                 );
                 // Should still be valid CREATE TABLE
                 assert!(modified_sql.to_uppercase().contains("CREATE TABLE"));
+                assert_eq!(store_key, "foo");
             }
             PreprocessResult::Unchanged => panic!("Expected Modified result"),
         }

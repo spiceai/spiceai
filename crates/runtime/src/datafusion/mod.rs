@@ -2152,6 +2152,15 @@ impl DataFusion {
         key: &RawCacheKey,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let plans_cache = self.plans_cache_provider();
+
+        if let Some(cache) = plans_cache.as_ref()
+            && let Some(plan) = cache.get_raw_key(&key.as_u64()).await
+        {
+            tracing::trace!("using cached plan for {sql}");
+            return Ok(plan);
+        }
+
         // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning.
         // This extracts acceleration options, stores them for the analyzer rule,
         // and returns modified SQL without the WITH clause.
@@ -2159,24 +2168,31 @@ impl DataFusion {
             sql,
             &self.acceleration_options_store,
         )?;
-        let effective_sql = match &preprocessed {
-            iceberg_ddl::preprocess::PreprocessResult::Modified(modified) => modified.as_str(),
-            iceberg_ddl::preprocess::PreprocessResult::Unchanged => sql,
+        let (effective_sql, store_key) = match &preprocessed {
+            iceberg_ddl::preprocess::PreprocessResult::Modified {
+                sql: modified,
+                store_key,
+            } => (modified.as_str(), Some(store_key.as_str())),
+            iceberg_ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
-        let Some(plans_cache) = self.plans_cache_provider() else {
-            return session.create_logical_plan(effective_sql).await;
+        let plan = match session.create_logical_plan(effective_sql).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                if let Some(store_key) = store_key {
+                    iceberg_ddl::preprocess::cleanup_preprocessed_acceleration_option(
+                        &self.acceleration_options_store,
+                        store_key,
+                    )?;
+                }
+                return Err(e);
+            }
         };
 
-        if let Some(plan) = plans_cache.get_raw_key(&key.as_u64()).await {
-            tracing::trace!("using cached plan for {sql}");
-            return Ok(plan);
+        if let Some(cache) = plans_cache {
+            tracing::trace!("caching plan for {sql}");
+            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
         }
-
-        let plan = session.create_logical_plan(effective_sql).await?;
-
-        tracing::trace!("caching plan for {sql}");
-        plans_cache.put_raw_key(&key.as_u64(), plan.clone()).await;
 
         Ok(plan)
     }
