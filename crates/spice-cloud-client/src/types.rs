@@ -235,6 +235,24 @@ pub struct RegenerateApiKeyRequest {
 }
 
 // ============================================================================
+// Metrics
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PodMetrics {
+    pub cpu_usage_percent: f64,
+    pub memory_usage_bytes: u64,
+    pub filesystem_usage_bytes: u64,
+    pub filesystem_available_bytes: u64,
+    pub filesystem_capacity_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricsResponse {
+    pub metrics: BTreeMap<String, PodMetrics>,
+}
+
+// ============================================================================
 // Rollback
 // ============================================================================
 
