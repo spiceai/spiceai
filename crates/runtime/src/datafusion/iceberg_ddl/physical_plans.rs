@@ -38,7 +38,7 @@ use datafusion::catalog::CatalogProviderList;
 
 /// Coerce nanosecond timestamp fields to microsecond precision.
 ///
-/// Iceberg v2 does not support `timestamp_ns`. DataFusion's SQL parser maps
+/// Iceberg v2 does not support `timestamp_ns`. `DataFusion`'s SQL parser maps
 /// `TIMESTAMP` to `Timestamp(Nanosecond, ...)` by default, so we downgrade to
 /// microsecond before converting to Iceberg schema.
 fn coerce_timestamps_to_microsecond(schema: &Schema) -> Arc<Schema> {
