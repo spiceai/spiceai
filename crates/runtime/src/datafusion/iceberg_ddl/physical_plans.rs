@@ -212,11 +212,24 @@ impl ExecutionPlan for IcebergCreateTableExec {
                 ))
             })?;
 
-            // Register in the DataFusion catalog's schema provider
+            // Register in the DataFusion catalog's schema provider.
+            // Wrap in IcebergDeletionProvider + DeletionTableProviderAdapter so the
+            // table supports DELETE FROM via equality delete files.
             if let Some(df_catalog) = catalog_list.catalog(&df_catalog_name)
                 && let Some(schema_provider) = df_catalog.schema(&df_schema_name)
             {
-                schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
+                let deletion_provider =
+                    data_components::iceberg::delete::IcebergDeletionProvider::new(
+                        Arc::clone(&catalog),
+                        namespace.clone(),
+                        table_name.clone(),
+                        Arc::new(provider),
+                    );
+                let adapted: Arc<dyn datafusion::datasource::TableProvider> =
+                    Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
+                        Arc::new(deletion_provider),
+                    ));
+                schema_provider.register_table(table_name.clone(), adapted)?;
             }
 
             let batch = RecordBatch::try_new(
