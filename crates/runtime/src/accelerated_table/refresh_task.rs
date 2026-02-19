@@ -746,6 +746,14 @@ impl RefreshTask {
                 .await;
         }
 
+        if let Some(stat) = &refresh_stat {
+            for dataset_name in self.get_dataset_names().await {
+                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
+                metrics::REFRESH_PROCESSED_ROWS.add(stat.num_rows as u64, &labels);
+                metrics::REFRESH_PROCESSED_BYTES.add(stat.memory_size as u64, &labels);
+            }
+        }
+
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
 
