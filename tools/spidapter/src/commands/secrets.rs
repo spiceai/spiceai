@@ -14,33 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use reqwest::Client;
 use runtime_secrets::{ExposeSecret, Secrets};
+use spice_cloud_client::CloudClient;
 use test_framework::anyhow;
 
 /// Set a single secret on a Spice Cloud app.
 pub(crate) async fn set_secret(
-    client: &Client,
-    base_url: &str,
-    token: &str,
+    cloud: &CloudClient,
     app_id: i64,
     name: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    let secrets_url = format!("{base_url}/v1/apps/{app_id}/secrets");
-
-    let response = client
-        .post(&secrets_url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "name": name,
-            "value": value,
-        }))
-        .send()
-        .await?;
-
-    response.error_for_status()?;
-
+    cloud.set_secret(app_id, name, value).await?;
     Ok(())
 }
 
@@ -48,9 +33,7 @@ pub(crate) async fn set_secret(
 ///
 /// Extracts all secrets referenced in the spicepod YAML (regardless of store type), and sets them in SCP by using the local ENV variable of the same key name.
 pub(crate) async fn set_spicepod_secrets(
-    client: &Client,
-    base_url: &str,
-    token: &str,
+    cloud: &CloudClient,
     app_id: i64,
     spicepod_yaml: &str,
 ) -> anyhow::Result<()> {
@@ -73,15 +56,7 @@ pub(crate) async fn set_spicepod_secrets(
         match secrets.get_secret(&secret_key).await {
             Ok(Some(secret_value)) => {
                 println!("Setting secret: {secret_key} (from store: {store_name})");
-                set_secret(
-                    client,
-                    base_url,
-                    token,
-                    app_id,
-                    &secret_key,
-                    secret_value.expose_secret(),
-                )
-                .await?;
+                set_secret(cloud, app_id, &secret_key, secret_value.expose_secret()).await?;
             }
             Ok(None) => {
                 eprintln!(
