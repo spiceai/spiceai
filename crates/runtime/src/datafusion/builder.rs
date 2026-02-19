@@ -411,8 +411,7 @@ impl DataFusionBuilder {
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
-        let ddl_options_store =
-            super::iceberg_ddl::acceleration_options::new_shared_store();
+        let ddl_options_store = super::iceberg_ddl::acceleration_options::new_shared_store();
 
         // Add the Iceberg DDL analyzer rule after context creation so it can
         // reference the catalog list and DDL-enabled catalogs.
