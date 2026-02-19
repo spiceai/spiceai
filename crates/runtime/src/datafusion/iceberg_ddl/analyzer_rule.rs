@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock, Weak};
 
 use datafusion::catalog::CatalogProviderList;
 use datafusion::config::ConfigOptions;
+use datafusion::error::DataFusionError;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::DdlStatement;
 use datafusion::logical_expr::{Extension, LogicalPlan};
@@ -31,6 +32,7 @@ use datafusion::optimizer::AnalyzerRule;
 
 use data_components::iceberg::provider::IcebergCatalogProvider;
 
+use super::acceleration_options::SharedAccelerationOptionsStore;
 use super::composed_catalog_to_iceberg;
 use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -47,6 +49,8 @@ pub struct IcebergDdlAnalyzerRule {
     catalog_list: Weak<dyn CatalogProviderList>,
     /// Weak reference to the set of DDL-enabled catalog names.
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
+    /// Shared store for acceleration options extracted from `WITH` clauses.
+    acceleration_options: SharedAccelerationOptionsStore,
 }
 
 impl fmt::Debug for IcebergDdlAnalyzerRule {
@@ -61,10 +65,12 @@ impl IcebergDdlAnalyzerRule {
     pub fn new(
         catalog_list: &Arc<dyn CatalogProviderList>,
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
+        acceleration_options: SharedAccelerationOptionsStore,
     ) -> Self {
         Self {
             catalog_list: Arc::downgrade(catalog_list),
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
+            acceleration_options,
         }
     }
 
@@ -121,11 +127,22 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     .unwrap_or(SPICE_DEFAULT_SCHEMA)
                     .to_string();
                 let table_name = create.name.table().to_string();
+                let acceleration_key = create.name.to_string();
 
                 // Extract the Arrow schema from the logical plan's input
                 let arrow_schema = Arc::new(create.input.schema().inner().as_ref().clone());
 
                 let namespace = iceberg::NamespaceIdent::new(schema_name.clone());
+
+                // Look up acceleration options from the store (consumed on use)
+                let acceleration = {
+                    let mut store = self.acceleration_options.write().map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to acquire acceleration options store lock: {e}"
+                        ))
+                    })?;
+                    store.remove(&acceleration_key)
+                };
 
                 let node = IcebergCreateTableNode::new(
                     iceberg_catalog,
@@ -136,6 +153,7 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     create.or_replace,
                     catalog_name,
                     schema_name,
+                    acceleration,
                 );
 
                 Ok(LogicalPlan::Extension(Extension {
