@@ -21,7 +21,7 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use arrow::array::{RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -35,6 +35,26 @@ use spicepod::acceleration::Acceleration;
 use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::DataFusion;
 use datafusion::catalog::CatalogProviderList;
+
+/// Coerce nanosecond timestamp fields to microsecond precision.
+///
+/// Iceberg v2 does not support `timestamp_ns`. DataFusion's SQL parser maps
+/// `TIMESTAMP` to `Timestamp(Nanosecond, ...)` by default, so we downgrade to
+/// microsecond before converting to Iceberg schema.
+fn coerce_timestamps_to_microsecond(schema: &Schema) -> Arc<Schema> {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => f
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
 
 /// Creates a result schema for DDL operations (single "result" column).
 fn ddl_result_schema() -> SchemaRef {
@@ -166,6 +186,9 @@ impl ExecutionPlan for IcebergCreateTableExec {
         let datafusion = Weak::<DataFusion>::clone(&self.datafusion);
 
         let stream = futures::stream::once(async move {
+            // Coerce nanosecond timestamps to microsecond for Iceberg v2 compatibility
+            let arrow_schema = coerce_timestamps_to_microsecond(&arrow_schema);
+
             // Convert Arrow schema to Iceberg schema
             let iceberg_schema =
                 iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema.as_ref())
