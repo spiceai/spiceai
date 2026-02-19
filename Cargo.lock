@@ -6672,6 +6672,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "duration-parse"
+version = "2.0.0-unstable"
+dependencies = [
+ "snafu",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18128,7 +18135,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
  "byte-unit",
- "fundu",
+ "duration-parse",
  "futures",
  "object_store",
  "regex",
