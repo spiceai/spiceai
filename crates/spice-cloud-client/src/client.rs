@@ -48,21 +48,21 @@ impl CloudClient {
     ///
     /// Use [`Self::with_token`] to set an authentication token, and
     /// [`Self::with_timeout`] to override the default 30-second timeout.
-    #[must_use]
-    pub fn new(base_url: &str) -> Self {
-        Self {
+    pub fn new(base_url: &str) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .context(HttpRequestSnafu)?;
+
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::builder()
-                .timeout(DEFAULT_TIMEOUT)
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
             token: None,
-        }
+        })
     }
 
     /// Create a new client pointing at the default production API.
-    #[must_use]
-    pub fn default_url() -> Self {
+    pub fn default_url() -> Result<Self> {
         Self::new(DEFAULT_BASE_URL)
     }
 
@@ -121,8 +121,17 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        if response.status() == reqwest::StatusCode::ACCEPTED || !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::ACCEPTED {
             return Ok(None);
+        }
+
+        if !status.is_success() {
+            self.handle_empty_response(response).await?;
+            return Err(error::Error::Api {
+                status: status.as_u16(),
+                message: "Unexpected non-success status while exchanging auth code".to_string(),
+            });
         }
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
@@ -473,30 +482,24 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    // ============================================================================
+    // ========================================================================
     // Metrics
-    // ============================================================================
+    // ========================================================================
 
     /// Get metrics for an app's pods.
-    ///
-    /// `window` controls the rate window for counter metrics (disk I/O).
-    /// Valid values are with time units, e.g: `"1m"`, `"5m"`, `"15m"`.
-    ///
-    /// Pass `None` for cumulative values since the last reset (e.g. container start).
-    pub async fn get_app_metrics(
-        &self,
-        app_id: i64,
-        window: Option<&str>,
-    ) -> Result<MetricsResponse> {
+    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
         let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
-        let mut request = self.client.get(&url).bearer_auth(self.token_str());
-        if let Some(w) = window {
-            request = request.query(&[("window", w)]);
-        }
-        let response = request.send().await.context(HttpRequestSnafu)?;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
 
         self.handle_response(response).await
     }
+
     // ========================================================================
     // Response handling
     // ========================================================================
@@ -507,7 +510,6 @@ impl CloudClient {
     ) -> Result<T> {
         let status = response.status();
         let body = response.text().await.context(HttpRequestSnafu)?;
-
         match status.as_u16() {
             200..=202 => {
                 serde_json::from_str(&body).map_err(|source| error::Error::JsonParse { source })
