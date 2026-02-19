@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
-    AdbcDriver, DatasetConfig, EtlType, Handler, QueryMethodResponse, Server, SetupResponse,
+    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, Server, SetupResponse,
     TeardownResponse,
 };
 use test_framework::anyhow;
@@ -67,11 +67,11 @@ impl Handler for SpidapterHandler {
     async fn setup(
         &mut self,
         run_id: Uuid,
-        datasets: HashMap<String, DatasetConfig>,
+        metadata: HashMap<String, serde_json::Value>,
     ) -> Result<SetupResponse, String> {
         eprintln!(
-            "[stdio] setup: run_id={run_id}, datasets={:?}",
-            datasets.keys().collect::<Vec<_>>()
+            "[stdio] setup: run_id={run_id}, metadata_keys={:?}",
+            metadata.keys().collect::<Vec<_>>()
         );
 
         let state = provision_spice_cloud_app(
@@ -113,6 +113,22 @@ impl Handler for SpidapterHandler {
                 ),
             ]),
         })
+    }
+
+    async fn create_tables(
+        &mut self,
+        run_id: Uuid,
+        _datasets: HashMap<String, DatasetConfig>,
+    ) -> Result<CreateTablesResponse, String> {
+        eprintln!("[stdio] create_tables: run_id={run_id}");
+
+        let _state = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
+
+        // Tables are created by Spice Cloud during deployment
+        Ok(CreateTablesResponse { ok: true })
     }
 
     async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
@@ -160,7 +176,6 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 /// 6. Wait for the deployment to become ready
 async fn provision_spice_cloud_app(
     run_id: Uuid,
-    datasets: &HashMap<String, DatasetConfig>,
     api_url_override: Option<&str>,
     ready_wait: u64,
     channel: Option<&str>,
@@ -186,8 +201,8 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    // Generate spicepod YAML from the dataset configs
-    let spicepod_yaml = generate_spicepod_yaml(&run_id, datasets);
+    // Generate initial spicepod YAML (tables created later via create_tables)
+    let spicepod_yaml = generate_initial_spicepod(&run_id);
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -227,79 +242,9 @@ async fn provision_spice_cloud_app(
     })
 }
 
-/// Generate a spicepod YAML document from the datasets in a `SetupRequest`.
-///
-/// Each dataset entry in the map becomes a spicepod dataset. For S3 datasets
-/// the `from` param becomes the dataset `from` field, and remaining params
-/// are passed through as dataset-level params.
-fn generate_spicepod_yaml(run_id: &Uuid, datasets: &HashMap<String, DatasetConfig>) -> String {
-    use std::fmt::Write;
-
+/// Generate a minimal initial spicepod YAML with no datasets.
+fn generate_initial_spicepod(run_id: &Uuid) -> String {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
-    let mut yaml = format!("version: v1beta1\nkind: Spicepod\nname: spidapter-{short_id}\n");
-
-    if datasets.is_empty() {
-        return yaml;
-    }
-
-    yaml.push_str("datasets:\n");
-
-    for (name, config) in datasets {
-        let from = dataset_from_field(config);
-        let _ = write!(yaml, "  - from: {from}\n    name: {name}\n");
-
-        // Collect non-`from` params to emit as dataset params
-        let other_params: Vec<_> = config
-            .params
-            .iter()
-            .filter(|(k, _)| {
-                k.as_str() != "from" && k.as_str() != "bucket" && k.as_str() != "prefix"
-            })
-            .collect();
-
-        if !other_params.is_empty() {
-            yaml.push_str("    params:\n");
-            for (key, value) in other_params {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                let _ = writeln!(yaml, "      {key}: \"{value_str}\"");
-            }
-        }
-    }
-
-    yaml
-}
-
-/// Derive the spicepod `from` field from a `DatasetConfig`.
-///
-/// Supports two styles:
-/// - `params.from` — used directly (e.g. `s3://bucket/path/file.parquet`)
-/// - `params.bucket` + optional `params.prefix` — composed into `s3://bucket/prefix`
-fn dataset_from_field(config: &DatasetConfig) -> String {
-    // Direct `from` takes precedence
-    if let Some(from) = config.params.get("from").and_then(|v| v.as_str()) {
-        return from.to_string();
-    }
-
-    // Compose from bucket + prefix for S3
-    if config.etl_type == EtlType::S3
-        && let Some(bucket) = config.params.get("bucket").and_then(|v| v.as_str())
-    {
-        let prefix = config
-            .params
-            .get("prefix")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let prefix = prefix.trim_start_matches('/');
-        return if prefix.is_empty() {
-            format!("s3://{bucket}/")
-        } else {
-            format!("s3://{bucket}/{prefix}")
-        };
-    }
-
-    "unknown://source".to_string()
+    format!("version: v1beta1\nkind: Spicepod\nname: spidapter-{short_id}\n")
 }
