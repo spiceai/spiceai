@@ -140,7 +140,6 @@ fn parse_bool(value: &str, field: &str) -> DFResult<bool> {
         "Invalid value for '{field}': '{value}'. Expected 'true' or 'false'."
     )))
 }
-
 fn parse_mode(value: &str) -> DFResult<acceleration::Mode> {
     match value.to_lowercase().as_str() {
         "memory" => Ok(acceleration::Mode::Memory),

@@ -901,7 +901,6 @@ impl Query {
                             self.handle_schema_error(&request_context, &cleanup_err);
                             return Err(cleanup_err);
                         }
-
                         let e = find_datafusion_root(e);
                         self.handle_schema_error(&request_context, &e);
                         return Err(e);
