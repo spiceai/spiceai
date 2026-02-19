@@ -316,11 +316,7 @@ fn sql_url_from_cname(cname: &str) -> String {
     format!("https://{cname}.spiceai.io/v1/sql")
 }
 
-/// Generate a `CREATE TABLE IF NOT EXISTS` DDL statement from a dataset's Arrow schema,
-/// with acceleration configured for the cayenne engine with append refresh every 10 seconds.
-///
-/// If the schema contains a timestamp column, it is used as the acceleration time column
-/// with `timestamptz` format.
+/// Generate a `CREATE TABLE IF NOT EXISTS` DDL statement from a dataset's Arrow schema.
 fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
     let columns: Vec<String> = config
         .schema
@@ -333,18 +329,10 @@ fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
         })
         .collect();
 
-    let with_opts = [
-        "\"acceleration.engine\" = 'cayenne'".to_string(),
-        "\"acceleration.mode\" = 'file'".to_string(),
-        "\"acceleration.refresh_mode\" = 'full'".to_string(),
-        "\"acceleration.refresh_check_interval\" = '1s'".to_string(),
-    ];
-
     format!(
-        "CREATE TABLE IF NOT EXISTS {} ({}) WITH ({})",
+        "CREATE TABLE IF NOT EXISTS {} ({})",
         quote_ident(table_name),
-        columns.join(", "),
-        with_opts.join(", ")
+        columns.join(", ")
     )
 }
 
