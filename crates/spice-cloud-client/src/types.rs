@@ -122,7 +122,7 @@ pub struct CreateDeploymentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_channel: Option<String>,
+    pub channel: Option<String>,
     pub debug: bool,
 }
 

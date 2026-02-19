@@ -221,7 +221,7 @@ pub(crate) async fn create_deployment(
                 branch: None,
                 commit_sha: None,
                 commit_message: None,
-                updated_channel: channel.map(String::from),
+                channel: channel.map(String::from),
                 debug: false,
             },
         )

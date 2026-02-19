@@ -21,9 +21,13 @@ limitations under the License.
 //! into the CLI error type.
 
 use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
-use spice_cloud_client::types::*;
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
+use spice_cloud_client::types::{
+    ApiKeysResponse, App, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
+    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, RegenerateApiKeyResponse,
+    RegionsResponse, Secret, UpdateAppRequest,
+};
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
 const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
@@ -182,7 +186,7 @@ impl CloudClient {
             branch: None,
             commit_sha: None,
             commit_message: None,
-            updated_channel: None,
+            channel: None,
             debug,
         };
         self.inner
