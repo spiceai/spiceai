@@ -480,7 +480,8 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
     // Delete another row with reopened table
     let ctx2 = SessionContext::new();
     let filter2 = col("id").eq(lit(5i64));
-    let plan2 = DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
+    let plan2 =
+        DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     // Verify count
@@ -552,7 +553,8 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
 
     let ctx2 = SessionContext::new();
     let filter2 = col("value").eq(lit(1i64));
-    let plan2 = DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
+    let plan2 =
+        DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     ctx2.register_table(
@@ -673,16 +675,28 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
     insert_batch(&table3, batch3).await?;
 
     // Delete from each table
-    let plan1 = DeletionTableProvider::delete_from(table1.as_ref(), &ctx.state(), &[col("id").eq(lit(1i64))])
-        .await?;
+    let plan1 = DeletionTableProvider::delete_from(
+        table1.as_ref(),
+        &ctx.state(),
+        &[col("id").eq(lit(1i64))],
+    )
+    .await?;
     datafusion_physical_plan::collect(plan1, ctx.task_ctx()).await?;
 
-    let plan2 = DeletionTableProvider::delete_from(table2.as_ref(), &ctx.state(), &[col("key").eq(lit("X"))])
-        .await?;
+    let plan2 = DeletionTableProvider::delete_from(
+        table2.as_ref(),
+        &ctx.state(),
+        &[col("key").eq(lit("X"))],
+    )
+    .await?;
     datafusion_physical_plan::collect(plan2, ctx.task_ctx()).await?;
 
-    let plan3 = DeletionTableProvider::delete_from(table3.as_ref(), &ctx.state(), &[col("amount").eq(lit(100i64))])
-        .await?;
+    let plan3 = DeletionTableProvider::delete_from(
+        table3.as_ref(),
+        &ctx.state(),
+        &[col("amount").eq(lit(100i64))],
+    )
+    .await?;
     datafusion_physical_plan::collect(plan3, ctx.task_ctx()).await?;
 
     // Verify each table

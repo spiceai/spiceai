@@ -309,7 +309,10 @@ impl FileFormat for DeletionFilteringVortexFormat {
             .await
     }
 
-    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn datafusion_datasource::file::FileSource> {
+    fn file_source(
+        &self,
+        table_schema: TableSchema,
+    ) -> Arc<dyn datafusion_datasource::file::FileSource> {
         self.inner.file_source(table_schema)
     }
 }

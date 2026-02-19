@@ -317,13 +317,12 @@ impl DeltaTable {
         ))
         .context(DeltaTableExecutionSnafu)?;
 
-        let file_scan_config_builder = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::new(parquet_source),
-        )
-        .with_limit(limit)
-        .with_projection_indices(new_projections).context(DeltaTableExecutionSnafu)?
-        .with_file_group(FileGroup::new(partitioned_files.to_vec()));
+        let file_scan_config_builder =
+            FileScanConfigBuilder::new(object_store_url, Arc::new(parquet_source))
+                .with_limit(limit)
+                .with_projection_indices(new_projections)
+                .context(DeltaTableExecutionSnafu)?
+                .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 
         Ok(DataSourceExec::from_data_source(
             file_scan_config_builder.build(),

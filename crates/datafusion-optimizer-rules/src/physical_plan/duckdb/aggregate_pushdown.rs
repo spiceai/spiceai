@@ -6,7 +6,9 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, Statistics, exec_err, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{Distribution, OrderingRequirements, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    Distribution, OrderingRequirements, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, InvariantLevel};
 use datafusion::physical_plan::filter_pushdown::{
@@ -14,7 +16,9 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DuckDBDialect;
 use datafusion_expr::LogicalPlan;

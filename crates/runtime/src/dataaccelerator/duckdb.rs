@@ -1173,9 +1173,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1191,9 +1192,10 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1228,9 +1230,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1261,9 +1264,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
