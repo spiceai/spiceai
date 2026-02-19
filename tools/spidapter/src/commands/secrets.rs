@@ -55,7 +55,7 @@ pub(crate) async fn set_spicepod_secrets(
     for (secret_key, store_name) in secret_refs {
         match secrets.get_secret(&secret_key).await {
             Ok(Some(secret_value)) => {
-                println!("Setting secret: {secret_key} (from store: {store_name})");
+                eprintln!("Setting secret: {secret_key} (from store: {store_name})");
                 set_secret(cloud, app_id, &secret_key, secret_value.expose_secret()).await?;
             }
             Ok(None) => {
