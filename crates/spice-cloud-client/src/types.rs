@@ -247,9 +247,17 @@ pub struct PodMetrics {
     pub filesystem_capacity_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IngestionMetrics {
+    pub rows_ingested: Option<u64>,
+    pub bytes_ingested: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MetricsResponse {
     pub metrics: BTreeMap<String, PodMetrics>,
+    #[serde(default)]
+    pub ingestion: Option<IngestionMetrics>,
 }
 
 // ============================================================================

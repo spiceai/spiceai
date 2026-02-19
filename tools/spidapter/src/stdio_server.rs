@@ -151,9 +151,18 @@ impl Handler for SpidapterHandler {
             }
         };
 
+        let ingestion = cloud_metrics
+            .ingestion
+            .map(|i| IngestionMetrics {
+                rows_ingested: i.rows_ingested,
+                bytes_ingested: i.bytes_ingested,
+                ..IngestionMetrics::default()
+            })
+            .unwrap_or_default();
+
         Ok(MetricsResponse {
             resource,
-            ingestion: IngestionMetrics::default(),
+            ingestion,
         })
     }
 

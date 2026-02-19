@@ -1050,6 +1050,17 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     }
     table.print();
 
+    if let Some(ingestion) = &response.ingestion {
+        println!();
+        println!("Ingestion:");
+        if let Some(rows) = ingestion.rows_ingested {
+            println!("  Rows ingested:  {rows}");
+        }
+        if let Some(bytes) = ingestion.bytes_ingested {
+            println!("  Bytes ingested: {}", format_bytes(bytes));
+        }
+    }
+
     Ok(())
 }
 
