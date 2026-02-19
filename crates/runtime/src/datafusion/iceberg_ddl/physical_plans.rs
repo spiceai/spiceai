@@ -225,7 +225,6 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     ))
                 })?,
             );
-<<<<<<< HEAD
             // Register in the DataFusion catalog's schema provider
             let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
                 return Err(DataFusionError::Execution(format!(
@@ -237,22 +236,6 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
                 )));
             };
-
-=======
-
-            // Register in the DataFusion catalog's schema provider
-            let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
-                return Err(DataFusionError::Execution(format!(
-                    "Catalog '{df_catalog_name}' not found"
-                )));
-            };
-            let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
-                return Err(DataFusionError::Execution(format!(
-                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
-                )));
-            };
-
->>>>>>> fb0993d5b (feat: Per-table acceleration via CREATE TABLE ... WITH ("acceleration.*"))
             let register_raw_provider =
                 |raw_provider: Arc<dyn datafusion::datasource::TableProvider>| -> DFResult<()> {
                     let deletion_provider =
@@ -262,18 +245,10 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             table_name.clone(),
                             raw_provider,
                         );
-<<<<<<< HEAD
                     let adapted: Arc<dyn datafusion::datasource::TableProvider> =
                         Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
                             Arc::new(deletion_provider),
                         ));
-=======
-                    let adapted: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
-                        data_components::delete::DeletionTableProviderAdapter::new(Arc::new(
-                            deletion_provider,
-                        )),
-                    );
->>>>>>> fb0993d5b (feat: Per-table acceleration via CREATE TABLE ... WITH ("acceleration.*"))
                     schema_provider.register_table(table_name.clone(), adapted)?;
                     Ok(())
                 };
@@ -333,20 +308,12 @@ impl ExecutionPlan for IcebergCreateTableExec {
 /// Create an [`AcceleratedTable`] wrapping an Iceberg table provider.
 ///
 /// This is a streamlined version of `DataFusion::create_accelerated_table` for
-<<<<<<< HEAD
 /// DDL-created tables. It is typically used with full-refresh mode (the common
 /// case for ad-hoc CREATE TABLE) but honors the refresh mode configured in
 /// `acceleration`.
 async fn create_accelerated_iceberg_table(
     datafusion: &Weak<DataFusion>,
     source_provider: Arc<dyn datafusion::datasource::TableProvider>,
-=======
-/// DDL-created tables. It only supports full-refresh mode (the common case for
-/// ad-hoc CREATE TABLE).
-async fn create_accelerated_iceberg_table(
-    datafusion: &Weak<DataFusion>,
-    source_provider: Arc<dyn datafusion::catalog::TableProvider>,
->>>>>>> fb0993d5b (feat: Per-table acceleration via CREATE TABLE ... WITH ("acceleration.*"))
     acceleration: &Acceleration,
     catalog_name: &str,
     schema_name: &str,
@@ -556,7 +523,6 @@ impl ExecutionPlan for IcebergDropTableExec {
                 )));
             }
 
-<<<<<<< HEAD
             // Drop from Iceberg catalog
             catalog.drop_table(&table_ident).await.map_err(|e| {
                 DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
@@ -564,20 +530,11 @@ impl ExecutionPlan for IcebergDropTableExec {
 
             // Deregister from DataFusion catalog after successful Iceberg drop.
             // This preserves consistency if Iceberg drop fails.
-=======
-            // Deregister from DataFusion catalog — this drops the table provider,
-            // which for AcceleratedTable will abort its background refresh handlers.
->>>>>>> fb0993d5b (feat: Per-table acceleration via CREATE TABLE ... WITH ("acceleration.*"))
             if let Some(df_catalog) = catalog_list.catalog(&df_catalog_name)
                 && let Some(schema_provider) = df_catalog.schema(&df_schema_name)
             {
                 let _ = schema_provider.deregister_table(&table_name);
             }
-
-            // Drop from Iceberg catalog
-            catalog.drop_table(&table_ident).await.map_err(|e| {
-                DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
-            })?;
 
             let batch = RecordBatch::try_new(
                 result_schema,

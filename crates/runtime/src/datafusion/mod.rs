@@ -2405,7 +2405,25 @@ async fn build_snapshot_creation_config(
                     Ok(batches)
                 }
             }
+            None => Ok(DEFAULT_SNAPSHOT_CREATION_BATCHES),
         }
+    };
+
+    // Caching mode only supports time_interval - no "refresh complete" or "stream_batches" events.
+    let is_caching = matches!(refresh_mode, RefreshMode::Caching);
+
+    let snapshot_creation_trigger = if is_caching {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::RefreshComplete | SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedSnapshotTriggerForCaching);
+            }
+        }
+    } else if is_streaming_refresh {
+        match snapshot_trigger {
             None | Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;
                 SnapshotCreateTrigger::Interval(interval)
@@ -2425,6 +2443,10 @@ async fn build_snapshot_creation_config(
             }
             Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
             }
         }
     };
