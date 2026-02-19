@@ -163,6 +163,7 @@ pub fn preprocess_create_table_acceleration(
 
     // Extract the table name for the store key
     let table_name = create_table.name.to_string();
+    let store_key = table_name.clone();
 
     // Store the acceleration options
     {
@@ -181,7 +182,7 @@ pub fn preprocess_create_table_acceleration(
 
     Ok(PreprocessResult::Modified {
         sql: modified_sql,
-        store_key: table_name,
+        store_key,
     })
 }
 
