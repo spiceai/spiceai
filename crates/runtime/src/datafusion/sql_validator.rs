@@ -27,10 +27,10 @@ use crate::datafusion::DataFusion;
 /// Validates that a logical plan only performs allowed operations on datasets.
 ///
 /// Reads (SELECT queries) are allowed on all tables.
-/// INSERT operations are only allowed on datasets that are configured as writable,
+/// INSERT and DELETE operations are only allowed on datasets that are configured as writable,
 /// and are not allowed on internal Spice tables.
 /// DDL operations are only allowed on catalogs configured with `access: read_write_create`.
-/// DML (other than allowed INSERT), COPY, and Statement operations are not permitted.
+/// DML (other than allowed INSERT/DELETE), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
 /// * `Ok(())` if the plan is valid
@@ -75,6 +75,36 @@ pub fn validate_sql_query_operations(
                 } else {
                     plan_err!(
                         "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
+                        dml.table_name
+                    )
+                }
+            } else if matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete) {
+                if super::is_spice_internal_dataset(&dml.table_name) {
+                    return plan_err!(
+                        "DELETE operations are not allowed on Spice system dataset '{}'.",
+                        dml.table_name
+                    );
+                }
+
+                // Check if attempting to delete from a catalog table.
+                if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
+                    if !df.is_catalog_writable(catalog) {
+                        return plan_err!(
+                            "DELETE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                            dml.table_name
+                        );
+                    }
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+
+                if df.is_writable(&dml.table_name) {
+                    Ok(TreeNodeRecursion::Continue)
+                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                    // No catalog specified but default catalog is writable
+                    Ok(TreeNodeRecursion::Continue)
+                } else {
+                    plan_err!(
+                        "DELETE operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
                         dml.table_name
                     )
                 }
@@ -397,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_delete_operation_blocked() {
+    async fn test_validate_delete_on_writable_dataset_allowed() {
         let df = create_test_datafusion();
 
         let sql = "DELETE FROM tbl_writable WHERE id = 1";
@@ -408,9 +438,49 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        // DELETE operations should be blocked
+        // DELETE operations should be allowed on writable datasets
         let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_err(), "DELETE operations should be blocked");
+        assert!(
+            result.is_ok(),
+            "DELETE should be allowed on writable dataset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_delete_on_readonly_dataset_blocked() {
+        let df = create_test_datafusion();
+
+        let sql = "DELETE FROM tbl_read_only WHERE id = 1";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        // DELETE operations should be blocked on read-only datasets
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(result.is_err(), "DELETE should fail on read-only dataset");
+    }
+
+    #[tokio::test]
+    async fn test_validate_delete_on_internal_table_blocked() {
+        let df = create_test_datafusion();
+
+        let sql = "DELETE FROM runtime.spice_table WHERE id = 1";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        // DELETE operations should be blocked on internal tables
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_err(),
+            "DELETE should fail on Spice internal dataset"
+        );
     }
 
     #[tokio::test]
