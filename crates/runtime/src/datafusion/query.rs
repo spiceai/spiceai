@@ -864,17 +864,18 @@ impl Query {
             QueryMethod::Plan(ref plan) => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
                 // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning
-                let preprocessed = match super::iceberg_ddl::preprocess::preprocess_create_table_acceleration(
-                    sql,
-                    self.df.acceleration_options_store(),
-                ) {
-                    Ok(preprocessed) => preprocessed,
-                    Err(e) => {
-                        let e = find_datafusion_root(e);
-                        self.handle_schema_error(&request_context, &e);
-                        return Err(e);
-                    }
-                };
+                let preprocessed =
+                    match super::iceberg_ddl::preprocess::preprocess_create_table_acceleration(
+                        sql,
+                        self.df.acceleration_options_store(),
+                    ) {
+                        Ok(preprocessed) => preprocessed,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            self.handle_schema_error(&request_context, &e);
+                            return Err(e);
+                        }
+                    };
 
                 let (effective_sql, store_key) = match &preprocessed {
                     super::iceberg_ddl::preprocess::PreprocessResult::Modified {

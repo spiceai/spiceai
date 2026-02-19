@@ -200,9 +200,7 @@ impl Handler for SpidapterHandler {
                         );
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[stdio] teardown: failed to drop table '{table_name}': {e}"
-                        );
+                        eprintln!("[stdio] teardown: failed to drop table '{table_name}': {e}");
                     }
                 }
             }
@@ -373,7 +371,7 @@ fn generate_initial_spicepod(run_id: &Uuid) -> String {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     format!(
-        r#"version: v1beta1
+        r"version: v1beta1
 kind: Spicepod
 name: spidapter-{short_id}
 
@@ -386,6 +384,6 @@ catalogs:
       iceberg_s3_access_key_id: ${{secrets:AWS_ACCESS_KEY_ID}}
       iceberg_s3_secret_access_key: ${{secrets:AWS_SECRET_ACCESS_KEY}}
       iceberg_s3_region: us-east-1
-"#
+"
     )
 }
