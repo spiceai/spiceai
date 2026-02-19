@@ -406,11 +406,25 @@ impl DataFusionBuilder {
 
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
+        let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
+
+        // Add the Iceberg DDL analyzer rule after context creation so it can
+        // reference the catalog list and DDL-enabled catalogs.
+        // Uses Weak references to avoid reference cycles (SessionContext owns
+        // the analyzer rules, so Arc refs back would create a cycle).
+        ctx.add_analyzer_rule(Arc::new(
+            super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+            ),
+        ));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             writable_catalogs: RwLock::new(HashSet::new()),
+            ddl_enabled_catalogs,
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
@@ -567,6 +581,7 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new()),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]

@@ -55,6 +55,7 @@ pub enum SpicedInstance {
     External {
         flight_url: String,
         http_base_url: String,
+        api_key: Option<String>,
     },
     Owned {
         child: Child,
@@ -142,16 +143,22 @@ impl SpicedInstance {
     #[must_use]
     pub fn external(flight_url: impl Into<String>) -> Self {
         let flight_url = flight_url.into();
-        // Derive HTTP URL from Flight URL by replacing port
-        // e.g., "http://localhost:50051" -> "http://localhost:8090"
-        let http_base_url = if let Some(last_colon) = flight_url.rfind(':') {
+
+        // Spice Cloud has a dedicated HTTP endpoint
+        let http_base_url = if flight_url.contains("flight.spiceai.io") {
+            "https://data.spiceai.io".to_string()
+        } else if let Some(last_colon) = flight_url.rfind(':') {
+            // Derive HTTP URL from Flight URL by replacing port
+            // e.g., "http://localhost:50051" -> "http://localhost:8090"
             format!("{}:8090", &flight_url[..last_colon])
         } else {
             format!("{flight_url}:8090")
         };
+
         Self::External {
             flight_url,
             http_base_url,
+            api_key: None,
         }
     }
 
@@ -164,7 +171,21 @@ impl SpicedInstance {
         Self::External {
             flight_url: flight_url.into(),
             http_base_url: http_base_url.into(),
+            api_key: None,
         }
+    }
+
+    /// Set the API key for an external instance.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        if let Self::External {
+            api_key: ref mut key,
+            ..
+        } = self
+        {
+            *key = api_key;
+        }
+        self
     }
 
     /// Start a spiced instance
@@ -286,9 +307,22 @@ impl SpicedInstance {
     ///
     /// - If the http client fails to be created
     pub fn http_client(&self) -> Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
-            .user_agent("spice-test-framework/1.0")
-            .build()?)
+        let mut builder = reqwest::Client::builder().user_agent("spice-test-framework/1.0");
+
+        if let Self::External {
+            api_key: Some(key), ..
+        } = self
+        {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "X-API-Key",
+                reqwest::header::HeaderValue::from_str(key)
+                    .map_err(|e| anyhow!("Invalid API key header value: {e}"))?,
+            );
+            builder = builder.default_headers(headers);
+        }
+
+        Ok(builder.build()?)
     }
 
     /// Get the HTTP base URL for this instance
