@@ -74,6 +74,7 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
                 create.df_schema_name.clone(),
                 catalog_list,
                 create.acceleration.clone(),
+                create.dataset_options.clone(),
                 datafusion_weak,
             ))));
         }
