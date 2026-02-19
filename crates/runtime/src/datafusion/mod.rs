@@ -763,9 +763,7 @@ impl DataFusion {
     /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
     /// are then consumed by the `IcebergDdlAnalyzerRule`.
     #[must_use]
-    pub fn ddl_options_store(
-        &self,
-    ) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
+    pub fn ddl_options_store(&self) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
         &self.ddl_options_store
     }
 
