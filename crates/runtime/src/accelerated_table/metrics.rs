@@ -45,6 +45,20 @@ pub(crate) static REFRESH_DATA_FETCHES_SKIPPED: LazyLock<Counter<u64>> = LazyLoc
         .build()
 });
 
+pub(crate) static REFRESH_PROCESSED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_processed_rows")
+        .with_description("Number of rows processed during dataset refresh.")
+        .build()
+});
+
+pub(crate) static REFRESH_PROCESSED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_processed_bytes")
+        .with_description("Number of bytes processed during dataset refresh.")
+        .build()
+});
+
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("dataset_acceleration_last_refresh_unix_time_ms")
