@@ -204,7 +204,16 @@ impl Service {
     ) -> Result<(Schema, Option<Schema>), Status> {
         let query = QueryBuilder::new(sql, datafusion).build();
 
-        query.get_schema().await.map_err(handle_datafusion_error)
+        let (dataset_schema, parameter_schema) =
+            query.get_schema().await.map_err(handle_datafusion_error)?;
+
+        // The logical plan may report Utf8View/BinaryView, but the physical
+        // execution (with `expand_views_at_output = true`) will produce
+        // LargeUtf8/LargeBinary.  Align the advertised schema so that
+        // `get_flight_info` and `do_get` are consistent.
+        let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
+
+        Ok((dataset_schema, parameter_schema))
     }
 
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
