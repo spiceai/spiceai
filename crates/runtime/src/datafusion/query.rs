@@ -862,14 +862,51 @@ impl Query {
 
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
-            QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
-                Ok(plan) => Box::new(plan),
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    self.handle_schema_error(&request_context, &e);
-                    return Err(e);
+            QueryMethod::Text { ref sql, .. } => {
+                // Pre-process CREATE TABLE ... WITH (acceleration.*) before planning
+                let preprocessed =
+                    match super::iceberg_ddl::preprocess::preprocess_create_table_acceleration(
+                        sql,
+                        self.df.acceleration_options_store(),
+                    ) {
+                        Ok(preprocessed) => preprocessed,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            self.handle_schema_error(&request_context, &e);
+                            return Err(e);
+                        }
+                    };
+
+                let (effective_sql, store_key) = match &preprocessed {
+                    super::iceberg_ddl::preprocess::PreprocessResult::Modified {
+                        sql: modified,
+                        store_key,
+                    } => (modified.as_str(), Some(store_key.as_str())),
+                    super::iceberg_ddl::preprocess::PreprocessResult::Unchanged => {
+                        (sql.as_ref(), None)
+                    }
+                };
+
+                match session.create_logical_plan(effective_sql).await {
+                    Ok(plan) => Box::new(plan),
+                    Err(e) => {
+                        if let Some(store_key) = store_key
+                            && let Err(cleanup_err) =
+                                super::iceberg_ddl::preprocess::cleanup_preprocessed_acceleration_option(
+                                    self.df.acceleration_options_store(),
+                                    store_key,
+                                )
+                        {
+                            let cleanup_err = find_datafusion_root(cleanup_err);
+                            self.handle_schema_error(&request_context, &cleanup_err);
+                            return Err(cleanup_err);
+                        }
+                        let e = find_datafusion_root(e);
+                        self.handle_schema_error(&request_context, &e);
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
 
         // Verify the plan against the restricted options

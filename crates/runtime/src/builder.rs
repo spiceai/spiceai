@@ -284,6 +284,7 @@ impl RuntimeBuilder {
         }
 
         let df = Arc::new(df);
+        df.set_self_ref();
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self
