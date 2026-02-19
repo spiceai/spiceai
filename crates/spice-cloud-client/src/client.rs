@@ -510,7 +510,6 @@ impl CloudClient {
     ) -> Result<T> {
         let status = response.status();
         let body = response.text().await.context(HttpRequestSnafu)?;
-
         match status.as_u16() {
             200..=202 => {
                 serde_json::from_str(&body).map_err(|source| error::Error::JsonParse { source })

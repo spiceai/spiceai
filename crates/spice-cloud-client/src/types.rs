@@ -238,13 +238,13 @@ pub struct RegenerateApiKeyRequest {
 // Metrics
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PodMetrics {
-    pub cpu_usage_percent: f64,
-    pub memory_usage_bytes: u64,
-    pub filesystem_usage_bytes: u64,
-    pub filesystem_available_bytes: u64,
-    pub filesystem_capacity_bytes: u64,
+    pub cpu_usage_percent: Option<f64>,
+    pub memory_usage_bytes: Option<u64>,
+    pub filesystem_usage_bytes: Option<u64>,
+    pub filesystem_available_bytes: Option<u64>,
+    pub filesystem_capacity_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

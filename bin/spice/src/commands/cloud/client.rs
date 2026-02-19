@@ -25,8 +25,8 @@ use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
     ApiKeysResponse, App, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, RegenerateApiKeyResponse,
-    RegionsResponse, Secret, UpdateAppRequest,
+    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, MetricsResponse,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateAppRequest,
 };
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
@@ -77,6 +77,9 @@ impl CloudClient {
     // Apps
     // ========================================================================
 
+    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
+        self.inner.get_app_metrics(app_id).await.map_err(into_cli)
+    }
     pub async fn list_apps(&self) -> Result<Vec<App>> {
         self.inner.list_apps().await.map_err(into_cli)
     }
@@ -86,7 +89,7 @@ impl CloudClient {
         let (org, name) = parse_org_app(org_app);
 
         for app in apps {
-            if app.name == name && (org.is_empty() || app.org == org) {
+            if app.name == name && (org.is_empty() || org == org) {
                 return self.get_app_by_id(app.id).await;
             }
         }
