@@ -221,9 +221,36 @@ impl ExecutionPlan for IcebergCreateTableExec {
                 )));
             }
 
+            // Try to derive a table location from the namespace properties.
+            // Some catalogs (e.g. AWS Glue) require an explicit `location` when
+            // creating tables.  We look up the namespace's `location` property
+            // and, if present, derive `{namespace_location}/{table_name}`.
+            let table_location: Option<String> = match catalog
+                .get_namespace(&namespace)
+                .await
+            {
+                Ok(ns) => {
+                    ns.properties()
+                        .get("location")
+                        .map(|loc| {
+                            let base = loc.trim_end_matches('/');
+                            format!("{base}/{table_name}")
+                        })
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Could not fetch namespace properties for '{}' \
+                         (table location will not be set): {e}",
+                        namespace.join(".")
+                    );
+                    None
+                }
+            };
+
             // Create the table in the Iceberg catalog
             let table_creation = TableCreation::builder()
                 .name(table_name.clone())
+                .location_opt(table_location)
                 .schema(iceberg_schema)
                 .build();
 
@@ -362,11 +389,7 @@ async fn create_accelerated_iceberg_table(
         ))
     })?;
 
-    let dataset_name = TableReference::full(
-        catalog_name.to_string(),
-        schema_name.to_string(),
-        table_name.to_string(),
-    );
+    let dataset_name = TableReference::bare(table_name.to_string());
     let source_string = format!("{catalog_name}.{schema_name}.{table_name}");
 
     let source_schema = source_provider.schema();
