@@ -365,10 +365,7 @@ mod tests {
 
     #[test]
     fn test_parse_dataset_time_column() {
-        let options = vec![(
-            "dataset.time_column".to_string(),
-            "created_at".to_string(),
-        )];
+        let options = vec![("dataset.time_column".to_string(), "created_at".to_string())];
         let dataset = parse_dataset_options(&options).expect("should parse");
         assert_eq!(dataset.time_column.as_deref(), Some("created_at"));
         assert_eq!(dataset.time_format, None);
@@ -377,14 +374,8 @@ mod tests {
     #[test]
     fn test_parse_dataset_time_format() {
         let options = vec![
-            (
-                "dataset.time_column".to_string(),
-                "updated_at".to_string(),
-            ),
-            (
-                "dataset.time_format".to_string(),
-                "timestamptz".to_string(),
-            ),
+            ("dataset.time_column".to_string(), "updated_at".to_string()),
+            ("dataset.time_format".to_string(), "timestamptz".to_string()),
         ];
         let dataset = parse_dataset_options(&options).expect("should parse");
         assert_eq!(dataset.time_column.as_deref(), Some("updated_at"));
@@ -433,23 +424,14 @@ mod tests {
     fn test_parse_ddl_table_options_mixed() {
         let options = vec![
             ("acceleration.engine".to_string(), "arrow".to_string()),
-            (
-                "dataset.time_column".to_string(),
-                "created_at".to_string(),
-            ),
-            (
-                "dataset.time_format".to_string(),
-                "timestamptz".to_string(),
-            ),
+            ("dataset.time_column".to_string(), "created_at".to_string()),
+            ("dataset.time_format".to_string(), "timestamptz".to_string()),
         ];
         let ddl_opts = parse_ddl_table_options(&options).expect("should parse");
         assert!(ddl_opts.acceleration.is_some());
         let accel = ddl_opts.acceleration.expect("acceleration should be Some");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
-        assert_eq!(
-            ddl_opts.dataset.time_column.as_deref(),
-            Some("created_at")
-        );
+        assert_eq!(ddl_opts.dataset.time_column.as_deref(), Some("created_at"));
         assert_eq!(
             ddl_opts.dataset.time_format,
             Some(SpicepodTimeFormat::Timestamptz)
@@ -467,15 +449,9 @@ mod tests {
 
     #[test]
     fn test_parse_ddl_table_options_dataset_only() {
-        let options = vec![(
-            "dataset.time_column".to_string(),
-            "created_at".to_string(),
-        )];
+        let options = vec![("dataset.time_column".to_string(), "created_at".to_string())];
         let ddl_opts = parse_ddl_table_options(&options).expect("should parse");
         assert!(ddl_opts.acceleration.is_none());
-        assert_eq!(
-            ddl_opts.dataset.time_column.as_deref(),
-            Some("created_at")
-        );
+        assert_eq!(ddl_opts.dataset.time_column.as_deref(), Some("created_at"));
     }
 }

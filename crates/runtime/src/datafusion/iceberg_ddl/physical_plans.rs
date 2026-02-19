@@ -370,10 +370,10 @@ async fn create_accelerated_iceberg_table(
     table_name: &str,
 ) -> Result<AcceleratedTable, DataFusionError> {
     use crate::accelerated_table::refresh::Refresh;
+    use crate::component::dataset::TimeFormat;
     use crate::component::dataset::acceleration::{
         Acceleration as RuntimeAcceleration, RefreshMode,
     };
-    use crate::component::dataset::TimeFormat;
     use crate::federated_table::FederatedTable;
     use datafusion::common::TableReference;
 
