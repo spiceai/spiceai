@@ -47,6 +47,7 @@ members = [
     "crates/s3_vectors_metadata_filter",
     "crates/search",
     "crates/spice_cloud",
+    "crates/spice-cloud-client",
     "crates/spicepod",
     "crates/telemetry",
     "crates/test-framework",
@@ -267,6 +268,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
+spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "3d2e6fb4290c751d07e62c5f18705b934ca182ee" } # spiceai-57
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
