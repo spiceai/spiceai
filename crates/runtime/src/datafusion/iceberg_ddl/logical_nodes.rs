@@ -27,6 +27,8 @@ use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use iceberg::{Catalog, NamespaceIdent};
 use spicepod::acceleration::Acceleration;
 
+use super::acceleration_options::DatasetOptions;
+
 /// Creates the shared output schema for DDL result nodes (single `result` column).
 fn ddl_output_schema() -> DFSchemaRef {
     DFSchemaRef::new(
@@ -60,6 +62,8 @@ pub struct IcebergCreateTableNode {
     pub df_schema_name: String,
     /// Acceleration options from `WITH (acceleration.*)`, if any.
     pub acceleration: Option<Acceleration>,
+    /// Dataset options from `WITH (dataset.*)`, if any.
+    pub dataset_options: DatasetOptions,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
@@ -77,6 +81,7 @@ impl IcebergCreateTableNode {
         df_catalog_name: String,
         df_schema_name: String,
         acceleration: Option<Acceleration>,
+        dataset_options: DatasetOptions,
     ) -> Self {
         Self {
             catalog,
@@ -88,6 +93,7 @@ impl IcebergCreateTableNode {
             df_catalog_name,
             df_schema_name,
             acceleration,
+            dataset_options,
             output_schema: ddl_output_schema(),
         }
     }
@@ -159,6 +165,7 @@ impl UserDefinedLogicalNodeCore for IcebergCreateTableNode {
             df_catalog_name: self.df_catalog_name.clone(),
             df_schema_name: self.df_schema_name.clone(),
             acceleration: self.acceleration.clone(),
+            dataset_options: self.dataset_options.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }
