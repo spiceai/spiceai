@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
-    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, Server, SetupResponse,
-    TeardownResponse,
+    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, IngestionMetrics, MetricsResponse,
+    ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
 use test_framework::anyhow;
 use uuid::Uuid;
@@ -108,6 +108,53 @@ impl Handler for SpidapterHandler {
 
         self.runs.insert(run_id, state);
         Ok(response)
+    }
+
+    async fn metrics(&mut self, run_id: Uuid) -> std::result::Result<MetricsResponse, String> {
+        let state = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| format!("No active run found for {run_id}"))?;
+
+        let cloud_metrics = state
+            .cloud
+            .get_app_metrics(state.app_id)
+            .await
+            .map_err(|e| format!("Failed to fetch metrics: {e}"))?;
+
+        let pods = cloud_metrics.metrics.values().collect::<Vec<_>>();
+
+        let resource = if pods.is_empty() {
+            ResourceMetrics::default()
+        } else {
+            let avg_cpu = pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>()
+                / pods
+                    .iter()
+                    .filter_map(|p| p.cpu_usage_percent.is_some().then(|| 1.0))
+                    .sum::<f64>();
+            let total_memory = pods
+                .iter()
+                .filter_map(|p| p.memory_usage_bytes)
+                .sum::<u64>()
+                / pods
+                    .iter()
+                    .filter_map(|p| p.cpu_usage_percent.is_some().then(|| 1))
+                    .sum::<u64>();
+
+            ResourceMetrics {
+                cpu_usage_percent: Some(avg_cpu),
+                memory_usage_bytes: Some(total_memory as u64),
+                disk_read_bytes: None,
+                disk_write_bytes: None,
+                disk_read_iops: None,
+                disk_write_iops: None,
+            }
+        };
+
+        Ok(MetricsResponse {
+            resource,
+            ingestion: IngestionMetrics::default(),
+        })
     }
 
     async fn create_tables(
