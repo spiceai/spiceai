@@ -50,7 +50,7 @@ pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
 pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Result<CloudClient> {
     let base_url = spice_cloud_base_url(api_url_override);
     let token = spice_cloud_token()?;
-    Ok(CloudClient::new(&base_url)
+    Ok(CloudClient::new(&base_url)?
         .with_token(token)
         .with_timeout(Duration::from_secs(600))?)
 }

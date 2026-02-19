@@ -438,7 +438,7 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
         })
         .collect();
 
-    let client = CloudClient::new_unauthenticated();
+    let client = CloudClient::new_unauthenticated()?;
     let auth_url = client.get_auth_url(&auth_code);
 
     println!("Opening Spice Cloud authorization page in your default browser...");
