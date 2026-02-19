@@ -144,10 +144,6 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String(state.api_key.clone()),
                 ),
             ]),
-            catalog_namespace: etl_sink_type
-                .as_ref()
-                .filter(|t| matches!(t, EtlSinkType::Adbc))
-                .map(|_| "spicebench.bench".to_string()),
         };
 
         self.runs.insert(run_id, state);
