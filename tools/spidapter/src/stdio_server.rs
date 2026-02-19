@@ -88,19 +88,7 @@ impl Handler for SpidapterHandler {
         .await
         .map_err(|e| format!("Setup failed: {e}"))?;
 
-        self.runs.insert(run_id, state);
-        Ok(SetupResponse { ok: true })
-    }
-
-    async fn query_method(&mut self, run_id: Uuid) -> Result<QueryMethodResponse, String> {
-        eprintln!("[stdio] query_method: run_id={run_id}");
-
-        let state = self
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
-
-        Ok(QueryMethodResponse {
+        let response = SetupResponse {
             driver: AdbcDriver::Flightsql,
             db_kwargs: HashMap::from([
                 (
@@ -116,7 +104,10 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String(state.api_key.clone()),
                 ),
             ]),
-        })
+        };
+
+        self.runs.insert(run_id, state);
+        Ok(response)
     }
 
     async fn create_tables(
