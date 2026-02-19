@@ -682,6 +682,41 @@ impl Query {
                         }
                     };
                     (stream, df_plan)
+                } else if let LogicalPlan::Dml(dml) = &*plan && matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete) {
+                    // DELETE operations need special handling because DataFusion doesn't
+                    // support DELETE natively. We intercept the DML Delete plan, extract
+                    // the filter predicates, and delegate to the DeletionTableProvider.
+                    let delete_plan = match create_delete_physical_plan(dml, &ctx.df).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+
+                    let task_ctx = Arc::new(TaskContext::from(&session));
+                    let stream = match execute_stream(Arc::clone(&delete_plan), task_ctx) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+                    (stream, delete_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
                     let physical_plan = match session.create_physical_plan(&plan).await {
@@ -718,11 +753,16 @@ impl Query {
                     (stream, physical_plan)
                 };
 
-            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE)
-            // and DDL plans (CREATE TABLE/DROP TABLE) as their logical plan schema may
-            // differ from the actual execution result (DDL plans may be rewritten by
-            // analyzer rules into extension nodes with different output schemas)
-            if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_)) {
+            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
+            // DDL plans (CREATE TABLE/DROP TABLE), and DML Delete plans, as their logical
+            // plan schema may differ from the actual execution result (DDL plans may be
+            // rewritten by analyzer rules into extension nodes with different output schemas)
+            if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
+                && !matches!(
+                    &*plan,
+                    LogicalPlan::Dml(dml) if matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete)
+                )
+            {
                 let plan_schema = Arc::clone(plan.schema().inner());
                 let res_schema = res_stream.schema();
 
@@ -1090,6 +1130,62 @@ pub fn write_to_json_string(
     writer.finish()?;
 
     String::from_utf8(writer.into_inner()).boxed()
+}
+
+/// Creates a physical execution plan for a `DELETE FROM` DML statement.
+///
+/// `DataFusion` does not natively support `DELETE` operations, so we intercept
+/// the logical `DmlStatement` with `WriteOp::Delete`, extract the filter
+/// predicate from the source plan, look up the table's `DeletionTableProvider`,
+/// and call `delete_from` to produce the physical plan.
+///
+/// The source plan in the `DmlStatement` is either:
+/// - `Filter(predicate, TableScan)` — when `DELETE FROM t WHERE <predicate>`
+/// - `TableScan` — when `DELETE FROM t` (no WHERE clause)
+async fn create_delete_physical_plan(
+    dml: &datafusion::logical_expr::DmlStatement,
+    df: &Arc<DataFusion>,
+) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    use data_components::delete::get_deletion_provider;
+
+    // Extract filter expressions from the source plan
+    let filters = extract_delete_filters(&dml.input);
+
+    // Look up the table provider
+    let table_provider = df.get_table(&dml.table_name).await.ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Table '{}' not found for DELETE operation",
+            dml.table_name
+        ))
+    })?;
+
+    // Get the DeletionTableProvider
+    let deletion_provider = get_deletion_provider(table_provider).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Table '{}' does not support DELETE operations",
+            dml.table_name
+        ))
+    })?;
+
+    let session_state = df.ctx.state();
+    deletion_provider
+        .delete_from(&session_state, &filters)
+        .await
+}
+
+/// Extract filter expressions from a DELETE's source logical plan.
+///
+/// The source plan is either `Filter(predicate, scan)` or just `scan`.
+/// Returns the individual conjunctive filter expressions, or an empty
+/// vec if there is no WHERE clause.
+fn extract_delete_filters(source: &LogicalPlan) -> Vec<datafusion::logical_expr::Expr> {
+    use datafusion_expr::utils::split_conjunction_owned;
+
+    if let LogicalPlan::Filter(filter) = source {
+        split_conjunction_owned(filter.predicate.clone())
+    } else {
+        vec![]
+    }
 }
 
 #[cfg(test)]
