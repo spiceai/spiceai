@@ -155,7 +155,6 @@ impl Handler for SpidapterHandler {
             state.created_tables.push(table_name.clone());
             eprintln!("[stdio] create_tables: table '{table_name}' created");
         }
-
         Ok(CreateTablesResponse { ok: true })
     }
 
