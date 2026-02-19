@@ -234,7 +234,7 @@ mod tests {
         // Check that the store has the options
         let accel = store
             .write()
-            .unwrap()
+            .expect("store lock should be available")
             .remove("foo")
             .expect("should have options for 'foo'");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
@@ -256,8 +256,7 @@ mod tests {
         let sql =
             r#"CREATE TABLE foo (id INT) WITH ("acceleration.engine" = 'arrow', fillfactor = 70)"#;
         let result = preprocess_create_table_acceleration(sql, &store);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("should return an error").to_string();
         assert!(err.contains("Cannot mix"));
     }
 
@@ -266,8 +265,7 @@ mod tests {
         let store = new_shared_store();
         let sql = r#"CREATE TABLE foo (id INT) WITH ("acceleration.nonexistent" = 'value')"#;
         let result = preprocess_create_table_acceleration(sql, &store);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("should return an error").to_string();
         assert!(err.contains("Unknown acceleration option"));
     }
 }
