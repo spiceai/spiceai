@@ -65,9 +65,7 @@ pub fn cleanup_preprocessed_ddl_options(
     store_key: &str,
 ) -> DFResult<()> {
     let mut guard = store.write().map_err(|e| {
-        DataFusionError::Execution(format!(
-            "Failed to acquire DDL options store lock: {e}"
-        ))
+        DataFusionError::Execution(format!("Failed to acquire DDL options store lock: {e}"))
     })?;
     let _ = guard.remove(store_key);
     Ok(())
@@ -172,9 +170,7 @@ pub fn preprocess_create_table_with_options(
     // Store the DDL table options
     {
         let mut guard = ddl_store.write().map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to acquire DDL options store lock: {e}"
-            ))
+            DataFusionError::Execution(format!("Failed to acquire DDL options store lock: {e}"))
         })?;
         guard.insert(table_name, ddl_table_options);
     }
