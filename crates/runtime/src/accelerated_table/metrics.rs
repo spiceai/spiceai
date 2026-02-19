@@ -125,3 +125,23 @@ pub(crate) static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .with_unit("By")
         .build()
 });
+
+pub(crate) static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_rows_written")
+        .with_description(
+            "Cumulative number of rows read from the federated source and written into the accelerated table.",
+        )
+        .with_unit("rows")
+        .build()
+});
+
+pub(crate) static REFRESH_BYTES_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_bytes_written")
+        .with_description(
+            "Cumulative number of bytes (Arrow in-memory size) read from the federated source and written into the accelerated table.",
+        )
+        .with_unit("By")
+        .build()
+});

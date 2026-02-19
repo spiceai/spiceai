@@ -687,6 +687,12 @@ impl RefreshTask {
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
 
+                                // Record incremental ingestion counters per batch.
+                                let labels = [KeyValue::new("dataset", ds_name.clone())];
+                                metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+                                metrics::REFRESH_BYTES_WRITTEN
+                                    .add(batch.get_array_memory_size() as u64, &labels);
+
                                 // Check memory usage after processing each batch
                                 if let Some(ref monitor) = resource_monitor {
                                     monitor.check_memory_usage(&ds_name);
