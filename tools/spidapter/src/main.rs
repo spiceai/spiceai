@@ -19,17 +19,9 @@ use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
-mod health;
-mod metrics;
-mod spiced_metrics;
 mod stdio_server;
 
-use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, StdioArgs,
-    TestCommands, TextToSqlArgs,
-};
-
-use crate::args::SearchTestArgs;
+use args::{Commands, StdioArgs};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -46,77 +38,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Commands::Stdio(args) => return run_stdio_mode(&args).await,
-        Commands::Export(
-            TestCommands::Throughput(DatasetTestArgs { common, .. })
-            | TestCommands::Bench(DatasetTestArgs { common, .. })
-            | TestCommands::Load(LoadTestArgs {
-                test_args: DatasetTestArgs { common, .. },
-                ..
-            })
-            | TestCommands::Evals(EvalsTestArgs { common, .. })
-            | TestCommands::Search(SearchTestArgs { common, .. })
-            | TestCommands::TextToSql(TextToSqlArgs { common, .. })
-            | TestCommands::DataConsistency(DataConsistencyArgs {
-                test_args: DatasetTestArgs { common, .. },
-                ..
-            }),
-        ) => {
-            commands::env_export(&common).await?;
-        }
-        Commands::Run(TestCommands::Throughput(args)) => commands::throughput::run(&args).await?,
-        Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
-        Commands::Run(TestCommands::Bench(args)) => {
-            commands::bench::run(&args).await?;
-        }
-        Commands::Run(TestCommands::Query(args)) => {
-            commands::query::run(&args).await?;
-        }
-        Commands::Run(TestCommands::DataConsistency(args)) => {
-            commands::data_consistency::run(&args).await?;
-        }
-        Commands::Dispatch(args) => {
-            commands::dispatch::dispatch(args).await?;
-        }
-        Commands::Run(TestCommands::Evals(args)) => {
-            commands::evals::run(&args).await?;
-        }
-        #[cfg(feature = "append")]
-        Commands::Run(TestCommands::Append(args)) => {
-            commands::append::run(&args).await?;
-        }
-        #[cfg(feature = "append")]
-        Commands::Export(TestCommands::Append(args)) => {
-            commands::env_export(&args.test_args.common).await?;
-        }
-        Commands::Run(TestCommands::Search(args)) => {
-            commands::search::run(&args).await?;
-        }
-        Commands::Run(TestCommands::TextToSql(args)) => {
-            commands::text_to_sql::run(&args).await?;
-        }
-        Commands::Run(TestCommands::StreamingDynamodb(args)) => {
-            commands::streaming::run_dynamodb(&args).await?;
-        }
-        Commands::Export(TestCommands::StreamingDynamodb(_)) => {
-            return Err(anyhow::anyhow!(
-                "Export is not supported for streaming-dynamodb (spicepods are transformed at runtime)"
-            ));
-        }
-        Commands::Run(TestCommands::StreamingDynamodbDispatch(args)) => {
-            commands::streaming::run_dispatch(&args).await?;
-        }
-        Commands::Export(TestCommands::StreamingDynamodbDispatch(_)) => {
-            return Err(anyhow::anyhow!(
-                "Export is not supported for dispatch-dynamodb (spicepods are transformed at runtime)"
-            ));
-        }
-        _ => {
-            return Err(anyhow::anyhow!("Unsupported command"));
-        }
+        Commands::Stdio(args) => run_stdio_mode(&args).await,
     }
-
-    Ok(())
 }
 
 async fn run_stdio_mode(args: &StdioArgs) -> anyhow::Result<()> {

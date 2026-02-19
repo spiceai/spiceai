@@ -114,10 +114,12 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+pub mod composed_catalog;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
 pub mod flight_session_extension;
+pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
@@ -400,7 +402,7 @@ pub struct DataFusion {
     data_writers: RwLock<HashSet<TableReference>>,
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
-    ddl_enabled_catalogs: RwLock<HashSet<String>>,
+    ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
@@ -547,7 +549,14 @@ impl DataFusion {
                 .await
                 .insert(name.to_string(), Arc::new(deferred_catalog.clone()));
         } else {
-            self.ctx.register_catalog(name, catalog);
+            let catalog_to_register = if name == SPICE_DEFAULT_CATALOG {
+                // When overriding the default catalog, preserve internal schemas
+                self.compose_with_internal_schemas(catalog)
+            } else {
+                catalog
+            };
+
+            self.ctx.register_catalog(name, catalog_to_register);
 
             if access.allows_ddl() {
                 self.mark_catalog_ddl_enabled(name)?;
@@ -557,6 +566,39 @@ impl DataFusion {
         }
 
         Ok(())
+    }
+
+    /// When an external catalog replaces the default `spice` catalog, extract the
+    /// internal schemas (`runtime`, `metadata`, `eval`, `scp`) from the current
+    /// default catalog and wrap the external catalog in a [`ComposedCatalogProvider`]
+    /// that preserves those internal schemas.
+    fn compose_with_internal_schemas(
+        &self,
+        external: Arc<dyn CatalogProvider>,
+    ) -> Arc<dyn CatalogProvider> {
+        use composed_catalog::ComposedCatalogProvider;
+        use std::collections::HashMap;
+
+        let internal_schema_names = [
+            SPICE_RUNTIME_SCHEMA,
+            SPICE_METADATA_SCHEMA,
+            SPICE_SCP_SCHEMA,
+            #[cfg(feature = "models")]
+            SPICE_EVAL_SCHEMA,
+        ];
+
+        let mut internal_schemas: HashMap<String, Arc<dyn datafusion::catalog::SchemaProvider>> =
+            HashMap::new();
+
+        if let Some(current_catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
+            for schema_name in &internal_schema_names {
+                if let Some(schema) = current_catalog.schema(schema_name) {
+                    internal_schemas.insert((*schema_name).to_string(), schema);
+                }
+            }
+        }
+
+        Arc::new(ComposedCatalogProvider::new(external, internal_schemas))
     }
 
     // Returns a Notify if the table supports notifying the runtime when the table is ready.
@@ -663,6 +705,14 @@ impl DataFusion {
         } else {
             false
         }
+    }
+
+    /// Check if a table reference belongs to a writable catalog.
+    /// Handles both explicit catalog names and bare names (defaults to `SPICE_DEFAULT_CATALOG`).
+    #[must_use]
+    pub fn is_path_catalog_writable(&self, table_reference: &TableReference) -> bool {
+        let catalog = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        self.is_catalog_writable(catalog)
     }
 
     pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
@@ -903,7 +953,7 @@ impl DataFusion {
         table_reference: &TableReference,
         data_update: DataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(table_reference) {
+        if !self.is_writable(table_reference) && !self.is_path_catalog_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -961,7 +1011,7 @@ impl DataFusion {
         table_reference: &TableReference,
         streaming_update: StreamingDataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(table_reference) {
+        if !self.is_writable(table_reference) && !self.is_path_catalog_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
