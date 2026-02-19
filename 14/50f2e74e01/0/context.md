@@ -1,0 +1,28 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+new endpoint for `crates/spice-cloud-client` for new spice cloud API `GET /v1/apps/{appId}/metrics` endpoint
+
+Response format
+```json
+{
+    "metrics": {
+        "pod-name-1": {
+        "cpu_usage_percent": 45.5,
+        "memory_usage_bytes": 1073741824,
+        "filesystem_usage_bytes": 5368709120,
+        "filesystem_available_bytes": 10737418240,
+        "filesystem_capacity_bytes": 16106127360
+        }
+    }
+}
+```
+     
+Error handling
+
+- 400: Invalid app ID
+- 401: Unauthorized (handled by wi...
+

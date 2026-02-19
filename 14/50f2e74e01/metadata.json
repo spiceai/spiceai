@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "1450f2e74e01",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-19/metrics-2",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/spice-cloud-client/src/client.rs",
+    "crates/spice-cloud-client/src/types.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/14/50f2e74e01/0/metadata.json",
+      "transcript": "/14/50f2e74e01/0/full.jsonl",
+      "context": "/14/50f2e74e01/0/context.md",
+      "content_hash": "/14/50f2e74e01/0/content_hash.txt",
+      "prompt": "/14/50f2e74e01/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 13,
+    "cache_creation_tokens": 18062,
+    "cache_read_tokens": 349649,
+    "output_tokens": 286,
+    "api_call_count": 11
+  }
+}
