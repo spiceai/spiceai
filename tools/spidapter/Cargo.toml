@@ -16,9 +16,10 @@ reqwest.workspace = true
 runtime-secrets = { path = "../../crates/runtime-secrets" }
 spice-cloud-client.workspace = true
 serde_json.workspace = true
-spice-cloud-client = { path = "../../crates/spice-cloud-client" }
+spicepod = { path = "../../crates/spicepod", default-features = false }
 system-adapter-protocol.workspace = true
 uuid.workspace = true
+yaml = { path = "../../crates/yaml" }
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 

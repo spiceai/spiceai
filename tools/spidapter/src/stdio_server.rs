@@ -17,6 +17,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
+use spicepod::component::ComponentOrReference;
+use spicepod::component::dataset::Dataset;
+use spicepod::param::Params;
+use spicepod::spec::SpicepodDefinition;
+use spicepod::{
+    acceleration::{Acceleration, Mode, RefreshMode},
+    component::ComponentOrReference,
+    dataset::Dataset,
+};
 use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
     SetupResponse, TeardownResponse,
@@ -327,55 +336,40 @@ fn generate_initial_spicepod(
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
         .unwrap_or_else(|| "us-east-1".to_string());
 
-    let mut dataset_entries = Vec::new();
-    for d in datasets {
-        match d {
-            (
-                dataset_name,
-                DatasetConfig {
-                    location: Some(from),
-                    ..
-                },
-            ) => {
-                let mut params = vec![
-                    "      file_format: parquet".to_string(),
-                    "      s3_auth: public".to_string(),
-                    format!("      s3_region: {region}"),
-                ];
+    let mut spicepod = SpicepodDefinition::new(format!("spidapter-{short_id}"));
 
-                if let Some(endpoint) = &setup_config.etl_endpoint {
-                    params.push(format!("      s3_endpoint: {endpoint}"));
-                }
+    for (dataset_name, config) in datasets {
+        let from = config.location.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Dataset '{dataset_name}' is missing a 'from' URI in its config")
+        })?;
 
-                dataset_entries.push(format!(
-                    "  - from: {from}\n    \
-                    name: {dataset_name}\n    \
-                    params:\n{}\n    \
-                    acceleration:\n      \
-                    enabled: true\n      \
-                    engine: cayenne\n      \
-                    mode: file\n      \
-                    refresh_mode: full\n      \
-                    refresh_check_interval: 1s",
-                    params.join("\n")
-                ));
-            }
-            (dataset_name, _) => {
-                return Err(anyhow::anyhow!(
-                    "Dataset '{dataset_name}' is missing a 'from' URI in its config"
-                ));
-            }
+        let mut param_map = HashMap::from([
+            ("file_format".to_string(), "parquet".to_string()),
+            ("s3_auth".to_string(), "public".to_string()),
+            ("s3_region".to_string(), region.clone()),
+            ("hive_partitioning_enabled".to_string(), "true".to_string()),
+        ]);
+        if let Some(endpoint) = &setup_config.etl_endpoint {
+            param_map.insert("s3_endpoint".to_string(), endpoint.clone());
         }
+
+        let mut dataset = Dataset::new(from, dataset_name.as_str());
+        dataset.params = Some(Params::from_string_map(param_map));
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            refresh_check_interval: Some("1s".to_string()),
+            ..Acceleration::default()
+        });
+
+        spicepod
+            .datasets
+            .push(ComponentOrReference::Component(dataset));
     }
 
-    Ok(format!(
-        "version: v1beta1\n\
-         kind: Spicepod\n\
-         name: spidapter-{short_id}\n\
-         \n\
-         datasets:\n{}\n",
-        dataset_entries.join("\n")
-    ))
+    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
 #[cfg(test)]
@@ -385,33 +379,19 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn setup_config_parses_dataset_sources_from_metadata() {
-        let metadata = HashMap::from([
-            (
-                "my_table".to_string(),
-                serde_json::json!({"from": "s3://bucket/path/my_table/"}),
-            ),
-            (
-                "etl_region".to_string(),
-                serde_json::Value::String("us-west-2".to_string()),
-            ),
-        ]);
+    fn setup_config_parses_metadata() {
+        let metadata = HashMap::from([(
+            "etl_region".to_string(),
+            serde_json::Value::String("us-west-2".to_string()),
+        )]);
 
         let config = SetupConfig::from_metadata(&metadata).expect("metadata should parse");
-        assert_eq!(
-            config.dataset_sources.get("my_table").unwrap(),
-            "s3://bucket/path/my_table/"
-        );
         assert_eq!(config.etl_region.as_deref(), Some("us-west-2"));
     }
 
     #[test]
     fn generate_spicepod_includes_dataset_entries() {
         let setup_config = SetupConfig {
-            dataset_sources: HashMap::from([(
-                "my_table".to_string(),
-                "s3://bucket/path/my_table/".to_string(),
-            )]),
             etl_region: Some("us-west-2".to_string()),
             etl_endpoint: Some("http://localhost:9000".to_string()),
         };
@@ -421,17 +401,18 @@ mod tests {
             "my_table".to_string(),
             DatasetConfig {
                 schema: schema.clone(),
+                location: Some("s3://bucket/path/my_table/".to_string()),
             },
         )]);
 
         let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
             .expect("spicepod should generate");
 
-        assert!(spicepod.contains("from: s3://bucket/path/my_table/"));
+        assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
         assert!(spicepod.contains("name: my_table"));
         assert!(spicepod.contains("file_format: parquet"));
         assert!(spicepod.contains("s3_region: us-west-2"));
-        assert!(spicepod.contains("s3_endpoint: http://localhost:9000"));
+        assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
         assert!(spicepod.contains("engine: cayenne"));
         assert!(spicepod.contains("mode: file"));
         assert!(spicepod.contains("refresh_mode: full"));
@@ -441,7 +422,6 @@ mod tests {
     #[test]
     fn generate_spicepod_errors_on_missing_dataset_source() {
         let setup_config = SetupConfig {
-            dataset_sources: HashMap::new(),
             etl_region: None,
             etl_endpoint: None,
         };
@@ -451,6 +431,7 @@ mod tests {
             "missing_table".to_string(),
             DatasetConfig {
                 schema: schema.clone(),
+                location: None,
             },
         )]);
 
