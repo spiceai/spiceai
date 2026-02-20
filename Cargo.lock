@@ -18161,31 +18161,16 @@ name = "spidapter"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-json",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
- "bollard",
  "clap",
- "duckdb",
- "futures",
- "hf-hub",
- "itertools 0.14.0",
- "rand 0.9.2",
  "reqwest 0.12.24",
  "runtime-secrets",
- "serde",
  "serde_json",
  "spice-cloud-client",
- "spiceai",
- "spicepod",
  "system-adapter-protocol",
  "test-framework",
  "tokio",
- "tokio-util",
  "uuid 1.20.0",
- "yaml",
 ]
 
 [[package]]

@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
@@ -38,54 +37,31 @@ struct RunState {
     flight_url: String,
     /// Cloud client used during provisioning (reused for teardown).
     cloud: CloudClient,
-    /// Region cname (used to build the SQL endpoint URL).
-    cname: String,
-    /// Table names created for this run (for cleanup during teardown).
-    created_tables: Vec<String>,
-    /// ETL sink mode used by this run.
-    etl_sink_mode: EtlSinkMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EtlSinkMode {
-    Adbc,
-    IcebergObjectStore,
-}
-
-impl EtlSinkMode {
-    fn from_setup_metadata(metadata: &HashMap<String, serde_json::Value>) -> anyhow::Result<Self> {
-        let value = metadata
-            .get("etl_sink_mode")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("adbc");
-
-        match value {
-            "adbc" => Ok(Self::Adbc),
-            "iceberg-object-store" => Ok(Self::IcebergObjectStore),
-            other => Err(anyhow::anyhow!(
-                "Unsupported setup metadata etl_sink_mode '{other}'. Allowed values: adbc, iceberg-object-store"
-            )),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 struct SetupConfig {
-    etl_sink_mode: EtlSinkMode,
+    /// Per-dataset `from` URIs, keyed by dataset name.
+    dataset_sources: HashMap<String, String>,
     etl_region: Option<String>,
     etl_endpoint: Option<String>,
-    etl_iceberg_warehouse_uri: Option<String>,
-    etl_iceberg_namespace: Option<String>,
 }
 
 impl SetupConfig {
     fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> anyhow::Result<Self> {
+        let mut dataset_sources = HashMap::new();
+        for (key, value) in metadata {
+            if let Some(obj) = value.as_object() {
+                if let Some(from) = obj.get("from").and_then(|v| v.as_str()) {
+                    dataset_sources.insert(key.clone(), from.to_string());
+                }
+            }
+        }
+
         Ok(Self {
-            etl_sink_mode: EtlSinkMode::from_setup_metadata(metadata)?,
+            dataset_sources,
             etl_region: metadata_string(metadata, "etl_region"),
             etl_endpoint: metadata_string(metadata, "etl_endpoint"),
-            etl_iceberg_warehouse_uri: metadata_string(metadata, "etl_iceberg_warehouse_uri"),
-            etl_iceberg_namespace: metadata_string(metadata, "etl_iceberg_namespace"),
         })
     }
 }
@@ -144,6 +120,7 @@ impl Handler for SpidapterHandler {
             self.ready_wait,
             self.channel.as_deref(),
             &setup_config,
+            &datasets,
         )
         .await
         .map_err(|e| format!("Setup failed: {e}"))?;
@@ -167,55 +144,6 @@ impl Handler for SpidapterHandler {
         };
 
         self.runs.insert(run_id, state);
-
-        // Create tables as part of setup
-        eprintln!("[stdio] setup: creating tables for run_id={run_id}");
-
-        let state = self
-            .runs
-            .get_mut(&run_id)
-            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-
-        let sql_url = sql_url_from_cname(&state.cname);
-
-        if state.etl_sink_mode != EtlSinkMode::IcebergObjectStore {
-            for (table_name, config) in &datasets {
-                let ddl = create_table_ddl(table_name, config);
-                eprintln!("[stdio] setup: executing DDL: {ddl}");
-
-                let resp = client
-                    .post(&sql_url)
-                    .header("X-API-Key", &state.api_key)
-                    .body(ddl.clone())
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to send DDL for table '{table_name}': {e}"))?;
-
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<failed to read body>".to_string());
-                    return Err(format!(
-                        "DDL for table '{table_name}' failed ({status}): {body}"
-                    ));
-                }
-
-                state.created_tables.push(table_name.clone());
-                eprintln!("[stdio] setup: table '{table_name}' created");
-            }
-        } else {
-            eprintln!(
-                "[stdio] setup: skipping SQL DDL for run_id={run_id} (etl_sink_mode=iceberg-object-store)"
-            );
-        }
-
         Ok(response)
     }
 
@@ -291,46 +219,6 @@ impl Handler for SpidapterHandler {
             return Ok(TeardownResponse { ok: true });
         };
 
-        // Drop tables via DDL before deleting the app
-        if !state.created_tables.is_empty() {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-
-            let sql_url = sql_url_from_cname(&state.cname);
-
-            for table_name in &state.created_tables {
-                let ddl = format!("DROP TABLE IF EXISTS {}", quote_ident(table_name));
-                eprintln!("[stdio] teardown: executing DDL: {ddl}");
-
-                match client
-                    .post(&sql_url)
-                    .header("X-API-Key", &state.api_key)
-                    .body(ddl)
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status().is_success() => {
-                        eprintln!("[stdio] teardown: table '{table_name}' dropped");
-                    }
-                    Ok(response) => {
-                        let status = response.status();
-                        let body = response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "<failed to read body>".to_string());
-                        eprintln!(
-                            "[stdio] teardown: failed to drop table '{table_name}' ({status}): {body}"
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[stdio] teardown: failed to drop table '{table_name}': {e}");
-                    }
-                }
-            }
-        }
-
         eprintln!(
             "[stdio] teardown: deleting app {} at {}",
             state.app_id,
@@ -372,6 +260,7 @@ async fn provision_spice_cloud_app(
     ready_wait: u64,
     channel: Option<&str>,
     setup_config: &SetupConfig,
+    datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
     let cloud = commands::build_cloud_client(api_url_override)?;
 
@@ -394,8 +283,7 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    // Generate initial spicepod YAML (tables created later via create_tables)
-    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config)?;
+    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config, datasets)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -432,252 +320,152 @@ async fn provision_spice_cloud_app(
         api_key,
         flight_url,
         cloud,
-        cname,
-        created_tables: Vec::new(),
-        etl_sink_mode: setup_config.etl_sink_mode,
     })
 }
 
-/// Build the SQL endpoint URL from a Spice Cloud cname.
-fn sql_url_from_cname(cname: &str) -> String {
-    format!("https://{cname}.spiceai.io/v1/sql")
-}
-
-/// Generate a `CREATE TABLE IF NOT EXISTS` DDL statement from a dataset's Arrow schema,
-/// with acceleration configured for the cayenne engine with append refresh every 10 seconds.
-///
-/// If the schema contains a timestamp column, it is used as the acceleration time column
-/// with `timestamptz` format.
-fn create_table_ddl(table_name: &str, config: &DatasetConfig) -> String {
-    let columns: Vec<String> = config
-        .schema
-        .fields()
-        .iter()
-        .map(|f| {
-            let sql_type = sql_type_for_arrow(f.data_type());
-            let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
-            format!("{} {sql_type}{nullable}", quote_ident(f.name()))
-        })
-        .collect();
-
-    let with_opts = [
-        "\"acceleration.engine\" = 'cayenne'".to_string(),
-        "\"acceleration.mode\" = 'file'".to_string(),
-        "\"acceleration.refresh_mode\" = 'full'".to_string(),
-        "\"acceleration.refresh_check_interval\" = '1s'".to_string(),
-    ];
-
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} ({}) WITH ({})",
-        quote_ident(table_name),
-        columns.join(", "),
-        with_opts.join(", ")
-    )
-}
-
-/// Map Arrow data types to SQL type names for DDL.
-fn sql_type_for_arrow(data_type: &DataType) -> String {
-    match data_type {
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int8 => "TINYINT".to_string(),
-        DataType::UInt8 | DataType::Int16 => "SMALLINT".to_string(),
-        DataType::UInt16 | DataType::Int32 => "INT".to_string(),
-        DataType::UInt32 | DataType::Int64 => "BIGINT".to_string(),
-        DataType::UInt64 => "DECIMAL(20, 0)".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
-        DataType::Float64 => "DOUBLE".to_string(),
-        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Timestamp(
-            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
-            _,
-        ) => "TIMESTAMP".to_string(),
-        DataType::Decimal128(p, s) => format!("DECIMAL({p}, {s})"),
-        DataType::Binary | DataType::LargeBinary => "BINARY".to_string(),
-        _ => "VARCHAR".to_string(),
-    }
-}
-
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
-/// Generate the initial spicepod YAML with an Iceberg Glue catalog as the default catalog.
-fn generate_initial_spicepod(run_id: &Uuid, setup_config: &SetupConfig) -> anyhow::Result<String> {
+/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
+fn generate_initial_spicepod(
+    run_id: &Uuid,
+    setup_config: &SetupConfig,
+    datasets: &HashMap<String, DatasetConfig>,
+) -> anyhow::Result<String> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
         .etl_region
         .clone()
-        .or_else(|| std::env::var("SPIDAPTER_ICEBERG_REGION").ok())
         .or_else(|| std::env::var("AWS_REGION").ok())
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
         .unwrap_or_else(|| "us-east-1".to_string());
 
-    match setup_config.etl_sink_mode {
-        EtlSinkMode::IcebergObjectStore => {
-            let warehouse_uri = setup_config
-                .etl_iceberg_warehouse_uri
-                .as_deref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Missing setup metadata etl_iceberg_warehouse_uri for etl_sink_mode=iceberg-object-store"
-                    )
-                })?;
-
-            let mut params = vec![
-                "      iceberg_s3_access_key_id: ${secrets:AWS_ACCESS_KEY_ID}".to_string(),
-                "      iceberg_s3_secret_access_key: ${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
-                format!("      iceberg_s3_region: {region}"),
-            ];
-
-            if let Some(endpoint) = setup_config
-                .etl_endpoint
-                .clone()
-                .or_else(|| std::env::var("SPIDAPTER_ICEBERG_S3_ENDPOINT").ok())
-            {
-                params.push(format!("      iceberg_s3_endpoint: {endpoint}"));
-            }
-
-            if let Some(namespace) = &setup_config.etl_iceberg_namespace {
-                eprintln!(
-                    "[stdio] setup: iceberg object-store namespace from metadata: {namespace}"
-                );
-            }
-
-            Ok(format!(
-                "version: v1beta1
-kind: Spicepod
-name: spidapter-{short_id}
-
-catalogs:
-  - from: iceberg:{warehouse_uri}
-    name: spice
-    access: read
-    params:
-{}
-",
-                params.join("\n")
-            ))
-        }
-        EtlSinkMode::Adbc => {
-            let catalog_from = if let Ok(from) = std::env::var("SPIDAPTER_ICEBERG_CATALOG_FROM") {
-                from
-            } else {
-                let account_id = std::env::var("SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID")
-                    .or_else(|_| std::env::var("AWS_ICEBERG_ACCOUNT_ID"))
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Missing Iceberg catalog account id. Set SPIDAPTER_ICEBERG_CATALOG_FROM or SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID (or AWS_ICEBERG_ACCOUNT_ID)."
-                        )
-                    })?;
-
-                format!(
-                    "iceberg:https://glue.{region}.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"
+    let mut dataset_entries = Vec::new();
+    for dataset_name in datasets.keys() {
+        let from = setup_config
+            .dataset_sources
+            .get(dataset_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing 'from' in metadata for dataset '{dataset_name}'"
                 )
-            };
+            })?;
 
-            Ok(format!(
-                "version: v1beta1
-kind: Spicepod
-name: spidapter-{short_id}
+        let mut params = vec![
+            "      file_format: parquet".to_string(),
+            "      s3_auth: key".to_string(),
+            "      s3_key: ${secrets:AWS_ACCESS_KEY_ID}".to_string(),
+            "      s3_secret: ${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
+            format!("      s3_region: {region}"),
+        ];
 
-runtime:
-  scheduler:
-    state_location: s3://spicebench-ap-northeast-3/spidapter-{short_id}/
-    params:
-      s3_auth: key
-      s3_key: ${{secrets:AWS_ACCESS_KEY_ID}}
-      s3_secret: ${{secrets:AWS_SECRET_ACCESS_KEY}}
-      s3_session_token: ${{secrets:AWS_SESSION_TOKEN}}
-      s3_region: ap-northeast-3
-
-
-catalogs:
-  - from: {catalog_from}
-    name: spice
-    access: read_write_create
-    params:
-      iceberg_sigv4_enabled: true
-      iceberg_s3_access_key_id: ${{secrets:AWS_ACCESS_KEY_ID}}
-      iceberg_s3_secret_access_key: ${{secrets:AWS_SECRET_ACCESS_KEY}}
-      iceberg_s3_region: {region}
-"
-            ))
+        if let Some(endpoint) = &setup_config.etl_endpoint {
+            params.push(format!("      s3_endpoint: {endpoint}"));
         }
+
+        dataset_entries.push(format!(
+            "  - from: {from}\n    \
+             name: {dataset_name}\n    \
+             params:\n{}\n    \
+             acceleration:\n      \
+             enabled: true\n      \
+             engine: cayenne\n      \
+             mode: file\n      \
+             refresh_mode: full\n      \
+             refresh_check_interval: 1s",
+            params.join("\n")
+        ));
     }
+
+    Ok(format!(
+        "version: v1beta1\n\
+         kind: Spicepod\n\
+         name: spidapter-{short_id}\n\
+         \n\
+         datasets:\n{}\n",
+        dataset_entries.join("\n")
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     #[test]
-    fn setup_config_defaults_to_adbc_sink_mode() {
-        let metadata = HashMap::new();
+    fn setup_config_parses_dataset_sources_from_metadata() {
+        let metadata = HashMap::from([
+            (
+                "my_table".to_string(),
+                serde_json::json!({"from": "s3://bucket/path/my_table/"}),
+            ),
+            (
+                "etl_region".to_string(),
+                serde_json::Value::String("us-west-2".to_string()),
+            ),
+        ]);
+
         let config = SetupConfig::from_metadata(&metadata).expect("metadata should parse");
-        assert_eq!(config.etl_sink_mode, EtlSinkMode::Adbc);
-    }
-
-    #[test]
-    fn setup_config_parses_iceberg_object_store_sink_mode() {
-        let metadata = HashMap::from([(
-            "etl_sink_mode".to_string(),
-            serde_json::Value::String("iceberg-object-store".to_string()),
-        )]);
-
-        let config = SetupConfig::from_metadata(&metadata).expect("metadata should parse");
-        assert_eq!(config.etl_sink_mode, EtlSinkMode::IcebergObjectStore);
-    }
-
-    #[test]
-    fn setup_config_rejects_unknown_sink_mode() {
-        let metadata = HashMap::from([(
-            "etl_sink_mode".to_string(),
-            serde_json::Value::String("unknown".to_string()),
-        )]);
-
-        let err = SetupConfig::from_metadata(&metadata).expect_err("invalid sink mode should fail");
-        assert!(
-            err.to_string()
-                .contains("Unsupported setup metadata etl_sink_mode"),
-            "unexpected error: {err}"
+        assert_eq!(
+            config.dataset_sources.get("my_table").unwrap(),
+            "s3://bucket/path/my_table/"
         );
+        assert_eq!(config.etl_region.as_deref(), Some("us-west-2"));
     }
 
     #[test]
-    fn generate_spicepod_for_iceberg_object_store_requires_warehouse_uri() {
+    fn generate_spicepod_includes_dataset_entries() {
         let setup_config = SetupConfig {
-            etl_sink_mode: EtlSinkMode::IcebergObjectStore,
-            etl_region: Some("us-west-2".to_string()),
-            etl_endpoint: None,
-            etl_iceberg_warehouse_uri: None,
-            etl_iceberg_namespace: None,
-        };
-
-        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config)
-            .expect_err("missing warehouse uri should fail");
-        assert!(
-            err.to_string().contains("etl_iceberg_warehouse_uri"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn generate_spicepod_for_iceberg_object_store_uses_metadata_values() {
-        let setup_config = SetupConfig {
-            etl_sink_mode: EtlSinkMode::IcebergObjectStore,
+            dataset_sources: HashMap::from([(
+                "my_table".to_string(),
+                "s3://bucket/path/my_table/".to_string(),
+            )]),
             etl_region: Some("us-west-2".to_string()),
             etl_endpoint: Some("http://localhost:9000".to_string()),
-            etl_iceberg_warehouse_uri: Some("s3://bucket/prefix/run-id".to_string()),
-            etl_iceberg_namespace: Some("spicebench.etl".to_string()),
         };
 
-        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config)
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let datasets = HashMap::from([(
+            "my_table".to_string(),
+            DatasetConfig {
+                schema: schema.clone(),
+            },
+        )]);
+
+        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
             .expect("spicepod should generate");
 
-        assert!(spicepod.contains("from: iceberg:s3://bucket/prefix/run-id"));
-        assert!(spicepod.contains("access: read"));
-        assert!(spicepod.contains("iceberg_s3_region: us-west-2"));
-        assert!(spicepod.contains("iceberg_s3_endpoint: http://localhost:9000"));
+        assert!(spicepod.contains("from: s3://bucket/path/my_table/"));
+        assert!(spicepod.contains("name: my_table"));
+        assert!(spicepod.contains("file_format: parquet"));
+        assert!(spicepod.contains("s3_region: us-west-2"));
+        assert!(spicepod.contains("s3_endpoint: http://localhost:9000"));
+        assert!(spicepod.contains("engine: cayenne"));
+        assert!(spicepod.contains("mode: file"));
+        assert!(spicepod.contains("refresh_mode: full"));
+        assert!(spicepod.contains("refresh_check_interval: 1s"));
+    }
+
+    #[test]
+    fn generate_spicepod_errors_on_missing_dataset_source() {
+        let setup_config = SetupConfig {
+            dataset_sources: HashMap::new(),
+            etl_region: None,
+            etl_endpoint: None,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let datasets = HashMap::from([(
+            "missing_table".to_string(),
+            DatasetConfig {
+                schema: schema.clone(),
+            },
+        )]);
+
+        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
+            .expect_err("missing source should fail");
+        assert!(
+            err.to_string().contains("missing_table"),
+            "unexpected error: {err}"
+        );
     }
 }
