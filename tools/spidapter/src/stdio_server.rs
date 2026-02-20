@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
-    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, Server, SetupResponse,
-    TeardownResponse,
+    AdbcDriver, CreateTablesResponse, DatasetConfig, DriverConfig, Handler, Server,
+    SetupResponse, TeardownResponse,
 };
 use test_framework::anyhow;
 use uuid::Uuid;
@@ -88,7 +88,7 @@ impl Handler for SpidapterHandler {
         .await
         .map_err(|e| format!("Setup failed: {e}"))?;
 
-        let response = SetupResponse {
+        let driver_config = DriverConfig {
             driver: AdbcDriver::Flightsql,
             db_kwargs: HashMap::from([
                 (
@@ -104,6 +104,11 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String(state.api_key.clone()),
                 ),
             ]),
+        };
+
+        let response = SetupResponse {
+            ingest_driver: driver_config.clone(),
+            read_driver: driver_config,
         };
 
         self.runs.insert(run_id, state);
