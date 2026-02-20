@@ -339,9 +339,7 @@ fn generate_initial_spicepod(
             ) => {
                 let mut params = vec![
                     "      file_format: parquet".to_string(),
-                    "      s3_auth: key".to_string(),
-                    "      s3_key: ${secrets:AWS_ACCESS_KEY_ID}".to_string(),
-                    "      s3_secret: ${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
+                    "      s3_auth: public".to_string(),
                     format!("      s3_region: {region}"),
                 ];
 
