@@ -274,7 +274,7 @@ sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.37.2"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "1c3f11ecee3086232d472fa99381d3e922378afc", features = ["server"] } # branch: trunk
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "ee9fb3106d04dd64a7dae8b95b01b4455b12b7b0", features = ["server"] } # branch: trunk
 tantivy = "0.25.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
