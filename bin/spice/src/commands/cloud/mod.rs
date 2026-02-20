@@ -27,6 +27,7 @@ use snafu::ResultExt;
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
+use spice_cloud_client::types::IngestionMetrics;
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
@@ -1050,15 +1051,31 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     }
     table.print();
 
-    if let Some(ingestion) = &response.ingestion {
-        println!();
-        println!("Ingestion:");
-        if let Some(rows) = ingestion.rows_ingested {
-            println!("  Rows ingested:  {rows}");
+    println!();
+    match &response.ingestion {
+        Some(IngestionMetrics {
+            rows_ingested: Some(rows),
+            bytes_ingested: Some(bytes),
+        }) => {
+            println!("Ingestion: {rows} rows, {}", format_bytes(*bytes));
         }
-        if let Some(bytes) = ingestion.bytes_ingested {
-            println!("  Bytes ingested: {}", format_bytes(bytes));
+        Some(IngestionMetrics {
+            rows_ingested: Some(rows),
+            bytes_ingested: None,
+        }) => {
+            println!("Ingestion: {rows} rows");
         }
+        Some(IngestionMetrics {
+            rows_ingested: None,
+            bytes_ingested: Some(bytes),
+        }) => {
+            println!("Ingestion: {}", format_bytes(*bytes));
+        }
+        Some(IngestionMetrics {
+            rows_ingested: None,
+            bytes_ingested: None,
+        })
+        | None => {}
     }
 
     Ok(())
