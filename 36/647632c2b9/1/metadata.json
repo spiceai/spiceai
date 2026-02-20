@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "36647632c2b9",
+  "session_id": "ec15ec1b-8052-4bc7-a49f-deb6b4a2abaf",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-20T17:00:39.748309Z",
+  "branch": "spicebench",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "4c00f5fd7e10",
+  "transcript_identifier_at_start": "d4e2d757-202e-4524-83d3-c98a4b8fdcf1",
+  "token_usage": {
+    "input_tokens": 59,
+    "cache_creation_tokens": 122905,
+    "cache_read_tokens": 2635767,
+    "output_tokens": 5895,
+    "api_call_count": 49
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-20T17:00:39.350336Z",
+    "agent_lines": 0,
+    "human_added": 213,
+    "human_modified": 128,
+    "human_removed": 0,
+    "total_committed": 331,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-jeadie-Github-spiceai/ec15ec1b-8052-4bc7-a49f-deb6b4a2abaf.jsonl"
+}
