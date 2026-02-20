@@ -42,24 +42,13 @@ struct RunState {
 #[derive(Debug, Clone)]
 struct SetupConfig {
     /// Per-dataset `from` URIs, keyed by dataset name.
-    dataset_sources: HashMap<String, String>,
     etl_region: Option<String>,
     etl_endpoint: Option<String>,
 }
 
 impl SetupConfig {
     fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> anyhow::Result<Self> {
-        let mut dataset_sources = HashMap::new();
-        for (key, value) in metadata {
-            if let Some(obj) = value.as_object() {
-                if let Some(from) = obj.get("from").and_then(|v| v.as_str()) {
-                    dataset_sources.insert(key.clone(), from.to_string());
-                }
-            }
-        }
-
         Ok(Self {
-            dataset_sources,
             etl_region: metadata_string(metadata, "etl_region"),
             etl_endpoint: metadata_string(metadata, "etl_endpoint"),
         })
@@ -339,40 +328,46 @@ fn generate_initial_spicepod(
         .unwrap_or_else(|| "us-east-1".to_string());
 
     let mut dataset_entries = Vec::new();
-    for dataset_name in datasets.keys() {
-        let from = setup_config
-            .dataset_sources
-            .get(dataset_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Missing 'from' in metadata for dataset '{dataset_name}'"
-                )
-            })?;
+    for d in datasets {
+        match d {
+            (
+                dataset_name,
+                DatasetConfig {
+                    location: Some(from),
+                    ..
+                },
+            ) => {
+                let mut params = vec![
+                    "      file_format: parquet".to_string(),
+                    "      s3_auth: key".to_string(),
+                    "      s3_key: ${secrets:AWS_ACCESS_KEY_ID}".to_string(),
+                    "      s3_secret: ${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
+                    format!("      s3_region: {region}"),
+                ];
 
-        let mut params = vec![
-            "      file_format: parquet".to_string(),
-            "      s3_auth: key".to_string(),
-            "      s3_key: ${secrets:AWS_ACCESS_KEY_ID}".to_string(),
-            "      s3_secret: ${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
-            format!("      s3_region: {region}"),
-        ];
+                if let Some(endpoint) = &setup_config.etl_endpoint {
+                    params.push(format!("      s3_endpoint: {endpoint}"));
+                }
 
-        if let Some(endpoint) = &setup_config.etl_endpoint {
-            params.push(format!("      s3_endpoint: {endpoint}"));
+                dataset_entries.push(format!(
+                    "  - from: {from}\n    \
+                    name: {dataset_name}\n    \
+                    params:\n{}\n    \
+                    acceleration:\n      \
+                    enabled: true\n      \
+                    engine: cayenne\n      \
+                    mode: file\n      \
+                    refresh_mode: full\n      \
+                    refresh_check_interval: 1s",
+                    params.join("\n")
+                ));
+            }
+            (dataset_name, _) => {
+                return Err(anyhow::anyhow!(
+                    "Dataset '{dataset_name}' is missing a 'from' URI in its config"
+                ));
+            }
         }
-
-        dataset_entries.push(format!(
-            "  - from: {from}\n    \
-             name: {dataset_name}\n    \
-             params:\n{}\n    \
-             acceleration:\n      \
-             enabled: true\n      \
-             engine: cayenne\n      \
-             mode: file\n      \
-             refresh_mode: full\n      \
-             refresh_check_interval: 1s",
-            params.join("\n")
-        ));
     }
 
     Ok(format!(
