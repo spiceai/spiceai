@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
-    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, Server, SetupResponse,
-    TeardownResponse,
+    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, IngestionMetrics, MetricsResponse,
+    ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
 use test_framework::anyhow;
 use uuid::Uuid;
@@ -167,6 +167,70 @@ impl Handler for SpidapterHandler {
 
         self.runs.insert(run_id, state);
         Ok(response)
+    }
+
+    async fn metrics(&mut self, run_id: Uuid) -> std::result::Result<MetricsResponse, String> {
+        let state = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| format!("No active run found for {run_id}"))?;
+
+        let cloud_metrics = state
+            .cloud
+            .get_app_metrics(state.app_id)
+            .await
+            .map_err(|e| format!("Failed to fetch metrics: {e}"))?;
+
+        let pods = cloud_metrics.metrics.values().collect::<Vec<_>>();
+
+        let resource = if pods.is_empty() {
+            ResourceMetrics::default()
+        } else {
+            let avg_cpu = match pods
+                .iter()
+                .filter_map(|p| p.cpu_usage_percent.is_some().then(|| 1.0))
+                .sum::<f64>()
+            {
+                0.0 => None,
+                n => Some(pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>() / n),
+            };
+
+            let total_memory = match pods
+                .iter()
+                .filter_map(|p| p.memory_usage_bytes.is_some().then(|| 1))
+                .sum::<u64>()
+            {
+                0 => None,
+                n => Some(
+                    pods.iter()
+                        .filter_map(|p| p.memory_usage_bytes)
+                        .sum::<u64>()
+                        / n as u64,
+                ),
+            };
+            ResourceMetrics {
+                cpu_usage_percent: avg_cpu,
+                memory_usage_bytes: total_memory,
+                disk_read_bytes: None,
+                disk_write_bytes: None,
+                disk_read_iops: None,
+                disk_write_iops: None,
+            }
+        };
+
+        let ingestion = cloud_metrics
+            .ingestion
+            .map(|i| IngestionMetrics {
+                rows_ingested: i.rows_ingested,
+                bytes_ingested: i.bytes_ingested,
+                ..IngestionMetrics::default()
+            })
+            .unwrap_or_default();
+
+        Ok(MetricsResponse {
+            resource,
+            ingestion,
+        })
     }
 
     async fn create_tables(
@@ -521,6 +585,17 @@ catalogs:
                 "version: v1beta1
 kind: Spicepod
 name: spidapter-{short_id}
+
+runtime:
+  scheduler:
+    state_location: s3://spicebench-ap-northeast-3/spidapter-{short_id}/
+    params:
+      s3_auth: key
+      s3_key: ${{secrets:AWS_ACCESS_KEY_ID}}
+      s3_secret: ${{secrets:AWS_SECRET_ACCESS_KEY}}
+      s3_session_token: ${{secrets:AWS_SESSION_TOKEN}}
+      s3_region: ap-northeast-3
+
 
 catalogs:
   - from: {catalog_from}

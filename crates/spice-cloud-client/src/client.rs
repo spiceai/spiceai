@@ -25,8 +25,8 @@ use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
     CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
-    RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret,
-    SecretsResponse, SetSecretRequest, UpdateAppRequest,
+    MetricsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse,
+    RollbackRequest, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -483,6 +483,24 @@ impl CloudClient {
     }
 
     // ========================================================================
+    // Metrics
+    // ========================================================================
+
+    /// Get metrics for an app's pods.
+    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
+        let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
     // Response handling
     // ========================================================================
 
@@ -492,7 +510,6 @@ impl CloudClient {
     ) -> Result<T> {
         let status = response.status();
         let body = response.text().await.context(HttpRequestSnafu)?;
-
         match status.as_u16() {
             200..=202 => {
                 serde_json::from_str(&body).map_err(|source| error::Error::JsonParse { source })
