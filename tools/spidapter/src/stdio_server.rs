@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use system_adapter_protocol::{
-    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, IngestionMetrics, MetricsResponse,
-    ResourceMetrics, Server, SetupResponse, TeardownResponse,
+    AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
+    SetupResponse, TeardownResponse,
 };
 use test_framework::anyhow;
 use uuid::Uuid;
@@ -128,6 +128,7 @@ impl Handler for SpidapterHandler {
         &mut self,
         run_id: Uuid,
         metadata: HashMap<String, serde_json::Value>,
+        datasets: HashMap<String, DatasetConfig>,
     ) -> Result<SetupResponse, String> {
         eprintln!(
             "[stdio] setup: run_id={run_id}, metadata_keys={:?}",
@@ -166,6 +167,55 @@ impl Handler for SpidapterHandler {
         };
 
         self.runs.insert(run_id, state);
+
+        // Create tables as part of setup
+        eprintln!("[stdio] setup: creating tables for run_id={run_id}");
+
+        let state = self
+            .runs
+            .get_mut(&run_id)
+            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+        let sql_url = sql_url_from_cname(&state.cname);
+
+        if state.etl_sink_mode != EtlSinkMode::IcebergObjectStore {
+            for (table_name, config) in &datasets {
+                let ddl = create_table_ddl(table_name, config);
+                eprintln!("[stdio] setup: executing DDL: {ddl}");
+
+                let resp = client
+                    .post(&sql_url)
+                    .header("X-API-Key", &state.api_key)
+                    .body(ddl.clone())
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to send DDL for table '{table_name}': {e}"))?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<failed to read body>".to_string());
+                    return Err(format!(
+                        "DDL for table '{table_name}' failed ({status}): {body}"
+                    ));
+                }
+
+                state.created_tables.push(table_name.clone());
+                eprintln!("[stdio] setup: table '{table_name}' created");
+            }
+        } else {
+            eprintln!(
+                "[stdio] setup: skipping SQL DDL for run_id={run_id} (etl_sink_mode=iceberg-object-store)"
+            );
+        }
+
         Ok(response)
     }
 
@@ -231,61 +281,6 @@ impl Handler for SpidapterHandler {
             resource,
             ingestion,
         })
-    }
-
-    async fn create_tables(
-        &mut self,
-        run_id: Uuid,
-        datasets: HashMap<String, DatasetConfig>,
-    ) -> Result<CreateTablesResponse, String> {
-        eprintln!("[stdio] create_tables: run_id={run_id}");
-
-        let state = self
-            .runs
-            .get_mut(&run_id)
-            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-
-        let sql_url = sql_url_from_cname(&state.cname);
-
-        if state.etl_sink_mode == EtlSinkMode::IcebergObjectStore {
-            eprintln!(
-                "[stdio] create_tables: skipping SQL DDL for run_id={run_id} (etl_sink_mode=iceberg-object-store)"
-            );
-            return Ok(CreateTablesResponse { ok: true });
-        }
-
-        for (table_name, config) in &datasets {
-            let ddl = create_table_ddl(table_name, config);
-            eprintln!("[stdio] create_tables: executing DDL: {ddl}");
-
-            let response = client
-                .post(&sql_url)
-                .header("X-API-Key", &state.api_key)
-                .body(ddl.clone())
-                .send()
-                .await
-                .map_err(|e| format!("Failed to send DDL for table '{table_name}': {e}"))?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<failed to read body>".to_string());
-                return Err(format!(
-                    "DDL for table '{table_name}' failed ({status}): {body}"
-                ));
-            }
-
-            state.created_tables.push(table_name.clone());
-            eprintln!("[stdio] create_tables: table '{table_name}' created");
-        }
-        Ok(CreateTablesResponse { ok: true })
     }
 
     async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
@@ -643,7 +638,8 @@ mod tests {
 
         let err = SetupConfig::from_metadata(&metadata).expect_err("invalid sink mode should fail");
         assert!(
-            err.to_string().contains("Unsupported setup metadata etl_sink_mode"),
+            err.to_string()
+                .contains("Unsupported setup metadata etl_sink_mode"),
             "unexpected error: {err}"
         );
     }
@@ -676,8 +672,8 @@ mod tests {
             etl_iceberg_namespace: Some("spicebench.etl".to_string()),
         };
 
-        let spicepod =
-            generate_initial_spicepod(&Uuid::nil(), &setup_config).expect("spicepod should generate");
+        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config)
+            .expect("spicepod should generate");
 
         assert!(spicepod.contains("from: iceberg:s3://bucket/prefix/run-id"));
         assert!(spicepod.contains("access: read"));
