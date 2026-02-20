@@ -167,7 +167,7 @@ pub(crate) async fn create_deployment(
             &CreateDeploymentRequest {
                 image: None,
                 image_tag: None,
-                replicas: Some(4),
+                replicas: Some(1),
                 branch: None,
                 commit_sha: None,
                 commit_message: None,

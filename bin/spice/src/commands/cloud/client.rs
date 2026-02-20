@@ -89,7 +89,7 @@ impl CloudClient {
         let (org, name) = parse_org_app(org_app);
 
         for app in apps {
-            if app.name == name && (org.is_empty() || app.org == org) {
+            if app.name == name && (org.is_empty() || org == org) {
                 return self.get_app_by_id(app.id).await;
             }
         }

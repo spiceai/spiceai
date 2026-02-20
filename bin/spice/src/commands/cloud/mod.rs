@@ -24,10 +24,10 @@ use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::TableOutput;
 use clap::{Args, Subcommand};
 use snafu::ResultExt;
-use spice_cloud_client::types::IngestionMetrics;
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
+use spice_cloud_client::types::IngestionMetrics;
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
@@ -102,7 +102,7 @@ pub enum CloudCommands {
     #[command(name = "api-keys")]
     ApiKeys(ApiKeysArgs),
 
-    /// Show resource metrics for an app
+    /// Show metrics for an app's pods
     Metrics(MetricsArgs),
 }
 
@@ -123,16 +123,6 @@ pub struct LinkArgs {
     pub app: String,
 }
 
-#[derive(Args, Debug)]
-pub struct MetricsArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
-
-    /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
-    #[arg(long, value_parser = parse_window)]
-    pub window: Option<String>,
-}
 #[derive(Args, Debug)]
 pub struct DeploymentsArgs {
     /// App name in org/app format (uses linked app if not specified)
@@ -220,6 +210,13 @@ pub struct ApiKeysArgs {
     /// Regenerate API key (1 or 2)
     #[arg(long)]
     pub regenerate: Option<u8>,
+}
+
+#[derive(Args, Debug)]
+pub struct MetricsArgs {
+    /// App name in org/app format (uses linked app if not specified)
+    #[arg(long)]
+    pub app: Option<String>,
 }
 
 // ============================================================================
@@ -1022,31 +1019,21 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     let app_name = require_app(args.app.as_deref())?;
     let app = client.get_app(&app_name).await?;
 
-    let response = client
-        .get_app_metrics(app.id, args.window.as_deref())
-        .await?;
+    let response = client.get_app_metrics(app.id).await?;
 
     if response.metrics.is_empty() {
         println!("No metrics available for {app_name}");
         return Ok(());
     }
 
-    let has_window = args.window.is_some();
-    let window_label = args
-        .window
-        .as_deref()
-        .map_or(String::new(), |w| format!(" ({w})"));
-
     let mut table = TableOutput::new(vec![
         "POD",
         "CPU %",
         "MEMORY",
-        &format!("DISK READ{window_label}"),
-        &format!("DISK READ IOPS{window_label}"),
-        &format!("DISK WRITE{window_label}"),
-        &format!("DISK WRITE IOPS{window_label}"),
+        "DISK USED",
+        "DISK AVAIL",
+        "DISK CAP",
     ]);
-
     for (pod, m) in &response.metrics {
         table.add_row(vec![
             pod.clone(),
@@ -1054,21 +1041,17 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
             m.memory_usage_bytes
                 .map_or_else(|| "-".to_string(), format_bytes),
-            m.disk_read_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_read_iops
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.disk_write_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_write_iops
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+            m.filesystem_usage_bytes
+                .map_or_else(|| "-".to_string(), format_bytes),
+            m.filesystem_available_bytes
+                .map_or_else(|| "-".to_string(), format_bytes),
+            m.filesystem_capacity_bytes
+                .map_or_else(|| "-".to_string(), format_bytes),
         ]);
     }
-
     table.print();
 
     println!();
-
     match &response.ingestion {
         Some(IngestionMetrics {
             rows_ingested: Some(rows),
@@ -1114,46 +1097,9 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_bytes_f64(bytes: f64, is_windowed: bool) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-
-    if is_windowed {
-        // increase() over window — show as a delta amount
-        if bytes >= GIB {
-            format!("{:.1} GiB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MiB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KiB", bytes / KIB)
-        } else {
-            format!("{bytes:.0} B")
-        }
-    } else {
-        // Raw cumulative counter — show total bytes
-        if bytes >= GIB {
-            format!("{:.1} GiB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MiB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KiB", bytes / KIB)
-        } else {
-            format!("{bytes:.0} B")
-        }
-    }
-}
-
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-/// Validate that `--window` parses as a duration via `fundu`.
-fn parse_window(s: &str) -> std::result::Result<String, String> {
-    fundu::parse_duration(s)
-        .map(|_| s.to_string())
-        .map_err(|e| format!("invalid duration '{s}': {e}"))
-}
 
 /// Get the app name from the flag or the linked app.
 fn require_app(flag_value: Option<&str>) -> Result<String> {
