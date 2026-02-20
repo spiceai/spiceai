@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "36647632c2b9",
+  "strategy": "manual-commit",
+  "branch": "spicebench",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/36/647632c2b9/0/metadata.json",
+      "transcript": "/36/647632c2b9/0/full.jsonl",
+      "context": "/36/647632c2b9/0/context.md",
+      "content_hash": "/36/647632c2b9/0/content_hash.txt",
+      "prompt": "/36/647632c2b9/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 50,
+    "cache_creation_tokens": 184821,
+    "cache_read_tokens": 1928632,
+    "output_tokens": 1736,
+    "api_call_count": 40
+  }
+}
