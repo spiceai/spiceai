@@ -19,13 +19,10 @@ use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
+use spicepod::component::runtime::{Runtime, TelemetryConfig};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
-use spicepod::{
-    acceleration::{Acceleration, Mode, RefreshMode},
-    component::ComponentOrReference,
-    dataset::Dataset,
-};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
     SetupResponse, TeardownResponse,
@@ -337,6 +334,13 @@ fn generate_initial_spicepod(
         .unwrap_or_else(|| "us-east-1".to_string());
 
     let mut spicepod = SpicepodDefinition::new(format!("spidapter-{short_id}"));
+    spicepod.runtime = Runtime {
+        telemetry: TelemetryConfig {
+            enabled: false,
+            ..TelemetryConfig::default()
+        },
+        ..Runtime::default()
+    };
 
     for (dataset_name, config) in datasets {
         let from = config.location.as_deref().ok_or_else(|| {
@@ -417,6 +421,8 @@ mod tests {
         assert!(spicepod.contains("mode: file"));
         assert!(spicepod.contains("refresh_mode: full"));
         assert!(spicepod.contains("refresh_check_interval: 1s"));
+        assert!(spicepod.contains("telemetry:"));
+        assert!(spicepod.contains("enabled: false"));
     }
 
     #[test]
