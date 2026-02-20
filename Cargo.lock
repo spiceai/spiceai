@@ -18166,10 +18166,12 @@ dependencies = [
  "runtime-secrets",
  "serde_json",
  "spice-cloud-client",
+ "spicepod",
  "system-adapter-protocol",
  "test-framework",
  "tokio",
  "uuid 1.20.0",
+ "yaml",
 ]
 
 [[package]]
