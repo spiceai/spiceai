@@ -42,6 +42,61 @@ struct RunState {
     cname: String,
     /// Table names created for this run (for cleanup during teardown).
     created_tables: Vec<String>,
+    /// ETL sink mode used by this run.
+    etl_sink_mode: EtlSinkMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EtlSinkMode {
+    Adbc,
+    IcebergObjectStore,
+}
+
+impl EtlSinkMode {
+    fn from_setup_metadata(metadata: &HashMap<String, serde_json::Value>) -> anyhow::Result<Self> {
+        let value = metadata
+            .get("etl_sink_mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("adbc");
+
+        match value {
+            "adbc" => Ok(Self::Adbc),
+            "iceberg-object-store" => Ok(Self::IcebergObjectStore),
+            other => Err(anyhow::anyhow!(
+                "Unsupported setup metadata etl_sink_mode '{other}'. Allowed values: adbc, iceberg-object-store"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SetupConfig {
+    etl_sink_mode: EtlSinkMode,
+    etl_region: Option<String>,
+    etl_endpoint: Option<String>,
+    etl_iceberg_warehouse_uri: Option<String>,
+    etl_iceberg_namespace: Option<String>,
+}
+
+impl SetupConfig {
+    fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> anyhow::Result<Self> {
+        Ok(Self {
+            etl_sink_mode: EtlSinkMode::from_setup_metadata(metadata)?,
+            etl_region: metadata_string(metadata, "etl_region"),
+            etl_endpoint: metadata_string(metadata, "etl_endpoint"),
+            etl_iceberg_warehouse_uri: metadata_string(metadata, "etl_iceberg_warehouse_uri"),
+            etl_iceberg_namespace: metadata_string(metadata, "etl_iceberg_namespace"),
+        })
+    }
+}
+
+fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
 }
 
 /// System adapter handler that provisions Spice Cloud apps.
@@ -79,11 +134,15 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
+        let setup_config = SetupConfig::from_metadata(&metadata)
+            .map_err(|e| format!("Invalid setup metadata: {e}"))?;
+
         let state = provision_spice_cloud_app(
             run_id,
             self.api_url_override.as_deref(),
             self.ready_wait,
             self.channel.as_deref(),
+            &setup_config,
         )
         .await
         .map_err(|e| format!("Setup failed: {e}"))?;
@@ -128,6 +187,13 @@ impl Handler for SpidapterHandler {
             .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
         let sql_url = sql_url_from_cname(&state.cname);
+
+        if state.etl_sink_mode == EtlSinkMode::IcebergObjectStore {
+            eprintln!(
+                "[stdio] create_tables: skipping SQL DDL for run_id={run_id} (etl_sink_mode=iceberg-object-store)"
+            );
+            return Ok(CreateTablesResponse { ok: true });
+        }
 
         for (table_name, config) in &datasets {
             let ddl = create_table_ddl(table_name, config);
@@ -246,6 +312,7 @@ async fn provision_spice_cloud_app(
     api_url_override: Option<&str>,
     ready_wait: u64,
     channel: Option<&str>,
+    setup_config: &SetupConfig,
 ) -> anyhow::Result<RunState> {
     let cloud = commands::build_cloud_client(api_url_override)?;
 
@@ -269,7 +336,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] App ID: {app_id}");
 
     // Generate initial spicepod YAML (tables created later via create_tables)
-    let spicepod_yaml = generate_initial_spicepod(&run_id)?;
+    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -308,6 +375,7 @@ async fn provision_spice_cloud_app(
         cloud,
         cname,
         created_tables: Vec::new(),
+        etl_sink_mode: setup_config.etl_sink_mode,
     })
 }
 
@@ -375,31 +443,82 @@ fn quote_ident(ident: &str) -> String {
 }
 
 /// Generate the initial spicepod YAML with an Iceberg Glue catalog as the default catalog.
-fn generate_initial_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
+fn generate_initial_spicepod(run_id: &Uuid, setup_config: &SetupConfig) -> anyhow::Result<String> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
-    let region = std::env::var("SPIDAPTER_ICEBERG_REGION")
-        .or_else(|_| std::env::var("AWS_REGION"))
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string());
-    let catalog_from = if let Ok(from) = std::env::var("SPIDAPTER_ICEBERG_CATALOG_FROM") {
-        from
-    } else {
-        let account_id = std::env::var("SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID")
-            .or_else(|_| std::env::var("AWS_ICEBERG_ACCOUNT_ID"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Missing Iceberg catalog account id. Set SPIDAPTER_ICEBERG_CATALOG_FROM or SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID (or AWS_ICEBERG_ACCOUNT_ID)."
+    let region = setup_config
+        .etl_region
+        .clone()
+        .or_else(|| std::env::var("SPIDAPTER_ICEBERG_REGION").ok())
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    match setup_config.etl_sink_mode {
+        EtlSinkMode::IcebergObjectStore => {
+            let warehouse_uri = setup_config
+                .etl_iceberg_warehouse_uri
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Missing setup metadata etl_iceberg_warehouse_uri for etl_sink_mode=iceberg-object-store"
+                    )
+                })?;
+
+            let mut params = vec![
+                "      iceberg_s3_access_key_id: ${secrets:AWS_ACCESS_KEY_ID}".to_string(),
+                "      iceberg_s3_secret_access_key: ${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
+                format!("      iceberg_s3_region: {region}"),
+            ];
+
+            if let Some(endpoint) = setup_config
+                .etl_endpoint
+                .clone()
+                .or_else(|| std::env::var("SPIDAPTER_ICEBERG_S3_ENDPOINT").ok())
+            {
+                params.push(format!("      iceberg_s3_endpoint: {endpoint}"));
+            }
+
+            if let Some(namespace) = &setup_config.etl_iceberg_namespace {
+                eprintln!(
+                    "[stdio] setup: iceberg object-store namespace from metadata: {namespace}"
+                );
+            }
+
+            Ok(format!(
+                "version: v1beta1
+kind: Spicepod
+name: spidapter-{short_id}
+
+catalogs:
+  - from: iceberg:{warehouse_uri}
+    name: spice
+    access: read
+    params:
+{}
+",
+                params.join("\n")
+            ))
+        }
+        EtlSinkMode::Adbc => {
+            let catalog_from = if let Ok(from) = std::env::var("SPIDAPTER_ICEBERG_CATALOG_FROM") {
+                from
+            } else {
+                let account_id = std::env::var("SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID")
+                    .or_else(|_| std::env::var("AWS_ICEBERG_ACCOUNT_ID"))
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Missing Iceberg catalog account id. Set SPIDAPTER_ICEBERG_CATALOG_FROM or SPIDAPTER_ICEBERG_CATALOG_ACCOUNT_ID (or AWS_ICEBERG_ACCOUNT_ID)."
+                        )
+                    })?;
+
+                format!(
+                    "iceberg:https://glue.{region}.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"
                 )
-            })?;
+            };
 
-        format!(
-            "iceberg:https://glue.{region}.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"
-        )
-    };
-
-    Ok(format!(
-        "version: v1beta1
+            Ok(format!(
+                "version: v1beta1
 kind: Spicepod
 name: spidapter-{short_id}
 
@@ -413,5 +532,81 @@ catalogs:
       iceberg_s3_secret_access_key: ${{secrets:AWS_SECRET_ACCESS_KEY}}
       iceberg_s3_region: {region}
 "
-    ))
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_config_defaults_to_adbc_sink_mode() {
+        let metadata = HashMap::new();
+        let config = SetupConfig::from_metadata(&metadata).expect("metadata should parse");
+        assert_eq!(config.etl_sink_mode, EtlSinkMode::Adbc);
+    }
+
+    #[test]
+    fn setup_config_parses_iceberg_object_store_sink_mode() {
+        let metadata = HashMap::from([(
+            "etl_sink_mode".to_string(),
+            serde_json::Value::String("iceberg-object-store".to_string()),
+        )]);
+
+        let config = SetupConfig::from_metadata(&metadata).expect("metadata should parse");
+        assert_eq!(config.etl_sink_mode, EtlSinkMode::IcebergObjectStore);
+    }
+
+    #[test]
+    fn setup_config_rejects_unknown_sink_mode() {
+        let metadata = HashMap::from([(
+            "etl_sink_mode".to_string(),
+            serde_json::Value::String("unknown".to_string()),
+        )]);
+
+        let err = SetupConfig::from_metadata(&metadata).expect_err("invalid sink mode should fail");
+        assert!(
+            err.to_string().contains("Unsupported setup metadata etl_sink_mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_spicepod_for_iceberg_object_store_requires_warehouse_uri() {
+        let setup_config = SetupConfig {
+            etl_sink_mode: EtlSinkMode::IcebergObjectStore,
+            etl_region: Some("us-west-2".to_string()),
+            etl_endpoint: None,
+            etl_iceberg_warehouse_uri: None,
+            etl_iceberg_namespace: None,
+        };
+
+        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config)
+            .expect_err("missing warehouse uri should fail");
+        assert!(
+            err.to_string().contains("etl_iceberg_warehouse_uri"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_spicepod_for_iceberg_object_store_uses_metadata_values() {
+        let setup_config = SetupConfig {
+            etl_sink_mode: EtlSinkMode::IcebergObjectStore,
+            etl_region: Some("us-west-2".to_string()),
+            etl_endpoint: Some("http://localhost:9000".to_string()),
+            etl_iceberg_warehouse_uri: Some("s3://bucket/prefix/run-id".to_string()),
+            etl_iceberg_namespace: Some("spicebench.etl".to_string()),
+        };
+
+        let spicepod =
+            generate_initial_spicepod(&Uuid::nil(), &setup_config).expect("spicepod should generate");
+
+        assert!(spicepod.contains("from: iceberg:s3://bucket/prefix/run-id"));
+        assert!(spicepod.contains("access: read"));
+        assert!(spicepod.contains("iceberg_s3_region: us-west-2"));
+        assert!(spicepod.contains("iceberg_s3_endpoint: http://localhost:9000"));
+    }
 }
