@@ -129,10 +129,10 @@ impl Handler for SpidapterHandler {
         } else {
             let avg_cpu = match pods
                 .iter()
-                .filter_map(|p| p.cpu_usage_percent.is_some().then(|| 1))
-                .sum::<u64>()
+                .filter_map(|p| p.cpu_usage_percent.is_some().then(|| 1.0))
+                .sum::<f64>()
             {
-                0 => None,
+                0.0 => None,
                 n => Some(pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>() / n),
             };
 
@@ -466,6 +466,17 @@ fn generate_initial_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
         "version: v1beta1
 kind: Spicepod
 name: spidapter-{short_id}
+
+runtime:
+  scheduler:
+    state_location: s3://spicebench-ap-northeast-3/spidapter-{short_id}/
+    params:
+      s3_auth: key
+      s3_key: ${{secrets:AWS_ACCESS_KEY_ID}}
+      s3_secret: ${{secrets:AWS_SECRET_ACCESS_KEY}}
+      s3_session_token: ${{secrets:AWS_SESSION_TOKEN}}
+      s3_region: ap-northeast-3
+
 
 catalogs:
   - from: {catalog_from}
