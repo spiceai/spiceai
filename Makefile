@@ -36,6 +36,14 @@ build-testoperator-dev:
 build-testoperator:
 	cargo build --release -p testoperator --all-features
 
+.PHONY: build-distributed-dev
+build-distributed-dev:
+	cargo build -p distributed
+
+.PHONY: build-distributed
+build-distributed:
+	cargo build --release -p distributed
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -280,6 +288,16 @@ install-testoperator-dev: build-testoperator-dev
 install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-distributed-dev
+install-distributed-dev: build-distributed-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/distributed ~/.spice/bin/distributed
+
+.PHONY: install-distributed
+install-distributed: build-distributed
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/distributed ~/.spice/bin/distributed
 
 .PHONY: install-cli
 install-cli: build-cli

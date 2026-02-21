@@ -65,7 +65,8 @@ members = [
     "tools/spicepod-validator",
     "tools/testoperator",
     "tools/parsley",
-    "tools/pr-builds"
+    "tools/pr-builds",
+    "tools/distributed"
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
