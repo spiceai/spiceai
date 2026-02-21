@@ -16,6 +16,7 @@ limitations under the License.
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
+use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,6 +56,30 @@ where
     }
 
     Ok(result)
+}
+
+pub fn serialize_partition_by<S>(
+    partition_by: &Vec<PartitionedBy>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(partition_by.len()))?;
+
+    for item in partition_by {
+        // If the name is auto-generated (matches "expr{number}"), serialize as just the expression string
+        if item.name.starts_with("expr") && item.name[4..].parse::<usize>().is_ok() {
+            seq.serialize_element(&item.expression)?;
+        } else {
+            // Otherwise, serialize as an object with the custom name
+            let mut map = std::collections::HashMap::new();
+            map.insert(&item.name, &item.expression);
+            seq.serialize_element(&map)?;
+        }
+    }
+
+    seq.end()
 }
 
 #[cfg(test)]
