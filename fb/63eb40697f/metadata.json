@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fb63eb40697f",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-19/metrics-2",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "bin/spice/src/commands/cloud/mod.rs",
+    "crates/spice-cloud-client/src/types.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/fb/63eb40697f/0/metadata.json",
+      "transcript": "/fb/63eb40697f/0/full.jsonl",
+      "context": "/fb/63eb40697f/0/context.md",
+      "content_hash": "/fb/63eb40697f/0/content_hash.txt",
+      "prompt": "/fb/63eb40697f/0/prompt.txt"
+    },
+    {
+      "metadata": "/fb/63eb40697f/1/metadata.json",
+      "transcript": "/fb/63eb40697f/1/full.jsonl",
+      "context": "/fb/63eb40697f/1/context.md",
+      "content_hash": "/fb/63eb40697f/1/content_hash.txt",
+      "prompt": "/fb/63eb40697f/1/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 76,
+    "cache_creation_tokens": 213173,
+    "cache_read_tokens": 2920190,
+    "output_tokens": 2514,
+    "api_call_count": 64
+  }
+}

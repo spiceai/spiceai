@@ -1,0 +1,58 @@
+Fix these errors. Essentially logic in create_tables should be moved to setup
+
+error[E0432]: unresolved import `system_adapter_protocol::CreateTablesResponse`
+  --> tools/spidapter/src/stdio_server.rs:22:17
+   |
+22 |     AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, IngestionMetrics, MetricsResponse,
+   |                 ^^^^^^^^^^^^^^^^^^^^ no `CreateTablesResponse` in the root
+
+error[E0407]: method `create_tables` is not a member of trait `Handler`
+   --> tools/spidapter/src/stdio_server.rs:236:5
+    |
+236 | /     async fn create_tables(
+237 | |         &mut self,
+238 | |         run_id: Uuid,
+239 | |         datasets: HashMap<String, DatasetConfig>,
+...   |
+288 | |         Ok(CreateTablesResponse { ok: true })
+289 | |     }
+    | |_____^ not a member of trait `Handler`
+
+error[E0050]: method `setup` has 3 parameters but the declaration in trait `setup` has 4
+   --> tools/spidapter/src/stdio_server.rs:128:9
+    |
+128 | /         &mut self,
+129 | |         run_id: Uuid,
+130 | |         metadata: HashMap<String, serde_json::Value>,
+    | |____________________________________________________^ expected 4 parameters, found 3
+    |
+    = note: `setup` from trait: `fn(&'life0 mut Self, Uuid, HashMap<std::string::String, serde_json::Value>, HashMap<std::string::String, DatasetConfig>) -> Pin<Box<(dyn std::future::Future<Output = Result<SetupResponse, std::string::String>> + std::marker::Send + 'async_trait)>>`
+
+Some errors have detailed explanations: E0050, E0407, E0432.
+For more information about an error, try `rustc --explain E0050`.
+error: could not compile `spidapter` (bin "spidapter") due to 3 previous errors
+
+---
+
+next task. We're changing `generate_initial_spicepod` in tools/spidapter/src/stdio_server.rs. Instead of a single catalog in spicepod, we're going to define each dataset (from setup), as a different dataset in the spicepod. They're going to be parquet or maybe delta in s3. I have to figure out where the s3 path comes from, but they will be suffixed with `/<dataset_name>`. The spicepod datasets should have accelerations in the YAML (configured as per `create_table_ddl`) but directly on the YAML
+
+---
+
+`metadata:  HashMap<String, serde_json::Value>,` should have a `from` key for each dataset. 
+
+like this. we won't need to suffix it.
+{ 
+    "metadata": {
+       "table_name": {
+         "from": " s3://{base_path}/{dataset_name}/"
+       }
+    }
+}
+
+---
+
+where does tools/spidapter use the `spicepod = { path = "../../crates/spicepod" }` it has in Cargo.toml
+
+---
+
+what cargo command can find me unused crates in spidapter

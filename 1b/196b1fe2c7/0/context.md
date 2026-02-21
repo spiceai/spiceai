@@ -1,0 +1,8 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+in `crates/runtime/src/accelerated_table/refresh_task/deletion.rs` fix `|l, r| l.and(r)` with `Expr::and`
+

@@ -1,0 +1,38 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "ffdc9b42b0e4",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-18/accel",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "bin/spice/src/commands/cloud/client.rs",
+    "crates/spice-cloud-client/src/client.rs",
+    "crates/spice-cloud-client/src/types.rs",
+    "tools/spidapter/src/args/mod.rs",
+    "tools/spidapter/src/commands/mod.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ff/dc9b42b0e4/0/metadata.json",
+      "transcript": "/ff/dc9b42b0e4/0/full.jsonl",
+      "context": "/ff/dc9b42b0e4/0/context.md",
+      "content_hash": "/ff/dc9b42b0e4/0/content_hash.txt",
+      "prompt": "/ff/dc9b42b0e4/0/prompt.txt"
+    },
+    {
+      "metadata": "/ff/dc9b42b0e4/1/metadata.json",
+      "transcript": "/ff/dc9b42b0e4/1/full.jsonl",
+      "context": "/ff/dc9b42b0e4/1/context.md",
+      "content_hash": "/ff/dc9b42b0e4/1/content_hash.txt",
+      "prompt": "/ff/dc9b42b0e4/1/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 54,
+    "cache_creation_tokens": 413596,
+    "cache_read_tokens": 5474120,
+    "output_tokens": 1846,
+    "api_call_count": 44
+  }
+}

@@ -1,0 +1,170 @@
+It looks like `tools/spidapter/src/commands/mod.rs` uses a bunch of cloud API methods. The client methods (request/response) don't look complete. I think the cloud side has swagger defined here `/Users/jeadie/Github/cloud/apps/api/app/v1/apps/[appId]/deployments/route.ts`. Is that correct?
+
+---
+
+is there any other cloud APIs used in thie rust file?
+
+---
+
+ya
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+It looks like we have a basic client `bin/spice/src/commands/cloud/client.rs`. Can you 1. Make a new crate in `./crates/spice-cloud-client`. Use it in place of `bin/spice/src/commands/cloud/client.rs`. Use it in `tools/spidapter/src/commands/mod.rs` too.
+
+---
+
+what is a good PR description?
+
+---
+
+We need to add the image_tag  in `pub struct StdioArgs {` of spidapter CLI args.
+
+---
+
+[Request interrupted by user]
+
+---
+
+The new `pub fn with_timeout(mut self, timeout: Duration) -> Self {` should return an error if `.timeout` does not work (not return an empty client).
+
+---
+
+error: this method could have a `#[must_use]` attribute
+  --> crates/spice-cloud-client/src/client.rs:47:12
+   |
+47 |     pub fn new(base_url: &str) -> Self {
+   |            ^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#must_use_candidate
+   = note: `-D clippy::must-use-candidate` implied by `-D clippy::pedantic`
+   = help: to override `-D clippy::pedantic` add `#[allow(clippy::must_use_candidate)]`
+help: add the attribute
+   |
+47 ~     #[must_use] 
+48 ~     pub fn new(base_url: &str) -> Self {
+   |
+
+error: this method could have a `#[must_use]` attribute
+  --> crates/spice-cloud-client/src/client.rs:59:12
+   |
+59 |     pub fn default_url() -> Self {
+   |            ^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#must_use_candidate
+help: add the attribute
+   |
+59 ~     #[must_use] 
+60 ~     pub fn default_url() -> Self {
+   |
+
+error: this method could have a `#[must_use]` attribute
+  --> crates/spice-cloud-client/src/client.rs:84:12
+   |
+84 |     pub fn base_url(&self) -> &str {
+   |            ^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#must_use_candidate
+help: add the attribute
+   |
+84 ~     #[must_use] 
+85 ~     pub fn base_url(&self) -> &str {
+   |
+
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/spice-cloud-client/src/client.rs:396:5
+    |
+396 |     pub async fn set_secret(&self, app_id: i64, name: &str, value: &str) -> Result<Secret> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/spice-cloud-client/src/client.rs:416:5
+    |
+416 |     pub async fn delete_secret(&self, app_id: i64, name: &str) -> Result<()> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/spice-cloud-client/src/client.rs:434:5
+    |
+434 |     pub async fn get_api_keys(&self, app_id: i64) -> Result<ApiKeysResponse> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/spice-cloud-client/src/client.rs:448:5
+    |
+448 | /     pub async fn regenerate_api_key(
+449 | |         &self,
+450 | |         app_id: i64,
+451 | |         key_number: u8,
+452 | |     ) -> Result<RegenerateApiKeyResponse> {
+    | |_________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+    Checking vortex-buffer v0.1.0 (https://github.com/spiceai/vortex.git?rev=5093499e6f8da6e945acd1552d5bf424898e97d3#5093499e)
+    Checking tools v2.0.0-unstable (/home/runner/_work/spiceai/spiceai/crates/tools)
+error: this method could have a `#[must_use]` attribute
+  --> crates/spice-cloud-client/src/types.rs:42:12
+   |
+42 |     pub fn full_name(&self) -> String {
+   |            ^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#must_use_candidate
+help: add the attribute
+   |
+42 ~     #[must_use] 
+43 ~     pub fn full_name(&self) -> String {
+   |
+
+
+We should have an `expect(..` for `missing_errors_doc`
+
+---
+
+which part of the docker image is the image_tag
+
+---
+
+[Request interrupted by user]
+
+---
+
+Okay, i think you need to look into the POST v1/deployments code to figure out what docker image is used for me
+
+---
+
+Okay, i've updated the server side like this
+
+apps/api/app/v1/apps/[appId]/deployments/route.ts --- 1/2 --- TypeScript
+29 29 const CreateDeploymentSchema = z.object({
+30 30   // Optional overrides for this deployment
+31 31   image_tag: z.string().optional(),
+.. 32   image: z.string().optional(),
+32 33   replicas: z.number().min(1).max(10).optional(),
+33 34
+34 35   // Git context
+
+Can you update the management client and add it as a input flag in spidapter
+
+---
+
+Okay, we're changing again. Get rid of image from spidapter. There is new field in create_deployment. `updated_channel: z.enum([
+  'stable',
+  'preview',
+  'nightly',
+  'internal',
+]);

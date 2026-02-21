@@ -1,0 +1,34 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "f5ce118fa528",
+  "session_id": "2c036424-da60-4992-9f6a-16c8d0559801",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-18T20:35:17.441122Z",
+  "branch": "jeadie/26-02-18/accel",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/spidapter/build_docker.sh",
+    "tools/spidapter/src/args/mod.rs",
+    "tools/spidapter/src/commands/mod.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "c0013571f727",
+  "token_usage": {
+    "input_tokens": 9,
+    "cache_creation_tokens": 4172,
+    "cache_read_tokens": 147690,
+    "output_tokens": 305,
+    "api_call_count": 7
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-18T20:35:17.403454Z",
+    "agent_lines": 0,
+    "human_added": 0,
+    "human_modified": 17,
+    "human_removed": 13,
+    "total_committed": 0,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-jeadie-Github-spiceai/2c036424-da60-4992-9f6a-16c8d0559801.jsonl"
+}

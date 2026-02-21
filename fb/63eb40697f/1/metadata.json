@@ -1,0 +1,34 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fb63eb40697f",
+  "session_id": "a7a3b215-de93-4cc7-81a0-a370c7bf53e9",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-19T23:55:07.413741Z",
+  "branch": "jeadie/26-02-19/metrics-2",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "bin/spice/src/commands/cloud/mod.rs",
+    "crates/spice-cloud-client/src/types.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "0db8576dab5e",
+  "transcript_identifier_at_start": "82dc49c1-61ef-47d6-a715-c5da80bcbf31",
+  "token_usage": {
+    "input_tokens": 26,
+    "cache_creation_tokens": 28352,
+    "cache_read_tokens": 991558,
+    "output_tokens": 778,
+    "api_call_count": 24
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-19T23:55:07.224398Z",
+    "agent_lines": 29,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 29,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-jeadie-Github-spiceai/a7a3b215-de93-4cc7-81a0-a370c7bf53e9.jsonl"
+}

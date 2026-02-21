@@ -1,0 +1,32 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "e41839760b98",
+  "session_id": "ec15ec1b-8052-4bc7-a49f-deb6b4a2abaf",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-20T17:30:41.532437Z",
+  "branch": "spicebench",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "tools/spidapter/Cargo.toml",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "6e1e8512c260",
+  "transcript_identifier_at_start": "d4e2d757-202e-4524-83d3-c98a4b8fdcf1",
+  "token_usage": {
+    "input_tokens": 69,
+    "cache_creation_tokens": 127647,
+    "cache_read_tokens": 3100214,
+    "output_tokens": 5993,
+    "api_call_count": 55
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-20T17:30:41.093596Z",
+    "agent_lines": 109,
+    "human_added": 0,
+    "human_modified": 8,
+    "human_removed": 1,
+    "total_committed": 117,
+    "agent_percentage": 93.16239316239316
+  }
+}

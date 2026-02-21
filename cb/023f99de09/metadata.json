@@ -1,0 +1,27 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "cb023f99de09",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-20/spicepod",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "tools/spidapter/Cargo.toml",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/cb/023f99de09/0/metadata.json",
+      "transcript": "/cb/023f99de09/0/full.jsonl",
+      "context": "/cb/023f99de09/0/context.md",
+      "content_hash": "/cb/023f99de09/0/content_hash.txt",
+      "prompt": "/cb/023f99de09/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 40,
+    "cache_creation_tokens": 76268,
+    "cache_read_tokens": 1676523,
+    "output_tokens": 637,
+    "api_call_count": 36
+  }
+}

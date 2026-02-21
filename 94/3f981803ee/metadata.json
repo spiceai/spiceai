@@ -1,0 +1,83 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "943f981803ee",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-18/spidaptero-delete",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "tools/spidapter/src/args/append.rs",
+    "tools/spidapter/src/args/dataset.rs",
+    "tools/spidapter/src/args/dispatch.rs",
+    "tools/spidapter/src/args/evals.rs",
+    "tools/spidapter/src/args/mod.rs",
+    "tools/spidapter/src/args/search.rs",
+    "tools/spidapter/src/args/streaming.rs",
+    "tools/spidapter/src/args/text_to_sql.rs",
+    "tools/spidapter/src/commands/append/mod.rs",
+    "tools/spidapter/src/commands/bench/mod.rs",
+    "tools/spidapter/src/commands/data_consistency/mod.rs",
+    "tools/spidapter/src/commands/dispatch/mod.rs",
+    "tools/spidapter/src/commands/evals/mod.rs",
+    "tools/spidapter/src/commands/load/mod.rs",
+    "tools/spidapter/src/commands/mod.rs",
+    "tools/spidapter/src/commands/query/mod.rs",
+    "tools/spidapter/src/commands/search/mod.rs",
+    "tools/spidapter/src/commands/search/mteb_quora.rs",
+    "tools/spidapter/src/commands/streaming/datasets/customer.rs",
+    "tools/spidapter/src/commands/streaming/datasets/lineitem.rs",
+    "tools/spidapter/src/commands/streaming/datasets/mod.rs",
+    "tools/spidapter/src/commands/streaming/datasets/nation.rs",
+    "tools/spidapter/src/commands/streaming/datasets/orders.rs",
+    "tools/spidapter/src/commands/streaming/datasets/part.rs",
+    "tools/spidapter/src/commands/streaming/datasets/partsupp.rs",
+    "tools/spidapter/src/commands/streaming/datasets/region.rs",
+    "tools/spidapter/src/commands/streaming/datasets/supplier.rs",
+    "tools/spidapter/src/commands/streaming/dynamodb_dispatch.rs",
+    "tools/spidapter/src/commands/streaming/dynamodb_runner.rs",
+    "tools/spidapter/src/commands/streaming/mod.rs",
+    "tools/spidapter/src/commands/streaming/mutations.rs",
+    "tools/spidapter/src/commands/streaming/query_liveness.rs",
+    "tools/spidapter/src/commands/streaming/querysets.rs",
+    "tools/spidapter/src/commands/streaming/sources/dynamodb.rs",
+    "tools/spidapter/src/commands/streaming/sources/mod.rs",
+    "tools/spidapter/src/commands/streaming/traits.rs",
+    "tools/spidapter/src/commands/streaming/utils.rs",
+    "tools/spidapter/src/commands/streaming/verification.rs",
+    "tools/spidapter/src/commands/text_to_sql/mod.rs",
+    "tools/spidapter/src/commands/throughput/mod.rs",
+    "tools/spidapter/src/health.rs",
+    "tools/spidapter/src/main.rs",
+    "tools/spidapter/src/metrics.rs",
+    "tools/spidapter/src/spiced_metrics.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/94/3f981803ee/0/metadata.json",
+      "transcript": "/94/3f981803ee/0/full.jsonl",
+      "context": "/94/3f981803ee/0/context.md",
+      "content_hash": "/94/3f981803ee/0/content_hash.txt",
+      "prompt": "/94/3f981803ee/0/prompt.txt"
+    },
+    {
+      "metadata": "/94/3f981803ee/1/metadata.json",
+      "transcript": "/94/3f981803ee/1/full.jsonl",
+      "context": "/94/3f981803ee/1/context.md",
+      "content_hash": "/94/3f981803ee/1/content_hash.txt",
+      "prompt": "/94/3f981803ee/1/prompt.txt"
+    },
+    {
+      "metadata": "/94/3f981803ee/2/metadata.json",
+      "transcript": "/94/3f981803ee/2/full.jsonl",
+      "context": "/94/3f981803ee/2/context.md",
+      "content_hash": "/94/3f981803ee/2/content_hash.txt",
+      "prompt": "/94/3f981803ee/2/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 197,
+    "cache_creation_tokens": 1103698,
+    "cache_read_tokens": 17688575,
+    "output_tokens": 5210,
+    "api_call_count": 167
+  }
+}

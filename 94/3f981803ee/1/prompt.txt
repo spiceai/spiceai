@@ -1,0 +1,5 @@
+I only want `Commands::Stdio` in `tools/spidapter/src/args/mod.rs`. Remove unneeded commands, args, etc.
+
+---
+
+what about, for example, `tools/spidapter/src/args/append.rs`
