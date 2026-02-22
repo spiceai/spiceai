@@ -15,6 +15,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/duration-parse",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -64,6 +65,7 @@ members = [
     "tools/spicepodschema/",
     "tools/spiceschema",
     "tools/spicepod-validator",
+    "tools/spidapter",
     "tools/testoperator",
     "tools/parsley",
     "tools/pr-builds"
@@ -282,6 +284,8 @@ tiberius = { version = "0.12.3", default-features = false, features = [
 ] }
 tokenizers = "0.21.2"
 tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
     "rt-multi-thread",
     "signal",
     "macros",
