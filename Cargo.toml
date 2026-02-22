@@ -15,6 +15,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/duration-parse",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -64,6 +65,7 @@ members = [
     "tools/spicepodschema/",
     "tools/spiceschema",
     "tools/spicepod-validator",
+    "tools/spidapter",
     "tools/testoperator",
     "tools/parsley",
     "tools/pr-builds"
@@ -271,6 +273,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "3d
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "5cbdb2a84ba47de959a395777e721b4a2d3a172c", features = ["server"] } # branch: trunk
 sysinfo = "0.37.2"
 system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "523a2fdcbee64982e14db992c8811207d370d05c", features = ["server"] } # branch: trunk
 tantivy = "0.25.0"
@@ -282,6 +285,8 @@ tiberius = { version = "0.12.3", default-features = false, features = [
 ] }
 tokenizers = "0.21.2"
 tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
     "rt-multi-thread",
     "signal",
     "macros",
