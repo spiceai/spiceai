@@ -18187,6 +18187,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "spidapter"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "bollard",
+ "clap",
+ "duckdb",
+ "futures",
+ "hf-hub",
+ "itertools 0.14.0",
+ "rand 0.9.2",
+ "reqwest 0.12.24",
+ "runtime-secrets",
+ "serde",
+ "serde_json",
+ "spiceai",
+ "spicepod",
+ "system-adapter-protocol",
+ "test-framework",
+ "tokio",
+ "tokio-util",
+ "uuid 1.21.0",
+ "yaml",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18832,6 +18863,20 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "system-adapter-protocol"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/spicebench.git?rev=5cbdb2a84ba47de959a395777e721b4a2d3a172c#5cbdb2a84ba47de959a395777e721b4a2d3a172c"
+dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid 1.21.0",
 ]
 
 [[package]]
