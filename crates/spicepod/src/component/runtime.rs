@@ -280,10 +280,24 @@ impl Default for TelemetryConfig {
     }
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Flight {
     pub max_message_size: Option<String>,
+
+    /// Whether to enable rate limiting on Flight DoPut (write) requests.
+    /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
+    #[serde(default = "default_true")]
+    pub do_put_rate_limit_enabled: bool,
+}
+
+impl Default for Flight {
+    fn default() -> Self {
+        Self {
+            max_message_size: None,
+            do_put_rate_limit_enabled: true,
+        }
+    }
 }
 
 impl Flight {

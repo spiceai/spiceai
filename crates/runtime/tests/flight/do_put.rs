@@ -246,7 +246,7 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
+async fn test_flight_do_put_large_batch_slicing() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -258,24 +258,22 @@ async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
-            assert!(
-                // Simulate a normal batch, followed by a batch that exceeds the allowed number of rows, and then another normal batch.
-                write_record_batches(
-                    &mut client,
-                    vec![
-                        test_record_batch()?,
-                        large_test_record_batch()?,
-                        test_record_batch()?
-                    ]
-                    .into_iter()
-                )
-                .await
-                .is_err(),
-                "Expected an error but got a successful result"
-            );
+            // Simulate a normal batch, followed by a batch that exceeds the per-batch
+            // row limit (35,000 rows), and then another normal batch. The large batch
+            // should be automatically sliced rather than rejected.
+            write_record_batches(
+                &mut client,
+                vec![
+                    test_record_batch()?,
+                    large_test_record_batch()?,
+                    test_record_batch()?
+                ]
+                .into_iter()
+            )
+            .await?;
 
             let query = df
-                .query_builder("SELECT * from my_table")
+                .query_builder("SELECT count(*) AS row_count from my_table")
                 .build()
                 .run()
                 .await?;
@@ -283,7 +281,8 @@ async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
             let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
             let results_str =
                 arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-            insta::assert_snapshot!("max_rows_allowed_table_content", results_str);
+            // 3 rows (test_record_batch) + 35,000 rows (large_test_record_batch) + 3 rows (test_record_batch) = 35,006
+            insta::assert_snapshot!("large_batch_slicing_row_count", results_str);
 
             Ok(())
         })
