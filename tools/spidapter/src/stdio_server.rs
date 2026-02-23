@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
     SetupResponse, TeardownResponse,
@@ -53,11 +53,11 @@ struct SetupConfig {
 }
 
 impl SetupConfig {
-    fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> anyhow::Result<Self> {
-        Ok(Self {
+    fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Self {
+        Self {
             etl_region: metadata_string(metadata, "etl_region"),
             etl_endpoint: metadata_string(metadata, "etl_endpoint"),
-        })
+        }
     }
 }
 
@@ -106,8 +106,7 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
-        let setup_config = SetupConfig::from_metadata(&metadata)
-            .map_err(|e| format!("Invalid setup metadata: {e}"))?;
+        let setup_config = SetupConfig::from_metadata(&metadata);
 
         let state = provision_spice_cloud_app(
             run_id,
@@ -161,7 +160,7 @@ impl Handler for SpidapterHandler {
         } else {
             let avg_cpu = match pods
                 .iter()
-                .filter_map(|p| p.cpu_usage_percent.is_some().then(|| 1.0))
+                .filter_map(|p| p.cpu_usage_percent.is_some().then_some(1.0))
                 .sum::<f64>()
             {
                 0.0 => None,
@@ -170,7 +169,7 @@ impl Handler for SpidapterHandler {
 
             let total_memory = match pods
                 .iter()
-                .filter_map(|p| p.memory_usage_bytes.is_some().then(|| 1))
+                .filter_map(|p| p.memory_usage_bytes.is_some().then_some(1_u64))
                 .sum::<u64>()
             {
                 0 => None,
@@ -178,7 +177,7 @@ impl Handler for SpidapterHandler {
                     pods.iter()
                         .filter_map(|p| p.memory_usage_bytes)
                         .sum::<u64>()
-                        / n as u64,
+                        / n,
                 ),
             };
             ResourceMetrics {
@@ -389,7 +388,7 @@ mod tests {
             serde_json::Value::String("us-west-2".to_string()),
         )]);
 
-        let config = SetupConfig::from_metadata(&metadata).expect("metadata should parse");
+        let config = SetupConfig::from_metadata(&metadata);
         assert_eq!(config.etl_region.as_deref(), Some("us-west-2"));
     }
 
@@ -406,6 +405,9 @@ mod tests {
             DatasetConfig {
                 schema: schema.clone(),
                 location: Some("s3://bucket/path/my_table/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
             },
         )]);
 
@@ -438,6 +440,9 @@ mod tests {
             DatasetConfig {
                 schema: schema.clone(),
                 location: None,
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
             },
         )]);
 
