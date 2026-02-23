@@ -285,7 +285,7 @@ impl Default for TelemetryConfig {
 pub struct Flight {
     pub max_message_size: Option<String>,
 
-    /// Whether to enable rate limiting on Flight DoPut (write) requests.
+    /// Whether to enable rate limiting on Flight `DoPut` (write) requests.
     /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
     #[serde(default = "default_true")]
     pub do_put_rate_limit_enabled: bool,

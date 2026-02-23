@@ -364,7 +364,7 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
-    // Configure Flight DoPut rate limits from spicepod runtime.flight settings
+    // Configure Flight `DoPut` rate limits from spicepod runtime.flight settings
     let flight_config = runtime_config.and_then(|rt| rt.flight.clone());
     let rate_limits = {
         let mut limits = runtime::flight::RateLimits::default();
