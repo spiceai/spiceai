@@ -29,6 +29,7 @@ use arrow::array::RecordBatch;
 use duckdb::Connection;
 use test_framework::TestType;
 use test_framework::anyhow::{Context, Result};
+use test_framework::execution::FlightExecutor;
 use test_framework::metrics::{
     DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus,
 };
@@ -90,6 +91,14 @@ pub async fn run_verification(
         validation_data.len()
     );
 
+    // Create query executor for running queries against the spiced instance
+    let spice_client = spiced_instance
+        .spice_client(None, false)
+        .await
+        .context("Failed to create Flight client for query verification")?;
+    let executor: Box<dyn test_framework::execution::QueryExecutor> =
+        Box::new(FlightExecutor::new(Arc::new(spice_client)));
+
     // Create SpiceTest state with runtime-generated validation data
     let state = NotStarted::new()
         .with_parallel_count(1)
@@ -99,7 +108,8 @@ pub async fn run_verification(
         .with_scale_factor(scale_factor)
         .with_query_set_type(QuerySet::Tpch)
         .with_query_overrides(Some(QueryOverrides::DynamoDB))
-        .with_validation_data(validation_data);
+        .with_validation_data(validation_data)
+        .with_query_executor(executor);
 
     // Create and run SpiceTest (name differentiates snapshots per config)
     let test = SpiceTest::new(format!("streaming_{config_name}"), state)
