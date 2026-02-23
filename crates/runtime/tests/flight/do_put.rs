@@ -266,9 +266,9 @@ async fn test_flight_do_put_large_batch_slicing() -> Result<(), anyhow::Error> {
                 vec![
                     test_record_batch()?,
                     large_test_record_batch()?,
-                    test_record_batch()?
+                    test_record_batch()?,
                 ]
-                .into_iter()
+                .into_iter(),
             )
             .await?;
 

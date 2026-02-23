@@ -465,8 +465,14 @@ mod tests {
             .expect("spicepod should generate");
 
         // Cayenne catalog should be present
-        assert!(spicepod.contains("from: cayenne"), "missing cayenne catalog from");
-        assert!(spicepod.contains("name: cayenne"), "missing cayenne catalog name");
+        assert!(
+            spicepod.contains("from: cayenne"),
+            "missing cayenne catalog from"
+        );
+        assert!(
+            spicepod.contains("name: cayenne"),
+            "missing cayenne catalog name"
+        );
 
         // S3 dataset should be present without acceleration
         assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
@@ -474,9 +480,18 @@ mod tests {
         assert!(spicepod.contains("file_format: parquet"));
         assert!(spicepod.contains("s3_region: us-west-2"));
         assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
-        assert!(!spicepod.contains("engine: cayenne"), "should not have per-dataset acceleration");
-        assert!(!spicepod.contains("mode: file"), "should not have acceleration mode");
-        assert!(!spicepod.contains("refresh_mode:"), "should not have refresh_mode");
+        assert!(
+            !spicepod.contains("engine: cayenne"),
+            "should not have per-dataset acceleration"
+        );
+        assert!(
+            !spicepod.contains("mode: file"),
+            "should not have acceleration mode"
+        );
+        assert!(
+            !spicepod.contains("refresh_mode:"),
+            "should not have refresh_mode"
+        );
 
         // Telemetry should be disabled
         assert!(spicepod.contains("telemetry:"));
