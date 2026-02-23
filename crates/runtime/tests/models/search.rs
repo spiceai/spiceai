@@ -182,13 +182,13 @@ fn normalize_search_response(mut json: Value) -> String {
         // To avoid inconsistent snapshots when scores are equal (common when using RRF),
         // we also order based on primary key.
         matches.sort_by(|a, b| {
-            let Some(Value::Number(num_a)) = a.get("score") else {
+            let Some(Value::Number(num_a)) = a.get("_score") else {
                 return Ordering::Greater;
             };
             let Some(score_a) = num_a.as_f64() else {
                 return Ordering::Greater;
             };
-            let Some(Value::Number(num_b)) = b.get("score") else {
+            let Some(Value::Number(num_b)) = b.get("_score") else {
                 return Ordering::Less;
             };
             let Some(score_b) = num_b.as_f64() else {
@@ -212,13 +212,13 @@ fn normalize_search_response(mut json: Value) -> String {
         });
         for m in matches {
             if let Some(obj) = m.as_object_mut()
-                && let Some(Value::Number(n)) = obj.get("score")
+                && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
                 && let Some(truncated_score) =
                     serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
             // Keep 4 decimals
             {
-                obj.insert("score".to_string(), Value::Number(truncated_score));
+                obj.insert("_score".to_string(), Value::Number(truncated_score));
             }
         }
     }
@@ -523,25 +523,25 @@ async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_column_view_question_vector_search_sql_filters".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', question) where subject!='math' order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "multi_column_view_question_vector_search_sql_no_score".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "multi_column_view_question_vector_search_sql_random".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    "SELECT subject FROM vector_search(qs, 'second', question) order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "multi_column_view_question_vector_search_sql_vectors".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+                    "SELECT id, answer, array_length(question_embedding), round(_score, 1) FROM vector_search(qs, 'second', question) order by _score desc LIMIT 4;",
                 ),
             ),
         ]
@@ -613,25 +613,25 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_column_question_vector_search_sql_filters".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', question) where subject!='math' order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "multi_column_question_vector_search_sql_no_score".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "multi_column_question_vector_search_sql_random".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    "SELECT subject FROM vector_search(qs, 'second', question) order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "multi_column_question_vector_search_sql_vectors".to_string(),
                 SearchTestType::from_sql(
-                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+                    "SELECT id, answer, array_length(question_embedding), round(_score, 1) FROM vector_search(qs, 'second', question) order by _score desc LIMIT 4;",
                 ),
             ),
         ],
@@ -690,7 +690,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_embeddings_sql_vector_search",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, question, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
         ],
@@ -786,19 +786,19 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_single_column_sql_text_search",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_single_column_sql_vector_search",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, question, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_single_column_sql_vector_search_no_score",
                 SearchTestType::from_sql(
-                    "SELECT question FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT question FROM vector_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
         ],
@@ -859,25 +859,25 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_text_search",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_text_search_wrong_column",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second', question) order by _score desc LIMIT 4",
                 ),
             ).should_fail(),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_vector_search",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, question, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_vector_search_wrong_column",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
+                    "SELECT id, question, trunc(_score, 3) FROM vector_search(qs, 'second', answer) order by _score desc LIMIT 4",
                 ),
             ).should_fail(),
         ],
@@ -909,7 +909,7 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_wrong_column",
                 SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(_score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by fused_score desc LIMIT 4",
                 ),
             ).should_fail(),
             SearchTestCase::new(
@@ -990,31 +990,31 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "text_search_sql_text_search_basic",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_sql_text_search_projection",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_sql_text_search_filters",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) as _score FROM text_search(qs, 'secondary') where subject!='math' order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_sql_text_search_no_score",
                 SearchTestType::from_sql(
-                    "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_sql_text_search_random",
                 SearchTestType::from_sql(
-                    "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT subject FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
         ],
@@ -1076,31 +1076,31 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "text_search_view_sql_text_search_basic",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_view_sql_text_search_projection",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_view_sql_text_search_filters",
                 SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    "SELECT id, answer, trunc(_score, 3) as _score FROM text_search(qs, 'secondary') where subject!='math' order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_view_sql_text_search_no_score",
                 SearchTestType::from_sql(
-                    "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT id, answer FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "text_search_view_sql_text_search_random",
                 SearchTestType::from_sql(
-                    "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    "SELECT subject FROM text_search(qs, 'second') order by _score desc LIMIT 4",
                 ),
             ),
         ],
@@ -1130,7 +1130,7 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
             ),
             SearchTestCase::new(
                 "test_text_search_sql_where_rowid_is_search_column_basic",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4"),
             ),
         ]
     )
@@ -1192,7 +1192,7 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
             ),
             SearchTestCase::new(
                 "test_text_search_sql_where_rowid_is_search_column_composite_pk_basic",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4"),
             ),
         ],
     )
@@ -1248,32 +1248,32 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_answer",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second', answer) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, question, trunc(_score, 3) FROM text_search(qs, 'angles', question) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
                 "multi_text_column_sql_text_search_error_without_column",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc LIMIT 4"),
             ).should_fail(),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_projection",
-                SearchTestType::from_sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM text_search(qs, 'second', answer) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_filters",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, trunc(_score, 3) as _score FROM text_search(qs, 'secondary', answer) where subject!='math' order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_no_score",
-                SearchTestType::from_sql("SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer FROM text_search(qs, 'second', answer) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_random",
-                SearchTestType::from_sql("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT subject FROM text_search(qs, 'second', answer) order by _score desc LIMIT 4"),
             ),
         ],
     )
@@ -1334,23 +1334,23 @@ async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
             ),
             SearchTestCase::new(
                 "text_search_metadata_sql_text_search_answer",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second', answer) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "text_search_metadata_sql_text_search_answer_w_question",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, question, trunc(_score, 3) FROM text_search(qs, 'second', answer) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "text_search_metadata_sql_text_search_question",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, question, trunc(_score, 3) FROM text_search(qs, 'angles', question) order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "text_search_metadata_sql_text_search_subject_filter",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) where subject='math' order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, question, trunc(_score, 3) FROM text_search(qs, 'angles', question) where subject='math' order by _score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 "text_search_metadata_sql_text_search_subject_projection",
-                SearchTestType::from_sql("SELECT id, subject, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+                SearchTestType::from_sql("SELECT id, subject, trunc(_score, 3) FROM text_search(qs, 'angles', question) order by _score desc LIMIT 4"),
             ),
         ],
         true
@@ -1608,17 +1608,17 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
     let queries = vec![
         (
             "topk_with_fetch_4",
-            "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic') order by score desc LIMIT 4".to_string(),
+            "EXPLAIN SELECT cp_catalog_page_sk, _score FROM vector_search(spice.public.basic_embedding_search, 'basic') order by _score desc LIMIT 4".to_string(),
             vec!["SortExec: TopK(fetch=4)"]
         ),
         (
             "topk_with_fetch_2_from_parameter_ignores_other_limit",
-            "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) order by score desc LIMIT 4".to_string(),
+            "EXPLAIN SELECT cp_catalog_page_sk, _score FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) order by _score desc LIMIT 4".to_string(),
             vec!["SortExec: TopK(fetch=2)"]
         ),
         (
             "topk_with_fetch_3_from_parameter",
-            "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 3) order by score desc".to_string(),
+            "EXPLAIN SELECT cp_catalog_page_sk, _score FROM vector_search(spice.public.basic_embedding_search, 'basic', 3) order by _score desc".to_string(),
             vec!["SortExec: TopK(fetch=3)"]
         )
     ];

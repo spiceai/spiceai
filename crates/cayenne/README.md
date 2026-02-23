@@ -148,8 +148,11 @@ let table = CayenneTableProvider::create_table(catalog, options).await?;
 ### Insert Data
 
 ```rust
-// Insert record batches
-let rows_inserted = table.insert(record_batch_stream).await?;
+// Insert record batches via DataFusion's insert_into() API
+use datafusion::prelude::*;
+let ctx = SessionContext::new();
+ctx.register_table("my_table", Arc::new(table))?;
+ctx.sql("INSERT INTO my_table SELECT * FROM source_table").await?.collect().await?;
 ```
 
 ### Delete by Primary Key
@@ -281,9 +284,10 @@ let options = CreateTableOptions {
 
 let table = CayenneTableProvider::create_table(catalog.clone(), options).await?;
 
-// Insert data
+// Insert data via DataFusion's insert_into() API
 let batch = create_record_batch()?;
-table.insert(Box::pin(stream::once(async { Ok(batch) }))).await?;
+ctx.register_table("events", Arc::new(table))?;
+ctx.read_batch(batch)?.write_table("events", DataFrameWriteOptions::new()).await?;
 
 // Query (deletion vectors applied automatically)
 let ctx = SessionContext::new();

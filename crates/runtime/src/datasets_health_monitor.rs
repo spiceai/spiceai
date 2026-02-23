@@ -45,10 +45,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read the table. {source}"))]
+    #[snafu(display("Failed to read the dataset table for health check: {source}"))]
     UnableToGetTable { source: DataFusionError },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to query dataset health status: {source}"))]
     DataFusionQuery {
         source: crate::datafusion::query::Error,
     },

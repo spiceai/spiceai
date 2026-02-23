@@ -297,6 +297,11 @@ pub struct LoadTestArgs {
     /// Run until manually interrupted; disables duration-based stopping for the load phase
     #[arg(long)]
     pub(crate) run_until_stopped: bool,
+
+    /// API key for authenticating with an external spiced instance.
+    /// Only applicable when --spiced-path is a URL to an already-running instance.
+    #[arg(long)]
+    pub(crate) api_key: Option<String>,
 }
 
 /// Parse a duration string like "500ms", "2s", "1m" into a `Duration`

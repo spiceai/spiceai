@@ -339,6 +339,24 @@ impl CayenneTableProvider {
         &self.table_metadata.path
     }
 
+    /// Returns the table ID from the catalog.
+    #[must_use]
+    pub(crate) fn table_id(&self) -> i64 {
+        self.table_metadata.table_id
+    }
+
+    /// Returns a reference to the write lock for serializing insert operations.
+    #[must_use]
+    pub(crate) fn write_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.write_lock
+    }
+
+    /// Returns whether retention filters are configured for this table.
+    #[must_use]
+    pub(crate) fn has_retention_filters(&self) -> bool {
+        !self.retention_filters.is_empty()
+    }
+
     /// Returns the path to a snapshot directory for this table.
     #[must_use]
     pub(crate) fn snapshot_dir_path_for(&self, snapshot_id: &str) -> std::path::PathBuf {
@@ -1038,224 +1056,6 @@ impl CayenneTableProvider {
         &self.table_metadata
     }
 
-    /// Insert data from a record batch stream.
-    ///
-    /// This method writes data to the Vortex `ListingTable`. The actual file writing is
-    /// delegated to `DataFusion`'s `ListingTable` via `insert_into`, which uses `VortexSink`
-    /// to create Vortex files in the table directory.
-    ///
-    /// # Implementation Notes
-    ///
-    /// The insert operation is handled by the underlying `ListingTable`, which:
-    /// 1. Receives the record batch stream
-    /// 2. Writes Vortex files to the table directory
-    /// 3. Returns the number of rows written
-    ///
-    /// Note: Currently this doesn't create per-file virtual file entries in the Cayenne
-    /// catalog. In a future enhancement, we could track individual Vortex files as
-    /// separate `DataFile` entries by:
-    /// - Intercepting the `VortexSink` output to discover written files
-    /// - Creating unique subdirectories per "virtual file"
-    /// - Adding one `DataFile` entry per subdirectory to the catalog
-    ///
-    /// For now, the data is successfully written to the `ListingTable`'s directory and
-    /// will be readable on the next scan, even though we're not tracking individual
-    /// files in the Cayenne catalog metadata yet.
-    ///
-    /// # Size-Based File Chunking
-    ///
-    /// This method implements size-based chunking to control Vortex file sizes:
-    /// - Batches are accumulated until the target file size is reached
-    /// - Each chunk is written as a separate Vortex file in parallel
-    /// - Each file maintains proper statistics for `DataFusion` pushdown and pruning
-    ///
-    /// The target file size is configurable via `VortexConfig.target_vortex_file_size_mb`
-    /// and defaults to 128 MB.
-    ///
-    /// # Performance Optimizations
-    ///
-    /// - **Streaming**: Processes chunks as they're formed, avoiding buffering all data
-    /// - **Parallel writes**: Multiple chunks written concurrently with bounded parallelism
-    /// - **Zero-copy**: Reuses `RecordBatch` Arc references, no data copying
-    /// - **Pre-allocation**: Reserves capacity to minimize reallocations
-    ///
-    /// # Concurrency Safety
-    ///
-    /// This method uses an internal write lock to serialize insert operations on the same table.
-    /// Multiple concurrent `insert()` calls will block, ensuring that:
-    /// - Only one insert runs at a time per table
-    /// - All parallel chunk writes complete before the listing table is refreshed
-    /// - Retention filters are applied atomically after all writes
-    /// - Table statistics remain consistent
-    ///
-    /// **Within a single insert**, chunks are written in parallel with bounded concurrency
-    /// (configurable via `VortexConfig.upload_concurrency`, default 4) for optimal I/O throughput.
-    /// The serialization only applies across different `insert()` calls.
-    ///
-    /// This design ensures correctness while maintaining high performance for individual inserts.
-    /// If you need higher write concurrency, consider partitioning your data across multiple tables.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the data cannot be inserted.
-    pub(crate) async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
-        // Acquire write lock to serialize inserts and prevent concurrent write races.
-        // This ensures listing table refresh happens after all parallel chunk writes complete
-        // and retention filters are applied atomically.
-        let _write_guard = self.write_lock.lock().await;
-
-        // Check for pending deletions based on the deletion strategy.
-        //
-        // POSITION-BASED STRATEGY: No compaction needed on insert.
-        // Deletion vectors are tracked per-file (HashMap<file_path, RoaringBitmap>), so each
-        // file's deletion bitmap is independent. Adding new files doesn't affect existing
-        // deletion vectors - the new files simply have no entries in the deletion cache.
-        // Compaction would be wasteful here and can cause issues if retention filters
-        // re-run on the compacted data.
-        //
-        // PK-BASED STRATEGIES (Int64Pk, RowConverterBased): Use anti-deletions to avoid compaction.
-        // New data is written to a new snapshot with higher sequence number, ensuring proper
-        // Iceberg-style ordering where deletions only apply to earlier snapshots.
-        let has_pending_deletions = self.has_pending_deletions()?;
-
-        // For PK-based strategies with pending deletions, we need to write to a NEW snapshot
-        // with a higher sequence number. This ensures proper Iceberg-style ordering:
-        // - Deletions apply to snapshots with sequence <= delete_sequence
-        // - New data in snapshots with sequence > delete_sequence is visible
-        //
-        // We still need to run validate_on_conflict() on the incoming stream
-        // to handle upserts for PKs that already exist in the table. Without this,
-        // duplicate PKs would appear in query results.
-        //
-        // NOTE: This block only applies to PK-based strategies. PositionBased strategy
-        // doesn't need special handling - new files are simply added to the current snapshot
-        // and existing per-file deletion vectors remain valid.
-        if has_pending_deletions && !self.pk_deletion_strategy.is_position_based() {
-            let new_sequence = self
-                .catalog
-                .increment_sequence_number(self.table_metadata.table_id)
-                .await?;
-            tracing::info!(
-                "Table {} has pending PK-based deletions, inserting to new snapshot with seq={}",
-                self.table_metadata.table_name,
-                new_sequence
-            );
-
-            let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
-                self.prepare_stream_for_insert(stream).await?;
-
-            tracing::debug!(
-                "insert() with pending deletions: delete_specs={} files, deleted_pk_i64={} keys",
-                delete_specs.len(),
-                deleted_pk_i64.len()
-            );
-
-            // Write to new snapshot with the prepared (deduplicated) stream
-            let total_rows = self
-                .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
-                .await?;
-
-            // Update deletion caches for the upserted PKs
-            self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
-                .await?;
-
-            return Ok(total_rows);
-        }
-
-        let target_size_bytes = self.context.target_file_size_bytes();
-
-        // If a primary key is configured, enforce on_conflict behavior by materializing
-        // the incoming stream, validating keys, and preparing deletion vectors.
-        let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
-            self.prepare_stream_for_insert(stream).await?;
-
-        tracing::debug!(
-            "insert(): delete_specs={} files, deleted_pk_i64={} keys",
-            delete_specs.len(),
-            deleted_pk_i64.len()
-        );
-
-        // Process stream in chunks and write them in parallel with bounded concurrency
-        let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(prepared_stream, target_size_bytes)
-            .await?;
-
-        tracing::debug!(
-            "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
-            total_rows,
-            chunk_count
-        );
-
-        // Apply any deletion vectors generated by on_conflict handling before retention.
-        self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
-            .await?;
-
-        // Apply retention filters before refreshing the listing table so any rows matching the
-        // configured predicate are captured in deletion vector files within this refresh.
-        //
-        // ACID GUARANTEES: The write lock ensures atomicity:
-        // 1. All chunk writes complete before retention filters are evaluated
-        // 2. Retention filters are applied before the write lock is released
-        // 3. The listing table is refreshed atomically after retention
-        // 4. Other inserts are blocked until the entire operation completes
-        //
-        // This provides ACID semantics: either all data is written with retention applied,
-        // or the operation fails and nothing is visible. There is a small visibility window
-        // (milliseconds) between file write and retention filter application where newly
-        // written data is queryable before deletion vectors are created, but this window is
-        // bounded by the write lock and cannot be observed by other insert operations.
-        //
-        // This is the correct design for retention filters - they are table-wide predicates
-        // that must scan all data, not per-chunk predicates. Applying them atomically after
-        // the write completes ensures consistency without write amplification.
-        if !self.retention_filters.is_empty() {
-            match self.apply_retention_filters().await {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        tracing::info!(
-                            "Retention filters deleted {} row(s) for table {}",
-                            deleted,
-                            self.table_metadata.table_name
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Retention filters found no rows to delete for table {}",
-                            self.table_metadata.table_name
-                        );
-                    }
-                }
-                Err(err) => {
-                    return Err(CatalogError::InvalidOperation {
-                        message: "Failed to apply retention filters after insert.".to_string(),
-                        source: Box::new(err),
-                    });
-                }
-            }
-        }
-
-        // If sort_columns is configured, sort the data on disk after retention filters.
-        // This operates on the listing table data (the complete corpus after retention),
-        // ensuring optimal zone maps with non-overlapping min/max ranges.
-        // Sorting uses DataFusion's SortExec with:
-        // - Automatic disk spilling for datasets larger than available memory
-        // - Streaming external merge sort for efficient memory usage
-        // - SIMD-optimized kernels (NEON on arm64, AVX2/AVX-512 on amd64)
-        // - Configurable compression for spill files (zstd, lz4_frame, uncompressed)
-        if self.context.has_sort_columns() {
-            self.sort_and_rewrite_data(target_size_bytes).await?;
-        }
-
-        // Refresh the listing table to pick up new/rewritten files and update statistics.
-        // This ensures that query plans have access to up-to-date table statistics
-        // after the insert operation completes. The write lock ensures this refresh
-        // happens after all parallel chunk writes are complete and no other insert
-        // can interfere.
-        self.refresh_listing_table()?;
-
-        // Write lock is released here, allowing the next insert to proceed
-        Ok(total_rows)
-    }
-
     /// Insert data to a NEW snapshot with a specific sequence number.
     ///
     /// This is used when inserting while pending PK-based deletions exist.
@@ -1264,7 +1064,7 @@ impl CayenneTableProvider {
     /// - New data in this snapshot is visible (`new_snapshot_seq` > `delete_seq`)
     ///
     /// This achieves Iceberg-style sequence ordering without rewriting existing files.
-    async fn insert_to_new_snapshot_with_sequence(
+    pub(crate) async fn insert_to_new_snapshot_with_sequence(
         &self,
         stream: SendableRecordBatchStream,
         sequence_number: i64,
@@ -1363,7 +1163,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any chunk write fails.
-    async fn chunk_and_write_parallel(
+    pub(crate) async fn chunk_and_write_parallel(
         &self,
         mut stream: SendableRecordBatchStream,
         target_size_bytes: usize,
@@ -2160,7 +1960,7 @@ impl CayenneTableProvider {
     /// 3. Returns a prepared stream with conflicts resolved and deletion specs
     ///
     /// If no primary key is configured, returns the stream unchanged with empty deletion specs.
-    async fn prepare_stream_for_insert(
+    pub(crate) async fn prepare_stream_for_insert(
         &self,
         stream: SendableRecordBatchStream,
     ) -> CatalogResult<(
@@ -2461,7 +2261,7 @@ impl CayenneTableProvider {
     ///
     /// Following Iceberg's sequence-based ordering model where deletes are tracked by
     /// PK value + sequence number for proper ordering of concurrent operations.
-    async fn apply_on_conflict_deletions(
+    pub(crate) async fn apply_on_conflict_deletions(
         &self,
         delete_specs: HashMap<i64, Vec<i64>>,
         deleted_pk_i64: Vec<i64>,
@@ -2749,7 +2549,10 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if reading, sorting, or rewriting fails.
-    async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> CatalogResult<()> {
+    pub(crate) async fn sort_and_rewrite_data(
+        &self,
+        target_size_bytes: usize,
+    ) -> CatalogResult<()> {
         tracing::info!(
             "Sorting and rewriting data for table {} by columns {:?}",
             self.table_metadata.table_name,
@@ -2973,7 +2776,7 @@ impl CayenneTableProvider {
         Ok(Arc::new(filter_exec))
     }
 
-    async fn apply_retention_filters(&self) -> CatalogResult<u64> {
+    pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
         use data_components::delete::DeletionSink;
 
         if self.retention_filters.is_empty() {
@@ -3291,7 +3094,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the deletion cache lock is poisoned.
-    fn has_pending_deletions(&self) -> CatalogResult<bool> {
+    pub(crate) fn has_pending_deletions(&self) -> CatalogResult<bool> {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::PositionBased {
                 cached_deleted_row_ids,
@@ -3327,6 +3130,12 @@ impl CayenneTableProvider {
                 Ok(!guard.is_empty())
             }
         }
+    }
+
+    /// Returns a reference to the primary key deletion strategy and its caches.
+    #[must_use]
+    pub(crate) fn pk_deletion_strategy(&self) -> &PkDeletionStrategyWithCache {
+        &self.pk_deletion_strategy
     }
 
     /// Clear all cached deletion vectors and insert records.
@@ -3515,7 +3324,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be refreshed.
-    fn refresh_listing_table(&self) -> CatalogResult<()> {
+    pub(crate) fn refresh_listing_table(&self) -> CatalogResult<()> {
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id()?;
@@ -4454,24 +4263,9 @@ impl TableProvider for CayenneTableProvider {
             );
         }
 
-        // For overwrite mode, delegate directly to CayenneDataSink which handles:
-        // - Creating a new snapshot
-        // - Memory-bounded writes via chunk_and_write_parallel_to_snapshot
-        // - Catalog commit and state updates AFTER the data is written
-        // - Old snapshot cleanup
-        if overwrite == InsertOp::Overwrite {
-            let sink = Arc::new(CayenneDataSink::new(
-                self.clone_for_write(),
-                InsertOp::Overwrite,
-                Arc::clone(&self.table_metadata.schema),
-                Arc::clone(&self.context),
-            ));
-            return Ok(Arc::new(DataSinkExec::new(input, sink, None)));
-        }
-
-        // For regular appends, use the existing snapshot and listing table
-        // Ensure the snapshot directory exists for local paths (S3 creates paths on write)
-        if !self.table_metadata.path.starts_with("s3://") {
+        // For appends on local paths, ensure the snapshot directory exists before writing.
+        // S3 creates paths on write automatically so this is only needed for local storage.
+        if overwrite != InsertOp::Overwrite && !is_s3 {
             let current_snapshot = self.get_current_snapshot_id().map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "Failed to get current snapshot ID: {e}"
@@ -4485,187 +4279,18 @@ impl TableProvider for CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        if is_s3 {
-            tracing::info!(
-                "Preparing CayenneDataSink for S3 write to {}",
-                self.table_metadata.table_name
-            );
-        }
-
-        // If a primary key is configured, materialize the input and apply on-conflict handling.
-        let final_input = if let Some(pk_indices) = self.primary_key_indices().map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to get primary key indices: {e}"
-            ))
-        })? {
-            // Execute the input plan to get the data stream
-            let task_ctx = state.task_ctx();
-            let input_stream = input.execute(0, Arc::clone(&task_ctx)).map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to execute input plan for on-conflict handling: {e}"
-                ))
-            })?;
-
-            // Build converter and load existing keys
-            let converter = self.build_pk_converter(&pk_indices).map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to build PK converter: {e}"
-                ))
-            })?;
-            let mut existing_keys = self
-                .load_existing_keyset(&pk_indices, &converter)
-                .await
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to load existing keyset: {e}"
-                    ))
-                })?;
-
-            // Validate on-conflict and get filtered batches + deletion specs
-            let validation_result = self
-                .validate_on_conflict(input_stream, &pk_indices, &converter, &mut existing_keys)
-                .await
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to validate on-conflict: {e}"
-                    ))
-                })?;
-
-            // Apply deletion vectors for upserted rows
-            let has_on_conflict_deletions = !validation_result.delete_specs.is_empty();
-            if has_on_conflict_deletions {
-                self.apply_on_conflict_deletions(
-                    validation_result.delete_specs,
-                    validation_result.deleted_pk_i64,
-                    validation_result.deleted_row_keys,
-                )
-                .await
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to apply on-conflict deletions: {e}"
-                    ))
-                })?;
-            }
-
-            // Create new input from validated batches
-            if validation_result.filtered_batches.is_empty() {
-                // Nothing to insert after on-conflict filtering
-                // Return a plan that returns 0 rows with the count schema expected by DataFusion
-                let count_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                    arrow::datatypes::Field::new(
-                        "count",
-                        arrow::datatypes::DataType::UInt64,
-                        false,
-                    ),
-                ]));
-                return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
-                    count_schema,
-                )));
-            }
-
-            // If there were on-conflict deletions, write to a NEW snapshot that's protected
-            // from those deletions. Otherwise, write to the main snapshot.
-            if has_on_conflict_deletions {
-                // Use the streaming insert to write to a new snapshot with proper sequence handling
-                let schema = validation_result
-                    .filtered_batches
-                    .first()
-                    .map(RecordBatch::schema)
-                    .ok_or_else(|| {
-                        datafusion_common::DataFusionError::Execution(
-                            "No validated batches after applying on-conflict deletions".to_string(),
-                        )
-                    })?;
-                let batch_stream =
-                    futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok));
-                let validated_stream =
-                    RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-                // Get a sequence number higher than the delete sequence
-                let insert_sequence = self
-                    .catalog
-                    .increment_sequence_number(self.table_metadata.table_id)
-                    .await
-                    .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to get insert sequence: {e}"
-                        ))
-                    })?;
-
-                // Write to a new snapshot
-                let _rows_written = self
-                    .insert_to_new_snapshot_with_sequence(
-                        Box::pin(validated_stream),
-                        insert_sequence,
-                    )
-                    .await
-                    .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to insert to new snapshot: {e}"
-                        ))
-                    })?;
-
-                // Refresh the listing table to include the new snapshot
-                self.refresh_listing_table().map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to refresh listing table: {e}"
-                    ))
-                })?;
-
-                // Return an empty plan with the count schema expected by DataFusion
-                // (we already did the insert, so return 0 as no more rows to insert)
-                let count_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                    arrow::datatypes::Field::new(
-                        "count",
-                        arrow::datatypes::DataType::UInt64,
-                        false,
-                    ),
-                ]));
-                return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
-                    count_schema,
-                )));
-            }
-
-            let schema = validation_result
-                .filtered_batches
-                .first()
-                .map(RecordBatch::schema)
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(
-                        "No validated batches for on-conflict handling".to_string(),
-                    )
-                })?;
-            let batch_stream =
-                futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok));
-            let validated_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-            Arc::new(StreamingExec::new(schema, Box::pin(validated_stream)))
-                as Arc<dyn ExecutionPlan>
-        } else {
-            // No primary key, use input as-is
-            input
-        };
-
-        // Use CayenneDataSink with DataSinkExec for memory-bounded writes:
-        // - Chunked writes via chunk_and_write_parallel
-        // - Retention filter application
-        // - Automatic listing table refresh
+        // Delegate entirely to CayenneDataSink which handles:
+        // - Overwrite: new snapshot creation, catalog commit, state updates, cleanup
+        // - Append: write lock, PK validation, on-conflict deletions, new snapshot
+        //   when needed, retention filters, sort-and-rewrite, listing table refresh
         let sink = Arc::new(CayenneDataSink::new(
             self.clone_for_write(),
-            InsertOp::Append,
+            overwrite,
             Arc::clone(&self.table_metadata.schema),
             Arc::clone(&self.context),
         ));
-        let result = Arc::new(DataSinkExec::new(final_input, sink, None));
 
-        if is_s3 {
-            tracing::info!(
-                "CayenneDataSink created for {} (S3 write plan)",
-                self.table_metadata.table_name
-            );
-        }
-
-        Ok(result)
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 }
 

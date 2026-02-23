@@ -7,21 +7,21 @@ snapshot_kind: text
   {
     "id": 938,
     "answer": "The presence of fibrinolysin in the reagents can partially or totally dissolve the clot, leading to erroneous results.",
-    "score": 0.668
+    "_score": 0.668
   },
   {
     "id": 1279,
     "answer": "$\\boxed{\\text{Pyruvate}}$ is not an intermediate of the TCA cycle. It is converted to acetyl-CoA, which then enters the cycle.",
-    "score": 0.667
+    "_score": 0.667
   },
   {
     "id": 1289,
     "answer": "$\\boxed{\\text{(a) pressure}}$ (Intensive properties, like pressure, do not depend on the size or mass of the system.)",
-    "score": 0.654
+    "_score": 0.654
   },
   {
     "id": 446,
     "answer": "Infection is acquired by ingestion of the spores, which transmit the sporoplasm through the tubules into enterocytes.",
-    "score": 0.647
+    "_score": 0.647
   }
 ]

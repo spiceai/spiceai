@@ -45,15 +45,17 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to scan DynamoDB table: {source}"))]
     ScanError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Table does not exist: {table_name}"))]
+    #[snafu(display("DynamoDB table '{table_name}' does not exist"))]
     TableDoesNotExist { table_name: Arc<str> },
 
-    #[snafu(display("Table status is not active"))]
+    #[snafu(display(
+        "DynamoDB table is not in 'ACTIVE' status. Verify the table status and try again."
+    ))]
     TableStatusIsNotActive,
 
     #[snafu(display("Failed to infer schema: {source}"))]
@@ -78,7 +80,7 @@ pub enum Error {
     ))]
     MaxRecursionDepthExceeded { max_depth: usize },
 
-    #[snafu(display("Table has no partition key"))]
+    #[snafu(display("DynamoDB table has no partition key defined"))]
     MissingPartitionKey,
 
     #[snafu(display("Failed to initialize DynamoDB Stream checkpoint: {source}"))]

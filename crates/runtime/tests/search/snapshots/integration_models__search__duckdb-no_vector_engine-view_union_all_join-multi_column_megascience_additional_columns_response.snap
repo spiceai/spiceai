@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.01,
       "data": {
         "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
@@ -17,10 +18,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 468
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
@@ -32,10 +33,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 361
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "How many groups of 2 are in 14?"
       },
@@ -47,10 +48,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 462
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -62,8 +63,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      },
-      "score": 0.01
+      }
     }
   ]
 }

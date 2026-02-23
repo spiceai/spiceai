@@ -16,7 +16,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 863
       },
-      "score": 0.93
+      "_score": 0.93
     },
     {
       "dataset": "qs",
@@ -28,7 +28,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 6
       },
-      "score": 0.9
+      "_score": 0.9
     }
   ]
 }

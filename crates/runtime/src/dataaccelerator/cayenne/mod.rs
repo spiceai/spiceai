@@ -95,7 +95,7 @@ pub enum Error {
     ))]
     PartitionByRequired,
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Cayenne S3 acceleration error: {source}"))]
     S3Error { source: s3::Error },
 }
 
@@ -829,10 +829,6 @@ impl DataAccelerator for CayenneAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::warn!(
-            "Cayenne data accelerator (Beta) is in preview and is not recommended for production."
-        );
-
         if !source.is_file_accelerated() {
             return Err(Box::new(Error::InvalidConfiguration {
                 detail: Arc::from(
@@ -1398,7 +1394,6 @@ impl PartitionCreator for CayennePartitionCreator {
         std::fs::create_dir_all(&partition_dir)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
         let partition_column_names = self.partition_column_labels();
 
         // Create composite key for table naming (slash-separated values)

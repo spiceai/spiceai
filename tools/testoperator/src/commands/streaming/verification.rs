@@ -97,8 +97,7 @@ pub async fn run_verification(
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(false)
         .with_explain_plan_snapshot()
-        .start()
-        .await?
+        .start()?
         .wait()
         .await?;
 

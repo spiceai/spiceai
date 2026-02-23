@@ -26,16 +26,16 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to list all files when inferring partitions: {source}"))]
+    #[snafu(display("Failed to list files when inferring data partitions: {source}"))]
     ListAllFiles { source: DataFusionError },
 
-    #[snafu(display("Found mixed partition values: {sorted_diff:?}"))]
+    #[snafu(display("Inconsistent partition columns found across files: {sorted_diff:?}"))]
     MixedPartitionValues { sorted_diff: [Vec<String>; 2] },
 
-    #[snafu(display("Prefix: {prefix} does not contain file: {file_path}"))]
+    #[snafu(display("File path '{file_path}' is not under the expected prefix '{prefix}'"))]
     FileNotContainedInPrefix { prefix: Path, file_path: Path },
 
-    #[snafu(display("Could not get object store: {source}"))]
+    #[snafu(display("Failed to access the object store: {source}"))]
     ObjectStore { source: DataFusionError },
 }
 

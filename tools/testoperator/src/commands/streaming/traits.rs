@@ -145,7 +145,7 @@ pub trait DynamoDBStreamingSource: StreamingSource {
         run_id: &str,
         config_name: &str,
         snapshot_config: &SnapshotConfig,
-    ) -> SpicepodDefinition;
+    ) -> Result<SpicepodDefinition>;
 
     /// Transform spicepod for benchmark phase.
     ///
@@ -159,5 +159,5 @@ pub trait DynamoDBStreamingSource: StreamingSource {
         run_id: &str,
         config_name: &str,
         snapshot_config: &SnapshotConfig,
-    ) -> SpicepodDefinition;
+    ) -> Result<SpicepodDefinition>;
 }

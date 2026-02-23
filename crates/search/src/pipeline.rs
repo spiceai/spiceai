@@ -48,7 +48,7 @@ pub enum Error {
     CandidateAggregationError { source: aggregation::Error },
 
     #[snafu(display(
-        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: {source}"
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {source}"
     ))]
     SearchRequestConstructionError { source: DataFusionError },
 

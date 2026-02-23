@@ -355,7 +355,7 @@ impl RefreshTask {
         let mut spans = vec![];
         let mut parent_span = Span::current();
         for dataset_name in self.get_dataset_names().await {
-            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "acceleration_refresh", input = %dataset_name);
             spans.push(span.clone());
             parent_span = span;
         }
@@ -686,6 +686,12 @@ impl RefreshTask {
                                 tracing.on_new_batch_received(&batch);
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
+
+                                // Record incremental ingestion counters per batch.
+                                let labels = [KeyValue::new("dataset", ds_name.clone())];
+                                metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+                                metrics::REFRESH_BYTES_WRITTEN
+                                    .add(batch.get_array_memory_size() as u64, &labels);
 
                                 // Check memory usage after processing each batch
                                 if let Some(ref monitor) = resource_monitor {

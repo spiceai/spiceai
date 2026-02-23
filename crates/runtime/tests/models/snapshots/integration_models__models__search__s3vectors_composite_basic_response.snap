@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.54,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -16,10 +16,10 @@ snapshot_kind: text
       "primary_key": {
         "id": 468,
         "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
-      },
-      "score": 0.54
+      }
     },
     {
+      "_score": 0.53,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -29,10 +29,10 @@ snapshot_kind: text
       "primary_key": {
         "id": 1277,
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
-      },
-      "score": 0.53
+      }
     },
     {
+      "_score": 0.53,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -42,10 +42,10 @@ snapshot_kind: text
       "primary_key": {
         "id": 189,
         "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-      },
-      "score": 0.53
+      }
     },
     {
+      "_score": 0.52,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -55,8 +55,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 948,
         "question": "What is the fifth root of 32?"
-      },
-      "score": 0.52
+      }
     }
   ]
 }

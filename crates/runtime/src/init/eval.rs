@@ -71,8 +71,7 @@ impl Runtime {
     }
 
     pub(crate) async fn verify_evals(&self) {
-        let app_lock_opt = self.app.read().await;
-        let Some(app_lock) = app_lock_opt.as_deref() else {
+        let Some(app_lock) = self.read_app().await else {
             return;
         };
         for eval in &app_lock.evals {

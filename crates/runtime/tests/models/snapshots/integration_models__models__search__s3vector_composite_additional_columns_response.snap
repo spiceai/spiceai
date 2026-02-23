@@ -20,7 +20,7 @@ snapshot_kind: text
         "id": 863,
         "question": "What is created by making a choice?"
       },
-      "score": 0.89
+      "_score": 0.89
     },
     {
       "data": {
@@ -36,7 +36,7 @@ snapshot_kind: text
         "id": 1316,
         "question": "Write down in simplest form \\( 5a - 2b - 3a + 6b \\)."
       },
-      "score": 0.84
+      "_score": 0.84
     },
     {
       "data": {
@@ -52,7 +52,7 @@ snapshot_kind: text
         "id": 590,
         "question": "Make \\( x \\) the subject of the formula \\( x - A = E \\)."
       },
-      "score": 0.83
+      "_score": 0.83
     },
     {
       "data": {
@@ -68,7 +68,7 @@ snapshot_kind: text
         "id": 6,
         "question": "<refined question>"
       },
-      "score": 0.83
+      "_score": 0.83
     }
   ]
 }

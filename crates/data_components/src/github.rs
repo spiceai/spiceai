@@ -43,10 +43,10 @@ use serde::Deserialize;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error executing query. {source}"))]
+    #[snafu(display("Failed to process GitHub API response: {source}"))]
     UnableToConstructRecordBatchError { source: arrow::error::ArrowError },
 
-    #[snafu(display("Error executing query. {source}"))]
+    #[snafu(display("GitHub API request failed: {source}"))]
     GithubApiError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

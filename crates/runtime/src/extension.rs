@@ -24,17 +24,17 @@ pub type ExtensionManifest = ExtensionComponent;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to initialize extension: {source}"))]
+    #[snafu(display("Failed to initialize extension: {source}"))]
     UnableToInitializeExtension {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to start extension: {source}"))]
+    #[snafu(display("Failed to start extension: {source}"))]
     UnableToStartExtension {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to get catalog provider: {source}"))]
+    #[snafu(display("Failed to get catalog from extension: {source}"))]
     UnableToGetCatalogProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

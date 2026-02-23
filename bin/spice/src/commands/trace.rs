@@ -29,7 +29,7 @@ use std::collections::HashMap;
 const SUPPORTED_TRACE_TASKS: &[&str] = &[
     "ai",
     "ai_chat",
-    "accelerated_refresh",
+    "acceleration_refresh",
     "ai_completion",
     "eval_run",
     "nsql",

@@ -5,18 +5,18 @@ description: "SELECT id, trunc(score, 3) as score  FROM vector_search(qs, 'secon
 [
   {
     "id": 468,
-    "score": 0.77
+    "_score": 0.77
   },
   {
     "id": 1277,
-    "score": 0.769
+    "_score": 0.769
   },
   {
     "id": 189,
-    "score": 0.769
+    "_score": 0.769
   },
   {
     "id": 948,
-    "score": 0.765
+    "_score": 0.765
   }
 ]

@@ -183,6 +183,40 @@ pub(crate) async fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create the appropriate query executor based on command-line arguments
+///
+/// This helper function centralizes the executor creation logic to avoid duplication
+/// across different test commands (bench, throughput, load, query).
+pub(crate) async fn create_query_executor(
+    args: &DatasetTestArgs,
+    spiced_instance: &test_framework::spiced::SpicedInstance,
+) -> anyhow::Result<Box<dyn test_framework::execution::QueryExecutor>> {
+    let executor: Box<dyn test_framework::execution::QueryExecutor> = if args.distributed {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::DistributedExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else if args.http_clients {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::HttpExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else {
+        let spice_client = spiced_instance
+            .spice_client(None, args.disable_caching)
+            .await?;
+        Box::new(test_framework::execution::FlightExecutor::new(
+            std::sync::Arc::new(spice_client),
+        ))
+    };
+
+    Ok(executor)
+}
+
 #[macro_export]
 macro_rules! wait_test_and_memory {
     ($test:expr, $memory_token:expr, $memory_readings:expr) => {
