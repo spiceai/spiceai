@@ -73,8 +73,14 @@ done
 echo ""
 
 # Create logs directory
-LOG_DIR="./cluster_logs"
+LOG_DIR="$(pwd)/cluster_logs"
 mkdir -p ${LOG_DIR}
+
+# Create distributed working directory
+DISTRIBUTED_DIR="$(pwd)/.distributed"
+mkdir -p ${DISTRIBUTED_DIR}
+
+PROJECT_DIR="$(pwd)"
 
 # Array to store PIDs
 SCHEDULER_PID=""
@@ -88,6 +94,10 @@ start_scheduler() {
     echo "  Node Port: ${SCHEDULER_NODE_PORT}"
 
     if [ "$MODE" = "background" ]; then
+        local workdir="${DISTRIBUTED_DIR}/scheduler"
+        mkdir -p "${workdir}"
+        
+        pushd "${workdir}" > /dev/null
         ~/.spice/bin/spiced --role scheduler \
           --node-bind-address 127.0.0.1:${SCHEDULER_NODE_PORT} \
           --node-advertise-address 127.0.0.1:${SCHEDULER_NODE_PORT} \
@@ -96,9 +106,11 @@ start_scheduler() {
           --node-mtls-ca-certificate-file ~/.spice/pki/ca.crt \
           --node-mtls-certificate-file ~/.spice/pki/scheduler1.crt \
           --node-mtls-key-file ~/.spice/pki/scheduler1.key \
+          "${PROJECT_DIR}" \
           > ${LOG_DIR}/scheduler.log 2>&1 &
-
         SCHEDULER_PID=$!
+        echo $SCHEDULER_PID > pid
+        popd > /dev/null
         echo "  PID: ${SCHEDULER_PID}"
         echo "  Log: ${LOG_DIR}/scheduler.log"
     else
@@ -137,6 +149,10 @@ start_executor() {
     echo "  Connecting to scheduler: ${SCHEDULER_ADDRESS}"
 
     if [ "$MODE" = "background" ]; then
+        local workdir="${DISTRIBUTED_DIR}/${executor_name}"
+        mkdir -p "${workdir}"
+
+        pushd "${workdir}" > /dev/null
         ~/.spice/bin/spiced --role executor \
           --http 127.0.0.1:${http_port} \
           --scheduler-address ${SCHEDULER_ADDRESS} \
@@ -145,9 +161,11 @@ start_executor() {
           --node-mtls-key-file ~/.spice/pki/${executor_name}.key \
           --node-bind-address 127.0.0.1:${node_port} \
           --node-advertise-address 127.0.0.1:${node_port} \
+          "${PROJECT_DIR}" \
           > ${LOG_DIR}/${executor_name}.log 2>&1 &
-
         local pid=$!
+        echo $pid > pid
+        popd > /dev/null
         EXECUTOR_PIDS+=($pid)
         echo "  PID: ${pid}"
         echo "  Log: ${LOG_DIR}/${executor_name}.log"

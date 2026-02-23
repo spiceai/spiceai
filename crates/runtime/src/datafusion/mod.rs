@@ -114,10 +114,12 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+pub mod composed_catalog;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
 pub mod flight_session_extension;
+pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
@@ -265,6 +267,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[snafu(display("Unable to acquire lock for DDL-enabled catalogs"))]
+    UnableToLockDdlEnabledCatalogs {},
+
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
@@ -396,6 +401,8 @@ pub struct DataFusion {
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     writable_catalogs: RwLock<HashSet<String>>,
+    /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
+    ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
@@ -542,14 +549,56 @@ impl DataFusion {
                 .await
                 .insert(name.to_string(), Arc::new(deferred_catalog.clone()));
         } else {
-            self.ctx.register_catalog(name, catalog);
+            let catalog_to_register = if name == SPICE_DEFAULT_CATALOG {
+                // When overriding the default catalog, preserve internal schemas
+                self.compose_with_internal_schemas(catalog)
+            } else {
+                catalog
+            };
 
-            if matches!(access, AccessMode::ReadWrite) {
+            self.ctx.register_catalog(name, catalog_to_register);
+
+            if access.allows_ddl() {
+                self.mark_catalog_ddl_enabled(name)?;
+            } else if access.allows_write() {
                 self.mark_catalog_writable(name)?;
             }
         }
 
         Ok(())
+    }
+
+    /// When an external catalog replaces the default `spice` catalog, extract the
+    /// internal schemas (`runtime`, `metadata`, `eval`, `scp`) from the current
+    /// default catalog and wrap the external catalog in a [`ComposedCatalogProvider`]
+    /// that preserves those internal schemas.
+    fn compose_with_internal_schemas(
+        &self,
+        external: Arc<dyn CatalogProvider>,
+    ) -> Arc<dyn CatalogProvider> {
+        use composed_catalog::ComposedCatalogProvider;
+        use std::collections::HashMap;
+
+        let internal_schema_names = [
+            SPICE_RUNTIME_SCHEMA,
+            SPICE_METADATA_SCHEMA,
+            SPICE_SCP_SCHEMA,
+            #[cfg(feature = "models")]
+            SPICE_EVAL_SCHEMA,
+        ];
+
+        let mut internal_schemas: HashMap<String, Arc<dyn datafusion::catalog::SchemaProvider>> =
+            HashMap::new();
+
+        if let Some(current_catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
+            for schema_name in &internal_schema_names {
+                if let Some(schema) = current_catalog.schema(schema_name) {
+                    internal_schemas.insert((*schema_name).to_string(), schema);
+                }
+            }
+        }
+
+        Arc::new(ComposedCatalogProvider::new(external, internal_schemas))
     }
 
     // Returns a Notify if the table supports notifying the runtime when the table is ready.
@@ -633,7 +682,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_access_mode, AccessMode::ReadWrite) {
+        if dataset_access_mode.allows_write() {
             self.mark_dataset_writable(&dataset_table_ref)?;
         }
 
@@ -658,10 +707,44 @@ impl DataFusion {
         }
     }
 
+    /// Check if a table reference belongs to a writable catalog.
+    /// Handles both explicit catalog names and bare names (defaults to `SPICE_DEFAULT_CATALOG`).
+    #[must_use]
+    pub fn is_path_catalog_writable(&self, table_reference: &TableReference) -> bool {
+        let catalog = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        self.is_catalog_writable(catalog)
+    }
+
     pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write' is enabled for catalog {catalog_name}. This feature is currently in preview."
         );
+        self.writable_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    /// Returns true if the catalog allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
+    #[must_use]
+    pub fn is_catalog_ddl_enabled(&self, catalog_name: &str) -> bool {
+        if let Ok(ddl_catalogs) = self.ddl_enabled_catalogs.read() {
+            ddl_catalogs.contains(catalog_name)
+        } else {
+            false
+        }
+    }
+
+    /// Marks a catalog as DDL-enabled, allowing CREATE TABLE, DROP TABLE, etc. operations.
+    pub fn mark_catalog_ddl_enabled(&self, catalog_name: &str) -> Result<()> {
+        tracing::warn!(
+            "Access mode 'read_write_create' is enabled for catalog {catalog_name}. DDL operations are allowed. This feature is currently in preview."
+        );
+        self.ddl_enabled_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
+            .insert(catalog_name.to_string());
         self.writable_catalogs
             .write()
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
@@ -791,7 +874,9 @@ impl DataFusion {
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
-                if matches!(access, AccessMode::ReadWrite) {
+                if access.allows_ddl() {
+                    self.mark_catalog_ddl_enabled(name)?;
+                } else if access.allows_write() {
                     self.mark_catalog_writable(name)?;
                 }
             }
@@ -868,7 +953,7 @@ impl DataFusion {
         table_reference: &TableReference,
         data_update: DataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(table_reference) {
+        if !self.is_writable(table_reference) && !self.is_path_catalog_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -926,7 +1011,7 @@ impl DataFusion {
         table_reference: &TableReference,
         streaming_update: StreamingDataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(table_reference) {
+        if !self.is_writable(table_reference) && !self.is_path_catalog_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -1054,7 +1139,7 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access() == AccessMode::ReadWrite && !has_on_conflict;
+        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -1650,7 +1735,7 @@ impl DataFusion {
 
         let source_table_provider = match dataset.access() {
             AccessMode::Read => federated_table_provider,
-            AccessMode::ReadWrite => source
+            AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
                 .await
                 .ok_or_else(|| {

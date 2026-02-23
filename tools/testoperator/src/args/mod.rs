@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
 
 #[cfg(feature = "append")]
 mod append;
@@ -69,7 +69,7 @@ pub enum TestCommands {
     Append(AppendTestArgs),
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
-    Query(QueryArgs),
+    Query(DatasetTestArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
     /// Run a streaming ingestion performance benchmark for `DynamoDB` Streams

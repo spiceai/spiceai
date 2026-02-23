@@ -422,7 +422,6 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
         DataFusionError::Execution(format!("Failed to cast timestamp to nanoseconds: {e}"))
     })
 }
-
 const RESPONSE_STATUS_COLUMN: &str = "response_status";
 
 /// Helper functions for cache refresh operations

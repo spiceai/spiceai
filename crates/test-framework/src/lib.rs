@@ -21,6 +21,7 @@ pub mod app_utils;
 // this is our test framework, used in tests - expect is acceptable
 pub mod arrow_record_batch_gen;
 pub mod constants;
+pub mod execution;
 pub mod flight;
 pub mod gh_utils;
 pub mod git;

@@ -77,13 +77,14 @@ pub(crate) async fn handle(
             ))
         }
         // Additional Commands not yet supported
-        Command::CommandStatementUpdate(cmd) => {
+        Command::CommandStatementUpdate(_cmd) => {
             let _start =
                 metrics::track_flight_request("get_flight_info", Some("statement_update")).await;
-            tracing::debug!("CommandStatementUpdate not yet implemented: {cmd:?}");
-            Err(Status::unimplemented(
-                "CommandStatementUpdate is not yet implemented",
-            ))
+            // Per FlightSQL spec, CommandStatementUpdate is primarily handled via DoPut.
+            // Return minimal FlightInfo indicating this is a write operation.
+            let fd = request.into_inner();
+            let info = FlightInfo::new().with_descriptor(fd);
+            Ok(Response::new(info))
         }
         Command::CommandStatementSubstraitPlan(cmd) => {
             let _start =
