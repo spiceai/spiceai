@@ -313,36 +313,11 @@ fn create_response_stream(
     }
 }
 
-/// Maximum number of rows per batch sent to the write channel.
-/// 32,768 is four times the default batch size in DataFusion
-/// (`datafusion.execution.batch_size`), which defaults to 8,192.
-const MAX_BATCH_ROWS: usize = 32_768;
-
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
-
-    // Slice oversized batches into chunks rather than rejecting them outright.
-    // This avoids forcing clients to pre-chunk during bulk ingest, reducing
-    // round-trip overhead and improving throughput.
-    if batch.num_rows() > MAX_BATCH_ROWS {
-        let mut offset = 0;
-        let total = batch.num_rows();
-        while offset < total {
-            let length = (total - offset).min(MAX_BATCH_ROWS);
-            let chunk = batch.slice(offset, length);
-            if let Err(e) = batch_tx.send(Ok(chunk)).await {
-                tracing::error!("Error sending record batch chunk to write channel: {e}");
-                return Err(Status::internal(format!(
-                    "Error sending record batch to write channel: {e}"
-                )));
-            }
-            offset += length;
-        }
-        return Ok(PutResult::default());
-    }
 
     if let Err(e) = batch_tx.send(Ok(batch)).await {
         tracing::error!("Error sending record batch to write channel: {e}");
