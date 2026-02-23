@@ -182,7 +182,6 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             // Get catalog references before the async boundary
             let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
-            let object_store_config = cayenne_provider.object_store_config().cloned();
             let data_base_path = cayenne_provider.data_base_path().to_string();
             let vortex_config = cayenne_provider.vortex_config().clone();
 
@@ -235,10 +234,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
             };
 
             // Create the table via Cayenne
-            let mut builder = CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
-            if let Some(config) = object_store_config {
-                builder = builder.with_object_store(config);
-            }
+            let builder = CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
 
             let provider = builder.create(create_options).await.map_err(|e| {
                 DataFusionError::Execution(format!(

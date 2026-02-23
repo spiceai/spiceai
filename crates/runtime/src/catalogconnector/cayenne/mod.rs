@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Catalog connector for Cayenne catalogs backed by S3 Express One Zone storage.
+//! Catalog connector for Cayenne catalogs backed by local file storage.
 //!
 //! Cayenne catalogs use SQLite for metadata and Vortex files for columnar data,
-//! with data stored exclusively in S3 Express One Zone directory buckets.
+//! with data stored on local disk.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
@@ -49,36 +49,7 @@ pub const CAYENNE_PUBLIC_SCHEMA: &str = "public";
 /// Parameters for configuring a Cayenne catalog.
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cayenne_data_dir")
-        .description("Local directory for table data files. When set, uses local file storage instead of S3. Defaults to spice data directory if neither S3 nor data_dir is configured."),
-    ParameterSpec::component("cayenne_s3_bucket")
-        .description("Explicit S3 Express One Zone bucket name. If not specified, auto-generated from catalog_id and zone."),
-    ParameterSpec::component("cayenne_s3_zone_ids")
-        .description("Comma-separated Availability Zone IDs for S3 Express One Zone storage (e.g., 'usw2-az1'). Required when using S3 storage."),
-    ParameterSpec::component("cayenne_s3_region")
-        .description("AWS region for S3 Express One Zone storage. If not specified, derived from cayenne_s3_zone_ids."),
-    ParameterSpec::component("cayenne_s3_endpoint")
-        .description("Custom S3 endpoint URL for S3 Express One Zone."),
-    ParameterSpec::component("cayenne_s3_key")
-        .description("AWS access key ID for S3 authentication.")
-        .secret(),
-    ParameterSpec::component("cayenne_s3_secret")
-        .description("AWS secret access key for S3 authentication.")
-        .secret(),
-    ParameterSpec::component("cayenne_s3_session_token")
-        .description("AWS session token for temporary credentials (optional).")
-        .secret(),
-    ParameterSpec::component("cayenne_s3_auth")
-        .description("Authentication method: 'iam_role' (default) or 'key'.")
-        .default("iam_role"),
-    ParameterSpec::component("cayenne_s3_client_timeout")
-        .description("Timeout for S3 client operations. Default: 120s.")
-        .default("120s"),
-    ParameterSpec::component("cayenne_s3_allow_http")
-        .description("Allow HTTP (non-TLS) connections. Default: false.")
-        .default("false"),
-    ParameterSpec::component("cayenne_s3_unsigned_payload")
-        .description("Use unsigned payload for S3 Express uploads. Default: true.")
-        .default("true"),
+        .description("Local directory for table data files. Defaults to spice data directory."),
     ParameterSpec::component("cayenne_metadata_dir")
         .description("Local directory for Cayenne SQLite metadata. Defaults to spice data directory."),
     ParameterSpec::component("cayenne_footer_cache_mb")
@@ -93,21 +64,15 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cayenne_compression_strategy")
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
-    ParameterSpec::component("cayenne_upload_concurrency")
-        .description("Parallel file upload concurrency. Default: 4.")
-        .default("4"),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
 ///
 /// Cayenne catalogs provide a high-performance lakehouse format combining:
 /// - SQLite for transactional metadata management (stored locally)
-/// - Vortex columnar files for data (stored locally or in S3 Express One Zone)
+/// - Vortex columnar files for data (stored locally)
 ///
-/// **Storage modes:**
-/// - **Local**: Set `cayenne_data_dir` or omit all S3 parameters. Data is stored on local disk.
-/// - **S3 Express One Zone**: Set `cayenne_s3_zone_ids` (and optionally `cayenne_s3_bucket`).
-///   Data is stored in S3 Express One Zone directory buckets.
+/// Used as `from: cayenne` in the spicepod. Does not support a catalog ID.
 #[derive(Clone)]
 pub struct CayenneCatalogConnector {
     params: Parameters,
