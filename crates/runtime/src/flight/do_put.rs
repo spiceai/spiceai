@@ -236,7 +236,20 @@ fn create_response_stream(
                 // Poll the writing task to check if it has completed with an error while processing the data
                 write_result = &mut write_future => {
                     match write_result {
-                        Ok(()) => unreachable!("Write operation should not complete successfully before the end of the stream"),
+                        Ok(()) => {
+                            // The write operation completed before the flight stream
+                            // ended. This can happen when the data sink does not
+                            // consume the input stream or finishes early. Drain
+                            // remaining messages and report success.
+                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
+                            while let Some(msg) = streaming_flight.next().await {
+                                if let Err(e) = msg {
+                                    tracing::error!("Error reading remaining message after early write completion: {e}");
+                                }
+                            }
+                            yield Ok(PutResult::default());
+                            break;
+                        }
                         Err(e) => {
                             tracing::error!("Write operation failed. Details included in the response.");
                             yield Err(Status::internal(format!("Write operation failed: {e}")));
