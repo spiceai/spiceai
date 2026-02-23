@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
+use spicepod::component::catalog::Catalog as SpicepodCatalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
 use spicepod::param::Params;
@@ -309,6 +309,17 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
+    // Execute CREATE TABLE statements to create cayenne-backed tables from S3 sources.
+    let sql_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3600))
+        .build()?;
+    for (dataset_name, _config) in datasets {
+        let sql = generate_create_table_sql(CAYENNE_CATALOG_NAME, dataset_name);
+        eprintln!("[stdio] Executing: {sql}");
+        execute_sql(&sql_client, &cname, &api_key, &sql).await?;
+        eprintln!("[stdio] Created cayenne table '{dataset_name}'");
+    }
+
     Ok(RunState {
         app_id,
         api_key,
@@ -317,7 +328,14 @@ async fn provision_spice_cloud_app(
     })
 }
 
-/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
+/// Name of the cayenne catalog registered in the spicepod.
+const CAYENNE_CATALOG_NAME: &str = "cayenne";
+
+/// Generate the spicepod YAML with a cayenne catalog and S3-sourced federated datasets.
+///
+/// The datasets are registered as plain S3 sources (no acceleration). After deployment,
+/// `CREATE TABLE cayenne.{table} AS SELECT * FROM {table}` DDL statements are executed
+/// to create cayenne-backed tables that ingest data from these S3 sources.
 fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -341,6 +359,13 @@ fn generate_initial_spicepod(
         ..Runtime::default()
     };
 
+    // Add a cayenne catalog for local acceleration via DDL.
+    let cayenne_catalog =
+        SpicepodCatalog::new("cayenne".to_string(), CAYENNE_CATALOG_NAME.to_string());
+    spicepod
+        .catalogs
+        .push(ComponentOrReference::Component(cayenne_catalog));
+
     for (dataset_name, config) in datasets {
         let from = config.location.as_deref().ok_or_else(|| {
             anyhow::anyhow!("Dataset '{dataset_name}' is missing a 'from' URI in its config")
@@ -358,14 +383,6 @@ fn generate_initial_spicepod(
 
         let mut dataset = Dataset::new(from, dataset_name.as_str());
         dataset.params = Some(Params::from_string_map(param_map));
-        dataset.acceleration = Some(Acceleration {
-            enabled: true,
-            engine: Some("cayenne".to_string()),
-            mode: Mode::File,
-            refresh_mode: Some(RefreshMode::Full),
-            refresh_check_interval: Some("1s".to_string()),
-            ..Acceleration::default()
-        });
 
         spicepod
             .datasets
@@ -373,6 +390,39 @@ fn generate_initial_spicepod(
     }
 
     yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+}
+
+/// Generate a `CREATE TABLE` DDL statement for a cayenne catalog table.
+///
+/// Produces `CREATE TABLE {catalog}.{table} AS SELECT * FROM {table}` which creates
+/// a cayenne-backed table and ingests data from the identically-named S3 source dataset.
+fn generate_create_table_sql(catalog_name: &str, table_name: &str) -> String {
+    format!("CREATE TABLE {catalog_name}.{table_name} AS SELECT * FROM {table_name}")
+}
+
+/// Execute a SQL statement against the deployed Spice Cloud instance.
+async fn execute_sql(
+    client: &reqwest::Client,
+    cname: &str,
+    api_key: &str,
+    sql: &str,
+) -> anyhow::Result<()> {
+    let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
+    let response = client
+        .post(&sql_url)
+        .header("X-API-Key", api_key)
+        .body(sql.to_string())
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "SQL execution failed (HTTP {status}): {body}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -393,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_spicepod_includes_dataset_entries() {
+    fn generate_spicepod_includes_cayenne_catalog_and_datasets() {
         let setup_config = SetupConfig {
             etl_region: Some("us-west-2".to_string()),
             etl_endpoint: Some("http://localhost:9000".to_string()),
@@ -414,15 +464,21 @@ mod tests {
         let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
             .expect("spicepod should generate");
 
+        // Cayenne catalog should be present
+        assert!(spicepod.contains("from: cayenne"), "missing cayenne catalog from");
+        assert!(spicepod.contains("name: cayenne"), "missing cayenne catalog name");
+
+        // S3 dataset should be present without acceleration
         assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
         assert!(spicepod.contains("name: my_table"));
         assert!(spicepod.contains("file_format: parquet"));
         assert!(spicepod.contains("s3_region: us-west-2"));
         assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
-        assert!(spicepod.contains("engine: cayenne"));
-        assert!(spicepod.contains("mode: file"));
-        assert!(spicepod.contains("refresh_mode: full"));
-        assert!(spicepod.contains("refresh_check_interval: 1s"));
+        assert!(!spicepod.contains("engine: cayenne"), "should not have per-dataset acceleration");
+        assert!(!spicepod.contains("mode: file"), "should not have acceleration mode");
+        assert!(!spicepod.contains("refresh_mode:"), "should not have refresh_mode");
+
+        // Telemetry should be disabled
         assert!(spicepod.contains("telemetry:"));
         assert!(spicepod.contains("enabled: false"));
     }
@@ -452,5 +508,11 @@ mod tests {
             err.to_string().contains("missing_table"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn generate_create_table_produces_correct_sql() {
+        let sql = generate_create_table_sql("cayenne", "orders");
+        assert_eq!(sql, "CREATE TABLE cayenne.orders AS SELECT * FROM orders");
     }
 }
