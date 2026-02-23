@@ -152,10 +152,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     let runtime = if args.cli_only {
         None
     } else {
-        match ctx.runtime_version() {
-            Ok(v) => Some(v),
-            Err(_) => None,
-        }
+        ctx.runtime_version().ok()
     };
 
     match args.output {

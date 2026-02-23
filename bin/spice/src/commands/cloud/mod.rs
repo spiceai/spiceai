@@ -665,7 +665,13 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
         return write_json(&apps);
     }
 
-    let mut table = TableOutput::new(vec!["NAME", "DESCRIPTION", "REGION", "VISIBILITY", "CREATED"]);
+    let mut table = TableOutput::new(vec![
+        "NAME",
+        "DESCRIPTION",
+        "REGION",
+        "VISIBILITY",
+        "CREATED",
+    ]);
     for app in apps {
         table.add_row(vec![
             app.full_name(),

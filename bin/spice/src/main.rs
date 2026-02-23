@@ -180,10 +180,9 @@ fn is_json_output(cmd: &Commands) -> bool {
         Commands::Search(a) => a.output == OutputFormat::Json,
         Commands::Query(a) => a.output == OutputFormat::Json,
         Commands::Acceleration(AccelerationArgs {
-            command: acceleration::AccelerationCommand::Snapshots(SnapshotsArgs { output, .. }),
-        })
-        | Commands::Acceleration(AccelerationArgs {
-            command: acceleration::AccelerationCommand::Snapshot(SnapshotArgs { output, .. }),
+            command:
+                acceleration::AccelerationCommand::Snapshots(SnapshotsArgs { output, .. })
+                | acceleration::AccelerationCommand::Snapshot(SnapshotArgs { output, .. }),
         }) => *output == OutputFormat::Json,
         Commands::Cloud(a) => match &a.command {
             cloud::CloudCommands::Whoami(x) => x.output == OutputFormat::Json,
