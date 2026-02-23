@@ -19,6 +19,7 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::github::{GitHubClient, get_latest_release};
+use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use std::fs;
 use std::path::PathBuf;
@@ -33,6 +34,10 @@ pub struct VersionArgs {
     /// Show only the CLI version (no runtime version)
     #[arg(long)]
     cli_only: bool,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    output: OutputFormat,
 }
 
 /// Get the CLI version string.
@@ -143,16 +148,31 @@ async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
 ///
 /// Returns an error if the runtime version cannot be determined.
 pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
-    println!("CLI version:     {}", cli_version());
-
-    if !args.cli_only {
+    let cli = cli_version();
+    let runtime = if args.cli_only {
+        None
+    } else {
         match ctx.runtime_version() {
-            Ok(version) => {
-                println!("Runtime version: {version}");
+            Ok(v) => Some(v),
+            Err(_) => None,
+        }
+    };
+
+    match args.output {
+        OutputFormat::Table => {
+            println!("CLI version:     {cli}");
+            if !args.cli_only {
+                println!(
+                    "Runtime version: {}",
+                    runtime.as_deref().unwrap_or("not installed")
+                );
             }
-            Err(_) => {
-                println!("Runtime version: not installed");
-            }
+        }
+        OutputFormat::Json => {
+            write_json(&serde_json::json!({
+                "cli": cli,
+                "runtime": runtime,
+            }))?;
         }
     }
 

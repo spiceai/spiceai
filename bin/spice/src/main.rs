@@ -17,6 +17,7 @@ limitations under the License.
 //! Spice.ai CLI - Main entry point.
 
 use clap::{Parser, Subcommand};
+use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, eval, init,
     install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade,
@@ -152,8 +153,8 @@ fn main() {
         .without_time()
         .init();
 
-    // Print version header (matching Go CLI behavior)
-    if !matches!(cli.command, Commands::Version(_)) {
+    // Print version header (matching Go CLI behavior), suppressed in JSON mode
+    if !matches!(cli.command, Commands::Version(_)) && !is_json_output(&cli.command) {
         println!("Spice.ai OSS CLI {}", version::cli_version());
     }
 
@@ -161,6 +162,47 @@ fn main() {
     if let Err(e) = run_cli(cli) {
         tracing::error!("{e}");
         std::process::exit(1);
+    }
+}
+
+/// Returns true if the command will output JSON, so the banner should be suppressed.
+fn is_json_output(cmd: &Commands) -> bool {
+    use spice::output::OutputFormat;
+    match cmd {
+        Commands::Status(a) => a.output == OutputFormat::Json,
+        Commands::Datasets(a) => a.output == OutputFormat::Json,
+        Commands::Catalogs(a) => a.output == OutputFormat::Json,
+        Commands::Models(a) => a.output == OutputFormat::Json,
+        Commands::Pods(a) => a.output == OutputFormat::Json,
+        Commands::Workers(a) => a.output == OutputFormat::Json,
+        Commands::Trace(a) => matches!(a.output, trace::OutputFormat::Json),
+        Commands::Eval(a) => a.output == OutputFormat::Json,
+        Commands::Search(a) => a.output == OutputFormat::Json,
+        Commands::Query(a) => a.output == OutputFormat::Json,
+        Commands::Acceleration(AccelerationArgs {
+            command: acceleration::AccelerationCommand::Snapshots(SnapshotsArgs { output, .. }),
+        })
+        | Commands::Acceleration(AccelerationArgs {
+            command: acceleration::AccelerationCommand::Snapshot(SnapshotArgs { output, .. }),
+        }) => *output == OutputFormat::Json,
+        Commands::Cloud(a) => match &a.command {
+            cloud::CloudCommands::Whoami(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Apps(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Regions(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Images(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Deployments(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Inspect(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::ApiKeys(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Get(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Get(cloud::GetCommands::App(x)) => x.output == OutputFormat::Json,
+            _ => false,
+        },
+        _ => false,
     }
 }
 

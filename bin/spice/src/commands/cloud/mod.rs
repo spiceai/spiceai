@@ -21,7 +21,7 @@ mod config;
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, Result};
-use crate::output::TableOutput;
+use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
 use snafu::ResultExt;
 
@@ -45,7 +45,7 @@ pub enum CloudCommands {
     Logout,
 
     /// Show current authenticated user
-    Whoami,
+    Whoami(WhoamiArgs),
 
     /// Link current directory to a Spice Cloud app
     Link(LinkArgs),
@@ -54,13 +54,13 @@ pub enum CloudCommands {
     Unlink,
 
     /// List all apps
-    Apps,
+    Apps(AppsArgs),
 
     /// List deployments for an app
     Deployments(DeploymentsArgs),
 
     /// List available regions
-    Regions,
+    Regions(RegionsArgs),
 
     /// List available container images
     Images(ImagesArgs),
@@ -107,6 +107,27 @@ pub enum CloudCommands {
 // ============================================================================
 
 #[derive(Args, Debug)]
+pub struct WhoamiArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct AppsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct RegionsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug)]
 pub struct LoginArgs {
     /// Skip opening the browser and print the auth URL instead
     #[arg(long)]
@@ -132,6 +153,10 @@ pub struct DeploymentsArgs {
     /// Filter by deployment status
     #[arg(long)]
     pub status: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -139,6 +164,10 @@ pub struct ImagesArgs {
     /// Filter by channel (stable, beta, etc.)
     #[arg(long)]
     pub channel: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -184,6 +213,10 @@ pub struct InspectArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -206,6 +239,10 @@ pub struct ApiKeysArgs {
     /// Regenerate API key (1 or 2)
     #[arg(long)]
     pub regenerate: Option<u8>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -233,6 +270,10 @@ pub struct SecretsListArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -256,6 +297,10 @@ pub struct SecretsGetArgs {
 
     /// Secret name
     pub name: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -328,6 +373,10 @@ pub enum GetCommands {
 pub struct GetAppArgs {
     /// App name in org/app format
     pub app: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -400,12 +449,12 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
     match &args.command {
         CloudCommands::Login(login_args) => execute_login(login_args).await,
         CloudCommands::Logout => execute_logout(),
-        CloudCommands::Whoami => execute_whoami().await,
+        CloudCommands::Whoami(whoami_args) => execute_whoami(whoami_args).await,
         CloudCommands::Link(link_args) => execute_link(link_args).await,
         CloudCommands::Unlink => execute_unlink(),
-        CloudCommands::Apps => execute_apps().await,
+        CloudCommands::Apps(apps_args) => execute_apps(apps_args).await,
         CloudCommands::Deployments(deploy_args) => execute_deployments(deploy_args).await,
-        CloudCommands::Regions => execute_regions().await,
+        CloudCommands::Regions(regions_args) => execute_regions(regions_args).await,
         CloudCommands::Images(images_args) => execute_images(images_args).await,
         CloudCommands::Secrets(secrets_cmd) => execute_secrets(secrets_cmd).await,
         CloudCommands::Logs(logs_args) => execute_logs(logs_args).await,
@@ -554,9 +603,13 @@ fn execute_logout() -> Result<()> {
     Ok(())
 }
 
-async fn execute_whoami() -> Result<()> {
+async fn execute_whoami(args: &WhoamiArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let context = client.get_auth_context().await?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&context);
+    }
 
     println!("Logged in as: {} ({})", context.username, context.email);
     println!("Organization: {}", context.org_name);
@@ -599,7 +652,7 @@ fn execute_unlink() -> Result<()> {
     Ok(())
 }
 
-async fn execute_apps() -> Result<()> {
+async fn execute_apps(args: &AppsArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let apps = client.list_apps().await?;
 
@@ -608,13 +661,11 @@ async fn execute_apps() -> Result<()> {
         return Ok(());
     }
 
-    let mut table = TableOutput::new(vec![
-        "NAME",
-        "DESCRIPTION",
-        "REGION",
-        "VISIBILITY",
-        "CREATED",
-    ]);
+    if args.output == OutputFormat::Json {
+        return write_json(&apps);
+    }
+
+    let mut table = TableOutput::new(vec!["NAME", "DESCRIPTION", "REGION", "VISIBILITY", "CREATED"]);
     for app in apps {
         table.add_row(vec![
             app.full_name(),
@@ -642,6 +693,10 @@ async fn execute_deployments(args: &DeploymentsArgs) -> Result<()> {
         return Ok(());
     }
 
+    if args.output == OutputFormat::Json {
+        return write_json(&deployments);
+    }
+
     let mut table = TableOutput::new(vec!["ID", "STATUS", "IMAGE", "REPLICAS", "CREATED"]);
     for dep in deployments {
         table.add_row(vec![
@@ -658,9 +713,13 @@ async fn execute_deployments(args: &DeploymentsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_regions() -> Result<()> {
+async fn execute_regions(args: &RegionsArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let regions_resp = client.list_regions(None).await?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&regions_resp.regions);
+    }
 
     let mut table = TableOutput::new(vec!["NAME", "REGION", "PROVIDER", "DEFAULT"]);
     for region in regions_resp.regions {
@@ -681,6 +740,10 @@ async fn execute_images(args: &ImagesArgs) -> Result<()> {
     let images_resp = client
         .list_container_images(args.channel.as_deref())
         .await?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&images_resp);
+    }
 
     let mut table = TableOutput::new(vec!["TAG", "CHANNEL", "DEFAULT"]);
     for image in images_resp.images {
@@ -708,6 +771,10 @@ async fn execute_secrets(cmd: &SecretsCommands) -> Result<()> {
                 return Ok(());
             }
 
+            if args.output == OutputFormat::Json {
+                return write_json(&secrets);
+            }
+
             let mut table = TableOutput::new(vec!["NAME", "UPDATED"]);
             for secret in secrets {
                 table.add_row(vec![
@@ -729,6 +796,9 @@ async fn execute_secrets(cmd: &SecretsCommands) -> Result<()> {
             let client = CloudClient::new()?;
             let app_name = require_app(args.app.as_deref())?;
             let secret = client.get_secret(&app_name, &args.name).await?;
+            if args.output == OutputFormat::Json {
+                return write_json(&secret);
+            }
             println!("{}", secret.value.unwrap_or_default());
         }
         SecretsCommands::Delete(args) => {
@@ -811,6 +881,10 @@ async fn execute_get(cmd: &GetCommands) -> Result<()> {
         GetCommands::App(args) => {
             let client = CloudClient::new()?;
             let app = client.get_app(&args.app).await?;
+
+            if args.output == OutputFormat::Json {
+                return write_json(&app);
+            }
 
             println!("Name:        {}", app.full_name());
             if let Some(desc) = app.description {
@@ -914,6 +988,13 @@ async fn execute_inspect(args: &InspectArgs) -> Result<()> {
     let app = client.get_app(&app_name).await?;
     let deployments = client.list_deployments(&app_name, 1, None).await?;
 
+    if args.output == OutputFormat::Json {
+        return write_json(&serde_json::json!({
+            "app": app,
+            "latest_deployment": deployments.first(),
+        }));
+    }
+
     println!("App: {}", app.full_name());
     if let Some(region) = app.region {
         println!("Region: {region}");
@@ -982,6 +1063,9 @@ async fn execute_api_keys(args: &ApiKeysArgs) -> Result<()> {
             .fail();
         }
         let response = client.regenerate_api_key(&app_name, key_num).await?;
+        if args.output == OutputFormat::Json {
+            return write_json(&response);
+        }
         println!("\x1b[32m✓ Regenerated API key {key_num}\x1b[0m");
         if let Some(key) = response.api_key {
             println!("\nAPI Key 1: {key}");
@@ -991,6 +1075,9 @@ async fn execute_api_keys(args: &ApiKeysArgs) -> Result<()> {
         }
     } else {
         let keys = client.get_api_keys(&app_name).await?;
+        if args.output == OutputFormat::Json {
+            return write_json(&keys);
+        }
         if let Some(key) = keys.api_key {
             println!("API Key 1: {key}");
         }

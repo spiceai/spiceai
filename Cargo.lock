@@ -17925,6 +17925,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "ansi_colors",
  "arrow",
+ "arrow-json",
  "assert_cmd",
  "chrono",
  "clap",
