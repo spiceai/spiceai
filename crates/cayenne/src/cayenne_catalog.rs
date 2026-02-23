@@ -198,7 +198,6 @@ impl MetadataCatalog for CayenneCatalog {
             tokio::fs::create_dir_all(db_dir).await?;
         }
 
-
         // Initialize schema using the appropriate metastore backend
         match &self.metastore {
             MetastoreImpl::Sqlite(metastore) => metastore.init_schema().await?,
@@ -461,9 +460,12 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        results.into_iter().next().ok_or(CatalogError::TableNotFound {
-            table_name: table_name_owned,
-        })
+        results
+            .into_iter()
+            .next()
+            .ok_or(CatalogError::TableNotFound {
+                table_name: table_name_owned,
+            })
     }
 
     async fn set_current_snapshot(&self, table_id: i64, snapshot_id: &str) -> CatalogResult<()> {

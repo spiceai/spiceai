@@ -186,7 +186,10 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 
         validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
 
-        if catalog.name.eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG) {
+        if catalog
+            .name
+            .eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG)
+        {
             return Err(crate::Error::ComponentError {
                 source: super::Error::ReservedCatalogName {
                     name: catalog.name.clone(),

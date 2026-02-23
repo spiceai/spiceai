@@ -116,9 +116,7 @@ where
 
     fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         // Apply rate limiting to the Flight DoPut only
-        if !self.enabled
-            || req.uri().path() != "/arrow.flight.protocol.FlightService/DoPut"
-        {
+        if !self.enabled || req.uri().path() != "/arrow.flight.protocol.FlightService/DoPut" {
             return Box::pin(self.inner.call(req));
         }
 

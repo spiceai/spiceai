@@ -98,7 +98,9 @@ impl CayenneCatalogProvider {
             .expose()
             .ok()
             .map(String::from)
-            .unwrap_or_else(|| format!("{}/cayenne_{catalog_name}/metadata", spice_data_base_path()));
+            .unwrap_or_else(|| {
+                format!("{}/cayenne_{catalog_name}/metadata", spice_data_base_path())
+            });
 
         // Ensure metadata directory exists
         std::fs::create_dir_all(&metadata_dir).map_err(|e| Error::InvalidConfiguration {
@@ -108,8 +110,7 @@ impl CayenneCatalogProvider {
         // Initialize SQLite catalog
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
         let catalog = Arc::new(
-            CayenneCatalog::new(connection_string)
-                .map_err(|e| Error::CatalogInit { source: e })?,
+            CayenneCatalog::new(connection_string).map_err(|e| Error::CatalogInit { source: e })?,
         ) as Arc<dyn MetadataCatalog>;
 
         catalog.init().await.context(CatalogInitSnafu)?;
@@ -195,12 +196,10 @@ impl CayenneCatalogProvider {
         if let Some(v) = params.get("cayenne_compression_strategy").expose().ok() {
             match v.to_lowercase().as_str() {
                 "zstd" => {
-                    config.compression_strategy =
-                        cayenne::metadata::CompressionStrategy::Zstd;
+                    config.compression_strategy = cayenne::metadata::CompressionStrategy::Zstd;
                 }
                 "btrblocks" => {
-                    config.compression_strategy =
-                        cayenne::metadata::CompressionStrategy::Btrblocks;
+                    config.compression_strategy = cayenne::metadata::CompressionStrategy::Btrblocks;
                 }
                 _ => {}
             }
@@ -210,13 +209,8 @@ impl CayenneCatalogProvider {
     }
 
     /// Load all tables from the Cayenne catalog into a schema provider.
-    async fn load_schema(
-        catalog: &Arc<dyn MetadataCatalog>,
-    ) -> Result<Arc<dyn SchemaProvider>> {
-        let schema_provider = CayenneSchemaProvider::try_new(
-            Arc::clone(catalog),
-        )
-        .await?;
+    async fn load_schema(catalog: &Arc<dyn MetadataCatalog>) -> Result<Arc<dyn SchemaProvider>> {
+        let schema_provider = CayenneSchemaProvider::try_new(Arc::clone(catalog)).await?;
 
         Ok(Arc::new(schema_provider))
     }
@@ -287,17 +281,12 @@ impl std::fmt::Debug for CayenneSchemaProvider {
 
 impl CayenneSchemaProvider {
     /// Create a new schema provider, loading all existing tables from the catalog.
-    pub async fn try_new(
-        catalog: Arc<dyn MetadataCatalog>,
-    ) -> Result<Self> {
+    pub async fn try_new(catalog: Arc<dyn MetadataCatalog>) -> Result<Self> {
         // Load all existing tables from the metadata catalog
-        let table_names = catalog
-            .list_table_names()
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to list existing Cayenne tables: {e}");
-                Vec::new()
-            });
+        let table_names = catalog.list_table_names().await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to list existing Cayenne tables: {e}");
+            Vec::new()
+        });
 
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
         for name in &table_names {
@@ -349,9 +338,7 @@ impl CayenneSchemaProvider {
                 match builder.open(table_name).await {
                     Ok(provider) => Ok(Some(Arc::new(provider))),
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to open Cayenne table '{table_name}': {e}"
-                        );
+                        tracing::warn!("Failed to open Cayenne table '{table_name}': {e}");
                         Ok(None)
                     }
                 }

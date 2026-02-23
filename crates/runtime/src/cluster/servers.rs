@@ -212,9 +212,10 @@ pub async fn start_executor_flight_server(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
-        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
-            RateLimits::default().flight_write_limit,
-        ), true));
+        .layer(WriteRateLimitLayer::new(
+            RateLimiter::direct(RateLimits::default().flight_write_limit),
+            true,
+        ));
 
     let server = server.add_service(
         arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)

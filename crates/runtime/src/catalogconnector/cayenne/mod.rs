@@ -21,9 +21,7 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime,
-    component::catalog::Catalog,
-    dataconnector::parameters::ConnectorParams,
+    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
     parameters::Parameters,
 };
 use async_trait::async_trait;
@@ -50,8 +48,9 @@ pub const CAYENNE_PUBLIC_SCHEMA: &str = "public";
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cayenne_data_dir")
         .description("Local directory for table data files. Defaults to spice data directory."),
-    ParameterSpec::component("cayenne_metadata_dir")
-        .description("Local directory for Cayenne SQLite metadata. Defaults to spice data directory."),
+    ParameterSpec::component("cayenne_metadata_dir").description(
+        "Local directory for Cayenne SQLite metadata. Defaults to spice data directory.",
+    ),
     ParameterSpec::component("cayenne_footer_cache_mb")
         .description("Vortex footer cache size in MB. Default: 128.")
         .default("128"),

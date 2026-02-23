@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use cayenne::metadata::CreateTableOptions;
 use cayenne::CayenneTableProviderBuilder;
+use cayenne::metadata::CreateTableOptions;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -164,21 +164,15 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
         let stream = futures::stream::once(async move {
             // Get the Cayenne catalog provider
-            let df_catalog =
-                catalog_list
-                    .catalog(&df_catalog_name)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Catalog '{df_catalog_name}' not found"
-                        ))
-                    })?;
+            let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
+            })?;
 
-            let cayenne_provider =
-                get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Catalog '{df_catalog_name}' is not a Cayenne catalog"
-                    ))
-                })?;
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
 
             // Get catalog references before the async boundary
             let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
@@ -186,10 +180,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
             let vortex_config = cayenne_provider.vortex_config().clone();
 
             // Check if table already exists via the metadata catalog
-            let exists = metadata_catalog
-                .get_table(&table_name)
-                .await
-                .is_ok();
+            let exists = metadata_catalog.get_table(&table_name).await.is_ok();
 
             if exists {
                 if if_not_exists {
@@ -207,19 +198,17 @@ impl ExecutionPlan for CayenneCreateTableExec {
             }
 
             // Transform schema for Vortex compatibility
-            let vortex_schema =
-                transform_schema_for_vortex(&arrow_schema, UnsupportedTypeAction::Error)
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to transform schema for Vortex: {e}"
-                        ))
-                    })?;
+            let vortex_schema = transform_schema_for_vortex(
+                &arrow_schema,
+                UnsupportedTypeAction::Error,
+            )
+            .map_err(|e| {
+                DataFusionError::Execution(format!("Failed to transform schema for Vortex: {e}"))
+            })?;
 
             let table_data_path = format!(
                 "{}{table_name}/",
-                data_base_path.trim_end_matches('/')
-                    .to_string()
-                    + "/"
+                data_base_path.trim_end_matches('/').to_string() + "/"
             );
 
             // Create table options
@@ -243,14 +232,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
             })?;
 
             // Register in the DataFusion schema provider
-            let schema_provider =
-                df_catalog
-                    .schema(&df_schema_name)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
-                        ))
-                    })?;
+            let schema_provider = df_catalog.schema(&df_schema_name).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
+                ))
+            })?;
 
             schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
 
@@ -366,21 +352,15 @@ impl ExecutionPlan for CayenneDropTableExec {
 
         let stream = futures::stream::once(async move {
             // Get the Cayenne catalog provider
-            let df_catalog =
-                catalog_list
-                    .catalog(&df_catalog_name)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Catalog '{df_catalog_name}' not found"
-                        ))
-                    })?;
+            let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
+            })?;
 
-            let cayenne_provider =
-                get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Catalog '{df_catalog_name}' is not a Cayenne catalog"
-                    ))
-                })?;
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
 
             let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
 
