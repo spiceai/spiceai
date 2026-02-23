@@ -804,37 +804,8 @@ impl Runtime {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
                 partition_manager, ..
-            }) => {
-                if let Ok(guard) = partition_manager.try_read() {
-                    guard.clone()
-                } else {
-                    tracing::debug!(
-                        "Partition manager is currently being initialized. Returning None."
-                    );
-                    None
-                }
-            }
+            }) => Some(Arc::clone(&partition_manager)),
             _ => None,
-        }
-    }
-
-    /// Sets the partition manager for accelerated table partition metadata.
-    pub async fn set_partition_manager(&self, manager: Arc<PartitionManager>) {
-        match self.distributed.as_ref() {
-            Some(DistributedNode::Scheduler {
-                partition_manager, ..
-            }) => {
-                let mut guard = partition_manager.write().await;
-                *guard = Some(manager);
-            }
-            Some(DistributedNode::Executor { .. }) => {
-                tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
-            }
-            None => {
-                tracing::warn!(
-                    "Attempted to set partition manager on a non-cluster runtime. Ignoring."
-                );
-            }
         }
     }
 

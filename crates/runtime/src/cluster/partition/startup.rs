@@ -36,7 +36,6 @@ use tonic::transport::Channel;
 
 use super::{PartitionManager, Result};
 use crate::{
-    Runtime,
     cluster::partition::{
         ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
         PartitionExpressionDeserializationSnafu, PartitionMetadataInitSnafu, discovery,

@@ -95,7 +95,7 @@ pub enum DistributedNode {
         executor_registry: Arc<ExecutorRegistry>,
 
         /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<PartitionManager>>,
+        partition_manager: Arc<PartitionManager>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -804,7 +804,6 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 .await,
         )];
 
-
     let Some(app) = rt.read_app().await else {
         tracing::warn!(
             "No app found in runtime during cluster scheduler initialization; skipping scheduler registry and partition manager setup"
@@ -813,71 +812,61 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        // Initialize partition manager with the configured object store
-        match partition::build_partition_metadata_store(rt, &config).await {
-            Ok(store) => {
-                let partition_manager = Arc::new(PartitionManager::new(store));
-                rt.set_partition_manager(Arc::clone(&partition_manager))
-                    .await;
-
-                // Initialize partition metadata for all accelerated tables
-                if let Err(err) = partition::initialize_partition_metadata(
-                    rt.datafusion(),
-                    Arc::clone(&app),
-                    &partition_manager,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to initialize partition metadata during scheduler startup: {err}"
-                    );
-                }
-
-                // Start partition management task
-                let pm_shutdown = CancellationToken::new();
-                let pm_config = match config
-                    .partition_management
-                    .clone()
-                    .map(PartitionManagementConfig::try_from)
-                {
-                    Some(Ok(cfg)) => cfg,
-                    None => PartitionManagementConfig::default(),
-                    Some(Err(err)) => {
-                        tracing::warn!(
-                            "Failed to parse partition management config, partition management task will not be started: {err
-                        }");
-                        return Ok(None);
-                    }
-                };
-
-                let pm_task = PartitionManagementTask::new(
-                    rt.app(),
-                    rt.datafusion(),
-                    Arc::clone(&partition_manager),
-                    Arc::clone(&scheduler_executor_registry),
-                    pm_config,
-                    pm_shutdown.clone(),
+        if let Some(partition_manager) = rt.partition_manager() {
+            // Initialize partition metadata for all accelerated tables
+            if let Err(err) = partition::initialize_partition_metadata(
+                rt.datafusion(),
+                Arc::clone(&app),
+                &partition_manager,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to initialize partition metadata during scheduler startup: {err}"
                 );
+            }
 
-                futures.push(Box::pin(
-                    self_for_task
-                        .start_runtime_task(
-                            CLUSTER_PARTITION_MANAGEMENT_TASK,
-                            Some(pm_shutdown),
-                            async move {
-                                pm_task
-                                    .run()
-                                    .await
-                                    .boxed()
-                                    .context(FailedToRegisterSchedulerSnafu)
-                            },
-                        )
-                        .await,
-                ));
-            }
-            Err(err) => {
-                tracing::error!("Failed to build partition metadata store: {err}");
-            }
+            // Start partition management task
+            let pm_shutdown = CancellationToken::new();
+            let pm_config = match config
+                .partition_management
+                .clone()
+                .map(PartitionManagementConfig::try_from)
+            {
+                Some(Ok(cfg)) => cfg,
+                None => PartitionManagementConfig::default(),
+                Some(Err(err)) => {
+                    tracing::warn!(
+                        "Failed to parse partition management config, partition management task will not be started: {err
+                    }");
+                    return Ok(None);
+                }
+            };
+
+            let pm_task = PartitionManagementTask::new(
+                rt.app(),
+                rt.datafusion(),
+                Arc::clone(&partition_manager),
+                Arc::clone(&scheduler_executor_registry),
+                pm_config,
+                pm_shutdown.clone(),
+            );
+
+            futures.push(Box::pin(
+                self_for_task
+                    .start_runtime_task(
+                        CLUSTER_PARTITION_MANAGEMENT_TASK,
+                        Some(pm_shutdown),
+                        async move {
+                            pm_task
+                                .run()
+                                .await
+                                .boxed()
+                                .context(FailedToRegisterSchedulerSnafu)
+                        },
+                    )
+                    .await,
+            ));
         }
 
         let registry_shutdown = CancellationToken::new();
