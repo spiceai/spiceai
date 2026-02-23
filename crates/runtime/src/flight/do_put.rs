@@ -32,10 +32,7 @@ use datafusion::{
 };
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
-use tokio::{
-    sync::mpsc::{self, Sender},
-    time::sleep,
-};
+use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -214,7 +211,7 @@ fn create_response_stream(
     .ok();
 
     stream! {
-        // channel to propogate new record batches to the data writing stream
+        // channel to propagate new record batches to the data writing stream
         let (batch_tx, batch_rx)= mpsc::channel::<Result<RecordBatch, DataFusionError>>(100);
 
         let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), Box::new(ReceiverStream::new(batch_rx))));
@@ -226,9 +223,15 @@ fn create_response_stream(
             yield handle_record_batch(first_batch, &batch_tx).await;
         }
 
+        // Use a single pinned Sleep future that is reset on each received message,
+        // rather than creating a new timer allocation on every loop iteration.
+        let idle_timeout = Duration::from_secs(120);
+        let deadline = tokio::time::sleep(idle_timeout);
+        tokio::pin!(deadline);
+
         loop {
             tokio::select! {
-                () = sleep(Duration::from_secs(120)) => {
+                () = &mut deadline => {
                     tracing::error!("Timeout: no record batch received within 120 seconds");
                     yield Err(Status::deadline_exceeded("Timeout: no record batch received within 120 seconds"));
                     break;
@@ -260,6 +263,9 @@ fn create_response_stream(
                 message = streaming_flight.next() => {
                     match message {
                         Some(Ok(message)) => {
+                            // Reset the idle timeout on each received message
+                            deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+
                             let new_batch = match flight_data_to_arrow_batch(
                                 &message,
                                 Arc::clone(&schema),
@@ -312,15 +318,6 @@ async fn handle_record_batch(
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
-
-    // 32,768 is four times the default batch size in DataFusion (`datafusion.execution.batch_size`), which defaults to 8,192.
-    if batch.num_rows() > 32_768 {
-        return Err(Status::invalid_argument(format!(
-            "The provided batch contains too many rows. Maximum allowed: {allowed}, received: {received}.",
-            allowed = 32_768,
-            received = batch.num_rows()
-        )));
-    }
 
     if let Err(e) = batch_tx.send(Ok(batch)).await {
         tracing::error!("Error sending record batch to write channel: {e}");

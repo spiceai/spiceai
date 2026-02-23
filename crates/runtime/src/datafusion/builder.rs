@@ -425,6 +425,15 @@ impl DataFusionBuilder {
             ),
         ));
 
+        // Add the Cayenne DDL analyzer rule.
+        #[cfg(not(windows))]
+        ctx.add_analyzer_rule(Arc::new(
+            super::cayenne_ddl::analyzer_rule::CayenneDdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+            ),
+        ));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -592,6 +601,8 @@ pub(crate) fn default_extension_planners(
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
+        #[cfg(not(windows))]
+        Arc::new(super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new()),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]

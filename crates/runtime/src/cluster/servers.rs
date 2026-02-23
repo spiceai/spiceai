@@ -214,7 +214,7 @@ pub async fn start_executor_flight_server(
         )
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             RateLimits::default().flight_write_limit,
-        )));
+        ), true));
 
     let server = server.add_service(
         arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)

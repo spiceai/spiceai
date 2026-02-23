@@ -114,6 +114,8 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+#[cfg(not(windows))]
+pub mod cayenne_ddl;
 pub mod composed_catalog;
 pub mod dialect;
 pub mod error;
