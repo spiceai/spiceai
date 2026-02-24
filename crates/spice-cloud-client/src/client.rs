@@ -480,7 +480,9 @@ impl CloudClient {
     /// Get metrics for an app's pods.
     ///
     /// `window` controls the rate window for counter metrics (disk I/O).
-    /// Valid values are with time units, e.g: `"1m"`, `"5m"`, `"15m"`. Pass `None` for the server default (`"5m"`).
+    /// Valid values are with time units, e.g: `"1m"`, `"5m"`, `"15m"`.
+    ///
+    /// Pass `None` for cumulative values since the last reset (e.g. container start).
     pub async fn get_app_metrics(
         &self,
         app_id: i64,

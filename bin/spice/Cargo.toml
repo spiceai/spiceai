@@ -50,6 +50,7 @@ chrono = { workspace = true, features = ["serde"] }
 
 # Duration parsing
 humantime = "2"
+fundu.workspace = true
 
 # Terminal colors
 ansi_colors = { path = "../../crates/ansi_colors" }

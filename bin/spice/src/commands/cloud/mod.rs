@@ -129,8 +129,8 @@ pub struct MetricsArgs {
     #[arg(long)]
     pub app: Option<String>,
 
-    /// Rate window for counter metrics (disk I/O)
-    #[arg(long, value_parser = ["1m", "5m", "15m"])]
+    /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
+    #[arg(long, value_parser = parse_window)]
     pub window: Option<String>,
 }
 #[derive(Args, Debug)]
@@ -1031,14 +1031,20 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
         return Ok(());
     }
 
+    let has_window = args.window.is_some();
+    let window_label = args
+        .window
+        .as_deref()
+        .map_or(String::new(), |w| format!(" ({w})"));
+
     let mut table = TableOutput::new(vec![
         "POD",
         "CPU %",
         "MEMORY",
-        "DISK READ",
-        "DISK READ IOPS",
-        "DISK WRITE",
-        "DISK WRITE IOPS",
+        &format!("DISK READ{window_label}"),
+        &format!("DISK READ IOPS{window_label}"),
+        &format!("DISK WRITE{window_label}"),
+        &format!("DISK WRITE IOPS{window_label}"),
     ]);
 
     for (pod, m) in &response.metrics {
@@ -1049,11 +1055,11 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
             m.memory_usage_bytes
                 .map_or_else(|| "-".to_string(), format_bytes),
             m.disk_read_bytes
-                .map_or_else(|| "-".to_string(), format_bytes_f64),
+                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
             m.disk_read_iops
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
             m.disk_write_bytes
-                .map_or_else(|| "-".to_string(), format_bytes_f64),
+                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
             m.disk_write_iops
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
         ]);
@@ -1108,25 +1114,46 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_bytes_f64(bytes: f64) -> String {
+fn format_bytes_f64(bytes: f64, is_windowed: bool) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
 
-    if bytes >= GIB {
-        format!("{:.1} GiB/s", bytes / GIB)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB/s", bytes / MIB)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB/s", bytes / KIB)
+    if is_windowed {
+        // increase() over window — show as a delta amount
+        if bytes >= GIB {
+            format!("{:.1} GiB", bytes / GIB)
+        } else if bytes >= MIB {
+            format!("{:.1} MiB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.1} KiB", bytes / KIB)
+        } else {
+            format!("{bytes:.0} B")
+        }
     } else {
-        format!("{bytes:.0} B/s")
+        // Raw cumulative counter — show total bytes
+        if bytes >= GIB {
+            format!("{:.1} GiB", bytes / GIB)
+        } else if bytes >= MIB {
+            format!("{:.1} MiB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.1} KiB", bytes / KIB)
+        } else {
+            format!("{bytes:.0} B")
+        }
     }
 }
 
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+/// Validate that `--window` parses as a duration via `fundu`.
+fn parse_window(s: &str) -> std::result::Result<String, String> {
+    fundu::parse_duration(s)
+        .map(|_| s.to_string())
+        .map_err(|e| format!("invalid duration '{s}': {e}"))
+}
 
 /// Get the app name from the flag or the linked app.
 fn require_app(flag_value: Option<&str>) -> Result<String> {

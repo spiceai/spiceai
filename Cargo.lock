@@ -17933,6 +17933,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "flate2",
+ "fundu",
  "futures",
  "humantime",
  "nix 0.29.0",

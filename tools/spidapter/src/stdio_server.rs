@@ -67,6 +67,51 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(ToString::to_string)
 }
 
+/// Average non-`None` `f64` values extracted from pods.
+fn avg_opt(
+    pods: &[&spice_cloud_client::types::PodMetrics],
+    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
+) -> Option<f64> {
+    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
+        if let Some(v) = f(p) {
+            (s + v, c + 1)
+        } else {
+            (s, c)
+        }
+    });
+    (count > 0).then_some(sum / count as f64)
+}
+
+/// Sum non-`None` `u64` values extracted from pods.
+fn sum_opt_u64(
+    pods: &[&spice_cloud_client::types::PodMetrics],
+    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<u64>,
+) -> Option<u64> {
+    let (sum, any) = pods.iter().fold((0_u64, false), |(s, _), p| {
+        if let Some(v) = f(p) {
+            (s.saturating_add(v), true)
+        } else {
+            (s, false)
+        }
+    });
+    any.then_some(sum)
+}
+
+/// Sum non-`None` `f64` values and convert to `u64`.
+fn sum_opt_f64_as_u64(
+    pods: &[&spice_cloud_client::types::PodMetrics],
+    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
+) -> Option<u64> {
+    let (sum, any) = pods.iter().fold((0.0_f64, false), |(s, _), p| {
+        if let Some(v) = f(p) {
+            (s + v, true)
+        } else {
+            (s, false)
+        }
+    });
+    any.then_some(sum as u64)
+}
+
 /// State for an active benchmark run provisioned via `setup`.
 struct RunState {
     /// Spice Cloud app ID.
@@ -169,40 +214,17 @@ impl Handler for SpidapterHandler {
 
         let pods = cloud_metrics.metrics.values().collect::<Vec<_>>();
 
-        let resource = if pods.is_empty() {
-            ResourceMetrics::default()
-        } else {
-            let avg_cpu = match pods
-                .iter()
-                .filter_map(|p| p.cpu_usage_percent.is_some().then_some(1.0))
-                .sum::<f64>()
-            {
-                0.0 => None,
-                n => Some(pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>() / n),
-            };
-
-            let total_memory = match pods
-                .iter()
-                .filter_map(|p| p.memory_usage_bytes.is_some().then_some(1_u64))
-                .sum::<u64>()
-            {
-                0 => None,
-                n => Some(
-                    pods.iter()
-                        .filter_map(|p| p.memory_usage_bytes)
-                        .sum::<u64>()
-                        / n,
-                ),
-            };
-            ResourceMetrics {
-                cpu_usage_percent: avg_cpu,
-                memory_usage_bytes: total_memory,
-                disk_read_bytes: None,
-                disk_write_bytes: None,
-                disk_read_iops: None,
-                disk_write_iops: None,
-            }
-        };
+        let resource = pods
+            .is_empty()
+            .then(|| ResourceMetrics {
+                cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
+                disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
+                disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
+                disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
+                disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
+            })
+            .unwrap_or_default();
 
         let ingestion = cloud_metrics
             .ingestion
@@ -213,7 +235,10 @@ impl Handler for SpidapterHandler {
             })
             .unwrap_or_default();
 
-        Ok(MetricsResponse { resource, ingestion })
+        Ok(MetricsResponse {
+            resource,
+            ingestion,
+        })
     }
 
     async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
