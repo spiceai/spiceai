@@ -281,7 +281,7 @@ impl ExecutorRegistry {
     fn get_partitions_legacy(
         &self,
         table: &TableReference,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
         let Ok(partitions) = self.partitions.try_read() else {
             tracing::warn!(
@@ -312,7 +312,7 @@ impl ExecutorRegistry {
                     executor_id,
                     client.clone(),
                     table.clone(),
-                    Arc::clone(&schema),
+                    Arc::clone(schema),
                     Arc::new(CookieStore::new()),
                 )) as Arc<dyn TableProvider>;
 
