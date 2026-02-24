@@ -67,9 +67,9 @@ where
 {
     let mut seq = serializer.serialize_seq(Some(partition_by.len()))?;
 
-    for item in partition_by {
-        // If the name is auto-generated (matches "expr{number}"), serialize as just the expression string
-        if item.name.starts_with("expr") && item.name[4..].parse::<usize>().is_ok() {
+    for (idx, item) in partition_by.iter().enumerate() {
+        // If the name is auto-generated for this position (matches "expr{idx}"), serialize as just the expression string
+        if item.name == format!("expr{idx}") {
             seq.serialize_element(&item.expression)?;
         } else {
             // Otherwise, serialize as an object with the custom name
