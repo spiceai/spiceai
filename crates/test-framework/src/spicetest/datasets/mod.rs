@@ -63,24 +63,40 @@ impl EndCondition {
     }
 }
 
-#[derive(Default)]
-#[expect(clippy::struct_excessive_bools)]
 pub struct NotStarted {
     query_set: Vec<Query>,
     end_condition: EndCondition,
     query_count: usize,
     parallel_count: usize,
     validate: bool,
-    disable_caching: bool,
     scale_factor: f64,
-    http_client: bool,
-    distributed_mode: bool,
+    query_executor: Option<Box<dyn crate::execution::QueryExecutor>>,
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
     reference_schema: Option<String>,
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     query_duration_threshold: Option<Duration>,
     query_set_type: Option<QuerySet>,
     query_overrides: Option<QueryOverrides>,
+}
+
+impl Default for NotStarted {
+    fn default() -> Self {
+        Self {
+            query_set: Vec::new(),
+            end_condition: EndCondition::default(),
+            query_count: 0,
+            parallel_count: 0,
+            validate: false,
+            scale_factor: 1.0,
+            query_executor: None,
+            validation_data: None,
+            reference_schema: None,
+            streaming_metrics_sender: None,
+            query_duration_threshold: None,
+            query_set_type: None,
+            query_overrides: None,
+        }
+    }
 }
 
 impl NotStarted {
@@ -90,8 +106,11 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_disable_caching(mut self, disable_caching: bool) -> Self {
-        self.disable_caching = disable_caching;
+    pub fn with_query_executor(
+        mut self,
+        executor: Box<dyn crate::execution::QueryExecutor>,
+    ) -> Self {
+        self.query_executor = Some(executor);
         self
     }
 
@@ -123,18 +142,6 @@ impl NotStarted {
     #[must_use]
     pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
         self.scale_factor = scale_factor;
-        self
-    }
-
-    #[must_use]
-    pub fn with_http_client(mut self, http_client: bool) -> Self {
-        self.http_client = http_client;
-        self
-    }
-
-    #[must_use]
-    pub fn with_distributed_mode(mut self, distributed_mode: bool) -> Self {
-        self.distributed_mode = distributed_mode;
         self
     }
 
@@ -232,7 +239,7 @@ impl SpiceTest<NotStarted> {
         }
     }
 
-    pub async fn start(self) -> Result<SpiceTest<Running>> {
+    pub fn start(mut self) -> Result<SpiceTest<Running>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
@@ -241,13 +248,19 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
+        // Ensure executor is configured
+        let executor = self
+            .state
+            .query_executor
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Query executor not configured"))?;
+
         let multi = if self.use_progress_bars {
             Some(MultiProgress::new())
         } else {
             None
         };
 
-        let http_client = self.get_spiced()?.http_client()?;
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
         let row_count_validation_skip_queries: Vec<String> = self
@@ -272,6 +285,7 @@ impl SpiceTest<NotStarted> {
                 self.state.query_set.clone(),
                 self.state.end_condition,
                 self.name.clone(),
+                executor.clone(),
             )
             .with_explain_plan_snapshot(self.explain_plan_snapshot)
             .with_results_snapshot(self.results_snapshot_predicate)
@@ -282,21 +296,6 @@ impl SpiceTest<NotStarted> {
 
             if let Some(multi) = &multi {
                 worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
-            }
-
-            if self.state.distributed_mode {
-                // Distributed mode uses the /v1/queries async API
-                worker = worker
-                    .with_http_client(http_client.clone())
-                    .with_distributed_mode(true);
-            } else if self.state.http_client {
-                worker = worker.with_http_client(http_client.clone());
-            } else {
-                let spice_client = self
-                    .get_spiced()?
-                    .spice_client(self.api_key.clone(), self.state.disable_caching)
-                    .await?;
-                worker = worker.with_flight_client(spice_client);
             }
 
             if let Some(validation_data) = &self.state.validation_data {

@@ -506,11 +506,19 @@ async fn sql_schema_describe(
         .send()
         .await?;
 
-    let json: Value = response.json().await?;
+    let mut json: Value = response.json().await?;
+    if let Some(schema) = json.get_mut("schema")
+        && let Some(fields) = schema.get_mut("fields")
+    {
+        let fields: Vec<Field> = serde_json::from_value(fields.take()).map_err(|e| {
+            anyhow::anyhow!("Failed to deserialize fields from DESCRIBE schema: {e}")
+        })?;
+        return Ok(Schema::new(fields));
+    }
 
     let Some(data) = json.get("data").and_then(Value::as_array) else {
         return Err(anyhow::anyhow!(
-            "Failed to extract data from DESCRIBE response"
+            "Failed to extract schema fields or data from DESCRIBE response"
         ));
     };
 
@@ -532,6 +540,7 @@ async fn sql_schema_describe(
 
         fields.push(Field::new(column_name, data_type, nullable));
     }
+
     Ok(Schema::new(fields))
 }
 
