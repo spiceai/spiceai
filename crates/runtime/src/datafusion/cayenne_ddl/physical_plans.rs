@@ -44,7 +44,57 @@ use datafusion_table_providers::UnsupportedTypeAction;
 
 use super::get_cayenne_provider;
 use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
+
+/// Maps an Arrow [`DataType`] to a SQL type string suitable for DDL forwarding.
+///
+/// Returns a SQL type that DataFusion's SQL parser can understand in a
+/// `CREATE TABLE` statement.
+fn arrow_datatype_to_sql(dt: &DataType) -> String {
+    match dt {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INT".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt8 => "TINYINT UNSIGNED".to_string(),
+        DataType::UInt16 => "SMALLINT UNSIGNED".to_string(),
+        DataType::UInt32 => "INT UNSIGNED".to_string(),
+        DataType::UInt64 => "BIGINT UNSIGNED".to_string(),
+        DataType::Float16 => "FLOAT".to_string(),
+        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BYTEA".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+            format!("DECIMAL({p},{s})")
+        }
+        other => format!("{other}"),
+    }
+}
+
+/// Forwards a DDL SQL statement to all connected executor nodes.
+///
+/// Iterates over [`ExecutorRegistry::flight_sql_clients`] and sends the SQL
+/// via `FlightSqlClient::execute`. Failures are logged as warnings but do not
+/// cause the overall operation to fail (partial failure is acceptable for MVP).
+async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) {
+    let clients = executor_registry.flight_sql_clients.read().await;
+    for (executor_id, client) in clients.iter() {
+        let mut client = client.clone();
+        match client.execute(sql.to_string(), None).await {
+            Ok(_) => {
+                tracing::info!(executor_id, sql, "Forwarded Cayenne DDL to executor");
+            }
+            Err(e) => {
+                tracing::warn!(executor_id, sql, error = %e, "Failed to forward Cayenne DDL to executor");
+            }
+        }
+    }
+}
 
 /// Creates a result schema for DDL operations (single "result" column).
 fn ddl_result_schema() -> SchemaRef {
@@ -73,6 +123,7 @@ pub struct CayenneCreateTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
     properties: PlanProperties,
 }
 
@@ -97,6 +148,7 @@ impl CayenneCreateTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -113,6 +165,7 @@ impl CayenneCreateTableExec {
             df_catalog_name,
             df_schema_name,
             catalog_list,
+            executor_registry,
             properties,
         }
     }
@@ -163,6 +216,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let df_catalog_name = self.df_catalog_name.clone();
         let df_schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
+        let executor_registry = self.executor_registry.clone();
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
@@ -257,6 +311,28 @@ impl ExecutionPlan for CayenneCreateTableExec {
             };
 
             schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
+
+            // Forward the CREATE TABLE DDL to executor nodes
+            if let Some(ref registry) = executor_registry {
+                let columns_sql: Vec<String> = arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let null_str = if f.is_nullable() { "" } else { " NOT NULL" };
+                        format!(
+                            "\"{}\" {}{}",
+                            f.name(),
+                            arrow_datatype_to_sql(f.data_type()),
+                            null_str,
+                        )
+                    })
+                    .collect();
+                let ddl_sql = format!(
+                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
+                    columns_sql.join(", ")
+                );
+                forward_ddl_to_executors(registry, &ddl_sql).await;
+            }
 
             let batch = RecordBatch::try_new(
                 result_schema,
@@ -429,6 +505,7 @@ pub struct CayenneDropTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
     properties: PlanProperties,
 }
 
@@ -451,6 +528,7 @@ impl CayenneDropTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -465,6 +543,7 @@ impl CayenneDropTableExec {
             df_catalog_name,
             df_schema_name,
             catalog_list,
+            executor_registry,
             properties,
         }
     }
@@ -514,6 +593,7 @@ impl ExecutionPlan for CayenneDropTableExec {
         let df_catalog_name = self.df_catalog_name.clone();
         let df_schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
+        let executor_registry = self.executor_registry.clone();
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
@@ -561,6 +641,14 @@ impl ExecutionPlan for CayenneDropTableExec {
             // Deregister from the DataFusion catalog
             if let Some(schema_provider) = df_catalog.schema(&df_schema_name) {
                 let _ = schema_provider.deregister_table(&table_name);
+            }
+
+            // Forward the DROP TABLE DDL to executor nodes
+            if let Some(ref registry) = executor_registry {
+                let ddl_sql = format!(
+                    "DROP TABLE IF EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\""
+                );
+                forward_ddl_to_executors(registry, &ddl_sql).await;
             }
 
             let batch = RecordBatch::try_new(

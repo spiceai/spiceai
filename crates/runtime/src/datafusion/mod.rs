@@ -48,7 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::{ExecutorControlStreamRegistry, ResolvedClusterConfig},
+    crate::cluster::{ExecutorControlStreamRegistry, ExecutorRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -221,6 +221,9 @@ pub enum Error {
         table_name: String,
         source: DataFusionError,
     },
+
+    #[snafu(display("No executors available to forward write for table {table_name}"))]
+    NoExecutorsAvailable { table_name: String },
 
     #[snafu(display("Failed to refresh the dataset {dataset_name}. {source}"))]
     UnableToTriggerRefresh {
@@ -435,6 +438,8 @@ pub struct DataFusion {
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
+    /// Executor registry for distributed write forwarding (scheduler mode only).
+    pub(crate) executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1002,6 +1007,16 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
+        // In distributed scheduler mode, forward Cayenne table writes to an executor
+        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
+            let streaming_update = StreamingDataUpdate::try_from(data_update)
+                .map_err(find_datafusion_root)
+                .context(UnableToCreateStreamingUpdateSnafu)?;
+            return self
+                .forward_write_to_executor(table_reference, streaming_update)
+                .await;
+        }
+
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1059,6 +1074,13 @@ impl DataFusion {
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
 
+        // In distributed scheduler mode, forward Cayenne table writes to an executor
+        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
+            return self
+                .forward_write_to_executor(table_reference, streaming_update)
+                .await;
+        }
+
         let overwrite = match streaming_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1083,6 +1105,130 @@ impl DataFusion {
             .context(UnableToExecuteTableInsertSnafu {
                 table_name: table_reference.to_string(),
             })?;
+
+        Ok(())
+    }
+
+    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
+    /// meaning the write should be forwarded to an executor.
+    fn should_forward_cayenne_write(
+        &self,
+        _table_reference: &TableReference,
+        table_provider: &dyn TableProvider,
+    ) -> bool {
+        // Only forward if we have an executor registry (i.e., we are a scheduler)
+        let Some(executor_registry) = &self.executor_registry else {
+            return false;
+        };
+
+        // Check if the table provider is a CayenneTableProvider
+        if table_provider
+            .as_any()
+            .downcast_ref::<cayenne::CayenneTableProvider>()
+            .is_none()
+        {
+            return false;
+        }
+
+        // Check if there are any connected executors with flight clients
+        let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+            return false;
+        };
+        !clients.is_empty()
+    }
+
+    /// Forwards a streaming write to an executor node via Flight DoPut.
+    async fn forward_write_to_executor(
+        &self,
+        table_reference: &TableReference,
+        streaming_update: StreamingDataUpdate,
+    ) -> Result<()> {
+        let Some(executor_registry) = self.executor_registry.as_ref() else {
+            return NoExecutorsAvailableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail();
+        };
+
+        // Get an executor's FlightSqlClient
+        let client = {
+            let clients = executor_registry.flight_sql_clients.read().await;
+            let Some((_executor_id, client)) = clients.iter().next() else {
+                tracing::error!(
+                    "No executors available to forward Cayenne write for table {table_reference}"
+                );
+                return NoExecutorsAvailableSnafu {
+                    table_name: table_reference.to_string(),
+                }
+                .fail();
+            };
+            client.clone()
+        };
+
+        tracing::info!("Forwarding Cayenne write for table {table_reference} to executor");
+
+        // Build FlightDescriptor for the table reference
+        let descriptor =
+            arrow_flight::FlightDescriptor::new_path(vec![table_reference.to_string()]);
+
+        // Collect batches from the streaming update and send via DoPut
+        let schema = streaming_update.data.schema();
+        let stream = streaming_update.data;
+
+        // Build flight data from the record batch stream
+        let mut flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::unfold(stream, |mut s| async move {
+                use futures::StreamExt;
+                match s.next().await {
+                    Some(Ok(batch)) => Some((Ok(batch), s)),
+                    Some(Err(e)) => {
+                        Some((Err(arrow_flight::error::FlightError::Arrow(arrow_schema::ArrowError::ExternalError(Box::new(e)))), s))
+                    }
+                    None => None,
+                }
+            }));
+
+        // Set the flight descriptor on the first message
+        use futures::StreamExt;
+        let mut flight_data_vec = Vec::new();
+        let mut first = true;
+        while let Some(data) = flight_data_encoder.next().await {
+            let mut fd = data.map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_reference.to_string(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+            if first {
+                fd.flight_descriptor = Some(descriptor.clone());
+                first = false;
+            }
+            flight_data_vec.push(fd);
+        }
+
+        let request = futures::stream::iter(flight_data_vec);
+        let mut inner_client = client.into_inner();
+        let response = inner_client
+            .do_put(request)
+            .await
+            .map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_reference.to_string(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+
+        // Wait for the server to acknowledge
+        use futures::TryStreamExt;
+        response
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_reference.to_string(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+
+        tracing::info!(
+            "Successfully forwarded Cayenne write for table {table_reference} to executor"
+        );
 
         Ok(())
     }

@@ -30,15 +30,21 @@ use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, Caye
 use super::physical_plans::{
     CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
 };
+use crate::cluster::executor_registry::ExecutorRegistry;
 
 /// Extension planner for Cayenne DDL operations.
+///
+/// When an [`ExecutorRegistry`] is provided (scheduler mode), the physical
+/// plans will forward DDL statements to executor nodes after local execution.
 #[derive(Debug)]
-pub struct CayenneDdlExtensionPlanner;
+pub struct CayenneDdlExtensionPlanner {
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+}
 
 impl CayenneDdlExtensionPlanner {
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(executor_registry: Option<Arc<ExecutorRegistry>>) -> Self {
+        Self { executor_registry }
     }
 }
 
@@ -69,6 +75,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 create.df_catalog_name.clone(),
                 create.df_schema_name.clone(),
                 catalog_list,
+                self.executor_registry.clone(),
             ))));
         }
 
@@ -88,6 +95,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 drop.df_catalog_name.clone(),
                 drop.df_schema_name.clone(),
                 catalog_list,
+                self.executor_registry.clone(),
             ))));
         }
 

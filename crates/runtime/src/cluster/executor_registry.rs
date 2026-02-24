@@ -35,6 +35,8 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::accelerated_table::AcceleratedTable;
+#[cfg(not(windows))]
+use cayenne::CayenneTableProvider;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -266,16 +268,20 @@ impl ExecutorRegistry {
 }
 
 impl TablePartitionProvider for ExecutorRegistry {
-    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
+    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables and Cayenne tables.
     fn should_partition(&self, tbl: &TableScan) -> bool {
         let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
             return false;
         };
-        default
-            .table_provider
-            .as_any()
-            .downcast_ref::<AcceleratedTable>()
-            .is_some()
+        let tp = &default.table_provider;
+        if tp.as_any().downcast_ref::<AcceleratedTable>().is_some() {
+            return true;
+        }
+        #[cfg(not(windows))]
+        if tp.as_any().downcast_ref::<CayenneTableProvider>().is_some() {
+            return true;
+        }
+        false
     }
 
     fn get_partitions(
