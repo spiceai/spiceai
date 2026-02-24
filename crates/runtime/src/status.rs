@@ -83,7 +83,7 @@ impl RuntimeStatus {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = notifiers.get(component_name) {
-            let _ = sender.send(status.clone()); // Ignore error if no receivers
+            let _ = sender.send(status); // Ignore error if no receivers
         }
     }
 
