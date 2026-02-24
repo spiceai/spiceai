@@ -34,7 +34,7 @@ use spicepod::{
         embeddings::ColumnEmbeddingConfig,
     },
     metric::Metrics,
-    param::Params,
+    component::dataset::DatasetParams,
     semantic::Column,
     vector::VectorStore,
 };
@@ -122,7 +122,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             params: dataset
                 .params
                 .as_ref()
-                .map(Params::as_string_map)
+                .map(DatasetParams::as_string_map)
                 .unwrap_or_default(),
             metadata: dataset
                 .metadata

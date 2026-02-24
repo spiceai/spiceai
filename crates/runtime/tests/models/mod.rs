@@ -24,10 +24,7 @@ use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
-use spicepod::{
-    component::{dataset::Dataset, view::View},
-    param::Params,
-};
+use spicepod::component::{dataset::{Dataset, DatasetParams}, view::View};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -162,7 +159,7 @@ pub(crate) fn create_api_bindings_config() -> Config {
 
 fn get_taxi_trips_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
@@ -183,7 +180,7 @@ fn get_small_clickbench_dataset(name: &str) -> Dataset {
         "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
         name,
     );
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
@@ -224,7 +221,7 @@ fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
         "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
         spice_name.unwrap_or("megascience"),
     );
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![("client_timeout".to_string(), "120s".to_string())]
             .into_iter()
             .collect(),
@@ -304,7 +301,7 @@ pub fn get_tpcds_dataset(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
         spice_name.unwrap_or(ds_name),
     );
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),

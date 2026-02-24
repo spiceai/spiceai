@@ -1,0 +1,12 @@
+[package]
+name = "secret-ref-detect"
+description = "Detects secret references (e.g. ${store:key}) in configuration strings"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+logos.workspace = true

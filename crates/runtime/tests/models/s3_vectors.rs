@@ -21,7 +21,7 @@ use s3_vectors::{Client, DeleteIndexInput, S3Vectors};
 use serde_json::json;
 use spicepod::{
     acceleration::Acceleration,
-    component::dataset::Dataset,
+    component::dataset::{Dataset, DatasetParams},
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig},
 };
@@ -984,7 +984,7 @@ pub fn get_package_delivery_dataset(
         format!("s3://spiceai-public-datasets/test_array_json/package-delivery/{path}"),
         ds_name.to_string(),
     );
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "json".to_string()),
             ("json_format".to_string(), "array".to_string()),

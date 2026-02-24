@@ -26,6 +26,9 @@ use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
 use crate::metric::Metrics;
 use crate::param::Params;
+use crate::param::connectors::{
+    ClickhouseParams, DuckDbParams, MysqlParams, PostgresParams,
+};
 use crate::semantic::Column;
 use crate::vector::VectorStore;
 
@@ -84,6 +87,108 @@ pub enum CheckAvailability {
     Disabled,
 }
 
+/// Typed, per-connector dataset parameters.
+///
+/// Known connectors get typed param structs with `SecretParam<T>` fields.
+/// Unknown connectors fall back to `Generic(Params)`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(untagged)]
+pub enum DatasetParams {
+    Postgres(PostgresParams),
+    DuckDb(DuckDbParams),
+    Clickhouse(ClickhouseParams),
+    Mysql(MysqlParams),
+    Generic(Params),
+}
+
+impl DatasetParams {
+    /// Converts typed params into a flat `HashMap<String, String>` for backward
+    /// compatibility with the existing runtime parameter pipeline.
+    #[must_use]
+    pub fn as_string_map(&self) -> HashMap<String, String> {
+        match self {
+            DatasetParams::Postgres(p) => postgres_to_map(p),
+            DatasetParams::DuckDb(p) => duckdb_to_map(p),
+            DatasetParams::Clickhouse(p) => clickhouse_to_map(p),
+            DatasetParams::Mysql(p) => mysql_to_map(p),
+            DatasetParams::Generic(p) => p.as_string_map(),
+        }
+    }
+
+    /// Constructs a `Generic` variant from a flat string map.
+    #[must_use]
+    pub fn from_string_map(map: HashMap<String, String>) -> Self {
+        DatasetParams::Generic(Params::from_string_map(map))
+    }
+
+    /// Looks up a key in the params, returning its string value.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.as_string_map().remove(key)
+    }
+}
+
+fn insert_opt<T: std::fmt::Display>(
+    map: &mut HashMap<String, String>,
+    key: &str,
+    val: &Option<crate::param::SecretParam<T>>,
+) {
+    if let Some(v) = val {
+        map.insert(key.to_string(), v.as_string());
+    }
+}
+
+fn postgres_to_map(p: &PostgresParams) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    insert_opt(&mut m, "pg_connection_string", &p.connection_string);
+    insert_opt(&mut m, "pg_user", &p.user);
+    insert_opt(&mut m, "pg_pass", &p.pass);
+    insert_opt(&mut m, "pg_host", &p.host);
+    insert_opt(&mut m, "pg_port", &p.port);
+    insert_opt(&mut m, "pg_db", &p.db);
+    insert_opt(&mut m, "pg_sslmode", &p.sslmode);
+    insert_opt(&mut m, "pg_sslrootcert", &p.sslrootcert);
+    insert_opt(&mut m, "connection_pool_min_idle", &p.connection_pool_min_idle);
+    insert_opt(&mut m, "connection_pool_size", &p.connection_pool_size);
+    m
+}
+
+fn duckdb_to_map(p: &DuckDbParams) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    insert_opt(&mut m, "duckdb_open", &p.open);
+    m
+}
+
+fn clickhouse_to_map(p: &ClickhouseParams) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    insert_opt(&mut m, "clickhouse_connection_string", &p.connection_string);
+    insert_opt(&mut m, "clickhouse_pass", &p.pass);
+    insert_opt(&mut m, "clickhouse_user", &p.user);
+    insert_opt(&mut m, "clickhouse_host", &p.host);
+    insert_opt(&mut m, "clickhouse_tcp_port", &p.tcp_port);
+    insert_opt(&mut m, "clickhouse_db", &p.db);
+    insert_opt(&mut m, "clickhouse_secure", &p.secure);
+    insert_opt(&mut m, "clickhouse_connection_timeout", &p.connection_timeout);
+    m
+}
+
+fn mysql_to_map(p: &MysqlParams) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    insert_opt(&mut m, "mysql_connection_string", &p.connection_string);
+    insert_opt(&mut m, "mysql_user", &p.user);
+    insert_opt(&mut m, "mysql_pass", &p.pass);
+    insert_opt(&mut m, "mysql_host", &p.host);
+    insert_opt(&mut m, "mysql_tcp_port", &p.tcp_port);
+    insert_opt(&mut m, "mysql_db", &p.db);
+    insert_opt(&mut m, "mysql_sslmode", &p.sslmode);
+    insert_opt(&mut m, "mysql_sslrootcert", &p.sslrootcert);
+    insert_opt(&mut m, "mysql_pool_min", &p.pool_min);
+    insert_opt(&mut m, "mysql_pool_max", &p.pool_max);
+    insert_opt(&mut m, "mysql_time_zone", &p.time_zone);
+    m
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -107,7 +212,7 @@ pub struct Dataset {
     pub access: AccessMode,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Params>,
+    pub params: Option<DatasetParams>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_metadata_table: Option<bool>,
@@ -190,7 +295,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn with_params(self, params: Params) -> Self {
+    pub fn with_params(self, params: DatasetParams) -> Self {
         Self {
             params: Some(params),
             ..self
@@ -301,7 +406,69 @@ pub enum InvalidTypeAction {
     Ignore,
 }
 
-/// Helper struct for deserializing Dataset with custom logic for handling `InvalidTypeAction` migration
+/// Extract the connector prefix from a `from` field value.
+///
+/// Examples:
+/// - `"postgres:my_table"` → `Some("postgres")`
+/// - `"mysql://host/db"` → `Some("mysql")`
+/// - `"duckdb:path/to/file"` → `Some("duckdb")`
+/// - `"file://test.csv"` → `Some("file")`
+fn extract_connector_prefix(from: &str) -> Option<&str> {
+    // Check for `://` first, then `:` (but not windows drive letters like `C:`)
+    if let Some(idx) = from.find("://") {
+        return Some(&from[..idx]);
+    }
+    if let Some(idx) = from.find(':') {
+        let prefix = &from[..idx];
+        // Must look like a connector name, not a windows drive letter
+        if prefix.len() > 1 && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+/// Returns the key prefix to strip for a given connector prefix.
+fn connector_key_prefix(connector: &str) -> Option<&'static str> {
+    match connector {
+        "postgres" => Some("pg_"),
+        "mysql" => Some("mysql_"),
+        "clickhouse" => Some("clickhouse_"),
+        "duckdb" => Some("duckdb_"),
+        _ => None,
+    }
+}
+
+/// Strips connector-specific prefixes from keys in a YAML map value.
+/// For example, given prefix `"pg_"`, the key `"pg_host"` becomes `"host"`.
+fn strip_key_prefixes(
+    raw: serde_value::Value,
+    prefix: &str,
+) -> serde_value::Value {
+    if let serde_value::Value::Map(map) = raw {
+        let new_map = map
+            .into_iter()
+            .map(|(k, v)| {
+                let new_key = if let serde_value::Value::String(ref s) = k {
+                    if let Some(stripped) = s.strip_prefix(prefix) {
+                        serde_value::Value::String(stripped.to_owned())
+                    } else {
+                        k
+                    }
+                } else {
+                    k
+                };
+                (new_key, v)
+            })
+            .collect();
+        serde_value::Value::Map(new_map)
+    } else {
+        raw
+    }
+}
+
+/// Helper struct for deserializing Dataset with custom logic for handling
+/// `InvalidTypeAction` migration and typed connector params.
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,7 +485,7 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "is_default", alias = "mode")]
     access: AccessMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    params: Option<Params>,
+    params: Option<serde_value::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     has_metadata_table: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,6 +520,49 @@ struct DatasetDeserializer {
     check_availability: CheckAvailability,
 }
 
+/// Deserialize a raw `serde_value::Value` into a typed connector params struct,
+/// dispatching on the connector prefix extracted from the `from` field.
+fn deserialize_typed_params(
+    from: &str,
+    raw: serde_value::Value,
+) -> Result<DatasetParams, String> {
+    let connector = extract_connector_prefix(from);
+
+    match connector {
+        Some("postgres") => {
+            let stripped = strip_key_prefixes(raw, connector_key_prefix("postgres").unwrap_or(""));
+            PostgresParams::deserialize(stripped)
+                .map(DatasetParams::Postgres)
+                .map_err(|e| format!("invalid postgres params: {e}"))
+        }
+        Some("duckdb") => {
+            let stripped = strip_key_prefixes(raw, connector_key_prefix("duckdb").unwrap_or(""));
+            DuckDbParams::deserialize(stripped)
+                .map(DatasetParams::DuckDb)
+                .map_err(|e| format!("invalid duckdb params: {e}"))
+        }
+        Some("clickhouse") => {
+            let stripped =
+                strip_key_prefixes(raw, connector_key_prefix("clickhouse").unwrap_or(""));
+            ClickhouseParams::deserialize(stripped)
+                .map(DatasetParams::Clickhouse)
+                .map_err(|e| format!("invalid clickhouse params: {e}"))
+        }
+        Some("mysql") => {
+            let stripped = strip_key_prefixes(raw, connector_key_prefix("mysql").unwrap_or(""));
+            MysqlParams::deserialize(stripped)
+                .map(DatasetParams::Mysql)
+                .map_err(|e| format!("invalid mysql params: {e}"))
+        }
+        _ => {
+            // Fallback to generic Params
+            Params::deserialize(raw)
+                .map(DatasetParams::Generic)
+                .map_err(|e| format!("invalid params: {e}"))
+        }
+    }
+}
+
 #[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
@@ -380,6 +590,11 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             (None, None) => None,
         };
 
+        let params = match deserializer.params {
+            Some(raw) => Some(deserialize_typed_params(&deserializer.from, raw)?),
+            None => None,
+        };
+
         Ok(Dataset {
             from: deserializer.from,
             name: deserializer.name,
@@ -387,7 +602,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             metadata: deserializer.metadata,
             columns: deserializer.columns,
             access: deserializer.access,
-            params: deserializer.params,
+            params,
             has_metadata_table: deserializer.has_metadata_table,
             replication: deserializer.replication,
             time_column: deserializer.time_column,
@@ -495,5 +710,144 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.unsupported_type_action, None);
+    }
+
+    #[test]
+    fn test_postgres_typed_params() {
+        let yaml = r#"
+            name: test
+            from: postgres:my_table
+            params:
+                pg_host: localhost
+                pg_port: 5432
+                pg_db: mydb
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        match &dataset.params {
+            Some(DatasetParams::Postgres(p)) => {
+                assert_eq!(
+                    p.host,
+                    Some(crate::param::SecretParam::Plain("localhost".to_string()))
+                );
+                assert_eq!(p.port, Some(crate::param::SecretParam::Plain(5432)));
+                assert_eq!(
+                    p.db,
+                    Some(crate::param::SecretParam::Plain("mydb".to_string()))
+                );
+            }
+            other => panic!("Expected Postgres params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_postgres_typed_params_with_secret_ref() {
+        let yaml = r#"
+            name: test
+            from: postgres:my_table
+            params:
+                pg_host: ${env:PG_HOST}
+                pg_port: 5432
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        match &dataset.params {
+            Some(DatasetParams::Postgres(p)) => {
+                assert_eq!(
+                    p.host,
+                    Some(crate::param::SecretParam::Unresolved(
+                        "${env:PG_HOST}".to_string()
+                    ))
+                );
+                assert_eq!(p.port, Some(crate::param::SecretParam::Plain(5432)));
+            }
+            other => panic!("Expected Postgres params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generic_params_for_unknown_connector() {
+        let yaml = r#"
+            name: test
+            from: file://test.csv
+            params:
+                key1: value1
+                key2: 42
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        match &dataset.params {
+            Some(DatasetParams::Generic(p)) => {
+                let map = p.as_string_map();
+                assert_eq!(map.get("key1"), Some(&"value1".to_string()));
+                assert_eq!(map.get("key2"), Some(&"42".to_string()));
+            }
+            other => panic!("Expected Generic params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dataset_params_as_string_map() {
+        let yaml = r#"
+            name: test
+            from: postgres:my_table
+            params:
+                pg_host: localhost
+                pg_port: 5432
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let map = dataset.params.as_ref().map(DatasetParams::as_string_map).unwrap();
+        assert_eq!(map.get("pg_host"), Some(&"localhost".to_string()));
+        assert_eq!(map.get("pg_port"), Some(&"5432".to_string()));
+    }
+
+    #[test]
+    fn test_duckdb_typed_params() {
+        let yaml = r#"
+            name: test
+            from: duckdb:my_table
+            params:
+                duckdb_open: /path/to/file.db
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        match &dataset.params {
+            Some(DatasetParams::DuckDb(p)) => {
+                assert_eq!(
+                    p.open,
+                    Some(crate::param::SecretParam::Plain(
+                        "/path/to/file.db".to_string()
+                    ))
+                );
+            }
+            other => panic!("Expected DuckDb params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_no_params() {
+        let yaml = r"
+            name: test
+            from: test
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert!(dataset.params.is_none());
+    }
+
+    #[test]
+    fn test_extract_connector_prefix() {
+        assert_eq!(extract_connector_prefix("postgres:my_table"), Some("postgres"));
+        assert_eq!(extract_connector_prefix("mysql://host/db"), Some("mysql"));
+        assert_eq!(extract_connector_prefix("duckdb:path/to/file"), Some("duckdb"));
+        assert_eq!(extract_connector_prefix("file://test.csv"), Some("file"));
+        assert_eq!(extract_connector_prefix("clickhouse:table"), Some("clickhouse"));
+        assert_eq!(extract_connector_prefix("just_a_name"), None);
+    }
+
+    #[test]
+    fn test_from_string_map_bridge() {
+        let map = HashMap::from([
+            ("key1".to_string(), "value1".to_string()),
+            ("key2".to_string(), "value2".to_string()),
+        ]);
+        let params = DatasetParams::from_string_map(map.clone());
+        let result = params.as_string_map();
+        assert_eq!(result, map);
     }
 }

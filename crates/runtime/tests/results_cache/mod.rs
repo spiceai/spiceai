@@ -22,9 +22,9 @@ use cache::result::CacheStatus;
 use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
-use spicepod::{
-    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
-    param::Params,
+use spicepod::component::{
+    caching::SQLResultsCacheConfig,
+    dataset::{Dataset, DatasetParams},
 };
 
 use crate::{
@@ -37,7 +37,7 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
         format!("s3://spiceai-demo-datasets/tpch/{name}/"),
         name.to_string(),
     );
-    test_dataset.params = Some(Params::from_string_map(
+    test_dataset.params = Some(DatasetParams::from_string_map(
         vec![("file_format".to_string(), "parquet".to_string())]
             .into_iter()
             .collect(),

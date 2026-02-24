@@ -28,7 +28,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
-use spicepod::param::Params;
+use spicepod::component::dataset::DatasetParams;
 use spicepod::partitioning::PartitionedBy;
 use test_framework::queries::QuerySet;
 
@@ -37,7 +37,7 @@ fn make_s3_tpch_dataset(name: &str, partition_by: Option<String>) -> Dataset {
         format!("s3://spiceai-demo-datasets/tpch/{name}/"),
         name.to_string(),
     );
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![("file_format".to_string(), "parquet".to_string())]
             .into_iter()
             .collect(),

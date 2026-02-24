@@ -16,6 +16,7 @@ futures.workspace = true
 object_store = { workspace = true, optional = true }
 regex.workspace = true
 schemars = { workspace = true, optional = true }
+secret-ref-detect = { path = "../secret-ref-detect" }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde-value = "0.7.0"
 serde_json.workspace = true

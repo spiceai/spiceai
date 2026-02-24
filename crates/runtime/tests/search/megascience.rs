@@ -20,8 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spicepod::{
     acceleration::Acceleration,
-    component::{dataset::Dataset, view::View},
-    param::Params,
+    component::{dataset::{Dataset, DatasetParams}, view::View},
     semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
 };
 
@@ -192,7 +191,7 @@ impl TableOptions {
                         "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
                         "megascience",
                     )
-                    .with_params(Params::from_string_map(HashMap::from([(
+                    .with_params(DatasetParams::from_string_map(HashMap::from([(
                         "client_timeout".to_string(),
                         "120s".to_string(),
                     )]))),
@@ -205,7 +204,7 @@ impl TableOptions {
                         "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
                         "qs",
                     )
-                    .with_params(Params::from_string_map(HashMap::from([(
+                    .with_params(DatasetParams::from_string_map(HashMap::from([(
                         "client_timeout".to_string(),
                         "120s".to_string(),
                     )]))),

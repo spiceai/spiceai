@@ -14,4 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub use secret_ref_detect::*;
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::param::SecretParam;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct DuckDbParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<SecretParam<String>>,
+}

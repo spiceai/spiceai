@@ -21,8 +21,7 @@ use futures::{StreamExt, TryStreamExt};
 use secrecy::ExposeSecret;
 use spicepod::{
     acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
-    component::dataset::{Dataset, TimeFormat},
-    param::Params,
+    component::dataset::{Dataset, DatasetParams, TimeFormat},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -317,7 +316,7 @@ SET
                 .into_iter()
                 .map(|(k, v)| (k, v.expose_secret().to_string()))
                 .collect::<HashMap<String, String>>();
-            dataset.params = Some(Params::from_string_map(params));
+            dataset.params = Some(DatasetParams::from_string_map(params));
             dataset.time_column = Some("updated_at".to_string());
             dataset.time_format = Some(TimeFormat::Timestamptz);
             dataset.acceleration = Some(Acceleration {

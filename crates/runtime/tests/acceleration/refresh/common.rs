@@ -11,6 +11,7 @@ use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, IndexType, OnConflictBehavior, RefreshMode};
 use spicepod::component::dataset::{Dataset, TimeFormat};
+use spicepod::component::dataset::DatasetParams;
 use spicepod::param::Params;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ pub(crate) fn get_acceleration_config_full(
 
 pub(crate) fn get_dataset(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:test_table", "test_table");
-    ds.params = Some(Params::from_string_map(
+    ds.params = Some(DatasetParams::from_string_map(
         get_pg_params(port)
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))
@@ -81,7 +82,7 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
 
 pub(crate) fn get_dataset_no_time_column(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:test_table", "test_table");
-    ds.params = Some(Params::from_string_map(
+    ds.params = Some(DatasetParams::from_string_map(
         get_pg_params(port)
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))
@@ -95,7 +96,7 @@ pub(crate) fn get_dataset_no_time_column(port: usize) -> Dataset {
 #[expect(dead_code)]
 pub(crate) fn get_dataset_unix_time(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:test_table", "test_table");
-    ds.params = Some(Params::from_string_map(
+    ds.params = Some(DatasetParams::from_string_map(
         get_pg_params(port)
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))

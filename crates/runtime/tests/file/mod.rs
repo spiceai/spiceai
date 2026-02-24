@@ -20,7 +20,7 @@ use app::AppBuilder;
 
 use runtime::Runtime;
 use spicepod::{
-    component::dataset::Dataset,
+    component::dataset::{Dataset, DatasetParams},
     param::{ParamValue, Params},
 };
 
@@ -58,12 +58,12 @@ pub fn get_raw_file_dataset() -> Result<Dataset, anyhow::Error> {
 
     let mut dataset = Dataset::new(format!("file:{file_path}"), "docs");
 
-    dataset.params = Some(Params {
+    dataset.params = Some(DatasetParams::Generic(Params {
         data: HashMap::from([(
             "file_format".to_string(),
             ParamValue::String("md".to_string()),
         )]),
-    });
+    }));
 
     Ok(dataset)
 }

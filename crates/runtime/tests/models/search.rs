@@ -37,9 +37,8 @@ use runtime::config::Config;
 use serde_json::{Value, json};
 use spicepod::acceleration::Acceleration;
 use spicepod::component::caching::CacheConfig;
-use spicepod::component::dataset::Dataset;
+use spicepod::component::dataset::{Dataset, DatasetParams};
 use spicepod::component::embeddings::EmbeddingChunkConfig;
-use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -263,7 +262,7 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
         "s3://spiceai-public-datasets/integration/tpcds/catalog_page.parquet".to_string(),
         ds_name,
     );
-    ds_tpcds_cp.params = Some(Params::from_string_map(
+    ds_tpcds_cp.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
@@ -1361,7 +1360,7 @@ async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
 #[cfg(feature = "flightsql")]
 #[tokio::test]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
-    use spicepod::{acceleration::Acceleration, param::Params};
+    use spicepod::acceleration::Acceleration;
 
     let api_config = start_app(
         AppBuilder::new("search_app")
@@ -1391,7 +1390,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
         enabled: true,
         ..Default::default()
     });
-    ds.params = Some(Params::from_string_map(params));
+    ds.params = Some(DatasetParams::from_string_map(params));
     ds.columns = vec![
         Column {
             name: "cp_description".to_string(),

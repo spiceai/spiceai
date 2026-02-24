@@ -24,11 +24,11 @@ use crate::{
 };
 
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 
 fn make_spark_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("spark:{path}"), name.to_string());
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![(
             "spark_remote".to_string(),
             format!(

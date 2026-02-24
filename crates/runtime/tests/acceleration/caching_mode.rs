@@ -52,8 +52,7 @@ use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
-    component::dataset::Dataset,
-    param::Params,
+    component::dataset::{Dataset, DatasetParams},
 };
 use std::sync::Arc;
 
@@ -78,7 +77,7 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
         .scope(async {
             // Create HTTP dataset with caching mode
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -210,7 +209,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
         .scope(async {
             // Create HTTP dataset with caching mode
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -424,7 +423,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
         .scope(async {
             // Create HTTP dataset with caching mode
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -642,7 +641,7 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
         .scope(async {
             // Create HTTP dataset with caching mode using Cayenne
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -795,7 +794,7 @@ async fn test_caching_mode_with_sql_results_cache() -> Result<(), anyhow::Error>
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -868,7 +867,7 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![(
                     "allowed_request_paths".to_string(),
                     "/search/people".to_string(),
@@ -985,7 +984,7 @@ async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1061,7 +1060,7 @@ async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> 
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1201,7 +1200,7 @@ async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> 
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1275,7 +1274,7 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1364,7 +1363,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1515,7 +1514,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
     test_request_context()
         .scope(async {
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1707,7 +1706,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
         .scope(async {
             // Create HTTP dataset with caching mode, short TTL, short refresh interval, and retention
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -1866,7 +1865,7 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
         .scope(async {
             // Create parent HTTP dataset with file-mode DuckDB caching
             let mut parent_dataset = Dataset::new("https://api.tvmaze.com", "tvmaze_file");
-            parent_dataset.params = Some(Params::from_string_map(
+            parent_dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -2016,7 +2015,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
 
             // Create parent HTTP dataset with DuckDB caching (memory mode for test)
             let mut parent_dataset = Dataset::new("https://api.tvmaze.com", "tvmaze_parent");
-            parent_dataset.params = Some(Params::from_string_map(
+            parent_dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -2230,7 +2229,7 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
         .scope(async {
             // Create HTTP dataset with caching mode
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -2360,7 +2359,7 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
         .scope(async {
             // Create HTTP dataset with caching mode
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),
@@ -2453,7 +2452,7 @@ async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Err
         .scope(async {
             // Create HTTP dataset with caching mode
             let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 vec![
                     (
                         "allowed_request_paths".to_string(),

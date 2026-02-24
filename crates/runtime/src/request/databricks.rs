@@ -20,6 +20,7 @@ use datafusion::sql::TableReference;
 use http::HeaderMap;
 use runtime_request_context::{Extension, RequestContextBuilder};
 use secrecy::SecretString;
+use spicepod::component::dataset::DatasetParams;
 use spicepod::param::ParamValue;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -129,14 +130,9 @@ impl DatabricksAuthExtension {
                 .datasets
                 .iter()
                 .filter_map(|dataset| {
-                    let params = dataset.params.as_ref()?;
-                    let Some(ParamValue::String(client_id)) =
-                        params.data.get("databricks_client_id")
-                    else {
-                        return None;
-                    };
+                    let client_id = dataset.params.as_ref()?.get("databricks_client_id")?;
 
-                    if !client_ids.contains(client_id) {
+                    if !client_ids.contains(&client_id) {
                         return None;
                     }
 

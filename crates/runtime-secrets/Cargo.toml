@@ -14,6 +14,7 @@ base64.workspace = true
 dotenvy.workspace = true
 indexmap.workspace = true
 logos.workspace = true
+secret-ref-detect = { path = "../secret-ref-detect" }
 reqwest.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true

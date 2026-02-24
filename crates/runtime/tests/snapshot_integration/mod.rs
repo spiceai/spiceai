@@ -55,7 +55,7 @@ use spicepod::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
     },
     component::{
-        dataset::Dataset,
+        dataset::{Dataset, DatasetParams},
         snapshot::{BootstrapOnFailureBehavior, Snapshots},
     },
     param::Params,
@@ -271,7 +271,7 @@ fn build_dataset(
     refresh_on_startup: RefreshOnStartup,
 ) -> Dataset {
     let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(Params::from_string_map(dataset_params.clone()));
+    dataset.params = Some(DatasetParams::from_string_map(dataset_params.clone()));
 
     let acceleration = Acceleration {
         mode: Mode::File,
@@ -2061,7 +2061,7 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
 
             // Build dataset 1 WITH snapshots enabled
             let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
-            dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset1.params = Some(DatasetParams::from_string_map(dataset_params.clone()));
             dataset1.acceleration = Some(Acceleration {
                 mode: Mode::File,
                 engine: Some("cayenne".to_string()),
@@ -2082,7 +2082,7 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
 
             // Build dataset 2 WITHOUT snapshots (disabled)
             let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
-            dataset2.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset2.params = Some(DatasetParams::from_string_map(dataset_params.clone()));
             dataset2.acceleration = Some(Acceleration {
                 mode: Mode::File,
                 engine: Some("cayenne".to_string()),
@@ -2208,7 +2208,7 @@ async fn snapshot_int_test14_cayenne_multiple_datasets_bootstrap() -> Result<()>
 
             // Build dataset 1
             let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
-            dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset1.params = Some(DatasetParams::from_string_map(dataset_params.clone()));
             dataset1.acceleration = Some(Acceleration {
                 mode: Mode::File,
                 engine: Some("cayenne".to_string()),
@@ -2231,7 +2231,7 @@ async fn snapshot_int_test14_cayenne_multiple_datasets_bootstrap() -> Result<()>
 
             // Build dataset 2
             let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
-            dataset2.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset2.params = Some(DatasetParams::from_string_map(dataset_params.clone()));
             dataset2.acceleration = Some(Acceleration {
                 mode: Mode::File,
                 engine: Some("cayenne".to_string()),

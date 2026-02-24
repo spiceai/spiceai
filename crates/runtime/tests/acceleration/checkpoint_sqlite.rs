@@ -26,7 +26,7 @@ use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::acceleration::Mode;
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
-use spicepod::param::Params;
+use spicepod::component::dataset::DatasetParams;
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
@@ -54,7 +54,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 refresh_sql: Some("SELECT * FROM decimal".to_string()),
                 ..Acceleration::default()
             });
-            dataset.params = Some(Params::from_string_map(
+            dataset.params = Some(DatasetParams::from_string_map(
                 [("file_format".to_string(), "parquet".to_string())].into(),
             ));
 

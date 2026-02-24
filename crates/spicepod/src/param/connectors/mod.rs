@@ -14,4 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub use secret_ref_detect::*;
+pub mod clickhouse;
+pub mod duckdb;
+pub mod mysql;
+pub mod postgres;
+
+pub use clickhouse::ClickhouseParams;
+pub use duckdb::DuckDbParams;
+pub use mysql::MysqlParams;
+pub use postgres::PostgresParams;

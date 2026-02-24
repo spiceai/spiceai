@@ -20,7 +20,7 @@ use app::AppBuilder;
 use datafusion_datasource::metadata::MetadataColumn;
 use futures::StreamExt;
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -32,7 +32,7 @@ pub fn get_s3_hive_partitioned_dataset(
     metadata_columns: Vec<MetadataColumn>,
 ) -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-public-datasets/hive_partitioned_data/", name);
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),

@@ -23,7 +23,7 @@ use std::{
 use app::AppBuilder;
 use rand::Rng;
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 use tokio::time::sleep;
 
 use crate::{
@@ -33,7 +33,7 @@ use crate::{
 
 pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),

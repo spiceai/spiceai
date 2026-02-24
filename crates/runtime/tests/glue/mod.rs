@@ -21,13 +21,13 @@ use arrow::compute::concat_batches;
 use futures::StreamExt;
 
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
 pub fn get_glue_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("glue_region".to_string(), "ap-northeast-2".to_string()),
             ("glue_key".to_string(), "${ env:AWS_GLUE_KEY }".to_string()),

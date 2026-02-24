@@ -19,7 +19,7 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
@@ -28,7 +28,7 @@ use crate::{
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("spice.ai/{path}"), name.to_string());
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             (
                 "spiceai_api_key".to_string(),

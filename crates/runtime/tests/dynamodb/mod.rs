@@ -22,7 +22,7 @@ use app::AppBuilder;
 use futures::StreamExt;
 
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
@@ -697,7 +697,7 @@ fn get_test_dataset(
     }
 
     let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(Params::from_string_map(params.into_iter().collect()));
+    dataset.params = Some(DatasetParams::from_string_map(params.into_iter().collect()));
     dataset
 }
 

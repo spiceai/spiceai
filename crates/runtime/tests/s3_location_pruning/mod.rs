@@ -20,11 +20,11 @@ use app::AppBuilder;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::component::dataset::{Dataset, DatasetParams};
 
 fn get_rustfs_hive_dataset_with_location(name: &str, endpoint: &str) -> Dataset {
     let mut dataset = Dataset::new("s3://data/hive_partitioned_data/", name);
-    dataset.params = Some(Params::from_string_map(
+    dataset.params = Some(DatasetParams::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
