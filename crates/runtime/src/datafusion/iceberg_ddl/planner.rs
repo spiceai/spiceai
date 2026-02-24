@@ -19,24 +19,28 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use app::App;
 use async_trait::async_trait;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use tokio::sync::RwLock;
 
 use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
 use super::physical_plans::{IcebergCreateTableExec, IcebergDropTableExec};
 
 /// Extension planner for Iceberg DDL operations.
-#[derive(Debug, Default)]
-pub struct IcebergDdlExtensionPlanner;
+#[derive(Debug)]
+pub struct IcebergDdlExtensionPlanner {
+    app: Option<Arc<RwLock<Option<Arc<App>>>>>,
+}
 
 impl IcebergDdlExtensionPlanner {
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(app: Option<Arc<RwLock<Option<Arc<App>>>>>) -> Self {
+        Self { app }
     }
 }
 
@@ -63,6 +67,7 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
                 create.df_catalog_name.clone(),
                 create.df_schema_name.clone(),
                 catalog_list,
+                self.app.clone(),
             ))));
         }
 
@@ -75,6 +80,7 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
                 drop.df_catalog_name.clone(),
                 drop.df_schema_name.clone(),
                 catalog_list,
+                self.app.clone(),
             ))));
         }
 

@@ -20,6 +20,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -28,8 +29,12 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::sql::TableReference;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
+use spicepod::acceleration::Acceleration;
+use spicepod::component::dataset::Dataset;
+use tokio::sync::RwLock;
 
 use datafusion::catalog::CatalogProviderList;
 
@@ -53,6 +58,7 @@ pub struct IcebergCreateTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
+    app: Option<Arc<RwLock<Option<Arc<App>>>>>,
     properties: PlanProperties,
 }
 
@@ -81,6 +87,7 @@ impl IcebergCreateTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
+        app: Option<Arc<RwLock<Option<Arc<App>>>>>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -99,6 +106,7 @@ impl IcebergCreateTableExec {
             df_catalog_name,
             df_schema_name,
             catalog_list,
+            app,
             properties,
         }
     }
@@ -152,6 +160,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
         let df_schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let result_schema = ddl_result_schema();
+        let app = self.app.clone();
 
         let stream = futures::stream::once(async move {
             // Convert Arrow schema to Iceberg schema
@@ -219,6 +228,10 @@ impl ExecutionPlan for IcebergCreateTableExec {
                 schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
             }
 
+            // Register as a dataset in the App so partition management can discover it
+            register_ddl_dataset_in_app(&app, &df_catalog_name, &df_schema_name, &table_name, None)
+                .await;
+
             let batch = RecordBatch::try_new(
                 result_schema,
                 vec![Arc::new(StringArray::from(vec![format!(
@@ -244,6 +257,7 @@ pub struct IcebergDropTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
+    app: Option<Arc<RwLock<Option<Arc<App>>>>>,
     properties: PlanProperties,
 }
 
@@ -269,6 +283,7 @@ impl IcebergDropTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
+        app: Option<Arc<RwLock<Option<Arc<App>>>>>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -285,6 +300,7 @@ impl IcebergDropTableExec {
             df_catalog_name,
             df_schema_name,
             catalog_list,
+            app,
             properties,
         }
     }
@@ -337,6 +353,7 @@ impl ExecutionPlan for IcebergDropTableExec {
         let df_schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let result_schema = ddl_result_schema();
+        let app = self.app.clone();
 
         let stream = futures::stream::once(async move {
             let table_ident = TableIdent::new(namespace.clone(), table_name.clone());
@@ -374,6 +391,11 @@ impl ExecutionPlan for IcebergDropTableExec {
                 let _ = schema_provider.deregister_table(&table_name);
             }
 
+            // Remove the dataset from the App
+
+            deregister_ddl_dataset_from_app(&app, &df_catalog_name, &df_schema_name, &table_name)
+                .await;
+
             let batch = RecordBatch::try_new(
                 result_schema,
                 vec![Arc::new(StringArray::from(vec![format!(
@@ -387,5 +409,58 @@ impl ExecutionPlan for IcebergDropTableExec {
             ddl_result_schema(),
             stream,
         )))
+    }
+}
+
+/// Formats a DDL dataset name from its catalog, schema, and table components.
+fn ddl_dataset_name(catalog: &str, schema: &str, table: &str) -> String {
+    format!("{catalog}.{schema}.{table}")
+}
+
+/// Registers a synthetic [`Dataset`] in the [`App`] for a DDL-created table.
+///
+/// This makes the table visible to systems that scan `App.datasets`, such as
+/// partition management for distributed acceleration.
+///
+/// `acceleration` can be provided when DDL `WITH` clause acceleration is supported.
+async fn register_ddl_dataset_in_app(
+    app: &Option<Arc<RwLock<Option<Arc<App>>>>>,
+    df_catalog_name: &str,
+    df_schema_name: &str,
+    table_name: &str,
+    acceleration: Option<Acceleration>,
+) {
+    let Some(app_lock) = app else { return };
+    // Dataset name and dataset `from` are the same
+    let tbl = TableReference::full(df_catalog_name, df_schema_name, table_name);
+    let from = format!("iceberg:{tbl}");
+
+    let mut ds = Dataset::new(format!("iceberg:{tbl}"), tbl.to_string());
+    ds.acceleration = acceleration;
+    let mut guard = app_lock.write().await;
+    if let Some(current_app) = guard.as_ref() {
+        let mut new_app = current_app.as_ref().clone();
+        new_app.datasets.push(ds);
+        *guard = Some(Arc::new(new_app));
+    }
+}
+
+/// Removes a DDL-created [`Dataset`] from the [`App`] when its table is dropped.
+async fn deregister_ddl_dataset_from_app(
+    app: &Option<Arc<RwLock<Option<Arc<App>>>>>,
+    df_catalog_name: &str,
+    df_schema_name: &str,
+    table_name: &str,
+) {
+    let Some(app_lock) = app else { return };
+    let dataset_name = TableReference::full(df_catalog_name, df_schema_name, table_name);
+
+    let mut guard = app_lock.write().await;
+    if let Some(current_app) = guard.as_ref() {
+        let mut new_app = current_app.as_ref().clone();
+        new_app
+            .datasets
+            .retain(|d| TableReference::parse_str(&d.name) != dataset_name);
+        *guard = Some(Arc::new(new_app));
     }
 }

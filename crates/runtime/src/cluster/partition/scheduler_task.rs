@@ -32,6 +32,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use crate::CLUSTER_PARTITION_MANAGEMENT_TASK;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
 use crate::cluster::partition::discovery::table_partition_values;
+use crate::cluster::partition::startup::accelerated_tables;
 use crate::cluster::partition::{
     PartitionManager, PartitionMetadata, PartitionValue, partition_value_to_bytes,
 };
@@ -288,6 +289,8 @@ impl PartitionManagementTask {
         tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} task run");
         let state = self.refresh_state().await?;
 
+        self.initialize_new_tables(&state).await;
+
         let discovery_result = self.discover_and_sync_partitions(&state).await?;
 
         tracing::debug!(
@@ -346,6 +349,55 @@ impl PartitionManagementTask {
             executor_ids,
             tables,
         })
+    }
+
+    /// Checks for newly-registered accelerated tables (e.g. from DDL) that don't
+    /// yet have partition metadata and initializes them.
+    async fn initialize_new_tables(&self, state: &CycleState) {
+        let Some(app) = &*self.app.read().await else {
+            return;
+        };
+
+        let accel_tables = accelerated_tables(app);
+        if accel_tables.is_empty() {
+            return;
+        }
+
+        let existing: HashSet<&str> = state.tables.iter().map(String::as_str).collect();
+
+        for (table_ref, partitioning) in &accel_tables {
+            let table_name = table_ref.to_string();
+            if existing.contains(table_name.as_str()) {
+                continue;
+            }
+
+            tracing::info!(table = %table_name, "Discovered new accelerated table, initializing partition metadata");
+
+            let partition_values = match timeout(
+                self.config.discovery_timeout,
+                table_partition_values(table_ref, partitioning, &self.df),
+            )
+            .await
+            {
+                Ok(Ok(values)) => values,
+                Ok(Err(e)) => {
+                    tracing::warn!(table = %table_name, error = %e, "Failed to discover partitions for new table");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(table = %table_name, "Partition discovery timed out for new table");
+                    continue;
+                }
+            };
+
+            if let Err(e) = self
+                .partition_manager
+                .set_unassigned_partitions(table_ref, partition_values)
+                .await
+            {
+                tracing::warn!(table = %table_name, error = %e, "Failed to set unassigned partitions for new table");
+            }
+        }
     }
 
     async fn discover_and_sync_partitions(&self, state: &CycleState) -> Result<DiscoveryResult> {

@@ -277,6 +277,11 @@ impl RuntimeBuilder {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
         }
 
+        // Create the app lock early so it can be shared with DataFusion's DDL planners.
+        // The same Arc is used for Runtime.app below.
+        let app_lock = Arc::new(RwLock::new(self.app.clone()));
+        df_builder = df_builder.with_app(Arc::clone(&app_lock));
+
         let mut df = df_builder.build();
 
         if let Some(callback) = self.datafusion_configuration_fn {
@@ -307,7 +312,7 @@ impl RuntimeBuilder {
             .unwrap_or_default();
 
         let mut rt = Runtime {
-            app: Arc::new(RwLock::new(self.app)),
+            app: app_lock,
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),

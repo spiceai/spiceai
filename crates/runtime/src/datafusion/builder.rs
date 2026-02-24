@@ -129,6 +129,9 @@ pub struct DataFusionBuilder {
     url_tables_enabled: bool,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+    /// Shared handle to the runtime App definition, threaded to DDL planners
+    /// so dynamically-created tables can be registered as datasets.
+    app: Option<Arc<TokioRwLock<Option<Arc<app::App>>>>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -173,6 +176,7 @@ impl DataFusionBuilder {
             resource_monitor: None,
             url_tables_enabled: false,
             additional_analyzer_rules: vec![],
+            app: None,
         }
     }
 
@@ -266,6 +270,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Sets the shared App handle so DDL operations can register datasets.
+    #[must_use]
+    pub fn with_app(mut self, app: Arc<TokioRwLock<Option<Arc<app::App>>>>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -283,7 +294,9 @@ impl DataFusionBuilder {
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
+                    self.app.clone(),
+                )),
             ))
             .with_runtime_env(runtime_env(
                 self.memory_limit,
@@ -576,12 +589,14 @@ pub(crate) fn runtime_env(
     }
 }
 
-pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+pub(crate) fn default_extension_planners(
+    app: Option<Arc<TokioRwLock<Option<Arc<app::App>>>>>,
+) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
-        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new()),
+        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(app)),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]
