@@ -47,6 +47,7 @@ members = [
     "crates/s3_vectors_metadata_filter",
     "crates/search",
     "crates/spice_cloud",
+    "crates/spice-cloud-client",
     "crates/spicepod",
     "crates/telemetry",
     "crates/test-framework",
@@ -267,12 +268,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
+spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "3d2e6fb4290c751d07e62c5f18705b934ca182ee" } # spiceai-57
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.37.2"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "5cbdb2a84ba47de959a395777e721b4a2d3a172c", features = ["server"] } # branch: trunk
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "6ae0474665d0f2bed4492277c9e8ed73f70b75fb", features = ["server"] } # branch: trunk
 tantivy = "0.25.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
