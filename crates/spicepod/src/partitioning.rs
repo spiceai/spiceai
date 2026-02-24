@@ -59,7 +59,7 @@ where
 }
 
 pub fn serialize_partition_by<S>(
-    partition_by: &Vec<PartitionedBy>,
+    partition_by: &[PartitionedBy],
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
