@@ -36,6 +36,14 @@ build-testoperator-dev:
 build-testoperator:
 	cargo build --release -p testoperator --all-features
 
+.PHONY: build-spidapter-dev
+build-spidapter-dev:
+	cargo build -p spidapter --all-features
+
+.PHONY: build-spidapter
+build-spidapter:
+	cargo build --release -p spidapter --all-features
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -280,6 +288,16 @@ install-testoperator-dev: build-testoperator-dev
 install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-spidapter-dev
+install-spidapter-dev: build-spidapter-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/spidapter ~/.spice/bin/spidapter
+
+.PHONY: install-spidapter
+install-spidapter: build-spidapter
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-cli
 install-cli: build-cli

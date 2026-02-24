@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use system_adapter_protocol::{
-    AdbcDriver, CreateTablesResponse, DatasetConfig, Handler, Server, SetupResponse,
+    AdbcDriver, DatasetConfig, Handler, QueryMethodResponse, Server, SetupResponse,
     TeardownResponse,
 };
 use test_framework::anyhow;
@@ -34,9 +34,9 @@ struct RunState {
     api_key: String,
     /// Flight SQL endpoint URL derived from the cname.
     flight_url: String,
-    /// Spice Cloud API base URL used during provisioning.
+    /// Spice Cloud API base URL (for rebuilding client on teardown).
     base_url: String,
-    /// Spice Cloud API token used during provisioning.
+    /// Spice Cloud API token (for rebuilding client on teardown).
     token: String,
 }
 
@@ -65,11 +65,11 @@ impl Handler for SpidapterHandler {
     async fn setup(
         &mut self,
         run_id: Uuid,
-        metadata: HashMap<String, serde_json::Value>,
+        datasets: HashMap<String, DatasetConfig>,
     ) -> Result<SetupResponse, String> {
         eprintln!(
-            "[stdio] setup: run_id={run_id}, metadata_keys={:?}",
-            metadata.keys().collect::<Vec<_>>()
+            "[stdio] setup: run_id={run_id}, dataset_keys={:?}",
+            datasets.keys().collect::<Vec<_>>()
         );
 
         let state =
@@ -77,7 +77,22 @@ impl Handler for SpidapterHandler {
                 .await
                 .map_err(|e| format!("Setup failed: {e}"))?;
 
-        let response = SetupResponse {
+        self.runs.insert(run_id, state);
+        Ok(SetupResponse { ok: true })
+    }
+
+    async fn query_method(
+        &mut self,
+        run_id: Uuid,
+    ) -> Result<QueryMethodResponse, String> {
+        eprintln!("[stdio] query_method: run_id={run_id}");
+
+        let state = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
+
+        Ok(QueryMethodResponse {
             driver: AdbcDriver::Flightsql,
             db_kwargs: HashMap::from([
                 (
@@ -93,26 +108,7 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String(state.api_key.clone()),
                 ),
             ]),
-        };
-
-        self.runs.insert(run_id, state);
-        Ok(response)
-    }
-
-    async fn create_tables(
-        &mut self,
-        run_id: Uuid,
-        _datasets: HashMap<String, DatasetConfig>,
-    ) -> Result<CreateTablesResponse, String> {
-        eprintln!("[stdio] create_tables: run_id={run_id}");
-
-        let _state = self
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| format!("Unknown run_id: {run_id}"))?;
-
-        // Tables are created by Spice Cloud during deployment
-        Ok(CreateTablesResponse { ok: true })
+        })
     }
 
     async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
@@ -128,12 +124,10 @@ impl Handler for SpidapterHandler {
             state.app_id, state.base_url
         );
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+        let cloud_client = commands::build_cloud_client(&state.base_url, &state.token)
+            .map_err(|e| format!("Failed to create cloud client: {e}"))?;
 
-        commands::delete_app(&client, &state.base_url, &state.token, state.app_id)
+        commands::delete_app(&cloud_client, state.app_id)
             .await
             .map_err(|e| format!("Failed to delete app {}: {e}", state.app_id))?;
 
@@ -170,11 +164,10 @@ async fn provision_spice_cloud_app(
     let base_url = commands::spice_cloud_base_url(api_url_override);
     let token = commands::spice_cloud_token()?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let cloud_client = commands::build_cloud_client(&base_url, &token)?
+        .with_timeout(Duration::from_secs(600))?;
 
-    let cname = commands::resolve_default_cname(&client, &base_url, &token).await?;
+    let cname = commands::resolve_default_cname(&cloud_client).await?;
     let flight_url = commands::flight_url_from_cname(&cname);
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -186,7 +179,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] App name: {app_name}");
 
     let (app_id, app_api_key) =
-        commands::ensure_spice_cloud_app(&client, &base_url, &token, &app_name).await?;
+        commands::ensure_spice_cloud_app(&cloud_client, &app_name).await?;
 
     let api_key = app_api_key.ok_or_else(|| {
         anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
@@ -199,24 +192,27 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
-    commands::apply_spicepod_to_app(&client, &base_url, &token, app_id, &spicepod_yaml).await?;
+    commands::apply_spicepod_to_app(&cloud_client, app_id, &spicepod_yaml).await?;
     eprintln!("[stdio] Spicepod uploaded");
 
     // Set secrets from environment for any secret references in the spicepod
     eprintln!("[stdio] Setting secrets from spicepod...");
-    commands::secrets::set_spicepod_secrets(&client, &base_url, &token, app_id, &spicepod_yaml)
+    commands::secrets::set_spicepod_secrets(&cloud_client, app_id, &spicepod_yaml)
         .await?;
     eprintln!("[stdio] Spicepod secrets set");
 
     eprintln!("[stdio] Setting RUNNER secret...");
-    commands::secrets::set_secret(&client, &base_url, &token, app_id, "RUNNER", "spidapter")
+    commands::secrets::set_secret(&cloud_client, app_id, "RUNNER", "spidapter")
         .await?;
     eprintln!("[stdio] RUNNER secret set");
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&client, &base_url, &token, app_id).await?;
+    commands::create_deployment(&cloud_client, app_id).await?;
 
-    commands::wait_for_deployment_ready(&client, &cname, &api_key, Duration::from_secs(ready_wait))
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()?;
+    commands::wait_for_deployment_ready(&http_client, &cname, &api_key, Duration::from_secs(ready_wait))
         .await?;
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");

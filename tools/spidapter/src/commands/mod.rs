@@ -14,65 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
+use std::time::Duration;
 
-use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use reqwest::Client;
+use spice_cloud_client::CloudClient;
+use spice_cloud_client::types::{CreateAppRequest, CreateDeploymentRequest, UpdateAppRequest};
 use test_framework::anyhow;
 
 pub(crate) mod secrets;
-
-#[derive(Debug, Deserialize)]
-struct CloudAppsResponse {
-    apps: Vec<CloudApp>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CloudApp {
-    id: i64,
-    name: String,
-    api_key: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CloudCreateAppRequest {
-    name: String,
-    cname: String,
-    visibility: String,
-    tags: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CloudUpdateAppRequest {
-    spicepod: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CloudRegionsResponse {
-    regions: Vec<CloudRegion>,
-    default: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CloudRegion {
-    region: String,
-    #[serde(default)]
-    cname: Option<String>,
-    #[serde(rename = "isDefault", default)]
-    is_default: bool,
-    #[serde(default)]
-    disabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct CloudDeployment {
-    id: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct CloudCreateDeploymentRequest {
-    debug: bool,
-}
 
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
     api_url_override
@@ -95,71 +45,50 @@ pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
         })
 }
 
+/// Build a [`CloudClient`] from the given base URL and token.
+pub(crate) fn build_cloud_client(base_url: &str, token: &str) -> anyhow::Result<CloudClient> {
+    Ok(CloudClient::new(base_url).with_token(token))
+}
+
 pub(crate) async fn ensure_spice_cloud_app(
-    client: &Client,
-    base_url: &str,
-    token: &str,
+    client: &CloudClient,
     app_name: &str,
 ) -> anyhow::Result<(i64, Option<String>)> {
-    let apps_url = format!("{base_url}/v1/apps");
-    let response = client.get(&apps_url).bearer_auth(token).send().await?;
-
-    if response.status() == StatusCode::UNAUTHORIZED {
-        return Err(anyhow::anyhow!(
-            "Spice Cloud authentication failed (401). Verify your token scopes for apps:read/apps:write"
-        ));
-    }
-
-    let apps: CloudAppsResponse = response.error_for_status()?.json().await?;
-    if let Some(app) = apps.apps.into_iter().find(|a| a.name == app_name) {
+    let apps = client.list_apps().await?;
+    if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
         return Ok((app.id, app.api_key));
     }
 
-    let cname = resolve_default_cname(client, base_url, token).await?;
+    let cname = resolve_default_cname(client).await?;
 
-    let create_response = client
-        .post(&apps_url)
-        .bearer_auth(token)
-        .json(&CloudCreateAppRequest {
+    let result = client
+        .create_app(&CreateAppRequest {
             name: app_name.to_string(),
-            cname,
+            description: None,
             visibility: "private".to_string(),
-            tags: BTreeMap::from([("kind".to_string(), "cluster".to_string())]),
+            cname: Some(cname),
+            tags: Some(BTreeMap::from([("kind".to_string(), "cluster".to_string())])),
         })
-        .send()
-        .await?;
+        .await;
 
-    if create_response.status() == StatusCode::CONFLICT {
-        let retry = client.get(&apps_url).bearer_auth(token).send().await?;
-        let apps: CloudAppsResponse = retry.error_for_status()?.json().await?;
-        if let Some(app) = apps.apps.into_iter().find(|a| a.name == app_name) {
-            return Ok((app.id, app.api_key));
+    match result {
+        Ok(app) => Ok((app.id, app.api_key)),
+        Err(spice_cloud_client::error::Error::Conflict { .. }) => {
+            // Race condition: app was created between list and create. Retry list.
+            let apps = client.list_apps().await?;
+            if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
+                return Ok((app.id, app.api_key));
+            }
+            Err(anyhow::anyhow!(
+                "Failed to create Spice Cloud app '{app_name}': conflict, but app not found on retry"
+            ))
         }
+        Err(e) => Err(e.into()),
     }
-
-    let status = create_response.status();
-    if status.is_client_error() || status.is_server_error() {
-        let body = create_response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read body>".to_string());
-        return Err(anyhow::anyhow!(
-            "Failed to create Spice Cloud app '{app_name}' ({status}): {body}"
-        ));
-    }
-
-    let app: CloudApp = create_response.json().await?;
-    Ok((app.id, app.api_key))
 }
 
-pub(crate) async fn resolve_default_cname(
-    client: &Client,
-    base_url: &str,
-    token: &str,
-) -> anyhow::Result<String> {
-    let regions_url = format!("{base_url}/v1/regions");
-    let response = client.get(&regions_url).bearer_auth(token).send().await?;
-    let regions: CloudRegionsResponse = response.error_for_status()?.json().await?;
+pub(crate) async fn resolve_default_cname(client: &CloudClient) -> anyhow::Result<String> {
+    let regions = client.list_regions(None).await?;
 
     // Find the region matching the `default` field, then return its cname
     if let Some(default_region) = &regions.default
@@ -198,66 +127,39 @@ pub(crate) async fn resolve_default_cname(
 }
 
 pub(crate) async fn apply_spicepod_to_app(
-    client: &Client,
-    base_url: &str,
-    token: &str,
+    client: &CloudClient,
     app_id: i64,
     spicepod_yaml: &str,
 ) -> anyhow::Result<()> {
-    let app_url = format!("{base_url}/v1/apps/{app_id}");
-
     client
-        .put(app_url)
-        .bearer_auth(token)
-        .json(&CloudUpdateAppRequest {
-            spicepod: spicepod_yaml.to_string(),
-        })
-        .send()
-        .await?
-        .error_for_status()?;
-
+        .update_app(
+            app_id,
+            &UpdateAppRequest {
+                spicepod: Some(spicepod_yaml.to_string()),
+                ..UpdateAppRequest::default()
+            },
+        )
+        .await?;
     Ok(())
 }
 
-pub(crate) async fn create_deployment(
-    client: &Client,
-    base_url: &str,
-    token: &str,
-    app_id: i64,
-) -> anyhow::Result<()> {
-    let deployments_url = format!("{base_url}/v1/apps/{app_id}/deployments");
-
-    let response = client
-        .post(&deployments_url)
-        .bearer_auth(token)
-        .json(&CloudCreateDeploymentRequest { debug: false })
-        .send()
+pub(crate) async fn create_deployment(client: &CloudClient, app_id: i64) -> anyhow::Result<()> {
+    let created = client
+        .create_deployment(
+            app_id,
+            &CreateDeploymentRequest {
+                debug: false,
+                ..CreateDeploymentRequest::default()
+            },
+        )
         .await?;
-
-    let created: CloudDeployment = response.error_for_status()?.json().await?;
     eprintln!("Deployment {} created", created.id);
     Ok(())
 }
 
 /// Delete (soft-delete) a Spice Cloud app.
-///
-/// Calls `DELETE /v1/apps/{appId}` which sets `deleted_at`, stops the app,
-/// and releases its resources.
-pub(crate) async fn delete_app(
-    client: &Client,
-    base_url: &str,
-    token: &str,
-    app_id: i64,
-) -> anyhow::Result<()> {
-    let app_url = format!("{base_url}/v1/apps/{app_id}");
-
-    client
-        .delete(&app_url)
-        .bearer_auth(token)
-        .send()
-        .await?
-        .error_for_status()?;
-
+pub(crate) async fn delete_app(client: &CloudClient, app_id: i64) -> anyhow::Result<()> {
+    client.delete_app(app_id).await?;
     Ok(())
 }
 

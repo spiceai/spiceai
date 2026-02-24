@@ -18175,6 +18175,7 @@ dependencies = [
  "runtime-secrets",
  "serde",
  "serde_json",
+ "spice-cloud-client",
  "spiceai",
  "spicepod",
  "system-adapter-protocol",
