@@ -213,7 +213,6 @@ impl CayenneCatalogProvider {
 
         config
     }
-
 }
 
 impl CatalogProvider for CayenneCatalogProvider {
@@ -266,9 +265,7 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
                     .or_default()
                     .push(full_name.clone());
             } else {
-                tracing::debug!(
-                    "Cayenne table '{full_name}' has no namespace prefix, skipping"
-                );
+                tracing::debug!("Cayenne table '{full_name}' has no namespace prefix, skipping");
             }
         }
 
@@ -331,9 +328,7 @@ impl CayenneSchemaProvider {
         let ns_prefix = format!("{namespace}/");
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
         for full_name in full_table_names {
-            let short_name = full_name
-                .strip_prefix(&ns_prefix)
-                .unwrap_or(full_name);
+            let short_name = full_name.strip_prefix(&ns_prefix).unwrap_or(full_name);
             match Self::load_table(&catalog, full_name).await {
                 Ok(Some(provider)) => {
                     tables.insert(short_name.to_string(), provider);

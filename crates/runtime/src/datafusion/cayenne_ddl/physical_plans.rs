@@ -184,7 +184,10 @@ impl ExecutionPlan for CayenneCreateTableExec {
             let metadata_table_name = format!("{df_schema_name}/{table_name}");
 
             // Check if table already exists via the metadata catalog
-            let exists = metadata_catalog.get_table(&metadata_table_name).await.is_ok();
+            let exists = metadata_catalog
+                .get_table(&metadata_table_name)
+                .await
+                .is_ok();
 
             if exists {
                 if if_not_exists {
