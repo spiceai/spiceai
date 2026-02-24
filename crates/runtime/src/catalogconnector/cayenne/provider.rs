@@ -16,8 +16,12 @@ limitations under the License.
 
 //! Cayenne catalog and schema provider implementations for DataFusion.
 //!
-//! Provides a flat-namespace catalog backed by a Cayenne [`MetadataCatalog`]
+//! Provides a dynamic-namespace catalog backed by a Cayenne [`MetadataCatalog`]
 //! (SQLite) and local file storage for data files.
+//!
+//! Tables are organized into namespaces (schemas) specified at DDL time.
+//! In the metadata catalog, table names are stored with a namespace prefix
+//! (`namespace/table_name`) so that namespace membership survives restarts.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -34,8 +38,6 @@ use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
-
-use super::CAYENNE_DEFAULT_SCHEMA;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -60,8 +62,12 @@ const DEFAULT_CATALOG_NAME: &str = "cayenne";
 
 /// DataFusion [`CatalogProvider`] backed by a Cayenne metadata catalog.
 ///
-/// All tables are in a single "default" schema. Data is stored on local disk,
-/// metadata in local SQLite.
+/// Schemas are created dynamically when tables are created via DDL.
+/// There are no automatic "default" or "public" schemas; tables are only
+/// accessible through the namespace they were explicitly created in
+/// (e.g., `my_catalog.my_namespace.my_table`).
+///
+/// Data is stored on local disk, metadata in local SQLite.
 pub struct CayenneCatalogProvider {
     /// The underlying Cayenne metadata catalog (SQLite).
     catalog: Arc<dyn MetadataCatalog>,
@@ -71,7 +77,7 @@ pub struct CayenneCatalogProvider {
     data_base_path: String,
     /// Local metadata directory.
     metadata_dir: String,
-    /// Schema providers (just "default" for Cayenne).
+    /// Schema providers keyed by namespace name, created dynamically via DDL.
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
 
@@ -208,12 +214,6 @@ impl CayenneCatalogProvider {
         config
     }
 
-    /// Load all tables from the Cayenne catalog into a schema provider.
-    async fn load_schema(catalog: &Arc<dyn MetadataCatalog>) -> Result<Arc<dyn SchemaProvider>> {
-        let schema_provider = CayenneSchemaProvider::try_new(Arc::clone(catalog)).await?;
-
-        Ok(Arc::new(schema_provider))
-    }
 }
 
 impl CatalogProvider for CayenneCatalogProvider {
@@ -222,54 +222,93 @@ impl CatalogProvider for CayenneCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        vec![
-            CAYENNE_DEFAULT_SCHEMA.to_string(),
-            super::CAYENNE_PUBLIC_SCHEMA.to_string(),
-        ]
+        self.schemas
+            .read()
+            .map(|schemas| schemas.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        // Both "default" and "public" resolve to the same schema provider.
-        let key = if name == super::CAYENNE_PUBLIC_SCHEMA {
-            CAYENNE_DEFAULT_SCHEMA
-        } else {
-            name
-        };
         self.schemas
             .read()
             .ok()
-            .and_then(|schemas| schemas.get(key).cloned())
+            .and_then(|schemas| schemas.get(name).cloned())
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn SchemaProvider>,
+    ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
+        match self.schemas.write() {
+            Ok(mut schemas) => Ok(schemas.insert(name.to_string(), schema)),
+            Err(_) => Err(datafusion::error::DataFusionError::Internal(
+                "Failed to acquire write lock on Cayenne schemas".to_string(),
+            )),
+        }
     }
 }
 
 #[async_trait]
 impl RefreshableCatalogProvider for CayenneCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let schema = Self::load_schema(&self.catalog).await?;
+        let table_names = self.catalog.list_table_names().await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to list existing Cayenne tables: {e}");
+            Vec::new()
+        });
+
+        // Group tables by namespace (tables stored as "namespace/table_name" in metadata).
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for full_name in &table_names {
+            if let Some((ns, _table)) = full_name.split_once('/') {
+                grouped
+                    .entry(ns.to_string())
+                    .or_default()
+                    .push(full_name.clone());
+            } else {
+                tracing::debug!(
+                    "Cayenne table '{full_name}' has no namespace prefix, skipping"
+                );
+            }
+        }
+
+        let mut new_schemas: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
+        for (ns, full_names) in &grouped {
+            let schema_provider =
+                CayenneSchemaProvider::try_new(Arc::clone(&self.catalog), ns, full_names).await?;
+            new_schemas.insert(ns.clone(), Arc::new(schema_provider));
+        }
+
+        if !new_schemas.is_empty() {
+            let total_tables: usize = grouped.values().map(Vec::len).sum();
+            tracing::info!(
+                "Loaded {total_tables} existing Cayenne table{} across {} namespace{}",
+                if total_tables == 1 { "" } else { "s" },
+                new_schemas.len(),
+                if new_schemas.len() == 1 { "" } else { "s" },
+            );
+        }
 
         match self.schemas.write() {
-            Ok(mut schemas) => {
-                schemas.insert(CAYENNE_DEFAULT_SCHEMA.to_string(), schema);
-            }
-            Err(poisoned) => {
-                poisoned
-                    .into_inner()
-                    .insert(CAYENNE_DEFAULT_SCHEMA.to_string(), schema);
-            }
+            Ok(mut schemas) => *schemas = new_schemas,
+            Err(poisoned) => *poisoned.into_inner() = new_schemas,
         }
 
         Ok(())
     }
 }
 
-/// Schema provider for a Cayenne catalog's "default" schema.
+/// Schema provider for a single namespace within a Cayenne catalog.
 ///
-/// Discovers all tables in the Cayenne metadata catalog and creates
-/// [`CayenneTableProvider`] instances for each.
+/// Tables in the Cayenne metadata catalog are stored with namespace-prefixed
+/// names (`namespace/table_name`). This schema provider manages tables for
+/// one namespace, exposing them under their short (unqualified) names.
 pub struct CayenneSchemaProvider {
     /// The underlying Cayenne metadata catalog.
     catalog: Arc<dyn MetadataCatalog>,
-    /// Table providers keyed by table name.
+    /// The namespace this schema provider represents.
+    namespace: String,
+    /// Table providers keyed by short (unqualified) table name.
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
 
@@ -280,43 +319,51 @@ impl std::fmt::Debug for CayenneSchemaProvider {
 }
 
 impl CayenneSchemaProvider {
-    /// Create a new schema provider, loading all existing tables from the catalog.
-    pub async fn try_new(catalog: Arc<dyn MetadataCatalog>) -> Result<Self> {
-        // Load all existing tables from the metadata catalog
-        let table_names = catalog.list_table_names().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to list existing Cayenne tables: {e}");
-            Vec::new()
-        });
-
+    /// Create a new schema provider for a namespace, loading specified tables.
+    ///
+    /// `full_table_names` are namespace-prefixed names (`namespace/table_name`) as
+    /// stored in the Cayenne metadata catalog.
+    pub async fn try_new(
+        catalog: Arc<dyn MetadataCatalog>,
+        namespace: &str,
+        full_table_names: &[String],
+    ) -> Result<Self> {
+        let ns_prefix = format!("{namespace}/");
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
-        for name in &table_names {
-            match Self::load_table(&catalog, name).await {
+        for full_name in full_table_names {
+            let short_name = full_name
+                .strip_prefix(&ns_prefix)
+                .unwrap_or(full_name);
+            match Self::load_table(&catalog, full_name).await {
                 Ok(Some(provider)) => {
-                    tables.insert(name.clone(), provider);
+                    tables.insert(short_name.to_string(), provider);
                 }
                 Ok(None) => {
-                    tracing::debug!("Table '{name}' listed in catalog but could not be loaded");
+                    tracing::debug!(
+                        "Table '{full_name}' listed in catalog but could not be loaded"
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to load Cayenne table '{name}': {e}");
+                    tracing::warn!("Failed to load Cayenne table '{full_name}': {e}");
                 }
             }
         }
 
-        if !tables.is_empty() {
-            tracing::info!(
-                "Loaded {} existing Cayenne table{}",
-                tables.len(),
-                if tables.len() == 1 { "" } else { "s" }
-            );
-        }
-
-        let provider = Self {
+        Ok(Self {
             catalog,
+            namespace: namespace.to_string(),
             tables: RwLock::new(tables),
-        };
+        })
+    }
 
-        Ok(provider)
+    /// Create an empty schema provider for a namespace (used by DDL).
+    #[must_use]
+    pub fn new_empty(catalog: Arc<dyn MetadataCatalog>, namespace: String) -> Self {
+        Self {
+            catalog,
+            namespace,
+            tables: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Returns a reference to the underlying Cayenne metadata catalog.
@@ -325,7 +372,18 @@ impl CayenneSchemaProvider {
         &self.catalog
     }
 
-    /// Create a [`CayenneTableProvider`] for a table by name.
+    /// Returns the namespace this schema provider represents.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Construct the full metadata table name for a short table name.
+    fn full_table_name(&self, short_name: &str) -> String {
+        format!("{}/{short_name}", self.namespace)
+    }
+
+    /// Create a [`CayenneTableProvider`] for a table by its full metadata name.
     async fn load_table(
         catalog: &Arc<dyn MetadataCatalog>,
         table_name: &str,
@@ -377,8 +435,9 @@ impl SchemaProvider for CayenneSchemaProvider {
             }
         }
 
-        // Try to load from catalog (lazy loading)
-        match Self::load_table(&self.catalog, name).await {
+        // Try to load from catalog (lazy loading) using namespace-prefixed name
+        let full_name = self.full_table_name(name);
+        match Self::load_table(&self.catalog, &full_name).await {
             Ok(Some(provider)) => {
                 if let Ok(mut tables) = self.tables.write() {
                     tables.insert(name.to_string(), Arc::clone(&provider));
