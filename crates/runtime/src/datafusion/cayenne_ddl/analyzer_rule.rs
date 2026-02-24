@@ -30,9 +30,7 @@ use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion::optimizer::AnalyzerRule;
 
 use super::is_cayenne_catalog;
-use super::logical_nodes::{
-    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-};
+use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 fn parse_qualified_schema_name(name: &str) -> (String, String) {
@@ -181,11 +179,8 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     return Ok(plan);
                 }
 
-                let node = CayenneCreateSchemaNode::new(
-                    schema_name,
-                    create.if_not_exists,
-                    catalog_name,
-                );
+                let node =
+                    CayenneCreateSchemaNode::new(schema_name, create.if_not_exists, catalog_name);
 
                 Ok(LogicalPlan::Extension(Extension {
                     node: Arc::new(node),
