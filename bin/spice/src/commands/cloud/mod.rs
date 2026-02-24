@@ -24,6 +24,7 @@ use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::TableOutput;
 use clap::{Args, Subcommand};
 use snafu::ResultExt;
+use spice_cloud_client::types::IngestionMetrics;
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
@@ -100,6 +101,9 @@ pub enum CloudCommands {
     /// Show API keys for an app
     #[command(name = "api-keys")]
     ApiKeys(ApiKeysArgs),
+
+    /// Show resource metrics for an app
+    Metrics(MetricsArgs),
 }
 
 // ============================================================================
@@ -119,6 +123,16 @@ pub struct LinkArgs {
     pub app: String,
 }
 
+#[derive(Args, Debug)]
+pub struct MetricsArgs {
+    /// App name in org/app format (uses linked app if not specified)
+    #[arg(long)]
+    pub app: Option<String>,
+
+    /// Rate window for counter metrics (disk I/O)
+    #[arg(long, value_parser = ["1m", "5m", "15m"])]
+    pub window: Option<String>,
+}
 #[derive(Args, Debug)]
 pub struct DeploymentsArgs {
     /// App name in org/app format (uses linked app if not specified)
@@ -1008,7 +1022,9 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     let app_name = require_app(args.app.as_deref())?;
     let app = client.get_app(&app_name).await?;
 
-    let response = client.get_app_metrics(app.id).await?;
+    let response = client
+        .get_app_metrics(app.id, args.window.as_deref())
+        .await?;
 
     if response.metrics.is_empty() {
         println!("No metrics available for {app_name}");
@@ -1019,9 +1035,10 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
         "POD",
         "CPU %",
         "MEMORY",
-        "DISK USED",
-        "DISK AVAIL",
-        "DISK CAP",
+        "DISK READ",
+        "DISK READ IOPS",
+        "DISK WRITE",
+        "DISK WRITE IOPS",
     ]);
 
     for (pod, m) in &response.metrics {
@@ -1031,12 +1048,14 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
             m.memory_usage_bytes
                 .map_or_else(|| "-".to_string(), format_bytes),
-            m.filesystem_usage_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
-            m.filesystem_available_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
-            m.filesystem_capacity_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
+            m.disk_read_bytes
+                .map_or_else(|| "-".to_string(), format_bytes_f64),
+            m.disk_read_iops
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+            m.disk_write_bytes
+                .map_or_else(|| "-".to_string(), format_bytes_f64),
+            m.disk_write_iops
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
         ]);
     }
 
@@ -1086,6 +1105,22 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_bytes_f64(bytes: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    if bytes >= GIB {
+        format!("{:.1} GiB/s", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB/s", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB/s", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B/s")
     }
 }
 

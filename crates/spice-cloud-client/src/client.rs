@@ -25,8 +25,8 @@ use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
     CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
-    RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret,
-    SecretsResponse, SetSecretRequest, UpdateAppRequest,
+    MetricsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse,
+    RollbackRequest, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -478,15 +478,20 @@ impl CloudClient {
     // ============================================================================
 
     /// Get metrics for an app's pods.
-    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
+    ///
+    /// `window` controls the rate window for counter metrics (disk I/O).
+    /// Valid values are with time units, e.g: `"1m"`, `"5m"`, `"15m"`. Pass `None` for the server default (`"5m"`).
+    pub async fn get_app_metrics(
+        &self,
+        app_id: i64,
+        window: Option<&str>,
+    ) -> Result<MetricsResponse> {
         let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
-        let response = self
-            .client
-            .get(&url)
-            .bearer_auth(self.token_str())
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
+        let mut request = self.client.get(&url).bearer_auth(self.token_str());
+        if let Some(w) = window {
+            request = request.query(&[("window", w)]);
+        }
+        let response = request.send().await.context(HttpRequestSnafu)?;
 
         self.handle_response(response).await
     }

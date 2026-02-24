@@ -62,7 +62,7 @@ pub struct CreateAppRequest {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -107,7 +107,7 @@ pub struct DeploymentsResponse {
     pub deployments: Vec<Deployment>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct CreateDeploymentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -134,9 +134,10 @@ pub struct CreateDeploymentRequest {
 pub struct PodMetrics {
     pub cpu_usage_percent: Option<f64>,
     pub memory_usage_bytes: Option<u64>,
-    pub filesystem_usage_bytes: Option<u64>,
-    pub filesystem_available_bytes: Option<u64>,
-    pub filesystem_capacity_bytes: Option<u64>,
+    pub disk_read_bytes: Option<f64>,
+    pub disk_read_iops: Option<f64>,
+    pub disk_write_bytes: Option<f64>,
+    pub disk_write_iops: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

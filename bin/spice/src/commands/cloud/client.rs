@@ -25,8 +25,8 @@ use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
     ApiKeysResponse, App, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, RegenerateApiKeyResponse,
-    RegionsResponse, Secret, UpdateAppRequest,
+    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, MetricsResponse,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateAppRequest,
 };
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
@@ -70,8 +70,15 @@ impl CloudClient {
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
         self.inner.get_auth_context().await.map_err(into_cli)
     }
-    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
-        self.inner.get_app_metrics(app_id).await.map_err(into_cli)
+    pub async fn get_app_metrics(
+        &self,
+        app_id: i64,
+        window: Option<&str>,
+    ) -> Result<MetricsResponse> {
+        self.inner
+            .get_app_metrics(app_id, window)
+            .await
+            .map_err(into_cli)
     }
 
     // ========================================================================
@@ -79,16 +86,42 @@ impl CloudClient {
     // ========================================================================
 
     pub async fn list_apps(&self) -> Result<Vec<App>> {
-        self.inner.list_apps().await.map_err(into_cli)
+        let mut apps = self.inner.list_apps().await.map_err(into_cli)?;
+        // The API does not return `org`; populate from auth context.
+        let org_name = self.get_auth_context().await?.org_name;
+        for app in &mut apps {
+            if app.org.is_empty() {
+                app.org.clone_from(&org_name);
+            }
+        }
+        Ok(apps)
     }
 
     pub async fn get_app(&self, org_app: &str) -> Result<App> {
-        let apps = self.list_apps().await?;
         let (org, name) = parse_org_app(org_app);
 
-        for app in apps {
-            if app.name == name && (org.is_empty() || app.org == org) {
-                return self.get_app_by_id(app.id).await;
+        // list_apps populates org from auth context.
+        let apps = self.list_apps().await?;
+
+        if !org.is_empty() {
+            // Validate against the org returned by list_apps (populated from auth context).
+            if let Some(first) = apps.first() {
+                if first.org != org {
+                    return InvalidResponseSnafu {
+                        message: format!("App '{org_app}' not found"),
+                    }
+                    .fail();
+                }
+            }
+        }
+
+        for app in &apps {
+            if app.name == name {
+                let mut app = self.get_app_by_id(app.id).await?;
+                if app.org.is_empty() {
+                    app.org.clone_from(&apps[0].org);
+                }
+                return Ok(app);
             }
         }
 
