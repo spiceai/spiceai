@@ -52,3 +52,11 @@ pub const WRITE_SEMAPHORE_CLOSED: &str =
 ///
 /// In Cayenne, this represents the single data file in a non-partitioned table.
 pub const DEFAULT_DATA_FILE_ID: i64 = 0;
+
+/// Reserved directory name for staged append writes.
+///
+/// Append writes are first written to `{table_path}/{table_id}/_staging/`,
+/// then moved to the current snapshot directory on success. On error, the
+/// staging directory is cleaned up (best-effort) and the current snapshot
+/// remains unchanged.
+pub const STAGING_DIR_NAME: &str = "_staging";

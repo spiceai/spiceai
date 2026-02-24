@@ -29,6 +29,7 @@ use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
 
+use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
 use super::table::CayenneTableProvider;
 
@@ -254,12 +255,39 @@ impl CayenneDataSink {
                 .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
                 .await?
         } else {
-            // Write chunks to the current snapshot.
+            // Write chunks to a staging directory, then move to the current snapshot.
+            // This prevents partial files from appearing in the active snapshot on
+            // stream errors, which would advance the watermark past lost data.
             let target_size_bytes = self.context.target_file_size_bytes();
-            let (rows, chunk_count) = self
+
+            // Step 1: Clear staging dir (removes leftovers from previous crash)
+            self.table.clear_staging_dir().await?;
+
+            // Step 2: Write to _staging/ directory
+            let (rows, chunk_count) = match self
                 .table
-                .chunk_and_write_parallel(prepared_stream, target_size_bytes)
-                .await?;
+                .chunk_and_write_parallel_to_snapshot(
+                    prepared_stream,
+                    target_size_bytes,
+                    STAGING_DIR_NAME,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    // Best-effort cleanup — next append's clear_staging_dir() handles leftovers
+                    if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                        tracing::warn!(
+                            "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                            self.table.table_name(),
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+
+            // Step 3: Move files from staging into current snapshot (atomic on local FS)
+            self.table.move_files_to_current_snapshot().await?;
 
             tracing::debug!(
                 "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
