@@ -138,7 +138,7 @@ pub struct ExecutorRegistry {
 
     /// Manager for partition metadata. Used to validate partition completeness
     /// and optimize executor selection. If None, fallback to legacy behavior.
-    /// Uses RwLock for interior mutability so it can be set after construction.
+    /// Uses `RwLock` for interior mutability so it can be set after construction.
     partition_manager: Arc<PartitionManager>,
 }
 
@@ -154,6 +154,7 @@ impl ExecutorRegistry {
         }
     }
 
+    #[must_use]
     pub fn partition_manager(&self) -> Arc<PartitionManager> {
         Arc::clone(&self.partition_manager)
     }
@@ -275,7 +276,7 @@ impl ExecutorRegistry {
         }
     }
 
-    /// Legacy implementation of get_partitions without validation or optimization.
+    /// Legacy implementation of `get_partitions` without validation or optimization.
     /// Returns all executors that have any partition for the table.
     fn get_partitions_legacy(
         &self,
@@ -319,6 +320,7 @@ impl ExecutorRegistry {
             })
             .collect()
     }
+}
 
 impl TablePartitionProvider for ExecutorRegistry {
     /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.

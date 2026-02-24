@@ -299,5 +299,5 @@ fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
-        .map_err(|source| Error::TimeError { source })
+        .context(SystemTimeSnafu)
 }
