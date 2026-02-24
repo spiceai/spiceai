@@ -171,7 +171,7 @@ tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = ">=8.1.1", features = [
     "axum",

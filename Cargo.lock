@@ -18159,16 +18159,17 @@ dependencies = [
 name = "spidapter"
 version = "2.0.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow",
  "async-trait",
  "clap",
  "reqwest 0.12.24",
  "runtime-secrets",
+ "rustls 0.23.36",
  "serde_json",
  "spice-cloud-client",
  "spicepod",
  "system-adapter-protocol",
- "test-framework",
  "tokio",
  "uuid 1.20.0",
  "yaml",
@@ -18825,7 +18826,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=2153680f3c42bd66632fd3f180016c0d5a984d64#2153680f3c42bd66632fd3f180016c0d5a984d64"
+source = "git+https://github.com/spiceai/spicebench.git?rev=523a2fdcbee64982e14db992c8811207d370d05c#523a2fdcbee64982e14db992c8811207d370d05c"
 dependencies = [
  "arrow-schema",
  "async-trait",
