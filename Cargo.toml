@@ -274,7 +274,7 @@ sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.37.2"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "2153680f3c42bd66632fd3f180016c0d5a984d64", features = ["server"] } # branch: trunk
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "523a2fdcbee64982e14db992c8811207d370d05c", features = ["server"] } # branch: trunk
 tantivy = "0.25.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
@@ -314,7 +314,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 turso = { version = "0.4.4", default-features = false }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
-util = { path = "crates/util" }
+util = { path = "crates/util", default-features = false }
 uuid = "1"
 
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version

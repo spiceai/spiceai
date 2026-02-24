@@ -34,7 +34,7 @@ snowflake-api = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 tokio-util = { workspace = true }
 tracing.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -10,42 +10,16 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 reqwest.workspace = true
-runtime-secrets = { path = "../../crates/runtime-secrets" }
+runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }
 spice-cloud-client.workspace = true
 serde_json.workspace = true
 spicepod = { path = "../../crates/spicepod", default-features = false }
 system-adapter-protocol.workspace = true
 uuid.workspace = true
 yaml = { path = "../../crates/yaml" }
-test-framework = { path = "../../crates/test-framework" }
+rustls.workspace = true
 tokio.workspace = true
-
-[features]
-default = ["append"]
-anonymous_telemetry = []
-aws-secrets-manager = []
-clickhouse = []
-databricks = []
-debezium = []
-delta_lake = []
-dremio = []
-duckdb = []
-flightsql = []
-ftp = []
-imap = []
-keyring-secret-store = []
-models = []
-mssql = []
-mysql = []
-odbc = []
-postgres = []
-sharepoint = []
-snowflake = []
-spark = []
-sqlite = []
-turso = []
-
-append = ["test-framework/file_append"]
