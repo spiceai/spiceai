@@ -31,8 +31,10 @@ limitations under the License.
 //! from the in-memory protected snapshots map, and deletes the empty snapshot
 //! data directory from disk.
 
-use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use crate::catalog::MetadataCatalog;
+use crate::provider::constants::LISTING_TABLE_LOCK_POISONED;
 use crate::provider::retention::extract_retention_column_and_threshold;
+use crate::provider::Error;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
@@ -88,7 +90,6 @@ pub struct FileBasedDeletionSink {
     filter: Expr,
     /// Table name for logging.
     table_name: String,
-
     /// Metadata catalog for clearing snapshot sequence records.
     catalog: Arc<dyn MetadataCatalog>,
     /// In-memory protected snapshots map (shared with `CayenneTableProvider`).
@@ -157,24 +158,15 @@ impl FileBasedDeletionSink {
         listing_table: &ListingTable,
         retention_col: &str,
         retention_threshold: &ScalarValue,
-    ) -> CatalogResult<DeletionCheckScanResult> {
+    ) -> crate::provider::Result<DeletionCheckScanResult> {
         // Call list_files_for_scan — lists all files + collects per-file stats.
         // collect_stat is true by default via SessionConfig::default().
         let (file_groups, _aggregate_stats) = listing_table
             .list_files_for_scan(&ctx.state(), &[], None)
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to list files for retention scan".to_string(),
-                source: Box::new(e),
-            })?;
+            .await?;
 
         // Find the column index for the retention column
-        let col_idx = listing_table
-            .schema()
-            .index_of(retention_col)
-            .map_err(|_| CatalogError::InvalidOperationNoSource {
-                message: format!("Retention column '{retention_col}' not found in schema"),
-            })?;
+        let col_idx = listing_table.schema().index_of(retention_col)?;
 
         // Filter: file is eligible when max(retention_col) < threshold
         let mut total_files: usize = 0;
@@ -211,7 +203,7 @@ impl FileBasedDeletionSink {
         eligible_files: &[(ObjectMeta, Option<usize>)],
         object_store: &dyn ObjectStore,
         source: &str,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> crate::provider::Result<u64> {
         let mut total_rows: u64 = 0;
         let mut deleted_count: u64 = 0;
 
@@ -220,11 +212,13 @@ impl FileBasedDeletionSink {
                 Ok(()) => {
                     let row_count = num_rows.unwrap_or(0);
                     let Ok(rows) = u64::try_from(row_count) else {
-                        return Err(format!(
-                            "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
-                            meta.location
-                        )
-                        .into());
+                        return Err(Error::Internal {
+                            table: self.table_name.clone(),
+                            message: format!(
+                                "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
+                                meta.location
+                            ),
+                        });
                     };
 
                     total_rows = total_rows.saturating_add(rows);
@@ -253,7 +247,11 @@ impl FileBasedDeletionSink {
                         error = %e,
                         "Retention: failed to delete expired file"
                     );
-                    return Err(Box::new(e));
+                    return Err(Error::ObjectStore {
+                        operation: "delete expired retention file",
+                        table: self.table_name.clone(),
+                        source: e,
+                    });
                 }
             }
         }
@@ -271,10 +269,13 @@ impl FileBasedDeletionSink {
     /// including cleanup metadata for post-delete operations.
     pub(crate) async fn delete_from_internal(
         &self,
-    ) -> Result<FileBasedDeletionResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> crate::provider::Result<FileBasedDeletionResult> {
         // Parse the filter expression to extract column name and threshold
         let (col_name, _op, threshold) = extract_retention_column_and_threshold(&self.filter)
-            .map_err(|e| format!("Failed to extract retention column and threshold: {e}"))?;
+            .map_err(|e| Error::Internal {
+                table: self.table_name.clone(),
+                message: format!("Failed to extract retention column and threshold: {e}"),
+            })?;
 
         tracing::debug!(
             table = %self.table_name,
@@ -287,7 +288,10 @@ impl FileBasedDeletionSink {
         let listing_table = {
             self.listing_table
                 .read()
-                .map_err(|_| "Listing table lock poisoned".to_string())?
+                .map_err(|_| Error::LockPoisoned {
+                    table: self.table_name.clone(),
+                    lock: LISTING_TABLE_LOCK_POISONED,
+                })?
                 .clone()
         };
 
@@ -302,21 +306,22 @@ impl FileBasedDeletionSink {
             .table_paths()
             .first()
             .map(datafusion_datasource::ListingTableUrl::object_store)
-            .ok_or("Table has no paths")?;
+            .ok_or_else(|| Error::Internal {
+                table: self.table_name.clone(),
+                message: "Table has no paths".to_string(),
+            })?;
 
         let object_store: Arc<dyn ObjectStore> = ctx
             .runtime_env()
             .object_store_registry
-            .get_store(object_store_url.as_ref())
-            .map_err(|e| format!("Failed to get object store: {e}"))?;
+            .get_store(object_store_url.as_ref())?;
 
         let mut total_deleted_rows: u64 = 0;
 
         // 1. Discover and delete eligible files from the main listing table
         let main_scan = self
             .retention_eligible_files(&ctx, &listing_table, &col_name, &threshold)
-            .await
-            .map_err(|e| format!("Failed to discover retention-eligible files: {e}"))?;
+            .await?;
 
         if !main_scan.files.is_empty() {
             let rows = self
@@ -333,12 +338,7 @@ impl FileBasedDeletionSink {
         {
             let scan_result = self
                 .retention_eligible_files(&ctx, snapshot_table, &col_name, &threshold)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Failed to discover retention-eligible files in protected snapshot {snapshot_id}: {e}"
-                    )
-                })?;
+                .await?;
 
             if scan_result.files.is_empty() {
                 continue;
