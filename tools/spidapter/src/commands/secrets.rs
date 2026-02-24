@@ -16,7 +16,6 @@ limitations under the License.
 
 use runtime_secrets::{ExposeSecret, Secrets};
 use spice_cloud_client::CloudClient;
-use test_framework::anyhow;
 
 /// Set a single secret on a Spice Cloud app.
 pub(crate) async fn set_secret(

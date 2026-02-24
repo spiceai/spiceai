@@ -61,7 +61,7 @@ tracing.workspace = true
 tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-util = { path = "../../crates/util" }
+util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
