@@ -184,14 +184,14 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     // (Initializing, Refreshing, Ready, Error, etc.)
     let dataset_statuses = df.runtime_status().get_dataset_statuses();
     if let Some(status) = dataset_statuses.get(&ds.name) {
-        return *status;
+        return status.clone();
     }
 
     // Fallback: if not in runtime status, check if table exists
     if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
-        ComponentStatus::Error
+        ComponentStatus::error()
     }
 }
 

@@ -1856,7 +1856,7 @@ impl DataFusion {
                 tracing::error!(
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
-                status.update_view(&table, status::ComponentStatus::Error);
+                status.update_view(&table, status::ComponentStatus::error());
                 return None;
             }
 
@@ -1867,7 +1867,7 @@ impl DataFusion {
                 Ok(tbl) => tbl,
                 Err(e) => {
                     tracing::error!("Failed to create view {table}: {e}");
-                    status.update_view(&table, status::ComponentStatus::Error);
+                    status.update_view(&table, status::ComponentStatus::error());
                     return None;
                 }
             };
@@ -1883,7 +1883,7 @@ impl DataFusion {
                     }
                     Err(e) => {
                         tracing::error!("Failed to create view {table}: {e}");
-                        status.update_view(&table, status::ComponentStatus::Error);
+                        status.update_view(&table, status::ComponentStatus::error());
                         return None;
                     }
                 }
@@ -1892,7 +1892,7 @@ impl DataFusion {
             // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), tbl_provider) {
                 tracing::error!("Failed to create view {table}: {e}");
-                status.update_view(&table, status::ComponentStatus::Error);
+                status.update_view(&table, status::ComponentStatus::error());
                 return None;
             }
             tracing::info!("{}", view_registered_trace(&table, None));

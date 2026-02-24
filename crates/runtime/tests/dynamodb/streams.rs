@@ -565,7 +565,7 @@ async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: 
         // Check dataset status
         let statuses = rt.datafusion().runtime_status().get_dataset_statuses();
         if let Some(status) = statuses.get(&table_ref)
-            && *status == ComponentStatus::Error
+            && status.is_error()
         {
             return true;
         }

@@ -57,7 +57,7 @@ impl Runtime {
                 Err(err) => {
                     let catalog_name = &catalog.name;
                     self.status
-                        .update_catalog(catalog_name, status::ComponentStatus::Error);
+                        .update_catalog(catalog_name, status::ComponentStatus::error());
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
@@ -91,7 +91,7 @@ impl Runtime {
         else {
             let catalog_name = &catalog.name;
             self.status
-                .update_catalog(catalog_name, status::ComponentStatus::Error);
+                .update_catalog(catalog_name, status::ComponentStatus::error());
             metrics::catalogs::LOAD_ERROR.add(1, &[]);
             let err = crate::Error::UnknownCatalogConnector {
                 catalog_connector: source,

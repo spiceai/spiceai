@@ -159,17 +159,22 @@ pub(crate) async fn get(
 
     let resp: Vec<_> = datasets
         .iter()
-        .map(|d| DatasetResponseItem {
-            from: d.from.clone(),
-            name: d.name.to_quoted_string(),
-            replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
-            acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
-            properties: dataset_properties(d),
-            status: if params.status {
+        .map(|d| {
+            let status = if params.status {
                 Some(dataset_status(&df, d))
             } else {
                 None
-            },
+            };
+            let error_message = status.as_ref().and_then(|s| s.error_message().map(String::from));
+            DatasetResponseItem {
+                from: d.from.clone(),
+                name: d.name.to_quoted_string(),
+                replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
+                acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
+                properties: dataset_properties(d),
+                status,
+                error_message,
+            }
         })
         .collect();
 
