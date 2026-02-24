@@ -319,8 +319,7 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
+        let cached_result = CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
 
         // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
@@ -400,12 +399,8 @@ mod tests {
         )
         .expect("should create batch");
 
-        let cached_result = CachedQueryResult::new_raw(
-            vec![batch],
-            Arc::clone(&schema),
-            Arc::new(HashSet::new()),
-            Instant::now(),
-        );
+        let cached_result =
+            CachedQueryResult::new_raw(vec![batch], Arc::clone(&schema), Arc::new(HashSet::new()), Instant::now());
 
         let memory_size = cached_result.memory_size();
         let sizeable_size = cached_result.get_memory_size();
@@ -417,8 +412,8 @@ mod tests {
         );
     }
 
-    /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
-    /// Empty query results must preserve the correct schema, not `Schema::empty()`.
+    /// Regression test for https://github.com/spiceai/spiceai/issues/9481
+    /// Empty query results must preserve the correct schema, not Schema::empty().
     #[test]
     fn test_empty_batches_preserve_schema_new_raw() {
         let schema = Arc::new(Schema::new(vec![
@@ -442,7 +437,7 @@ mod tests {
         assert_eq!(cached_result.schema, schema);
     }
 
-    /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
+    /// Regression test for https://github.com/spiceai/spiceai/issues/9481
     #[tokio::test]
     async fn test_empty_batches_preserve_schema_from_batches() {
         let schema = Arc::new(Schema::new(vec![
