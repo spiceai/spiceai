@@ -127,6 +127,32 @@ pub struct CreateDeploymentRequest {
 }
 
 // ============================================================================
+// Metrics
+// ============================================================================
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PodMetrics {
+    pub cpu_usage_percent: Option<f64>,
+    pub memory_usage_bytes: Option<u64>,
+    pub filesystem_usage_bytes: Option<u64>,
+    pub filesystem_available_bytes: Option<u64>,
+    pub filesystem_capacity_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IngestionMetrics {
+    pub rows_ingested: Option<u64>,
+    pub bytes_ingested: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricsResponse {
+    pub metrics: BTreeMap<String, PodMetrics>,
+    #[serde(default)]
+    pub ingestion: Option<IngestionMetrics>,
+}
+
+// ============================================================================
 // Regions
 // ============================================================================
 

@@ -473,6 +473,23 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
+    // ============================================================================
+    // Metrics
+    // ============================================================================
+
+    /// Get metrics for an app's pods.
+    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
+        let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(self.token_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
     // ========================================================================
     // Response handling
     // ========================================================================
