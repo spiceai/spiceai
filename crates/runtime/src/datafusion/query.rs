@@ -757,7 +757,7 @@ impl Query {
             // DDL plans (CREATE TABLE/DROP TABLE), and DML Delete plans, as their logical
             // plan schema may differ from the actual execution result (DDL plans may be
             // rewritten by analyzer rules into extension nodes with different output schemas)
-            if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
+            let res_stream = if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
                 && !matches!(
                     &*plan,
                     LogicalPlan::Dml(dml) if matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete)
@@ -775,7 +775,18 @@ impl Query {
                         SchemaMismatch
                     )
                 }
-            }
+
+                // The AggregateStatistics physical optimizer may replace an
+                // AggregateExec with a ProjectionExec containing a literal
+                // value, which changes the output nullability (literals report
+                // nullable = value.is_null()).  Reconcile the execution result
+                // schema with the logical plan schema so downstream consumers
+                // (e.g. FlightSQL GetFlightInfo vs DoGet) see consistent
+                // nullability.
+                reconcile_stream_nullability(res_stream, plan_schema)
+            } else {
+                res_stream
+            };
 
             let final_stream = if cache_manager.should_cache_results() {
                 Self::wrap_stream_with_cache(
@@ -1225,6 +1236,70 @@ fn extract_delete_filters(source: &LogicalPlan) -> Vec<datafusion::logical_expr:
     }
 }
 
+/// Reconciles the nullability of a result stream with the logical plan schema.
+///
+/// Physical optimizer rules (e.g. `AggregateStatistics`) may replace aggregate
+/// execution plans with literal projections whose nullability differs from the
+/// logical plan.  For example, `MAX(int64)` is logically nullable (empty input
+/// → NULL) but the optimized literal `ScalarValue::Int64(Some(v))` is
+/// non-nullable.
+///
+/// This function widens non-nullable fields to nullable when the logical plan
+/// schema says they should be nullable, and wraps the stream so every batch
+/// conforms.  This uses the same `try_cast_to` mechanism as `SchemaCastScanExec`.
+fn reconcile_stream_nullability(
+    stream: SendableRecordBatchStream,
+    plan_schema: Arc<Schema>,
+) -> SendableRecordBatchStream {
+    let exec_schema = stream.schema();
+
+    if exec_schema.fields().len() != plan_schema.fields().len() {
+        return stream;
+    }
+
+    let mut needs_reconciliation = false;
+    for (exec_field, plan_field) in exec_schema.fields().iter().zip(plan_schema.fields()) {
+        if plan_field.is_nullable() && !exec_field.is_nullable() {
+            needs_reconciliation = true;
+            break;
+        }
+    }
+
+    if !needs_reconciliation {
+        return stream;
+    }
+
+    // Build a reconciled schema: widen to nullable where the logical plan says
+    // so, but keep data types and metadata from the execution schema.
+    let reconciled_fields: Vec<Field> = exec_schema
+        .fields()
+        .iter()
+        .zip(plan_schema.fields())
+        .map(|(exec_field, plan_field)| {
+            if plan_field.is_nullable() && !exec_field.is_nullable() {
+                Field::new(exec_field.name(), exec_field.data_type().clone(), true)
+                    .with_metadata(exec_field.metadata().clone())
+            } else {
+                exec_field.as_ref().clone()
+            }
+        })
+        .collect();
+
+    let reconciled =
+        Arc::new(Schema::new(reconciled_fields).with_metadata(exec_schema.metadata().clone()));
+    let target = Arc::clone(&reconciled);
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        reconciled,
+        stream.map(move |batch| {
+            batch.and_then(|b| {
+                arrow_tools::record_batch::try_cast_to(b, Arc::clone(&target))
+                    .map_err(|e| DataFusionError::External(Box::new(e)))
+            })
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
@@ -1640,5 +1715,194 @@ mod tests {
         assert_eq!(totals.produced_spills, 40);
         assert_eq!(totals.spilled_bytes, 0);
         assert_eq!(totals.spilled_rows, 200);
+    }
+
+    /// Helper: build a `SendableRecordBatchStream` from a schema and batches.
+    fn stream_from_batches(
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+    ) -> SendableRecordBatchStream {
+        let s = schema.clone();
+        Box::pin(RecordBatchStreamAdapter::new(s, {
+            futures::stream::iter(batches.into_iter().map(Ok))
+        }))
+    }
+
+    /// Collect all batches from a `SendableRecordBatchStream`.
+    async fn collect_stream(
+        mut stream: SendableRecordBatchStream,
+    ) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        while let Some(Ok(batch)) = stream.next().await {
+            batches.push(batch);
+        }
+        batches
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_widens_non_nullable() {
+        // Simulates AggregateStatistics replacing MAX(id) with a literal:
+        // execution schema has non-nullable field, plan schema has nullable.
+        let exec_schema = Arc::new(Schema::new(vec![
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(Arc::clone(&exec_schema), vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+
+        // Schema should now be nullable
+        assert!(
+            reconciled.schema().field(0).is_nullable(),
+            "field should be nullable after reconciliation"
+        );
+
+        // Batch data should be preserved
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert!(
+            batches[0].schema().field(0).is_nullable(),
+            "batch schema should also be nullable"
+        );
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 array");
+        assert_eq!(col.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_no_op_when_already_matching() {
+        // Both schemas agree: nullable. No wrapping needed.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(Arc::clone(&schema), vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, Arc::clone(&schema));
+
+        // Schema unchanged
+        assert_eq!(reconciled.schema(), schema);
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_no_op_when_non_nullable_in_both() {
+        // Both schemas agree: non-nullable. No wrapping needed.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("count", arrow::datatypes::DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(Arc::clone(&schema), vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, Arc::clone(&schema));
+
+        assert!(!reconciled.schema().field(0).is_nullable());
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_mixed_fields() {
+        // Multiple fields: only some need reconciliation.
+        let exec_schema = Arc::new(Schema::new(vec![
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),   // already nullable
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, false), // needs widening
+            Field::new("count", arrow::datatypes::DataType::Int64, false),   // stays non-nullable
+        ]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, true),  // nullable in plan
+            Field::new("count", arrow::datatypes::DataType::Int64, false),   // non-nullable in plan
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(Arc::clone(&exec_schema), vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+
+        let schema = reconciled.schema();
+        assert!(schema.field(0).is_nullable(), "name stays nullable");
+        assert!(schema.field(1).is_nullable(), "max(id) widened to nullable");
+        assert!(!schema.field(2).is_nullable(), "count stays non-nullable");
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].schema(), schema);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_field_count_mismatch() {
+        // Different field counts: return stream unchanged.
+        let exec_schema = Arc::new(Schema::new(vec![
+            Field::new("a", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("a", arrow::datatypes::DataType::Int64, true),
+            Field::new("b", arrow::datatypes::DataType::Int64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(Arc::clone(&exec_schema), vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+
+        // Should be unchanged — no widening when field counts differ
+        assert!(!reconciled.schema().field(0).is_nullable());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_empty_stream() {
+        let exec_schema = Arc::new(Schema::new(vec![
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, true),
+        ]));
+
+        let stream = stream_from_batches(Arc::clone(&exec_schema), vec![]);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+
+        assert!(reconciled.schema().field(0).is_nullable());
+
+        let batches = collect_stream(reconciled).await;
+        assert!(batches.is_empty());
     }
 }
