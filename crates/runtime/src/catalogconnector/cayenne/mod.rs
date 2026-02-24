@@ -36,14 +36,6 @@ use provider::CayenneCatalogProvider;
 /// Catalog connector prefix for Cayenne catalogs.
 pub static PREFIX: &str = "cayenne";
 
-/// Default schema name for Cayenne catalogs (flat namespace).
-pub const CAYENNE_DEFAULT_SCHEMA: &str = "default";
-
-/// The Cayenne catalog also exposes a `public` schema alias so that
-/// unqualified DDL (which DataFusion resolves to the `public` schema)
-/// works transparently.
-pub const CAYENNE_PUBLIC_SCHEMA: &str = "public";
-
 /// Parameters for configuring a Cayenne catalog.
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cayenne_data_dir")

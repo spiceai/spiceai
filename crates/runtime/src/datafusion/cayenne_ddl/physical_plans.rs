@@ -30,7 +30,7 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
-use datafusion::catalog::CatalogProviderList;
+use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -40,6 +40,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_table_providers::UnsupportedTypeAction;
 
 use super::get_cayenne_provider;
+use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
 
 /// Creates a result schema for DDL operations (single "result" column).
@@ -179,8 +180,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
             let data_base_path = cayenne_provider.data_base_path().to_string();
             let vortex_config = cayenne_provider.vortex_config().clone();
 
+            // Use namespace-prefixed name for metadata storage
+            let metadata_table_name = format!("{df_schema_name}/{table_name}");
+
             // Check if table already exists via the metadata catalog
-            let exists = metadata_catalog.get_table(&table_name).await.is_ok();
+            let exists = metadata_catalog.get_table(&metadata_table_name).await.is_ok();
 
             if exists {
                 if if_not_exists {
@@ -207,13 +211,13 @@ impl ExecutionPlan for CayenneCreateTableExec {
             })?;
 
             let table_data_path = format!(
-                "{}{table_name}/",
+                "{}{metadata_table_name}/",
                 data_base_path.trim_end_matches('/').to_string() + "/"
             );
 
-            // Create table options
+            // Create table options with namespace-prefixed name
             let create_options = CreateTableOptions {
-                table_name: table_name.clone(),
+                table_name: metadata_table_name.clone(),
                 schema: Arc::new(vortex_schema),
                 primary_key: Vec::new(),
                 on_conflict: None,
@@ -231,12 +235,21 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 ))
             })?;
 
-            // Register in the DataFusion schema provider
-            let schema_provider = df_catalog.schema(&df_schema_name).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
-                ))
-            })?;
+            // Ensure the schema exists, creating it on demand if needed
+            let schema_provider = match df_catalog.schema(&df_schema_name) {
+                Some(s) => s,
+                None => {
+                    let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
+                        Arc::clone(&metadata_catalog),
+                        df_schema_name.clone(),
+                    ));
+                    df_catalog.register_schema(
+                        &df_schema_name,
+                        Arc::clone(&new_schema) as Arc<dyn SchemaProvider>,
+                    )?;
+                    Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
+                }
+            };
 
             schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
 
@@ -364,9 +377,12 @@ impl ExecutionPlan for CayenneDropTableExec {
 
             let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
 
+            // Use namespace-prefixed name for metadata lookup
+            let metadata_table_name = format!("{df_schema_name}/{table_name}");
+
             // Drop from the Cayenne metadata catalog
             let was_dropped = metadata_catalog
-                .drop_table(&table_name)
+                .drop_table(&metadata_table_name)
                 .await
                 .map_err(|e| {
                     DataFusionError::Execution(format!(
