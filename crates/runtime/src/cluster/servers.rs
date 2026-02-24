@@ -107,9 +107,6 @@ pub async fn start_internal_cluster_server(
         })
         .unwrap_or_else(|| bind_address.to_string());
 
-    // Get partition manager if available (scheduler only)
-    let partition_manager = rt.partition_manager();
-
     // Use the shared executor stream registry if available (created during scheduler init).
     // This allows the scheduler callback to broadcast PollNow to connected executors.
     let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {

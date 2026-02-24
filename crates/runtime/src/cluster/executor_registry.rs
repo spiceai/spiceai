@@ -320,110 +320,6 @@ impl ExecutorRegistry {
             .collect()
     }
 
-    /// Enhanced implementation with partition completeness validation and executor optimization.
-    /// - Validates all required partitions are assigned to executors
-    /// - Selects minimal set of executors to cover all partitions
-    /// - Returns empty Vec if partitions are missing (causes EmptyRelation in analyzer)
-    fn get_partitions_with_validation(
-        &self,
-        table: &TableReference,
-        schema: SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
-        // Get partition metadata from manager (async call, requires runtime)
-        let Some(table_metadata) = self.partition_manager.get_cached_table_metadata(table) else {
-            // TODO: better on this cache miss. Should not exist.
-            return self.get_partitions_legacy(table, schema);
-        };
-
-        // Build set of all required partitions (for now, all partitions in table)
-        // Future: filter based on query predicates
-        let required_partitions: Vec<HashMap<String, String>> = table_metadata
-            .partitions
-            .iter()
-            .map(|p| p.partition_value.clone())
-            .collect();
-
-        if required_partitions.is_empty() {
-            tracing::debug!("No partitions required for table {table}");
-            return Vec::new();
-        }
-        // required_partitions
-
-        // Build map of executor -> partitions from metadata
-        let mut executor_partition_map: std::collections::HashMap<String, Vec<_>> =
-            std::collections::HashMap::new();
-
-        for partition_meta in &table_metadata.partitions {
-            for executor_id in &partition_meta.assigned_executors {
-                executor_partition_map
-                    .entry(executor_id.clone())
-                    .or_default()
-                    .push(partition_meta.partition_value.clone());
-            }
-        }
-
-        // Select minimal set of executors to cover all partitions
-        let selected_executors = match executor_selection::select_executors(
-            &required_partitions,
-            &executor_partition_map,
-        ) {
-            Ok(executors) => executors,
-            Err(executor_selection::Error::MissingPartitions(missing)) => {
-                tracing::error!(
-                    "Cannot execute query on table {}: {} partition(s) not assigned to any executor. Missing partitions: {:?}",
-                    table,
-                    missing.len(),
-                    missing.iter().take(5).collect::<Vec<_>>() // Show first 5 missing partitions
-                );
-                // TODO: return DataFusionError from this trait instead.
-                return Vec::new(); // Empty Vec causes EmptyRelation in rewrite rule
-            }
-        };
-
-        tracing::debug!(
-            "Selected {} executor(s) from {} available for table {} (covering {} partition(s))",
-            selected_executors.len(),
-            executor_partition_map.len(),
-            table,
-            required_partitions.len()
-        );
-
-        // Build result using only selected executors
-        let Ok(executor_partitions) = self.partitions.try_read() else {
-            tracing::warn!("Failed to acquire read lock on partitions");
-            return Vec::new();
-        };
-
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
-
-        selected_executors
-            .into_iter()
-            .filter_map(|executor_id| {
-                // Get partition expressions for this executor
-                let table_map = executor_partitions.get(&executor_id)?;
-                let parts = table_map.get(table)?;
-
-                // Get FlightSQL client for this executor
-                let client = flight_sql_clients.get(&executor_id)?;
-
-                let table_provider = Arc::new(FlightSQLTable::create_with_schema(
-                    "flightsql",
-                    &executor_id,
-                    client.clone(),
-                    table.clone(),
-                    Arc::clone(&schema),
-                    Arc::new(CookieStore::new()),
-                )) as Arc<dyn TableProvider>;
-
-                Some((table_provider, parts.clone()))
-            })
-            .collect()
-    }
-}
-
 impl TablePartitionProvider for ExecutorRegistry {
     /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
     fn should_partition(&self, tbl: &TableScan) -> bool {
@@ -440,7 +336,7 @@ impl TablePartitionProvider for ExecutorRegistry {
     /// Enhanced implementation with partition completeness validation and executor optimization.
     /// - Validates all required partitions are assigned to executors
     /// - Selects minimal set of executors to cover all partitions
-    /// - Returns empty Vec if partitions are missing (causes EmptyRelation in analyzer)
+    /// - Returns empty Vec if partitions are missing (causes `EmptyRelation` in analyzer)
     fn get_partitions(
         &self,
         table: &TableReference,

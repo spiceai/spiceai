@@ -35,7 +35,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to get current time: {source}"))]
-    TimeError { source: std::time::SystemTimeError },
+    SystemTime { source: std::time::SystemTimeError },
 
     #[snafu(display("Partition {partition} not found in table {table}"))]
     PartitionNotFound { table: String, partition: String },

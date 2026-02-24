@@ -804,7 +804,7 @@ impl Runtime {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
                 partition_manager, ..
-            }) => Some(Arc::clone(&partition_manager)),
+            }) => Some(Arc::clone(partition_manager)),
             _ => None,
         }
     }

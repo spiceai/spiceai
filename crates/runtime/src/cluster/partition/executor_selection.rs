@@ -80,6 +80,7 @@ impl std::error::Error for Error {}
 /// let selected = select_executors(&required, &available)?;
 /// // Returns ["executor1", "executor2"] - minimal set covering all partitions
 /// ```
+#[expect(clippy::implicit_hasher)]
 pub fn select_executors(
     required_partitions: &[PartitionValue],
     executor_partitions: &HashMap<String, Vec<PartitionValue>>,
