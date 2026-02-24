@@ -433,7 +433,6 @@ async fn register_ddl_dataset_in_app(
     let Some(app_lock) = app else { return };
     // Dataset name and dataset `from` are the same
     let tbl = TableReference::full(df_catalog_name, df_schema_name, table_name);
-    let from = format!("iceberg:{tbl}");
 
     let mut ds = Dataset::new(format!("iceberg:{tbl}"), tbl.to_string());
     ds.acceleration = acceleration;
