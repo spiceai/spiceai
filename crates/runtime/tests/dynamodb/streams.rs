@@ -554,7 +554,6 @@ fn get_acceleration_row_count(duckdb_path: &str, table_name: &str) -> usize {
 
 async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: u64) -> bool {
     use datafusion::sql::TableReference;
-    use runtime::status::ComponentStatus;
 
     let table_ref = TableReference::bare(dataset_name);
     let start = std::time::Instant::now();
