@@ -26,8 +26,8 @@ use spicepod::component::runtime::{Runtime, TelemetryConfig};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
-    AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
-    SetupResponse, TeardownResponse, EtlSinkType,
+    AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
+    ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
 use uuid::Uuid;
 
@@ -49,22 +49,22 @@ struct RunState {
 #[derive(Debug, Clone)]
 struct SetupConfig {
     /// Per-dataset `from` URIs, keyed by dataset name.
-    etl_region: Option<String>,
-    etl_endpoint: Option<String>,
-    etl_sink_type: Option<EtlSinkType>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    sink_type: Option<EtlSinkType>,
 }
 
 impl SetupConfig {
     fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Self {
         Self {
-            etl_region: metadata_string(metadata, "etl_region"),
-            etl_endpoint: metadata_string(metadata, "etl_endpoint"),
-            etl_sink_type: None
+            region: metadata_string(metadata, "etl_region"),
+            endpoint: metadata_string(metadata, "etl_endpoint"),
+            sink_type: None,
         }
     }
 
     fn set_etl_sink_type(mut self, sink_type: Option<EtlSinkType>) -> Self {
-        self.etl_sink_type = sink_type;
+        self.sink_type = sink_type;
         self
     }
 }
@@ -144,7 +144,10 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String(state.api_key.clone()),
                 ),
             ]),
-            catalog_namespace: etl_sink_type.as_ref().filter(|t| matches!(t, EtlSinkType::Adbc)).map(|_| "spicebench.bench".to_string()),
+            catalog_namespace: etl_sink_type
+                .as_ref()
+                .filter(|t| matches!(t, EtlSinkType::Adbc))
+                .map(|_| "spicebench.bench".to_string()),
         };
 
         self.runs.insert(run_id, state);
@@ -253,7 +256,7 @@ async fn post_setup_sink_action(
     cname: &str,
     api_key: &str,
 ) -> anyhow::Result<()> {
-    if let Some(EtlSinkType::Adbc) = setup_config.etl_sink_type {
+    if setup_config.sink_type == Some(EtlSinkType::Adbc) {
         eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
 
         let create_table_statements = generate_adbc_create_table_statements(datasets)?;
@@ -290,7 +293,9 @@ async fn post_setup_sink_action(
 
         eprintln!("[stdio] ADBC post-setup table creation complete");
     } else {
-        eprintln!("[stdio] No ETL sink type specified or ETL sink requires no additional steps, skipping post-setup actions");
+        eprintln!(
+            "[stdio] No ETL sink type specified or ETL sink requires no additional steps, skipping post-setup actions"
+        );
     }
     Ok(())
 }
@@ -353,8 +358,7 @@ fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
         DataType::UInt16 => "SMALLINT UNSIGNED".to_string(),
         DataType::UInt32 => "INT UNSIGNED".to_string(),
         DataType::UInt64 => "BIGINT UNSIGNED".to_string(),
-        DataType::Float16 => "FLOAT".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
         DataType::Float64 => "DOUBLE".to_string(),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
@@ -472,7 +476,7 @@ fn generate_hive_spicepod(
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
-        .etl_region
+        .region
         .clone()
         .or_else(|| std::env::var("AWS_REGION").ok())
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
@@ -498,7 +502,7 @@ fn generate_hive_spicepod(
             ("s3_region".to_string(), region.clone()),
             ("hive_partitioning_enabled".to_string(), "true".to_string()),
         ]);
-        if let Some(endpoint) = &setup_config.etl_endpoint {
+        if let Some(endpoint) = &setup_config.endpoint {
             param_map.insert("s3_endpoint".to_string(), endpoint.clone());
         }
 
@@ -521,9 +525,7 @@ fn generate_hive_spicepod(
     yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
-fn generate_adbc_spicepod(
-    run_id: &Uuid,
-) -> anyhow::Result<String> {
+fn generate_adbc_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -536,7 +538,12 @@ fn generate_adbc_spicepod(
         ..Runtime::default()
     };
 
-    spicepod.catalogs.push(ComponentOrReference::Component(Catalog::new("cayenne".to_string(), "spicebench".to_string())));
+    spicepod
+        .catalogs
+        .push(ComponentOrReference::Component(Catalog::new(
+            "cayenne".to_string(),
+            "spicebench".to_string(),
+        )));
     yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
@@ -546,7 +553,7 @@ fn generate_initial_spicepod(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<String> {
-    match setup_config.etl_sink_type {
+    match setup_config.sink_type {
         Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
     }
@@ -566,15 +573,15 @@ mod tests {
         )]);
 
         let config = SetupConfig::from_metadata(&metadata);
-        assert_eq!(config.etl_region.as_deref(), Some("us-west-2"));
+        assert_eq!(config.region.as_deref(), Some("us-west-2"));
     }
 
     #[test]
     fn generate_spicepod_includes_dataset_entries() {
         let setup_config = SetupConfig {
-            etl_region: Some("us-west-2".to_string()),
-            etl_endpoint: Some("http://localhost:9000".to_string()),
-            etl_sink_type: None,
+            region: Some("us-west-2".to_string()),
+            endpoint: Some("http://localhost:9000".to_string()),
+            sink_type: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -608,9 +615,9 @@ mod tests {
     #[test]
     fn generate_spicepod_errors_on_missing_dataset_source() {
         let setup_config = SetupConfig {
-            etl_region: None,
-            etl_endpoint: None,
-            etl_sink_type: None,
+            region: None,
+            endpoint: None,
+            sink_type: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -639,7 +646,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("price", DataType::Decimal128(10, 2), true),
-            Field::new("created_at", DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
         ]));
 
         let statement = generate_adbc_create_table_statement(

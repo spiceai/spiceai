@@ -26,9 +26,7 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
-use super::logical_nodes::{
-    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-};
+use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
 use super::physical_plans::{
     CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
 };

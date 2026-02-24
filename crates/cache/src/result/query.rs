@@ -319,7 +319,8 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
+        let cached_result =
+            CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
 
         // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
@@ -399,8 +400,12 @@ mod tests {
         )
         .expect("should create batch");
 
-        let cached_result =
-            CachedQueryResult::new_raw(vec![batch], Arc::clone(&schema), Arc::new(HashSet::new()), Instant::now());
+        let cached_result = CachedQueryResult::new_raw(
+            vec![batch],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            Instant::now(),
+        );
 
         let memory_size = cached_result.memory_size();
         let sizeable_size = cached_result.get_memory_size();
