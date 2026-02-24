@@ -113,7 +113,7 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status.update_model(
                     &model.name,
-                    status::ComponentStatus::error_with_message(e.to_string()),
+                    status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 tracing::warn!("{err}");
                 return;
