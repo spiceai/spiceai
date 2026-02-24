@@ -45,9 +45,13 @@ pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
         })
 }
 
-/// Build a [`CloudClient`] from the given base URL and token.
-pub(crate) fn build_cloud_client(base_url: &str, token: &str) -> anyhow::Result<CloudClient> {
-    Ok(CloudClient::new(base_url).with_token(token))
+/// Build a [`CloudClient`] from an optional API URL override and environment token.
+pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Result<CloudClient> {
+    let base_url = spice_cloud_base_url(api_url_override);
+    let token = spice_cloud_token()?;
+    Ok(CloudClient::new(&base_url)
+        .with_token(token)
+        .with_timeout(Duration::from_secs(600))?)
 }
 
 pub(crate) async fn ensure_spice_cloud_app(
@@ -67,7 +71,10 @@ pub(crate) async fn ensure_spice_cloud_app(
             description: None,
             visibility: "private".to_string(),
             cname: Some(cname),
-            tags: Some(BTreeMap::from([("kind".to_string(), "cluster".to_string())])),
+            tags: Some(BTreeMap::from([(
+                "kind".to_string(),
+                "cluster".to_string(),
+            )])),
         })
         .await;
 
@@ -143,11 +150,16 @@ pub(crate) async fn apply_spicepod_to_app(
     Ok(())
 }
 
-pub(crate) async fn create_deployment(client: &CloudClient, app_id: i64) -> anyhow::Result<()> {
+pub(crate) async fn create_deployment(
+    client: &CloudClient,
+    app_id: i64,
+    channel: Option<&str>,
+) -> anyhow::Result<()> {
     let created = client
         .create_deployment(
             app_id,
             &CreateDeploymentRequest {
+                channel: channel.map(ToString::to_string),
                 debug: false,
                 ..CreateDeploymentRequest::default()
             },
