@@ -342,7 +342,7 @@ impl TablePartitionProvider for ExecutorRegistry {
     fn get_partitions(
         &self,
         table: &TableReference,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
         // Get partition metadata from manager (async call, requires runtime)
         let Some(table_metadata) = self.partition_manager.get_cached_table_metadata(table) else {

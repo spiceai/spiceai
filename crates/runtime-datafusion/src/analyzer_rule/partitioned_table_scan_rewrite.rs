@@ -39,7 +39,7 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
     fn get_partitions(
         &self,
         table: &TableReference,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)>;
 
     /// Whether partitioning should be applied to the given table.
