@@ -70,6 +70,9 @@ impl CloudClient {
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
         self.inner.get_auth_context().await.map_err(into_cli)
     }
+    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
+        self.inner.get_app_metrics(app_id).await.map_err(into_cli)
+    }
 
     // ========================================================================
     // Apps
