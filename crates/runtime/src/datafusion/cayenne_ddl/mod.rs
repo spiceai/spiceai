@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Cayenne DDL support: analyzer rule, logical nodes, extension planner,
-//! and physical execution plans for `CREATE TABLE` / `DROP TABLE` on
+//! and physical execution plans for `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` on
 //! Cayenne-backed DDL-enabled catalogs.
 //!
 //! Reuses the shared DDL options infrastructure from [`super::iceberg_ddl::acceleration_options`]
