@@ -123,7 +123,7 @@ pub(crate) async fn get(
                     Ok(status) => status,
                     Err(e) => {
                         tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                        ComponentStatus::error()
+                        ComponentStatus::error_with_message(e.to_string())
                     }
                 },
                 None => ComponentStatus::Disabled,
@@ -173,7 +173,7 @@ async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
         Ok(_) => ComponentStatus::Ready,
         Err(e) => {
             tracing::error!("Error connecting to flight when checking status: {e}");
-            ComponentStatus::error()
+            ComponentStatus::error_with_message(e.to_string())
         }
     }
 }

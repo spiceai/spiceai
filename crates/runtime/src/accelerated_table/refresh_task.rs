@@ -740,8 +740,11 @@ impl RefreshTask {
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            self.set_refresh_status(sql, status::ComponentStatus::error_with_message(e.to_string()))
-                .await;
+            self.set_refresh_status(
+                sql,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            )
+            .await;
             return Err(e);
         }
 
@@ -1331,7 +1334,8 @@ impl RefreshTask {
     async fn update_component_status(&self, status: status::ComponentStatus) {
         // main component status update
         if self.is_view_acceleration() {
-            self.runtime_status.update_view(&self.dataset_name, status.clone());
+            self.runtime_status
+                .update_view(&self.dataset_name, status.clone());
         } else {
             self.runtime_status
                 .update_dataset(&self.dataset_name, status.clone());
@@ -1375,8 +1379,11 @@ impl RefreshTask {
                 "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
                 self.component_type(),
             );
-            self.set_refresh_status(refresh_sql, status::ComponentStatus::error_with_message(error.to_string()))
-                .await;
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(error.to_string()),
+            )
+            .await;
             return;
         }
 
@@ -1406,8 +1413,11 @@ impl RefreshTask {
             self.component_type(),
             include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
         );
-        self.set_refresh_status(refresh_sql, status::ComponentStatus::error_with_message(error.to_string()))
-            .await;
+        self.set_refresh_status(
+            refresh_sql,
+            status::ComponentStatus::error_with_message(error.to_string()),
+        )
+        .await;
     }
 
     /// Updates `last_updated_at` timestamp based on refresh type and row count.

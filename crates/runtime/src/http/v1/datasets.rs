@@ -165,7 +165,9 @@ pub(crate) async fn get(
             } else {
                 None
             };
-            let error_message = status.as_ref().and_then(|s| s.error_message().map(String::from));
+            let error_message = status
+                .as_ref()
+                .and_then(|s| s.error_message().map(String::from));
             DatasetResponseItem {
                 from: d.from.clone(),
                 name: d.name.to_quoted_string(),

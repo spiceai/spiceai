@@ -56,8 +56,10 @@ impl Runtime {
                 Ok(connector) => connector,
                 Err(err) => {
                     let catalog_name = &catalog.name;
-                    self.status
-                        .update_catalog(catalog_name, status::ComponentStatus::error());
+                    self.status.update_catalog(
+                        catalog_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
@@ -90,8 +92,10 @@ impl Runtime {
         let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
         else {
             let catalog_name = &catalog.name;
-            self.status
-                .update_catalog(catalog_name, status::ComponentStatus::error());
+            self.status.update_catalog(
+                catalog_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
             metrics::catalogs::LOAD_ERROR.add(1, &[]);
             let err = crate::Error::UnknownCatalogConnector {
                 catalog_connector: source,

@@ -111,8 +111,10 @@ impl Runtime {
             // Otherwise, we will fail to determine the model type and the error will be confusing.
             if let Err(err) = verify_local_files_exist(m) {
                 metrics::models::LOAD_ERROR.add(1, &[]);
-                self.status
-                    .update_model(&model.name, status::ComponentStatus::error());
+                self.status.update_model(
+                    &model.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
                 tracing::warn!("{err}");
                 return;
             }
@@ -170,8 +172,10 @@ impl Runtime {
             }
             Err(e) => {
                 metrics::models::LOAD_ERROR.add(1, &[]);
-                self.status
-                    .update_model(&model.name, status::ComponentStatus::error());
+                self.status.update_model(
+                    &model.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
 
                 // Try to fetch available models to help user debug the issue
                 let error_msg = e.to_string();

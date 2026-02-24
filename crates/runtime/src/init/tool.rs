@@ -110,8 +110,10 @@ impl Runtime {
                 }
                 Err(e) => {
                     metrics::tools::LOAD_ERROR.add(1, &[]);
-                    self.status
-                        .update_tool(&tool.name, status::ComponentStatus::error());
+                    self.status.update_tool(
+                        &tool.name,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                     tracing::warn!(
                         "Unable to load tool '{}' from spicepod. Error: {}",
                         tool.name,
