@@ -19,6 +19,9 @@ limitations under the License.
 //! `CayenneCreateTableExec` creates a new table in the Cayenne metadata catalog
 //! with data stored in S3 Express One Zone via Vortex columnar format.
 //!
+//! `CayenneCreateSchemaExec` registers a schema namespace in the DataFusion catalog
+//! for Cayenne-backed DDL catalogs.
+//!
 //! `CayenneDropTableExec` removes a table from both the Cayenne metadata catalog
 //! and the DataFusion catalog.
 
@@ -239,14 +242,14 @@ impl ExecutionPlan for CayenneCreateTableExec {
             })?;
 
             // Ensure the schema exists, creating it on demand if needed
-            let schema_provider = match df_catalog.schema(&df_schema_name) {
+            let schema_provider = match cayenne_provider.schema_provider(&df_schema_name) {
                 Some(s) => s,
                 None => {
                     let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
                         Arc::clone(&metadata_catalog),
                         df_schema_name.clone(),
                     ));
-                    df_catalog.register_schema(
+                    cayenne_provider.register_schema_provider(
                         &df_schema_name,
                         Arc::clone(&new_schema) as Arc<dyn SchemaProvider>,
                     )?;
@@ -260,6 +263,154 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 result_schema,
                 vec![Arc::new(StringArray::from(vec![format!(
                     "Table '{table_name}' created"
+                )]))],
+            )?;
+            Ok(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Physical plan for creating a Cayenne schema.
+pub struct CayenneCreateSchemaExec {
+    schema_name: String,
+    if_not_exists: bool,
+    df_catalog_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for CayenneCreateSchemaExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneCreateSchemaExec")
+            .field("schema_name", &self.schema_name)
+            .field("if_not_exists", &self.if_not_exists)
+            .field("df_catalog_name", &self.df_catalog_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CayenneCreateSchemaExec {
+    #[must_use]
+    pub fn new(
+        schema_name: String,
+        if_not_exists: bool,
+        df_catalog_name: String,
+        catalog_list: Arc<dyn CatalogProviderList>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            schema_name,
+            if_not_exists,
+            df_catalog_name,
+            catalog_list,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for CayenneCreateSchemaExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CayenneCreateSchemaExec: {}.{}",
+            self.df_catalog_name, self.schema_name
+        )
+    }
+}
+
+impl ExecutionPlan for CayenneCreateSchemaExec {
+    fn name(&self) -> &'static str {
+        "CayenneCreateSchemaExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let schema_name = self.schema_name.clone();
+        let if_not_exists = self.if_not_exists;
+        let df_catalog_name = self.df_catalog_name.clone();
+        let catalog_list = Arc::clone(&self.catalog_list);
+        let result_schema = ddl_result_schema();
+
+        let stream = futures::stream::once(async move {
+            let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
+            })?;
+
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
+
+            if cayenne_provider.schema_provider(&schema_name).is_some() {
+                if if_not_exists {
+                    let batch = RecordBatch::try_new(
+                        result_schema,
+                        vec![Arc::new(StringArray::from(vec![format!(
+                            "Schema '{schema_name}' already exists"
+                        )]))],
+                    )?;
+                    return Ok(batch);
+                }
+
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{schema_name}' already exists in catalog '{df_catalog_name}'"
+                )));
+            }
+
+            let schema_provider = Arc::new(CayenneSchemaProvider::new_empty(
+                Arc::clone(cayenne_provider.metadata_catalog()),
+                schema_name.clone(),
+            ));
+
+            cayenne_provider
+                .register_schema_provider(
+                    &schema_name,
+                    Arc::clone(&schema_provider) as Arc<dyn SchemaProvider>,
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to create schema '{schema_name}' in catalog '{df_catalog_name}': {e}"
+                    ))
+                })?;
+
+            let batch = RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "Schema '{schema_name}' created"
                 )]))],
             )?;
             Ok(batch)

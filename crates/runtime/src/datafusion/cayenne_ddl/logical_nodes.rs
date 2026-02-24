@@ -144,6 +144,91 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
     }
 }
 
+/// Logical plan node for `CREATE SCHEMA` on a Cayenne catalog.
+#[derive(Debug)]
+pub struct CayenneCreateSchemaNode {
+    /// The schema name to create.
+    pub schema_name: String,
+    /// If true, do not error if the schema already exists.
+    pub if_not_exists: bool,
+    /// The `DataFusion` catalog name.
+    pub df_catalog_name: String,
+    /// Output schema (single "result" column).
+    output_schema: DFSchemaRef,
+}
+
+impl CayenneCreateSchemaNode {
+    #[must_use]
+    pub fn new(schema_name: String, if_not_exists: bool, df_catalog_name: String) -> Self {
+        Self {
+            schema_name,
+            if_not_exists,
+            df_catalog_name,
+            output_schema: ddl_output_schema(),
+        }
+    }
+}
+
+impl Hash for CayenneCreateSchemaNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.schema_name.hash(state);
+        self.df_catalog_name.hash(state);
+    }
+}
+
+impl PartialEq for CayenneCreateSchemaNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_name == other.schema_name && self.df_catalog_name == other.df_catalog_name
+    }
+}
+
+impl Eq for CayenneCreateSchemaNode {}
+
+impl PartialOrd for CayenneCreateSchemaNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.schema_name.partial_cmp(&other.schema_name)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for CayenneCreateSchemaNode {
+    fn name(&self) -> &'static str {
+        "CayenneCreateSchema"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CayenneCreateSchema: {}.{}",
+            self.df_catalog_name, self.schema_name
+        )
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        _inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        Ok(Self {
+            schema_name: self.schema_name.clone(),
+            if_not_exists: self.if_not_exists,
+            df_catalog_name: self.df_catalog_name.clone(),
+            output_schema: DFSchemaRef::clone(&self.output_schema),
+        })
+    }
+}
+
 /// Logical plan node for `DROP TABLE` on a Cayenne catalog.
 #[derive(Debug)]
 pub struct CayenneDropTableNode {

@@ -26,8 +26,12 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
-use super::logical_nodes::{CayenneCreateTableNode, CayenneDropTableNode};
-use super::physical_plans::{CayenneCreateTableExec, CayenneDropTableExec};
+use super::logical_nodes::{
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
+};
+use super::physical_plans::{
+    CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
+};
 
 /// Extension planner for Cayenne DDL operations.
 #[derive(Debug)]
@@ -60,6 +64,15 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 create.or_replace,
                 create.df_catalog_name.clone(),
                 create.df_schema_name.clone(),
+                catalog_list,
+            ))));
+        }
+
+        if let Some(create_schema) = node.as_any().downcast_ref::<CayenneCreateSchemaNode>() {
+            return Ok(Some(Arc::new(CayenneCreateSchemaExec::new(
+                create_schema.schema_name.clone(),
+                create_schema.if_not_exists,
+                create_schema.df_catalog_name.clone(),
                 catalog_list,
             ))));
         }
