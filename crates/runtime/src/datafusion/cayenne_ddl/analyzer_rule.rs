@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Analyzer rule that intercepts DDL plans (`CREATE TABLE` / `DROP TABLE`)
+//! Analyzer rule that intercepts DDL plans (`CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA`)
 //! targeting Cayenne-backed DDL-enabled catalogs and rewrites them into
 //! custom [`LogicalPlan::Extension`] nodes.
 
@@ -30,8 +30,17 @@ use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion::optimizer::AnalyzerRule;
 
 use super::is_cayenne_catalog;
-use super::logical_nodes::{CayenneCreateTableNode, CayenneDropTableNode};
+use super::logical_nodes::{
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
+};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
+fn parse_qualified_schema_name(name: &str) -> (String, String) {
+    match name.split_once('.') {
+        Some((catalog_name, schema_name)) => (catalog_name.to_string(), schema_name.to_string()),
+        None => (SPICE_DEFAULT_CATALOG.to_string(), name.to_string()),
+    }
+}
 
 /// Analyzer rule that rewrites DDL targeting Cayenne catalogs into
 /// custom extension nodes for Cayenne catalog operations.
@@ -160,7 +169,49 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     node: Arc::new(node),
                 }))
             }
+            LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(create)) => {
+                let (catalog_name, schema_name) =
+                    parse_qualified_schema_name(create.schema_name.as_str());
+
+                if !self.is_ddl_enabled(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                let node = CayenneCreateSchemaNode::new(
+                    schema_name,
+                    create.if_not_exists,
+                    catalog_name,
+                );
+
+                Ok(LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                }))
+            }
             _ => Ok(plan),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_qualified_schema_name;
+    use crate::datafusion::SPICE_DEFAULT_CATALOG;
+
+    #[test]
+    fn parse_qualified_schema_name_extracts_catalog_and_schema() {
+        let (catalog, schema) = parse_qualified_schema_name("spicebench.bench");
+        assert_eq!(catalog, "spicebench");
+        assert_eq!(schema, "bench");
+    }
+
+    #[test]
+    fn parse_qualified_schema_name_uses_default_catalog_when_unqualified() {
+        let (catalog, schema) = parse_qualified_schema_name("bench");
+        assert_eq!(catalog, SPICE_DEFAULT_CATALOG);
+        assert_eq!(schema, "bench");
     }
 }

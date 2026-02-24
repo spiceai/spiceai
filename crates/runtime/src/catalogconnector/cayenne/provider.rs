@@ -180,6 +180,29 @@ impl CayenneCatalogProvider {
         &self.metadata_dir
     }
 
+    /// Returns the schema provider for a namespace if it exists.
+    #[must_use]
+    pub fn schema_provider(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        self.schemas
+            .read()
+            .ok()
+            .and_then(|schemas| schemas.get(name).cloned())
+    }
+
+    /// Registers or replaces a schema provider for a namespace.
+    pub fn register_schema_provider(
+        &self,
+        name: &str,
+        schema: Arc<dyn SchemaProvider>,
+    ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
+        match self.schemas.write() {
+            Ok(mut schemas) => Ok(schemas.insert(name.to_string(), schema)),
+            Err(_) => Err(datafusion::error::DataFusionError::Internal(
+                "Failed to acquire write lock on Cayenne schemas".to_string(),
+            )),
+        }
+    }
+
     /// Parse Vortex configuration from catalog parameters.
     fn parse_vortex_config(params: &Parameters) -> VortexConfig {
         let mut config = VortexConfig::default();
@@ -228,10 +251,7 @@ impl CatalogProvider for CayenneCatalogProvider {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas
-            .read()
-            .ok()
-            .and_then(|schemas| schemas.get(name).cloned())
+        self.schema_provider(name)
     }
 
     fn register_schema(
@@ -239,12 +259,7 @@ impl CatalogProvider for CayenneCatalogProvider {
         name: &str,
         schema: Arc<dyn SchemaProvider>,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
-        match self.schemas.write() {
-            Ok(mut schemas) => Ok(schemas.insert(name.to_string(), schema)),
-            Err(_) => Err(datafusion::error::DataFusionError::Internal(
-                "Failed to acquire write lock on Cayenne schemas".to_string(),
-            )),
-        }
+        self.register_schema_provider(name, schema)
     }
 }
 
