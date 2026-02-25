@@ -21,7 +21,7 @@ use std::{
 
 use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
 
-use datafusion::{logical_expr::Expr, sql::TableReference};
+use datafusion::{execution::FunctionRegistry, logical_expr::Expr, sql::TableReference};
 use datafusion_proto::bytes::Serializeable;
 use object_store::ObjectStore;
 use object_store::prefix::PrefixStore;
@@ -175,6 +175,7 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
 pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
+    registry: &(dyn FunctionRegistry + Send + Sync),
 ) -> Result<HashMap<TableReference, Vec<Expr>>> {
     let response = client
         .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
@@ -189,7 +190,8 @@ pub async fn executor_request_initial_partitions(
         let mut exprs = Vec::new();
 
         for item in partitions.items {
-            let expr = Expr::from_bytes(&item).context(PartitionExpressionDeserializationSnafu)?;
+            let expr = Expr::from_bytes_with_registry(&item, registry)
+                .context(PartitionExpressionDeserializationSnafu)?;
             exprs.push(expr);
         }
 
