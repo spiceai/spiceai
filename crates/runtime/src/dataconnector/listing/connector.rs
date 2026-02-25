@@ -186,16 +186,19 @@ impl TableProvider for LocationPruningListingTable {
     async fn scan(
         &self,
         state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let Some(locations) = extract_location_predicates(filters) else {
-            // DataFusion's low-level ListingTable scan expects projection indices
-            // relative to the file schema, while table scans can include partition
-            // and metadata columns. Forwarding table-level indices can panic with
-            // index out of bounds. Omit projection here and let higher-level
-            // projections be applied by DataFusion planning.
+            if !self.inner.options().table_partition_cols.is_empty()
+                && !self.inner.options().metadata_cols.is_empty()
+            {
+                return Err(DataFusionError::Execution(
+                    "Listing metadata columns with partition columns are currently unsupported in the wrapped listing table path on DataFusion v52; disable listing metadata for this dataset or query through a non-partitioned table path".to_string(),
+                ));
+            }
+
             return self.inner.scan(state, None, filters, limit).await;
         };
 
@@ -1945,28 +1948,11 @@ mod tests {
         );
     }
 
-    /// Regression test for issue where SELECT with metadata columns (like `location`)
-    /// appearing before partition columns in the projection would fail with
-    /// "column types must match schema types" error.
+    /// Regression test for metadata-column projection with partition columns.
     ///
-    /// The root cause was in `DataFusion`'s `ExtendedColumnProjector::project()` which
-    /// inserted partition columns first, then metadata columns, without accounting
-    /// for index position shifts when metadata columns had lower schema indices
-    /// than partition columns.
-    ///
-    /// For example, with schema [compression, day, location] where:
-    /// - compression is a file column (index 0)
-    /// - day is a partition column (index 1)
-    /// - location is a metadata column (index 2)
-    ///
-    /// `SELECT location, day, compression` would request projection [2, 1, 0] which
-    /// maps to output positions [0, 1, 2]. The old code would:
-    /// 1. Insert partition column `day` at position 1 → [compression, day]
-    /// 2. Insert metadata column `location` at position 0 → [location, compression, day]
-    ///
-    /// But the correct output should be [location, day, compression].
+    /// DataFusion v52 can panic in this path during physical planning.
+    /// Runtime must fail safely with a clear error instead of panicking.
     #[tokio::test]
-    #[ignore = "DataFusion v52 planner panic for metadata+partition projection ordering"]
     async fn test_location_metadata_column_projection_order() {
         use datafusion::parquet::arrow::ArrowWriter;
         use tempfile::TempDir;
@@ -2037,106 +2023,40 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .expect("register table");
 
-        // Test 1: SELECT with location first (this was failing before the fix)
+        // Test 1: SELECT with metadata + partition columns fails safely (no panic).
         let df = ctx
             .sql("SELECT location, day, compression FROM test_table")
             .await
             .expect("execute query");
-
-        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
-        assert_eq!(batches.len(), 1, "should have one batch");
-
-        let result = &batches[0];
-        assert_eq!(result.num_columns(), 3, "should have 3 columns");
-        assert_eq!(result.num_rows(), 1, "should have 1 row");
-
-        // Verify column order is correct
-        assert_eq!(
-            result.schema().field(0).name(),
-            "location",
-            "first column should be location"
-        );
-        assert_eq!(
-            result.schema().field(1).name(),
-            "day",
-            "second column should be day"
-        );
-        assert_eq!(
-            result.schema().field(2).name(),
-            "compression",
-            "third column should be compression"
-        );
-
-        // Verify data types are correct
-        let location_col = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("location should be string array");
-        let day_col = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("day should be string array");
-        let compression_col = result
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("compression should be string array");
-
-        // Verify values
+        let err = df.collect().await.expect_err("metadata+partition scan should fail safely");
         assert!(
-            location_col
-                .value(0)
-                .contains("day=2025-01-01/data.parquet"),
-            "location should contain file path, got: {}",
-            location_col.value(0)
-        );
-        assert_eq!(day_col.value(0), "2025-01-01", "day should be 2025-01-01");
-        assert_eq!(
-            compression_col.value(0),
-            "gzip",
-            "compression should be gzip"
+            err.to_string().contains("Listing metadata columns with partition columns are currently unsupported"),
+            "expected a clear metadata+partition error, got: {err}"
         );
 
-        // Test 2: SELECT with just location and day (was causing panic before fix)
+        // Test 2: SELECT with just location and day also fails safely.
         let df = ctx
             .sql("SELECT location, day FROM test_table")
             .await
             .expect("execute query");
-
-        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
-        assert_eq!(batches.len(), 1, "should have one batch");
-        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
-        assert_eq!(
-            batches[0].schema().field(0).name(),
-            "location",
-            "first column should be location"
-        );
-        assert_eq!(
-            batches[0].schema().field(1).name(),
-            "day",
-            "second column should be day"
+        let err = df.collect().await.expect_err("metadata+partition scan should fail safely");
+        assert!(
+            err.to_string().contains("Listing metadata columns with partition columns are currently unsupported"),
+            "expected a clear metadata+partition error, got: {err}"
         );
 
-        // Test 3: SELECT with reversed order (day, location) - should also work
+        // Test 3: File-column-only projection also fails safely for this unsupported combination.
         let df = ctx
-            .sql("SELECT day, location FROM test_table")
+            .sql("SELECT compression FROM test_table")
             .await
             .expect("execute query");
 
-        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
-        assert_eq!(batches.len(), 1, "should have one batch");
-        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
-        assert_eq!(
-            batches[0].schema().field(0).name(),
-            "day",
-            "first column should be day"
-        );
-        assert_eq!(
-            batches[0].schema().field(1).name(),
-            "location",
-            "second column should be location"
+        let err = df.collect().await.expect_err("metadata+partition scan should fail safely");
+        assert!(
+            err.to_string().contains(
+                "Listing metadata columns with partition columns are currently unsupported"
+            ),
+            "expected a clear metadata+partition error, got: {err}"
         );
     }
 
