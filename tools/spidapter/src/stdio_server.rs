@@ -38,22 +38,22 @@ use crate::commands;
 #[derive(Debug, Clone)]
 struct SetupConfig {
     /// Per-dataset `from` URIs, keyed by dataset name.
-    etl_region: Option<String>,
-    etl_endpoint: Option<String>,
-    etl_sink_type: Option<EtlSinkType>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    sink_type: Option<EtlSinkType>,
 }
 
 impl SetupConfig {
     fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Self {
         Self {
-            etl_region: metadata_string(metadata, "etl_region"),
-            etl_endpoint: metadata_string(metadata, "etl_endpoint"),
-            etl_sink_type: None,
+            region: metadata_string(metadata, "etl_region"),
+            endpoint: metadata_string(metadata, "etl_endpoint"),
+            sink_type: None,
         }
     }
 
     fn set_etl_sink_type(mut self, sink_type: Option<EtlSinkType>) -> Self {
-        self.etl_sink_type = sink_type;
+        self.sink_type = sink_type;
         self
     }
 }
@@ -79,7 +79,7 @@ fn avg_opt(
             (s, c)
         }
     });
-    (count > 0).then_some(sum / count as f64)
+    (count > 0).then_some(sum / (count as f64))
 }
 
 /// Sum non-`None` `u64` values extracted from pods.
@@ -109,7 +109,7 @@ fn sum_opt_f64_as_u64(
             (s, any)
         }
     });
-    any.then_some(sum as u64)
+    any.then_some(sum.round() as u64)
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -214,16 +214,18 @@ impl Handler for SpidapterHandler {
 
         let pods = cloud_metrics.metrics.values().collect::<Vec<_>>();
 
-        let resource = (!pods.is_empty())
-            .then(|| ResourceMetrics {
+        let resource = if !pods.is_empty() {
+            ResourceMetrics {
                 cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
                 disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
                 disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
                 disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
                 disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            ResourceMetrics::default()
+        };
 
         let ingestion = cloud_metrics
             .ingestion
@@ -269,16 +271,6 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 }
 
 // ── Spice Cloud provisioning ─────────────────────────────────────────
-
-/// Provision a Spice Cloud app from the setup request.
-///
-/// Follows the same flow as `SpiceCloudSpicedStarter::start()`:
-/// 1. Resolve the default cname / region
-/// 2. Create or find the SCP app
-/// 3. Generate and upload the spicepod from the dataset configs
-/// 4. Set secrets (RUNNER + any env-based secrets)
-/// 5. Create a deployment
-/// 6. Wait for the deployment to become ready
 
 /// Provision a Spice Cloud app from the setup request.
 ///
@@ -366,7 +358,7 @@ async fn post_setup_sink_action(
     cname: &str,
     api_key: &str,
 ) -> anyhow::Result<()> {
-    if let Some(EtlSinkType::Adbc) = setup_config.etl_sink_type {
+    if let Some(EtlSinkType::Adbc) = setup_config.sink_type {
         eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
 
         let create_table_statements = generate_adbc_create_table_statements(datasets)?;
@@ -468,8 +460,7 @@ fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
         DataType::UInt16 => "SMALLINT UNSIGNED".to_string(),
         DataType::UInt32 => "INT UNSIGNED".to_string(),
         DataType::UInt64 => "BIGINT UNSIGNED".to_string(),
-        DataType::Float16 => "FLOAT".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
         DataType::Float64 => "DOUBLE".to_string(),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
@@ -505,7 +496,7 @@ fn generate_hive_spicepod(
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
-        .etl_region
+        .region
         .clone()
         .or_else(|| std::env::var("AWS_REGION").ok())
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
@@ -531,7 +522,7 @@ fn generate_hive_spicepod(
             ("s3_region".to_string(), region.clone()),
             ("hive_partitioning_enabled".to_string(), "true".to_string()),
         ]);
-        if let Some(endpoint) = &setup_config.etl_endpoint {
+        if let Some(endpoint) = &setup_config.endpoint {
             param_map.insert("s3_endpoint".to_string(), endpoint.clone());
         }
 
@@ -582,7 +573,7 @@ fn generate_initial_spicepod(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<String> {
-    match setup_config.etl_sink_type {
+    match setup_config.sink_type {
         Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
     }
