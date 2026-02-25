@@ -4673,7 +4673,7 @@ mod tests {
         .await;
     }
 
-    /// Helper: build a single-column Int64 RecordBatch and the matching RowConverter.
+    /// Helper: build a single-column Int64 `RecordBatch` and the matching `RowConverter`.
     fn make_int64_pk_batch(values: &[i64]) -> (RecordBatch, RowConverter) {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
