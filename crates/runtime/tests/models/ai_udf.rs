@@ -55,10 +55,7 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
 
             let app = AppBuilder::new("ai_udf_test")
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_anthropic_model(
-                    "claude-haiku-4-5",
-                    "claude-haiku",
-                ))
+                .with_model(get_anthropic_model("claude-haiku-4-5", "claude-haiku"))
                 .build();
 
             let api_config = create_api_bindings_config();
