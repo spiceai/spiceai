@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Cayenne catalog and schema provider implementations for DataFusion.
+//! Cayenne catalog and schema provider implementations for `DataFusion`.
 //!
 //! Provides a dynamic-namespace catalog backed by a Cayenne [`MetadataCatalog`]
-//! (SQLite) and local file storage for data files.
+//! (`SQLite`) and local file storage for data files.
 //!
 //! Tables are organized into namespaces (schemas) specified at DDL time.
 //! In the metadata catalog, table names are stored with a namespace prefix
@@ -60,16 +60,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Default catalog name used when no catalog ID is specified.
 const DEFAULT_CATALOG_NAME: &str = "cayenne";
 
-/// DataFusion [`CatalogProvider`] backed by a Cayenne metadata catalog.
+/// `DataFusion` [`CatalogProvider`] backed by a Cayenne metadata catalog.
 ///
 /// Schemas are created dynamically when tables are created via DDL.
 /// There are no automatic "default" or "public" schemas; tables are only
 /// accessible through the namespace they were explicitly created in
 /// (e.g., `my_catalog.my_namespace.my_table`).
 ///
-/// Data is stored on local disk, metadata in local SQLite.
+/// Data is stored on local disk, metadata in local `SQLite`.
 pub struct CayenneCatalogProvider {
-    /// The underlying Cayenne metadata catalog (SQLite).
+    /// The underlying Cayenne metadata catalog (`SQLite`).
     catalog: Arc<dyn MetadataCatalog>,
     /// Vortex configuration for table providers.
     vortex_config: VortexConfig,
@@ -86,14 +86,14 @@ impl std::fmt::Debug for CayenneCatalogProvider {
         f.debug_struct("CayenneCatalogProvider")
             .field("data_base_path", &self.data_base_path)
             .field("metadata_dir", &self.metadata_dir)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl CayenneCatalogProvider {
     /// Create a new Cayenne catalog provider.
     ///
-    /// Initializes the SQLite metadata catalog and local file storage.
+    /// Initializes the `SQLite` metadata catalog and local file storage.
     /// The `catalog_id` field is ignored; Cayenne always uses a fixed default name.
     pub async fn try_new(params: Parameters, _catalog_config: &Catalog) -> Result<Self> {
         let catalog_name = DEFAULT_CATALOG_NAME;
@@ -103,10 +103,10 @@ impl CayenneCatalogProvider {
             .get("cayenne_metadata_dir")
             .expose()
             .ok()
-            .map(String::from)
-            .unwrap_or_else(|| {
-                format!("{}/cayenne_{catalog_name}/metadata", spice_data_base_path())
-            });
+            .map_or_else(
+                || format!("{}/cayenne_{catalog_name}/metadata", spice_data_base_path()),
+                String::from,
+            );
 
         // Ensure metadata directory exists
         std::fs::create_dir_all(&metadata_dir).map_err(|e| Error::InvalidConfiguration {
@@ -122,12 +122,10 @@ impl CayenneCatalogProvider {
         catalog.init().await.context(CatalogInitSnafu)?;
 
         // Initialize local file storage
-        let data_dir = params
-            .get("cayenne_data_dir")
-            .expose()
-            .ok()
-            .map(String::from)
-            .unwrap_or_else(|| format!("{}/cayenne_{catalog_name}/data", spice_data_base_path()));
+        let data_dir = params.get("cayenne_data_dir").expose().ok().map_or_else(
+            || format!("{}/cayenne_{catalog_name}/data", spice_data_base_path()),
+            String::from,
+        );
 
         std::fs::create_dir_all(&data_dir).map_err(|e| Error::InvalidConfiguration {
             message: format!("Failed to create data directory '{data_dir}': {e}"),
@@ -207,20 +205,20 @@ impl CayenneCatalogProvider {
     fn parse_vortex_config(params: &Parameters) -> VortexConfig {
         let mut config = VortexConfig::default();
 
-        if let Some(v) = params.get("cayenne_footer_cache_mb").expose().ok() {
-            if let Ok(val) = v.parse::<usize>() {
-                config.footer_cache_mb = val;
-            }
+        if let Some(v) = params.get("cayenne_footer_cache_mb").expose().ok()
+            && let Ok(val) = v.parse::<usize>()
+        {
+            config.footer_cache_mb = val;
         }
-        if let Some(v) = params.get("cayenne_segment_cache_mb").expose().ok() {
-            if let Ok(val) = v.parse::<usize>() {
-                config.segment_cache_mb = val;
-            }
+        if let Some(v) = params.get("cayenne_segment_cache_mb").expose().ok()
+            && let Ok(val) = v.parse::<usize>()
+        {
+            config.segment_cache_mb = val;
         }
-        if let Some(v) = params.get("cayenne_target_file_size_mb").expose().ok() {
-            if let Ok(val) = v.parse::<usize>() {
-                config.target_vortex_file_size_mb = val;
-            }
+        if let Some(v) = params.get("cayenne_target_file_size_mb").expose().ok()
+            && let Ok(val) = v.parse::<usize>()
+        {
+            config.target_vortex_file_size_mb = val;
         }
         if let Some(v) = params.get("cayenne_compression_strategy").expose().ok() {
             match v.to_lowercase().as_str() {
@@ -439,10 +437,10 @@ impl SchemaProvider for CayenneSchemaProvider {
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         // Check in-memory cache first
-        if let Ok(tables) = self.tables.read() {
-            if let Some(provider) = tables.get(name) {
-                return Ok(Some(Arc::clone(provider)));
-            }
+        if let Ok(tables) = self.tables.read()
+            && let Some(provider) = tables.get(name)
+        {
+            return Ok(Some(Arc::clone(provider)));
         }
 
         // Try to load from catalog (lazy loading) using namespace-prefixed name

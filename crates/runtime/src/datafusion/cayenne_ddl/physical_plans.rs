@@ -19,11 +19,11 @@ limitations under the License.
 //! `CayenneCreateTableExec` creates a new table in the Cayenne metadata catalog
 //! with data stored in S3 Express One Zone via Vortex columnar format.
 //!
-//! `CayenneCreateSchemaExec` registers a schema namespace in the DataFusion catalog
+//! `CayenneCreateSchemaExec` registers a schema namespace in the `DataFusion` catalog
 //! for Cayenne-backed DDL catalogs.
 //!
 //! `CayenneDropTableExec` removes a table from both the Cayenne metadata catalog
-//! and the DataFusion catalog.
+//! and the `DataFusion` catalog.
 
 use std::any::Any;
 use std::fmt;
@@ -58,7 +58,7 @@ fn ddl_result_schema() -> SchemaRef {
 /// Physical plan for creating a Cayenne table.
 ///
 /// Executes the following steps:
-/// 1. Retrieves the [`CayenneCatalogProvider`] from the DataFusion catalog.
+/// 1. Retrieves the [`CayenneCatalogProvider`] from the `DataFusion` catalog.
 /// 2. Transforms the Arrow schema for Vortex compatibility.
 /// 3. Creates the table via [`CayenneTableProviderBuilder::create`].
 /// 4. Registers the resulting [`CayenneTableProvider`] in the schema provider.
@@ -89,7 +89,6 @@ impl fmt::Debug for CayenneCreateTableExec {
 
 impl CayenneCreateTableExec {
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         table_name: String,
         arrow_schema: Arc<Schema>,
@@ -242,19 +241,19 @@ impl ExecutionPlan for CayenneCreateTableExec {
             })?;
 
             // Ensure the schema exists, creating it on demand if needed
-            let schema_provider = match cayenne_provider.schema_provider(&df_schema_name) {
-                Some(s) => s,
-                None => {
-                    let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
-                        Arc::clone(&metadata_catalog),
-                        df_schema_name.clone(),
-                    ));
-                    cayenne_provider.register_schema_provider(
-                        &df_schema_name,
-                        Arc::clone(&new_schema) as Arc<dyn SchemaProvider>,
-                    )?;
-                    Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
-                }
+            let schema_provider = if let Some(s) = cayenne_provider.schema_provider(&df_schema_name)
+            {
+                s
+            } else {
+                let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
+                    Arc::clone(&metadata_catalog),
+                    df_schema_name.clone(),
+                ));
+                cayenne_provider.register_schema_provider(
+                    &df_schema_name,
+                    Arc::clone(&new_schema) as Arc<dyn SchemaProvider>,
+                )?;
+                Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
             };
 
             schema_provider.register_table(table_name.clone(), Arc::new(provider))?;

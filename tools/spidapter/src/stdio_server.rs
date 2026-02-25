@@ -588,7 +588,7 @@ mod tests {
         let datasets = HashMap::from([(
             "my_table".to_string(),
             DatasetConfig {
-                schema: schema.clone(),
+                schema,
                 location: Some("s3://bucket/path/my_table/".to_string()),
                 primary_key_columns: Vec::new(),
                 time_column: None,
@@ -624,7 +624,7 @@ mod tests {
         let datasets = HashMap::from([(
             "missing_table".to_string(),
             DatasetConfig {
-                schema: schema.clone(),
+                schema,
                 location: None,
                 primary_key_columns: Vec::new(),
                 time_column: None,
