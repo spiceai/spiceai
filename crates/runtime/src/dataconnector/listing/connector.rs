@@ -199,7 +199,7 @@ impl TableProvider for LocationPruningListingTable {
                 ));
             }
 
-            return self.inner.scan(state, None, filters, limit).await;
+            return self.inner.scan(state, projection, filters, limit).await;
         };
 
         // Ensure the query runtime uses the same object store configuration (endpoint/region)
@@ -1950,7 +1950,7 @@ mod tests {
 
     /// Regression test for metadata-column projection with partition columns.
     ///
-    /// DataFusion v52 can panic in this path during physical planning.
+    /// `DataFusion` v52 can panic in this path during physical planning.
     /// Runtime must fail safely with a clear error instead of panicking.
     #[tokio::test]
     async fn test_location_metadata_column_projection_order() {
@@ -2028,9 +2028,14 @@ mod tests {
             .sql("SELECT location, day, compression FROM test_table")
             .await
             .expect("execute query");
-        let err = df.collect().await.expect_err("metadata+partition scan should fail safely");
+        let err = df
+            .collect()
+            .await
+            .expect_err("metadata+partition scan should fail safely");
         assert!(
-            err.to_string().contains("Listing metadata columns with partition columns are currently unsupported"),
+            err.to_string().contains(
+                "Listing metadata columns with partition columns are currently unsupported"
+            ),
             "expected a clear metadata+partition error, got: {err}"
         );
 
@@ -2039,9 +2044,14 @@ mod tests {
             .sql("SELECT location, day FROM test_table")
             .await
             .expect("execute query");
-        let err = df.collect().await.expect_err("metadata+partition scan should fail safely");
+        let err = df
+            .collect()
+            .await
+            .expect_err("metadata+partition scan should fail safely");
         assert!(
-            err.to_string().contains("Listing metadata columns with partition columns are currently unsupported"),
+            err.to_string().contains(
+                "Listing metadata columns with partition columns are currently unsupported"
+            ),
             "expected a clear metadata+partition error, got: {err}"
         );
 
@@ -2051,7 +2061,10 @@ mod tests {
             .await
             .expect("execute query");
 
-        let err = df.collect().await.expect_err("metadata+partition scan should fail safely");
+        let err = df
+            .collect()
+            .await
+            .expect_err("metadata+partition scan should fail safely");
         assert!(
             err.to_string().contains(
                 "Listing metadata columns with partition columns are currently unsupported"
