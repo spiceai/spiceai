@@ -24,9 +24,8 @@ use super::constants::{
     PROTECTED_SNAPSHOTS_LOCK_POISONED, WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
-    CayenneDeletionSink, DeletionIdentifier,
-    DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink,
-    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+    CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
+    FileBasedDeletionSink, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
@@ -77,6 +76,9 @@ use vortex_datafusion::VortexFormat;
 use super::context::CayenneContext;
 use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 use super::vortex_format::DeletionFilteringVortexFormat;
+
+/// Maps serialized primary key bytes to their maximum delete sequence number.
+type DeletedRowKeysMap = HashMap<Box<[u8]>, i64>;
 
 /// Extension trait to extract `UpsertOptions` from `OnConflict`.
 ///
@@ -1762,8 +1764,8 @@ impl CayenneTableProvider {
             pk_indices,
             converter,
             &projected_pk_indices,
-            &deleted_pk_i64,
-            &deleted_row_keys,
+            deleted_pk_i64.as_ref(),
+            deleted_row_keys.as_ref(),
             None, // all deletions apply to main listing table
             &self.table_metadata.table_name,
             &mut keyset,
@@ -1799,8 +1801,8 @@ impl CayenneTableProvider {
                 pk_indices,
                 converter,
                 &projected_pk_indices,
-                &deleted_pk_i64,
-                &deleted_row_keys,
+                deleted_pk_i64.as_ref(),
+                deleted_row_keys.as_ref(),
                 Some(*max_delete_seq_at_creation), // only deletions with seq > threshold apply
                 &self.table_metadata.table_name,
                 &mut keyset,
@@ -1813,13 +1815,13 @@ impl CayenneTableProvider {
 
     /// Process record batches and add visible keys to the keyset.
     ///
-    /// Filters out deleted rows using the provided deletion maps. No insert_records are
+    /// Filters out deleted rows using the provided deletion maps. No `insert_records` are
     /// used — visibility is determined solely by whether a deletion exists for the key.
     ///
     /// `min_delete_seq_threshold`: When `Some(threshold)`, only deletions with
     /// `seq > threshold` are considered (for protected snapshots). When `None`, all
     /// deletions apply (for the main listing table). This avoids building filtered
-    /// HashMap copies per snapshot — each row is checked with a single O(1) lookup.
+    /// `HashMap` copies per snapshot — each row is checked with a single O(1) lookup.
     ///
     /// Keys from later batches override earlier ones in the keyset, which is correct
     /// because protected snapshots contain data inserted at higher sequence numbers.
@@ -1830,8 +1832,8 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         projected_pk_indices: &[usize],
-        deleted_pk_i64: &Option<Arc<HashMap<i64, i64>>>,
-        deleted_row_keys: &Option<Arc<HashMap<Box<[u8]>, i64>>>,
+        deleted_pk_i64: Option<&Arc<HashMap<i64, i64>>>,
+        deleted_row_keys: Option<&Arc<DeletedRowKeysMap>>,
         min_delete_seq_threshold: Option<i64>,
         table_name: &str,
         keyset: &mut HashMap<OwnedRow, RowLocation>,
@@ -3790,7 +3792,7 @@ impl CayenneTableProvider {
                         Arc::clone(&guard)
                     };
                     // Don't use insert_records for protected snapshot approach
-                    let empty_insert_records: Arc<HashMap<Box<[u8]>, i64>> =
+                    let empty_insert_records: Arc<DeletedRowKeysMap> =
                         Arc::new(HashMap::new());
 
                     if !deleted_row_keys.is_empty() {
