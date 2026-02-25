@@ -22,7 +22,7 @@ The tests use the following models:
 
 - **OpenAI**: `gpt-4o-mini`
 - **xAI**: `grok-4-1-fast-non-reasoning`
-- **Anthropic**: `claude-3-5-haiku-latest`
+- **Anthropic**: `claude-haiku-4-5`
 - **Local**: `llama3` (Phi-3.5-mini-instruct from HuggingFace)
 
 ### Model Verification
@@ -96,7 +96,7 @@ cargo test -p runtime --test integration_models test_ai_udf_with_local_model --f
 - Tests LEFT() function on ai() results
 - Tests multiple ai() calls in a single query
 - **Duration**: ~30-60 seconds
-- **Models**: gpt-4o-mini, claude-3-5-haiku-latest
+- **Models**: gpt-4o-mini, claude-haiku-4-5
 - **Note**: Model name is required in all calls since multiple models are configured
 
 ### `test_ai_udf_with_dataset`
