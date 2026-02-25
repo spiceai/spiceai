@@ -107,6 +107,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use tokio_stream::wrappers::ReceiverStream;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -846,35 +847,32 @@ impl DataFusion {
         &self,
         table_reference: &TableReference,
     ) -> Result<Arc<dyn TableProvider>> {
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         let table_name = table_reference.table();
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
-        if let Some(schema_name) = table_reference.schema()
-            && let Some(schema) = self.schema(schema_name)
-        {
-            let table_provider = schema
-                .table(table_name)
-                .await
-                .map_err(find_datafusion_root)
-                .context(UnableToGetTableSnafu)?
-                .ok_or_else(|| {
-                    TableMissingSnafu {
-                        schema: schema_name.to_string(),
-                        table: table_name.to_string(),
-                    }
-                    .build()
-                })
-                .boxed()
-                .context(UnableToGetSchemaTableSnafu)?;
+        let catalog_provider = self
+            .resolve_catalog_provider(table_reference)
+            .context(CatalogMissingSnafu {
+                catalog: catalog_name.to_string(),
+            })
+            ?;
 
-            return Ok(table_provider);
-        }
+        let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)
+            .context(SchemaMissingSnafu {
+            schema: schema_name.to_string(),
+            })?;
 
-        let table_provider = self
-            .ctx
-            .table_provider(TableReference::bare(table_name.to_string()))
+        let table_provider = schema_provider
+            .table(table_name)
             .await
             .map_err(find_datafusion_root)
-            .context(UnableToGetTableSnafu)?;
+            .context(UnableToGetTableSnafu)?
+            .context(TableMissingSnafu {
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
+            })
+            ?;
 
         Ok(table_provider)
     }
@@ -1151,9 +1149,9 @@ impl DataFusion {
         };
 
         // Get an executor's FlightSqlClient
-        let client = {
+        let (executor_id, client) = {
             let clients = executor_registry.flight_sql_clients.read().await;
-            let Some((_executor_id, client)) = clients.iter().next() else {
+            let Some((executor_id, client)) = clients.iter().next() else {
                 tracing::error!(
                     "No executors available to forward Cayenne write for table {table_reference}"
                 );
@@ -1162,21 +1160,28 @@ impl DataFusion {
                 }
                 .fail();
             };
-            client.clone()
+            (executor_id.clone(), client.clone())
         };
 
         tracing::info!("Forwarding Cayenne write for table {table_reference} to executor");
 
-        // Build FlightDescriptor for the table reference
-        let descriptor =
-            arrow_flight::FlightDescriptor::new_path(vec![table_reference.to_string()]);
+        // Resolve the table reference to a fully qualified form so the executor
+        // can locate it regardless of its default catalog/schema settings.
+        let resolved = table_reference
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let descriptor = arrow_flight::FlightDescriptor::new_path(vec![
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        ]);
 
-        // Collect batches from the streaming update and send via DoPut
         let schema = streaming_update.data.schema();
         let stream = streaming_update.data;
 
-        // Build flight data from the record batch stream
-        let mut flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
+        // Build a flight data stream from the record batches, setting the
+        // FlightDescriptor on the first message so the executor knows the target table.
+        let flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(futures::stream::unfold(stream, |mut s| async move {
                 use futures::StreamExt;
@@ -1189,42 +1194,67 @@ impl DataFusion {
                 }
             }));
 
-        // Set the flight descriptor on the first message
+        // Stream directly into the executor's do_put without buffering.
         use futures::StreamExt;
-        let mut flight_data_vec = Vec::new();
+        let table_name = table_reference.to_string();
         let mut first = true;
-        while let Some(data) = flight_data_encoder.next().await {
-            let mut fd = data.map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_reference.to_string(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
+        let request_stream = flight_data_encoder.map(move |result| {
+            let mut fd = result.expect("flight data encoding failed");
             if first {
                 fd.flight_descriptor = Some(descriptor.clone());
                 first = false;
             }
-            flight_data_vec.push(fd);
+            fd
+        });
+
+        // Forward the authorization header from the original request so the
+        // executor can validate the caller's credentials.
+        let auth_header = runtime_request_context::RequestContext::current(
+            runtime_request_context::AsyncMarker::new().await,
+        )
+        .authorization_header()
+        .map(str::to_string);
+
+        let mut request = tonic::Request::new(request_stream);
+        if let Some(auth_value) = auth_header {
+            if let Ok(val) = auth_value.parse() {
+                request.metadata_mut().insert("authorization", val);
+            }
         }
 
-        let request = futures::stream::iter(flight_data_vec);
         let mut inner_client = client.into_inner();
         let response = inner_client
             .do_put(request)
             .await
             .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_reference.to_string(),
+                table_name: table_name.clone(),
                 source: DataFusionError::External(Box::new(e)),
             })?;
 
-        // Wait for the server to acknowledge
+        // Wait for the server to acknowledge.
         use futures::TryStreamExt;
         response
             .into_inner()
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_reference.to_string(),
+                table_name,
                 source: DataFusionError::External(Box::new(e)),
             })?;
+
+        // Ensure subsequent scans for this Cayenne table are forwarded to the executor
+        // that accepted the write, even if the table was created after initial partition allocation.
+        let resolved_table = TableReference::full(
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        );
+        let mut partitions = executor_registry.partitions.write().await;
+        partitions
+            .entry(executor_id)
+            .or_default()
+            .entry(resolved_table)
+            .or_insert_with(Vec::new);
 
         tracing::info!(
             "Successfully forwarded Cayenne write for table {table_reference} to executor"
@@ -1233,14 +1263,163 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
-        let data_frame = self
-            .ctx
-            .table(dataset)
+    /// Forwards a raw FlightData stream to an executor via Flight DoPut.
+    ///
+    /// This avoids scheduler-side decode/re-encode overhead and is used as a fast path
+    /// for scheduler -> executor Cayenne write-through ingestion.
+    pub(crate) async fn forward_flight_data_stream_to_executor<S>(
+        &self,
+        table_reference: &TableReference,
+        mut inbound_stream: S,
+    ) -> Result<()>
+    where
+        S: futures::Stream<Item = std::result::Result<arrow_flight::FlightData, tonic::Status>>
+            + Send
+            + 'static,
+    {
+        let Some(executor_registry) = self.executor_registry.as_ref() else {
+            return NoExecutorsAvailableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail();
+        };
+
+        // Get an executor's FlightSqlClient
+        let (executor_id, client) = {
+            let clients = executor_registry.flight_sql_clients.read().await;
+            let Some((executor_id, client)) = clients.iter().next() else {
+                tracing::error!(
+                    "No executors available to forward Cayenne write for table {table_reference}"
+                );
+                return NoExecutorsAvailableSnafu {
+                    table_name: table_reference.to_string(),
+                }
+                .fail();
+            };
+            (executor_id.clone(), client.clone())
+        };
+
+        tracing::info!("Forwarding raw Cayenne DoPut stream for table {table_reference} to executor");
+
+        let resolved = table_reference
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let descriptor_path = vec![
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        ];
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
+        let (copy_result_tx, copy_result_rx) = tokio::sync::oneshot::channel::<
+            std::result::Result<(), tonic::Status>,
+        >();
+
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut inbound_stream = Box::pin(inbound_stream);
+            let mut is_first = true;
+            loop {
+                match inbound_stream.next().await {
+                    Some(Ok(mut fd)) => {
+                        if is_first {
+                            if let Some(descriptor) = fd.flight_descriptor.as_mut() {
+                                descriptor.path = descriptor_path.clone();
+                            } else {
+                                fd.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_path(
+                                    descriptor_path.clone(),
+                                ));
+                            }
+                            is_first = false;
+                        }
+
+                        if tx.send(fd).await.is_err() {
+                            let _ = copy_result_tx.send(Ok(()));
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = copy_result_tx.send(Err(e));
+                        break;
+                    }
+                    None => {
+                        let _ = copy_result_tx.send(Ok(()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Forward the authorization header from the original request so the
+        // executor can validate the caller's credentials when configured.
+        let auth_header = runtime_request_context::RequestContext::current(
+            runtime_request_context::AsyncMarker::new().await,
+        )
+        .authorization_header()
+        .map(str::to_string);
+
+        let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        if let Some(auth_value) = auth_header
+            && let Ok(val) = auth_value.parse()
+        {
+            request.metadata_mut().insert("authorization", val);
+        }
+
+        let table_name = table_reference.to_string();
+        let mut inner_client = client.into_inner();
+        let response = inner_client
+            .do_put(request)
             .await
-            .map_err(find_datafusion_root)
-            .context(UnableToGetTableSnafu)?;
-        Ok(data_frame.schema().as_arrow().clone())
+            .map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_name.clone(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+
+        // Wait for the server to acknowledge.
+        use futures::TryStreamExt;
+        response
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_name.clone(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+
+        match copy_result_rx.await {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(e)) => {
+                return Err(Error::UnableToExecuteTableInsert {
+                    table_name,
+                    source: DataFusionError::External(Box::new(e)),
+                });
+            }
+        }
+
+        // Ensure subsequent scans for this Cayenne table are forwarded to the executor.
+        let resolved_table = TableReference::full(
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        );
+        let mut partitions = executor_registry.partitions.write().await;
+        partitions
+            .entry(executor_id)
+            .or_default()
+            .entry(resolved_table)
+            .or_insert_with(Vec::new);
+
+        tracing::info!(
+            "Successfully forwarded raw Cayenne DoPut stream for table {table_reference} to executor"
+        );
+
+        Ok(())
+    }
+
+    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
+        let table_reference = dataset.into();
+        let table_provider = self.get_table_provider(&table_reference).await?;
+        Ok(table_provider.schema().as_ref().clone())
     }
 
     #[must_use]

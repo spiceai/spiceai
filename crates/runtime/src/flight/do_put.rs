@@ -39,6 +39,7 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
+    config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
     timing::TimedStream,
@@ -88,23 +89,38 @@ pub(crate) async fn handle(
             }
             Command::CommandStatementIngest(ingest_cmd) => {
                 // Handle FlightSQL bulk ingestion command
-                // Extract the table reference from the command
-                let table_ref = if let Some(catalog) = &ingest_cmd.catalog {
-                    if let Some(schema) = &ingest_cmd.schema {
-                        TableReference::full(
-                            catalog.as_str(),
-                            schema.as_str(),
-                            ingest_cmd.table.as_str(),
-                        )
-                    } else {
-                        TableReference::partial(catalog.as_str(), ingest_cmd.table.as_str())
+                // Prefer descriptor path when command is under-qualified (table only).
+                // This preserves fully-qualified paths forwarded by the scheduler.
+                match (ingest_cmd.catalog.as_ref(), ingest_cmd.schema.as_ref()) {
+                    (Some(catalog), Some(schema)) => Some(vec![
+                        catalog.clone(),
+                        schema.clone(),
+                        ingest_cmd.table.clone(),
+                    ]),
+                    // If command is under-qualified, prefer descriptor path if present,
+                    // because scheduler forwarding includes fully-qualified path parts.
+                    (Some(catalog), None) => {
+                        if fd.path.is_empty() {
+                            Some(vec![catalog.clone(), ingest_cmd.table.clone()])
+                        } else {
+                            None
+                        }
                     }
-                } else if let Some(schema) = &ingest_cmd.schema {
-                    TableReference::partial(schema.as_str(), ingest_cmd.table.as_str())
-                } else {
-                    TableReference::bare(ingest_cmd.table.as_str())
-                };
-                Some(vec![table_ref.to_string()])
+                    (None, Some(schema)) => {
+                        if fd.path.is_empty() {
+                            Some(vec![schema.clone(), ingest_cmd.table.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                    (None, None) => {
+                        if fd.path.is_empty() {
+                            Some(vec![ingest_cmd.table.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                }
             }
             _ => None,
         }
@@ -117,7 +133,10 @@ pub(crate) async fn handle(
         rate_limit_check()?;
     }
 
-    match RequestContext::current(AsyncMarker::new().await).auth_principal() {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    match context.auth_principal() {
         Some(principal) => {
             if !principal
                 .groups()
@@ -130,9 +149,15 @@ pub(crate) async fn handle(
             }
         }
         None => {
-            return Err(Status::unauthenticated(
-                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
-            ));
+            if allow_scheduler_trusted_executor_write(&datafusion) {
+                tracing::debug!(
+                    "Allowing unauthenticated DoPut on executor in mTLS scheduler-trusted mode"
+                );
+            } else {
+                return Err(Status::unauthenticated(
+                    "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+                ));
+            }
         }
     }
 
@@ -154,18 +179,38 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No path provided"));
     }
 
-    let path = TableReference::parse_str(&path_vec.join("."));
+    let path = match path_vec.len() {
+        3 => TableReference::full(path_vec[0].as_str(), path_vec[1].as_str(), path_vec[2].as_str()),
+        2 => TableReference::partial(path_vec[0].as_str(), path_vec[1].as_str()),
+        _ => TableReference::parse_str(&path_vec.join(".")),
+    };
+    let path = normalize_path_table_reference(path, &datafusion);
 
     // Initializing tracking here so that both counter and duration have consistent path dimensions
     let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
-
-    let context = RequestContext::current(AsyncMarker::new().await);
-    let datafusion = get_current_datafusion(&context);
 
     if !datafusion.is_writable(&path) && !datafusion.is_path_catalog_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
+    }
+
+    // Fast path: for scheduler -> executor Cayenne writes, forward raw FlightData
+    // directly to executor to avoid decode/re-encode overhead on scheduler.
+    if should_forward_raw_cayenne_write(&datafusion, &path).await {
+        use futures::stream;
+
+        let inbound = futures::StreamExt::chain(
+            stream::once(async move { Ok(first_message.clone()) }),
+            streaming_flight,
+        );
+        datafusion
+            .forward_flight_data_stream_to_executor(&path, inbound)
+            .await
+            .map_err(|e| Status::internal(format!("Write operation failed: {e}")))?;
+
+        let output = futures::stream::iter(vec![Ok(PutResult::default())]);
+        return Ok(Response::new(Box::pin(output)));
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
@@ -184,12 +229,126 @@ pub(crate) async fn handle(
     }
 
     let first_message = first_message.clone();
-    let response_stream =
-        create_response_stream(path, schema, datafusion, streaming_flight, &first_message);
+    let response_stream = create_response_stream(
+        path,
+        schema,
+        Arc::clone(&datafusion),
+        streaming_flight,
+        &first_message,
+    );
+    let response_stream = context.scope_stream(response_stream);
 
     let timed_stream = TimedStream::new(response_stream, move || start);
 
     Ok(Response::new(Box::pin(timed_stream)))
+}
+
+fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
+    datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
+        && datafusion.cluster_config.tls_config().is_some()
+}
+
+async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableReference) -> bool {
+    if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
+        return false;
+    }
+
+    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
+        return false;
+    };
+
+    let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+        return false;
+    };
+    if clients.is_empty() {
+        return false;
+    }
+    drop(clients);
+
+    let Some(table_provider) = datafusion.get_table(path).await else {
+        return false;
+    };
+
+    table_provider
+        .as_any()
+        .downcast_ref::<cayenne::CayenneTableProvider>()
+        .is_some()
+}
+
+fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
+    match path {
+        TableReference::Full { .. } => path,
+        TableReference::Partial { schema, table } => {
+            let matching_catalogs = datafusion
+                .ctx
+                .catalog_names()
+                .into_iter()
+                .filter(|catalog_name| {
+                    datafusion
+                        .ctx
+                        .catalog(catalog_name)
+                        .and_then(|catalog| catalog.schema(schema.as_ref()))
+                        .is_some_and(|schema_provider| {
+                            schema_provider.table_exist(table.as_ref())
+                                || datafusion.is_catalog_writable(catalog_name)
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if matching_catalogs.len() == 1 {
+                return TableReference::full(
+                    matching_catalogs[0].clone(),
+                    schema.to_string(),
+                    table.to_string(),
+                );
+            }
+
+            TableReference::partial(schema, table)
+        }
+        TableReference::Bare { table } => {
+            let table_for_match = table.clone();
+            let matching_tables = datafusion
+                .ctx
+                .catalog_names()
+                .into_iter()
+                .flat_map(|catalog_name| {
+                    let catalog_name_for_outer = catalog_name.clone();
+                    let table_for_outer = table_for_match.clone();
+                    datafusion
+                        .ctx
+                        .catalog(&catalog_name)
+                        .into_iter()
+                        .flat_map(move |catalog| {
+                            let catalog_name_for_inner = catalog_name_for_outer.clone();
+                            let table_for_inner = table_for_outer.clone();
+                            catalog.schema_names().into_iter().filter_map(move |schema_name| {
+                                let catalog_name_for_schema = catalog_name_for_inner.clone();
+                                let table_for_schema = table_for_inner.clone();
+                                catalog
+                                    .schema(&schema_name)
+                                    .filter(|schema_provider| {
+                                        schema_provider.table_exist(table_for_schema.as_ref())
+                                    })
+                                    .map(|_| {
+                                        (
+                                            catalog_name_for_schema,
+                                            schema_name,
+                                            table_for_schema.clone(),
+                                        )
+                                    })
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if matching_tables.len() == 1 {
+                let (catalog, schema, table) = matching_tables[0].clone();
+                return TableReference::full(catalog, schema, table.to_string());
+            }
+
+            TableReference::bare(table_for_match)
+        }
+    }
 }
 
 fn create_response_stream(

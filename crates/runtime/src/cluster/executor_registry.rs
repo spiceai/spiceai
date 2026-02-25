@@ -320,7 +320,6 @@ impl TablePartitionProvider for ExecutorRegistry {
                     table.clone(),
                     Arc::clone(&schema),
                     Arc::new(CookieStore::new()),
-
                 )) as Arc<dyn TableProvider>;
 
                 Some((table_provider, parts.clone()))
@@ -328,6 +327,8 @@ impl TablePartitionProvider for ExecutorRegistry {
             .collect()
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
