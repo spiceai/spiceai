@@ -105,7 +105,9 @@ impl CloudClient {
 
         if !org.is_empty() {
             // Validate against the org returned by list_apps (populated from auth context).
-            if let Some(first) = apps.first() && first.org != org {
+            if let Some(first) = apps.first()
+                && first.org != org
+            {
                 return InvalidResponseSnafu {
                     message: format!("App '{org_app}' not found"),
                 }

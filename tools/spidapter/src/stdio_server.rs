@@ -68,6 +68,7 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
 }
 
 /// Average non-`None` `f64` values extracted from pods.
+#[expect(clippy::cast_precision_loss)]
 fn avg_opt(
     pods: &[&spice_cloud_client::types::PodMetrics],
     f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
@@ -98,6 +99,8 @@ fn sum_opt_u64(
 }
 
 /// Sum non-`None` `f64` values and convert to `u64`.
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
 fn sum_opt_f64_as_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
     f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
@@ -214,7 +217,9 @@ impl Handler for SpidapterHandler {
 
         let pods = cloud_metrics.metrics.values().collect::<Vec<_>>();
 
-        let resource = if !pods.is_empty() {
+        let resource = if pods.is_empty() {
+            ResourceMetrics::default()
+        } else {
             ResourceMetrics {
                 cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
@@ -223,8 +228,6 @@ impl Handler for SpidapterHandler {
                 disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
                 disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
             }
-        } else {
-            ResourceMetrics::default()
         };
 
         let ingestion = cloud_metrics
@@ -358,7 +361,7 @@ async fn post_setup_sink_action(
     cname: &str,
     api_key: &str,
 ) -> anyhow::Result<()> {
-    if let Some(EtlSinkType::Adbc) = setup_config.sink_type {
+    if setup_config.sink_type == Some(EtlSinkType::Adbc) {
         eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
 
         let create_table_statements = generate_adbc_create_table_statements(datasets)?;
