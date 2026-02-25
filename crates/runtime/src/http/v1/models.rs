@@ -191,7 +191,7 @@ pub(crate) async fn get(
                     object: "model".to_string(),
                     owned_by: m.from.clone(),
                     datasets: d,
-                    status: statuses.get(&m.name).copied(),
+                    status: statuses.get(&m.name).cloned(),
                     metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
                 }
             })
@@ -218,7 +218,7 @@ pub(crate) async fn get(
             object: "model".to_string(),
             owned_by: "spiceai".to_string(),
             datasets: None,
-            status: worker_statuses.get(name).copied(),
+            status: worker_statuses.get(name).cloned(),
             metadata: generate_metadata(name, &metadata_keys, &responses_models),
         })
     }));

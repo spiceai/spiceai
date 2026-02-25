@@ -561,7 +561,7 @@ async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
                 let view_statuses = rt.status().get_view_statuses();
                 let view_status = view_statuses.get(&TableReference::bare("invalid_syntax_view"));
                 if let Some(status) = view_status {
-                    if *status != runtime::status::ComponentStatus::Error {
+                    if !status.is_error() {
                         return Err(anyhow::anyhow!(
                             "Invalid SQL view should be in error state, got {status:?}"
                         ));
@@ -597,7 +597,7 @@ async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
                 let view_statuses = rt.status().get_view_statuses();
                 let view_status = view_statuses.get(&TableReference::bare("empty_sql_view"));
                 if let Some(status) = view_status {
-                    if *status != runtime::status::ComponentStatus::Error {
+                    if !status.is_error() {
                         return Err(anyhow::anyhow!(
                             "Empty SQL view should be in error state, got {status:?}"
                         ));
@@ -633,7 +633,7 @@ async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
                 let view_statuses = rt.status().get_view_statuses();
                 let view_status = view_statuses.get(&TableReference::bare("multi_statement_view"));
                 if let Some(status) = view_status {
-                    if *status != runtime::status::ComponentStatus::Error {
+                    if !status.is_error() {
                         return Err(anyhow::anyhow!(
                             "Multi-statement view should be in error state, got {status:?}"
                         ));
@@ -669,7 +669,7 @@ async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
                 let view_statuses = rt.status().get_view_statuses();
                 let view_status = view_statuses.get(&TableReference::bare("insert_view"));
                 if let Some(status) = view_status {
-                    if *status != runtime::status::ComponentStatus::Error {
+                    if !status.is_error() {
                         return Err(anyhow::anyhow!(
                             "Non-SELECT view should be in error state, got {status:?}"
                         ));
