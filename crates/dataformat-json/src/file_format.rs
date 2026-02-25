@@ -283,9 +283,10 @@ impl FileFormat for SpiceJsonFormat {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let table_schema = conf.file_source().table_schema().clone();
         let source = Arc::new(
-            SpiceJsonSource::new(table_schema)
+            SpiceJsonSource::new()
                 .with_array_to_ndjson(matches!(self.options.format, Format::Array))
-                .with_unnest_struct(self.options.flatten_json.clone()),
+                .with_unnest_struct(self.options.flatten_json.clone())
+                .with_table_schema(table_schema),
         );
 
         if matches!(self.options.format, Format::Array) {
@@ -337,7 +338,7 @@ impl FileFormat for SpiceJsonFormat {
 
     fn file_source(&self, table_schema: datafusion_datasource::TableSchema) -> Arc<dyn FileSource> {
         Arc::new(
-            SpiceJsonSource::new(table_schema)
+            SpiceJsonSource::new()
                 .with_array_to_ndjson(matches!(self.options.format, Format::Array))
                 .with_unnest_struct(self.options.flatten_json.clone())
                 .with_table_schema(table_schema),

@@ -35,7 +35,6 @@ use datafusion_datasource::{PartitionedFile, RangeCalculation, TableSchema, calc
 
 use arrow::datatypes::SchemaRef;
 use arrow::json::ReaderBuilder;
-use datafusion::common::Statistics;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
@@ -81,7 +80,6 @@ impl SpiceJsonOpener {
 pub struct SpiceJsonSource {
     batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
-    projected_statistics: Option<Statistics>,
     array_to_ndjson: bool,
     unnest_struct: Option<String>,
     table_schema: Option<TableSchema>,
@@ -142,9 +140,10 @@ impl FileSource for SpiceJsonSource {
     }
 
     fn table_schema(&self) -> &TableSchema {
-        self.table_schema
-            .as_ref()
-            .expect("table_schema must be set before use")
+        match self.table_schema.as_ref() {
+            Some(table_schema) => table_schema,
+            None => unreachable!("table_schema must be set before use"),
+        }
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
