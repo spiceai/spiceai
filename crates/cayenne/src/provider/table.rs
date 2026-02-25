@@ -3792,8 +3792,7 @@ impl CayenneTableProvider {
                         Arc::clone(&guard)
                     };
                     // Don't use insert_records for protected snapshot approach
-                    let empty_insert_records: Arc<DeletedRowKeysMap> =
-                        Arc::new(HashMap::new());
+                    let empty_insert_records: Arc<DeletedRowKeysMap> = Arc::new(HashMap::new());
 
                     if !deleted_row_keys.is_empty() {
                         return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
@@ -4672,5 +4671,121 @@ mod tests {
             &format!("{table_name}_types"),
         )
         .await;
+    }
+
+    /// Helper: build a single-column Int64 RecordBatch and the matching RowConverter.
+    fn make_int64_pk_batch(values: &[i64]) -> (RecordBatch, RowConverter) {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)]));
+        let col = Arc::new(Int64Array::from(values.to_vec()));
+        let batch = RecordBatch::try_new(schema, vec![col]).expect("valid batch");
+        let converter =
+            RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("valid converter");
+        (batch, converter)
+    }
+
+    #[test]
+    fn test_process_batches_into_keyset_int64pk_filters_deleted() {
+        let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
+
+        // Delete pk=2 with del_seq=1
+        let deleted: Arc<HashMap<i64, i64>> = Arc::new(HashMap::from([(2, 1)]));
+        let strategy = PkDeletionStrategyWithCache::Int64Pk {
+            cached_deleted_pk: Arc::new(RwLock::new(Arc::clone(&deleted))),
+            cached_insert_records: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+        };
+
+        let mut keyset = HashMap::new();
+        let mut row_id_base: i64 = 0;
+
+        CayenneTableProvider::process_batches_into_keyset(
+            &[batch],
+            &strategy,
+            &[0],
+            &converter,
+            &[0],
+            Some(&deleted),
+            None,
+            None, // all deletions apply
+            "test_table",
+            &mut keyset,
+            &mut row_id_base,
+        )
+        .expect("process_batches_into_keyset should succeed");
+
+        assert_eq!(keyset.len(), 2, "pk=2 should be filtered out");
+        assert_eq!(row_id_base, 3);
+    }
+
+    #[test]
+    fn test_process_batches_into_keyset_threshold_filters_partial() {
+        let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
+
+        // pk=1 deleted at seq 5, pk=2 deleted at seq 15
+        let deleted: Arc<HashMap<i64, i64>> = Arc::new(HashMap::from([(1, 5), (2, 15)]));
+        let strategy = PkDeletionStrategyWithCache::Int64Pk {
+            cached_deleted_pk: Arc::new(RwLock::new(Arc::clone(&deleted))),
+            cached_insert_records: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+        };
+
+        let mut keyset = HashMap::new();
+        let mut row_id_base: i64 = 0;
+
+        // threshold=10: only deletions with del_seq > 10 apply
+        CayenneTableProvider::process_batches_into_keyset(
+            &[batch],
+            &strategy,
+            &[0],
+            &converter,
+            &[0],
+            Some(&deleted),
+            None,
+            Some(10),
+            "test_table",
+            &mut keyset,
+            &mut row_id_base,
+        )
+        .expect("process_batches_into_keyset should succeed");
+
+        // pk=1 (del_seq=5 <= 10) => visible, pk=2 (del_seq=15 > 10) => filtered, pk=3 => visible
+        assert_eq!(
+            keyset.len(),
+            2,
+            "only pk=2 should be filtered (del_seq 15 > threshold 10)"
+        );
+        assert_eq!(row_id_base, 3);
+    }
+
+    #[test]
+    fn test_process_batches_into_keyset_no_deletions() {
+        let (batch, converter) = make_int64_pk_batch(&[10, 20, 30]);
+
+        let strategy = PkDeletionStrategyWithCache::Int64Pk {
+            cached_deleted_pk: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+            cached_insert_records: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+        };
+
+        let mut keyset = HashMap::new();
+        let mut row_id_base: i64 = 0;
+
+        CayenneTableProvider::process_batches_into_keyset(
+            &[batch],
+            &strategy,
+            &[0],
+            &converter,
+            &[0],
+            None,
+            None,
+            None,
+            "test_table",
+            &mut keyset,
+            &mut row_id_base,
+        )
+        .expect("process_batches_into_keyset should succeed");
+
+        assert_eq!(keyset.len(), 3, "all rows should be in keyset");
+        assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
     }
 }
