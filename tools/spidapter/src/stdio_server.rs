@@ -87,11 +87,11 @@ fn sum_opt_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
     f: fn(&spice_cloud_client::types::PodMetrics) -> Option<u64>,
 ) -> Option<u64> {
-    let (sum, any) = pods.iter().fold((0_u64, false), |(s, _), p| {
+    let (sum, any) = pods.iter().fold((0_u64, false), |(s, any), p| {
         if let Some(v) = f(p) {
             (s.saturating_add(v), true)
         } else {
-            (s, false)
+            (s, any)
         }
     });
     any.then_some(sum)
@@ -102,11 +102,11 @@ fn sum_opt_f64_as_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
     f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
 ) -> Option<u64> {
-    let (sum, any) = pods.iter().fold((0.0_f64, false), |(s, _), p| {
+    let (sum, any) = pods.iter().fold((0.0_f64, false), |(s, any), p| {
         if let Some(v) = f(p) {
             (s + v, true)
         } else {
-            (s, false)
+            (s, any)
         }
     });
     any.then_some(sum as u64)
