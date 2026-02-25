@@ -819,20 +819,8 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 rt.set_partition_manager(Arc::clone(&partition_manager))
                     .await;
 
-                // Initialize partition metadata for all accelerated tables
-                if let Err(err) = partition::initialize_partition_metadata(
-                    rt.datafusion(),
-                    Arc::clone(&app),
-                    &partition_manager,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to initialize partition metadata during scheduler startup: {err}"
-                    );
-                }
-
-                // Start partition management task
+                // Start partition management task (which also seeds initial partition
+                // metadata as its first step, before entering the periodic loop).
                 let pm_shutdown = CancellationToken::new();
                 let pm_config = match config
                     .partition_management

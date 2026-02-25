@@ -77,6 +77,11 @@ pub async fn initialize_partition_metadata(
         return Ok(());
     }
 
+    tracing::info!(
+        table_count = tables.len(),
+        "Initializing partition metadata for accelerated tables"
+    );
+
     // Get existing tables from partition manager
     let existing_tables: HashSet<String> = partition_manager
         .list_tables()

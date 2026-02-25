@@ -248,6 +248,23 @@ impl PartitionManagementTask {
 
     pub async fn run(self) -> Result<()> {
         tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} in background");
+
+        // Seed partition metadata for tables that don't have it yet.
+        // This runs once before the periodic loop and is cancellation-aware
+        // so it can be interrupted during shutdown (the discovery query against
+        // a large source table like S3 can take a long time).
+        tokio::select! {
+            () = self.cancel.cancelled() => {
+                tracing::info!("Partition metadata initialization cancelled during shutdown");
+                return Ok(());
+            }
+            result = self.initialize_metadata() => {
+                if let Err(err) = result {
+                    tracing::warn!("Failed to initialize partition metadata: {err}");
+                }
+            }
+        }
+
         let mut interval = tokio::time::interval(self.config.interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -323,6 +340,23 @@ impl PartitionManagementTask {
         }
 
         Ok(())
+    }
+
+    /// Seed partition metadata for all accelerated tables that don't have metadata yet.
+    ///
+    /// This delegates to [`super::initialize_partition_metadata`] which discovers partition
+    /// values from the federated source and writes them as unassigned in the object store.
+    async fn initialize_metadata(&self) -> std::result::Result<(), super::Error> {
+        let Some(app) = &*self.app.read().await else {
+            tracing::debug!("App not initialized, skipping partition metadata seeding");
+            return Ok(());
+        };
+        super::initialize_partition_metadata(
+            Arc::clone(&self.df),
+            Arc::clone(app),
+            &self.partition_manager,
+        )
+        .await
     }
 
     async fn refresh_state(&self) -> Result<CycleState> {

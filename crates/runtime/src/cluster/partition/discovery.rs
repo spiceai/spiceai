@@ -20,6 +20,7 @@ use crate::{
     accelerated_table::AcceleratedTable,
     cluster::partition::{Error, PartitionDiscoverySnafu, Result, metadata::PartitionValue},
     datafusion::DataFusion,
+    search::util::find_concrete_table_provider,
 };
 use datafusion::common::ToDFSchema;
 use datafusion::{execution::SessionStateBuilder, prelude::SessionContext, sql::TableReference};
@@ -35,6 +36,12 @@ pub async fn table_partition_values(
     df: &Arc<DataFusion>,
 ) -> Result<Vec<PartitionValue>> {
     let table_name = table.to_string();
+
+    tracing::debug!(
+        table = %table_name,
+        partitioning = ?partitioning,
+        "Starting partition value discovery"
+    );
 
     // Build SQL query to get distinct partition values
     // For single partition column: SELECT DISTINCT partition_col as  FROM table
@@ -105,10 +112,12 @@ async fn execute_partition_discovery_query(
     df.runtime_status().wait_for_dataset_ready(table).await;
 
     // Must get table source of `AcceleratedTable` to get true value of partition.
+    // The table may be registered directly as AcceleratedTable, or wrapped in a
+    // FederatedTableProviderAdaptor when federation is enabled. Use the generic
+    // unwrapping helper to handle all known wrapper types.
     let table_opt = df.get_table(table).await;
-    let Some(acc) = table_opt.clone().and_then(|t| {
-        t.as_any()
-            .downcast_ref::<AcceleratedTable>()
+    let Some(acc) = table_opt.as_ref().and_then(|t| {
+        find_concrete_table_provider::<AcceleratedTable>(t)
             .map(AcceleratedTable::get_federated_table)
     }) else {
         return Err(Error::NotAcceleratedTable {
@@ -157,9 +166,31 @@ async fn execute_partition_discovery_query(
             table: table_name.clone(),
         });
 
-    df_result?
+    let df_result = df_result?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            table = %table_name,
+            "Executing partition discovery query against federated source\n{}",
+            df_result.logical_plan().display_indent(),
+        );
+    }
+    let batches = df_result
         .collect()
         .await
         .boxed()
-        .context(PartitionDiscoverySnafu { table: table_name })
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?;
+
+    let total_rows: usize = batches
+        .iter()
+        .map(arrow::record_batch::RecordBatch::num_rows)
+        .sum();
+    tracing::debug!(
+        table = %table_name,
+        total_rows,
+        "Partition discovery query completed"
+    );
+
+    Ok(batches)
 }
