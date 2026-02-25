@@ -180,11 +180,8 @@ mod tests {
         let required = vec![part_a.clone(), part_b.clone(), part_c.clone()];
 
         let mut available = HashMap::new();
-        available.insert(
-            "executor1".to_string(),
-            vec![part_a.clone(), part_b.clone()],
-        );
-        available.insert("executor2".to_string(), vec![part_c.clone()]);
+        available.insert("executor1".to_string(), vec![part_a, part_b]);
+        available.insert("executor2".to_string(), vec![part_c]);
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
@@ -217,16 +214,13 @@ mod tests {
         let mut available = HashMap::new();
         available.insert(
             "executor1".to_string(),
-            vec![part_a.clone(), part_b.clone(), part_c.clone()],
+            vec![part_a, part_b.clone(), part_c.clone()],
         );
         available.insert(
             "executor2".to_string(),
-            vec![part_b.clone(), part_c.clone(), part_d.clone()],
+            vec![part_b.clone(), part_c.clone(), part_d],
         );
-        available.insert(
-            "executor3".to_string(),
-            vec![part_b.clone(), part_c.clone()],
-        );
+        available.insert("executor3".to_string(), vec![part_b, part_c]);
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
@@ -251,10 +245,7 @@ mod tests {
 
         let mut available = HashMap::new();
         // Only has A and B, missing C
-        available.insert(
-            "executor1".to_string(),
-            vec![part_a.clone(), part_b.clone()],
-        );
+        available.insert("executor1".to_string(), vec![part_a, part_b]);
 
         let result = select_executors(&required, &available);
         assert!(result.is_err());
