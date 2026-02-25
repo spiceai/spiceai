@@ -16,11 +16,13 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use super::composite_flight_service::CompositeFlightService;
+use crate::auth::EndpointAuth;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
-use crate::auth::EndpointAuth;
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
-use crate::flight::{Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error, session_auth};
+use crate::flight::{
+    Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error, session_auth,
+};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
@@ -215,7 +217,8 @@ pub async fn start_executor_flight_server(
     }
 
     // Create composite Flight service that handles both Ballista and Spice protocols
-    let spice_service = SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let spice_service =
+        SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
     let session_store = spice_service.session_store();
     let composite_service = CompositeFlightService::new(spice_service);
 

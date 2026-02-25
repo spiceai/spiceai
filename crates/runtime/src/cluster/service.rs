@@ -816,7 +816,11 @@ async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference>
                             let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
                                 continue;
                             };
-                            let key = (catalog_name.clone(), schema_name.clone(), short_name.to_string());
+                            let key = (
+                                catalog_name.clone(),
+                                schema_name.clone(),
+                                short_name.to_string(),
+                            );
                             if seen.insert(key.clone()) {
                                 tables.push(TableReference::full(key.0, key.1, key.2));
                             }
@@ -832,7 +836,11 @@ async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference>
             }
 
             for table_name in schema.table_names() {
-                let key = (catalog_name.clone(), schema_name.clone(), table_name.clone());
+                let key = (
+                    catalog_name.clone(),
+                    schema_name.clone(),
+                    table_name.clone(),
+                );
                 if seen.insert(key.clone()) {
                     tables.push(TableReference::full(key.0, key.1, key.2));
                 }

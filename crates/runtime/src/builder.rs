@@ -264,9 +264,10 @@ impl RuntimeBuilder {
         {
             df_builder = df_builder
                 .with_executor_registry(Arc::clone(executor_registry))
-                .with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
-                ))
+                .with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(Arc::clone(
+                    executor_registry,
+                )
+                    as Arc<dyn TablePartitionProvider>))
                     as Arc<dyn AnalyzerRule + Send + Sync>]);
         }
 

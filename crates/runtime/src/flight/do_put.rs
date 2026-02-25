@@ -180,7 +180,11 @@ pub(crate) async fn handle(
     }
 
     let path = match path_vec.len() {
-        3 => TableReference::full(path_vec[0].as_str(), path_vec[1].as_str(), path_vec[2].as_str()),
+        3 => TableReference::full(
+            path_vec[0].as_str(),
+            path_vec[1].as_str(),
+            path_vec[2].as_str(),
+        ),
         2 => TableReference::partial(path_vec[0].as_str(), path_vec[1].as_str()),
         _ => TableReference::parse_str(&path_vec.join(".")),
     };
@@ -321,22 +325,25 @@ fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion)
                         .flat_map(move |catalog| {
                             let catalog_name_for_inner = catalog_name_for_outer.clone();
                             let table_for_inner = table_for_outer.clone();
-                            catalog.schema_names().into_iter().filter_map(move |schema_name| {
-                                let catalog_name_for_schema = catalog_name_for_inner.clone();
-                                let table_for_schema = table_for_inner.clone();
-                                catalog
-                                    .schema(&schema_name)
-                                    .filter(|schema_provider| {
-                                        schema_provider.table_exist(table_for_schema.as_ref())
-                                    })
-                                    .map(|_| {
-                                        (
-                                            catalog_name_for_schema,
-                                            schema_name,
-                                            table_for_schema.clone(),
-                                        )
-                                    })
-                            })
+                            catalog
+                                .schema_names()
+                                .into_iter()
+                                .filter_map(move |schema_name| {
+                                    let catalog_name_for_schema = catalog_name_for_inner.clone();
+                                    let table_for_schema = table_for_inner.clone();
+                                    catalog
+                                        .schema(&schema_name)
+                                        .filter(|schema_provider| {
+                                            schema_provider.table_exist(table_for_schema.as_ref())
+                                        })
+                                        .map(|_| {
+                                            (
+                                                catalog_name_for_schema,
+                                                schema_name,
+                                                table_for_schema.clone(),
+                                            )
+                                        })
+                                })
                         })
                 })
                 .collect::<Vec<_>>();

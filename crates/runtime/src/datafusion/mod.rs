@@ -851,16 +851,15 @@ impl DataFusion {
         let table_name = table_reference.table();
         let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
-        let catalog_provider = self
-            .resolve_catalog_provider(table_reference)
-            .context(CatalogMissingSnafu {
-                catalog: catalog_name.to_string(),
-            })
-            ?;
+        let catalog_provider =
+            self.resolve_catalog_provider(table_reference)
+                .context(CatalogMissingSnafu {
+                    catalog: catalog_name.to_string(),
+                })?;
 
         let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)
             .context(SchemaMissingSnafu {
-            schema: schema_name.to_string(),
+                schema: schema_name.to_string(),
             })?;
 
         let table_provider = schema_provider
@@ -871,8 +870,7 @@ impl DataFusion {
             .context(TableMissingSnafu {
                 schema: schema_name.to_string(),
                 table: table_name.to_string(),
-            })
-            ?;
+            })?;
 
         Ok(table_provider)
     }
@@ -1163,7 +1161,7 @@ impl DataFusion {
             (executor_id.clone(), client.clone())
         };
 
-        tracing::info!("Forwarding Cayenne write for table {table_reference} to executor");
+        tracing::debug!("Forwarding Cayenne write for table {table_reference} to executor");
 
         // Resolve the table reference to a fully qualified form so the executor
         // can locate it regardless of its default catalog/schema settings.
@@ -1187,9 +1185,12 @@ impl DataFusion {
                 use futures::StreamExt;
                 match s.next().await {
                     Some(Ok(batch)) => Some((Ok(batch), s)),
-                    Some(Err(e)) => {
-                        Some((Err(arrow_flight::error::FlightError::Arrow(arrow_schema::ArrowError::ExternalError(Box::new(e)))), s))
-                    }
+                    Some(Err(e)) => Some((
+                        Err(arrow_flight::error::FlightError::Arrow(
+                            arrow_schema::ArrowError::ExternalError(Box::new(e)),
+                        )),
+                        s,
+                    )),
                     None => None,
                 }
             }));
@@ -1223,13 +1224,14 @@ impl DataFusion {
         }
 
         let mut inner_client = client.into_inner();
-        let response = inner_client
-            .do_put(request)
-            .await
-            .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_name.clone(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
+        let response =
+            inner_client
+                .do_put(request)
+                .await
+                .map_err(|e| Error::UnableToExecuteTableInsert {
+                    table_name: table_name.clone(),
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
 
         // Wait for the server to acknowledge.
         use futures::TryStreamExt;
@@ -1256,7 +1258,7 @@ impl DataFusion {
             .entry(resolved_table)
             .or_insert_with(Vec::new);
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully forwarded Cayenne write for table {table_reference} to executor"
         );
 
@@ -1270,7 +1272,7 @@ impl DataFusion {
     pub(crate) async fn forward_flight_data_stream_to_executor<S>(
         &self,
         table_reference: &TableReference,
-        mut inbound_stream: S,
+        inbound_stream: S,
     ) -> Result<()>
     where
         S: futures::Stream<Item = std::result::Result<arrow_flight::FlightData, tonic::Status>>
@@ -1299,7 +1301,9 @@ impl DataFusion {
             (executor_id.clone(), client.clone())
         };
 
-        tracing::info!("Forwarding raw Cayenne DoPut stream for table {table_reference} to executor");
+        tracing::debug!(
+            "Forwarding raw Cayenne DoPut stream for table {table_reference} to executor"
+        );
 
         let resolved = table_reference
             .clone()
@@ -1311,9 +1315,8 @@ impl DataFusion {
         ];
 
         let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
-        let (copy_result_tx, copy_result_rx) = tokio::sync::oneshot::channel::<
-            std::result::Result<(), tonic::Status>,
-        >();
+        let (copy_result_tx, copy_result_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<(), tonic::Status>>();
 
         tokio::spawn(async move {
             use futures::StreamExt;
@@ -1326,9 +1329,10 @@ impl DataFusion {
                             if let Some(descriptor) = fd.flight_descriptor.as_mut() {
                                 descriptor.path = descriptor_path.clone();
                             } else {
-                                fd.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_path(
-                                    descriptor_path.clone(),
-                                ));
+                                fd.flight_descriptor =
+                                    Some(arrow_flight::FlightDescriptor::new_path(
+                                        descriptor_path.clone(),
+                                    ));
                             }
                             is_first = false;
                         }
@@ -1367,13 +1371,14 @@ impl DataFusion {
 
         let table_name = table_reference.to_string();
         let mut inner_client = client.into_inner();
-        let response = inner_client
-            .do_put(request)
-            .await
-            .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_name.clone(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
+        let response =
+            inner_client
+                .do_put(request)
+                .await
+                .map_err(|e| Error::UnableToExecuteTableInsert {
+                    table_name: table_name.clone(),
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
 
         // Wait for the server to acknowledge.
         use futures::TryStreamExt;
@@ -1409,7 +1414,7 @@ impl DataFusion {
             .entry(resolved_table)
             .or_insert_with(Vec::new);
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully forwarded raw Cayenne DoPut stream for table {table_reference} to executor"
         );
 

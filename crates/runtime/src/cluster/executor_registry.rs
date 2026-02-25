@@ -328,8 +328,6 @@ impl TablePartitionProvider for ExecutorRegistry {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

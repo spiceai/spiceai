@@ -111,7 +111,7 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
 
         match result {
             Ok(()) => {
-                tracing::info!(executor_id, sql, "Forwarded Cayenne DDL to executor");
+                tracing::debug!(executor_id, sql, "Forwarded Cayenne DDL to executor");
             }
             Err(e) => {
                 tracing::warn!(executor_id, sql, error = %e, "Failed to forward Cayenne DDL to executor");
@@ -291,9 +291,14 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
                     // Open and register the existing table provider if not already present.
                     if !schema_provider.table_exist(&table_name) {
-                        let builder = CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
+                        let builder =
+                            CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
                         if let Ok(provider) = builder.open(&metadata_table_name).await {
-                            let _ = schema_provider.register_table(table_name.clone(), Arc::new(provider));
+                            if let Err(e) = schema_provider
+                                .register_table(table_name.clone(), Arc::new(provider))
+                            {
+                                tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
+                            }
                         }
                     }
 
@@ -690,7 +695,9 @@ impl ExecutionPlan for CayenneDropTableExec {
 
             // Deregister from the DataFusion catalog
             if let Some(schema_provider) = df_catalog.schema(&df_schema_name) {
-                let _ = schema_provider.deregister_table(&table_name);
+                if let Err(err) = schema_provider.deregister_table(&table_name) {
+                    tracing::error!(table_name, error = %err, "Failed to deregister Cayenne table from DataFusion schema provider");
+                }
             }
 
             // Forward the DROP TABLE DDL to executor nodes

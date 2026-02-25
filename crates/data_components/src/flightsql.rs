@@ -534,10 +534,9 @@ impl ExecutionPlan for FlightSqlExec {
         let sql = self.sql().map_err(to_execution_error)?;
         let target_schema = self.schema();
 
-        let stream = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store))
-            .map(move |result| {
-                result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema))
-            });
+        let stream = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
+            move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)),
+        );
 
         let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), stream);
 

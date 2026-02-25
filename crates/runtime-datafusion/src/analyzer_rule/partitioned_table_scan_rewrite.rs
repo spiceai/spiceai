@@ -25,7 +25,7 @@ use datafusion::{
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
-    logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableScan, Union},
+    logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, Union},
     optimizer::AnalyzerRule,
     sql::TableReference,
 };
@@ -131,11 +131,16 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 sub_scans.push(Arc::new(plan));
             }
 
-            // If no partitions are available (e.g. no executors connected yet),
-            // preserve the original scan so it can still execute locally.
+            // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
             if sub_scans.is_empty() {
-                return Ok(Transformed::no(plan));
+                return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                    EmptyRelation {
+                        produce_one_row: false,
+                        schema: Arc::clone(plan.schema()),
+                    },
+                )));
             }
+
             Ok(Transformed::yes(LogicalPlan::Union(Union {
                 inputs: sub_scans,
                 schema: Arc::clone(plan.schema()),
