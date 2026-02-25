@@ -441,7 +441,7 @@ impl TablePartitionProvider for ExecutorRegistry {
 
 #[cfg(test)]
 mod tests {
-    use object_store::{ObjectStore, memory::InMemory};
+    use object_store::memory::InMemory;
 
     use super::*;
 

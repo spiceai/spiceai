@@ -151,7 +151,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert!(result.expect("should be ok").is_empty());
     }
 
     #[test]
@@ -162,14 +162,11 @@ mod tests {
         let required = vec![part_a.clone(), part_b.clone()];
 
         let mut available = HashMap::new();
-        available.insert(
-            "executor1".to_string(),
-            vec![part_a.clone(), part_b.clone()],
-        );
+        available.insert("executor1".to_string(), vec![part_a, part_b]);
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
-        let selected = result.unwrap();
+        let selected = result.expect("should be ok");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0], "executor1");
     }
@@ -191,7 +188,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
-        let selected = result.unwrap();
+        let selected = result.expect("should be ok");
         assert_eq!(selected.len(), 2);
         assert!(selected.contains(&"executor1".to_string()));
         assert!(selected.contains(&"executor2".to_string()));
@@ -233,7 +230,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
-        let selected = result.unwrap();
+        let selected = result.expect("should be ok");
 
         // Should select exactly 2 executors (greedy picks executor1 first with 3 partitions,
         // then executor2 to cover D)
@@ -261,7 +258,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_err());
-        match result.unwrap_err() {
+        match result.expect_err("should be err") {
             Error::MissingPartitions(missing) => {
                 assert_eq!(missing.len(), 1);
                 assert!(missing.contains(&part_c));
@@ -277,7 +274,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_err());
-        match result.unwrap_err() {
+        match result.expect_err("should be err") {
             Error::MissingPartitions(missing) => {
                 assert_eq!(missing.len(), 1);
                 assert!(missing.contains(&part_a));
@@ -303,7 +300,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
-        let selected = result.unwrap();
+        let selected = result.expect("should be ok");
         assert_eq!(selected.len(), 2);
     }
 }
