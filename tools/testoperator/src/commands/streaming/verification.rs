@@ -64,6 +64,7 @@ pub async fn run_verification(
     config_name: &str,
     iterations: usize,
     scale_factor: f64,
+    with_explain_plan_snapshot: bool,
 ) -> Result<VerificationResult> {
     println!("\n{}", "=".repeat(60));
     println!("Starting TPCH Query Verification (SpiceTest)");
@@ -112,10 +113,15 @@ pub async fn run_verification(
         .with_query_executor(executor);
 
     // Create and run SpiceTest (name differentiates snapshots per config)
-    let test = SpiceTest::new(format!("streaming_{config_name}"), state)
+    let mut test = SpiceTest::new(format!("streaming_{config_name}"), state)
         .with_spiced_instance(spiced_instance)
-        .with_progress_bars(false)
-        .with_explain_plan_snapshot()
+        .with_progress_bars(false);
+
+    if with_explain_plan_snapshot {
+        test = test.with_explain_plan_snapshot();
+    }
+
+    let test = test.with_explain_plan_snapshot()
         .start()?
         .wait()
         .await?;

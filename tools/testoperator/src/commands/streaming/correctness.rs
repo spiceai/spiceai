@@ -36,6 +36,9 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use futures::future::try_join_all;
 use test_framework::anyhow::{self, Result};
+use test_framework::git;
+use test_framework::opentelemetry::KeyValue;
+use test_framework::opentelemetry_sdk::Resource;
 use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
@@ -46,8 +49,9 @@ use super::utils::{
     generate_run_id, load_spicepod_definition, poll_for_all_markers, wait_for_all_marker_deletions,
     write_temp_spicepod,
 };
-use super::verification;
+use super::{utils, verification};
 use crate::args::StreamingDynamodbCorrectnessArgs;
+use crate::commands::create_telemetry_with_resource;
 
 /// Run the multi-round CDC data correctness test.
 ///
@@ -171,6 +175,32 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
+    // Build telemetry resource
+    let spiced_version = spiced_instance.version().to_string();
+    let testoperator_commit_sha = git::get_commit_sha();
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let branch_name = git::get_branch_name();
+
+    let resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "streaming_correctness"),
+            KeyValue::new("config_name", config_name.clone()),
+            KeyValue::new("run_id", run_id.clone()),
+            KeyValue::new("queryset", args.queryset.to_string()),
+            KeyValue::new("scale_factor", args.scale_factor.to_string()),
+            KeyValue::new("rounds", args.rounds.to_string()),
+            KeyValue::new("mutation_ratio", args.mutation_ratio.to_string()),
+            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("spiced_version", spiced_version),
+            KeyValue::new("branch_name", branch_name),
+        ])
+        .build();
+
+    let telemetry = create_telemetry_with_resource(&args.common, resource);
+
     println!("\nSpice is ready, starting correctness rounds\n");
 
     // Track results per round
@@ -262,7 +292,7 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
 
         // Run verification
         let verification_result =
-            verification::run_verification(spiced_instance, &config_name, 1, args.scale_factor)
+            verification::run_verification(spiced_instance, &config_name, 1, args.scale_factor, false)
                 .await?;
 
         // Get spiced_instance back from result
@@ -278,6 +308,40 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
             if passed { "PASS" } else { "FAIL" }
         );
     }
+
+    // Compute results
+    let all_passed = round_results.iter().all(|(_, passed)| *passed);
+    let pass_count = round_results.iter().filter(|(_, p)| *p).count();
+    let fail_count = round_results.len() - pass_count;
+
+    // Fetch DynamoDB metrics (requires spiced running)
+    let dynamodb_metrics = match utils::get_dynamodb_metrics().await {
+        Ok(metrics) => {
+            println!("\nDynamoDB records consumed: {}", metrics.records_consumed_total);
+            if metrics.errors_transient_total > 0 {
+                println!(
+                    "DynamoDB transient errors: {}",
+                    metrics.errors_transient_total
+                );
+            }
+            metrics
+        }
+        Err(e) => {
+            println!("\nWarning: Failed to fetch DynamoDB metrics: {e}");
+            utils::DynamoDbMetrics::default()
+        }
+    };
+
+    // Record metrics
+    crate::metrics::RECORD_COUNT.record(dynamodb_metrics.records_consumed_total, &[]);
+    crate::metrics::DYNAMODB_TRANSIENT_ERRORS
+        .record(dynamodb_metrics.errors_transient_total, &[]);
+    crate::metrics::CORRECTNESS_ROUNDS_TOTAL.record(round_results.len() as u64, &[]);
+    crate::metrics::CORRECTNESS_ROUNDS_PASSED.record(pass_count as u64, &[]);
+    crate::metrics::CORRECTNESS_ROUNDS_FAILED.record(fail_count as u64, &[]);
+
+    // Emit telemetry
+    telemetry.emit().await?;
 
     // Stop Spice
     spiced_instance.stop()?;
@@ -295,10 +359,6 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
     for (round, passed) in &round_results {
         println!("  Round {round}: {}", if *passed { "PASS" } else { "FAIL" });
     }
-
-    let all_passed = round_results.iter().all(|(_, passed)| *passed);
-    let pass_count = round_results.iter().filter(|(_, p)| *p).count();
-    let fail_count = round_results.len() - pass_count;
 
     println!(
         "\nResult: {pass_count}/{} rounds passed",
