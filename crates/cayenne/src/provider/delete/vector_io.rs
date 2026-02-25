@@ -45,8 +45,8 @@ use chrono::Utc;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::catalog::{CatalogError, CatalogResult};
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
+use crate::provider::{Error, Result};
 
 /// Directory under the table snapshot where deletion vectors are stored.
 const DELETION_DIR_NAME: &str = "deletions";
@@ -165,7 +165,7 @@ impl<'a> DeletionVectorWriter<'a> {
     pub async fn write(
         &self,
         specs: Vec<DeletionVectorWriteSpec>,
-    ) -> CatalogResult<Vec<DeletionVectorWriteResult>> {
+    ) -> Result<Vec<DeletionVectorWriteResult>> {
         let mut results = Vec::with_capacity(specs.len());
 
         for spec in specs {
@@ -174,9 +174,7 @@ impl<'a> DeletionVectorWriter<'a> {
             }
 
             let deletion_dir = self.table_snapshot_deletion_dir();
-            tokio::fs::create_dir_all(&deletion_dir)
-                .await
-                .map_err(|source| CatalogError::IoError { source })?;
+            tokio::fs::create_dir_all(&deletion_dir).await?;
 
             let file_path = Self::deletion_file_path(&deletion_dir);
 
@@ -219,8 +217,13 @@ impl<'a> DeletionVectorWriter<'a> {
                 }
             };
 
-            let file_size_bytes =
-                write_deletion_file(&file_path, Arc::clone(&schema), batch).await?;
+            let file_size_bytes = write_deletion_file(
+                &file_path,
+                Arc::clone(&schema),
+                batch,
+                &self.table.table_name,
+            )
+            .await?;
 
             // Determine deletion type from identifiers
             let deletion_type = match &identifiers {
@@ -421,27 +424,23 @@ pub fn detect_deletion_type_and_read(
 // ============================================================================
 
 /// Build a deletion batch for position-based row IDs.
-fn build_position_based_batch(schema: &SchemaRef, row_ids: &[u64]) -> CatalogResult<RecordBatch> {
+fn build_position_based_batch(schema: &SchemaRef, row_ids: &[u64]) -> Result<RecordBatch> {
     let deleted_at = Utc::now().timestamp_micros();
 
     let row_id_array = UInt64Array::from(row_ids.to_vec());
     let deleted_at_array = Int64Array::from(vec![deleted_at; row_ids.len()]);
 
-    RecordBatch::try_new(
+    Ok(RecordBatch::try_new(
         Arc::clone(schema),
         vec![
             Arc::new(row_id_array) as Arc<dyn Array>,
             Arc::new(deleted_at_array),
         ],
-    )
-    .map_err(|err| CatalogError::InvalidOperation {
-        message: "Failed to build position-based deletion batch.".to_string(),
-        source: Box::new(err),
-    })
+    )?)
 }
 
 /// Build a deletion batch for key-based row keys (primary key bytes).
-fn build_key_based_batch(schema: &SchemaRef, row_keys: &[Box<[u8]>]) -> CatalogResult<RecordBatch> {
+fn build_key_based_batch(schema: &SchemaRef, row_keys: &[Box<[u8]>]) -> Result<RecordBatch> {
     let deleted_at = Utc::now().timestamp_micros();
 
     // Convert Box<[u8]> to &[u8] for BinaryArray
@@ -449,59 +448,41 @@ fn build_key_based_batch(schema: &SchemaRef, row_keys: &[Box<[u8]>]) -> CatalogR
     let row_key_array = BinaryArray::from(key_refs);
     let deleted_at_array = Int64Array::from(vec![deleted_at; row_keys.len()]);
 
-    RecordBatch::try_new(
+    Ok(RecordBatch::try_new(
         Arc::clone(schema),
         vec![
             Arc::new(row_key_array) as Arc<dyn Array>,
             Arc::new(deleted_at_array),
         ],
-    )
-    .map_err(|err| CatalogError::InvalidOperation {
-        message: "Failed to build key-based deletion batch.".to_string(),
-        source: Box::new(err),
-    })
+    )?)
 }
 
 async fn write_deletion_file(
     file_path: &Path,
     schema: SchemaRef,
     batch: RecordBatch,
-) -> CatalogResult<u64> {
+    table_name: &str,
+) -> Result<u64> {
     let output_path = file_path.to_path_buf();
-    let schema_for_write = schema;
-    let batch_for_write = batch;
+    let table_name = table_name.to_string();
 
-    tokio::task::spawn_blocking(move || -> CatalogResult<u64> {
+    tokio::task::spawn_blocking(move || -> Result<u64> {
         use arrow::ipc::writer::FileWriter;
 
-        let file = std::fs::File::create(&output_path)
-            .map_err(|source| CatalogError::IoError { source })?;
-        let mut writer = FileWriter::try_new(file, &schema_for_write).map_err(|err| {
-            CatalogError::InvalidOperation {
-                message: "Failed to initialize deletion vector writer.".to_string(),
-                source: Box::new(err),
-            }
-        })?;
-        writer
-            .write(&batch_for_write)
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: "Failed to write deletion vector batch.".to_string(),
-                source: Box::new(err),
-            })?;
-        writer
-            .finish()
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: "Failed to finish deletion vector file.".to_string(),
-                source: Box::new(err),
-            })?;
+        let file = std::fs::File::create(&output_path)?;
+        let mut writer = FileWriter::try_new(file, &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
 
-        let metadata =
-            std::fs::metadata(&output_path).map_err(|source| CatalogError::IoError { source })?;
+        let metadata = std::fs::metadata(&output_path)?;
 
         Ok(metadata.len())
     })
     .await
-    .map_err(|source| CatalogError::TaskJoin { source })?
+    .map_err(|source| Error::TaskPanicked {
+        table: table_name,
+        source,
+    })?
 }
 
 fn build_delete_file(
@@ -511,17 +492,15 @@ fn build_delete_file(
     file_size_bytes: u64,
     deletion_type: DeletionType,
     source_data_file_path: Option<String>,
-) -> CatalogResult<DeleteFile> {
-    let delete_count_i64 =
-        i64::try_from(delete_count).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion count overflow ({delete_count})."),
-            source: Box::new(err),
-        })?;
-    let file_size_i64 =
-        i64::try_from(file_size_bytes).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion vector file too large ({file_size_bytes} bytes)."),
-            source: Box::new(err),
-        })?;
+) -> Result<DeleteFile> {
+    let delete_count_i64 = i64::try_from(delete_count).map_err(|_| Error::Internal {
+        table: table.table_name.clone(),
+        message: format!("Deletion count overflow ({delete_count})."),
+    })?;
+    let file_size_i64 = i64::try_from(file_size_bytes).map_err(|_| Error::Internal {
+        table: table.table_name.clone(),
+        message: format!("Deletion vector file too large ({file_size_bytes} bytes)."),
+    })?;
 
     Ok(DeleteFile {
         delete_file_id: 0,
@@ -624,7 +603,7 @@ mod tests {
         let reader = FileReader::try_new(file, None).expect("create reader");
         let batches: Vec<_> = reader
             .into_iter()
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read batches");
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
