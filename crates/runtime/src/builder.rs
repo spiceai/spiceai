@@ -262,7 +262,7 @@ impl RuntimeBuilder {
                             })
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::error!(
                                 "Failed to initialize partition metadata store for scheduler: {e}"
                             );
                             None

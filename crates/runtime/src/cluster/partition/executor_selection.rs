@@ -63,10 +63,6 @@ impl std::error::Error for Error {}
 /// * `Ok(Vec<String>)` - List of executor IDs that together cover all required partitions
 /// * `Err(Error::MissingPartitions)` - Some required partitions are not available on any executor
 ///
-/// # Algorithm Complexity
-///
-/// O(E * P) where E = number of executors, P = average partitions per executor
-///
 /// # Example
 ///
 /// ```ignore

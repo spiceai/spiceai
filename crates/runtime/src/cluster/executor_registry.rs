@@ -362,7 +362,6 @@ impl TablePartitionProvider for ExecutorRegistry {
             tracing::debug!("No partitions required for table {table}");
             return Vec::new();
         }
-        // required_partitions
 
         // Build map of executor -> partitions from metadata
         let mut executor_partition_map: std::collections::HashMap<String, Vec<_>> =
