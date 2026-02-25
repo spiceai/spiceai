@@ -1831,7 +1831,7 @@ impl CayenneTableProvider {
 
     /// Process record batches and add visible keys to the keyset.
     ///
-    /// Filters out deleted rows using the provided deletion maps (without insert_records).
+    /// Filters out deleted rows using the provided deletion maps (without `insert_records`).
     /// Keys from later batches override earlier ones in the keyset, which is correct
     /// because protected snapshots contain data inserted at higher sequence numbers.
     fn process_batches_into_keyset(
