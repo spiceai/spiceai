@@ -24,7 +24,7 @@ use super::constants::{
     PROTECTED_SNAPSHOTS_LOCK_POISONED, WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
-    is_pk_visible_i64, is_pk_visible_row_key, CayenneDeletionSink, DeletionIdentifier,
+    CayenneDeletionSink, DeletionIdentifier,
     DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink,
     Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
@@ -1755,6 +1755,7 @@ impl CayenneTableProvider {
         // Process main listing table batches with the FULL deletion filter (no insert_records).
         // This mirrors scan()'s apply_deletion_filter() which uses all deletions without
         // insert_records when protected snapshots exist.
+        // min_delete_seq_threshold=None means ALL deletions apply.
         Self::process_batches_into_keyset(
             &main_batches,
             &self.pk_deletion_strategy,
@@ -1763,6 +1764,7 @@ impl CayenneTableProvider {
             &projected_pk_indices,
             &deleted_pk_i64,
             &deleted_row_keys,
+            None, // all deletions apply to main listing table
             &self.table_metadata.table_name,
             &mut keyset,
             &mut row_id_base,
@@ -1791,35 +1793,15 @@ impl CayenneTableProvider {
 
             let snapshot_batches = collect(snapshot_plan, ctx.task_ctx()).await?;
 
-            // Build filtered deletion maps: only deletions with seq > max_delete_seq_at_creation
-            let filtered_deleted_pk_i64 = deleted_pk_i64.as_ref().map(|all_deleted| {
-                Arc::new(
-                    all_deleted
-                        .iter()
-                        .filter(|(_pk, &seq)| seq > *max_delete_seq_at_creation)
-                        .map(|(&pk, &seq)| (pk, seq))
-                        .collect::<HashMap<i64, i64>>(),
-                )
-            });
-
-            let filtered_deleted_row_keys = deleted_row_keys.as_ref().map(|all_deleted| {
-                Arc::new(
-                    all_deleted
-                        .iter()
-                        .filter(|(_key, &seq)| seq > *max_delete_seq_at_creation)
-                        .map(|(key, &seq)| (key.clone(), seq))
-                        .collect::<HashMap<Box<[u8]>, i64>>(),
-                )
-            });
-
             Self::process_batches_into_keyset(
                 &snapshot_batches,
                 &self.pk_deletion_strategy,
                 pk_indices,
                 converter,
                 &projected_pk_indices,
-                &filtered_deleted_pk_i64,
-                &filtered_deleted_row_keys,
+                &deleted_pk_i64,
+                &deleted_row_keys,
+                Some(*max_delete_seq_at_creation), // only deletions with seq > threshold apply
                 &self.table_metadata.table_name,
                 &mut keyset,
                 &mut row_id_base,
@@ -1831,9 +1813,17 @@ impl CayenneTableProvider {
 
     /// Process record batches and add visible keys to the keyset.
     ///
-    /// Filters out deleted rows using the provided deletion maps (without `insert_records`).
+    /// Filters out deleted rows using the provided deletion maps. No insert_records are
+    /// used — visibility is determined solely by whether a deletion exists for the key.
+    ///
+    /// `min_delete_seq_threshold`: When `Some(threshold)`, only deletions with
+    /// `seq > threshold` are considered (for protected snapshots). When `None`, all
+    /// deletions apply (for the main listing table). This avoids building filtered
+    /// HashMap copies per snapshot — each row is checked with a single O(1) lookup.
+    ///
     /// Keys from later batches override earlier ones in the keyset, which is correct
     /// because protected snapshots contain data inserted at higher sequence numbers.
+    #[expect(clippy::too_many_arguments)]
     fn process_batches_into_keyset(
         batches: &[RecordBatch],
         pk_deletion_strategy: &PkDeletionStrategyWithCache,
@@ -1842,6 +1832,7 @@ impl CayenneTableProvider {
         projected_pk_indices: &[usize],
         deleted_pk_i64: &Option<Arc<HashMap<i64, i64>>>,
         deleted_row_keys: &Option<Arc<HashMap<Box<[u8]>, i64>>>,
+        min_delete_seq_threshold: Option<i64>,
         table_name: &str,
         keyset: &mut HashMap<OwnedRow, RowLocation>,
         row_id_base: &mut i64,
@@ -1870,16 +1861,21 @@ impl CayenneTableProvider {
                     })?;
 
                 // Check if row is deleted based on pk_deletion_strategy.
-                // No insert_records are passed — for main batches this matches
-                // apply_deletion_filter(), and for protected snapshot batches the
-                // deletion map is already filtered to only relevant sequences.
+                // For main batches (threshold=None): all deletions apply.
+                // For protected snapshots (threshold=Some(T)): only deletions with seq > T apply.
                 let is_deleted = match pk_deletion_strategy {
                     PkDeletionStrategyWithCache::Int64Pk { .. } => {
                         if let (Some(pk_array), Some(deleted_pks)) =
                             (int64_pk_array, deleted_pk_i64)
                         {
                             let pk_value = pk_array.value(row_idx);
-                            !is_pk_visible_i64(pk_value, deleted_pks, None)
+                            match deleted_pks.get(&pk_value) {
+                                None => false, // not deleted
+                                Some(&del_seq) => match min_delete_seq_threshold {
+                                    None => true, // all deletions apply
+                                    Some(threshold) => del_seq > threshold,
+                                },
+                            }
                         } else {
                             false
                         }
@@ -1887,7 +1883,13 @@ impl CayenneTableProvider {
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                         if let Some(deleted_keys) = deleted_row_keys {
                             let key = rows.row(row_idx);
-                            !is_pk_visible_row_key(key.as_ref(), deleted_keys, None)
+                            match deleted_keys.get(key.as_ref()) {
+                                None => false, // not deleted
+                                Some(&del_seq) => match min_delete_seq_threshold {
+                                    None => true, // all deletions apply
+                                    Some(threshold) => del_seq > threshold,
+                                },
+                            }
                         } else {
                             false
                         }
