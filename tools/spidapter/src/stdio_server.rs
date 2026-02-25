@@ -214,8 +214,7 @@ impl Handler for SpidapterHandler {
 
         let pods = cloud_metrics.metrics.values().collect::<Vec<_>>();
 
-        let resource = pods
-            .is_empty()
+        let resource = (!pods.is_empty())
             .then(|| ResourceMetrics {
                 cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
