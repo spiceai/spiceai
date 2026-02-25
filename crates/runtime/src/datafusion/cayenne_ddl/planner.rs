@@ -48,6 +48,12 @@ impl CayenneDdlExtensionPlanner {
     }
 }
 
+impl Default for CayenneDdlExtensionPlanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl ExtensionPlanner for CayenneDdlExtensionPlanner {
     async fn plan_extension(

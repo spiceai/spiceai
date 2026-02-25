@@ -783,7 +783,7 @@ impl Query {
                 // schema with the logical plan schema so downstream consumers
                 // (e.g. FlightSQL GetFlightInfo vs DoGet) see consistent
                 // nullability.
-                reconcile_stream_nullability(res_stream, plan_schema)
+                reconcile_stream_nullability(res_stream, plan_schema.as_ref())
             } else {
                 res_stream
             };
@@ -1249,7 +1249,7 @@ fn extract_delete_filters(source: &LogicalPlan) -> Vec<datafusion::logical_expr:
 /// conforms.  This uses the same `try_cast_to` mechanism as `SchemaCastScanExec`.
 fn reconcile_stream_nullability(
     stream: SendableRecordBatchStream,
-    plan_schema: Arc<Schema>,
+    plan_schema: &Schema,
 ) -> SendableRecordBatchStream {
     let exec_schema = stream.schema();
 
@@ -1759,7 +1759,7 @@ mod tests {
         .expect("batch");
 
         let stream = stream_from_batches(Arc::clone(&exec_schema), vec![batch]);
-        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema.as_ref());
 
         // Schema should now be nullable
         assert!(
@@ -1799,7 +1799,7 @@ mod tests {
         .expect("batch");
 
         let stream = stream_from_batches(Arc::clone(&schema), vec![batch]);
-        let reconciled = reconcile_stream_nullability(stream, Arc::clone(&schema));
+        let reconciled = reconcile_stream_nullability(stream, schema.as_ref());
 
         // Schema unchanged
         assert_eq!(reconciled.schema(), schema);
@@ -1824,7 +1824,7 @@ mod tests {
         .expect("batch");
 
         let stream = stream_from_batches(Arc::clone(&schema), vec![batch]);
-        let reconciled = reconcile_stream_nullability(stream, Arc::clone(&schema));
+        let reconciled = reconcile_stream_nullability(stream, schema.as_ref());
 
         assert!(!reconciled.schema().field(0).is_nullable());
 
@@ -1857,7 +1857,7 @@ mod tests {
         .expect("batch");
 
         let stream = stream_from_batches(Arc::clone(&exec_schema), vec![batch]);
-        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema.as_ref());
 
         let schema = reconciled.schema();
         assert!(schema.field(0).is_nullable(), "name stays nullable");
@@ -1890,7 +1890,7 @@ mod tests {
         .expect("batch");
 
         let stream = stream_from_batches(Arc::clone(&exec_schema), vec![batch]);
-        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema.as_ref());
 
         // Should be unchanged — no widening when field counts differ
         assert!(!reconciled.schema().field(0).is_nullable());
@@ -1910,7 +1910,7 @@ mod tests {
         )]));
 
         let stream = stream_from_batches(Arc::clone(&exec_schema), vec![]);
-        let reconciled = reconcile_stream_nullability(stream, plan_schema);
+        let reconciled = reconcile_stream_nullability(stream, plan_schema.as_ref());
 
         assert!(reconciled.schema().field(0).is_nullable());
 

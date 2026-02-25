@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Catalog connector for Cayenne catalogs backed by local file storage.
 //!
-//! Cayenne catalogs use SQLite for metadata and Vortex files for columnar data,
+//! Cayenne catalogs use `SQLite` for metadata and Vortex files for columnar data,
 //! with data stored on local disk.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
@@ -60,7 +60,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// A catalog connector for Cayenne lakehouse catalogs.
 ///
 /// Cayenne catalogs provide a high-performance lakehouse format combining:
-/// - SQLite for transactional metadata management (stored locally)
+/// - `SQLite` for transactional metadata management (stored locally)
 /// - Vortex columnar files for data (stored locally)
 ///
 /// Used as `from: cayenne` in the spicepod. Does not support a catalog ID.

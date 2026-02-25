@@ -417,8 +417,8 @@ mod tests {
         );
     }
 
-    /// Regression test for https://github.com/spiceai/spiceai/issues/9481
-    /// Empty query results must preserve the correct schema, not Schema::empty().
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
+    /// Empty query results must preserve the correct schema, not `Schema::empty()`.
     #[test]
     fn test_empty_batches_preserve_schema_new_raw() {
         let schema = Arc::new(Schema::new(vec![
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(cached_result.schema, schema);
     }
 
-    /// Regression test for https://github.com/spiceai/spiceai/issues/9481
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
     #[tokio::test]
     async fn test_empty_batches_preserve_schema_from_batches() {
         let schema = Arc::new(Schema::new(vec![
