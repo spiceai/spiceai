@@ -1,0 +1,27 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "236c651af457",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-13/flightsql",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/runtime/src/cluster/executor_registry.rs",
+    "crates/runtime/src/cluster/partition/executor_selection.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/23/6c651af457/0/metadata.json",
+      "transcript": "/23/6c651af457/0/full.jsonl",
+      "context": "/23/6c651af457/0/context.md",
+      "content_hash": "/23/6c651af457/0/content_hash.txt",
+      "prompt": "/23/6c651af457/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 142,
+    "cache_creation_tokens": 27821,
+    "cache_read_tokens": 689424,
+    "output_tokens": 779,
+    "api_call_count": 20
+  }
+}
