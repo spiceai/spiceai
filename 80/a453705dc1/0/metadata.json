@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "80a453705dc1",
+  "session_id": "a555d55a-5eab-41e9-aaad-8ac31e88458b",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-24T22:19:45.264951Z",
+  "branch": "jeadie/26-02-24/spice-cloud",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "4a75ea13bcf9",
+  "token_usage": {
+    "input_tokens": 40,
+    "cache_creation_tokens": 76268,
+    "cache_read_tokens": 1676523,
+    "output_tokens": 637,
+    "api_call_count": 36
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-24T22:19:45.066441Z",
+    "agent_lines": 0,
+    "human_added": 78,
+    "human_modified": 327,
+    "human_removed": 0,
+    "total_committed": 78,
+    "agent_percentage": 0
+  }
+}

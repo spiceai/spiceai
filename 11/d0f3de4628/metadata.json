@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "11d0f3de4628",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-24/spice-cloud",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/11/d0f3de4628/0/metadata.json",
+      "transcript": "/11/d0f3de4628/0/full.jsonl",
+      "context": "/11/d0f3de4628/0/context.md",
+      "content_hash": "/11/d0f3de4628/0/content_hash.txt",
+      "prompt": "/11/d0f3de4628/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 40,
+    "cache_creation_tokens": 76268,
+    "cache_read_tokens": 1676523,
+    "output_tokens": 637,
+    "api_call_count": 36
+  }
+}
