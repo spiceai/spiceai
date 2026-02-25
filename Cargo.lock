@@ -18207,6 +18207,7 @@ dependencies = [
  "runtime-secrets",
  "serde",
  "serde_json",
+ "spice-cloud-client",
  "spiceai",
  "spicepod",
  "system-adapter-protocol",
@@ -18868,7 +18869,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=5cbdb2a84ba47de959a395777e721b4a2d3a172c#5cbdb2a84ba47de959a395777e721b4a2d3a172c"
+source = "git+https://github.com/spiceai/spicebench.git?rev=523a2fdcbee64982e14db992c8811207d370d05c#523a2fdcbee64982e14db992c8811207d370d05c"
 dependencies = [
  "arrow-schema",
  "async-trait",
