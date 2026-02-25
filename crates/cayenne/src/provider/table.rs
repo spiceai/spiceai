@@ -1706,14 +1706,72 @@ impl CayenneTableProvider {
         let ctx = SessionContext::new();
         // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
+
+        // Scan main listing table
         let scan_plan = listing_table
             .scan(&ctx.state(), Some(&pk_projection), &[], None)
             .await?;
 
-        let mut all_batches = collect(scan_plan, ctx.task_ctx()).await?;
+        let main_batches = collect(scan_plan, ctx.task_ctx()).await?;
 
-        // Also collect batches from each protected snapshot
-        for snapshot_id in protected_snapshots.keys() {
+        // Load the deletion caches based on pk_deletion_strategy.
+        // Note: PositionBased strategy is never used here since it implies no primary key,
+        // and this function is only called for tables with primary keys.
+        let deleted_pk_i64 = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
+                let guard = cached_deleted_pk.read().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+                Some(Arc::clone(&guard))
+            }
+            _ => None,
+        };
+
+        let deleted_row_keys = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
+                let guard = cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+                Some(Arc::clone(&guard))
+            }
+            _ => None,
+        };
+
+        let mut keyset = HashMap::with_capacity(1024);
+        let mut row_id_base: i64 = 0;
+
+        // After projection, batch columns are at indices 0..pk_indices.len()
+        let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
+
+        // Process main listing table batches with the FULL deletion filter (no insert_records).
+        // This mirrors scan()'s apply_deletion_filter() which uses all deletions without
+        // insert_records when protected snapshots exist.
+        Self::process_batches_into_keyset(
+            &main_batches,
+            &self.pk_deletion_strategy,
+            pk_indices,
+            converter,
+            &projected_pk_indices,
+            &deleted_pk_i64,
+            &deleted_row_keys,
+            &self.table_metadata.table_name,
+            &mut keyset,
+            &mut row_id_base,
+        )?;
+
+        // Process each protected snapshot with a PARTIAL deletion filter.
+        // Only deletions with seq > max_delete_seq_at_creation apply, mirroring
+        // scan()'s apply_partial_deletion_filter().
+        for (snapshot_id, max_delete_seq_at_creation) in &protected_snapshots {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
                 self.table_metadata.table_id,
@@ -1727,78 +1785,68 @@ impl CayenneTableProvider {
                 &self.pk_deletion_strategy,
             )?;
 
-            // Only read PK columns - no need to load all columns for keyset building
             let snapshot_plan = snapshot_listing_table
                 .scan(&ctx.state(), Some(&pk_projection), &[], None)
                 .await?;
 
             let snapshot_batches = collect(snapshot_plan, ctx.task_ctx()).await?;
 
-            all_batches.extend(snapshot_batches);
+            // Build filtered deletion maps: only deletions with seq > max_delete_seq_at_creation
+            let filtered_deleted_pk_i64 = deleted_pk_i64.as_ref().map(|all_deleted| {
+                Arc::new(
+                    all_deleted
+                        .iter()
+                        .filter(|(_pk, &seq)| seq > *max_delete_seq_at_creation)
+                        .map(|(&pk, &seq)| (pk, seq))
+                        .collect::<HashMap<i64, i64>>(),
+                )
+            });
+
+            let filtered_deleted_row_keys = deleted_row_keys.as_ref().map(|all_deleted| {
+                Arc::new(
+                    all_deleted
+                        .iter()
+                        .filter(|(_key, &seq)| seq > *max_delete_seq_at_creation)
+                        .map(|(key, &seq)| (key.clone(), seq))
+                        .collect::<HashMap<Box<[u8]>, i64>>(),
+                )
+            });
+
+            Self::process_batches_into_keyset(
+                &snapshot_batches,
+                &self.pk_deletion_strategy,
+                pk_indices,
+                converter,
+                &projected_pk_indices,
+                &filtered_deleted_pk_i64,
+                &filtered_deleted_row_keys,
+                &self.table_metadata.table_name,
+                &mut keyset,
+                &mut row_id_base,
+            )?;
         }
 
-        // Load the appropriate deletion cache based on pk_deletion_strategy.
-        // This ensures keys that were previously deleted are not considered as conflicts.
-        // Note: PositionBased strategy is never used here since it implies no primary key,
-        // and this function is only called for tables with primary keys.
-        let (deleted_pk_i64, insert_records_pk_i64) = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk,
-                cached_insert_records,
-            } => {
-                let deleted_guard = cached_deleted_pk.read().map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-                let insert_guard =
-                    cached_insert_records
-                        .read()
-                        .map_err(|_| Error::LockPoisoned {
-                            table: self.table_metadata.table_name.clone(),
-                            lock: DELETION_CACHE_LOCK_POISONED,
-                        })?;
-                (
-                    Some(Arc::clone(&deleted_guard)),
-                    Some(Arc::clone(&insert_guard)),
-                )
-            }
-            _ => (None, None),
-        };
+        Ok(keyset)
+    }
 
-        let (deleted_row_keys, insert_records_row_keys) = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                cached_insert_records,
-            } => {
-                let deleted_guard =
-                    cached_deleted_row_keys
-                        .read()
-                        .map_err(|_| Error::LockPoisoned {
-                            table: self.table_metadata.table_name.clone(),
-                            lock: DELETION_CACHE_LOCK_POISONED,
-                        })?;
-                let insert_guard =
-                    cached_insert_records
-                        .read()
-                        .map_err(|_| Error::LockPoisoned {
-                            table: self.table_metadata.table_name.clone(),
-                            lock: DELETION_CACHE_LOCK_POISONED,
-                        })?;
-                (
-                    Some(Arc::clone(&deleted_guard)),
-                    Some(Arc::clone(&insert_guard)),
-                )
-            }
-            _ => (None, None),
-        };
-
-        let mut keyset = HashMap::with_capacity(1024);
-        let mut row_id_base: i64 = 0;
-
-        // After projection, batch columns are at indices 0..pk_indices.len()
-        let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
-
-        for batch in all_batches {
+    /// Process record batches and add visible keys to the keyset.
+    ///
+    /// Filters out deleted rows using the provided deletion maps (without insert_records).
+    /// Keys from later batches override earlier ones in the keyset, which is correct
+    /// because protected snapshots contain data inserted at higher sequence numbers.
+    fn process_batches_into_keyset(
+        batches: &[RecordBatch],
+        pk_deletion_strategy: &PkDeletionStrategyWithCache,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        projected_pk_indices: &[usize],
+        deleted_pk_i64: &Option<Arc<HashMap<i64, i64>>>,
+        deleted_row_keys: &Option<Arc<HashMap<Box<[u8]>, i64>>>,
+        table_name: &str,
+        keyset: &mut HashMap<OwnedRow, RowLocation>,
+        row_id_base: &mut i64,
+    ) -> Result<()> {
+        for batch in batches {
             let pk_columns: Vec<_> = projected_pk_indices
                 .iter()
                 .map(|idx| Arc::clone(batch.column(*idx)))
@@ -1808,48 +1856,42 @@ impl CayenneTableProvider {
 
             // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
             let int64_pk_array: Option<&arrow::array::Int64Array> =
-                if self.pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1 {
+                if pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1 {
                     batch.column(0).as_any().downcast_ref()
                 } else {
                     None
                 };
 
             for row_idx in 0..batch.num_rows() {
-                let row_id = row_id_base
+                let row_id = *row_id_base
                     + i64::try_from(row_idx).map_err(|_| Error::Internal {
-                        table: self.table_metadata.table_name.clone(),
+                        table: table_name.to_string(),
                         message: "Row index exceeds i64::MAX; cannot compute row_id".to_string(),
                     })?;
 
-                // Check if row is deleted based on pk_deletion_strategy
-                let is_deleted = match &self.pk_deletion_strategy {
+                // Check if row is deleted based on pk_deletion_strategy.
+                // No insert_records are passed — for main batches this matches
+                // apply_deletion_filter(), and for protected snapshot batches the
+                // deletion map is already filtered to only relevant sequences.
+                let is_deleted = match pk_deletion_strategy {
                     PkDeletionStrategyWithCache::Int64Pk { .. } => {
                         if let (Some(pk_array), Some(deleted_pks)) =
-                            (int64_pk_array, &deleted_pk_i64)
+                            (int64_pk_array, deleted_pk_i64)
                         {
                             let pk_value = pk_array.value(row_idx);
-                            !is_pk_visible_i64(
-                                pk_value,
-                                deleted_pks,
-                                insert_records_pk_i64.as_deref(),
-                            )
+                            !is_pk_visible_i64(pk_value, deleted_pks, None)
                         } else {
                             false
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        if let Some(deleted_keys) = &deleted_row_keys {
+                        if let Some(deleted_keys) = deleted_row_keys {
                             let key = rows.row(row_idx);
-                            !is_pk_visible_row_key(
-                                key.as_ref(),
-                                deleted_keys,
-                                insert_records_row_keys.as_deref(),
-                            )
+                            !is_pk_visible_row_key(key.as_ref(), deleted_keys, None)
                         } else {
                             false
                         }
                     }
-                    // PositionBased implies no primary key, but this function requires PKs
                     PkDeletionStrategyWithCache::PositionBased { .. } => {
                         unreachable!("PositionBased strategy should not reach load_existing_keyset")
                     }
@@ -1863,10 +1905,9 @@ impl CayenneTableProvider {
                 let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
                 if has_null {
                     return Err(Error::DataValidation {
-                        table: self.table_metadata.table_name.clone(),
+                        table: table_name.to_string(),
                         message: format!(
-                            "Null primary key encountered in existing data for table {}",
-                            self.table_metadata.table_name
+                            "Null primary key encountered in existing data for table {table_name}",
                         ),
                     });
                 }
@@ -1886,13 +1927,13 @@ impl CayenneTableProvider {
                 );
             }
 
-            row_id_base += i64::try_from(batch.num_rows()).map_err(|_| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
+            *row_id_base += i64::try_from(batch.num_rows()).map_err(|_| Error::Internal {
+                table: table_name.to_string(),
                 message: "Batch row count exceeds i64::MAX; cannot compute row_id_base".to_string(),
             })?;
         }
 
-        Ok(keyset)
+        Ok(())
     }
 
     /// Prepare an incoming stream for insert by validating `on_conflict` constraints.
