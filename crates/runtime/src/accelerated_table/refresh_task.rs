@@ -1082,6 +1082,9 @@ impl RefreshTask {
         let default_catalog = state.config_options().catalog.default_catalog.clone();
         let ctx = SessionContext::new_with_state(state);
 
+        // Register core scalar UDFs (e.g. bucket())
+        crate::datafusion::udf::register_core_scalar_udfs(&ctx);
+
         match schema::ensure_schema_exists(&ctx, &default_catalog, dataset_name) {
             Ok(()) => (),
             Err(_) => {
