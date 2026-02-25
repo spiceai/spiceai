@@ -848,7 +848,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
 
 /// Test that `bucket()` can be used in `refresh_sql` and is executed successfully.
 ///
-/// `SELECT * FROM t WHERE bucket(3, id) = '0'` executes without errors
+/// `SELECT * FROM bucket_refresh_test WHERE bucket(5, id) = 0` executes without errors
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
@@ -897,7 +897,7 @@ async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Full),
                 refresh_sql: Some(
-                    "SELECT * FROM bucket_refresh_test WHERE bucket(3, city) = '0'".to_string(),
+                    "SELECT * FROM bucket_refresh_test WHERE bucket(5, id) = 0".to_string(),
                 ),
                 params: Some(Params::from_string_map(params)),
                 ..Acceleration::default()
