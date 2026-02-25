@@ -61,7 +61,7 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
@@ -673,7 +673,7 @@ impl ClusterService for ClusterServiceImpl {
             // Register Cayenne tables as single unpartitioned entries (empty filter expressions).
             // This tells the scheduler that queries targeting these tables should be forwarded to this executor.
             #[cfg(not(windows))]
-            for table_ref in discover_cayenne_tables(&self.datafusion) {
+            for table_ref in discover_cayenne_tables(&self.datafusion).await {
                 partition_map.entry(table_ref).or_insert_with(Vec::new);
             }
 
@@ -789,10 +789,12 @@ async fn notify_scheduler_executor_shutdown(
 /// register unpartitioned entries in the executor's partition map so that queries
 /// for Cayenne tables are forwarded to the executor.
 #[cfg(not(windows))]
-fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
 
     let mut tables = Vec::new();
+    let mut seen = HashSet::new();
     for catalog_name in datafusion.ctx.catalog_names() {
         let Some(catalog) = datafusion.ctx.catalog(&catalog_name) else {
             continue;
@@ -804,12 +806,36 @@ fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
             let Some(schema) = catalog.schema(&schema_name) else {
                 continue;
             };
+
+            // Prefer metadata-catalog discovery to avoid relying on in-memory schema cache.
+            if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
+                let namespace_prefix = format!("{}/", cayenne_schema.namespace());
+                match cayenne_schema.metadata_catalog().list_table_names().await {
+                    Ok(all_table_names) => {
+                        for full_name in all_table_names {
+                            let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
+                                continue;
+                            };
+                            let key = (catalog_name.clone(), schema_name.clone(), short_name.to_string());
+                            if seen.insert(key.clone()) {
+                                tables.push(TableReference::full(key.0, key.1, key.2));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to list Cayenne metadata tables for {catalog_name}.{schema_name}: {e}"
+                        );
+                    }
+                }
+                continue;
+            }
+
             for table_name in schema.table_names() {
-                tables.push(TableReference::full(
-                    catalog_name.clone(),
-                    schema_name.clone(),
-                    table_name,
-                ));
+                let key = (catalog_name.clone(), schema_name.clone(), table_name.clone());
+                if seen.insert(key.clone()) {
+                    tables.push(TableReference::full(key.0, key.1, key.2));
+                }
             }
         }
     }

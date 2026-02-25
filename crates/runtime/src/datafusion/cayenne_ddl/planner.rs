@@ -50,7 +50,7 @@ impl CayenneDdlExtensionPlanner {
 
 impl Default for CayenneDdlExtensionPlanner {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 

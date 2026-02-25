@@ -79,14 +79,38 @@ fn arrow_datatype_to_sql(dt: &DataType) -> String {
 /// Forwards a DDL SQL statement to all connected executor nodes.
 ///
 /// Iterates over [`ExecutorRegistry::flight_sql_clients`] and sends the SQL
-/// via `FlightSqlClient::execute`. Failures are logged as warnings but do not
+/// via `FlightSqlClient::execute`, then drains returned endpoints with `do_get`
+/// so the statement is actually executed on the remote executor. Failures are logged as warnings but do not
 /// cause the overall operation to fail (partial failure is acceptable for MVP).
 async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) {
     let clients = executor_registry.flight_sql_clients.read().await;
     for (executor_id, client) in clients.iter() {
         let mut client = client.clone();
-        match client.execute(sql.to_string(), None).await {
-            Ok(_) => {
+        let result: Result<(), String> = async {
+            use futures::StreamExt;
+
+            let flight_info = client
+                .execute(sql.to_string(), None)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            for endpoint in flight_info.endpoint {
+                let Some(ticket) = endpoint.ticket else {
+                    continue;
+                };
+
+                let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
+                while let Some(batch) = stream.next().await {
+                    batch.map_err(|e| e.to_string())?;
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
                 tracing::info!(executor_id, sql, "Forwarded Cayenne DDL to executor");
             }
             Err(e) => {
@@ -247,6 +271,32 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             if exists {
                 if if_not_exists {
+                    // Table exists in metadata (e.g. after restart). Ensure it is also
+                    // registered in the in-memory DataFusion schema provider immediately
+                    // rather than waiting for periodic catalog refresh.
+                    let schema_provider =
+                        if let Some(s) = cayenne_provider.schema_provider(&df_schema_name) {
+                            s
+                        } else {
+                            let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
+                                Arc::clone(&metadata_catalog),
+                                df_schema_name.clone(),
+                            ));
+                            cayenne_provider.register_schema_provider(
+                                &df_schema_name,
+                                Arc::clone(&new_schema) as Arc<dyn SchemaProvider>,
+                            )?;
+                            Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
+                        };
+
+                    // Open and register the existing table provider if not already present.
+                    if !schema_provider.table_exist(&table_name) {
+                        let builder = CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
+                        if let Ok(provider) = builder.open(&metadata_table_name).await {
+                            let _ = schema_provider.register_table(table_name.clone(), Arc::new(provider));
+                        }
+                    }
+
                     let batch = RecordBatch::try_new(
                         result_schema,
                         vec![Arc::new(StringArray::from(vec![format!(
