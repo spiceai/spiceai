@@ -1722,8 +1722,7 @@ mod tests {
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
     ) -> SendableRecordBatchStream {
-        let s = schema.clone();
-        Box::pin(RecordBatchStreamAdapter::new(s, {
+        Box::pin(RecordBatchStreamAdapter::new(schema, {
             futures::stream::iter(batches.into_iter().map(Ok))
         }))
     }
