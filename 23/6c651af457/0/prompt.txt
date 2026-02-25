@@ -1,0 +1,78 @@
+Fix these clippy issues 
+
+error: unused import: `ObjectStore`
+   --> crates/runtime/src/cluster/executor_registry.rs:444:24
+    |
+444 |     use object_store::{ObjectStore, memory::InMemory};
+    |                        ^^^^^^^^^^^
+    |
+    = note: `-D unused-imports` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: used `unwrap()` on a `Result` value
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:154:17
+    |
+154 |         assert!(result.unwrap().is_empty());
+    |                 ^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: consider using `expect()` to provide a better panic message
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unwrap_used
+    = note: requested on the command line with `-D clippy::unwrap-used`
+
+error: redundant clone
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:167:24
+    |
+167 |             vec![part_a.clone(), part_b.clone()],
+    |                        ^^^^^^^^ help: remove this
+    |
+note: this value is dropped without further use
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:167:18
+    |
+167 |             vec![part_a.clone(), part_b.clone()],
+    |                  ^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#redundant_clone
+    = note: requested on the command line with `-D clippy::redundant-clone`
+
+error: redundant clone
+    |                                        ^^^^^^^^ help: remove this
+    |
+note: this value is dropped without further use
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:259:34
+    |
+259 |             vec![part_a.clone(), part_b.clone()],
+    |                                  ^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#redundant_clone
+
+error: used `unwrap_err()` on a `Result` value
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:264:15
+    |
+264 |         match result.unwrap_err() {
+    |               ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Ok`, it will panic
+    = help: consider using `expect_err()` to provide a better panic message
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unwrap_used
+
+error: used `unwrap_err()` on a `Result` value
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:280:15
+    |
+280 |         match result.unwrap_err() {
+    |               ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Ok`, it will panic
+    = help: consider using `expect_err()` to provide a better panic message
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unwrap_used
+
+error: used `unwrap()` on a `Result` value
+   --> crates/runtime/src/cluster/partition/executor_selection.rs:306:24
+    |
+306 |         let selected = result.unwrap();
+    |                        ^^^^^^^^^^^^^^^
+    |
+    = note: if this value is an `Err`, it will panic
+    = help: consider using `expect()` to provide a better panic message
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#unwrap_used
+
+error: could not compile `runtime` (lib test) due to 19 previous errors
+make: *** [Makefile:90: lint-rust] Error 101

@@ -1,0 +1,31 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "236c651af457",
+  "session_id": "653e5e0d-d8e5-4b68-a351-28af4d5d8fbc",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-25T04:57:09.45803Z",
+  "branch": "jeadie/26-02-13/flightsql",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/runtime/src/cluster/executor_registry.rs",
+    "crates/runtime/src/cluster/partition/executor_selection.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "15c59922c445",
+  "token_usage": {
+    "input_tokens": 142,
+    "cache_creation_tokens": 27821,
+    "cache_read_tokens": 689424,
+    "output_tokens": 779,
+    "api_call_count": 20
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-25T04:57:09.165015Z",
+    "agent_lines": 7,
+    "human_added": 0,
+    "human_modified": 1,
+    "human_removed": 0,
+    "total_committed": 8,
+    "agent_percentage": 87.5
+  }
+}
