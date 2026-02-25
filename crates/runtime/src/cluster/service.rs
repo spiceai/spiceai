@@ -610,6 +610,13 @@ impl ClusterService for ClusterServiceImpl {
                 // Find accelerated datasets with partitioning
 
                 for table_ref in super::partition::accelerated_tables(app).keys() {
+                    // Wait for the table to be registered in DataFusion before serializing partition expressions.
+                    // Executors may connect before the scheduler has finished loading all datasets.
+                    self.datafusion
+                        .runtime_status()
+                        .wait_for_dataset_ready(table_ref)
+                        .await;
+
                     match partition_manager
                         .allocate_partitions(table_ref, executor_id, 10)
                         .await
@@ -652,6 +659,7 @@ impl ClusterService for ClusterServiceImpl {
 
         // Register the allocated partitions in the executor registry so the scheduler knows where they are
         {
+            let registry = self.datafusion.ctx.as_ref();
             let mut executor_partitions = self.executor_registry.partitions.write().await;
             executor_partitions.insert(
                 executor_id.to_string(),
@@ -661,11 +669,13 @@ impl ClusterService for ClusterServiceImpl {
                         let exprs = sa
                             .items
                             .iter()
-                            .filter_map(|bytes| match Expr::from_bytes(bytes) {
-                                Ok(expr) => Some(expr),
-                                Err(e) => {
-                                    tracing::error!("Failed to deserialize expr: {e}");
-                                    None
+                            .filter_map(|bytes| {
+                                match Expr::from_bytes_with_registry(bytes, registry) {
+                                    Ok(expr) => Some(expr),
+                                    Err(e) => {
+                                        tracing::error!("Failed to deserialize expr: {e}");
+                                        None
+                                    }
                                 }
                             })
                             .collect();
