@@ -27,6 +27,7 @@ use std::fmt::Display;
 /// include one.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(as = String, example = "Ready"))]
 pub enum ComponentStatus {
     /// The component is initializing and not yet ready
     Initializing,

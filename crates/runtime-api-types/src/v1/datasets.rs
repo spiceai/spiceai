@@ -44,8 +44,7 @@ pub struct DatasetInfo {
     pub status: Option<ComponentStatus>,
 
     /// An optional error message describing why the dataset entered an error state.
-    /// Only present when the dataset status is `Error` and an error message was recorded.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Only populated when the dataset status is `Error` and an error message was recorded.
     pub error_message: Option<String>,
 
     /// Custom properties for the dataset
