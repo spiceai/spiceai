@@ -969,3 +969,236 @@ async fn test_duckdb_connection_pool_concurrent_queries() -> Result<(), String> 
         })
         .await
 }
+
+/// Test that DuckDB upsert/delete cycles work correctly with ON CONFLICT
+/// across multiple tables sharing the same connection pool, written in parallel.
+///
+/// Reproduces the production pattern where multiple CDC-accelerated datasets
+/// share a single DuckDB instance and are written to concurrently.
+///
+/// Each table runs N rounds of: upsert X rows → verify → delete all → verify.
+/// All tables share one `DuckDBAccelerator` (and thus one connection pool).
+#[tokio::test]
+async fn test_duckdb_upsert_delete_cycles() -> Result<(), String> {
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::delete::get_deletion_provider;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::{Constraint, Constraints};
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::sql::TableReference;
+    use datafusion_table_providers::util::column_reference::ColumnReference;
+    use datafusion_table_providers::util::on_conflict::OnConflict;
+    use futures::stream;
+    use runtime::component::dataset::acceleration::{Engine, Mode};
+    use runtime::dataaccelerator::duckdb::DuckDBAccelerator;
+    use runtime::dataaccelerator::{AcceleratorExternalTableBuilder, DataAccelerator};
+    use runtime::dataupdate::StreamingDataUpdateExecutionPlan;
+    use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    // --- Configuration ---
+    let num_tables: usize = 8;
+    let num_rows: i64 = 500;
+    let num_rounds: i64 = 2000;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Int64, true),
+    ]));
+
+    // Single accelerator instance → all tables share the same DuckDB connection pool
+    let accelerator = Arc::new(DuckDBAccelerator::new());
+
+    // Create all table providers through the shared accelerator
+    let mut table_providers = Vec::with_capacity(num_tables);
+    for table_idx in 0..num_tables {
+        let constraints =
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+        let cmd = AcceleratorExternalTableBuilder::new(
+            TableReference::bare(format!("test_table_{table_idx}")),
+            Arc::clone(&schema),
+            Engine::DuckDB,
+        )
+        .mode(Mode::Memory)
+        .on_conflict(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ])))
+        .constraints(constraints)
+        .build()
+        .map_err(|e| format!("Failed to build external table {table_idx}: {e}"))?;
+
+        let table_provider = accelerator
+            .create_external_table(cmd, None, vec![])
+            .await
+            .map_err(|e| format!("Failed to create external table {table_idx}: {e}"))?;
+
+        table_providers.push(table_provider);
+    }
+
+    println!(
+        "Created {num_tables} tables sharing one DuckDB pool, starting {num_rounds} rounds of {num_rows} rows each"
+    );
+
+    // Spawn one task per table, all running concurrently
+    let mut handles = Vec::with_capacity(num_tables);
+    for (table_idx, table_provider) in table_providers.into_iter().enumerate() {
+        let schema = Arc::clone(&schema);
+        let handle = tokio::spawn(async move {
+            let deletion_provider = get_deletion_provider(Arc::clone(&table_provider))
+                .ok_or_else(|| format!("Table {table_idx}: failed to get deletion provider"))?;
+
+            for round in 0..num_rounds {
+                // --- UPSERT ---
+                {
+                    let ids: Vec<i64> = (1..=num_rows).collect();
+                    let names: Vec<String> = ids
+                        .iter()
+                        .map(|id| format!("t{table_idx}_n{id}_r{round}"))
+                        .collect();
+                    let values: Vec<i64> =
+                        ids.iter().map(|id| id * 10 + round).collect();
+
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int64Array::from(ids)) as ArrayRef,
+                            Arc::new(StringArray::from(names)) as ArrayRef,
+                            Arc::new(Int64Array::from(values)) as ArrayRef,
+                        ],
+                    )
+                    .map_err(|e| {
+                        format!("Table {table_idx} round {round}: batch create failed: {e}")
+                    })?;
+
+                    let ctx = SessionContext::new();
+                    let batch_clone = batch.clone();
+                    let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
+                        batch_clone.schema(),
+                        Box::pin(stream::once(async move { Ok(batch_clone) })),
+                    ));
+
+                    let target_schema = table_provider.schema();
+                    let streaming_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+                        Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
+                    let cast_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+                        Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
+
+                    let insert_plan = table_provider
+                        .insert_into(&ctx.state(), cast_plan, InsertOp::Append)
+                        .await
+                        .map_err(|e| {
+                            format!("Table {table_idx} round {round}: upsert failed: {e}")
+                        })?;
+                    collect(insert_plan, ctx.task_ctx()).await.map_err(|e| {
+                        format!("Table {table_idx} round {round}: upsert collect failed: {e}")
+                    })?;
+                }
+
+                // --- VERIFY COUNT after upsert ---
+                {
+                    let ctx = SessionContext::new();
+                    let exec_plan = table_provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .map_err(|e| {
+                            format!("Table {table_idx} round {round}: scan after upsert failed: {e}")
+                        })?;
+                    let batches =
+                        collect(exec_plan, ctx.task_ctx()).await.map_err(|e| {
+                            format!(
+                                "Table {table_idx} round {round}: scan collect failed: {e}"
+                            )
+                        })?;
+                    let count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    if count != num_rows as usize {
+                        return Err(format!(
+                            "Table {table_idx} round {round}: expected {num_rows} rows after upsert, got {count}"
+                        ));
+                    }
+                }
+
+                // --- DELETE all rows ---
+                {
+                    let ctx = SessionContext::new();
+                    let filter = col("id")
+                        .gt_eq(lit(1_i64))
+                        .and(col("id").lt_eq(lit(num_rows)));
+                    let delete_plan = deletion_provider
+                        .delete_from(&ctx.state(), &[filter])
+                        .await
+                        .map_err(|e| {
+                            format!("Table {table_idx} round {round}: delete failed: {e}")
+                        })?;
+                    collect(delete_plan, ctx.task_ctx()).await.map_err(|e| {
+                        format!("Table {table_idx} round {round}: delete collect failed: {e}")
+                    })?;
+                }
+
+                // --- VERIFY COUNT after delete ---
+                {
+                    let ctx = SessionContext::new();
+                    let exec_plan = table_provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Table {table_idx} round {round}: scan after delete failed: {e}"
+                            )
+                        })?;
+                    let batches =
+                        collect(exec_plan, ctx.task_ctx()).await.map_err(|e| {
+                            format!(
+                                "Table {table_idx} round {round}: delete scan collect failed: {e}"
+                            )
+                        })?;
+                    let count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    if count != 0 {
+                        return Err(format!(
+                            "Table {table_idx} round {round}: expected 0 rows after delete, got {count}"
+                        ));
+                    }
+                }
+
+                if (round + 1) % 500 == 0 {
+                    println!("  Table {table_idx}: {}/{num_rounds} rounds", round + 1);
+                }
+            }
+
+            Ok::<_, String>(table_idx)
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all tables to finish
+    let mut errors = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(table_idx)) => {
+                println!("Table {table_idx}: all {num_rounds} rounds passed");
+            }
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(format!("Task panicked: {e}")),
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "{} table(s) failed:\n{}",
+            errors.len(),
+            errors.join("\n")
+        ));
+    }
+
+    println!(
+        "All {num_tables} tables x {num_rounds} rounds passed (shared DuckDB pool)"
+    );
+    Ok(())
+}
