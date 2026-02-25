@@ -19,7 +19,7 @@ limitations under the License.
 //! Defines [`PkDeletionStrategy`] (the strategy kind) and [`PkDeletionStrategyWithCache`]
 //! (the strategy with its associated in-memory caches).
 
-use crate::catalog::{CatalogError, CatalogResult};
+use super::{Error, Result};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -168,7 +168,7 @@ impl PkDeletionStrategyWithCache {
     /// Returns an error if:
     /// - The strategies don't match (e.g., `Int64Pk` vs `RowConverterBased`)
     /// - Any lock is poisoned
-    pub fn refresh_from(&self, source: &Self) -> CatalogResult<()> {
+    pub fn refresh_from(&self, source: &Self, table_name: &str) -> Result<()> {
         match (self, source) {
             (
                 Self::PositionBased {
@@ -177,12 +177,7 @@ impl PkDeletionStrategyWithCache {
                 Self::PositionBased {
                     cached_deleted_row_ids: fresh,
                 },
-            ) => copy_cache(
-                existing,
-                fresh,
-                "read fresh position data",
-                "position write",
-            ),
+            ) => copy_cache(existing, fresh, table_name),
             (
                 Self::Int64Pk {
                     cached_deleted_pk: existing_pk,
@@ -193,18 +188,8 @@ impl PkDeletionStrategyWithCache {
                     cached_insert_records: fresh_insert,
                 },
             ) => {
-                copy_cache(
-                    existing_pk,
-                    fresh_pk,
-                    "read fresh pk_i64 data",
-                    "pk_i64 write",
-                )?;
-                copy_cache(
-                    existing_insert,
-                    fresh_insert,
-                    "read fresh insert_pk_i64 data",
-                    "insert_pk_i64 write",
-                )
+                copy_cache(existing_pk, fresh_pk, table_name)?;
+                copy_cache(existing_insert, fresh_insert, table_name)
             }
             (
                 Self::RowConverterBased {
@@ -216,27 +201,15 @@ impl PkDeletionStrategyWithCache {
                     cached_insert_records: fresh_insert,
                 },
             ) => {
-                copy_cache(
-                    existing_keys,
-                    fresh_keys,
-                    "read fresh row_keys data",
-                    "row_keys write",
-                )?;
-                copy_cache(
-                    existing_insert,
-                    fresh_insert,
-                    "read fresh insert_row_keys data",
-                    "insert_row_keys write",
-                )
+                copy_cache(existing_keys, fresh_keys, table_name)?;
+                copy_cache(existing_insert, fresh_insert, table_name)
             }
-            _ => Err(CatalogError::InvalidOperation {
+            _ => Err(Error::Internal {
+                table: table_name.to_string(),
                 message: format!(
                     "Strategy mismatch during cache refresh: existing={:?}, fresh={:?}",
                     self.strategy(),
                     source.strategy()
-                ),
-                source: Box::<dyn std::error::Error + Send + Sync>::from(
-                    "PkDeletionStrategy variant mismatch",
                 ),
             }),
         }
@@ -249,17 +222,18 @@ impl PkDeletionStrategyWithCache {
 fn copy_cache<T: Clone>(
     existing: &Arc<RwLock<Arc<T>>>,
     fresh: &Arc<RwLock<Arc<T>>>,
-    read_op: &str,
-    write_op: &str,
-) -> CatalogResult<()> {
+    table_name: &str,
+) -> Result<()> {
     let fresh_data = {
-        let guard = fresh.read().map_err(|_| CatalogError::LockPoisoned {
-            operation: format!("refresh deletion cache ({read_op})"),
+        let guard = fresh.read().map_err(|_| Error::LockPoisoned {
+            table: table_name.to_string(),
+            lock: "refresh deletion cache (read)",
         })?;
         Arc::clone(&*guard)
     };
-    let mut guard = existing.write().map_err(|_| CatalogError::LockPoisoned {
-        operation: format!("refresh deletion cache ({write_op})"),
+    let mut guard = existing.write().map_err(|_| Error::LockPoisoned {
+        table: table_name.to_string(),
+        lock: "refresh deletion cache (write)",
     })?;
     *guard = fresh_data;
     Ok(())
