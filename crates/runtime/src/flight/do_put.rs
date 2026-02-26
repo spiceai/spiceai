@@ -217,16 +217,17 @@ pub(crate) async fn handle(
         return Ok(Response::new(Box::pin(output)));
     }
 
-    let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
+    let incoming_schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
-    let schema = Arc::new(schema);
+    let incoming_schema = Arc::new(incoming_schema);
 
     let target_schema = datafusion
         .get_arrow_schema(path.clone())
         .await
         .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
+    let target_schema = Arc::new(target_schema);
 
-    if let Err(e) = verify_schema(target_schema.fields(), schema.fields()) {
+    if let Err(e) = verify_schema(target_schema.fields(), incoming_schema.fields()) {
         return Err(Status::invalid_argument(format!(
             "Schema validation error: the provided data schema does not match the expected schema for dataset `{path}`: {e}",
         )));
@@ -235,7 +236,7 @@ pub(crate) async fn handle(
     let first_message = first_message.clone();
     let response_stream = create_response_stream(
         path,
-        schema,
+        target_schema,
         Arc::clone(&datafusion),
         streaming_flight,
         &first_message,
