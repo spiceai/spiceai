@@ -294,8 +294,7 @@ mod tests {
 
     #[test]
     fn test_parse_catalog_slug_org_and_app() {
-        let (org, app, catalog) =
-            parse_catalog_slug("myorg/myapp").expect("valid two-part slug");
+        let (org, app, catalog) = parse_catalog_slug("myorg/myapp").expect("valid two-part slug");
         assert_eq!(org, "myorg");
         assert_eq!(app, "myapp");
         assert_eq!(catalog, "spice");
@@ -312,8 +311,7 @@ mod tests {
 
     #[test]
     fn test_parse_catalog_slug_default_catalog_name() {
-        let (_, _, catalog) =
-            parse_catalog_slug("org/app").expect("valid two-part slug");
+        let (_, _, catalog) = parse_catalog_slug("org/app").expect("valid two-part slug");
         assert_eq!(catalog, "spice", "default catalog should be 'spice'");
     }
 

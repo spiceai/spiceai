@@ -458,9 +458,7 @@ mod tests {
         // Verify factory metadata for a known connector
         {
             let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
-            let iceberg_factory = guard
-                .get("iceberg")
-                .expect("iceberg factory should exist");
+            let iceberg_factory = guard.get("iceberg").expect("iceberg factory should exist");
             assert_eq!(iceberg_factory.prefix(), "iceberg");
             assert!(
                 !iceberg_factory.parameters().is_empty(),

@@ -20,12 +20,10 @@ limitations under the License.
 //! discovery via `INFORMATION_SCHEMA` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
-};
+use crate::parameters::Parameters;
+use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use crate::parameters::Parameters;
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::provider::MssqlCatalogProvider;
 use snafu::prelude::*;
@@ -37,9 +35,7 @@ pub const PREFIX: &str = "mssql";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Missing required parameter: '{parameter}'. Specify a value."
-    ))]
+    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value."))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to create MSSQL connection pool: {source}"))]
@@ -67,14 +63,12 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .secret()
         .description("The MSSQL password for authentication."),
-    ParameterSpec::component("host")
-        .description("The MSSQL host address."),
-    ParameterSpec::component("port")
-        .description("The MSSQL port number."),
-    ParameterSpec::component("database")
-        .description("The MSSQL database name."),
-    ParameterSpec::component("encrypt")
-        .description("Encryption mode ('true', 'false', 'require', 'disable'). Defaults to 'true'."),
+    ParameterSpec::component("host").description("The MSSQL host address."),
+    ParameterSpec::component("port").description("The MSSQL port number."),
+    ParameterSpec::component("database").description("The MSSQL database name."),
+    ParameterSpec::component("encrypt").description(
+        "Encryption mode ('true', 'false', 'require', 'disable'). Defaults to 'true'.",
+    ),
     ParameterSpec::component("trust_server_certificate")
         .description("Whether to trust the server certificate ('true' or 'false')."),
 ];
@@ -178,12 +172,13 @@ impl CatalogConnector for MssqlCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let config = Self::create_config(&self.params.parameters)
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+        let config = Self::create_config(&self.params.parameters).map_err(|e| {
+            super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         let pool = SqlServerConnectionManager::create(config)
             .await
@@ -195,10 +190,7 @@ impl CatalogConnector for MssqlCatalog {
 
         let pool = Arc::new(pool);
 
-        let catalog_provider = Arc::new(MssqlCatalogProvider::new(
-            pool,
-            catalog.include.clone(),
-        ));
+        let catalog_provider = Arc::new(MssqlCatalogProvider::new(pool, catalog.include.clone()));
 
         catalog_provider
             .refresh()
@@ -235,8 +227,7 @@ mod tests {
             "connection_string",
             "Server=localhost,1433;Database=mydb;User Id=sa;Password=pass;",
         )]);
-        MssqlCatalog::create_config(&params)
-            .expect("should create config from connection string");
+        MssqlCatalog::create_config(&params).expect("should create config from connection string");
     }
 
     #[test]
@@ -248,8 +239,7 @@ mod tests {
             ("port", "1433"),
             ("database", "testdb"),
         ]);
-        MssqlCatalog::create_config(&params)
-            .expect("should create config from individual params");
+        MssqlCatalog::create_config(&params).expect("should create config from individual params");
     }
 
     #[test]
@@ -359,8 +349,7 @@ mod tests {
             ("host", "localhost"),
             ("trust_server_certificate", "true"),
         ]);
-        MssqlCatalog::create_config(&params)
-            .expect("should accept trust_server_certificate=true");
+        MssqlCatalog::create_config(&params).expect("should accept trust_server_certificate=true");
     }
 
     #[test]
@@ -371,8 +360,7 @@ mod tests {
             ("host", "localhost"),
             ("trust_server_certificate", "false"),
         ]);
-        MssqlCatalog::create_config(&params)
-            .expect("should accept trust_server_certificate=false");
+        MssqlCatalog::create_config(&params).expect("should accept trust_server_certificate=false");
     }
 
     #[test]
@@ -396,8 +384,7 @@ mod tests {
             ("password", "pass"),
             ("host", "localhost"),
         ]);
-        MssqlCatalog::create_config(&params)
-            .expect("should succeed with only required params");
+        MssqlCatalog::create_config(&params).expect("should succeed with only required params");
     }
 
     #[test]
@@ -408,8 +395,7 @@ mod tests {
             ("host", "localhost"),
             ("encrypt", "TRUE"),
         ]);
-        MssqlCatalog::create_config(&params)
-            .expect("should accept case-insensitive encrypt value");
+        MssqlCatalog::create_config(&params).expect("should accept case-insensitive encrypt value");
     }
 
     #[test]
