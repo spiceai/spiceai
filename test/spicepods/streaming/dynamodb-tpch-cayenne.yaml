@@ -1,6 +1,6 @@
 version: v1beta1
 kind: Spicepod
-name: streaming-benchmark-dynamodb
+name: streaming-benchmark-dynamodb-cayenne
 
 common_config:
   acceleration: &common_acceleration

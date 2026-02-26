@@ -1,0 +1,12 @@
+tests:
+  streaming_bench:
+    spicepod_path: test/spicepods/streaming/dynamodb-tpch-cayenne.yaml
+    runner_type: spiceai-dev-runners
+    scale_factor: 0.5
+    verify: true
+  streaming_correctness:
+    spicepod_path: test/spicepods/streaming/dynamodb-tpch-cayenne.yaml
+    runner_type: spiceai-dev-runners
+    scale_factor: 0.1
+    rounds: 5
+    mutation_ratio: 0.3
