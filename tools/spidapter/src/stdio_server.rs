@@ -171,26 +171,28 @@ impl Handler for SpidapterHandler {
         let resource = if pods.is_empty() {
             ResourceMetrics::default()
         } else {
-            let avg_cpu = match pods
+            let cpu_count = pods
                 .iter()
-                .filter_map(|p| p.cpu_usage_percent.is_some().then_some(1.0))
-                .sum::<f64>()
-            {
-                0.0 => None,
-                n => Some(pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>() / n),
+                .filter(|p| p.cpu_usage_percent.is_some())
+                .count();
+            let avg_cpu = match cpu_count {
+                0 => None,
+                n => Some(
+                    pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>() / n as f64,
+                ),
             };
 
-            let total_memory = match pods
+            let memory_count = pods
                 .iter()
-                .filter_map(|p| p.memory_usage_bytes.is_some().then_some(1_u64))
-                .sum::<u64>()
-            {
+                .filter(|p| p.memory_usage_bytes.is_some())
+                .count();
+            let total_memory = match memory_count {
                 0 => None,
                 n => Some(
                     pods.iter()
                         .filter_map(|p| p.memory_usage_bytes)
                         .sum::<u64>()
-                        / n,
+                        / n as u64,
                 ),
             };
             ResourceMetrics {
