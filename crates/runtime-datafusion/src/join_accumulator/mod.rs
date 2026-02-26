@@ -136,8 +136,9 @@ impl ColumnBounds for ExactColumnBounds {
             .map(|sv| Arc::new(Literal::new(sv)) as Arc<dyn PhysicalExpr>)
             .collect::<Vec<_>>();
 
-        // Build a dummy schema so InListExpr::try_new can validate data types.
-        // Literals carry their own type, so the schema just needs a placeholder field.
+        // Build a schema compatible with `left_expr` so InListExpr::try_new can validate data types.
+        // If `left_expr` is a Column referencing index N, we need at least N+1 fields.
+        // Literals carry their own type, so only the field at the column's index matters.
         let data_type = expr_values
             .first()
             .and_then(|e| {
@@ -149,7 +150,17 @@ impl ColumnBounds for ExactColumnBounds {
                 e.data_type(&s).ok()
             })
             .unwrap_or(arrow::datatypes::DataType::Null);
-        let dummy_schema = Schema::new(vec![Field::new("_col", data_type, true)]);
+
+        let col_index = left_expr
+            .as_any()
+            .downcast_ref::<datafusion::physical_plan::expressions::Column>()
+            .map_or(0, |c| c.index());
+
+        let mut fields: Vec<Field> = (0..col_index)
+            .map(|i| Field::new(format!("_pad{i}"), arrow::datatypes::DataType::Null, true))
+            .collect();
+        fields.push(Field::new("_col", data_type, true));
+        let dummy_schema = Schema::new(fields);
 
         let in_expr = Arc::new(InListExpr::try_new(
             left_expr,

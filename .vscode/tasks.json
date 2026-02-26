@@ -1,144 +1,24 @@
 {
-	"version": "2.0.0",
-	"tasks": [
-		{
-			"type": "cargo",
-			"command": "build",
-			"args": [
-				"--features",
-				"models"
-			],
-			"problemMatcher": [
-				"$rustc"
-			],
-			"group": "build",
-			"label": "rust: cargo build"
-		},
-		{
-			"type": "cargo",
-			"command": "build",
-			"args": [
-				"-p",
-				"testoperator",
-				"--features",
-				"models"
-			],
-			"problemMatcher": [
-				"$rustc"
-			],
-			"group": {
-				"kind": "build",
-				"isDefault": false
-			},
-			"label": "rust: cargo build testoperator"
-		},
-		{
-			"label": "make build",
-			"type": "shell",
-			"command": "make",
-			"args": [
-				"build"
-			],
-			"isBackground": false,
-			"group": "build"
-		},
-		{
-			"label": "make build-cli nextest",
-			"type": "shell",
-			"command": "make",
-			"args": [
-				"build-cli",
-				"nextest"
-			],
-			"isBackground": false,
-			"group": "build"
-		},
-		{
-			"label": "make build (verify)",
-			"type": "shell",
-			"command": "make",
-			"args": [
-				"build"
-			],
-			"isBackground": false,
-			"group": "build"
-		},
-		{
-			"label": "check gh cli",
-			"type": "shell",
-			"command": "gh",
-			"args": [
-				"--version"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "update issue 9490 ordered audit",
-			"type": "shell",
-			"command": "python3",
-			"args": [
-				"-c",
-				"import subprocess, pathlib, sys\nrepo='spiceai/spiceai'\nissue='9490'\nbody=subprocess.check_output(['gh','issue','view',issue,'--repo',repo,'--json','body','-q','.body'], text=True)\nrepls={\n'- [ ] Read the DataFusion [changelog](https://github.com/apache/datafusion/tree/branch-49/dev/changelog) of the new version to identify breaking changes and new features.':'- [x] Read the DataFusion [changelog](https://github.com/apache/datafusion/tree/branch-49/dev/changelog) of the new version to identify breaking changes and new features.',\n'- [ ] Read the DataFusion [blog](https://datafusion.apache.org/blog/) for the latest release.':'- [x] Read the DataFusion [blog](https://datafusion.apache.org/blog/) for the latest release.',\n'- [ ] Read the DataFusion [upgrade guides](https://datafusion.apache.org/library-user-guide/upgrading.html).':'- [x] Read the DataFusion [upgrade guides](https://datafusion.apache.org/library-user-guide/upgrading/index.html).',\n'- [ ] Identify which Arrow version the new DataFusion requires (check DataFusion\\'s `Cargo.toml`).':'- [x] Identify which Arrow version the new DataFusion requires (check DataFusion\\'s `Cargo.toml`).'\n}\nfor old,new in repls.items():\n    if old in body:\n        body=body.replace(old,new,1)\nappend='\\n- ordered checklist audit: pre-upgrade docs and Arrow requirement verified.\\n- `make build-cli` passed; `nextest` step could not run in this environment because `cargo-nextest` is not installed (`error: no such command: nextest`).\\n- `make build` output was inconclusive due task-output truncation in this session; keep build checkbox unchecked pending explicit successful completion log.\\n- fork gap to confirm: `spiceai/datafusion-ballista` branch `spiceai-52-patches` URL returned 404 during verification.\\n'\nmarker='## Verification Updates (2026-02-24)'\nif marker in body and 'ordered checklist audit' not in body:\n    body = body + append\np=pathlib.Path('/tmp/issue9490_body.md')\np.write_text(body)\nsubprocess.check_call(['gh','issue','edit',issue,'--repo',repo,'--body-file',str(p)])\nprint('updated')"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "run issue 9490 update script",
-			"type": "shell",
-			"command": "python3",
-			"args": [
-				"scripts/tmp_update_issue_9490.py"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "install cargo-nextest",
-			"type": "shell",
-			"command": "cargo",
-			"args": [
-				"install",
-				"cargo-nextest",
-				"--locked"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "verify cargo-nextest",
-			"type": "shell",
-			"command": "cargo",
-			"args": [
-				"nextest",
-				"--version"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "verify nextest installed",
-			"type": "shell",
-			"command": "cargo",
-			"args": [
-				"nextest",
-				"--version"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "run issue 9490 post-verify update",
-			"type": "shell",
-			"command": "python3",
-			"args": [
-				"scripts/tmp_update_issue_9490_postverify.py"
-			],
-			"isBackground": false
-		},
-		{
-			"label": "update issue 9490 nextest pass",
-			"type": "shell",
-			"command": "python3",
-			"args": [
-				"scripts/tmp_update_issue_9490_nextest_pass.py"
-			],
-			"isBackground": false
-		}
-	]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "cargo",
+      "command": "build",
+      "args": ["--features", "models"],
+      "problemMatcher": ["$rustc"],
+      "group": "build",
+      "label": "rust: cargo build"
+    },
+    {
+      "type": "cargo",
+      "command": "build",
+      "args": ["-p", "testoperator", "--features", "models"],
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "label": "rust: cargo build testoperator"
+    }
+  ]
 }

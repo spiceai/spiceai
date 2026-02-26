@@ -326,7 +326,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c3
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7815fb062ba508636abeff85ade93f93edff5a7e" } # branch: lukim/query
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7815fb062ba508636abeff85ade93f93edff5a7e" } # branch: lukim/query – required for DataFusion 52 upgrade; pinned to full SHA for reproducible builds
 
 [profile.release-lto]
 inherits = "release"

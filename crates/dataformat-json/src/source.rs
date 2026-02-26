@@ -76,20 +76,26 @@ impl SpiceJsonOpener {
 }
 
 /// `SpiceJsonSource` holds the extra configuration that is necessary for [`SpiceJsonOpener`]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SpiceJsonSource {
     batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
     array_to_ndjson: bool,
     unnest_struct: Option<String>,
-    table_schema: Option<TableSchema>,
+    table_schema: TableSchema,
 }
 
 impl SpiceJsonSource {
-    /// Initialize a [`SpiceJsonSource`] with default settings
+    /// Initialize a [`SpiceJsonSource`] with the given `table_schema`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(table_schema: TableSchema) -> Self {
+        Self {
+            batch_size: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            array_to_ndjson: false,
+            unnest_struct: None,
+            table_schema,
+        }
     }
 
     #[must_use]
@@ -106,7 +112,7 @@ impl SpiceJsonSource {
 
     #[must_use]
     pub fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
-        self.table_schema = Some(table_schema);
+        self.table_schema = table_schema;
         self
     }
 }
@@ -140,10 +146,7 @@ impl FileSource for SpiceJsonSource {
     }
 
     fn table_schema(&self) -> &TableSchema {
-        match self.table_schema.as_ref() {
-            Some(table_schema) => table_schema,
-            None => unreachable!("table_schema must be set before use"),
-        }
+        &self.table_schema
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
