@@ -98,6 +98,8 @@ pub mod iceberg;
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "snowflake")]
@@ -225,6 +227,16 @@ pub async fn register_all() {
             mssql::MssqlCatalog::new_connector,
             mssql::PREFIX,
             mssql::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "oracle")]
+    registry.insert(
+        oracle::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            oracle::OracleCatalog::new_connector,
+            oracle::PREFIX,
+            oracle::PARAMETERS,
         ),
     );
 
@@ -447,6 +459,11 @@ mod tests {
             assert!(
                 guard.contains_key(mssql::PREFIX),
                 "mssql should be registered"
+            );
+            #[cfg(feature = "oracle")]
+            assert!(
+                guard.contains_key(oracle::PREFIX),
+                "oracle should be registered"
             );
             #[cfg(not(windows))]
             assert!(
