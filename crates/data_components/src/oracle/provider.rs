@@ -32,8 +32,8 @@ use datafusion::sql::TableReference;
 use globset::GlobSet;
 use snafu::prelude::*;
 
-use super::connection::OracleConnectionPool;
 use super::OracleTableProvider;
+use super::connection::OracleConnectionPool;
 use crate::RefreshableCatalogProvider;
 
 #[derive(Debug, Snafu)]
@@ -240,8 +240,7 @@ impl OracleSchemaProvider {
                 continue;
             }
 
-            let table_ref =
-                TableReference::partial(self.schema_name.clone(), table_name.clone());
+            let table_ref = TableReference::partial(self.schema_name.clone(), table_name.clone());
 
             match OracleTableProvider::new(Arc::clone(&self.pool), &table_ref).await {
                 Ok(provider) => {

@@ -5,7 +5,7 @@ catalogs:
   - from: oracle
     name: oracle_tpch
     include:
-      - "TPCH_SF1.*"
+      - 'TPCH_SF1.*'
     params:
       oracle_username: ${secrets:ORACLE_CLOUD_USERNAME}
       oracle_password: ${secrets:ORACLE_CLOUD_PASSWORD}

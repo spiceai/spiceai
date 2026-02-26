@@ -135,14 +135,13 @@ impl CatalogConnector for OracleCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let conn_params =
-            Self::build_connection_params(&self.params.parameters).map_err(|e| {
-                super::Error::UnableToGetCatalogProvider {
-                    connector: PREFIX.to_string(),
-                    connector_component: connector_component.clone(),
-                    source: Box::new(e),
-                }
-            })?;
+        let conn_params = Self::build_connection_params(&self.params.parameters).map_err(|e| {
+            super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.to_string(),
+                connector_component: connector_component.clone(),
+                source: Box::new(e),
+            }
+        })?;
 
         let pool = data_components::oracle::connection::connect(&conn_params, None)
             .await
@@ -220,8 +219,8 @@ mod tests {
             ("password", "pass"),
             ("host", "myhost"),
         ]);
-        let conn = OracleCatalog::build_connection_params(&params)
-            .expect("should build with defaults");
+        let conn =
+            OracleCatalog::build_connection_params(&params).expect("should build with defaults");
         // Default port 1521, default service XEPDB1
         assert_eq!(conn.connect_string, "//myhost:1521/XEPDB1");
     }
