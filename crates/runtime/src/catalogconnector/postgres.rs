@@ -20,9 +20,7 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
-};
+use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::PostgresCatalogProvider;
@@ -52,16 +50,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pass")
         .secret()
         .description("The PostgreSQL password for authentication."),
-    ParameterSpec::component("host")
-        .description("The PostgreSQL host address."),
-    ParameterSpec::component("port")
-        .description("The PostgreSQL port number."),
-    ParameterSpec::component("db")
-        .description("The PostgreSQL database name."),
-    ParameterSpec::component("sslmode")
-        .description("The SSL mode for the connection."),
-    ParameterSpec::component("sslrootcert")
-        .description("The path to the SSL root certificate."),
+    ParameterSpec::component("host").description("The PostgreSQL host address."),
+    ParameterSpec::component("port").description("The PostgreSQL port number."),
+    ParameterSpec::component("db").description("The PostgreSQL database name."),
+    ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
+    ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
 ];
 
 /// A catalog connector for PostgreSQL, providing access to schemas and tables

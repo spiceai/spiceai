@@ -212,3 +212,226 @@ impl CatalogConnector for MssqlCatalog {
         Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+
+    fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
+        Parameters::new(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), SecretString::from(v.to_string())))
+                .collect(),
+            PREFIX,
+            PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn test_create_config_from_connection_string() {
+        let params = make_params(vec![(
+            "connection_string",
+            "Server=localhost,1433;Database=mydb;User Id=sa;Password=pass;",
+        )]);
+        MssqlCatalog::create_config(&params)
+            .expect("should create config from connection string");
+    }
+
+    #[test]
+    fn test_create_config_from_individual_params() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "my_password"),
+            ("host", "localhost"),
+            ("port", "1433"),
+            ("database", "testdb"),
+        ]);
+        MssqlCatalog::create_config(&params)
+            .expect("should create config from individual params");
+    }
+
+    #[test]
+    fn test_create_config_missing_username() {
+        let params = make_params(vec![("password", "pass"), ("host", "localhost")]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail without username"
+        );
+    }
+
+    #[test]
+    fn test_create_config_missing_password() {
+        let params = make_params(vec![("username", "sa"), ("host", "localhost")]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail without password"
+        );
+    }
+
+    #[test]
+    fn test_create_config_missing_host() {
+        let params = make_params(vec![("username", "sa"), ("password", "pass")]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail without host"
+        );
+    }
+
+    #[test]
+    fn test_create_config_invalid_port() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("port", "not_a_number"),
+        ]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail with invalid port"
+        );
+    }
+
+    #[test]
+    fn test_create_config_encrypt_true() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("encrypt", "true"),
+        ]);
+        MssqlCatalog::create_config(&params).expect("should accept encrypt=true");
+    }
+
+    #[test]
+    fn test_create_config_encrypt_false() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("encrypt", "false"),
+        ]);
+        MssqlCatalog::create_config(&params).expect("should accept encrypt=false");
+    }
+
+    #[test]
+    fn test_create_config_encrypt_require() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("encrypt", "require"),
+        ]);
+        MssqlCatalog::create_config(&params).expect("should accept encrypt=require");
+    }
+
+    #[test]
+    fn test_create_config_encrypt_disable() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("encrypt", "disable"),
+        ]);
+        MssqlCatalog::create_config(&params).expect("should accept encrypt=disable");
+    }
+
+    #[test]
+    fn test_create_config_invalid_encrypt() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("encrypt", "invalid"),
+        ]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail with invalid encrypt value"
+        );
+    }
+
+    #[test]
+    fn test_create_config_trust_server_certificate_true() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("trust_server_certificate", "true"),
+        ]);
+        MssqlCatalog::create_config(&params)
+            .expect("should accept trust_server_certificate=true");
+    }
+
+    #[test]
+    fn test_create_config_trust_server_certificate_false() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("trust_server_certificate", "false"),
+        ]);
+        MssqlCatalog::create_config(&params)
+            .expect("should accept trust_server_certificate=false");
+    }
+
+    #[test]
+    fn test_create_config_invalid_trust_server_certificate() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("trust_server_certificate", "maybe"),
+        ]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail with invalid trust_server_certificate"
+        );
+    }
+
+    #[test]
+    fn test_create_config_without_optional_params() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+        ]);
+        MssqlCatalog::create_config(&params)
+            .expect("should succeed with only required params");
+    }
+
+    #[test]
+    fn test_create_config_encrypt_case_insensitive() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("encrypt", "TRUE"),
+        ]);
+        MssqlCatalog::create_config(&params)
+            .expect("should accept case-insensitive encrypt value");
+    }
+
+    #[test]
+    fn test_create_config_port_overflow() {
+        let params = make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            ("port", "99999"),
+        ]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail with port exceeding u16 range"
+        );
+    }
+
+    #[test]
+    fn test_create_config_empty_params() {
+        let params = make_params(vec![]);
+        assert!(
+            MssqlCatalog::create_config(&params).is_err(),
+            "should fail with no params at all"
+        );
+    }
+}

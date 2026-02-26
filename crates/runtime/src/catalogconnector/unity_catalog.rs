@@ -196,3 +196,73 @@ fn table_reference_creator(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.storage_location.as_deref()?;
     Some(TableReference::bare(format!("{storage_location}/")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_uc_table(storage_location: Option<&str>) -> UCTable {
+        UCTable {
+            name: "my_table".to_string(),
+            catalog_name: "my_catalog".to_string(),
+            schema_name: "my_schema".to_string(),
+            table_type: "MANAGED".to_string(),
+            data_source_format: "DELTA".to_string(),
+            columns: vec![],
+            storage_location: storage_location.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_with_storage_location() {
+        let table = make_uc_table(Some("s3://my-bucket/warehouse/table"));
+        let reference = table_reference_creator(&table)
+            .expect("should return Some when storage_location is present");
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "s3://my-bucket/warehouse/table/");
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_without_storage_location() {
+        let table = make_uc_table(None);
+        assert!(
+            table_reference_creator(&table).is_none(),
+            "should return None when storage_location is None"
+        );
+    }
+
+    #[test]
+    fn test_table_reference_creator_appends_trailing_slash() {
+        let table = make_uc_table(Some("gs://bucket/path"));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert!(
+                    table.as_ref().ends_with('/'),
+                    "reference should end with trailing slash"
+                );
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_preserves_full_uri() {
+        let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/warehouse/table"));
+        let reference = table_reference_creator(&table)
+            .expect("should return Some for abfss URI");
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(
+                    table.as_ref(),
+                    "abfss://container@account.dfs.core.windows.net/warehouse/table/"
+                );
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+}

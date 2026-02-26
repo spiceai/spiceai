@@ -173,3 +173,105 @@ impl MySQLCatalog {
         Ok(mysql_async::Pool::new(opts))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::RuntimeBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::ConnectorComponent;
+    use app::AppBuilder;
+    use datafusion_table_providers::util::secrets::to_secret_map;
+    use std::collections::HashMap;
+    use tokio::runtime::Handle;
+
+    async fn make_connector_params(params: HashMap<String, String>) -> ConnectorParams {
+        let app = AppBuilder::new("test").build();
+        let rt = RuntimeBuilder::new().build().await;
+
+        let dataset = DatasetBuilder::try_new("mysql://localhost/db".to_string(), "test_ds")
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("valid dataset");
+
+        ConnectorParams {
+            parameters: crate::parameters::Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                PREFIX,
+                PARAMETERS,
+            ),
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&dataset),
+            app: None,
+            runtime: None,
+            io_runtime: Handle::current(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_metadata_pool_from_connection_string() {
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            "mysql://root:pass@127.0.0.1:3306/testdb".to_string(),
+        );
+        let connector_params = make_connector_params(params).await;
+        MySQLCatalog::create_metadata_pool(&connector_params)
+            .expect("should create pool from connection string");
+    }
+
+    #[tokio::test]
+    async fn test_create_metadata_pool_from_individual_params() {
+        let mut params = HashMap::new();
+        params.insert("user".to_string(), "root".to_string());
+        params.insert("pass".to_string(), "password".to_string());
+        params.insert("host".to_string(), "127.0.0.1".to_string());
+        params.insert("tcp_port".to_string(), "3306".to_string());
+        params.insert("db".to_string(), "mydb".to_string());
+        let connector_params = make_connector_params(params).await;
+        MySQLCatalog::create_metadata_pool(&connector_params)
+            .expect("should create pool from individual params");
+    }
+
+    #[tokio::test]
+    async fn test_create_metadata_pool_defaults_host_and_port() {
+        // With no host/port, should default to localhost:3306
+        let params = HashMap::new();
+        let connector_params = make_connector_params(params).await;
+        MySQLCatalog::create_metadata_pool(&connector_params)
+            .expect("should succeed with default host and port");
+    }
+
+    #[tokio::test]
+    async fn test_create_metadata_pool_invalid_connection_string() {
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            "not-a-valid-url".to_string(),
+        );
+        let connector_params = make_connector_params(params).await;
+        assert!(
+            MySQLCatalog::create_metadata_pool(&connector_params).is_err(),
+            "should fail with invalid connection string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_metadata_pool_connection_string_takes_precedence() {
+        // When both connection_string and individual params are present,
+        // connection_string should be used.
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            "mysql://conn_user:conn_pass@connhost:3307/conndb".to_string(),
+        );
+        params.insert("user".to_string(), "individual_user".to_string());
+        params.insert("host".to_string(), "individual_host".to_string());
+        let connector_params = make_connector_params(params).await;
+        // Should succeed using connection_string, not individual params
+        MySQLCatalog::create_metadata_pool(&connector_params)
+            .expect("should create pool from connection_string when both are present");
+    }
+}

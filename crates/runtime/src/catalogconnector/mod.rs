@@ -376,3 +376,119 @@ impl Drop for RefreshingCatalogProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_catalog_connector_registry_lifecycle() {
+        // Start clean
+        unregister_all().await;
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+            assert!(
+                guard.is_empty(),
+                "registry should be empty after unregister_all"
+            );
+        }
+
+        // Register all connectors
+        register_all().await;
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+
+            // Always-registered connectors (no feature gates)
+            assert!(
+                guard.contains_key("iceberg"),
+                "iceberg should be registered"
+            );
+            assert!(
+                guard.contains_key(glue::PREFIX),
+                "glue should be registered"
+            );
+            assert!(
+                guard.contains_key("spice.ai"),
+                "spice.ai should be registered"
+            );
+
+            // Feature-gated connectors
+            #[cfg(feature = "delta_lake")]
+            assert!(
+                guard.contains_key("unity_catalog"),
+                "unity_catalog should be registered"
+            );
+            #[cfg(feature = "databricks")]
+            assert!(
+                guard.contains_key("databricks"),
+                "databricks should be registered"
+            );
+            #[cfg(feature = "duckdb")]
+            assert!(
+                guard.contains_key(ducklake::PREFIX),
+                "ducklake should be registered"
+            );
+            #[cfg(feature = "snowflake")]
+            assert!(
+                guard.contains_key(snowflake::PREFIX),
+                "snowflake should be registered"
+            );
+            #[cfg(feature = "postgres")]
+            assert!(
+                guard.contains_key(postgres::PREFIX),
+                "postgres should be registered"
+            );
+            #[cfg(feature = "mysql")]
+            assert!(
+                guard.contains_key(mysql::PREFIX),
+                "mysql should be registered"
+            );
+            #[cfg(feature = "mssql")]
+            assert!(
+                guard.contains_key(mssql::PREFIX),
+                "mssql should be registered"
+            );
+            #[cfg(not(windows))]
+            assert!(
+                guard.contains_key(cayenne::PREFIX),
+                "cayenne should be registered"
+            );
+        }
+
+        // Verify factory metadata for a known connector
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+            let iceberg_factory = guard
+                .get("iceberg")
+                .expect("iceberg factory should exist");
+            assert_eq!(iceberg_factory.prefix(), "iceberg");
+            assert!(
+                !iceberg_factory.parameters().is_empty(),
+                "iceberg should have parameters"
+            );
+        }
+
+        // Unregister and verify empty
+        unregister_all().await;
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+            assert!(
+                guard.is_empty(),
+                "registry should be empty after final unregister_all"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_new_connector_unknown_returns_none() {
+        unregister_all().await;
+        register_all().await;
+
+        // Trying to look up the factory for a nonexistent connector
+        let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        assert!(
+            guard.get("nonexistent_connector").is_none(),
+            "unknown connector name should not be found"
+        );
+    }
+}

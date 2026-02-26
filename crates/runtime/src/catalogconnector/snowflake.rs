@@ -20,9 +20,7 @@ limitations under the License.
 //! via `INFORMATION_SCHEMA` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
-};
+use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::snowflake::SnowflakeTableFactory;
@@ -71,8 +69,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("role")
         .secret()
         .description("The Snowflake role to use."),
-    ParameterSpec::component("auth_type")
-        .description("The authentication type ('snowflake' or 'keypair'). Defaults to 'snowflake'."),
+    ParameterSpec::component("auth_type").description(
+        "The authentication type ('snowflake' or 'keypair'). Defaults to 'snowflake'.",
+    ),
 ];
 
 /// A catalog connector for Snowflake, providing access to schemas and tables
@@ -126,9 +125,8 @@ impl CatalogConnector for SnowflakeCatalog {
 
         let api = Arc::clone(&pool.api);
 
-        let pool: Arc<
-            dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync,
-        > = Arc::new(pool);
+        let pool: Arc<dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync> =
+            Arc::new(pool);
 
         let table_factory = Arc::new(SnowflakeTableFactory::new(pool));
 

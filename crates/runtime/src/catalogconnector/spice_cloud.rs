@@ -287,3 +287,67 @@ fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
         _ => Err(Error::InvalidPath),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_catalog_slug_org_and_app() {
+        let (org, app, catalog) =
+            parse_catalog_slug("myorg/myapp").expect("valid two-part slug");
+        assert_eq!(org, "myorg");
+        assert_eq!(app, "myapp");
+        assert_eq!(catalog, "spice");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_org_app_and_catalog() {
+        let (org, app, catalog) =
+            parse_catalog_slug("myorg/myapp/mycatalog").expect("valid three-part slug");
+        assert_eq!(org, "myorg");
+        assert_eq!(app, "myapp");
+        assert_eq!(catalog, "mycatalog");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_default_catalog_name() {
+        let (_, _, catalog) =
+            parse_catalog_slug("org/app").expect("valid two-part slug");
+        assert_eq!(catalog, "spice", "default catalog should be 'spice'");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_single_part_fails() {
+        assert!(parse_catalog_slug("justorg").is_err());
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_four_parts_fails() {
+        assert!(parse_catalog_slug("a/b/c/d").is_err());
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_empty_fails() {
+        assert!(parse_catalog_slug("").is_err());
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_trailing_slash() {
+        // "org/app/" splits into ["org", "app", ""], treated as 3 parts
+        let (org, app, catalog) =
+            parse_catalog_slug("org/app/").expect("valid three-part slug with empty catalog");
+        assert_eq!(org, "org");
+        assert_eq!(app, "app");
+        assert_eq!(catalog, "");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_preserves_case() {
+        let (org, app, catalog) =
+            parse_catalog_slug("MyOrg/MyApp/MyCatalog").expect("valid three-part slug");
+        assert_eq!(org, "MyOrg");
+        assert_eq!(app, "MyApp");
+        assert_eq!(catalog, "MyCatalog");
+    }
+}
