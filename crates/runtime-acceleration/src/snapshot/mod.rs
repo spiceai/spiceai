@@ -5103,5 +5103,4 @@ mod tests {
             "snapshot-row-count should be serialized"
         );
     }
-
 }
