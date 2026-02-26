@@ -12,10 +12,10 @@ expression: "normalize_chat_completion_response(response, true)"
         "tool_calls": [
           {
             "function": {
-              "arguments": "{\"limit\":\"1000\",\"dataset\":\"taxi_trips\"}",
-              "name": "python_dict"
+              "arguments": "{\"query\":\"\"}",
+              "name": "(sql"
             },
-            "id": "call-7685b5da-443d-435e-8467-7073e38a51b9",
+            "id": "call-cb6582bb-d1ff-4196-8bd1-ac5652994067",
             "type": "function"
           }
         ]
