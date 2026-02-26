@@ -33,6 +33,7 @@ use runtime::datafusion::query::QueryBuilder;
 use runtime::{auth::EndpointAuth, config::Config};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 use spicepod::component::dataset::Dataset;
+use spicepod::component::runtime::{Runtime as SpicepodRuntime, Scheduler as SchedulerConfig};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     partitioning::PartitionedBy,
@@ -42,10 +43,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use test_framework::pki::init_pki;
 use tokio::time::{Instant, sleep};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
-    configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    configure_test_datafusion,
+    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 
 /// CSV test data
@@ -62,139 +64,29 @@ const TEST_DATA_CSV: &str = r"id,name,age,city,score
 10,Anna Garcia,41,San Jose,90
 ";
 
-async fn wait_for_executor_count(
-    executor_manager: &ExecutorManager,
-    expected: usize,
-    timeout: Duration,
-) -> Result<(), anyhow::Error> {
-    let start = Instant::now();
-    loop {
-        let count = executor_manager
-            .get_executor_state()
-            .await
-            .map_err(|err| anyhow::Error::msg(err.to_string()))?
-            .len();
-        if count == expected {
-            return Ok(());
-        }
-        if start.elapsed() > timeout {
-            return Err(anyhow::Error::msg(format!(
-                "Timed out waiting for {expected} executors; found {count}"
-            )));
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-}
-
-async fn run_distributed_query_with_retries(
-    runtime: &Arc<Runtime>,
-    sql: &str,
-    job_name: &str,
-    max_attempts: usize,
-) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    for attempt in 1..=max_attempts {
-        let query = QueryBuilder::new(sql, runtime.datafusion());
-        let attempt_job_name = format!("{job_name}_{attempt}");
-        let query_handle = query
-            .build()
-            .submit_distributed(&attempt_job_name)
-            .await
-            .map_err(|err| {
-                anyhow::Error::msg(format!(
-                    "Failed to submit distributed query {attempt_job_name}: {err}"
-                ))
-            })?;
-
-        let stream_result = query_handle.into_stream().await;
-        match stream_result {
-            Ok(stream) => match stream.try_collect::<Vec<RecordBatch>>().await {
-                Ok(results) => return Ok(results),
-                Err(err) => {
-                    let message = err.to_string();
-                    let is_retryable =
-                        message.contains("reported as completed but status is not successful");
-                    if attempt < max_attempts && is_retryable {
-                        tracing::warn!(
-                            attempt,
-                            max_attempts,
-                            %message,
-                            "Distributed query failed with retryable error; retrying"
-                        );
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    return Err(anyhow::Error::msg(format!(
-                        "Distributed query failed (attempt {attempt}/{max_attempts}): {message}"
-                    )));
-                }
-            },
-            Err(err) => {
-                let message = err.to_string();
-                let is_retryable =
-                    message.contains("reported as completed but status is not successful");
-                if attempt < max_attempts && is_retryable {
-                    tracing::warn!(
-                        attempt,
-                        max_attempts,
-                        %message,
-                        "Distributed query stream creation failed with retryable error; retrying"
-                    );
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                return Err(anyhow::Error::msg(format!(
-                    "Failed to get distributed query stream (attempt {attempt}/{max_attempts}): {message}"
-                )));
-            }
-        }
-    }
-
-    Err(anyhow::Error::msg(
-        "Distributed query failed after all retry attempts",
-    ))
-}
-
-/// Create a dataset configured with `DuckDB` in-memory acceleration and `bucket()` partitioning.
-///
-/// Uses `DuckDB` in-memory mode so each runtime (scheduler + executors) gets its own
-/// isolated `DuckDB` instance — no file-path contention in single-process tests.
-fn make_accelerated_dataset(
-    source_path: &str,
-    name: &str,
-    num_buckets: i64,
-    partition_column: &str,
-) -> Dataset {
-    let mut dataset = Dataset::new(source_path, name);
-
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("duckdb".to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(RefreshMode::Full),
-        partition_by: vec![PartitionedBy {
-            name: "expr0".to_string(),
-            expression: format!("bucket({num_buckets}, {partition_column})"),
-        }],
-        ..Acceleration::default()
-    });
-
-    dataset
-}
-
 /// Test that distributed acceleration with `bucket()` partitioning works end to end.
 ///
-/// Sets up a cluster with 1 scheduler + 2 executors, each accelerating data
-/// with `partition_by: bucket(3, id)`. Verifies:
-/// - Static partition discovery (no source scan needed for deterministic bucket)
-/// - `bucket()` UDF is available in the refresh context
-/// - Executors load their assigned partitions into `DuckDB` in-memory acceleration
-/// - Queries through the scheduler return correct, complete results
+/// Sets up a cluster with 1 scheduler + 1 executor accelerating data
+/// with `partition_by: bucket(3, id)` using the Cayenne engine. Verifies:
+/// - `bucket()` UDF can be used in the dataset definition for partitioning
+/// - Queries return correct, complete results
+///
+/// Only a single executor is used because all nodes in this in-process test share
+/// the same filesystem; multiple executors would race writing to the same Cayenne
+/// data/metadata directories during acceleration.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[cfg(feature = "duckdb")]
-#[ignore = "WIP: distributed acceleration with bucket partitioning; pending https://github.com/spiceai/spiceai/pull/9502"]
 async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
 
     test_request_context()
         .scope(async {
@@ -209,9 +101,6 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let executor1_cert = pki
                 .create_client_cert("executor1")
                 .expect("should create executor1 cert");
-            let executor2_cert = pki
-                .create_client_cert("executor2")
-                .expect("should create executor2 cert");
 
             // Write test CSV data
             let csv_path = tempdir.path().join("test_data.csv");
@@ -221,12 +110,23 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             configure_test_datafusion();
 
             // --- Scheduler ---
-            // Scheduler owns the dataset definition. Executors receive it via
-            // `get_app_definition` gRPC and load their own DuckDB in-memory acceleration.
-            let scheduler_dataset = make_accelerated_dataset(&csv_source, "test_data", 3, "id");
+            // Scheduler owns the dataset definition. The executor receives it via
+            // `get_app_definition` gRPC and loads Cayenne file-mode acceleration.
+            let scheduler_data_dir = tempdir.path().join("scheduler_data");
+            std::fs::create_dir_all(&scheduler_data_dir).expect("create scheduler data dir");
+            let scheduler_dataset =
+                make_accelerated_dataset(&csv_source, "test_data", 3, "id", &scheduler_data_dir);
 
+            // The scheduler requires a `runtime.scheduler` config with a
+            // `state_location` so that the `PartitionManager` is created.
+            // Without it, partition allocation to executors never happens and
+            // the distributed query resolves to `EmptyExec`.
             let scheduler_app = AppBuilder::new("test_distributed_accel")
                 .with_dataset(scheduler_dataset)
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(make_scheduler_config()),
+                    ..SpicepodRuntime::default()
+                })
                 .build();
 
             let scheduler_config = Config {
@@ -285,6 +185,15 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 () = Arc::clone(&scheduler_rt).load_components() => {}
             }
 
+            // Ensure the scheduler's HTTP and cluster gRPC servers are listening
+            // before starting the executor — otherwise the executor's
+            // `start_servers` → `initialize_cluster_executor` fails with a
+            // transport error connecting to the scheduler.
+            runtime_ready_check(&scheduler_rt).await;
+
+            // Wait for port reachability so the executor can connect.
+            wait_for_port("127.0.0.1:50352", Duration::from_secs(30)).await;
+
             // --- Executor 1 ---
             // Executor apps are empty — they receive the dataset definition from
             // the scheduler via `get_app_definition` during cluster handshake.
@@ -331,7 +240,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             );
 
             let cloned_executor1_rt = Arc::clone(&executor1_rt);
-            let executor1_server_thread = tokio::spawn(async move {
+            let mut executor1_server_thread = tokio::spawn(async move {
                 Box::pin(cloned_executor1_rt.start_servers(
                     executor1_config,
                     None,
@@ -344,74 +253,19 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 () = tokio::time::sleep(Duration::from_secs(60)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for executor1 to start"));
                 }
+                result = &mut executor1_server_thread => {
+                    match result {
+                        Ok(Ok(())) => return Err(anyhow::Error::msg("Executor1 server thread finished unexpectedly")),
+                        Ok(Err(e)) => return Err(anyhow::Error::msg(format!("Executor1 server failed to start: {e}"))),
+                        Err(e) => return Err(anyhow::Error::msg(format!("Executor1 server thread panicked: {e}"))),
+                    }
+                }
                 () = Arc::clone(&executor1_rt).load_components() => {}
             }
 
-            // --- Executor 2 ---
-            let executor2_app = AppBuilder::new("test_distributed_accel_executor2").build();
-
-            let executor2_config = Config {
-                http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    8392,
-                )),
-                flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    50355,
-                )),
-                cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Executor),
-                    node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::LOCALHOST,
-                        50356,
-                    )),
-                    scheduler_address: Some("127.0.0.1:50352".to_string()),
-                    node_advertise_address: Some("127.0.0.1".to_string()),
-                    node_mtls_ca_certificate_file: Some(
-                        pki.ca_cert_path.to_string_lossy().to_string(),
-                    ),
-                    node_mtls_certificate_file: Some(
-                        executor2_cert.cert_path.to_string_lossy().to_string(),
-                    ),
-                    node_mtls_key_file: Some(executor2_cert.key_path.to_string_lossy().to_string()),
-                    ..Default::default()
-                },
-            };
-
-            let executor2_rt = Arc::new(
-                Runtime::builder()
-                    .with_runtime_config(executor2_config.clone())
-                    .with_resolved_cluster_config(
-                        ResolvedClusterConfig::try_new(executor2_config.cluster.clone())
-                            .expect("should resolve cluster config"),
-                    )
-                    .with_app(executor2_app)
-                    .build()
-                    .await,
-            );
-
-            let cloned_executor2_rt = Arc::clone(&executor2_rt);
-            let executor2_server_thread = tokio::spawn(async move {
-                Box::pin(cloned_executor2_rt.start_servers(
-                    executor2_config,
-                    None,
-                    EndpointAuth::no_auth(),
-                ))
-                .await
-            });
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for executor2 to start"));
-                }
-                () = Arc::clone(&executor2_rt).load_components() => {}
-            }
-
-            runtime_ready_check(&scheduler_rt).await;
             runtime_ready_check(&executor1_rt).await;
-            runtime_ready_check(&executor2_rt).await;
 
-            // Wait for both executors to register with scheduler
+            // Wait for the executor to register with the scheduler
             let scheduler_server = scheduler_rt
                 .datafusion()
                 .scheduler_server
@@ -421,20 +275,22 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 .expect("scheduler server should be available");
             let executor_manager = scheduler_server.state.executor_manager.clone();
 
-            wait_for_executor_count(&executor_manager, 2, Duration::from_secs(15)).await?;
+            wait_for_executor_count(&executor_manager, 1, Duration::from_secs(15)).await?;
 
-            // Wait for executor acceleration to complete. Executors load datasets
-            // asynchronously after connecting to the scheduler (inside `start_servers`).
+            // Wait for executor acceleration to complete. The executor loads datasets asynchronously after connecting to the scheduler
             sleep(Duration::from_secs(5)).await;
 
-            // Test 1: SELECT all rows — confirms all partitions are loaded across executors
-            let results = run_distributed_query_with_retries(
-                &scheduler_rt,
+            // Test 1: SELECT all rows
+            let query = QueryBuilder::new(
                 "SELECT id, name, age, city, score FROM test_data ORDER BY id",
-                "distributed_accel_select_all",
-                6,
-            )
-            .await?;
+                scheduler_rt.datafusion(),
+            );
+            let result = query.build().run().await.map_err(|e| {
+                anyhow::Error::msg(format!("Query 'select all' failed: {e}"))
+            })?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await.map_err(|e| {
+                anyhow::Error::msg(format!("Query 'select all' stream failed: {e}"))
+            })?;
 
             let pretty = arrow::util::pretty::pretty_format_batches(&results)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))
@@ -442,13 +298,16 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             insta::assert_snapshot!("distributed_accel_select_all", pretty);
 
             // Test 2: Aggregation query — tests distributed GROUP BY with accelerated data
-            let results = run_distributed_query_with_retries(
-                &scheduler_rt,
+            let query = QueryBuilder::new(
                 "SELECT COUNT(*) as total_rows, AVG(score) as avg_score, MIN(age) as min_age, MAX(age) as max_age FROM test_data",
-                "distributed_accel_aggregation",
-                6,
-            )
-            .await?;
+                scheduler_rt.datafusion(),
+            );
+            let result = query.build().run().await.map_err(|e| {
+                anyhow::Error::msg(format!("Query 'aggregation' failed: {e}"))
+            })?;
+            let results: Vec<RecordBatch> = result.data.try_collect().await.map_err(|e| {
+                anyhow::Error::msg(format!("Query 'aggregation' stream failed: {e}"))
+            })?;
 
             let pretty = arrow::util::pretty::pretty_format_batches(&results)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))
@@ -456,10 +315,6 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             insta::assert_snapshot!("distributed_accel_aggregation", pretty);
 
             // Cleanup
-            executor2_rt.shutdown().await;
-            drop(executor2_rt);
-            executor2_server_thread.abort();
-
             executor1_rt.shutdown().await;
             drop(executor1_rt);
             executor1_server_thread.abort();
@@ -475,4 +330,101 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             Ok(())
         })
         .await
+}
+
+async fn wait_for_port(addr: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_executor_count(
+    executor_manager: &ExecutorManager,
+    expected: usize,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let start = Instant::now();
+    loop {
+        let count = executor_manager
+            .get_executor_state()
+            .await
+            .map_err(|err| anyhow::Error::msg(err.to_string()))?
+            .len();
+        if count == expected {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Err(anyhow::Error::msg(format!(
+                "Timed out waiting for {expected} executors; found {count}"
+            )));
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Return a `SchedulerConfig` pointing at an S3 bucket for partition state.
+///
+/// `PartitionManager` uses OCC (optimistic concurrency control) which needs
+/// conditional-put support (`PutMode::Update`); the local filesystem `ObjectStore`
+/// does not support this, so S3 is required.
+fn make_scheduler_config() -> SchedulerConfig {
+    SchedulerConfig {
+        state_location: "s3://spiceai-integration-tests/cluster-state/test_distributed_acceleration_with_bucket_partitioning/".to_string(),
+        params: Some(spicepod::param::Params::from_string_map(
+            std::collections::HashMap::from([
+                ("s3_region".to_string(), "us-east-1".to_string()),
+                ("s3_key".to_string(), "${env:AWS_S3_VECTORS_KEY}".to_string()),
+                (
+                    "s3_secret".to_string(),
+                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                ),
+                ("s3_auth".to_string(), "key".to_string()),
+            ]),
+        )),
+        partition_management: None,
+    }
+}
+
+/// Create a dataset configured with Cayenne file-mode acceleration and `bucket()` partitioning.
+///
+/// Uses explicit `cayenne_file_path` and `cayenne_metadata_dir` so that each runtime in
+/// a single-process test gets its own data/metadata directories without contention.
+fn make_accelerated_dataset(
+    source_path: &str,
+    name: &str,
+    num_buckets: i64,
+    partition_column: &str,
+    data_dir: &std::path::Path,
+) -> Dataset {
+    let mut dataset = Dataset::new(source_path, name);
+
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        partition_by: vec![PartitionedBy {
+            name: "expr0".to_string(),
+            expression: format!("bucket({num_buckets}, {partition_column})"),
+        }],
+        params: Some(spicepod::param::Params::from_string_map(
+            std::collections::HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.join("data").to_string_lossy().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    data_dir.join("metadata").to_string_lossy().to_string(),
+                ),
+            ]),
+        )),
+        ..Acceleration::default()
+    });
+
+    dataset
 }
