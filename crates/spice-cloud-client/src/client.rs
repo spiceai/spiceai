@@ -28,7 +28,6 @@ use crate::types::{
     MetricsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse,
     RollbackRequest, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
 };
-use std::fmt::Write;
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
