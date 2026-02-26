@@ -369,18 +369,25 @@ mod tests {
             ComponentErrorType::from_message(Some("")),
             ComponentErrorType::Unknown
         );
-        assert_eq!(ComponentErrorType::from_message(None), ComponentErrorType::Unknown);
+        assert_eq!(
+            ComponentErrorType::from_message(None),
+            ComponentErrorType::Unknown
+        );
     }
 
     #[test]
     fn test_component_error_from_status_message_generates_stable_code() {
-        let dataset_auth =
-            ComponentError::from_status_message(ComponentErrorCategory::Dataset, Some("invalid_api_key"));
+        let dataset_auth = ComponentError::from_status_message(
+            ComponentErrorCategory::Dataset,
+            Some("invalid_api_key"),
+        );
         assert_eq!(dataset_auth.error_type, ComponentErrorType::Auth);
         assert_eq!(dataset_auth.code, "dataset.auth");
 
-        let model_unknown =
-            ComponentError::from_status_message(ComponentErrorCategory::Model, Some("totally novel failure"));
+        let model_unknown = ComponentError::from_status_message(
+            ComponentErrorCategory::Model,
+            Some("totally novel failure"),
+        );
         assert_eq!(model_unknown.error_type, ComponentErrorType::Unknown);
         assert_eq!(model_unknown.code, "model.unknown");
     }
