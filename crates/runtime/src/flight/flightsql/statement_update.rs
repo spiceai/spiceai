@@ -28,6 +28,7 @@ use prost::Message;
 use tonic::{Response, Status};
 
 use crate::{
+    config::ClusterRole,
     datafusion::request_context_extension::get_current_datafusion,
     flight::{Service, metrics},
 };
@@ -48,6 +49,8 @@ pub(crate) async fn do_put(
     // Authenticate — this handler is dispatched before the generic DoPut auth
     // check, so we must verify credentials here.
     let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
     match context.auth_principal() {
         Some(principal) => {
             if !principal
@@ -61,13 +64,17 @@ pub(crate) async fn do_put(
             }
         }
         None => {
-            return Err(Status::unauthenticated(
-                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
-            ));
+            if allow_scheduler_trusted_executor_write(&datafusion) {
+                tracing::debug!(
+                    "Allowing unauthenticated statement DoPut on executor in mTLS scheduler-trusted mode"
+                );
+            } else {
+                return Err(Status::unauthenticated(
+                    "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+                ));
+            }
         }
     }
-
-    let datafusion = get_current_datafusion(&context);
 
     let sql = &cmd.query;
     tracing::trace!("do_put_statement_update: {sql}");
@@ -107,6 +114,11 @@ pub(crate) async fn do_put(
     })]);
 
     Ok(Response::new(Box::pin(output)))
+}
+
+fn allow_scheduler_trusted_executor_write(datafusion: &crate::datafusion::DataFusion) -> bool {
+    datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
+        && datafusion.cluster_config.tls_config().is_some()
 }
 
 /// Extract affected row count from execution results.
