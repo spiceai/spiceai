@@ -77,9 +77,17 @@ impl CloudClient {
     // Apps
     // ========================================================================
 
-    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
-        self.inner.get_app_metrics(app_id).await.map_err(into_cli)
+    pub async fn get_app_metrics(
+        &self,
+        app_id: i64,
+        window: Option<&str>,
+    ) -> Result<MetricsResponse> {
+        self.inner
+            .get_app_metrics(app_id, window)
+            .await
+            .map_err(into_cli)
     }
+
     pub async fn list_apps(&self) -> Result<Vec<App>> {
         self.inner.list_apps().await.map_err(into_cli)
     }
