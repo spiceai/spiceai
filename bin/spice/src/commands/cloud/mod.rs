@@ -217,6 +217,10 @@ pub struct MetricsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
+
+    /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
+    #[arg(long, value_parser = parse_window)]
+    pub window: Option<String>,
 }
 
 // ============================================================================

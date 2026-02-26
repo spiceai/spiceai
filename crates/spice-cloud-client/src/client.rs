@@ -487,7 +487,11 @@ impl CloudClient {
     // ========================================================================
 
     /// Get metrics for an app's pods.
-    pub async fn get_app_metrics(&self, app_id: i64) -> Result<MetricsResponse> {
+    pub async fn get_app_metrics(
+        &self,
+        app_id: i64,
+        window: Option<&str>,
+    ) -> Result<MetricsResponse> {
         let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
         let response = self
             .client
