@@ -117,9 +117,7 @@ pub(crate) async fn do_put(
     update_result_response(affected_rows)
 }
 
-fn update_result_response(
-    affected_rows: i64,
-) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+fn update_result_response(affected_rows: i64) -> Response<<Service as FlightService>::DoPutStream> {
     let result = DoPutUpdateResult {
         record_count: affected_rows,
     };
@@ -128,7 +126,7 @@ fn update_result_response(
         app_metadata: result.as_any().encode_to_vec().into(),
     })]);
 
-    Ok(Response::new(Box::pin(output)))
+    Response::new(Box::pin(output))
 }
 
 pub(crate) async fn execute_statement_update_on_executor(
