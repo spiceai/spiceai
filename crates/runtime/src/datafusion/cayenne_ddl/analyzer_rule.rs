@@ -119,7 +119,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 let table_name = create.name.table().to_string();
 
                 // Extract the Arrow schema from the logical plan's input
-                let arrow_schema = create.input.schema().inner().clone();
+                let arrow_schema = Arc::clone(&create.input.schema().inner());
 
                 let node = CayenneCreateTableNode::new(
                     table_name,
