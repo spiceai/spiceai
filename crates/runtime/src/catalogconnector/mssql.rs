@@ -1,0 +1,214 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! MSSQL catalog connector.
+//!
+//! Connects to a Microsoft SQL Server database and provides schema/table
+//! discovery via `INFORMATION_SCHEMA` queries.
+
+use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
+use crate::{
+    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+};
+use async_trait::async_trait;
+use data_components::RefreshableCatalogProvider;
+use crate::parameters::Parameters;
+use data_components::mssql::connection_manager::SqlServerConnectionManager;
+use data_components::mssql::provider::MssqlCatalogProvider;
+use snafu::prelude::*;
+use std::any::Any;
+use std::sync::Arc;
+use tiberius::{Config, EncryptionLevel};
+
+pub const PREFIX: &str = "mssql";
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Missing required parameter: '{parameter}'. Specify a value."
+    ))]
+    MissingParameter { parameter: String },
+
+    #[snafu(display("Failed to create MSSQL connection pool: {source}"))]
+    UnableToCreateConnectionPool {
+        source: data_components::mssql::Error,
+    },
+
+    #[snafu(display("Invalid connection string: {source}"))]
+    InvalidConnectionString { source: tiberius::error::Error },
+
+    #[snafu(display("Invalid port value: {port}"))]
+    FailedToParsePort { port: String },
+
+    #[snafu(display("Invalid parameter value for '{parameter}'"))]
+    InvalidParameterValue { parameter: String },
+}
+
+pub const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::component("connection_string")
+        .secret()
+        .description("The MSSQL connection string."),
+    ParameterSpec::component("username")
+        .secret()
+        .description("The MSSQL username for authentication."),
+    ParameterSpec::component("password")
+        .secret()
+        .description("The MSSQL password for authentication."),
+    ParameterSpec::component("host")
+        .description("The MSSQL host address."),
+    ParameterSpec::component("port")
+        .description("The MSSQL port number."),
+    ParameterSpec::component("database")
+        .description("The MSSQL database name."),
+    ParameterSpec::component("encrypt")
+        .description("Encryption mode ('true', 'false', 'require', 'disable'). Defaults to 'true'."),
+    ParameterSpec::component("trust_server_certificate")
+        .description("Whether to trust the server certificate ('true' or 'false')."),
+];
+
+/// A catalog connector for MSSQL, providing access to schemas and tables
+/// within a SQL Server database.
+#[derive(Clone)]
+pub struct MssqlCatalog {
+    params: ConnectorParams,
+}
+
+impl MssqlCatalog {
+    #[must_use]
+    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+        Arc::new(Self { params })
+    }
+
+    fn create_config(params: &Parameters) -> std::result::Result<Config, Error> {
+        if let Some(conn_string) = params.get("connection_string").expose().ok() {
+            return Config::from_ado_string(conn_string).context(InvalidConnectionStringSnafu);
+        }
+
+        let mut config = Config::default();
+
+        config.authentication(tiberius::AuthMethod::sql_server(
+            params
+                .get("username")
+                .expose()
+                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
+            params
+                .get("password")
+                .expose()
+                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
+        ));
+
+        config.host(
+            params
+                .get("host")
+                .expose()
+                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
+        );
+
+        if let Some(port_str) = params.get("port").expose().ok() {
+            let port = port_str.parse::<u16>().map_err(|_| {
+                FailedToParsePortSnafu {
+                    port: port_str.to_string(),
+                }
+                .build()
+            })?;
+            config.port(port);
+        }
+
+        if let Some(database) = params.get("database").expose().ok() {
+            config.database(database);
+        }
+
+        if let Some(val) = params.get("encrypt").expose().ok() {
+            match val.to_lowercase().as_str() {
+                "true" | "require" => {
+                    config.encryption(EncryptionLevel::Required);
+                }
+                "false" | "disable" => {
+                    config.encryption(EncryptionLevel::Off);
+                }
+                _ => InvalidParameterValueSnafu {
+                    parameter: "encrypt",
+                }
+                .fail()?,
+            }
+        } else {
+            config.encryption(EncryptionLevel::Required);
+        }
+
+        if let Some(val) = params.get("trust_server_certificate").expose().ok() {
+            match val.to_lowercase().as_str() {
+                "true" => {
+                    config.trust_cert();
+                }
+                "false" => (),
+                _ => InvalidParameterValueSnafu {
+                    parameter: "trust_server_certificate",
+                }
+                .fail()?,
+            }
+        }
+
+        Ok(config)
+    }
+}
+
+#[async_trait]
+impl CatalogConnector for MssqlCatalog {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn refreshable_catalog_provider(
+        self: Arc<Self>,
+        _runtime: Arc<Runtime>,
+        catalog: &Catalog,
+    ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
+        let connector_component = ConnectorComponent::from(catalog);
+
+        let config = Self::create_config(&self.params.parameters)
+            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.to_string(),
+                connector_component: connector_component.clone(),
+                source: Box::new(e),
+            })?;
+
+        let pool = SqlServerConnectionManager::create(config)
+            .await
+            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.to_string(),
+                connector_component: connector_component.clone(),
+                source: Box::new(e),
+            })?;
+
+        let pool = Arc::new(pool);
+
+        let catalog_provider = Arc::new(MssqlCatalogProvider::new(
+            pool,
+            catalog.include.clone(),
+        ));
+
+        catalog_provider
+            .refresh()
+            .await
+            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.to_string(),
+                connector_component,
+                source: e,
+            })?;
+
+        Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+    }
+}

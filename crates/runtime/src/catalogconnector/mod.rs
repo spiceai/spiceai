@@ -94,6 +94,14 @@ pub mod deferred;
 pub mod ducklake;
 pub mod glue;
 pub mod iceberg;
+#[cfg(feature = "mssql")]
+pub mod mssql;
+#[cfg(feature = "mysql")]
+pub mod mysql;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
 pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
@@ -177,6 +185,46 @@ pub async fn register_all() {
             ducklake::DuckLakeCatalog::new_connector,
             ducklake::PREFIX,
             ducklake::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "snowflake")]
+    registry.insert(
+        snowflake::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            snowflake::SnowflakeCatalog::new_connector,
+            snowflake::PREFIX,
+            snowflake::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "postgres")]
+    registry.insert(
+        postgres::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            postgres::PostgresCatalog::new_connector,
+            postgres::PREFIX,
+            postgres::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "mysql")]
+    registry.insert(
+        mysql::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            mysql::MySQLCatalog::new_connector,
+            mysql::PREFIX,
+            mysql::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "mssql")]
+    registry.insert(
+        mssql::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            mssql::MssqlCatalog::new_connector,
+            mssql::PREFIX,
+            mssql::PARAMETERS,
         ),
     );
 
