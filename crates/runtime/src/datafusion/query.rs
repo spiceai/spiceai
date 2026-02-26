@@ -1261,7 +1261,7 @@ async fn create_delete_physical_plan(
     dml: &datafusion::logical_expr::DmlStatement,
     df: &Arc<DataFusion>,
 ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 
     // Extract filter expressions from the source plan
     let filters = extract_delete_filters(&dml.input);
@@ -1283,9 +1283,7 @@ async fn create_delete_physical_plan(
     })?;
 
     let session_state = df.ctx.state();
-    deletion_provider
-        .delete_from(&session_state, &filters)
-        .await
+    DeletionTableProvider::delete_from(deletion_provider.as_ref(), &session_state, &filters).await
 }
 
 /// Extract filter expressions from a DELETE's source logical plan.
