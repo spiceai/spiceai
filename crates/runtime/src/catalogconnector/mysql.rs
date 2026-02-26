@@ -20,9 +20,7 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
-};
+use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::mysql::provider::MySQLCatalogProvider;
@@ -52,16 +50,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pass")
         .secret()
         .description("The MySQL password for authentication."),
-    ParameterSpec::component("host")
-        .description("The MySQL host address."),
-    ParameterSpec::component("tcp_port")
-        .description("The MySQL port number."),
-    ParameterSpec::component("db")
-        .description("The MySQL database name."),
-    ParameterSpec::component("sslmode")
-        .description("The SSL mode for the connection."),
-    ParameterSpec::component("sslrootcert")
-        .description("The path to the SSL root certificate."),
+    ParameterSpec::component("host").description("The MySQL host address."),
+    ParameterSpec::component("tcp_port").description("The MySQL port number."),
+    ParameterSpec::component("db").description("The MySQL database name."),
+    ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
+    ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
 ];
 
 /// A catalog connector for MySQL, providing access to schemas and tables
@@ -103,12 +96,13 @@ impl CatalogConnector for MySQLCatalog {
         let table_factory = Arc::new(MySQLTableFactory::new(Arc::clone(&pool)));
 
         // Create a separate mysql_async::Pool for metadata queries.
-        let metadata_pool = Self::create_metadata_pool(&self.params)
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+        let metadata_pool = Self::create_metadata_pool(&self.params).map_err(|e| {
+            super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
                 source: e,
-            })?;
+            }
+        })?;
 
         let catalog_provider = Arc::new(MySQLCatalogProvider::new(
             metadata_pool,

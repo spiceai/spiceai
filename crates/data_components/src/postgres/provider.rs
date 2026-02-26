@@ -218,8 +218,7 @@ impl PostgresSchemaProvider {
                 continue;
             }
 
-            let table_ref =
-                TableReference::partial(self.schema_name.clone(), table_name.clone());
+            let table_ref = TableReference::partial(self.schema_name.clone(), table_name.clone());
 
             match self.table_creator.table_provider(table_ref).await {
                 Ok(provider) => {

@@ -129,9 +129,8 @@ impl SnowflakeCatalogProvider {
                 let mut names = Vec::new();
                 for batch in batches {
                     if let Some(col) = batch.column_by_name("SCHEMA_NAME")
-                        && let Some(array) = col
-                            .as_any()
-                            .downcast_ref::<arrow::array::StringArray>()
+                        && let Some(array) =
+                            col.as_any().downcast_ref::<arrow::array::StringArray>()
                     {
                         for value in array.iter().flatten() {
                             if value != "INFORMATION_SCHEMA" {
@@ -294,9 +293,8 @@ impl SnowflakeSchemaProvider {
                 let mut names = Vec::new();
                 for batch in batches {
                     if let Some(col) = batch.column_by_name("TABLE_NAME")
-                        && let Some(array) = col
-                            .as_any()
-                            .downcast_ref::<arrow::array::StringArray>()
+                        && let Some(array) =
+                            col.as_any().downcast_ref::<arrow::array::StringArray>()
                     {
                         for value in array.iter().flatten() {
                             names.push(value.to_string());

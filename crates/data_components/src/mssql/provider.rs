@@ -72,10 +72,7 @@ impl std::fmt::Debug for MssqlCatalogProvider {
 
 impl MssqlCatalogProvider {
     #[must_use]
-    pub fn new(
-        pool: Arc<SqlServerConnectionPool>,
-        include: Option<GlobSet>,
-    ) -> Self {
+    pub fn new(pool: Arc<SqlServerConnectionPool>, include: Option<GlobSet>) -> Self {
         Self {
             pool,
             schemas: RwLock::new(HashMap::new()),
@@ -128,9 +125,7 @@ impl MssqlCatalogProvider {
         while let Some(row_result) = stream.next().await {
             let row = row_result.context(QueryFailedSnafu)?;
             if let Some(name) = row.get::<&str, _>(0) {
-                if !SYSTEM_SCHEMAS.contains(&name)
-                    && !name.starts_with("db_")
-                {
+                if !SYSTEM_SCHEMAS.contains(&name) && !name.starts_with("db_") {
                     names.push(name.to_string());
                 }
             }
@@ -216,8 +211,7 @@ impl MssqlSchemaProvider {
                 continue;
             }
 
-            let table_ref =
-                TableReference::partial(self.schema_name.clone(), table_name.clone());
+            let table_ref = TableReference::partial(self.schema_name.clone(), table_name.clone());
 
             match SqlServerTableProvider::new(Arc::clone(&self.pool), &table_ref).await {
                 Ok(provider) => {

@@ -401,8 +401,8 @@ mod tests {
     #[test]
     fn test_table_reference_creator_spark_returns_full_reference() {
         let table = make_uc_table(Some("s3://bucket/path"));
-        let reference = table_reference_creator_spark(&table)
-            .expect("spark creator should always return Some");
+        let reference =
+            table_reference_creator_spark(&table).expect("spark creator should always return Some");
         match reference {
             TableReference::Full {
                 catalog,
@@ -461,8 +461,7 @@ mod tests {
     #[test]
     fn test_table_reference_creator_delta_lake_appends_trailing_slash() {
         let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/path"));
-        let reference = table_reference_creator_delta_lake(&table)
-            .expect("should return Some");
+        let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
         match reference {
             TableReference::Bare { table } => {
                 assert!(
@@ -485,8 +484,8 @@ mod tests {
             columns: vec![],
             storage_location: Some("s3://bucket/orders".to_string()),
         };
-        let reference = table_reference_creator_spark(&table)
-            .expect("spark creator should always return Some");
+        let reference =
+            table_reference_creator_spark(&table).expect("spark creator should always return Some");
         match reference {
             TableReference::Full {
                 catalog,
@@ -504,8 +503,7 @@ mod tests {
     #[test]
     fn test_table_reference_creator_delta_lake_preserves_full_storage_uri() {
         let table = make_uc_table(Some("s3://my-bucket/warehouse/catalog/schema/table"));
-        let reference = table_reference_creator_delta_lake(&table)
-            .expect("should return Some");
+        let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
         match reference {
             TableReference::Bare { table } => {
                 assert_eq!(

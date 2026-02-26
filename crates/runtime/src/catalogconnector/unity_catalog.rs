@@ -252,9 +252,10 @@ mod tests {
 
     #[test]
     fn test_table_reference_creator_preserves_full_uri() {
-        let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/warehouse/table"));
-        let reference = table_reference_creator(&table)
-            .expect("should return Some for abfss URI");
+        let table = make_uc_table(Some(
+            "abfss://container@account.dfs.core.windows.net/warehouse/table",
+        ));
+        let reference = table_reference_creator(&table).expect("should return Some for abfss URI");
         match reference {
             TableReference::Bare { table } => {
                 assert_eq!(
