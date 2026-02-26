@@ -1,0 +1,27 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "d0c07b17164e",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-26/build_and_release",
+  "checkpoints_count": 3,
+  "files_touched": [
+    ".github/workflows/build_and_release.yml",
+    "tools/pr-builds/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/d0/c07b17164e/0/metadata.json",
+      "transcript": "/d0/c07b17164e/0/full.jsonl",
+      "context": "/d0/c07b17164e/0/context.md",
+      "content_hash": "/d0/c07b17164e/0/content_hash.txt",
+      "prompt": "/d0/c07b17164e/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 234,
+    "cache_creation_tokens": 41522,
+    "cache_read_tokens": 1196960,
+    "output_tokens": 2668,
+    "api_call_count": 28
+  }
+}
