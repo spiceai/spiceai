@@ -162,10 +162,9 @@ pub(crate) async fn execute_statement_update_on_executor(
             continue;
         };
 
-        let mut stream = client
-            .do_get(ticket)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to fetch executor update result: {e}")))?;
+        let mut stream = client.do_get(ticket).await.map_err(|e| {
+            Status::internal(format!("Failed to fetch executor update result: {e}"))
+        })?;
 
         while let Some(batch) = stream.next().await {
             let batch = batch
@@ -241,10 +240,9 @@ fn ddl_catalog_name(ddl: &DdlStatement) -> Option<String> {
 fn is_cayenne_catalog(datafusion: &Arc<DataFusion>, catalog_name: &str) -> bool {
     #[cfg(not(windows))]
     {
-        datafusion
-            .ctx
-            .catalog(catalog_name)
-            .is_some_and(|catalog| crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
+        datafusion.ctx.catalog(catalog_name).is_some_and(|catalog| {
+            crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref())
+        })
     }
 
     #[cfg(windows)]
