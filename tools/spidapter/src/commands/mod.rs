@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use reqwest::Client;
-use spice_cloud_client::CloudClient;
-use spice_cloud_client::types::{CreateAppRequest, CreateDeploymentRequest, UpdateAppRequest};
-use test_framework::anyhow;
+use spice_cloud_client::{
+    CloudClient,
+    types::{CreateAppRequest, CreateDeploymentRequest, UpdateAppRequest},
+};
 
 pub(crate) mod secrets;
 
@@ -49,23 +49,23 @@ pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
 pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Result<CloudClient> {
     let base_url = spice_cloud_base_url(api_url_override);
     let token = spice_cloud_token()?;
-    Ok(CloudClient::new(&base_url)
+    Ok(CloudClient::new(&base_url)?
         .with_token(token)
         .with_timeout(Duration::from_secs(600))?)
 }
 
 pub(crate) async fn ensure_spice_cloud_app(
-    client: &CloudClient,
+    cloud: &CloudClient,
     app_name: &str,
 ) -> anyhow::Result<(i64, Option<String>)> {
-    let apps = client.list_apps().await?;
+    let apps = cloud.list_apps().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
         return Ok((app.id, app.api_key));
     }
 
-    let cname = resolve_default_cname(client).await?;
+    let cname = resolve_default_cname(cloud).await?;
 
-    let result = client
+    let create_result = cloud
         .create_app(&CreateAppRequest {
             name: app_name.to_string(),
             description: None,
@@ -78,24 +78,26 @@ pub(crate) async fn ensure_spice_cloud_app(
         })
         .await;
 
-    match result {
+    match create_result {
         Ok(app) => Ok((app.id, app.api_key)),
         Err(spice_cloud_client::error::Error::Conflict { .. }) => {
-            // Race condition: app was created between list and create. Retry list.
-            let apps = client.list_apps().await?;
+            // Race condition — another caller created it; re-fetch
+            let apps = cloud.list_apps().await?;
             if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
                 return Ok((app.id, app.api_key));
             }
             Err(anyhow::anyhow!(
-                "Failed to create Spice Cloud app '{app_name}': conflict, but app not found on retry"
+                "App '{app_name}' not found after conflict on create"
             ))
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to create Spice Cloud app '{app_name}': {e}"
+        )),
     }
 }
 
-pub(crate) async fn resolve_default_cname(client: &CloudClient) -> anyhow::Result<String> {
-    let regions = client.list_regions(None).await?;
+pub(crate) async fn resolve_default_cname(cloud: &CloudClient) -> anyhow::Result<String> {
+    let regions = cloud.list_regions(None).await?;
 
     // Find the region matching the `default` field, then return its cname
     if let Some(default_region) = &regions.default
@@ -134,16 +136,20 @@ pub(crate) async fn resolve_default_cname(client: &CloudClient) -> anyhow::Resul
 }
 
 pub(crate) async fn apply_spicepod_to_app(
-    client: &CloudClient,
+    cloud: &CloudClient,
     app_id: i64,
     spicepod_yaml: &str,
 ) -> anyhow::Result<()> {
-    client
+    cloud
         .update_app(
             app_id,
             &UpdateAppRequest {
+                description: None,
+                visibility: None,
+                replicas: None,
+                image_tag: None,
+                region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
-                ..UpdateAppRequest::default()
             },
         )
         .await?;
@@ -151,17 +157,22 @@ pub(crate) async fn apply_spicepod_to_app(
 }
 
 pub(crate) async fn create_deployment(
-    client: &CloudClient,
+    cloud: &CloudClient,
     app_id: i64,
     channel: Option<&str>,
 ) -> anyhow::Result<()> {
-    let created = client
+    let created = cloud
         .create_deployment(
             app_id,
             &CreateDeploymentRequest {
-                channel: channel.map(ToString::to_string),
+                image: None,
+                image_tag: None,
+                replicas: Some(1),
+                branch: None,
+                commit_sha: None,
+                commit_message: None,
+                channel: channel.map(String::from),
                 debug: false,
-                ..CreateDeploymentRequest::default()
             },
         )
         .await?;
@@ -170,8 +181,8 @@ pub(crate) async fn create_deployment(
 }
 
 /// Delete (soft-delete) a Spice Cloud app.
-pub(crate) async fn delete_app(client: &CloudClient, app_id: i64) -> anyhow::Result<()> {
-    client.delete_app(app_id).await?;
+pub(crate) async fn delete_app(cloud: &CloudClient, app_id: i64) -> anyhow::Result<()> {
+    cloud.delete_app(app_id).await?;
     Ok(())
 }
 

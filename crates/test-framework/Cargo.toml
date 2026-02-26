@@ -55,7 +55,7 @@ time = "0.3"
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(not(windows))'.dependencies]

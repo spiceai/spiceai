@@ -29,11 +29,22 @@ use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
     ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
-use test_framework::anyhow;
 use uuid::Uuid;
 
 use crate::args::StdioArgs;
 use crate::commands;
+
+/// State for an active benchmark run provisioned via `setup`.
+struct RunState {
+    /// Spice Cloud app ID.
+    app_id: i64,
+    /// API key for the app (used for Flight SQL authentication).
+    api_key: String,
+    /// Flight SQL endpoint URL derived from the cname.
+    flight_url: String,
+    /// Cloud client used during provisioning (reused for teardown).
+    cloud: CloudClient,
+}
 
 #[derive(Debug, Clone)]
 struct SetupConfig {
@@ -65,66 +76,6 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-}
-
-/// Average non-`None` `f64` values extracted from pods.
-#[expect(clippy::cast_precision_loss)]
-fn avg_opt(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
-) -> Option<f64> {
-    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
-        if let Some(v) = f(p) {
-            (s + v, c + 1)
-        } else {
-            (s, c)
-        }
-    });
-    (count > 0).then_some(sum / (count as f64))
-}
-
-/// Sum non-`None` `u64` values extracted from pods.
-fn sum_opt_u64(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<u64>,
-) -> Option<u64> {
-    let (sum, any) = pods.iter().fold((0_u64, false), |(s, any), p| {
-        if let Some(v) = f(p) {
-            (s.saturating_add(v), true)
-        } else {
-            (s, any)
-        }
-    });
-    any.then_some(sum)
-}
-
-/// Sum non-`None` `f64` values and convert to `u64`.
-#[expect(clippy::cast_sign_loss)]
-#[expect(clippy::cast_possible_truncation)]
-fn sum_opt_f64_as_u64(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
-) -> Option<u64> {
-    let (sum, any) = pods.iter().fold((0.0_f64, false), |(s, any), p| {
-        if let Some(v) = f(p) {
-            (s + v, true)
-        } else {
-            (s, any)
-        }
-    });
-    any.then_some(sum.round() as u64)
-}
-
-/// State for an active benchmark run provisioned via `setup`.
-struct RunState {
-    /// Spice Cloud app ID.
-    app_id: i64,
-    /// API key for the app (used for Flight SQL authentication).
-    api_key: String,
-    /// Flight SQL endpoint URL derived from the cname.
-    flight_url: String,
-    /// Spice Cloud client for API calls (metrics, teardown).
-    cloud: CloudClient,
 }
 
 /// System adapter handler that provisions Spice Cloud apps.
@@ -211,7 +162,7 @@ impl Handler for SpidapterHandler {
 
         let cloud_metrics = state
             .cloud
-            .get_app_metrics(state.app_id, None)
+            .get_app_metrics(state.app_id)
             .await
             .map_err(|e| format!("Failed to fetch metrics: {e}"))?;
 
@@ -220,13 +171,35 @@ impl Handler for SpidapterHandler {
         let resource = if pods.is_empty() {
             ResourceMetrics::default()
         } else {
+            let avg_cpu = match pods
+                .iter()
+                .filter_map(|p| p.cpu_usage_percent.is_some().then_some(1.0))
+                .sum::<f64>()
+            {
+                0.0 => None,
+                n => Some(pods.iter().filter_map(|p| p.cpu_usage_percent).sum::<f64>() / n),
+            };
+
+            let total_memory = match pods
+                .iter()
+                .filter_map(|p| p.memory_usage_bytes.is_some().then_some(1_u64))
+                .sum::<u64>()
+            {
+                0 => None,
+                n => Some(
+                    pods.iter()
+                        .filter_map(|p| p.memory_usage_bytes)
+                        .sum::<u64>()
+                        / n,
+                ),
+            };
             ResourceMetrics {
-                cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
-                memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
-                disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
-                disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
-                disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
-                disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
+                cpu_usage_percent: avg_cpu,
+                memory_usage_bytes: total_memory,
+                disk_read_bytes: None,
+                disk_write_bytes: None,
+                disk_read_iops: None,
+                disk_write_iops: None,
             }
         };
 
@@ -253,7 +226,11 @@ impl Handler for SpidapterHandler {
             return Ok(TeardownResponse { ok: true });
         };
 
-        eprintln!("[stdio] teardown: deleting app {}", state.app_id);
+        eprintln!(
+            "[stdio] teardown: deleting app {} at {}",
+            state.app_id,
+            state.cloud.base_url()
+        );
 
         commands::delete_app(&state.cloud, state.app_id)
             .await
@@ -271,88 +248,6 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
         .run_stdio()
         .await
         .map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
-}
-
-// ── Spice Cloud provisioning ─────────────────────────────────────────
-
-/// Provision a Spice Cloud app from the setup request.
-///
-/// Follows the same flow as `SpiceCloudSpicedStarter::start()`:
-/// 1. Resolve the default cname / region
-/// 2. Create or find the SCP app
-/// 3. Generate and upload the spicepod from the dataset configs
-/// 4. Set secrets (RUNNER + any env-based secrets)
-/// 5. Create a deployment
-/// 6. Wait for the deployment to become ready
-async fn provision_spice_cloud_app(
-    run_id: Uuid,
-    api_url_override: Option<&str>,
-    ready_wait: u64,
-    channel: Option<&str>,
-    setup_config: &SetupConfig,
-    datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<RunState> {
-    let cloud = commands::build_cloud_client(api_url_override)?;
-
-    let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
-    let run_id_str = run_id.to_string();
-    let short_id = run_id_str.split('-').next().unwrap_or_default();
-    let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
-
-    eprintln!("[stdio] Spice Cloud API: {}", cloud.base_url());
-    eprintln!("[stdio] Region cname: {cname}");
-    eprintln!("[stdio] Flight endpoint: {flight_url}");
-    eprintln!("[stdio] App name: {app_name}");
-
-    let (app_id, app_api_key) = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
-
-    let api_key = app_api_key.ok_or_else(|| {
-        anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
-    })?;
-
-    eprintln!("[stdio] App ID: {app_id}");
-
-    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config, datasets)?;
-    eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
-
-    eprintln!("[stdio] Uploading spicepod to app...");
-    commands::apply_spicepod_to_app(&cloud, app_id, &spicepod_yaml).await?;
-    eprintln!("[stdio] Spicepod uploaded");
-
-    // Set secrets from environment for any secret references in the spicepod
-    eprintln!("[stdio] Setting secrets from spicepod...");
-    commands::secrets::set_spicepod_secrets(&cloud, app_id, &spicepod_yaml).await?;
-    eprintln!("[stdio] Spicepod secrets set");
-
-    eprintln!("[stdio] Setting RUNNER secret...");
-    commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await?;
-    eprintln!("[stdio] RUNNER secret set");
-
-    eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, channel).await?;
-
-    let poll_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
-    commands::wait_for_deployment_ready(
-        &poll_client,
-        &cname,
-        &api_key,
-        Duration::from_secs(ready_wait),
-    )
-    .await?;
-
-    eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
-
-    post_setup_sink_action(setup_config, datasets, &cname, &api_key).await?;
-
-    Ok(RunState {
-        app_id,
-        api_key,
-        flight_url,
-        cloud,
-    })
 }
 
 async fn post_setup_sink_action(
@@ -491,6 +386,88 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+// ── Spice Cloud provisioning ─────────────────────────────────────────
+
+/// Provision a Spice Cloud app from the setup request.
+///
+/// Follows the same flow as `SpiceCloudSpicedStarter::start()`:
+/// 1. Resolve the default cname / region
+/// 2. Create or find the SCP app
+/// 3. Generate and upload the spicepod from the dataset configs
+/// 4. Set secrets (RUNNER + any env-based secrets)
+/// 5. Create a deployment
+/// 6. Wait for the deployment to become ready
+async fn provision_spice_cloud_app(
+    run_id: Uuid,
+    api_url_override: Option<&str>,
+    ready_wait: u64,
+    channel: Option<&str>,
+    setup_config: &SetupConfig,
+    datasets: &HashMap<String, DatasetConfig>,
+) -> anyhow::Result<RunState> {
+    let cloud = commands::build_cloud_client(api_url_override)?;
+
+    let cname = commands::resolve_default_cname(&cloud).await?;
+    let flight_url = commands::flight_url_from_cname(&cname);
+    let run_id_str = run_id.to_string();
+    let short_id = run_id_str.split('-').next().unwrap_or_default();
+    let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
+
+    eprintln!("[stdio] Spice Cloud API: {}", cloud.base_url());
+    eprintln!("[stdio] Region cname: {cname}");
+    eprintln!("[stdio] Flight endpoint: {flight_url}");
+    eprintln!("[stdio] App name: {app_name}");
+
+    let (app_id, app_api_key) = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
+
+    let api_key = app_api_key.ok_or_else(|| {
+        anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
+    })?;
+
+    eprintln!("[stdio] App ID: {app_id}");
+
+    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config, datasets)?;
+    eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
+
+    eprintln!("[stdio] Uploading spicepod to app...");
+    commands::apply_spicepod_to_app(&cloud, app_id, &spicepod_yaml).await?;
+    eprintln!("[stdio] Spicepod uploaded");
+
+    // Set secrets from environment for any secret references in the spicepod
+    eprintln!("[stdio] Setting secrets from spicepod...");
+    commands::secrets::set_spicepod_secrets(&cloud, app_id, &spicepod_yaml).await?;
+    eprintln!("[stdio] Spicepod secrets set");
+
+    eprintln!("[stdio] Setting RUNNER secret...");
+    commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await?;
+    eprintln!("[stdio] RUNNER secret set");
+
+    eprintln!("[stdio] Creating deployment...");
+    commands::create_deployment(&cloud, app_id, channel).await?;
+
+    let poll_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()?;
+    commands::wait_for_deployment_ready(
+        &poll_client,
+        &cname,
+        &api_key,
+        Duration::from_secs(ready_wait),
+    )
+    .await?;
+
+    eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
+
+    post_setup_sink_action(setup_config, datasets, &cname, &api_key).await?;
+
+    Ok(RunState {
+        app_id,
+        api_key,
+        flight_url,
+        cloud,
+    })
+}
+
 fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -570,7 +547,7 @@ fn generate_adbc_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
     yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
-/// Generate a minimal initial spicepod YAML with no datasets.
+/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
 fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -579,5 +556,146 @@ fn generate_initial_spicepod(
     match setup_config.sink_type {
         Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn setup_config_parses_metadata() {
+        let metadata = HashMap::from([(
+            "etl_region".to_string(),
+            serde_json::Value::String("us-west-2".to_string()),
+        )]);
+
+        let config = SetupConfig::from_metadata(&metadata);
+        assert_eq!(config.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn generate_spicepod_includes_dataset_entries() {
+        let setup_config = SetupConfig {
+            region: Some("us-west-2".to_string()),
+            endpoint: Some("http://localhost:9000".to_string()),
+            sink_type: None,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let datasets = HashMap::from([(
+            "my_table".to_string(),
+            DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/my_table/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )]);
+
+        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
+            .expect("spicepod should generate");
+
+        assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
+        assert!(spicepod.contains("name: my_table"));
+        assert!(spicepod.contains("file_format: parquet"));
+        assert!(spicepod.contains("s3_region: us-west-2"));
+        assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
+        assert!(spicepod.contains("engine: cayenne"));
+        assert!(spicepod.contains("mode: file"));
+        assert!(spicepod.contains("refresh_mode: full"));
+        assert!(spicepod.contains("refresh_check_interval: 1s"));
+        assert!(spicepod.contains("telemetry:"));
+        assert!(spicepod.contains("enabled: false"));
+    }
+
+    #[test]
+    fn generate_spicepod_errors_on_missing_dataset_source() {
+        let setup_config = SetupConfig {
+            region: None,
+            endpoint: None,
+            sink_type: None,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let datasets = HashMap::from([(
+            "missing_table".to_string(),
+            DatasetConfig {
+                schema,
+                location: None,
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )]);
+
+        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
+            .expect_err("missing source should fail");
+        assert!(
+            err.to_string().contains("missing_table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_uses_namespace_and_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            "orders",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/orders/".to_string()),
+                primary_key_columns: vec!["id".to_string()],
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(statement.contains("CREATE TABLE IF NOT EXISTS spicebench.bench.\"orders\""));
+        assert!(statement.contains("\"id\" BIGINT NOT NULL"));
+        assert!(statement.contains("\"name\" TEXT"));
+        assert!(statement.contains("\"price\" DECIMAL(10, 2)"));
+        assert!(statement.contains("\"created_at\" TIMESTAMP"));
+        assert!(statement.contains("PRIMARY KEY (\"id\")"));
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_for_unsupported_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "metadata",
+            DataType::Struct(vec![Field::new("k", DataType::Utf8, true)].into()),
+            true,
+        )]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )
+        .expect_err("unsupported Arrow type should fail");
+
+        assert!(
+            err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
     }
 }
