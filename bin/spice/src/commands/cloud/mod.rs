@@ -217,6 +217,10 @@ pub struct MetricsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
+
+    /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
+    #[arg(long, value_parser = parse_window)]
+    pub window: Option<String>,
 }
 
 // ============================================================================
@@ -1019,12 +1023,15 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     let app_name = require_app(args.app.as_deref())?;
     let app = client.get_app(&app_name).await?;
 
-    let response = client.get_app_metrics(app.id).await?;
+    let response = client
+        .get_app_metrics(app.id, args.window.as_deref())
+        .await?;
 
     if response.metrics.is_empty() {
         println!("No metrics available for {app_name}");
         return Ok(());
     }
+    let has_window = args.window.is_some();
 
     let mut table = TableOutput::new(vec![
         "POD",
@@ -1041,12 +1048,14 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
             m.memory_usage_bytes
                 .map_or_else(|| "-".to_string(), format_bytes),
-            m.filesystem_usage_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
-            m.filesystem_available_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
-            m.filesystem_capacity_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
+            m.disk_read_bytes
+                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
+            m.disk_read_iops
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+            m.disk_write_bytes
+                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
+            m.disk_write_iops
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
         ]);
     }
     table.print();
@@ -1097,9 +1106,46 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_bytes_f64(bytes: f64, is_windowed: bool) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    if is_windowed {
+        // increase() over window — show as a delta amount
+        if bytes >= GIB {
+            format!("{:.1} GiB", bytes / GIB)
+        } else if bytes >= MIB {
+            format!("{:.1} MiB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.1} KiB", bytes / KIB)
+        } else {
+            format!("{bytes:.0} B")
+        }
+    } else {
+        // Raw cumulative counter — show total bytes
+        if bytes >= GIB {
+            format!("{:.1} GiB", bytes / GIB)
+        } else if bytes >= MIB {
+            format!("{:.1} MiB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.1} KiB", bytes / KIB)
+        } else {
+            format!("{bytes:.0} B")
+        }
+    }
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+/// Validate that `--window` parses as a duration via `fundu`.
+fn parse_window(s: &str) -> std::result::Result<String, String> {
+    fundu::parse_duration(s)
+        .map(|_| s.to_string())
+        .map_err(|e| format!("invalid duration '{s}': {e}"))
+}
 
 /// Get the app name from the flag or the linked app.
 fn require_app(flag_value: Option<&str>) -> Result<String> {
