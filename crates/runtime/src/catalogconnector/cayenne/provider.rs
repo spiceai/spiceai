@@ -37,8 +37,8 @@ use snafu::prelude::*;
 use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use data_components::RefreshableCatalogProvider;
+use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

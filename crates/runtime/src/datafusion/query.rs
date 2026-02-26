@@ -21,8 +21,8 @@ use ::cache::{
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
-use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow::array::UInt64Array;
+use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
@@ -71,12 +71,12 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use data_components::delete::get_deletion_provider;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
-use data_components::delete::get_deletion_provider;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -687,24 +687,27 @@ impl Query {
                         }
                     };
                     (stream, df_plan)
-                } else if let LogicalPlan::Dml(dml) = &*plan && matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete) {
+                } else if let LogicalPlan::Dml(dml) = &*plan
+                    && matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete)
+                {
                     // DELETE operations need special handling because DataFusion doesn't
                     // support DELETE natively. We intercept the DML Delete plan, extract
                     // the filter predicates, and delegate to the DeletionTableProvider.
-                    let delete_plan = match create_delete_physical_plan(dml, &ctx.df, &session).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            let error_code = ErrorCode::from(&e);
-                            handle_error!(
-                                tracker,
-                                &request_context,
-                                error_code,
-                                e,
-                                UnableToExecuteQuery
-                            )
-                        }
-                    };
+                    let delete_plan =
+                        match create_delete_physical_plan(dml, &ctx.df, &session).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let error_code = ErrorCode::from(&e);
+                                handle_error!(
+                                    tracker,
+                                    &request_context,
+                                    error_code,
+                                    e,
+                                    UnableToExecuteQuery
+                                )
+                            }
+                        };
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream(Arc::clone(&delete_plan), task_ctx) {
@@ -722,25 +725,28 @@ impl Query {
                         }
                     };
                     (stream, delete_plan)
-                } else if let LogicalPlan::Dml(dml) = &*plan && matches!(&dml.op, datafusion::logical_expr::WriteOp::Update) {
+                } else if let LogicalPlan::Dml(dml) = &*plan
+                    && matches!(&dml.op, datafusion::logical_expr::WriteOp::Update)
+                {
                     // UPDATE operations are rewritten to an execution plan that:
                     // 1) materializes updated rows from the DML input,
                     // 2) deletes matched rows,
                     // 3) inserts updated rows back.
-                    let update_plan = match create_update_physical_plan(dml, &ctx.df, &session).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            let error_code = ErrorCode::from(&e);
-                            handle_error!(
-                                tracker,
-                                &request_context,
-                                error_code,
-                                e,
-                                UnableToExecuteQuery
-                            )
-                        }
-                    };
+                    let update_plan =
+                        match create_update_physical_plan(dml, &ctx.df, &session).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let error_code = ErrorCode::from(&e);
+                                handle_error!(
+                                    tracker,
+                                    &request_context,
+                                    error_code,
+                                    e,
+                                    UnableToExecuteQuery
+                                )
+                            }
+                        };
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream(Arc::clone(&update_plan), task_ctx) {
@@ -807,8 +813,7 @@ impl Query {
                             datafusion::logical_expr::WriteOp::Delete
                                 | datafusion::logical_expr::WriteOp::Update
                         )
-                )
-            {
+                ) {
                 let plan_schema = Arc::clone(plan.schema().inner());
                 let res_schema = res_stream.schema();
 
@@ -1327,9 +1332,7 @@ async fn create_delete_physical_plan(
         ))
     })?;
 
-    deletion_provider
-        .delete_from(session_state, &filters)
-        .await
+    deletion_provider.delete_from(session_state, &filters).await
 }
 
 /// Extract filter expressions from a DML source logical plan.
@@ -1342,9 +1345,9 @@ fn extract_dml_filters(source: &LogicalPlan) -> Vec<Expr> {
     use datafusion_expr::utils::split_conjunction_owned;
 
     match source {
-        LogicalPlan::Filter(filter) => split_conjunction_owned(unnormalize_col(
-            filter.predicate.clone(),
-        )),
+        LogicalPlan::Filter(filter) => {
+            split_conjunction_owned(unnormalize_col(filter.predicate.clone()))
+        }
         LogicalPlan::Projection(projection) => extract_dml_filters(projection.input.as_ref()),
         LogicalPlan::SubqueryAlias(alias) => extract_dml_filters(alias.input.as_ref()),
         _ => vec![],
@@ -1369,12 +1372,13 @@ async fn create_update_physical_plan(
         ))
     })?;
 
-    let deletion_provider = get_deletion_provider(Arc::clone(&table_provider)).ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "Table '{}' does not support UPDATE operations",
-            dml.table_name
-        ))
-    })?;
+    let deletion_provider =
+        get_deletion_provider(Arc::clone(&table_provider)).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Table '{}' does not support UPDATE operations",
+                dml.table_name
+            ))
+        })?;
 
     let source_plan = session_state.create_physical_plan(&dml.input).await?;
     let filters = extract_dml_filters(&dml.input);
@@ -1405,11 +1409,9 @@ impl UpdateExec {
         session_state: SessionState,
         filters: Vec<Expr>,
     ) -> Self {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "count",
-            arrow::datatypes::DataType::UInt64,
-            false,
-        )]));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
+        ]));
         let properties = datafusion::physical_plan::PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(Arc::clone(&schema)),
             datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
@@ -1497,11 +1499,9 @@ impl ExecutionPlan for UpdateExec {
         let session_state = self.session_state.clone();
         let filters = self.filters.clone();
 
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "count",
-            arrow::datatypes::DataType::UInt64,
-            false,
-        )]));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
+        ]));
 
         let stream = futures::stream::once(async move {
             use futures::TryStreamExt;
@@ -1514,11 +1514,15 @@ impl ExecutionPlan for UpdateExec {
             let target_schema = table_provider.schema();
             let normalized_batches = updated_batches
                 .into_iter()
-                .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
+                .map(|batch| {
+                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                })
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(DataFusionError::from)?;
 
-            let delete_plan = deletion_provider.delete_from(&session_state, &filters).await?;
+            let delete_plan = deletion_provider
+                .delete_from(&session_state, &filters)
+                .await?;
             let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
             let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
 
@@ -1545,13 +1549,11 @@ impl ExecutionPlan for UpdateExec {
                 let _insert_batches: Vec<RecordBatch> = insert_stream.try_collect().await?;
             }
 
-            let result = RecordBatch::try_from_iter_with_nullable(vec![
-                (
-                    "count",
-                    Arc::new(UInt64Array::from(vec![deleted_count])) as arrow::array::ArrayRef,
-                    false,
-                ),
-            ])
+            let result = RecordBatch::try_from_iter_with_nullable(vec![(
+                "count",
+                Arc::new(UInt64Array::from(vec![deleted_count])) as arrow::array::ArrayRef,
+                false,
+            )])
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
             Ok(result)

@@ -33,6 +33,7 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
+use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -41,7 +42,6 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_table_providers::UnsupportedTypeAction;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 
 use super::get_cayenne_provider;
 use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
@@ -319,8 +319,8 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
                             let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
                                 Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
-                            if let Err(e) = schema_provider
-                                .register_table(table_name.clone(), wrapped_provider)
+                            if let Err(e) =
+                                schema_provider.register_table(table_name.clone(), wrapped_provider)
                             {
                                 tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
                             }
