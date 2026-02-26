@@ -98,7 +98,7 @@ pub(crate) async fn do_put(
 
     if should_forward_cayenne_statement_update(&plan, &datafusion) {
         let affected_rows = execute_statement_update_on_executor(&datafusion, sql).await?;
-        return update_result_response(affected_rows);
+        return Ok(update_result_response(affected_rows));
     }
 
     // Execute
@@ -114,7 +114,7 @@ pub(crate) async fn do_put(
     // Extract affected rows count
     let affected_rows = extract_affected_rows(&results);
 
-    update_result_response(affected_rows)
+    Ok(update_result_response(affected_rows))
 }
 
 fn update_result_response(affected_rows: i64) -> Response<<Service as FlightService>::DoPutStream> {
