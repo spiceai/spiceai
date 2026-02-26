@@ -837,11 +837,17 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     }
                 };
 
+                // Register partition_metadata as Initializing so `/v1/ready`
+                // waits for metadata seeding to complete before reporting ready.
+                rt.status
+                    .update_component_status("partition_metadata", ComponentStatus::Initializing);
+
                 let pm_task = PartitionManagementTask::new(
                     rt.app(),
                     rt.datafusion(),
                     Arc::clone(&partition_manager),
                     Arc::clone(&scheduler_executor_registry),
+                    Arc::clone(&rt.status),
                     pm_config,
                     pm_shutdown.clone(),
                 );

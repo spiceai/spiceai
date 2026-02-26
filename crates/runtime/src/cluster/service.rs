@@ -610,13 +610,6 @@ impl ClusterService for ClusterServiceImpl {
                 // Find accelerated datasets with partitioning
 
                 for table_ref in super::partition::accelerated_tables(app).keys() {
-                    // Wait for the table to be registered in DataFusion before serializing partition expressions.
-                    // Executors may connect before the scheduler has finished loading all datasets.
-                    self.datafusion
-                        .runtime_status()
-                        .wait_for_dataset_ready(table_ref)
-                        .await;
-
                     match partition_manager
                         .allocate_partitions(table_ref, executor_id, 10)
                         .await
