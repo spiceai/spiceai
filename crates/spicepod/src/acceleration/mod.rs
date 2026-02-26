@@ -18,7 +18,7 @@ use crate::{
     component::dataset::ReadyState,
     metric::Metrics,
     param::Params,
-    partitioning::{PartitionedBy, deserialize_partition_by},
+    partitioning::{PartitionedBy, deserialize_partition_by, serialize_partition_by},
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -305,6 +305,7 @@ pub struct Acceleration {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_partition_by",
         deserialize_with = "deserialize_partition_by"
     )]
     pub partition_by: Vec<PartitionedBy>,

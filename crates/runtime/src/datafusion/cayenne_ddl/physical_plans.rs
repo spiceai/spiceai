@@ -1,0 +1,580 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Physical execution plans for Cayenne DDL operations.
+//!
+//! `CayenneCreateTableExec` creates a new table in the Cayenne metadata catalog
+//! with data stored in S3 Express One Zone via Vortex columnar format.
+//!
+//! `CayenneCreateSchemaExec` registers a schema namespace in the `DataFusion` catalog
+//! for Cayenne-backed DDL catalogs.
+//!
+//! `CayenneDropTableExec` removes a table from both the Cayenne metadata catalog
+//! and the `DataFusion` catalog.
+
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+
+use arrow::array::{RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use cayenne::CayenneTableProviderBuilder;
+use cayenne::metadata::CreateTableOptions;
+use datafusion::catalog::{CatalogProviderList, SchemaProvider};
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::TaskContext;
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion_table_providers::UnsupportedTypeAction;
+
+use super::get_cayenne_provider;
+use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
+
+/// Creates a result schema for DDL operations (single "result" column).
+fn ddl_result_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "result",
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// Physical plan for creating a Cayenne table.
+///
+/// Executes the following steps:
+/// 1. Retrieves the [`CayenneCatalogProvider`] from the `DataFusion` catalog.
+/// 2. Transforms the Arrow schema for Vortex compatibility.
+/// 3. Creates the table via [`CayenneTableProviderBuilder::create`].
+/// 4. Registers the resulting [`CayenneTableProvider`] in the schema provider.
+///
+/// Write-through inserts are handled natively by the `CayenneTableProvider`'s
+/// `insert_into()` implementation; no additional wrapping is needed.
+pub struct CayenneCreateTableExec {
+    table_name: String,
+    arrow_schema: Arc<Schema>,
+    if_not_exists: bool,
+    _or_replace: bool,
+    df_catalog_name: String,
+    df_schema_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for CayenneCreateTableExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneCreateTableExec")
+            .field("table_name", &self.table_name)
+            .field("df_catalog_name", &self.df_catalog_name)
+            .field("df_schema_name", &self.df_schema_name)
+            .field("if_not_exists", &self.if_not_exists)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CayenneCreateTableExec {
+    #[must_use]
+    pub fn new(
+        table_name: String,
+        arrow_schema: Arc<Schema>,
+        if_not_exists: bool,
+        or_replace: bool,
+        df_catalog_name: String,
+        df_schema_name: String,
+        catalog_list: Arc<dyn CatalogProviderList>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            table_name,
+            arrow_schema,
+            if_not_exists,
+            _or_replace: or_replace,
+            df_catalog_name,
+            df_schema_name,
+            catalog_list,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for CayenneCreateTableExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CayenneCreateTableExec: {}.{}.{}",
+            self.df_catalog_name, self.df_schema_name, self.table_name
+        )
+    }
+}
+
+impl ExecutionPlan for CayenneCreateTableExec {
+    fn name(&self) -> &'static str {
+        "CayenneCreateTableExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let arrow_schema = Arc::clone(&self.arrow_schema);
+        let if_not_exists = self.if_not_exists;
+        let df_catalog_name = self.df_catalog_name.clone();
+        let df_schema_name = self.df_schema_name.clone();
+        let catalog_list = Arc::clone(&self.catalog_list);
+        let result_schema = ddl_result_schema();
+
+        let stream = futures::stream::once(async move {
+            // Get the Cayenne catalog provider
+            let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
+            })?;
+
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
+
+            // Get catalog references before the async boundary
+            let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
+            let data_base_path = cayenne_provider.data_base_path().to_string();
+            let vortex_config = cayenne_provider.vortex_config().clone();
+
+            // Use namespace-prefixed name for metadata storage
+            let metadata_table_name = format!("{df_schema_name}/{table_name}");
+
+            // Check if table already exists via the metadata catalog
+            let exists = metadata_catalog
+                .get_table(&metadata_table_name)
+                .await
+                .is_ok();
+
+            if exists {
+                if if_not_exists {
+                    let batch = RecordBatch::try_new(
+                        result_schema,
+                        vec![Arc::new(StringArray::from(vec![format!(
+                            "Table '{table_name}' already exists"
+                        )]))],
+                    )?;
+                    return Ok(batch);
+                }
+                return Err(DataFusionError::Execution(format!(
+                    "Table '{table_name}' already exists in catalog '{df_catalog_name}'"
+                )));
+            }
+
+            // Transform schema for Vortex compatibility
+            let vortex_schema = transform_schema_for_vortex(
+                &arrow_schema,
+                UnsupportedTypeAction::Error,
+            )
+            .map_err(|e| {
+                DataFusionError::Execution(format!("Failed to transform schema for Vortex: {e}"))
+            })?;
+
+            let table_data_path = format!(
+                "{}{metadata_table_name}/",
+                data_base_path.trim_end_matches('/').to_string() + "/"
+            );
+
+            // Create table options with namespace-prefixed name
+            let create_options = CreateTableOptions {
+                table_name: metadata_table_name.clone(),
+                schema: Arc::new(vortex_schema),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: table_data_path,
+                partition_column: None,
+                vortex_config,
+            };
+
+            // Create the table via Cayenne
+            let builder = CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
+
+            let provider = builder.create(create_options).await.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to create Cayenne table '{table_name}': {e}"
+                ))
+            })?;
+
+            // Ensure the schema exists, creating it on demand if needed
+            let schema_provider = if let Some(s) = cayenne_provider.schema_provider(&df_schema_name)
+            {
+                s
+            } else {
+                let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
+                    Arc::clone(&metadata_catalog),
+                    df_schema_name.clone(),
+                ));
+                cayenne_provider.register_schema_provider(
+                    &df_schema_name,
+                    Arc::clone(&new_schema) as Arc<dyn SchemaProvider>,
+                )?;
+                Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
+            };
+
+            schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
+
+            let batch = RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "Table '{table_name}' created"
+                )]))],
+            )?;
+            Ok(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Physical plan for creating a Cayenne schema.
+pub struct CayenneCreateSchemaExec {
+    schema_name: String,
+    if_not_exists: bool,
+    df_catalog_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for CayenneCreateSchemaExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneCreateSchemaExec")
+            .field("schema_name", &self.schema_name)
+            .field("if_not_exists", &self.if_not_exists)
+            .field("df_catalog_name", &self.df_catalog_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CayenneCreateSchemaExec {
+    #[must_use]
+    pub fn new(
+        schema_name: String,
+        if_not_exists: bool,
+        df_catalog_name: String,
+        catalog_list: Arc<dyn CatalogProviderList>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            schema_name,
+            if_not_exists,
+            df_catalog_name,
+            catalog_list,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for CayenneCreateSchemaExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CayenneCreateSchemaExec: {}.{}",
+            self.df_catalog_name, self.schema_name
+        )
+    }
+}
+
+impl ExecutionPlan for CayenneCreateSchemaExec {
+    fn name(&self) -> &'static str {
+        "CayenneCreateSchemaExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let schema_name = self.schema_name.clone();
+        let if_not_exists = self.if_not_exists;
+        let df_catalog_name = self.df_catalog_name.clone();
+        let catalog_list = Arc::clone(&self.catalog_list);
+        let result_schema = ddl_result_schema();
+
+        let stream = futures::stream::once(async move {
+            let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
+            })?;
+
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
+
+            if cayenne_provider.schema_provider(&schema_name).is_some() {
+                if if_not_exists {
+                    let batch = RecordBatch::try_new(
+                        result_schema,
+                        vec![Arc::new(StringArray::from(vec![format!(
+                            "Schema '{schema_name}' already exists"
+                        )]))],
+                    )?;
+                    return Ok(batch);
+                }
+
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{schema_name}' already exists in catalog '{df_catalog_name}'"
+                )));
+            }
+
+            let schema_provider = Arc::new(CayenneSchemaProvider::new_empty(
+                Arc::clone(cayenne_provider.metadata_catalog()),
+                schema_name.clone(),
+            ));
+
+            cayenne_provider
+                .register_schema_provider(
+                    &schema_name,
+                    Arc::clone(&schema_provider) as Arc<dyn SchemaProvider>,
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to create schema '{schema_name}' in catalog '{df_catalog_name}': {e}"
+                    ))
+                })?;
+
+            let batch = RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "Schema '{schema_name}' created"
+                )]))],
+            )?;
+            Ok(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Physical plan for dropping a Cayenne table.
+pub struct CayenneDropTableExec {
+    table_name: String,
+    if_exists: bool,
+    df_catalog_name: String,
+    df_schema_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for CayenneDropTableExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneDropTableExec")
+            .field("table_name", &self.table_name)
+            .field("df_catalog_name", &self.df_catalog_name)
+            .field("df_schema_name", &self.df_schema_name)
+            .field("if_exists", &self.if_exists)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CayenneDropTableExec {
+    #[must_use]
+    pub fn new(
+        table_name: String,
+        if_exists: bool,
+        df_catalog_name: String,
+        df_schema_name: String,
+        catalog_list: Arc<dyn CatalogProviderList>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            table_name,
+            if_exists,
+            df_catalog_name,
+            df_schema_name,
+            catalog_list,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for CayenneDropTableExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "CayenneDropTableExec: {}.{}.{}",
+            self.df_catalog_name, self.df_schema_name, self.table_name
+        )
+    }
+}
+
+impl ExecutionPlan for CayenneDropTableExec {
+    fn name(&self) -> &'static str {
+        "CayenneDropTableExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let if_exists = self.if_exists;
+        let df_catalog_name = self.df_catalog_name.clone();
+        let df_schema_name = self.df_schema_name.clone();
+        let catalog_list = Arc::clone(&self.catalog_list);
+        let result_schema = ddl_result_schema();
+
+        let stream = futures::stream::once(async move {
+            // Get the Cayenne catalog provider
+            let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
+            })?;
+
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
+
+            let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
+
+            // Use namespace-prefixed name for metadata lookup
+            let metadata_table_name = format!("{df_schema_name}/{table_name}");
+
+            // Drop from the Cayenne metadata catalog
+            let was_dropped = metadata_catalog
+                .drop_table(&metadata_table_name)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to drop Cayenne table '{table_name}': {e}"
+                    ))
+                })?;
+
+            if !was_dropped {
+                if if_exists {
+                    let batch = RecordBatch::try_new(
+                        result_schema,
+                        vec![Arc::new(StringArray::from(vec![format!(
+                            "Table '{table_name}' does not exist"
+                        )]))],
+                    )?;
+                    return Ok(batch);
+                }
+                return Err(DataFusionError::Execution(format!(
+                    "Table '{table_name}' does not exist in catalog '{df_catalog_name}'"
+                )));
+            }
+
+            // Deregister from the DataFusion catalog
+            if let Some(schema_provider) = df_catalog.schema(&df_schema_name) {
+                let _ = schema_provider.deregister_table(&table_name);
+            }
+
+            let batch = RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "Table '{table_name}' dropped"
+                )]))],
+            )?;
+            Ok(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}

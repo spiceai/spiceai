@@ -24,6 +24,7 @@ pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;
 pub mod retry_strategy;
+#[cfg(feature = "datafusion")]
 pub mod security;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
@@ -32,9 +33,12 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+#[cfg(feature = "datafusion")]
 pub mod expr;
+#[cfg(feature = "datafusion")]
 pub mod stream_utils;
 pub mod time_format;
+#[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
 
 #[expect(clippy::cast_precision_loss)]

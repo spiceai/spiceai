@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2025, Spice AI, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,17 +26,24 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
+use super::SharedDataFusionRef;
 use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
 use super::physical_plans::{IcebergCreateTableExec, IcebergDropTableExec};
 
 /// Extension planner for Iceberg DDL operations.
-#[derive(Debug, Default)]
-pub struct IcebergDdlExtensionPlanner;
+///
+/// Holds a [`SharedDataFusionRef`] — a lazily-initialized weak reference to the
+/// `DataFusion` instance — so that physical plans can access the runtime for
+/// accelerated table creation.
+#[derive(Debug)]
+pub struct IcebergDdlExtensionPlanner {
+    datafusion_ref: SharedDataFusionRef,
+}
 
 impl IcebergDdlExtensionPlanner {
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(datafusion_ref: SharedDataFusionRef) -> Self {
+        Self { datafusion_ref }
     }
 }
 
@@ -52,6 +59,9 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         let catalog_list = Arc::<dyn CatalogProviderList>::clone(session_state.catalog_list());
 
+        // Resolve the weak DataFusion reference for physical plans
+        let datafusion_weak = self.datafusion_ref.get().cloned().unwrap_or_default();
+
         if let Some(create) = node.as_any().downcast_ref::<IcebergCreateTableNode>() {
             return Ok(Some(Arc::new(IcebergCreateTableExec::new(
                 Arc::clone(&create.catalog),
@@ -63,6 +73,9 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
                 create.df_catalog_name.clone(),
                 create.df_schema_name.clone(),
                 catalog_list,
+                create.acceleration.clone(),
+                create.dataset_options.clone(),
+                datafusion_weak,
             ))));
         }
 
@@ -75,6 +88,7 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
                 drop.df_catalog_name.clone(),
                 drop.df_schema_name.clone(),
                 catalog_list,
+                datafusion_weak,
             ))));
         }
 

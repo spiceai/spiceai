@@ -112,7 +112,7 @@ pub(crate) async fn get(
         },
         ConnectionDetails {
             name: "flight",
-            status: flight_status,
+            status: flight_status.clone(),
             endpoint: flight_url.clone(),
         },
         ConnectionDetails {
@@ -123,7 +123,7 @@ pub(crate) async fn get(
                     Ok(status) => status,
                     Err(e) => {
                         tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                        ComponentStatus::Error
+                        ComponentStatus::error_with_message(e.to_string())
                     }
                 },
                 None => ComponentStatus::Disabled,
@@ -132,7 +132,7 @@ pub(crate) async fn get(
         // OpenTelemetry is served on the same gRPC port as Flight
         ConnectionDetails {
             name: "opentelemetry",
-            status: flight_status,
+            status: flight_status.clone(),
             endpoint: flight_url,
         },
     ];
@@ -173,7 +173,7 @@ async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
         Ok(_) => ComponentStatus::Ready,
         Err(e) => {
             tracing::error!("Error connecting to flight when checking status: {e}");
-            ComponentStatus::Error
+            ComponentStatus::error_with_message(e.to_string())
         }
     }
 }
@@ -185,6 +185,6 @@ async fn get_metrics_status(
     if resp.status().is_success() && resp.text().await? == "OK" {
         Ok(ComponentStatus::Ready)
     } else {
-        Ok(ComponentStatus::Error)
+        Ok(ComponentStatus::error())
     }
 }

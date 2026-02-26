@@ -43,6 +43,10 @@ pub struct DatasetInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
 
+    /// An optional error message describing why the dataset entered an error state.
+    /// Only populated when the dataset status is `Error` and an error message was recorded.
+    pub error_message: Option<String>,
+
     /// Custom properties for the dataset
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub properties: HashMap<String, serde_json::Value>,

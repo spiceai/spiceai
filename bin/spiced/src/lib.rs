@@ -364,6 +364,16 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
+    // Configure Flight `DoPut` rate limits from spicepod runtime.flight settings
+    let flight_config = runtime_config.and_then(|rt| rt.flight.clone());
+    let rate_limits = {
+        let mut limits = runtime::flight::RateLimits::default();
+        if let Some(ref flight) = flight_config {
+            limits = limits.with_flight_write_enabled(flight.do_put_rate_limit_enabled);
+        }
+        limits
+    };
+
     let resolved_cluster_config =
         in_tracing_context(|| ResolvedClusterConfig::try_new(args.runtime.cluster.clone()));
 
@@ -379,6 +389,7 @@ pub async fn run(args: Args) -> Result<()> {
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .with_runtime_config(args.runtime.clone())
+        .with_rate_limits(rate_limits)
         .with_io_runtime(Handle::current());
 
     // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)

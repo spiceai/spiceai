@@ -18,17 +18,33 @@ limitations under the License.
 //! and physical execution plans for `CREATE TABLE` / `DROP TABLE` on
 //! Iceberg-backed catalogs.
 
+pub mod acceleration_options;
 pub mod analyzer_rule;
 pub mod logical_nodes;
 pub mod physical_plans;
 pub mod planner;
+pub mod preprocess;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use data_components::iceberg::provider::IcebergCatalogProvider;
 use datafusion::catalog::CatalogProvider;
 
+use super::DataFusion;
 use super::composed_catalog::ComposedCatalogProvider;
+
+/// A shared, lazily-initialized weak reference to the [`DataFusion`] instance.
+///
+/// Created at build time and shared between the extension planner and the
+/// `DataFusion` struct.  The `OnceLock` is populated once the `DataFusion` is
+/// wrapped in an `Arc` (see [`DataFusion::set_self_ref`]).
+pub type SharedDataFusionRef = Arc<OnceLock<Weak<DataFusion>>>;
+
+/// Create a new, empty [`SharedDataFusionRef`].
+#[must_use]
+pub fn new_shared_datafusion_ref() -> SharedDataFusionRef {
+    Arc::new(OnceLock::new())
+}
 
 /// Try to extract the Iceberg catalog from a `CatalogProvider`.
 /// Handles both direct `IcebergCatalogProvider` and `ComposedCatalogProvider`
