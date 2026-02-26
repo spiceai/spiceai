@@ -325,7 +325,6 @@ impl ExecutionPlan for CayenneCreateTableExec {
                                 tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
                             }
                         }
-                        }
                     }
 
                     let batch = RecordBatch::try_new(
