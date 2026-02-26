@@ -121,10 +121,7 @@ pub async fn run_verification(
         test = test.with_explain_plan_snapshot();
     }
 
-    let test = test.with_explain_plan_snapshot()
-        .start()?
-        .wait()
-        .await?;
+    let test = test.with_explain_plan_snapshot().start()?.wait().await?;
 
     // Collect metrics
     let _row_counts = test.validate_returned_row_counts()?;

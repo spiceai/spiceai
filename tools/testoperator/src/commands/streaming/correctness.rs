@@ -291,9 +291,14 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
             .await?;
 
         // Run verification
-        let verification_result =
-            verification::run_verification(spiced_instance, &config_name, 1, args.scale_factor, false)
-                .await?;
+        let verification_result = verification::run_verification(
+            spiced_instance,
+            &config_name,
+            1,
+            args.scale_factor,
+            false,
+        )
+        .await?;
 
         // Get spiced_instance back from result
         spiced_instance = verification_result.spiced_instance;
@@ -317,7 +322,10 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
     // Fetch DynamoDB metrics (requires spiced running)
     let dynamodb_metrics = match utils::get_dynamodb_metrics().await {
         Ok(metrics) => {
-            println!("\nDynamoDB records consumed: {}", metrics.records_consumed_total);
+            println!(
+                "\nDynamoDB records consumed: {}",
+                metrics.records_consumed_total
+            );
             if metrics.errors_transient_total > 0 {
                 println!(
                     "DynamoDB transient errors: {}",
@@ -334,8 +342,7 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
 
     // Record metrics
     crate::metrics::RECORD_COUNT.record(dynamodb_metrics.records_consumed_total, &[]);
-    crate::metrics::DYNAMODB_TRANSIENT_ERRORS
-        .record(dynamodb_metrics.errors_transient_total, &[]);
+    crate::metrics::DYNAMODB_TRANSIENT_ERRORS.record(dynamodb_metrics.errors_transient_total, &[]);
     crate::metrics::CORRECTNESS_ROUNDS_TOTAL.record(round_results.len() as u64, &[]);
     crate::metrics::CORRECTNESS_ROUNDS_PASSED.record(pass_count as u64, &[]);
     crate::metrics::CORRECTNESS_ROUNDS_FAILED.record(fail_count as u64, &[]);
