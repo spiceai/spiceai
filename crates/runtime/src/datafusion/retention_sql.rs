@@ -85,7 +85,6 @@ pub enum Error {
     },
 }
 
-#[allow(clippy::result_large_err)]
 pub fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,
@@ -136,7 +135,6 @@ pub fn parse_retention_sql(
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn validate_table_name(
     from: &sqlparser::ast::FromTable,
     expected_table: &TableReference,
@@ -184,7 +182,6 @@ fn validate_table_name(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
 fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let df_schema = DFSchema::try_from(schema).context(SchemaConversionSnafu)?;
 

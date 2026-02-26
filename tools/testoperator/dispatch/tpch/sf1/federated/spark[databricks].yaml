@@ -5,3 +5,4 @@ tests:
     query_overrides: spark
     runner_type: spiceai-dev-runners
     validate_results: true
+    ready_wait: 900

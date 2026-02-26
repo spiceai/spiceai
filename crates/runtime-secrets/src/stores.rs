@@ -20,3 +20,4 @@ pub mod env;
 #[cfg(feature = "keyring-secret-store")]
 pub mod keyring;
 pub mod kubernetes;
+pub mod scheduler_rpc;

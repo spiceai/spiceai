@@ -85,6 +85,7 @@ pub enum ModelSource {
     OpenAi,
     Azure,
     Anthropic,
+    Google,
     Xai,
     HuggingFace,
     Perplexity,
@@ -155,6 +156,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::File)
         } else if value.starts_with("anthropic") {
             Ok(ModelSource::Anthropic)
+        } else if value.starts_with("google") {
+            Ok(ModelSource::Google)
         } else if value.starts_with("perplexity") {
             Ok(ModelSource::Perplexity)
         } else if value.starts_with("openai") {
@@ -183,6 +186,7 @@ impl Display for ModelSource {
             ModelSource::Azure => write!(f, "azure"),
             ModelSource::Xai => write!(f, "xai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
+            ModelSource::Google => write!(f, "google"),
             ModelSource::Perplexity => write!(f, "perplexity"),
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
@@ -201,6 +205,7 @@ impl ModelSource {
             ModelSource::Azure => "azure",
             ModelSource::Xai => "xai",
             ModelSource::Anthropic => "anthropic",
+            ModelSource::Google => "google",
             ModelSource::Perplexity => "perplexity",
             ModelSource::HuggingFace => "hf",
             ModelSource::File => "file",
@@ -371,6 +376,7 @@ impl Model {
                 | ModelSource::Xai
                 | ModelSource::Databricks
                 | ModelSource::Bedrock
+                | ModelSource::Google
         ) {
             return Some(ModelType::Llm);
         }

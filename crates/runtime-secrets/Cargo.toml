@@ -21,6 +21,8 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+percent-encoding.workspace = true
+futures.workspace = true
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }
@@ -35,6 +37,7 @@ keyring = { version = "3.6.3", features = [
 
 [dev-dependencies]
 rand.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 
 [features]

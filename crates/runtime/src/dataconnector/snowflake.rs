@@ -24,7 +24,7 @@ use data_components::Read;
 use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to create Snowflake connection pool: {source}"))]
     UnableToCreateSnowflakeConnectionPool {
         source: db_connection_pool::snowflakepool::Error,
     },
@@ -69,6 +69,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("private_key_path").secret(),
+    ParameterSpec::component("private_key").secret(),
     ParameterSpec::component("private_key_passphrase").secret(),
     ParameterSpec::component("account").secret(),
     ParameterSpec::component("warehouse").secret(),
@@ -153,3 +154,5 @@ impl DataConnector for Snowflake {
             })?)
     }
 }
+
+register_data_connector!("snowflake", SnowflakeFactory);

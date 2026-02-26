@@ -44,7 +44,7 @@ pub fn get_branch_name() -> String {
         )
 }
 
-#[allow(clippy::map_unwrap_or)]
+#[expect(clippy::map_unwrap_or)]
 fn is_repo_dirty() -> bool {
     let output = Command::new("git")
         .arg("status")

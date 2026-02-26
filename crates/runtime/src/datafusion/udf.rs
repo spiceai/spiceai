@@ -28,23 +28,33 @@ use datafusion_table_providers::util::supported_functions::{FunctionRestriction,
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
-    embed,
+    embed::{self, EMBED_UDF_NAME},
 };
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use runtime_datafusion_udfs::{
     alias::ScalarUDFAlias,
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
-    embed::EMBED_UDF_NAME,
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
 };
 
-pub async fn register_udfs(runtime: &crate::Runtime) {
-    let ctx = &runtime.df.ctx;
+/// Register core scalar UDFs that have no runtime dependencies.
+///
+/// These UDFs only need a [`SessionContext`] and can be registered on any
+/// context, including isolated ones like the refresh-task context.
+pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(Bucket::new().into());
     ctx.register_udf(CosineDistance::new().into());
     ctx.register_udf(Truncate::new().into());
+    ctx.register_udf(INSTANCE.clone());
+}
+
+pub async fn register_udfs(runtime: &crate::Runtime) {
+    let ctx = &runtime.df.ctx;
+    register_core_scalar_udfs(ctx);
 
     ctx.register_udf(TextSearchTableFunc::new(Arc::downgrade(&runtime.df)).into());
     ctx.register_udtf(
@@ -79,8 +89,6 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
                 .into_scalar_udf(),
         );
     }
-
-    ctx.register_udf(INSTANCE.clone());
 }
 
 /// Create a [`FunctionSupport`] with all spice specific functions as unsupported for federation.

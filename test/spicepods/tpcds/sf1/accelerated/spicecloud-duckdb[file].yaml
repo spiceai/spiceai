@@ -8,6 +8,8 @@ datasets:
       enabled: true
       engine: duckdb
       mode: file
+      params:
+        connection_pool_size: 25
     params: &spicecloud_params
       spiceai_api_key: ${secrets:SPICEAI_TEST_TPCDS_API_KEY}
       spiceai_endpoint: ${secrets:SPICEAI_TEST_ENDPOINT}

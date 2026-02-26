@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Check for existing PR
         id: check_pr
@@ -42,6 +42,14 @@ jobs:
         if: steps.check_pr.outputs.skip != 'true'
         run: rustup toolchain install stable --profile minimal
 
+      - name: Set up make
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-cc
+
       - name: Build Cargo project
         if: steps.check_pr.outputs.skip != 'true'
         run: cargo build --manifest-path tools/spiceschema/Cargo.toml
@@ -63,7 +71,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: openapi.json
           path: .schema/openapi.json

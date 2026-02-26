@@ -53,6 +53,9 @@ pub struct RequestContext {
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
     nested_query_level: AtomicI16,
+    /// The raw `authorization` header value from the incoming request, if present.
+    /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
+    authorization_header: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -86,7 +89,7 @@ pub struct AsyncMarker {
 impl AsyncMarker {
     // This can only be called in async contexts due to .await
     #[must_use]
-    #[allow(clippy::unused_async)]
+    #[expect(clippy::unused_async)]
     pub async fn new() -> Self {
         AsyncMarker {
             marker: PhantomData,
@@ -235,6 +238,12 @@ impl RequestContext {
         &self.trace_parent
     }
 
+    /// Returns the raw `authorization` header value from the incoming request, if present.
+    #[must_use]
+    pub fn authorization_header(&self) -> Option<&str> {
+        self.authorization_header.as_deref()
+    }
+
     pub fn extension<T>(&self) -> Option<T>
     where
         T: Extension + Clone,
@@ -301,6 +310,7 @@ pub struct RequestContextBuilder {
     baggage: Vec<KeyValue>,
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
+    authorization_header: Option<String>,
 }
 
 impl RequestContextBuilder {
@@ -315,6 +325,7 @@ impl RequestContextBuilder {
             baggage: vec![],
             extensions: Extensions::default(),
             trace_parent: None,
+            authorization_header: None,
         }
     }
 
@@ -353,6 +364,11 @@ impl RequestContextBuilder {
         };
 
         self.baggage.extend(baggage::from_headers(headers));
+
+        self.authorization_header = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
 
         match super::extract_trace_parent(headers) {
             Ok(trace_parent) => {
@@ -442,15 +458,42 @@ impl RequestContextBuilder {
             .client_supplied_cache_key
             .and_then(Self::sanitize_cache_key);
 
-        // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
+        // Apply the runtime parameter `runtime.caching.sql_results.cache_key_type` to the cache control if set.
         let cache_control = match self.cache_control {
             CacheControl::Cache(CacheKeyType::Default) => {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
                 CacheControl::Cache(cache_key_type)
             }
+            CacheControl::MaxStale(CacheKeyType::Default, duration) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::MaxStale(cache_key_type, duration)
+            }
+            CacheControl::MinFresh(CacheKeyType::Default, duration) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::MinFresh(cache_key_type, duration)
+            }
+            CacheControl::OnlyIfCached(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::OnlyIfCached(cache_key_type)
+            }
             // If sanitized out, fall back to default
             CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
+            }
+            CacheControl::MaxStale(CacheKeyType::ClientSupplied, duration)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::MaxStale(CacheKeyType::Default, duration)
+            }
+            CacheControl::MinFresh(CacheKeyType::ClientSupplied, duration)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::MinFresh(CacheKeyType::Default, duration)
+            }
+            CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::OnlyIfCached(CacheKeyType::Default)
             }
             cache_control => cache_control,
         };
@@ -464,6 +507,7 @@ impl RequestContextBuilder {
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
             nested_query_level: AtomicI16::new(0),
+            authorization_header: self.authorization_header,
         }
     }
 

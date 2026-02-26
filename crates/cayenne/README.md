@@ -136,7 +136,10 @@ let options = CreateTableOptions {
         Field::new("name", DataType::Utf8, false),
     ])),
     primary_key: vec!["id".to_string()],
+    on_conflict: None,
     base_path: "/data/users".to_string(),
+    partition_column: None,
+    vortex_config: cayenne::metadata::VortexConfig::default(),
 };
 
 let table = CayenneTableProvider::create_table(catalog, options).await?;
@@ -145,8 +148,11 @@ let table = CayenneTableProvider::create_table(catalog, options).await?;
 ### Insert Data
 
 ```rust
-// Insert record batches
-let rows_inserted = table.insert(record_batch_stream).await?;
+// Insert record batches via DataFusion's insert_into() API
+use datafusion::prelude::*;
+let ctx = SessionContext::new();
+ctx.register_table("my_table", Arc::new(table))?;
+ctx.sql("INSERT INTO my_table SELECT * FROM source_table").await?.collect().await?;
 ```
 
 ### Delete by Primary Key
@@ -270,14 +276,18 @@ let options = CreateTableOptions {
         Field::new("data", DataType::Utf8, true),
     ])),
     primary_key: vec!["event_id".to_string()],
+    on_conflict: None,
     base_path: "/data/events".to_string(),
+    partition_column: None,
+    vortex_config: cayenne::metadata::VortexConfig::default(),
 };
 
 let table = CayenneTableProvider::create_table(catalog.clone(), options).await?;
 
-// Insert data
+// Insert data via DataFusion's insert_into() API
 let batch = create_record_batch()?;
-table.insert(Box::pin(stream::once(async { Ok(batch) }))).await?;
+ctx.register_table("events", Arc::new(table))?;
+ctx.read_batch(batch)?.write_table("events", DataFrameWriteOptions::new()).await?;
 
 // Query (deletion vectors applied automatically)
 let ctx = SessionContext::new();
@@ -288,29 +298,61 @@ df.show().await?;
 
 ## Implementation Status
 
-### Current Status (Phase 1)
+### Current Status
 
 - ✅ Trait abstractions defined
 - ✅ Data structures implemented
 - ✅ Deletion vector logic complete
-- ⚠️ SQLite catalog (skeleton only)
-- ⚠️ Table provider (skeleton only)
+- ✅ SQLite catalog implementation
+- ✅ Turso catalog implementation (optional feature)
+- ✅ Table provider with scan and deletion filtering
+- ✅ Insert/delete/update operations
+- ✅ Primary key support
+- ✅ Streaming data ingestion and queries
+- ✅ File-mode acceleration
+- ✅ S3 Express One Zone support
+- ✅ Partition support (file-based partitioning)
+- ✅ Upsert on conflict behavior
+- ✅ Retention policies (time-based and SQL-based)
 
-### Next Steps (Phase 2)
+### Known Limitations
 
-1. Complete SQLite catalog implementation with rusqlite
-2. Implement file I/O for Vortex data files
-3. Implement deletion vector Parquet I/O
-4. Complete table provider scan with deletion filtering
-5. Implement insert/delete/update operations
+The following limitations apply to the Cayenne accelerator:
 
-### Future Enhancements (Phase 3)
+#### Access Mode
+
+- **File mode only**: Cayenne only supports file-based acceleration (`mode: file`). In-memory mode is not supported.
+
+#### Data Types
+
+Some Arrow data types are not natively supported by the Vortex format used by Cayenne:
+
+- `Interval` types
+- `Duration` types
+- `Map` types
+- `FixedSizeBinary` types
+
+To handle unsupported types, use the `cayenne_unsupported_type_action` parameter:
+
+- `string` (default): Convert unsupported types to UTF-8 strings
+- `error`: Fail on unsupported types
+- `warn`: Include in schema but may fail on insert
+- `ignore`: Skip unsupported fields
+
+#### Indexes
+
+- Secondary indexes are not supported. Primary keys are supported for efficient upserts and deletions.
+
+#### Snapshots
+
+- Acceleration snapshots (`acceleration.snapshots`) are not supported with Cayenne.
+
+### Future Enhancements
 
 - Compaction and maintenance operations
 - Advanced statistics
-- Partitioning support
-- Performance optimizations
 - Additional catalog backends (PostgreSQL, DuckDB)
+- MVCC support for Turso backend
 
 ## Benefits
 

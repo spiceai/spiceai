@@ -1,9 +1,6 @@
 name: Install PostgreSQL
 description: 'Performs PostgreSQL installation and setup on the target operating system'
 inputs:
-  os:
-    description: 'Operating system to install PostgreSQL'
-    default: 'linux' # 'linux', 'darwin', 'windows'
   pg-db:
     description: 'Name of the database to create'
     default: 'postgres'
@@ -12,7 +9,7 @@ runs:
   using: 'composite'
   steps:
     - name: Install PostgreSQL (Linux)
-      if: inputs.os == 'linux'
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
@@ -24,7 +21,7 @@ runs:
         sudo -u postgres createdb ${{ inputs.pg-db }}
 
     - name: Install PostgreSQL (macOS)
-      if: inputs.os == 'darwin'
+      if: runner.os == 'macOS'
       shell: bash
       run: |
         # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066

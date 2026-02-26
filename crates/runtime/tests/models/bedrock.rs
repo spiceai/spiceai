@@ -17,7 +17,7 @@ limitations under the License.
 #[cfg(feature = "bedrock")]
 pub(crate) mod embeddings {
     use super::super::embedding::{EmbeddingTestCase, run_embedding_tests};
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use serde_json::Value;
     use spicepod::component::embeddings::Embeddings;
     use std::collections::HashMap;

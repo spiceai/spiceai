@@ -2,31 +2,30 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q22"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                    |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                                                      |
-|               |   Projection: hits.SearchPhrase, min(hits.URL), count(Int64(1)) AS c                                                                                                                    |
-|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(hits.URL), count(Int64(1))]]                                                                                                   |
-|               |       BytesProcessedNode                                                                                                                                                                |
-|               |         Filter: CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%") AND CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                          |
-|               |           TableScan: hits projection=[URL, SearchPhrase], partial_filters=[CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%"), CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")] |
-| physical_plan | SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[false]                                                                                                                |
-|               |   CoalescePartitionsExec                                                                                                                                                                |
-|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(hits.URL)@1 as min(hits.URL), count(Int64(1))@2 as c]                                                                     |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                                                                 |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
-|               |           RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                                                                                 |
-|               |             AggregateExec: mode=Partial, gby=[SearchPhrase@1 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                                                                    |
-|               |               BytesProcessedExec                                                                                                                                                        |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
-|               |                   FilterExec: CAST(URL@0 AS LargeUtf8) LIKE %google% AND CAST(SearchPhrase@1 AS Utf8View) !=                                                                            |
-|               |                     SchemaCastScanExec                                                                                                                                                  |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                             |
-|               |                         FallbackOnZeroResultsScanExec                                                                                                                                   |
-|               |                           CoalescePartitionsExec                                                                                                                                        |
-|               |                             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                       |
-|               |                               CooperativeExec                                                                                                                                           |
-|               |                                 DuckSqlExec sql= SELECT "URL", "SearchPhrase" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%' AND (CAST("SearchPhrase" AS VARCHAR) <> '')           |
-|               |                                                                                                                                                                                         |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                  |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                                                    |
+|               |   Projection: hits.SearchPhrase, min(hits.URL), count(Int64(1)) AS c                                                                                                                  |
+|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(hits.URL), count(Int64(1))]]                                                                                                 |
+|               |       Filter: CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%") AND CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                          |
+|               |         TableScan: hits projection=[URL, SearchPhrase], partial_filters=[CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%"), CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")] |
+| physical_plan | SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[false]                                                                                                              |
+|               |   CoalescePartitionsExec                                                                                                                                                              |
+|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(hits.URL)@1 as min(hits.URL), count(Int64(1))@2 as c]                                                                   |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                                                               |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                   |
+|               |           RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                                                                               |
+|               |             AggregateExec: mode=Partial, gby=[SearchPhrase@1 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                                                                  |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
+|               |                 FilterExec: CAST(URL@0 AS LargeUtf8) LIKE %google% AND CAST(SearchPhrase@1 AS Utf8View) !=                                                                            |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                               |
+|               |                     SchemaCastScanExec                                                                                                                                                |
+|               |                       FallbackOnZeroResultsScanExec                                                                                                                                   |
+|               |                         CoalescePartitionsExec                                                                                                                                        |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                       |
+|               |                             CooperativeExec                                                                                                                                           |
+|               |                               BytesProcessedExec                                                                                                                                      |
+|               |                                 DuckSqlExec sql= SELECT "URL", "SearchPhrase" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%' AND (CAST("SearchPhrase" AS VARCHAR) <> '')         |
+|               |                                                                                                                                                                                       |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

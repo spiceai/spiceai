@@ -80,7 +80,7 @@ fn acceleration_info(
 ) -> String {
     let mut info: String = acceleration.engine.to_string();
 
-    if acceleration.mode == Mode::File {
+    if matches!(acceleration.mode, Mode::File | Mode::FileCreate) {
         info.push_str(":file");
     }
 
@@ -97,6 +97,9 @@ fn acceleration_info(
         }
         RefreshMode::Changes => {
             info.push_str(", changes");
+        }
+        RefreshMode::Caching => {
+            info.push_str(", caching");
         }
     }
 

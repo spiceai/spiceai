@@ -16,7 +16,7 @@ limitations under the License.
 
 use datafusion::error::DataFusionError;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ErrorCode {
     SyntaxError,
     QueryPlanningError,

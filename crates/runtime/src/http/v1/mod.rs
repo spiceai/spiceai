@@ -22,10 +22,12 @@ pub mod eval;
 pub mod iceberg;
 pub mod inference;
 pub mod responses;
+pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
 pub mod packages;
+pub mod queries;
 pub mod query;
 pub mod ready;
 pub mod search;
@@ -51,7 +53,10 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
-use http::{HeaderValue, header::CONTENT_TYPE};
+use http::{
+    HeaderValue,
+    header::{CACHE_CONTROL, CONTENT_TYPE},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
@@ -59,6 +64,8 @@ use snafu::ResultExt;
 use futures::TryStreamExt;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
+
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -115,10 +122,12 @@ pub struct ResponseMetadata {
 
 impl ResponseMetadata {
     /// Creates an empty `ResponseMetadata`
+    #[must_use]
     pub fn empty() -> Self {
         Self { sql: None }
     }
 
+    #[must_use]
     pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
         self.sql = Some(sql.into());
         self
@@ -131,6 +140,7 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
+    #[must_use]
     pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
             Self::Json => "application/json",
@@ -142,6 +152,7 @@ impl ResponseMimeType {
         HeaderValue::from_str(media_type).ok()
     }
 
+    #[must_use]
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
@@ -169,10 +180,18 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
+    // First check the runtime status which tracks the actual component state
+    // (Initializing, Refreshing, Ready, Error, etc.)
+    let dataset_statuses = df.runtime_status().get_dataset_statuses();
+    if let Some(status) = dataset_statuses.get(&ds.name) {
+        return status.clone();
+    }
+
+    // Fallback: if not in runtime status, check if table exists
     if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
-        ComponentStatus::Error
+        ComponentStatus::error()
     }
 }
 
@@ -228,29 +247,19 @@ pub async fn to_http_response(
 ) -> (StatusCode, HeaderMap, String) {
     let mut headers = HeaderMap::new();
 
-    // Offload CPU-intensive serialization to blocking thread pool to avoid blocking async runtime
-    let res = tokio::task::spawn_blocking(move || match format {
+    let res = match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
         ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
             arrow_to_vnd_sql_json_v1(&data, meta)
         }
-    })
-    .await;
+    };
 
     let body = match res {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
-        }
+        Ok(body) => body,
         Err(e) => {
-            tracing::error!("Serialization task panicked: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                headers,
-                "Serialization failed".to_string(),
-            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
         }
     };
 
@@ -264,6 +273,7 @@ pub async fn to_http_response(
         &mut headers,
         cache_status,
         request_context.client_supplied_cache_key().is_some(),
+        &request_context,
     );
 
     (StatusCode::OK, headers, body)
@@ -273,6 +283,7 @@ fn attach_cache_headers(
     headers: &mut HeaderMap,
     results_cache_status: CacheStatus,
     user_key_specified: bool,
+    request_context: &RequestContext,
 ) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
@@ -289,12 +300,41 @@ fn attach_cache_headers(
     if user_key_specified {
         headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
     }
+
+    // Add Cache-Control response header with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = request_context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The Results-Cache-Status header will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
+                headers.insert(CACHE_CONTROL, header_value);
+            }
+        }
+    }
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }

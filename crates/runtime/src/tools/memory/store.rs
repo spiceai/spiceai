@@ -43,7 +43,7 @@ impl From<StoreMemoryParams> for Vec<MemoryTableElement> {
             .iter()
             .map(|thought| MemoryTableElement {
                 id: uuid::Uuid::now_v7(),
-                value: thought.to_string(),
+                value: thought.clone(),
                 created_by: None,
                 created_at: chrono::Utc::now().timestamp(),
             })

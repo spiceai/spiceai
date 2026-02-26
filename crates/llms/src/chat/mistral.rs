@@ -20,25 +20,28 @@ use crate::streaming_utils::create_stream_response_with_timestamp;
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
         ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role, Stop,
+        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
+use mistralrs::core::{
+    AdapterPaths, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
+    ModelPaths, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Pipeline,
+    RequestMessage, TokenSource,
+};
 use mistralrs::{
-    AdapterPaths, AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse,
-    ChunkChoice, Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder,
-    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
-    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
-    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
-    TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
+    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
+    ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
+    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, SecretString};
@@ -64,8 +67,10 @@ pub struct MistralLlama {
 fn to_openai_response(
     resp: &ChatCompletionResponse,
 ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-    let resp_str = serde_json::to_string(resp)?;
-    serde_json::from_str(&resp_str).map_err(OpenAIError::from)
+    let resp_str = serde_json::to_string(resp)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to serialize response: {e}")))?;
+    serde_json::from_str(&resp_str)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to deserialize response: {e}")))
 }
 
 impl MistralLlama {
@@ -155,12 +160,12 @@ impl MistralLlama {
         generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
-            tokenizer.map(Into::into).unwrap_or_default(),
-            config.map(Into::into).unwrap_or_default(),
-            tokenizer_config.map(Into::into),
-            model_weights.iter().map(Into::into).collect(),
+            tokenizer.map(PathBuf::from).unwrap_or_default(),
+            config.map(PathBuf::from).unwrap_or_default(),
+            tokenizer_config.map(PathBuf::from).unwrap_or_default(),
+            model_weights.to_vec(),
             AdapterPaths::None,
-            generation_config.map(Into::into),
+            generation_config.map(PathBuf::from),
             None,
             None,
             None,
@@ -175,7 +180,7 @@ impl MistralLlama {
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig::default(),
+            NormalSpecificConfig::default(),
             chat_template_literal.map(ToString::to_string),
             None,
             model_parts.first().map(ToString::to_string),
@@ -327,13 +332,13 @@ impl MistralLlama {
             // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
             let loader_type = arch
                 .map(|a| {
-                    mistralrs::NormalLoaderType::from_str(a)
+                    NormalLoaderType::from_str(a)
                         .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
                 })
                 .transpose()?;
 
             let builder = NormalLoaderBuilder::new(
-                mistralrs::NormalSpecificConfig::default(),
+                NormalSpecificConfig::default(),
                 None,
                 None,
                 Some(model_parts[0].to_string()),
@@ -368,7 +373,7 @@ impl MistralLlama {
         Ok(Self::from_pipeline(pipeline).await)
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
         Self {
             pipeline: MistralRsBuilder::new(
@@ -412,11 +417,11 @@ impl MistralLlama {
             logits_processors: None,
             return_raw_logits: false,
             model_id: None, // Not actually needed.
+            truncate_sequence: false,
         }))
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
-    #[allow(clippy::cast_possible_truncation)]
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
@@ -428,6 +433,7 @@ impl MistralLlama {
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
             enable_thinking: None,
+            reasoning_effort: None,
         };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
@@ -441,9 +447,10 @@ impl MistralLlama {
             top_n_logprobs: req.top_logprobs.unwrap_or_default().into(),
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
+            repetition_penalty: None,
             stop_toks: req.stop.map(|s| match s {
-                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
-                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
+                StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
+                StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
             max_len: req.max_completion_tokens.map(|x| x as usize),
             logits_bias: None,
@@ -677,6 +684,14 @@ fn stream_from_response(
                 },
                 MistralResponse::Raw{..} => {
                     unreachable!("We set `return_raw_logits: false`")
+                },
+                MistralResponse::Embeddings{..} => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Embeddings response is not supported in chat".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
                 }
              }
         }
@@ -684,7 +699,7 @@ fn stream_from_response(
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
-#[allow(clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_to_openai_stream(
     c: ChatCompletionChunkResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -711,11 +726,7 @@ fn chunk_to_openai_stream(
     Ok(response)
 }
 
-#[allow(
-    deprecated,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
     let ChunkChoice {
         index,
@@ -724,13 +735,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         ..
     } = choice;
     let role: Role = serde_json::from_str(&format!("\"{}\"", delta.role))
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse role: {e}")))?;
 
     let finish_reason: Option<FinishReason> = finish_reason
         .as_ref()
         .map(|f| serde_json::from_str(&format!("\"{f}\"")))
         .transpose()
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse finish_reason: {e}")))?;
 
     Ok(ChatChoiceStream {
         index: *index as u32,
@@ -752,12 +763,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
     match x {
-        ChatCompletionToolChoiceOption::None => ToolChoice::None,
-        ChatCompletionToolChoiceOption::Auto => ToolChoice::Auto,
-        ChatCompletionToolChoiceOption::Required => {
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
             unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
         }
-        ChatCompletionToolChoiceOption::Named(t) => ToolChoice::Tool(convert_named_tool(t)),
+        ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
+        // None, AllowedTools, or Custom not supported
+        _ => ToolChoice::None,
     }
 }
 
@@ -774,17 +786,27 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
     }
 }
 
-fn convert_tool(x: &ChatCompletionTool) -> Tool {
-    Tool {
-        tp: ToolType::Function,
-        function: Function {
-            description: x.function.description.clone(),
-            name: x.function.name.clone(),
-            parameters: x
-                .function
-                .parameters
-                .clone()
-                .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+fn convert_tool(x: &ChatCompletionTools) -> Tool {
+    match x {
+        ChatCompletionTools::Function(tool) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: tool.function.description.clone(),
+                name: tool.function.name.clone(),
+                parameters: tool
+                    .function
+                    .parameters
+                    .clone()
+                    .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+            },
+        },
+        ChatCompletionTools::Custom(_) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: None,
+                name: String::new(),
+                parameters: None,
+            },
         },
     }
 }
@@ -796,7 +818,7 @@ fn parse_tool_call_response(
     ChatCompletionMessageToolCallChunk {
         id: Some(r.id.clone()),
         index,
-        r#type: Some(ChatCompletionToolType::Function),
+        r#type: Some(FunctionType::Function),
         function: Some(FunctionCallStream {
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),

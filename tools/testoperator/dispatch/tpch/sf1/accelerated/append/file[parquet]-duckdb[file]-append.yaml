@@ -1,0 +1,5 @@
+tests:
+  append:
+    spicepod_path: accelerated/append/file[parquet]-duckdb[file]-append.yaml
+    query_set: tpch
+    query_overrides: duckdb

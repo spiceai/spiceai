@@ -36,6 +36,15 @@ pub enum Error {
         actual: String,
     },
 
+    #[snafu(display(
+        "Query returned an unexpected field name at position {position}: expected '{expected}', received '{actual}'"
+    ))]
+    SchemaMismatchFieldName {
+        position: usize,
+        expected: String,
+        actual: String,
+    },
+
     #[snafu(display("Failed to get field data type"))]
     UnableToGetFieldDataType {},
 }
@@ -63,6 +72,16 @@ pub fn verify_schema(
     for idx in 0..expected.len() {
         let a = expected.get(idx).context(UnableToGetFieldDataTypeSnafu)?;
         let b = actual.get(idx).context(UnableToGetFieldDataTypeSnafu)?;
+
+        // Verify field names match
+        if a.name() != b.name() {
+            return SchemaMismatchFieldNameSnafu {
+                position: idx,
+                expected: a.name(),
+                actual: b.name(),
+            }
+            .fail();
+        }
 
         let a_data_type = a.data_type();
         let b_data_type = b.data_type();

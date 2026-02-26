@@ -13,8 +13,8 @@ async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 itertools.workspace = true
+snafu.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-

@@ -58,11 +58,11 @@ impl TryFrom<&GuardRail> for GuardrailStreamConfiguration {
 
     fn try_from(value: &GuardRail) -> Result<Self, Self::Error> {
         let GuardRail { trace, id, version } = value;
-        GuardrailStreamConfigurationBuilder::default()
+        Ok(GuardrailStreamConfigurationBuilder::default()
             .guardrail_identifier(id)
             .trace(trace.clone())
             .guardrail_version(version.to_string())
-            .build()
+            .build())
     }
 }
 
@@ -71,11 +71,11 @@ impl TryFrom<&GuardRail> for GuardrailConfiguration {
 
     fn try_from(value: &GuardRail) -> Result<Self, Self::Error> {
         let GuardRail { trace, id, version } = value;
-        GuardrailConfigurationBuilder::default()
+        Ok(GuardrailConfigurationBuilder::default()
             .guardrail_identifier(id)
             .trace(trace.clone())
             .guardrail_version(version.to_string())
-            .build()
+            .build())
     }
 }
 

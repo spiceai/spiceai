@@ -55,11 +55,15 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_source_path")
         .description("Specify a path to use for schema inference."),
     ParameterSpec::runtime("json_format")
-        .description("jsonl | array. Defaults to jsonl.")
-        .one_of(&["jsonl", "array"]),
+        .description("jsonl | ndjson | ldjson | array. Defaults to jsonl.")
+        .one_of(&["jsonl", "ndjson", "ldjson", "array"]),
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
         .is_boolean(),
+    ParameterSpec::runtime("refresh_skip")
+        .description("Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.")
+        .default("enabled")
+        .one_of(&["enabled", "disabled"]),
 ];
 
 pub enum DelimitedFormat {

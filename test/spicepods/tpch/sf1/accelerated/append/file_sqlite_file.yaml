@@ -10,7 +10,7 @@ datasets:
       engine: sqlite
       mode: file
       refresh_mode: append
-      refresh_check_interval: 3m 
+      refresh_check_interval: 30s
   - from: file:lineitem.parquet
     name: lineitem
     time_column: l_created_at

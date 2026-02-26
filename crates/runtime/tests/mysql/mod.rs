@@ -24,7 +24,7 @@ use spicepod::param::ParamValue;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::{runtime_ready_check, test_request_context};
+use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 
 pub mod common;
 
@@ -40,7 +40,6 @@ const MYSQL_PORT1: u16 = 13316;
 const MYSQL_PORT2: u16 = 13317;
 const MYSQL_PORT3: u16 = 13318;
 
-#[allow(clippy::too_many_lines)]
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
     let pool = get_mysql_conn(port)?;
@@ -222,6 +221,7 @@ CREATE TABLE test_utf8mb4 (
 async fn mysql_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -308,6 +308,7 @@ async fn mysql_integration_test() -> Result<(), String> {
 async fn mysql_character_set_results_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -397,6 +398,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
 #[tokio::test]
 async fn mysql_timezone_test() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

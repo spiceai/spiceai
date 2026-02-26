@@ -29,19 +29,21 @@ use crate::{
 use app::AppBuilder;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
-use async_openai::types::responses::{
-    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
-};
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
-    responses::{Content, Response as OpenAIResponse},
+    CreateChatCompletionRequestArgs,
 };
+use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::responses::{
+    CreateResponseArgs, FunctionTool, OutputItem, OutputMessage, OutputMessageContent,
+    ResponseStreamEvent, Status, Tool as ToolDefinition,
+};
+use async_openai::types::responses::{OutputTextContent, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::Value;
@@ -52,12 +54,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[allow(clippy::expect_used)]
 mod nsql {
-
-    use crate::models::nsql::{TestCase, run_nsql_test};
-
     use super::*;
+    use crate::models::nsql::{TestCase, run_nsql_test};
 
     #[tokio::test]
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
@@ -149,7 +148,6 @@ mod nsql {
     }
 }
 
-#[allow(clippy::expect_used)]
 mod search {
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
@@ -293,7 +291,6 @@ mod search {
     }
 }
 
-#[allow(clippy::expect_used)]
 mod embeddings {
     use spicepod::component::caching::CacheConfig;
     use std::time::{Duration, Instant};
@@ -474,6 +471,121 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+async fn openai_test_chat_completion_gpt5_mini() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context().scope(async {
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mut model_with_tools = get_openai_model("gpt-5-mini", "openai_model");
+        model_with_tools
+            .params
+            .insert("tools".to_string(), "auto".into());
+
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(model_with_tools)
+            .build();
+
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        let response = send_chat_completions_request(
+            http_base_url.as_str(),
+            vec![
+                ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+                ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
+            ],
+            "openai_model",
+            false,
+        ).await?;
+
+        insta::assert_snapshot!(
+            "chat_completion_gpt5_mini",
+            normalize_chat_completion_response(response, false)
+        );
+
+        Ok(())
+    }).await
+}
+
+#[tokio::test]
+async fn openai_test_chat_completion_gpt5_mini_with_endpoint() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context().scope(async {
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mut model_with_tools = get_openai_model("gpt-5-mini", "openai_model");
+        model_with_tools
+            .params
+            .insert("tools".to_string(), "auto".into());
+        model_with_tools
+            .params
+            .insert("endpoint".to_string(), "https://api.openai.com/v1".into());
+
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(model_with_tools)
+            .build();
+
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        let response = send_chat_completions_request(
+            http_base_url.as_str(),
+            vec![
+                ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+                ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
+            ],
+            "openai_model",
+            false,
+        ).await?;
+
+        insta::assert_snapshot!(
+            "chat_completion_gpt5_mini_with_endpoint",
+            normalize_chat_completion_response(response, false)
+        );
+
+        Ok(())
+    }).await
+}
+
+#[tokio::test]
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -529,20 +641,18 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 }
 
 fn extract_text(response: &OpenAIResponse) -> Option<String> {
-    response
-        .output
-        .first()
-        .and_then(|out| {
-            if let OutputContent::Message(msg) = out {
-                msg.content.first()
-            } else {
-                None
+    response.output.first().and_then(|out| {
+        if let OutputItem::Message(OutputMessage { content, .. }) = out {
+            match content.first() {
+                Some(OutputMessageContent::OutputText(OutputTextContent { text, .. })) => {
+                    Some(text.clone())
+                }
+                _ => None,
             }
-        })
-        .and_then(|content| match content {
-            Content::OutputText(output_text) => Some(output_text.text.clone()),
-            Content::Refusal(_) => None,
-        })
+        } else {
+            None
+        }
+    })
 }
 
 #[tokio::test]
@@ -653,14 +763,15 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(response_event) => match &response_event {
-                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                             final_response += &delta.delta;
                             delta_count += 1;
                         }
-                        ResponseEvent::ResponseCompleted(_) => {
+                        ResponseStreamEvent::ResponseCompleted(_) => {
                             break;
                         }
-                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => {
                             failure = true;
                             break;
                         }
@@ -749,14 +860,15 @@ async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(response_event) => match &response_event {
-                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                             final_response += &delta.delta;
                             delta_count += 1;
                         }
-                        ResponseEvent::ResponseCompleted(_) => {
+                        ResponseStreamEvent::ResponseCompleted(_) => {
                             break;
                         }
-                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => {
                             failure = true;
                             break;
                         }
@@ -923,10 +1035,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
             )
             .await;
 
-            let mut desired_tools = tools
-                .iter()
-                .map(|t| t.name().clone())
-                .collect::<HashSet<_>>();
+            let mut desired_tools = tools.iter().map(|t| t.name()).collect::<HashSet<_>>();
             desired_tools.insert(std::borrow::Cow::Borrowed("web_search"));
             desired_tools.insert(std::borrow::Cow::Borrowed("code_interpreter"));
 
@@ -953,7 +1062,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                     ToolDefinition::WebSearchPreview(_) => {
                         assert!(desired_tools.remove("web_search"));
                     }
-                    ToolDefinition::Function(Function { name, .. }) => {
+                    ToolDefinition::Function(FunctionTool { name, .. }) => {
                         assert!(desired_tools.remove(name.as_str()));
                     }
                     _ => {}
@@ -971,10 +1080,10 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
+    trace_provider: &SdkTracerProvider,
 ) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
@@ -1045,7 +1154,7 @@ async fn verify_sql_query_chat_completion(
 }
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;

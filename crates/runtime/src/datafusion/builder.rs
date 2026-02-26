@@ -24,8 +24,8 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
-#[cfg(feature = "cluster")]
-use crate::config::ClusterConfig;
+use crate::cluster::ResolvedClusterConfig;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
@@ -47,8 +47,19 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+
 #[cfg(feature = "duckdb")]
-use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
+use {
+    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
+    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
+    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
+    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
+};
+
+#[cfg(feature = "duckdb")]
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "duckdb")]
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -58,6 +69,7 @@ use datafusion_optimizer_rules::{
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
+    url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
@@ -80,7 +92,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+    df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
         .execution
@@ -111,10 +123,14 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
-    #[cfg(feature = "cluster")]
-    cluster_config: Arc<ClusterConfig>,
+    cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    url_tables_enabled: bool,
+    /// Arbitrary additional analyzer rules.
+    additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -153,10 +169,13 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
-            #[cfg(feature = "cluster")]
-            cluster_config: Arc::new(ClusterConfig::default()),
+            cluster_config: None,
             metrics: None,
             io_runtime,
+            resource_monitor: None,
+            url_tables_enabled: false,
+            additional_analyzer_rules: vec![],
+            executor_registry: None,
         }
     }
 
@@ -172,10 +191,9 @@ impl DataFusionBuilder {
         self
     }
 
-    #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
-        self.cluster_config = config;
+    pub fn with_cluster_config(mut self, config: ResolvedClusterConfig) -> Self {
+        self.cluster_config = Some(Arc::new(config));
         self
     }
 
@@ -218,13 +236,52 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    /// Enable URL-based table resolution (e.g., `SELECT * FROM 's3://bucket/data.parquet'`).
+    ///
+    /// When enabled, queries can directly reference object store URLs as table names.
+    /// This feature is opt-in and disabled by default.
+    ///
+    /// Enable via spicepod.yml:
+    /// ```yaml
+    /// runtime:
+    ///   params:
+    ///     url_tables: enabled
+    /// ```
+    #[must_use]
+    pub fn with_url_tables(mut self, enabled: bool) -> Self {
+        self.url_tables_enabled = enabled;
+        self
+    }
+
+    /// Adds additional analyzer rules to the `DataFusion` instance.
+    #[must_use]
+    pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
+        self.additional_analyzer_rules = rules;
+        self
+    }
+
+    /// Sets the executor registry for distributed write forwarding (scheduler mode only).
+    #[must_use]
+    pub fn with_executor_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+        self.executor_registry = Some(registry);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -232,29 +289,54 @@ impl DataFusionBuilder {
             config = config.with_spill_compression(spill_compression);
         }
 
+        let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
+
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
+                    Arc::clone(&datafusion_ref),
+                    self.executor_registry.clone(),
+                )),
             ))
             .with_runtime_env(runtime_env(
                 self.memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
             ))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        for rule in self.additional_analyzer_rules {
+            state = state.with_analyzer_rule(rule);
+        }
 
         #[cfg(feature = "duckdb")]
         {
-            state = state.with_physical_optimizer_rule(
+            let mut physical_optimizers_with_duckdb: Vec<
+                Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+            > = vec![
+                DuckDBAggregatePushdownRewriter::new(),
                 DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            ];
+
+            physical_optimizers_with_duckdb.extend(
+                state
+                    .physical_optimizer_rules()
+                    .clone()
+                    .unwrap_or_else(|| PhysicalOptimizer::new().rules),
             );
+
+            state = state
+                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
+                .with_physical_optimizer_rules(physical_optimizers_with_duckdb);
         }
+
+        state = state
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                Arc::new(Box::new(track_bytes_processed)),
+            )));
 
         let mut state = state.build();
 
@@ -322,13 +404,55 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
+        // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
+        // This is opt-in via `runtime.params.url_tables=enabled`
+        if self.url_tables_enabled {
+            let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
+            let current_catalog_list = Arc::clone(ctx.state().catalog_list());
+            let dynamic_catalog_list = Arc::new(DynamicUrlCatalogList::new(
+                current_catalog_list,
+                Arc::clone(&url_table_factory),
+            ));
+            ctx.register_catalog_list(dynamic_catalog_list);
+
+            // Register the session state with the factory so it can infer schemas
+            url_table_factory.with_state(ctx.state_weak_ref());
+        }
+
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
+
+        let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
+        let ddl_options_store = super::iceberg_ddl::acceleration_options::new_shared_store();
+
+        // Add the Iceberg DDL analyzer rule after context creation so it can
+        // reference the catalog list and DDL-enabled catalogs.
+        // Uses Weak references to avoid reference cycles (SessionContext owns
+        // the analyzer rules, so Arc refs back would create a cycle).
+        ctx.add_analyzer_rule(Arc::new(
+            super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_options_store),
+            ),
+        ));
+
+        // Add the Cayenne DDL analyzer rule.
+        #[cfg(not(windows))]
+        ctx.add_analyzer_rule(Arc::new(
+            super::cayenne_ddl::analyzer_rule::CayenneDdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+            ),
+        ));
 
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             writable_catalogs: RwLock::new(HashSet::new()),
+            ddl_enabled_catalogs,
+            ddl_options_store,
+            datafusion_ref,
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
@@ -339,14 +463,15 @@ impl DataFusionBuilder {
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            refresh_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
-            #[cfg(feature = "cluster")]
-            cluster_config: self.cluster_config,
-            #[cfg(feature = "cluster")]
+            resource_monitor: self.resource_monitor,
+            cluster_config: self.cluster_config.unwrap_or_default(),
             scheduler_server: RwLock::new(None),
-            #[cfg(feature = "cluster")]
             executor: RwLock::new(None),
+            executor_stream_registry: RwLock::new(None),
+            executor_registry: self.executor_registry,
         }
     }
 }
@@ -419,7 +544,27 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
+    // If no memory limit is specified, default to 70% of total memory (container-aware)
+    let effective_memory_limit = memory_limit.or_else(|| {
+        let total_memory = crate::resource_monitor::get_total_memory();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let default_limit = (total_memory as f64 * 0.70) as u64;
+
+        tracing::debug!(
+            "No memory limit specified, defaulting to 70% of total memory: {}",
+            {
+                #[expect(clippy::cast_possible_truncation)]
+                util::human_readable_bytes(default_limit as usize)
+            }
+        );
+        Some(default_limit)
+    });
+
+    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
         let limit = if let Ok(limit) = limit.try_into() {
             limit
         } else {
@@ -460,11 +605,19 @@ pub(crate) fn runtime_env(
     }
 }
 
-pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+pub(crate) fn default_extension_planners(
+    datafusion_ref: super::iceberg_ddl::SharedDataFusionRef,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
+        #[cfg(not(windows))]
+        Arc::new(super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(executor_registry)),
+        #[cfg(feature = "duckdb")]
+        DuckDBLogicalExtensionPlanner::new(),
     ]
 }
 

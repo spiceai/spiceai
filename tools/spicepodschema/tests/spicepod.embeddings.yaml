@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+# =============================================================================
+# EMBEDDINGS - Test coverage for embedding model sources
+# =============================================================================
+version: v1
+kind: Spicepod
+name: schema-test-embeddings
+
+embeddings:
+  # ---------------------------------------------------------------------------
+  # OpenAI Embeddings
+  # ---------------------------------------------------------------------------
+  - name: openai_embeddings
+    from: openai:text-embedding-3-small
+    params:
+      openai_api_key: sk-test
+
+  - name: openai_embeddings_large
+    from: openai:text-embedding-3-large
+    params:
+      openai_api_key: sk-test
+
+  # ---------------------------------------------------------------------------
+  # Azure OpenAI Embeddings
+  # Runtime params: endpoint, azure_api_version, azure_deployment_name
+  # ---------------------------------------------------------------------------
+  - name: azure_embeddings
+    from: azure:text-embedding-ada-002
+    params:
+      azure_api_key: azure-key
+      azure_api_version: "2024-02-15-preview"
+      azure_deployment_name: ada-embedding
+      endpoint: https://myresource.openai.azure.com
+
+  # ---------------------------------------------------------------------------
+  # Huggingface Embeddings
+  # ---------------------------------------------------------------------------
+  - name: hf_embeddings
+    from: huggingface:sentence-transformers/all-MiniLM-L6-v2
+    params:
+      huggingface_token: hf_xxx
+
+  # ---------------------------------------------------------------------------
+  # File-based Embeddings
+  # ---------------------------------------------------------------------------
+  - name: local_embeddings
+    from: file:models/my_embeddings.gguf

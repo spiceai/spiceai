@@ -41,12 +41,12 @@ use crate::{
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
 };
-use retry_client::S3VectorRetryClientBuilder;
 use runtime_secrets::{Secrets, get_params_with_secrets};
 mod client;
 mod metrics;
-use client::S3VectorClient;
+use client::S3VectorsTelemetryMiddleware;
 mod retry_client;
+use retry_client::S3VectorsRetryMiddlewareBuilder;
 
 const DEFAULT_BATCH_WRITE_ROWS: usize = 100_000;
 
@@ -85,10 +85,12 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query."),
     ParameterSpec::component("batch_write_rows")
         .description("The number of rows to chunk record batches into for individual processing. Used to control memory usage during writes."),
+    ParameterSpec::component("spill_writes")
+        .description("If true, during periods where write throughput exceeds S3 vector rate limits, create and spill to an separate physical index. At query time, the spill index will also be queried. Incompatible with vector partitioning."),
 ];
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn try_from_table(
     ds_name: &TableReference,
     column: String,
@@ -127,7 +129,18 @@ pub async fn try_from_table(
             },
         })
         .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
-
+    let spill_writes = string_from_params(&params, "spill_writes")
+        .and_then(|s| match s.parse::<bool>() {
+            Ok(val) if partition_by.is_empty() => Some(val),
+            Ok(_) => {
+                tracing::warn!("Spill writes are not supported with partitioned S3 vector indexes. Ignoring 's3_vectors_spill_writes' setting.");
+                None
+            },
+            Err(e) => {
+                tracing::warn!("Invalid value for 's3_vectors_spill_writes': {s}. Error: {e}. Defaulting to false.");
+                None
+            },
+        });
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
@@ -147,7 +160,7 @@ pub async fn try_from_table(
         )));
     };
 
-    Ok(S3Vector::new(
+    let mut s3_vec = S3Vector::new(
         table,
         column.clone(),
         primary_key,
@@ -155,10 +168,16 @@ pub async fn try_from_table(
         Arc::clone(model),
         partition_by,
         batch_write_rows,
-    ))
+    );
+
+    if spill_writes == Some(true) {
+        s3_vec = s3_vec.enable_spill_writes();
+    }
+
+    Ok(s3_vec)
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 async fn embedding_vector_size(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
@@ -171,7 +190,7 @@ async fn embedding_vector_size(
 // Attempt to construct a S3 vector table from user-provided parameters.
 //
 // If no index name provided (either explicitly, or in ARN), use `default_s3_index_name`.
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 async fn try_vector_table(
     columns: MetadataColumns,
     params: Parameters,
@@ -239,11 +258,14 @@ async fn try_vector_table(
 
     let config = config_bldr.load().await;
 
-    let s3_vector_client = S3VectorClient::new(Arc::new(Client::new(&config)), index_poll_interval);
-
-    let s3_vector_client =
-        Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())
-            as Arc<dyn S3Vectors + Send + Sync>;
+    // Build S3Vectors middleware: retry(metrics_cache(base_client))
+    let base_client = Arc::new(Client::new(&config));
+    let with_metrics_cache = Arc::new(S3VectorsTelemetryMiddleware::new(
+        base_client,
+        index_poll_interval,
+    ));
+    let s3_vector_client: Arc<dyn S3Vectors + Send + Sync> =
+        Arc::new(S3VectorsRetryMiddlewareBuilder::new(with_metrics_cache).build());
 
     let Some(dimension) = embedding_vector_size(embedding_models, model_name).await else {
         return Err(Box::from(

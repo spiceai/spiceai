@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::key::PassthroughHashBuilder;
 use crate::{
     AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, Result,
     TabledCacheProvider,
@@ -31,16 +32,20 @@ use std::time::Duration;
 // 'static is required by a bound from moka::Cache
 pub struct SimpleCache<
     V: Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, T>,
+    cache: Cache<u64, V, PassthroughHashBuilder<T>>,
     hasher: T,
     max_size: u64,
     ttl: Duration,
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> Display
-    for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> Display for SimpleCache<V, T, H>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -52,8 +57,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    std::fmt::Debug for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> std::fmt::Debug for SimpleCache<V, T, H>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimpleCache")
@@ -63,15 +71,18 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> SimpleCache<V, T, H>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
-        let cache: Cache<u64, V, T> = Cache::builder()
+        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
-            .build_with_hasher(hasher.clone());
+            .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()));
 
         SimpleCache {
             cache,
@@ -82,16 +93,22 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    SimpleCache<V, T>
+impl<
+    V: AsTableRefs + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> SimpleCache<V, T, H>
 {
     pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
         self
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> HashProvider
-    for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> HashProvider for SimpleCache<V, T, H>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
         Box::new(self.hasher.build_hasher())
@@ -99,8 +116,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 }
 
 #[async_trait]
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    CacheProvider<V> for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> CacheProvider<V> for SimpleCache<V, T, H>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
         self.cache.get(key).await
@@ -110,15 +130,18 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
         self.cache.insert(*key, value).await;
     }
 
-    fn invalidate_all(&self) {
+    async fn invalidate_all(&self) {
         self.cache.invalidate_all();
+        self.cache.run_pending_tasks().await;
     }
 
-    fn size_bytes(&self) -> u64 {
+    async fn size_bytes(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
         self.cache.weighted_size()
     }
 
-    fn item_count(&self) -> u64 {
+    async fn item_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
         self.cache.entry_count()
     }
 
@@ -132,8 +155,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 }
 
 #[async_trait]
-impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    TabledCacheProvider<V> for SimpleCache<V, T>
+impl<
+    V: AsTableRefs + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> TabledCacheProvider<V> for SimpleCache<V, T, H>
 {
     fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = match &table_ref {
@@ -172,31 +198,40 @@ mod tests {
             .expect("Failed to create record batch")
     }
 
-    fn create_test_cached_result() -> CachedQueryResult {
+    async fn create_test_cached_result() -> CachedQueryResult {
         let record_batch = create_test_record_batch();
         let mut input_tables = HashSet::new();
         input_tables.insert(TableReference::Bare {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult {
-            records: Arc::new(vec![record_batch.clone()]),
-            schema: Arc::new(record_batch.schema().as_ref().to_owned()),
-            input_tables: Arc::new(input_tables),
-        }
+        let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
+
+        CachedQueryResult::from_batches(
+            &[record_batch],
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            Arc::new(input_tables),
+            std::time::Instant::now(),
+            encoder,
+        )
+        .await
+        .expect("Failed to create cached result")
     }
 
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_put_and_get<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
         #[case] hasher: T,
     ) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key.as_u64(), result.clone()).await;
@@ -205,37 +240,49 @@ mod tests {
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_some());
-        assert_eq!(
-            retrieved.expect("Failed to get from cache").records.len(),
-            result.records.len()
-        );
+        let retrieved = retrieved.expect("cache should contain the key");
+        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
+        let result_len = result.records().await.expect("Failed to decode").len();
+        (retrieved_len == result_len)
+            .then_some(())
+            .expect("retrieved and result should have same length");
     }
 
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+    async fn test_cache_miss<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
+        #[case] hasher: T,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain nonexistent key");
     }
 
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_invalidate_all<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_invalidate_all<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
         #[case] hasher: T,
     ) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         let get_key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
@@ -244,38 +291,55 @@ mod tests {
 
         // Verify the value is in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_some());
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before invalidation");
 
         // Invalidate the cache for the table
-        cache.invalidate_all();
+        cache.invalidate_all().await;
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after invalidation");
     }
 
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+    async fn test_cache_ttl<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
+        #[case] hasher: T,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;
 
         // Verify the value is in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
-        assert!(retrieved.is_some());
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before TTL expiry");
 
         // Wait for the TTL to expire
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after TTL expiry");
     }
 }

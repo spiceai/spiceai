@@ -38,53 +38,45 @@ concurrency:
 
 env:
   CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
-  # a sucess when skipped).
+  # a success when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     outputs:
-      relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          fetch-depth: 0
+          # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
-      - name: Detect all code changes
-        id: changed-code-files
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            code_changes:
-              - 'crates/**'
-              - 'bin/**'
-              - 'test/**'
-              - 'tools/**'
-              - 'install/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'go.mod'
-              - 'go.sum'
-
-      - name: Check for relevant changes
-        id: check_changes
-        run: |
-          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
 
   build:
     name: Build Test Binary
     needs: check_changes
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
 
       # Cache Cargo dependencies
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: |
             ~/.cargo/registry/index/
@@ -97,8 +89,6 @@ jobs:
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -108,41 +98,33 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      - name: Check if sccache can be set up
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up sccache
-        if: ${{ env.SCCACHE_SETUP == 'true' && needs.check_changes.outputs.relevant_changes == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
 
-      - name: Install Nextest
+      - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binaries without running tests
       - name: Build integration test archives
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
         run: |
           set -euo pipefail
 
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb,oracle,kafka,mongodb,iceberg-write,snapshots"
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -159,7 +141,7 @@ jobs:
       # Upload the test archive as an artifact
       - name: Upload test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
@@ -167,7 +149,7 @@ jobs:
 
       - name: Upload AWS SDK test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
@@ -175,7 +157,7 @@ jobs:
 
       - name: Upload AWS SDK credential bridge test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
@@ -183,7 +165,7 @@ jobs:
 
       - name: Upload partition table test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
@@ -191,7 +173,7 @@ jobs:
 
       - name: Upload data components test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
@@ -202,7 +184,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     strategy:
       fail-fast: false
       matrix:
@@ -214,7 +196,7 @@ jobs:
           - label: 3
             partition: 'count:3/3'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -222,35 +204,26 @@ jobs:
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
-          mkdir linux
-          unzip basic.zip -d linux -x "META-INF/*"
-          IC_DIR=$PWD/$(ls -d linux/instantclient*)
-          ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 $IC_DIR/libaio.so.1
-          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
+        uses: ./.github/actions/setup-oracle-odpi
 
       # Download the test archive artifact
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-test-archive
           path: ./integration_test
 
-      - name: Install Nextest
+      - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: spiceaitestimages.azurecr.io
           username: spiceai-repo-pull
@@ -270,7 +243,7 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
@@ -287,6 +260,10 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # MinIO/S3-compatible storage for TPC-DS and other S3 tests
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           # old dbc instance
           TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -339,7 +316,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
@@ -355,14 +332,14 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 1
 
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -400,27 +377,24 @@ jobs:
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 1
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download AWS SDK test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -443,27 +417,24 @@ jobs:
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 1
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download AWS SDK credential bridge test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -490,24 +461,21 @@ jobs:
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 1
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download data components test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-data-components-test-archive
           path: ./data_components_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Run data components integration test
         env:
@@ -521,29 +489,25 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 1
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download partition table test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -555,5 +519,19 @@ jobs:
         run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Run partition table integration test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
+
+      - name: Configure Git
+        if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git config --global user.name 'Spice Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

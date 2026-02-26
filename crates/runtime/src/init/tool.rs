@@ -29,10 +29,8 @@ use spicepod::component::tool::Tool;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
-    #[allow(clippy::implicit_hasher)]
     pub(crate) async fn load_tools(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
+        if let Some(app) = self.read_app().await {
             for tool in &app.tools {
                 tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
                 Arc::clone(&self).load_tool(tool).await;
@@ -65,7 +63,7 @@ impl Runtime {
         let mut tools_map = self.tools.write().await;
 
         tools_map.insert(name.clone(), Arc::clone(t).into());
-        tracing::debug!("Tool catalog {} ready to use", name.clone());
+        tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
             .update_tool_catalog(&name, status::ComponentStatus::Ready);
@@ -76,7 +74,7 @@ impl Runtime {
         let mut tools_map = self.tools.write().await;
 
         tools_map.insert(name.clone(), t);
-        tracing::debug!("Tool {} ready to use", name.clone());
+        tracing::trace!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status
             .update_tool(&name, status::ComponentStatus::Ready);
@@ -112,8 +110,10 @@ impl Runtime {
                 }
                 Err(e) => {
                     metrics::tools::LOAD_ERROR.add(1, &[]);
-                    self.status
-                        .update_tool(&tool.name, status::ComponentStatus::Error);
+                    self.status.update_tool(
+                        &tool.name,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                     tracing::warn!(
                         "Unable to load tool '{}' from spicepod. Error: {}",
                         tool.name,

@@ -15,13 +15,17 @@ limitations under the License.
 */
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
+use chrono::{DateTime, FixedOffset};
 use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use std::collections::HashMap;
+use std::str::FromStr;
+use util::time_format::format_datetime;
 
 pub fn scalar_to_attribute_value(
     scalar: &ScalarValue,
+    time_format: &str,
 ) -> datafusion::error::Result<AttributeValue> {
     match scalar {
         ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
@@ -30,6 +34,33 @@ pub fn scalar_to_attribute_value(
         ScalarValue::Float64(Some(f)) => Ok(AttributeValue::N(f.to_string())),
         ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
         ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
+        ScalarValue::TimestampMillisecond(Some(timestamp_in_millis), tz_opt) => {
+            let Some(dt_utc) = DateTime::from_timestamp_millis(*timestamp_in_millis) else {
+                return Err(DataFusionError::Internal(format!(
+                    "Failed to convert timestamp in millis to DateTime: {timestamp_in_millis}"
+                )));
+            };
+
+            let dt: DateTime<FixedOffset> = match tz_opt {
+                Some(tz_str) => {
+                    let tz = FixedOffset::from_str(tz_str).map_err(|e| {
+                        DataFusionError::Internal(format!(
+                            "Failed to parse TimeZone \"{tz_str}\": {e}"
+                        ))
+                    })?;
+                    dt_utc.with_timezone(&tz)
+                }
+                None => dt_utc.fixed_offset(),
+            };
+
+            let Some(formatted) = format_datetime(dt, time_format) else {
+                return Err(DataFusionError::Internal(format!(
+                    "Failed to parse timestamp. Verify format is valid: \"{time_format}\""
+                )));
+            };
+
+            Ok(AttributeValue::S(formatted))
+        }
         ScalarValue::Null => Ok(AttributeValue::Null(true)),
         _ => Err(DataFusionError::NotImplemented(
             "ScalarValue type not supported".to_string(),
@@ -94,7 +125,7 @@ impl<'n> TreeNodeVisitor<'n> for FilterStringVisitor<'_> {
                 let value_key = format!(":v{}", self.value_counter);
                 *self.value_counter += 1;
 
-                match scalar_to_attribute_value(scalar) {
+                match scalar_to_attribute_value(scalar, &self.schema.time_format()) {
                     Ok(attr_value) => {
                         self.attribute_values.insert(value_key.clone(), attr_value);
                         self.result_stack.push(value_key);

@@ -70,14 +70,91 @@ impl ManagedTokioRuntime {
     ///
     /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
     pub fn try_new() -> Result<Self> {
+        Self::builder().build()
+    }
+
+    /// Create a builder for configuring the runtime.
+    #[must_use]
+    pub fn builder() -> ManagedTokioRuntimeBuilder {
+        ManagedTokioRuntimeBuilder::new()
+    }
+
+    /// Return a handle suitable for spawning tasks
+    #[must_use]
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+}
+
+/// Builder for [`ManagedTokioRuntime`] with configuration options.
+pub struct ManagedTokioRuntimeBuilder {
+    low_priority: bool,
+    thread_name: Option<String>,
+}
+
+impl Default for ManagedTokioRuntimeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedTokioRuntimeBuilder {
+    /// Create a new builder with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            low_priority: false,
+            thread_name: None,
+        }
+    }
+
+    /// Set worker threads to run at lower priority (nice value 10 on Unix).
+    /// This is useful for background tasks that shouldn't compete with latency-sensitive work.
+    #[must_use]
+    pub fn with_low_priority(mut self) -> Self {
+        self.low_priority = true;
+        self
+    }
+
+    /// Set a custom thread name prefix for worker threads.
+    #[must_use]
+    pub fn with_thread_name(mut self, name: impl Into<String>) -> Self {
+        self.thread_name = Some(name.into());
+        self
+    }
+
+    /// Build the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
+    pub fn build(self) -> Result<ManagedTokioRuntime> {
         let cpu_cores = num_cpus::get();
         let worker_threads = std::cmp::max(cpu_cores.saturating_sub(1), 1);
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             // Reserve one core for the primary Tokio runtime handling HTTP and control-plane work.
             .worker_threads(worker_threads)
-            .enable_all()
-            .build()?;
+            .enable_all();
+
+        if let Some(name) = &self.thread_name {
+            builder.thread_name(name);
+        }
+
+        // Set low priority on worker threads if requested (Unix only)
+        #[cfg(unix)]
+        if self.low_priority {
+            builder.on_thread_start(|| {
+                // Set nice value to 10 (lower priority than default 0, range is -20 to 19)
+                // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0 (current thread)
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                }
+            });
+        }
+
+        let runtime = builder.build()?;
         let handle = runtime.handle().clone();
         let notify_shutdown = Arc::new(Notify::new());
         let notify_shutdown_captured = Arc::clone(&notify_shutdown);
@@ -90,17 +167,11 @@ impl ManagedTokioRuntime {
             // Note: runtime is dropped here
         });
 
-        Ok(Self {
+        Ok(ManagedTokioRuntime {
             handle,
             notify_shutdown,
             thread_join_handle: Some(thread_join_handle),
         })
-    }
-
-    /// Return a handle suitable for spawning tasks
-    #[must_use]
-    pub fn handle(&self) -> &Handle {
-        &self.handle
     }
 }
 

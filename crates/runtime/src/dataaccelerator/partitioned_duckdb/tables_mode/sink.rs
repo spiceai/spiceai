@@ -88,6 +88,7 @@ pub struct DuckDBPartitionedDataSink {
     table_definition: Arc<TableDefinition>,
     overwrite: InsertOp,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
     schema: SchemaRef,
     partitioner: Arc<BatchPartitioner>,
     write_settings: DuckDBWriteSettings,
@@ -108,7 +109,6 @@ impl DataSink for DuckDBPartitionedDataSink {
         &self.schema
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
@@ -165,12 +165,7 @@ impl DataSink for DuckDBPartitionedDataSink {
 
         let partitioner = Arc::clone(&self.partitioner);
 
-        let upsert_options = self
-            .on_conflict
-            .as_ref()
-            .map_or_else(UpsertOptions::default, |conflict| {
-                conflict.get_upsert_options()
-            });
+        let upsert_options = self.upsert_options.clone();
 
         while let Some(batch) = data.next().await {
             let batch = batch.map_err(check_and_mark_retriable_error)?;
@@ -282,6 +277,7 @@ impl DuckDBPartitionedDataSink {
         table_definition: Arc<TableDefinition>,
         overwrite: InsertOp,
         on_conflict: Option<OnConflict>,
+        upsert_options: UpsertOptions,
         schema: SchemaRef,
         partitioner: Arc<BatchPartitioner>,
     ) -> Self {
@@ -290,6 +286,7 @@ impl DuckDBPartitionedDataSink {
             table_definition,
             overwrite,
             on_conflict,
+            upsert_options,
             schema,
             partitioner,
             write_settings: DuckDBWriteSettings::default(),
@@ -325,13 +322,12 @@ impl DisplayAs for DuckDBPartitionedDataSink {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn insert_overwrite(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
     batch_rx: Receiver<(String, PartitionData)>,
     on_conflict: Option<&OnConflict>,
-    mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
+    on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
     write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
@@ -366,7 +362,7 @@ fn insert_overwrite(
     .map_err(to_retriable_data_write_error)?;
 
     on_commit_transaction
-        .try_recv()
+        .blocking_recv()
         .map_err(to_retriable_data_write_error)?;
 
     for new_table in &tables {
@@ -433,7 +429,7 @@ fn insert_append(
     table_definition: &Arc<TableDefinition>,
     batch_rx: Receiver<(String, PartitionData)>,
     on_conflict: Option<&OnConflict>,
-    mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
+    on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
     write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
@@ -474,7 +470,7 @@ fn insert_append(
     }
 
     on_commit_transaction
-        .try_recv()
+        .blocking_recv()
         .map_err(to_retriable_data_write_error)?;
 
     tx.commit()
@@ -585,7 +581,7 @@ fn write_to_tables(
             .context(UnableToGetElapsedTimeSnafu)
             .map_err(to_datafusion_error)?;
         let secs = elapsed.as_secs_f64();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let rps = if secs > 0.0 {
             (rows_written as f64) / secs
         } else {
@@ -764,6 +760,7 @@ mod test {
     use datafusion::prelude::col;
     use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
     use runtime_table_partition::expression::PartitionedBy;
+    use std::{thread, time::Duration};
 
     fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
         Arc::new(
@@ -781,6 +778,20 @@ mod test {
             RelationName::new("test_table"),
             schema,
         ))
+    }
+
+    fn make_partition_batch(schema: &SchemaRef, region: &str, ids: &[i64]) -> RecordBatch {
+        let id_values: Vec<Option<i64>> = ids.iter().copied().map(Some).collect();
+        let region_values: Vec<Option<&str>> = ids.iter().map(|_| Some(region)).collect();
+
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(id_values)),
+                Arc::new(StringArray::from(region_values)),
+            ],
+        )
+        .expect("should create a record batch")
     }
 
     fn verify_state_after_write(
@@ -921,6 +932,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         );
@@ -1042,6 +1054,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         );
@@ -1132,6 +1145,108 @@ mod test {
         tx2.rollback().expect("to rollback");
     }
 
+    #[test]
+    fn test_insert_overwrite_waits_for_commit_signal() {
+        let pool = get_mem_duckdb();
+        let table_definition = get_test_table_definition();
+        let schema = table_definition.schema();
+
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(2);
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+
+        let batch = make_partition_batch(&schema, "us-east-1", &[1, 2]);
+
+        batch_tx
+            .blocking_send((
+                "region=us-east-1".to_string(),
+                PartitionData::Batches(vec![batch]),
+            ))
+            .expect("to send partition batch");
+        drop(batch_tx);
+
+        let write_settings = DuckDBWriteSettings::default();
+
+        let handle = thread::spawn({
+            let pool = Arc::clone(&pool);
+            let table_definition = Arc::clone(&table_definition);
+            let schema = Arc::clone(&schema);
+
+            move || {
+                insert_overwrite(
+                    pool,
+                    &table_definition,
+                    batch_rx,
+                    None,
+                    commit_rx,
+                    &schema,
+                    &write_settings,
+                )
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        commit_tx.send(()).expect("to send commit signal");
+
+        let rows = handle
+            .join()
+            .expect("insert thread to finish")
+            .expect("insert_overwrite to succeed");
+
+        assert_eq!(rows, 2, "expected rows to be written after commit signal");
+    }
+
+    #[test]
+    fn test_insert_append_waits_for_commit_signal() {
+        let pool = get_mem_duckdb();
+        let table_definition = get_test_table_definition();
+        let schema = table_definition.schema();
+
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(2);
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+
+        let batch = make_partition_batch(&schema, "us-west-1", &[10, 11, 12]);
+
+        batch_tx
+            .blocking_send((
+                "region=us-west-1".to_string(),
+                PartitionData::Batches(vec![batch]),
+            ))
+            .expect("to send partition batch");
+        drop(batch_tx);
+
+        let write_settings = DuckDBWriteSettings::default();
+
+        let handle = thread::spawn({
+            let pool = Arc::clone(&pool);
+            let table_definition = Arc::clone(&table_definition);
+            let schema = Arc::clone(&schema);
+
+            move || {
+                insert_append(
+                    pool,
+                    &table_definition,
+                    batch_rx,
+                    None,
+                    commit_rx,
+                    &schema,
+                    &write_settings,
+                )
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        commit_tx.send(()).expect("to send commit signal");
+
+        let rows = handle
+            .join()
+            .expect("insert thread to finish")
+            .expect("insert_append to succeed");
+
+        assert_eq!(rows, 3, "expected rows to be written after commit signal");
+    }
+
     #[tokio::test]
     async fn test_write_append() {
         // Test scenario:
@@ -1162,6 +1277,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Append,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         );
@@ -1279,6 +1395,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         )
@@ -1360,6 +1477,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         )

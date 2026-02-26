@@ -16,11 +16,14 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
+use subtle::ConstantTimeEq;
+
 use super::{
     caching::{Caching, ResultsCache},
-    default_true, is_default, is_default_or_none,
+    default_true, is_default,
 };
 use crate::metric::Metrics;
+use crate::param::Params;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,8 +35,6 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[serde(deny_unknown_fields)]
 #[serde(try_from = "RuntimeDeserializer")]
 pub struct Runtime {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
-    pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub caching: Caching,
 
@@ -81,18 +82,19 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<Scheduler>,
 }
 
 impl Runtime {
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
-            let duration = fundu::parse_duration(timeout_str)
+            let duration = duration_parse::parse_duration(timeout_str)
                 .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
 
-            if duration.as_secs() == 0 {
-                return Err(
-                    "'shutdown_timeout' must be a positive duration greater than 0 seconds".into(),
-                );
+            if duration.is_zero() {
+                return Err("'shutdown_timeout' must be a positive duration greater than 0".into());
             }
 
             Ok(Some(duration))
@@ -140,6 +142,118 @@ pub enum UserAgentCollection {
     Disabled,
 }
 
+/// Default push interval for OTEL metrics (60 seconds)
+fn default_otel_push_interval() -> String {
+    "60s".to_string()
+}
+
+/// Configuration for pushing metrics to an OpenTelemetry collector.
+///
+/// The protocol is inferred from the endpoint:
+/// - **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`
+/// - **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)
+///
+/// # Examples
+///
+/// gRPC (hostname only, port defaults to 4317):
+/// ```yaml
+/// otel_exporter:
+///   enabled: true
+///   endpoint: "otel-collector"
+/// ```
+///
+/// With metric whitelist:
+/// ```yaml
+/// otel_exporter:
+///   enabled: true
+///   endpoint: "otel-collector:4317"
+///   metrics:
+///     - requests_total
+///     - request_duration_seconds
+/// ```
+///
+/// HTTP:
+/// ```yaml
+/// otel_exporter:
+///   enabled: true
+///   endpoint: "http://localhost:4318/v1/metrics"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct OtelExporterConfig {
+    /// Whether the OTEL exporter is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// The endpoint of the OTEL collector.
+    ///
+    /// For gRPC: use hostname with optional port (e.g., `otel-collector` or `localhost:4317`)
+    /// For HTTP: use full URL (e.g., `http://localhost:4318/v1/metrics`)
+    pub endpoint: String,
+
+    /// How often to push metrics to the collector (e.g., "30s", "1m", "5m")
+    #[serde(default = "default_otel_push_interval")]
+    pub push_interval: String,
+
+    /// Optional whitelist of metric names to export.
+    /// If not specified or empty, all metrics are exported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<String>,
+}
+
+impl OtelExporterConfig {
+    /// Returns true if the endpoint is configured for HTTP protocol.
+    ///
+    /// HTTP is used when:
+    /// - The endpoint has an `http://` or `https://` scheme
+    /// - The endpoint contains `/v1/metrics` path
+    ///
+    /// gRPC is used when the endpoint is just a hostname and optional port
+    /// (e.g., `localhost:4317` or `otel-collector`)
+    #[must_use]
+    pub fn is_http(&self) -> bool {
+        self.endpoint.starts_with("http://")
+            || self.endpoint.starts_with("https://")
+            || self.endpoint.contains("/v1/metrics")
+    }
+
+    /// Returns the endpoint formatted for gRPC use.
+    /// If no port is specified, defaults to 4317.
+    #[must_use]
+    pub fn grpc_endpoint(&self) -> String {
+        let endpoint = &self.endpoint;
+        // If it already has a port, use as-is with http:// prefix for tonic
+        if endpoint.contains(':') {
+            format!("http://{endpoint}")
+        } else {
+            format!("http://{endpoint}:4317")
+        }
+    }
+
+    /// Parses the push interval string into a Duration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the duration cannot be parsed
+    pub fn push_interval_duration(
+        &self,
+    ) -> Result<std::time::Duration, Box<dyn Error + Send + Sync>> {
+        let duration = duration_parse::parse_duration(&self.push_interval).map_err(|e| {
+            format!(
+                "Failed to parse 'push_interval' value '{}': {e}",
+                self.push_interval
+            )
+        })?;
+
+        if duration.is_zero() {
+            return Err("'push_interval' must be a positive duration greater than 0".into());
+        }
+
+        Ok(duration)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -150,6 +264,9 @@ pub struct TelemetryConfig {
     pub user_agent_collection: UserAgentCollection,
     #[serde(default)]
     pub properties: HashMap<String, String>,
+    /// Optional configuration for pushing metrics to an OpenTelemetry collector
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_exporter: Option<OtelExporterConfig>,
 }
 
 impl Default for TelemetryConfig {
@@ -158,14 +275,29 @@ impl Default for TelemetryConfig {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
             properties: HashMap::new(),
+            otel_exporter: None,
         }
     }
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Flight {
     pub max_message_size: Option<String>,
+
+    /// Whether to enable rate limiting on Flight `DoPut` (write) requests.
+    /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
+    #[serde(default = "default_true")]
+    pub do_put_rate_limit_enabled: bool,
+}
+
+impl Default for Flight {
+    fn default() -> Self {
+        Self {
+            max_message_size: None,
+            do_put_rate_limit_enabled: true,
+        }
+    }
 }
 
 impl Flight {
@@ -286,7 +418,7 @@ impl TaskHistory {
         value: &str,
         field: &str,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(value).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(value).map_err(|e| e.to_string())?;
 
         if duration.as_secs() < TASK_HISTORY_RETENTION_MINIMUM {
             return Err(format!(
@@ -316,7 +448,7 @@ impl TaskHistory {
         };
 
         let duration =
-            fundu::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
+            duration_parse::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -331,8 +463,8 @@ impl TaskHistory {
             return Ok(None);
         };
 
-        let duration =
-            fundu::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(min_plan_duration.as_ref())
+            .map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -355,11 +487,50 @@ pub struct ApiKeyAuth {
     pub keys: Vec<ApiKey>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// API key for authentication. Keys can be read-only or read-write.
+/// The key value is redacted in Debug output to prevent credential leakage.
+///
+/// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+/// constant-time comparison via the `subtle` crate to prevent timing attacks.
+#[derive(Clone)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+}
+
+/// Constant-time comparison for `ApiKey` to `ApiKey`.
+/// Both variants must match AND the key values must be equal using constant-time comparison.
+impl PartialEq for ApiKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ApiKey::ReadOnly { key: a }, ApiKey::ReadOnly { key: b })
+            | (ApiKey::ReadWrite { key: a }, ApiKey::ReadWrite { key: b }) => {
+                a.as_bytes().ct_eq(b.as_bytes()).into()
+            }
+            // Different variants are never equal
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ApiKey {}
+
+/// Custom Debug implementation that redacts the key value to prevent
+/// credential leakage in logs or error messages.
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiKey::ReadOnly { .. } => f
+                .debug_struct("ApiKey::ReadOnly")
+                .field("key", &"[REDACTED]")
+                .finish(),
+            ApiKey::ReadWrite { .. } => f
+                .debug_struct("ApiKey::ReadWrite")
+                .field("key", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -433,9 +604,17 @@ impl Serialize for ApiKey {
 }
 
 impl PartialEq<str> for ApiKey {
+    /// Compares the API key with another string using constant-time comparison
+    /// to prevent timing attacks that could leak key information.
+    ///
+    /// Uses the `subtle` crate which is specifically designed for cryptographic
+    /// constant-time operations and handles edge cases like length differences
+    /// correctly without leaking timing information.
     fn eq(&self, other: &str) -> bool {
         match self {
-            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key == other,
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => {
+                key.as_bytes().ct_eq(other.as_bytes()).into()
+            }
         }
     }
 }
@@ -487,15 +666,76 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Scheduler {
+    /// Root URI for shared cluster state.
+    pub state_location: String,
+
+    /// Optional object store params for the shared cluster state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
+    /// Partition management configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_management: Option<PartitionManagement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct PartitionManagement {
+    #[serde(default = "default_partition_management_interval")]
+    pub interval: String,
+
+    #[serde(default = "default_max_assignments_per_cycle")]
+    pub max_assignments_per_cycle: usize,
+
+    #[serde(default = "default_max_partitions_per_executor")]
+    pub max_partitions_per_executor: usize,
+
+    #[serde(default = "default_discovery_timeout")]
+    pub discovery_timeout: String,
+}
+
+fn default_partition_management_interval() -> String {
+    "30s".to_string()
+}
+
+fn default_max_assignments_per_cycle() -> usize {
+    100
+}
+
+fn default_max_partitions_per_executor() -> usize {
+    1000
+}
+
+fn default_discovery_timeout() -> String {
+    "60s".to_string()
+}
+
+impl Default for PartitionManagement {
+    fn default() -> Self {
+        Self {
+            interval: default_partition_management_interval(),
+            max_assignments_per_cycle: default_max_assignments_per_cycle(),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            discovery_timeout: default_discovery_timeout(),
+        }
+    }
+}
+
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDeserializer {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
+    #[serde(default)]
+    #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub caching: Caching,
+    #[serde(default)]
+    pub caching: Option<Caching>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
     /// If set, the runtime will configure all endpoints to use TLS
@@ -538,9 +778,11 @@ pub struct RuntimeDeserializer {
     pub query: Option<Query>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<Scheduler>,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<RuntimeDeserializer> for Runtime {
     type Error = String;
 
@@ -577,9 +819,25 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             (None, None) => None,
         };
 
+        // Convert deprecated runtime.results_cache to runtime.caching.sql_results
+        let caching_was_explicit = deserializer.caching.is_some();
+        let mut caching = deserializer.caching.unwrap_or_default();
+        if let Some(results_cache) = deserializer.results_cache {
+            tracing::warn!(
+                "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
+            );
+            // Only apply the deprecated value if `caching.sql_results` wasn't explicitly set.
+            // When `caching` is absent from YAML, `caching_was_explicit` is false, so we
+            // apply the deprecated value. When `caching` IS in the YAML, we check whether
+            // `sql_results` was also present (non-None) — if so, the new field takes priority.
+            let sql_results_explicit = caching_was_explicit && caching.sql_results.is_some();
+            if !sql_results_explicit {
+                caching.sql_results = Some(results_cache.into());
+            }
+        }
+
         Ok(Runtime {
-            results_cache: deserializer.results_cache,
-            caching: deserializer.caching,
+            caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
             tls: deserializer.tls,
             tracing: deserializer.tracing,
@@ -597,15 +855,15 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
                 Some(query)
             },
             metrics: deserializer.metrics,
+            scheduler: deserializer.scheduler,
         })
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_api_keys() {
@@ -618,7 +876,7 @@ mod tests {
                 - api-key-3:rw
         ";
 
-        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
 
         let api_key = parsed.api_key.expect("api_key section exists");
 
@@ -651,7 +909,7 @@ mod tests {
                 - api-key-1
         ";
 
-        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
 
         let api_key = parsed.api_key.expect("api_key section exists");
 
@@ -664,12 +922,82 @@ mod tests {
     }
 
     #[test]
+    fn test_api_key_constant_time_comparison() {
+        let key = ApiKey::ReadOnly {
+            key: "secret-api-key-12345".to_string(),
+        };
+
+        // Test exact match
+        assert!(key == *"secret-api-key-12345");
+
+        // Test mismatch at different positions
+        assert!(key != *"xecret-api-key-12345"); // First char different
+        assert!(key != *"secret-api-key-1234x"); // Last char different
+        assert!(key != *"secret-xpi-key-12345"); // Middle char different
+
+        // Test different lengths
+        assert!(key != *"secret-api-key-1234"); // Shorter
+        assert!(key != *"secret-api-key-123456"); // Longer
+        assert!(key != *""); // Empty string
+
+        // Test with ReadWrite variant
+        let rw_key = ApiKey::ReadWrite {
+            key: "rw-key".to_string(),
+        };
+        assert!(rw_key == *"rw-key");
+        assert!(rw_key != *"rw-key2");
+    }
+
+    #[test]
+    fn test_api_key_debug_redaction() {
+        let readonly_key = ApiKey::ReadOnly {
+            key: "super-secret-key".to_string(),
+        };
+        let readwrite_key = ApiKey::ReadWrite {
+            key: "another-secret".to_string(),
+        };
+
+        let readonly_debug = format!("{readonly_key:?}");
+        let readwrite_debug = format!("{readwrite_key:?}");
+
+        // Ensure the actual key values are NOT in the debug output
+        assert!(
+            !readonly_debug.contains("super-secret-key"),
+            "Debug output should not contain the actual key"
+        );
+        assert!(
+            !readwrite_debug.contains("another-secret"),
+            "Debug output should not contain the actual key"
+        );
+
+        // Ensure [REDACTED] is present
+        assert!(
+            readonly_debug.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+        assert!(
+            readwrite_debug.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+
+        // Ensure the variant name is present for debugging purposes
+        assert!(
+            readonly_debug.contains("ReadOnly"),
+            "Debug output should indicate the variant type"
+        );
+        assert!(
+            readwrite_debug.contains("ReadWrite"),
+            "Debug output should indicate the variant type"
+        );
+    }
+
+    #[test]
     fn test_memory_limit_migration() {
         // Test when only memory_limit is present
         let yaml = r"
             memory_limit: 100MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -684,7 +1012,7 @@ mod tests {
             query:
                 memory_limit: 200MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -700,7 +1028,7 @@ mod tests {
             query:
                 memory_limit: 200MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -713,7 +1041,7 @@ mod tests {
         // Test when neither is present
         let yaml = r"
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
     }
 
@@ -723,7 +1051,7 @@ mod tests {
         let yaml = r"
             temp_directory: '/foo'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -738,7 +1066,7 @@ mod tests {
             query:
                 temp_directory: '/bar'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -754,7 +1082,7 @@ mod tests {
             query:
                 temp_directory: '/bar'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -767,7 +1095,7 @@ mod tests {
         // Test when neither is present
         let yaml = r"
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
     }
 
@@ -841,7 +1169,7 @@ mod tests {
                 retention_check_interval: 15m
                 min_sql_duration: 10ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
         assert_eq!(
             runtime
@@ -856,7 +1184,7 @@ mod tests {
             task_history:
                 enabled: true
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
     }
 
@@ -1000,7 +1328,7 @@ mod tests {
                 captured_plan: explain analyze
                 min_plan_duration: 100ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.task_history.captured_plan,
             Some("explain analyze".into())
@@ -1032,9 +1360,378 @@ mod tests {
                 captured_plan: explain
                 min_plan_duration: 50ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
         assert_eq!(runtime.task_history.captured_plan, Some("explain".into()));
         assert_eq!(runtime.task_history.min_plan_duration, Some("50ms".into()));
+    }
+
+    #[test]
+    fn test_otel_exporter_config_parsing_grpc() {
+        let yaml = r"
+            telemetry:
+                enabled: true
+                otel_exporter:
+                    endpoint: otel-collector:4317
+                    push_interval: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.endpoint, "otel-collector:4317");
+        assert!(!otel_config.is_http()); // gRPC: bare hostname:port
+        assert_eq!(otel_config.push_interval, "30s");
+    }
+
+    #[test]
+    fn test_otel_exporter_config_parsing_http() {
+        let yaml = r"
+            telemetry:
+                enabled: true
+                otel_exporter:
+                    endpoint: http://localhost:4318/v1/metrics
+                    push_interval: 1m
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.endpoint, "http://localhost:4318/v1/metrics");
+        assert!(otel_config.is_http()); // HTTP: has http:// scheme
+        assert_eq!(otel_config.push_interval, "1m");
+    }
+
+    #[test]
+    fn test_otel_exporter_config_defaults() {
+        // Test with minimal config - push_interval should use default
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.endpoint, "otel-collector");
+        assert!(!otel_config.is_http()); // gRPC: bare hostname
+        assert_eq!(otel_config.push_interval, "60s"); // default
+    }
+
+    #[test]
+    fn test_otel_exporter_push_interval_duration_parsing() {
+        let config = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "30s".to_string(),
+            metrics: vec![],
+        };
+        let duration = config
+            .push_interval_duration()
+            .expect("should parse duration");
+        assert_eq!(duration, std::time::Duration::from_secs(30));
+
+        let config_minutes = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "5m".to_string(),
+            metrics: vec![],
+        };
+        let duration = config_minutes
+            .push_interval_duration()
+            .expect("should parse duration");
+        assert_eq!(duration, std::time::Duration::from_secs(300));
+
+        let config_hours = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "1h".to_string(),
+            metrics: vec![],
+        };
+        let duration = config_hours
+            .push_interval_duration()
+            .expect("should parse duration");
+        assert_eq!(duration, std::time::Duration::from_secs(3600));
+
+        // Sub-second intervals should also work
+        let config_ms = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "500ms".to_string(),
+            metrics: vec![],
+        };
+        let duration = config_ms
+            .push_interval_duration()
+            .expect("should parse sub-second duration");
+        assert_eq!(duration, std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_otel_exporter_push_interval_zero_fails() {
+        let config = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "0s".to_string(),
+            metrics: vec![],
+        };
+        let result = config.push_interval_duration();
+        assert!(result.is_err());
+        let Err(err) = result else {
+            panic!("Expected error");
+        };
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn test_otel_exporter_push_interval_invalid_fails() {
+        let config = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "invalid".to_string(),
+            metrics: vec![],
+        };
+        let result = config.push_interval_duration();
+        let _ = result.expect_err("Expected an error for invalid push_interval");
+    }
+
+    #[test]
+    fn test_telemetry_config_without_otel_exporter() {
+        let yaml = r"
+            telemetry:
+                enabled: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert!(runtime.telemetry.otel_exporter.is_none());
+    }
+
+    #[test]
+    fn test_otel_exporter_is_http_detection() {
+        // gRPC: bare hostname
+        let grpc_bare = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert!(!grpc_bare.is_http());
+
+        // gRPC: hostname with port
+        let grpc_port = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector:4317".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert!(!grpc_port.is_http());
+
+        // HTTP: http:// scheme
+        let http_scheme = OtelExporterConfig {
+            enabled: true,
+            endpoint: "http://localhost:4318".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert!(http_scheme.is_http());
+
+        // HTTP: https:// scheme
+        let https_config = OtelExporterConfig {
+            enabled: true,
+            endpoint: "https://otel.example.com:4318".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert!(https_config.is_http());
+
+        // HTTP: with /v1/metrics path
+        let http_path = OtelExporterConfig {
+            enabled: true,
+            endpoint: "http://localhost:4318/v1/metrics".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert!(http_path.is_http());
+    }
+
+    #[test]
+    fn test_otel_exporter_grpc_endpoint() {
+        // Bare hostname gets default port 4317
+        let bare = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert_eq!(bare.grpc_endpoint(), "http://otel-collector:4317");
+
+        // Hostname with port preserves port
+        let with_port = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector:9090".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert_eq!(with_port.grpc_endpoint(), "http://otel-collector:9090");
+
+        // localhost with port
+        let localhost = OtelExporterConfig {
+            enabled: true,
+            endpoint: "localhost:4317".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert_eq!(localhost.grpc_endpoint(), "http://localhost:4317");
+    }
+
+    #[test]
+    fn test_otel_exporter_enabled_default() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert!(otel_config.enabled); // default is true
+    }
+
+    #[test]
+    fn test_otel_exporter_disabled() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    enabled: false
+                    endpoint: otel-collector
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert!(!otel_config.enabled);
+    }
+
+    #[test]
+    fn test_otel_exporter_with_metrics_whitelist() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector:4317
+                    metrics:
+                        - requests_total
+                        - request_duration_seconds
+                        - active_connections
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.metrics.len(), 3);
+        assert!(otel_config.metrics.contains(&"requests_total".to_string()));
+        assert!(
+            otel_config
+                .metrics
+                .contains(&"request_duration_seconds".to_string())
+        );
+        assert!(
+            otel_config
+                .metrics
+                .contains(&"active_connections".to_string())
+        );
+    }
+
+    #[test]
+    fn test_otel_exporter_without_metrics_whitelist() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector:4317
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert!(otel_config.metrics.is_empty()); // no whitelist means all metrics
+    }
+
+    #[test]
+    fn test_otel_exporter_with_telemetry_properties() {
+        let yaml = r"
+            telemetry:
+                enabled: true
+                properties:
+                    environment: production
+                    team: platform
+                otel_exporter:
+                    endpoint: otel-collector:4317
+                    push_interval: 45s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+
+        assert!(runtime.telemetry.enabled);
+        assert_eq!(
+            runtime.telemetry.properties.get("environment"),
+            Some(&"production".to_string())
+        );
+        assert_eq!(
+            runtime.telemetry.properties.get("team"),
+            Some(&"platform".to_string())
+        );
+
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.endpoint, "otel-collector:4317");
+        assert_eq!(otel_config.push_interval, "45s");
+    }
+
+    #[test]
+    fn test_results_cache_backward_compat_migration() {
+        // Test that deprecated `results_cache` is migrated to `caching.sql_results`
+        let yaml = r"
+            results_cache:
+                enabled: true
+                item_ttl: 5s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be migrated from results_cache");
+        assert!(sql_results.enabled);
+        assert_eq!(sql_results.item_ttl, Some("5s".to_string()));
+
+        // Test that `caching.sql_results` takes priority over deprecated `results_cache`
+        let yaml = r"
+            results_cache:
+                enabled: false
+                item_ttl: 10s
+            caching:
+                sql_results:
+                    enabled: true
+                    item_ttl: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be present");
+        assert!(
+            sql_results.enabled,
+            "caching.sql_results should take priority"
+        );
+        assert_eq!(sql_results.item_ttl, Some("30s".to_string()));
     }
 }

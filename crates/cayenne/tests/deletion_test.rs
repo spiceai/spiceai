@@ -25,11 +25,17 @@ limitations under the License.
 mod common;
 
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::prelude::*;
+
 use datafusion_physical_plan::collect;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
@@ -39,7 +45,6 @@ test_with_backends!(test_delete_all_rows_impl);
 test_with_backends!(test_delete_then_insert_impl);
 test_with_backends!(test_delete_with_complex_filter_impl);
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_with_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -59,6 +64,7 @@ async fn test_delete_with_primary_key_impl(
         table_name: "test_delete_pk".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -175,7 +181,6 @@ async fn test_delete_with_primary_key_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_without_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -199,6 +204,7 @@ async fn test_delete_without_primary_key_impl(
         table_name: "test_delete_no_pk".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![], // NO primary key
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -277,7 +283,6 @@ async fn test_delete_without_primary_key_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_all_rows_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -300,6 +305,7 @@ async fn test_delete_all_rows_impl(
         table_name: "test_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -354,7 +360,6 @@ async fn test_delete_all_rows_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_then_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -377,6 +382,7 @@ async fn test_delete_then_insert_impl(
         table_name: "test_delete_insert".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -458,7 +464,6 @@ async fn test_delete_then_insert_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_with_complex_filter_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -483,6 +488,7 @@ async fn test_delete_with_complex_filter_impl(
         table_name: "test_delete_complex".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),

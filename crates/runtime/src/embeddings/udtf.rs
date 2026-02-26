@@ -29,7 +29,7 @@ limitations under the License.
 
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
@@ -48,6 +48,7 @@ use datafusion::{
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
 };
+#[cfg(feature = "s3_vectors")]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -64,10 +65,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{
-    SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex,
-    provider::SearchQueryProvider,
-};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -77,22 +75,46 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::{
-        find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
-        to_column_expr,
-    },
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
 
-use search::index::chunking::ChunkedSearchIndex;
+#[cfg(feature = "s3_vectors")]
+use {
+    crate::search::util::find_index_in_table_provider,
+    search::index::SearchIndex,
+    search::index::chunking::ChunkedSearchIndex,
+    search::index::s3_vectors::S3Vector,
+    search::provider::{SearchQueryProvider, UdtfSource},
+};
+
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 
-pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+/// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
+/// to pass through for RRF (Reciprocal Rank Fusion) operations.
+///
+/// This is required because `DataFusion` v51+ rejects named arguments for functions that use
+/// `VariadicAny` signature. The `UserDefined` signature type allows us to:
+/// 1. Accept any types (like `VariadicAny`)
+/// 2. Support named parameters via `with_parameter_names()`
+pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    // Parameter names that can be passed as named arguments.
+    // These are passthrough parameters used by RRF and other table functions.
+    let param_names = vec![
+        "tbl".to_string(),
+        "query".to_string(),
+        "column".to_string(),
+        "limit".to_string(),
+        "include_score".to_string(),
+        "rank_weight".to_string(),
+    ];
+    match Signature::user_defined(Volatility::Stable).with_parameter_names(param_names) {
+        Ok(sig) => sig,
+        Err(_) => Signature::variadic_any(Volatility::Stable),
+    }
+});
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct VectorSearchTableFuncArgs {
@@ -117,8 +139,8 @@ impl VectorSearchTableFuncArgs {
             .cloned();
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => Err(DataFusionError::Internal(format!(
-                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}.",
+            (Some(col), None) => Err(DataFusionError::Plan(format!(
+                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}",
                 self.tbl,
                 embedded_columns
                     .keys()
@@ -234,7 +256,11 @@ impl VectorSearchTableFunc {
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
-        let mut args = args.iter();
+        // Filter out passthrough parameters (those with spice.parameter_name metadata)
+        // These are meant for table functions like RRF, not for vector_search itself
+        let mut args = args.iter().filter(|arg| {
+            !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+        });
 
         let tbl = args.next();
         let Some(Expr::Column(c)) = tbl else {
@@ -316,7 +342,7 @@ impl VectorSearchTableFunc {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
-            query: q.to_string(),
+            query: q.clone(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,
@@ -332,7 +358,19 @@ impl VectorSearchTableFunc {
             find_index_in_table_provider::<S3Vector>(tbl),
             find_index_in_table_provider::<ChunkedSearchIndex>(tbl),
         ) {
-            (_, Some((chunked_index, _))) => chunked_index
+            (Some((vector_index, _)), Some((chunked_index, _))) => {
+                let mut indexes = chunked_index
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
+                    .collect::<Vec<_>>();
+                indexes.extend(
+                    vector_index
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+                indexes
+            }
+            (None, Some((chunked_index, _))) => chunked_index
                 .into_iter()
                 .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
                 .collect::<Vec<_>>(),
@@ -349,8 +387,8 @@ impl VectorSearchTableFunc {
                 .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
-                return Err(DataFusionError::Internal(format!(
-                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
+                return Err(DataFusionError::Plan(format!(
+                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`",
                     args.tbl,
                     vector_indexes.len()
                 )));
@@ -368,6 +406,13 @@ impl VectorSearchTableFunc {
                 args.query.as_str(),
                 args.limit,
             )?
+            .with_udtf_source(UdtfSource::VectorSearch {
+                table: args.tbl.to_string(),
+                query: args.query.clone(),
+                column: args.column.clone(),
+                limit: args.limit,
+                include_score: args.include_score,
+            })
             .call_on_scan(Arc::new(|| {
                 async {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -390,7 +435,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 
@@ -471,18 +516,32 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         Self::scalar_invocation_error()
     }
+
+    /// Required for `UserDefined` signature - accepts any types like `VariadicAny` would.
+    fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        Ok(arg_types.to_vec())
+    }
 }
 
 /// The [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+///
+/// This provider computes vector similarity scores on-the-fly using the embedding model,
+/// without relying on a pre-built vector index.
 #[derive(Debug, Clone)]
-pub(super) struct VectorSearchUDTFProvider {
-    pub args: VectorSearchTableFuncArgs,
+pub struct VectorSearchUDTFProvider {
+    args: VectorSearchTableFuncArgs,
     underlying: Arc<dyn TableProvider>,
     embedded_columns: HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl VectorSearchUDTFProvider {
+    /// Returns the arguments used to create this provider.
+    #[must_use]
+    pub fn args(&self) -> &VectorSearchTableFuncArgs {
+        &self.args
+    }
+
     /// Embed the query argument and convert to [`Float32Array`].
     async fn vector(
         &self,
@@ -670,7 +729,7 @@ fn alias_value_to_match(
         .into_iter()
         .map(|c| {
             if c.name() == "value" {
-                Expr::Column(c).alias("match")
+                Expr::Column(c).alias("_match")
             } else {
                 Expr::Column(c)
             }

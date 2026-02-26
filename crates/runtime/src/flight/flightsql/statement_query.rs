@@ -83,6 +83,6 @@ pub(crate) async fn do_get(
 
     let mut response =
         Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-    attach_cache_metadata(&mut response, from_cache);
+    attach_cache_metadata(&mut response, from_cache, &context);
     Ok(response)
 }

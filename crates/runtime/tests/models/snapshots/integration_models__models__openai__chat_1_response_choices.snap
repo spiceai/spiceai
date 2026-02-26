@@ -12,6 +12,9 @@ snapshot_kind: text
             ),
             refusal: None,
             tool_calls: None,
+            annotations: Some(
+                [],
+            ),
             role: Assistant,
             function_call: None,
             audio: None,

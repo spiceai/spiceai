@@ -108,7 +108,7 @@ pub(crate) async fn score_results(
             if let Some(scorer_results) = aggregate.get_mut(name) {
                 scorer_results.push(s);
             } else {
-                aggregate.insert((*name).to_string(), vec![s]);
+                aggregate.insert((*name).clone(), vec![s]);
             }
         }
     }
@@ -133,7 +133,7 @@ pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn mean(values: &[f32]) -> f32 {
     let n = values.len();
     if n == 0 {
@@ -143,6 +143,7 @@ fn mean(values: &[f32]) -> f32 {
     values.iter().sum::<f32>() / n as f32
 }
 
+#[cfg(feature = "models")]
 fn extract_text(output: &DatasetOutput) -> String {
     match output {
         DatasetOutput::AssistantResponse(text) => text.clone(),

@@ -36,7 +36,7 @@ ARG CUDA_COMPUTE_CAP=80
 RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \

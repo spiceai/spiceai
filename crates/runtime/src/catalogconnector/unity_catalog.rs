@@ -51,7 +51,7 @@ impl UnityCatalog {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token").secret().description(
         "The personal access token used to authenticate against the Unity Catalog API.",
     ),

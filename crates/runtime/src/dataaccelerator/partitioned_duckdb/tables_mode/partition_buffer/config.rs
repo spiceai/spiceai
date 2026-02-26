@@ -25,9 +25,10 @@ use crate::spice_data_base_path;
 const ROWS_PER_PARTITION_BUFFER: usize = 122_880;
 
 /// Configuration for partition buffer type selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PartitionBufferType {
     /// Use in-memory buffers (default behavior)
+    #[default]
     Memory,
     /// Use Parquet file-based buffers
     Parquet,
@@ -56,12 +57,6 @@ impl PartitionBufferType {
             Self::Memory => "memory",
             Self::Parquet => "parquet",
         }
-    }
-}
-
-impl Default for PartitionBufferType {
-    fn default() -> Self {
-        Self::Memory
     }
 }
 
@@ -98,13 +93,14 @@ impl PartitionBufferConfig {
         let mut config = PartitionBufferConfig::default();
 
         if let Some(params) = params {
-            if let Some(rows_threshold_str) = params.get("duckdb_partitioned_write_flush_threshold")
+            if let Some(rows_threshold_str) =
+                params.get("duckdb_partitioned_write_flush_threshold_rows")
             {
                 if let Ok(threshold) = rows_threshold_str.parse::<usize>() {
                     config.rows_per_partition_threshold = threshold;
                 } else {
                     tracing::warn!(
-                        "Invalid `duckdb_partitioned_write_flush_threshold` parameter '{rows_threshold_str}': must be a positive integer"
+                        "Invalid `duckdb_partitioned_write_flush_threshold_rows` parameter '{rows_threshold_str}': must be a positive integer"
                     );
                 }
             }
@@ -217,7 +213,7 @@ mod tests {
     fn test_config_from_params_custom_threshold() {
         let mut params = HashMap::new();
         params.insert(
-            "duckdb_partitioned_write_flush_threshold".to_string(),
+            "duckdb_partitioned_write_flush_threshold_rows".to_string(),
             "50000".to_string(),
         );
 
@@ -230,7 +226,7 @@ mod tests {
     fn test_config_from_params_invalid_threshold() {
         let mut params = HashMap::new();
         params.insert(
-            "duckdb_partitioned_write_flush_threshold".to_string(),
+            "duckdb_partitioned_write_flush_threshold_rows".to_string(),
             "not_a_number".to_string(),
         );
 

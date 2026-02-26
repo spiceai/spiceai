@@ -17,6 +17,9 @@ limitations under the License.
 
 pub mod chat;
 pub mod embed;
+mod list_models;
+
+pub use list_models::BedrockModelLister;
 
 use std::sync::Arc;
 
@@ -190,7 +193,7 @@ impl BedrockClient {
         let permit = self.rate_controller.acquire().await.boxed()?;
 
         let result = retry(self.retry_strategy.clone(), || async {
-            permit.until_ready().await;
+            permit.until_ready().await.boxed()?;
             make_request(Arc::clone(&self.client)).await
         })
         .await;

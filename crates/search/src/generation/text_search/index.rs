@@ -29,7 +29,7 @@ use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::{DocParsingError, SchemaBuilder};
 use tantivy::{TantivyDocument, TantivyError};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
@@ -50,7 +50,10 @@ pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
-    pub index: Arc<RwLock<tantivy::Index>>,
+
+    // `index` access should only be needed for write path. Query/reads should use [`self::reader`].
+    pub index: Arc<Mutex<tantivy::Index>>,
+    pub reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -120,12 +123,14 @@ impl FullTextDatabaseIndex {
         } else {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
+        let reader = index.reader().context(TextSearchIndexingSnafu)?;
 
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(RwLock::new(index)),
+            index: Arc::new(Mutex::new(index)),
             primary_key: pks,
+            reader,
         })
     }
 
@@ -156,13 +161,8 @@ impl FullTextDatabaseIndex {
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self
-            .index
-            .try_read()
-            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
-
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            &index_read,
+            self.reader.searcher(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -232,30 +232,36 @@ impl FullTextDatabaseIndex {
             rb.to_vec()
         };
 
-        let index_writable = self.index.write().await;
         // Updates in tantivy are a deletion then insertion.
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
-
-        // Deletion.
-        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
-            index_writer.delete_term(t);
-        }
-
-        // Insertion.
+        // Prepare documents to insert/delete with read lock.
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
-        let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
+        let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        let index_writable = self.index.lock().await;
+        let mut index_writer: tantivy::IndexWriter = index_writable
+            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
+            .context(IndexCreationSnafu)?;
+        // Deletion.
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
+        }
+        // Insertion.
         for doc in docs {
             index_writer.add_document(doc).context(IndexCreationSnafu)?;
         }
         index_writer
             .commit()
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        Ok(())
+        drop(index_writable);
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+        })
     }
 
     #[must_use]
@@ -278,6 +284,7 @@ impl FullTextDatabaseIndex {
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
             base_table,
+            reader: self.reader.clone(),
         }
     }
 
@@ -561,22 +568,18 @@ mod tests {
 
         // Initial table as expected
         {
-            let index_read = index.index.read().await;
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
-            +----------------+----+---------------------+----------------+
-            | content        | id | score               | value          |
-            +----------------+----+---------------------+----------------+
-            | test content 1 | 1  | 0.26706287264823914 | test content 1 |
-            | test content 2 | 2  | 0.26706287264823914 | test content 2 |
-            | test content 3 | 3  | 0.26706287264823914 | test content 3 |
-            +----------------+----+---------------------+----------------+
+            +---------------------+----------------+----------------+----+
+            | _score              | _value         | content        | id |
+            +---------------------+----------------+----------------+----+
+            | 0.26706287264823914 | test content 1 | test content 1 | 1  |
+            | 0.26706287264823914 | test content 2 | test content 2 | 2  |
+            | 0.26706287264823914 | test content 3 | test content 3 | 3  |
+            +---------------------+----------------+----------------+----+
             ");
         }
 
@@ -593,31 +596,27 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
-            let index_read = index.index.read().await;
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             // First, ensure old data is no longer existent.
             insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
-            +----------------+----+--------------------+----------------+
-            | content        | id | score              | value          |
-            +----------------+----+--------------------+----------------+
-            | test content 2 | 2  | 0.5389965176582336 | test content 2 |
-            +----------------+----+--------------------+----------------+
+            +--------------------+----------------+----------------+----+
+            | _score             | _value         | content        | id |
+            +--------------------+----------------+----------------+----+
+            | 0.5389965176582336 | test content 2 | test content 2 | 2  |
+            +--------------------+----------------+----------------+----+
             ");
 
             // Second, ensure new data is searchable.
             insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
-            +---------------+----+--------------------+---------------+
-            | content       | id | score              | value         |
-            +---------------+----+--------------------+---------------+
-            | new content 1 | 1  | 0.8754687905311584 | new content 1 |
-            | new content 3 | 3  | 0.8754687905311584 | new content 3 |
-            +---------------+----+--------------------+---------------+
+            +--------------------+---------------+---------------+----+
+            | _score             | _value        | content       | id |
+            +--------------------+---------------+---------------+----+
+            | 0.8754687905311584 | new content 1 | new content 1 | 1  |
+            | 0.8754687905311584 | new content 3 | new content 3 | 3  |
+            +--------------------+---------------+---------------+----+
             ");
         }
     }
@@ -655,22 +654,18 @@ mod tests {
 
         // Initial table as expected
         {
-            let index_read = index.index.read().await;
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id1".to_string(), "id2".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
-            +----------------+-----+-----+---------------------+----------------+
-            | content        | id1 | id2 | score               | value          |
-            +----------------+-----+-----+---------------------+----------------+
-            | test content 1 | a   | 1   | 0.26706287264823914 | test content 1 |
-            | test content 2 | a   | 2   | 0.26706287264823914 | test content 2 |
-            | test content 3 | b   | 1   | 0.26706287264823914 | test content 3 |
-            +----------------+-----+-----+---------------------+----------------+
+            +---------------------+----------------+----------------+-----+-----+
+            | _score              | _value         | content        | id1 | id2 |
+            +---------------------+----------------+----------------+-----+-----+
+            | 0.26706287264823914 | test content 1 | test content 1 | a   | 1   |
+            | 0.26706287264823914 | test content 2 | test content 2 | a   | 2   |
+            | 0.26706287264823914 | test content 3 | test content 3 | b   | 1   |
+            +---------------------+----------------+----------------+-----+-----+
             ");
         }
 
@@ -688,31 +683,27 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
-            let index_read = index.index.read().await;
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id1".to_string(), "id2".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             // First, ensure old data is no longer existent.
             insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
-            +----------------+-----+-----+--------------------+----------------+
-            | content        | id1 | id2 | score              | value          |
-            +----------------+-----+-----+--------------------+----------------+
-            | test content 2 | a   | 2   | 0.5389965176582336 | test content 2 |
-            +----------------+-----+-----+--------------------+----------------+
+            +--------------------+----------------+----------------+-----+-----+
+            | _score             | _value         | content        | id1 | id2 |
+            +--------------------+----------------+----------------+-----+-----+
+            | 0.5389965176582336 | test content 2 | test content 2 | a   | 2   |
+            +--------------------+----------------+----------------+-----+-----+
             ");
 
             // Second, ensure new data is searchable.
             insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
-            +---------------+-----+-----+--------------------+---------------+
-            | content       | id1 | id2 | score              | value         |
-            +---------------+-----+-----+--------------------+---------------+
-            | new content 1 | a   | 1   | 0.8754687905311584 | new content 1 |
-            | new content 3 | b   | 1   | 0.8754687905311584 | new content 3 |
-            +---------------+-----+-----+--------------------+---------------+
+            +--------------------+---------------+---------------+-----+-----+
+            | _score             | _value        | content       | id1 | id2 |
+            +--------------------+---------------+---------------+-----+-----+
+            | 0.8754687905311584 | new content 1 | new content 1 | a   | 1   |
+            | 0.8754687905311584 | new content 3 | new content 3 | b   | 1   |
+            +--------------------+---------------+---------------+-----+-----+
             ");
         }
     }

@@ -58,12 +58,12 @@ pub enum Error {
         valid_columns: String,
     },
 
-    #[snafu(display("Unable to get table constraints: {source}"))]
+    #[snafu(display("Failed to retrieve table constraints for the dataset: {source}"))]
     UnableToGetTableConstraints {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to convert a SchemaRef to a DFSchema: {source}"))]
+    #[snafu(display("Failed to convert the dataset schema for query planning: {source}"))]
     UnableToConvertSchemaRefToDFSchema {
         source: datafusion::error::DataFusionError,
     },
@@ -85,6 +85,9 @@ pub enum Error {
         source: fundu::ParseError,
     },
 
+    #[snafu(display("Error parsing 'snapshots_batches` as integer: {source}"))]
+    UnableToParseSnapshotsBatches { source: std::num::ParseIntError },
+
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
@@ -105,6 +108,14 @@ pub enum Error {
         "Chunking is not supported for vector engines. Disable chunking for the column '{column}', or disable the vector engine, and try again."
     ))]
     ChunkingNotSupportedForVectorEngine { column: String },
+
+    #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
+    InvalidConfiguration { config_key: String, message: String },
+
+    #[snafu(display(
+        "'snapshots_batches' is required when setting 'snapshots_trigger: batches'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotTriggerIntervalRequiresInterval,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -324,7 +335,7 @@ impl Dataset {
         self
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -549,7 +560,11 @@ impl Dataset {
                 return true;
             }
 
-            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+            return acceleration.enabled
+                && matches!(
+                    acceleration.mode,
+                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                );
         }
 
         false

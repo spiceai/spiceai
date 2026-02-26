@@ -18,6 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
+use datafusion_expr::Expr;
 use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -34,23 +35,21 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
+use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::datafusion::{DataFusion, resolved_equality};
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError,
+    auth::EndpointAuth, dataconnector::DataConnector, internal_table::Error as InternalTableError,
 };
 
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
+use datafusion_proto::bytes::Serializeable;
 
-#[cfg(feature = "cluster")]
-use {
-    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
-    crate::datafusion::cluster,
-};
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -59,8 +58,10 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    Stream, TryFutureExt,
+    future::{join_all, try_join_all},
+};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
@@ -77,9 +78,9 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
+use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
-
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
@@ -94,17 +95,27 @@ pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
+pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
 mod http;
+
+pub mod http_types {
+    pub use crate::http::v1::queries::SubmitQueryRequest;
+}
+
 mod init;
 pub mod internal_table;
+pub mod jobs;
 mod management;
 mod metrics;
+pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod otel_push_exporter;
+pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
 
@@ -115,12 +126,13 @@ pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
+pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
-mod token_providers;
+pub mod token_providers;
 pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
@@ -128,6 +140,9 @@ mod tracing_util;
 mod udtfs;
 mod view;
 mod worker;
+
+pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
+pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -145,45 +160,48 @@ pub enum Error {
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
 
-    #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
-    UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
+    #[snafu(display("Unable to start internal cluster server: {source}"))]
+    UnableToStartClusterServer { source: flight::Error },
+
+    #[snafu(display("Failed to start cluster scheduler: executor registry missing"))]
+    MissingSchedulerExecutorRegistry,
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
-    #[snafu(display("Unable to create data backend: {source}"))]
+    #[snafu(display("Failed to initialize the query engine: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach view: {source}"))]
+    #[snafu(display("Failed to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach dataset index: {source}"))]
+    #[snafu(display("Failed to attach dataset index: {source}"))]
     UnableToAttachIndex { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize data connector: {source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize catalog connector: {source}"))]
     UnableToInitializeCatalogConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM model: {source}"))]
     UnableToInitializeLlm {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize embedding model: {source}"))]
     UnableToInitializeEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM tool: {source}"))]
     UnableToInitializeLlmTool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -415,25 +433,32 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start or register Ballista executor: {source}"))]
     FailedToStartClusterExecutor {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to register scheduler: {source}"))]
+    FailedToRegisterScheduler {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to convert partition expression to SQL: {source}"))]
+    UnableToConvertPartitionExpr { source: DataFusionError },
 }
 
-#[cfg(feature = "cluster")]
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
+const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
+const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
+const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
-const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
@@ -446,7 +471,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
@@ -465,6 +490,9 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    /// On-demand metrics reader for cluster observability.
+    /// Used by `GetMetrics` RPC and executor control stream to collect local OTLP metrics.
+    metrics_reader: Option<metrics_reader::MetricsReader>,
     rate_limits: Arc<RateLimits>,
     io_runtime: Handle,
 
@@ -479,7 +507,10 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
-    #[allow(dead_code)] // used in "cluster" feature
+    /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
+    distributed: Option<DistributedNode>,
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     config: Arc<Config>,
 }
 
@@ -504,6 +535,11 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
+    }
+
+    #[must_use]
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
     }
 
     #[must_use]
@@ -536,6 +572,11 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
+    pub async fn read_app(&self) -> Option<Arc<App>> {
+        let guard = self.app.read().await;
+        guard.clone()
+    }
+
     #[must_use]
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
@@ -544,6 +585,11 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
     }
 
     #[must_use]
@@ -557,8 +603,318 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn scheduler_peers(&self) -> Option<Arc<RwLock<SchedulerPeers>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { peers, .. }) => Some(Arc::clone(peers)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn partition_assignments(&self) -> Option<Arc<RwLock<PartitionAssignments>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Executor {
+                partition_assignments,
+            }) => Some(Arc::clone(partition_assignments)),
+            _ => None,
+        }
+    }
+
+    pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+        }) = self.distributed.as_ref()
+        {
+            let mut guard = partition_assignments.write().await;
+            guard.clone_from(&assignments);
+            drop(guard); // drop lock before updating tables
+
+            // Update all assigned tables
+            for table in assignments.keys() {
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table.clone(), &assignments)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to set partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    pub async fn update_partition_assignments(
+        &self,
+        new_partitions: HashMap<String, Vec<Vec<u8>>>,
+        removed_partitions: HashMap<String, Vec<Vec<u8>>>,
+    ) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+        }) = self.distributed.as_ref()
+        {
+            let mut guard = partition_assignments.write().await;
+
+            // Handle removed partitions
+            for (table_name, partitions) in &removed_partitions {
+                let table_ref = TableReference::parse_str(table_name);
+                if let Some(current_partitions) = guard.get_mut(&table_ref) {
+                    for partition_bytes in partitions {
+                        if let Ok(partition_expr) =
+                            Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                        {
+                            current_partitions.retain(|p| p != &partition_expr);
+                        } else {
+                            tracing::warn!(
+                                "Failed to deserialize removed partition expression for table {table_name}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Handle new partitions
+            for (table_name, partitions) in &new_partitions {
+                let table_ref = TableReference::parse_str(table_name);
+                let current_partitions = guard.entry(table_ref.clone()).or_default();
+                for partition_bytes in partitions {
+                    if let Ok(partition_expr) = ::datafusion_expr::Expr::from_bytes_with_registry(
+                        partition_bytes,
+                        self.df.ctx.as_ref(),
+                    ) {
+                        if !current_partitions.contains(&partition_expr) {
+                            current_partitions.push(partition_expr);
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Failed to deserialize new partition expression for table {table_name}"
+                        );
+                    }
+                }
+            }
+
+            // Identify all affected tables
+            let affected_tables: HashSet<_> = new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .collect();
+            drop(guard); // drop lock before updating tables
+
+            // Take a snapshot of the current assignments without holding the lock across .await
+            let assignments = {
+                let assignments_guard = partition_assignments.read().await;
+                assignments_guard.clone()
+            };
+
+            // Update all affected tables
+            for table_name in affected_tables {
+                let table_ref = TableReference::parse_str(table_name);
+
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table_ref.clone(), &assignments)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table_name}: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to update partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    pub(crate) async fn update_partition_refresh_sql(
+        &self,
+        table: TableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        // Re-construct the refresh SQL with the new partitions
+        // 1. Get the dataset to find the base refresh SQL
+        let (dataset_component, app_arc) = {
+            let Some(app_arc) = self.read_app().await else {
+                tracing::debug!("App not initialized when updating partitions for {table}");
+                return Ok(());
+            };
+
+            let Some(ds) = app_arc
+                .datasets
+                .iter()
+                .find(|ds| resolved_equality(ds.name.clone().into(), table.clone()))
+            else {
+                tracing::debug!("Dataset {table} not found in App when updating partitions");
+                return Ok(());
+            };
+            (ds.clone(), Arc::clone(&app_arc))
+        };
+
+        let Ok(dataset) =
+            crate::component::dataset::builder::DatasetBuilder::try_from(dataset_component)
+                .and_then(|mut b| {
+                    b = b.with_app(app_arc);
+                    b.with_runtime(Arc::new(self.clone())).build().context(
+                        UnableToBuildDatasetSnafu {
+                            dataset: table.to_string(),
+                        },
+                    )
+                })
+        else {
+            tracing::warn!("Failed to build dataset {table} when updating partitions");
+            return Ok(());
+        };
+
+        // 2. Construct the new SQL
+        let new_sql = update_partitioning_filter_in_refresh_sql(
+            dataset
+                .acceleration
+                .as_ref()
+                .and_then(|a| a.refresh_sql.as_deref()),
+            &table,
+            assignments,
+        )
+        .context(UnableToConvertPartitionExprSnafu)?;
+
+        // 3. Update the AcceleratedTable
+        if let Err(e) = self
+            .datafusion()
+            .update_refresh_sql(table.clone(), new_sql)
+            .await
+        {
+            tracing::error!("Failed to update refresh SQL for {table}: {e}");
+        } else {
+            tracing::info!("Updated partition assignments for {table}");
+            // Trigger a refresh to load the data for the new partitions
+            if let Err(e) = self.datafusion().refresh_table(&table, None).await {
+                tracing::warn!(
+                    "Failed to trigger refresh for {table} after updating partitions: {e}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    ///
+    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
+    /// a write lock (e.g., during initialization), this returns `None`.
+    #[must_use]
+    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_manager, ..
+            }) => {
+                if let Ok(guard) = partition_manager.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Partition manager is currently being initialized. Returning None."
+                    );
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Sets the partition manager for accelerated table partition metadata.
+    pub async fn set_partition_manager(&self, manager: Arc<PartitionManager>) {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_manager, ..
+            }) => {
+                let mut guard = partition_manager.write().await;
+                *guard = Some(manager);
+            }
+            Some(DistributedNode::Executor { .. }) => {
+                tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set partition manager on a non-cluster runtime. Ignoring."
+                );
+            }
+        }
+    }
+
+    /// Returns the metrics reader for on-demand OTLP metrics collection.
+    ///
+    /// This is used in cluster mode by:
+    /// - `GetMetrics` RPC to return local metrics to peer schedulers
+    /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
+    pub fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
+        self.metrics_reader.as_ref()
+    }
+
+    /// Returns the job executor for async SQL queries if available (cluster mode only).
+    ///
+    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
+    /// a write lock (e.g., during initialization), this returns `None`. The caller
+    /// should be aware that a `None` result could mean either:
+    /// 1. Async jobs are not enabled (not in cluster mode), or
+    /// 2. The executor is being initialized (rare, transient condition)
+    #[must_use]
+    pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                if let Ok(guard) = job_executor.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Job executor is currently being initialized. Returning None. This is a transient condition during startup."
+                    );
+                    None
+                }
+            }
+            None | Some(DistributedNode::Executor { .. }) => None,
+        }
+    }
+
+    /// Sets the job executor for async SQL queries.
+    pub async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                let mut guard = job_executor.write().await;
+                *guard = Some(executor);
+            }
+            Some(DistributedNode::Executor { .. }) => {
+                tracing::warn!(
+                    "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Ignoring."
+                );
+            }
+        }
+    }
+
+    #[must_use]
     pub fn datasets_health_monitor(&self) -> Option<Arc<DatasetsHealthMonitor>> {
         self.datasets_health_monitor.clone()
+    }
+
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -596,7 +952,6 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    #[allow(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
@@ -625,51 +980,134 @@ impl Runtime {
             }
         };
 
-        // - Scheduler: does some init, but all requests handled by Flight RPC stack
+        // - Scheduler: does some init, starts internal cluster gRPC server on separate port
         // - Executor: does some init, but has a polling loop to fetch work from scheduler
-        #[cfg(feature = "cluster")]
-        let maybe_cluster_future = match self.config.cluster.mode {
-            Some(ClusterMode::Scheduler) => {
-                cluster::initialize_cluster_scheduler(&self).await?;
-                None
-            }
-            Some(ClusterMode::Executor) => Some(
-                self.start_runtime_task(
-                    CLUSTER_EXECUTOR,
-                    None,
-                    cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
+        #[expect(
+            clippy::items_after_statements,
+            reason = "type alias scoped to cluster setup"
+        )]
+        type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
+        // For distributed cluster mode, start the appropriate additional cluster components.
+        // For scheduler, this includes cluster-wide metrics collection.
+        let (maybe_cluster_future, cluster_collector): (
+            Option<BoxedClusterFuture>,
+            Option<Arc<metrics_server::cluster::ClusterMetricsCollector>>,
+        ) = match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                executor_registry,
+                peers,
+                ..
+            }) => {
+                let fut = cluster::initialize_cluster_scheduler_future(
+                    &self,
+                    Arc::clone(executor_registry),
+                    Arc::clone(peers),
                 )
-                .await,
-            ),
-            _ => None,
+                .await?;
+
+                // Create local metrics collector closure that uses MetricsReader
+                let metrics_reader_for_collector = self.metrics_reader.clone();
+                let local_metrics_collector: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+                    Arc::new(move || {
+                        metrics_reader_for_collector
+                            .as_ref()
+                            .map(metrics_reader::MetricsReader::collect_otlp)
+                            .unwrap_or_default()
+                    });
+                (
+                    fut,
+                    Some(Arc::new(
+                        metrics_server::cluster::ClusterMetricsCollector::new(
+                            Arc::clone(peers),
+                            Arc::clone(executor_registry),
+                            self.df.cluster_config.client_tls_config().cloned(),
+                            self.df.cluster_config.node_id(),
+                            local_metrics_collector,
+                        ),
+                    )),
+                )
+            }
+            Some(DistributedNode::Executor { .. }) => {
+                let executor_shutdown = CancellationToken::new();
+                let executor_fut = cluster::initialize_cluster_executor(
+                    Arc::clone(&self),
+                    executor_shutdown.clone(),
+                )
+                .await?;
+                let self_ref = Arc::clone(&self);
+                (
+                    Some(Box::pin(
+                        self_ref
+                            .start_runtime_task(
+                                CLUSTER_EXECUTOR,
+                                Some(executor_shutdown),
+                                executor_fut,
+                            )
+                            .await,
+                    )),
+                    None,
+                )
+            }
+            None => (None, None),
         };
 
         // Start Flight server
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
-        let cloned_endpoint_auth = endpoint_auth.clone();
-        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
+        let executor_endpoint_auth = endpoint_auth.clone();
+        let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
+            if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            cluster::start_executor_flight_server(
+                                config.flight_bind_address,
+                                Arc::clone(&self_ref),
+                                executor_endpoint_auth,
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
+                    )
+                    .await,
                 )
-                .await
-                .context(UnableToStartFlightServerSnafu)
-            })
-            .await;
+            } else {
+                let cloned_endpoint_auth = endpoint_auth.clone();
+                let cloned_app_ref = self.read_app().await;
 
-        #[cfg(feature = "cluster")]
-        // If this is an executor, we only need the shutdown signal and flight server
-        if matches!(self.config.cluster.mode, Some(ClusterMode::Executor)) {
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            flight::start(
+                                config.flight_bind_address,
+                                cloned_app_ref,
+                                Arc::clone(&self_ref),
+                                cloned_tls_config,
+                                cloned_endpoint_auth,
+                                Arc::clone(&self_ref.rate_limits),
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
+                    )
+                    .await,
+                )
+            };
+
+        // If this is an executor, we only need the shutdown signal, flight server, and health endpoint.
+        // Early exit to avoid starting unneeded servers: http server, metrics server, pods watcher, etc.
+        if matches!(
+            self.df.cluster_config.effective_role(),
+            Some(ClusterRole::Executor)
+        ) {
             let Some(executor_future) = maybe_cluster_future else {
                 return Err(FailedToStartClusterExecutor {
                     source: "Executor work loop not bound. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
@@ -678,30 +1116,47 @@ impl Runtime {
                 });
             };
 
-            return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)
-                .map(|_| ());
+            // Start health-only HTTP server for executor
+            let http_shutdown = CancellationToken::new();
+            let health_http_future = self
+                .start_runtime_task(
+                    HTTP_SERVER,
+                    Some(http_shutdown.clone()),
+                    http::start_health_only(config.http_bind_address, Some(http_shutdown))
+                        .map_err(Error::from),
+                )
+                .await;
+
+            return tokio::try_join!(
+                shutdown_signal_future,
+                executor_future,
+                flight_future,
+                health_http_future,
+            )
+            .map(|_| ());
         }
 
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let http_auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
-                    http_auth,
+                    auth,
                     Some(http_shutdown),
                 )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
+                .map_err(Error::from),
+            )
             .await;
 
         // Start Metrics server
@@ -711,34 +1166,15 @@ impl Runtime {
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
-                    .await
-                    .context(UnableToStartMetricsServerSnafu)
+                metrics_server::start(
+                    metrics_endpoint,
+                    prometheus_registry,
+                    cloned_tls_config,
+                    cluster_collector,
+                )
+                .await
+                .context(UnableToStartMetricsServerSnafu)
             })
-            .await;
-
-        // Start OpenTelemetry server
-        let opentelemetry_graceful_shutdown = CancellationToken::new();
-        let df_ref = Arc::clone(&self.df);
-        let cloned_tls_config = tls_config.clone();
-        let grpc_auth = endpoint_auth.grpc_auth.clone();
-
-        let opentelemetry_future = self
-            .start_runtime_task(
-                OPENTELEMETRY_SERVER,
-                Some(opentelemetry_graceful_shutdown.clone()),
-                async move {
-                    opentelemetry::start(
-                        config.open_telemetry_bind_address,
-                        df_ref,
-                        cloned_tls_config,
-                        grpc_auth,
-                        Some(opentelemetry_graceful_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartOpenTelemetryServerSnafu)
-                },
-            )
             .await;
 
         if let Some(tls_config) = tls_config {
@@ -764,11 +1200,24 @@ impl Runtime {
             .await;
 
         // wait for all servers to shut down or if any of the servers fail to start
+        if let Some(cluster_future) = maybe_cluster_future {
+            return match tokio::try_join!(
+                http_future,
+                flight_future,
+                metrics_future,
+                pods_watcher_future,
+                cluster_future,
+                shutdown_signal_future
+            ) {
+                Err(err) => Err(err),
+                _ => Ok(()),
+            };
+        }
+
         match tokio::try_join!(
             http_future,
             flight_future,
             metrics_future,
-            opentelemetry_future,
             pods_watcher_future,
             shutdown_signal_future
         ) {
@@ -779,12 +1228,11 @@ impl Runtime {
 
     /// Updates all of the component statuses to `Initializing`.
     pub async fn set_components_initializing(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -817,16 +1265,16 @@ impl Runtime {
             }
         }
 
-        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
     }
 
@@ -834,7 +1282,6 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         Arc::clone(&self).set_components_initializing().await;
 
@@ -919,7 +1366,7 @@ impl Runtime {
 
         let ctx = &self.datafusion().ctx;
         ctx.register_udtf(
-            "list_udfs",
+            udtfs::LIST_UDFS_UDTF_NAME,
             Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
         );
 
@@ -971,11 +1418,11 @@ impl Runtime {
                             break;
                         }
                         if status.is_ready() {
-                            if let Some(app) = self.app.read().await.as_ref() {
+                            if let Some(app) = self.read_app().await {
                                 let valid_datasets =
-                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
                                 let valid_catalogs =
-                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
                                 if valid_datasets.is_empty() && valid_catalogs.is_empty() {
                                     tracing::info!(
                                         "No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration."
@@ -999,7 +1446,7 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
-        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+        let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
                 tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
@@ -1068,12 +1515,12 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    async fn start_runtime_task<F>(
+    pub(crate) async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
         task_fn: F,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + use<F>
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
@@ -1149,16 +1596,23 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
-#[allow(clippy::result_large_err)]
+#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     make_spice_data_sub_directory(&[])?;
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);
     std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
     Ok(base_folder)
+}
+
+impl From<http::Error> for Error {
+    fn from(err: http::Error) -> Self {
+        Error::UnableToStartHttpServer { source: err }
+    }
 }

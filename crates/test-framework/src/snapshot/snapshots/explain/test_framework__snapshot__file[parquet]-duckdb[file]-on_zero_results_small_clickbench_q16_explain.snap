@@ -2,28 +2,27 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q16"
 ---
-+---------------+-----------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                          |
-+---------------+-----------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: count(*) DESC NULLS FIRST, fetch=10                                                     |
-|               |   Projection: hits.UserID, count(Int64(1)) AS count(*)                                        |
-|               |     Aggregate: groupBy=[[hits.UserID]], aggr=[[count(Int64(1))]]                              |
-|               |       BytesProcessedNode                                                                      |
-|               |         TableScan: hits projection=[UserID]                                                   |
-| physical_plan | SortExec: TopK(fetch=10), expr=[count(*)@1 DESC], preserve_partitioning=[false]               |
-|               |   CoalescePartitionsExec                                                                      |
-|               |     ProjectionExec: expr=[UserID@0 as UserID, count(Int64(1))@1 as count(*)]                  |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[UserID@0 as UserID], aggr=[count(Int64(1))]  |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                           |
-|               |           RepartitionExec: partitioning=Hash([UserID@0], 16), input_partitions=16             |
-|               |             AggregateExec: mode=Partial, gby=[UserID@0 as UserID], aggr=[count(Int64(1))]     |
-|               |               BytesProcessedExec                                                              |
-|               |                 SchemaCastScanExec                                                            |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1       |
-|               |                     FallbackOnZeroResultsScanExec                                             |
-|               |                       CoalescePartitionsExec                                                  |
-|               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |                           CooperativeExec                                                     |
-|               |                             DuckSqlExec sql= SELECT "UserID" FROM hits                        |
-|               |                                                                                               |
-+---------------+-----------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                         |
++---------------+----------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: count(*) DESC NULLS FIRST, fetch=10                                                    |
+|               |   Projection: hits.UserID, count(Int64(1)) AS count(*)                                       |
+|               |     Aggregate: groupBy=[[hits.UserID]], aggr=[[count(Int64(1))]]                             |
+|               |       TableScan: hits projection=[UserID]                                                    |
+| physical_plan | SortExec: TopK(fetch=10), expr=[count(*)@1 DESC], preserve_partitioning=[false]              |
+|               |   CoalescePartitionsExec                                                                     |
+|               |     ProjectionExec: expr=[UserID@0 as UserID, count(Int64(1))@1 as count(*)]                 |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[UserID@0 as UserID], aggr=[count(Int64(1))] |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                          |
+|               |           RepartitionExec: partitioning=Hash([UserID@0], 16), input_partitions=16            |
+|               |             AggregateExec: mode=Partial, gby=[UserID@0 as UserID], aggr=[count(Int64(1))]    |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1          |
+|               |                 SchemaCastScanExec                                                           |
+|               |                   FallbackOnZeroResultsScanExec                                              |
+|               |                     CoalescePartitionsExec                                                   |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1  |
+|               |                         CooperativeExec                                                      |
+|               |                           BytesProcessedExec                                                 |
+|               |                             DuckSqlExec sql= SELECT "UserID" FROM hits                       |
+|               |                                                                                              |
++---------------+----------------------------------------------------------------------------------------------+

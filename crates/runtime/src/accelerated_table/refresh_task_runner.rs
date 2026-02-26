@@ -31,8 +31,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+use std::sync::atomic::AtomicI64;
 use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
 use datafusion::{datasource::TableProvider, sql::TableReference};
@@ -51,9 +52,17 @@ pub struct RefreshTaskRunnerBuilder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
+    /// Shared with `CachingAccelerationScanExec`.
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl RefreshTaskRunnerBuilder {
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -63,6 +72,7 @@ impl RefreshTaskRunnerBuilder {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -76,6 +86,10 @@ impl RefreshTaskRunnerBuilder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
+            accelerator_write_mutex,
+            last_updated_at: Arc::new(AtomicI64::new(0)),
+            is_s3_express_acceleration: false,
         }
     }
 
@@ -105,6 +119,28 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> Self {
+        self.last_updated_at = last_updated_at;
+        self
+    }
+
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    #[must_use]
+    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> Self {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -113,8 +149,10 @@ impl RefreshTaskRunnerBuilder {
             self.federated_source,
             self.accelerator,
             self.io_runtime,
+            self.accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_metrics(self.metrics);
 
         if let Some(semaphore) = self.semaphore {
@@ -122,6 +160,13 @@ impl RefreshTaskRunnerBuilder {
         }
 
         refresh_task_builder = refresh_task_builder.with_cpu_runtime(self.cpu_runtime);
+
+        if let Some(resource_monitor) = self.resource_monitor {
+            refresh_task_builder = refresh_task_builder.with_resource_monitor(resource_monitor);
+        }
+
+        refresh_task_builder =
+            refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 
@@ -148,7 +193,11 @@ pub struct RefreshTaskRunner {
 type RefreshRunFuture =
     BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
 
+type RefreshTaskStartSender = Sender<Option<RefreshOverrides>>;
+type RefreshTaskCompletionReceiver = Receiver<super::Result<()>>;
+
 impl RefreshTaskRunner {
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -158,6 +207,7 @@ impl RefreshTaskRunner {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> RefreshTaskRunnerBuilder {
         RefreshTaskRunnerBuilder::new(
             runtime_status,
@@ -167,19 +217,16 @@ impl RefreshTaskRunner {
             refresh,
             accelerator,
             io_runtime,
+            accelerator_write_mutex,
         )
     }
 
-    /// # Panics
-    ///
-    /// Panics if `start` is called more than once for the same runner instance.
     pub fn start(
         &mut self,
-    ) -> (
-        Sender<Option<RefreshOverrides>>,
-        Receiver<super::Result<()>>,
-    ) {
-        assert!(self.task.is_none());
+    ) -> super::Result<(RefreshTaskStartSender, RefreshTaskCompletionReceiver)> {
+        if self.task.is_some() {
+            return Err(super::Error::RefreshTaskAlreadyStarted {});
+        }
 
         let (start_refresh, mut on_start_refresh) = mpsc::channel::<Option<RefreshOverrides>>(1);
 
@@ -253,7 +300,7 @@ impl RefreshTaskRunner {
             }
         }));
 
-        (start_refresh, on_refresh_complete)
+        Ok((start_refresh, on_refresh_complete))
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.

@@ -9,10 +9,11 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
-- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary.
+- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary, or URL to an already-running spiced instance's Flight endpoint (e.g., `http://localhost:50051` to connect to an external instance).
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 - `--disable-progress-bars`: Disable progress bars during the test.
+- `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
 ## Use cases
 
@@ -20,10 +21,11 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 
 Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In addition to the common options, this command supports the following options:
 
-- `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`.
+- `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`, `integration[http]`, `scenario`.
+- `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
 - `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
-- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Only supported for `tpch` or `tpch[parameterized]` query sets, and only supported for scale factor 1.
+- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
 - `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
 
@@ -63,6 +65,52 @@ or:
 cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
 ```
 
+##### Run a custom scenario query set with validation
+
+Scenario query sets allow you to define custom queries in a YAML file. This is useful for ad-hoc testing or when you need custom validation that doesn't fit the standard integration test pattern.
+
+```sh
+testoperator run bench \
+  -p test/spicepods/http/post_requests.yaml \
+  -s spiced \
+  --query-set scenario \
+  --scenario-query-file test/scenario/http/post_requests.yaml \
+  --validate
+```
+
+The scenario query file format:
+
+```yaml
+name: my_custom_queries # Optional name for the query set
+
+queries:
+  # Query without validation
+  - name: basic_select
+    sql: SELECT * FROM my_table
+
+  # Query with row count validation
+  - name: count_check
+    sql: SELECT COUNT(*) FROM my_table
+    expected_results:
+      row_count: 100
+
+  # Query with inline expected results
+  - name: specific_values
+    sql: SELECT id, name FROM users ORDER BY id LIMIT 2
+    expected_results:
+      columns: 'id, name'
+      rows:
+        - '1, Alice'
+        - '2, Bob'
+
+  # Query with external CSV file validation
+  # - name: full_dataset
+  #   sql: SELECT * FROM my_table ORDER BY id
+  #   expected_results: ./expected/full_dataset.csv
+```
+
+For more examples, see `test/spicepods/http/queries.yaml`.
+
 ### Running Throughput Tests
 
 A throughput test replicates a benchmark test, but runs with multiple concurrent query executors. A throughput test uses the same command options as a benchmark test, with the additional options:
@@ -94,6 +142,8 @@ testoperator run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data 
 A load test replicates a throughput test, but instead of running for a set number of query executions (2 by default for throughput tests) load tests run for a specified duration. A load test uses the same command options as a throughput test, with the additional options:
 
 - `--duration <SECONDS>`: The duration of the load test to run in seconds.
+- `--run-until-stopped`: Continue the load phase until manually interrupted (Ctrl+C). Warm-up and baseline still use `--duration` to size their runs.
+- `--mark-query-failed-if-exceeds <DURATION>`: Mark queries as failed if they exceed this duration threshold (e.g., "500ms", "2s"). Useful for identifying slow queries that should be treated as failures in metrics.
 
 A load test will match the specified duration as a best-effort. A load test will never be shorter than the specified duration, but can be longer than the specified duration if there are running queries when the end duration is passed. For example, a `--duration 10` is specified but a query that takes 60 seconds runs. The load test will end after the query finishes, taking 60 seconds instead of 10.
 
@@ -243,9 +293,30 @@ Run model evaluations (evals) test. In addition to the common options, supports 
 
 ### Running Vector Search Tests
 
-Running vector search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
 
-`testoperator run vector-search [OPTIONS]`
+`testoperator run search [OPTIONS]`
+
+### Running Text-to-SQL tests
+
+Running text to sql tests with the testoperator is still experimental.
+
+```bash
+testoperator run text-to-sql [OPTIONS]
+```
+Where options are:
+- `--model <MODEL NAME>`: The language model (named in spicepod) to perform text-to-sql.
+- `--queryset-file <FILE_PATH>`: File path to a JSONL of test questions and expected SQL (see `--queryset` for format). Cannot be used in conjunction with `--queryset`
+- `--queryset`: inline JSON array of test questions and expected SQL. Example:
+  ```bash
+    testoperator run text-to-sql --queryset '[ 
+      {"question": "how many sales have I made", "sql": "select count(1) from sales"},
+      {"question": "Who has the most sales?", "sql": "select sold_by from sales group by sold_by order by count(1) desc limit 1"}
+    ]'
+    --model foo
+  ```
+- `--sample-data-enabled`: Whether to use the `sample_data_enabled` HTTP parameter in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `sample_data_enabled`.
+- `--return-sql`: Whether to use the `Accept: application/sql` HTTP header in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `Accept`. 
 
 ### Running Append Tests
 
@@ -262,3 +333,15 @@ Append tests are not built by default, as the File connector source generation r
 ```sh
 testoperator run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
 ```
+
+### Running queries on existing `spiced` instances
+
+Testoperator supports running query sets against `spiced` instances that are already running. This option is useful for running testoperator quickly, locally, for development or performance comparisons (e.g. between versions, changes, etc).
+
+To run queries on an existing `spiced` instance, ensure your `spiced` instance is running and ready. Then, run testoperator with:
+
+```sh
+testoperator run query --query-set tpch --query-overrides duckdb
+```
+
+Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. Telemetry and metrics emission is not supported.

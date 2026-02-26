@@ -6,23 +6,43 @@ all: build
 
 .PHONY: build-cli
 build-cli:
-	make -C bin/spice
+	cargo build --release -p spice
 
 .PHONY: build-cli-dev
 build-cli-dev:
-	export DEV=true; make -C bin/spice
+	cargo build -p spice
 
 .PHONY: build-runtime
 build-runtime:
 	make -C bin/spiced
+
+.PHONY: build-validator
+build-validator:
+	cargo build --release -p spicepod-validator
 
 .PHONY: build
 build: build-cli build-runtime
 
 .PHONY: build-dev
 build-dev:
-	export DEV=true; make -C bin/spice
+	cargo build -p spice
 	export DEV=true; make -C bin/spiced
+
+.PHONY: build-testoperator-dev
+build-testoperator-dev:
+	cargo build -p testoperator --all-features
+
+.PHONY: build-testoperator
+build-testoperator:
+	cargo build --release -p testoperator --all-features
+
+.PHONY: build-spidapter-dev
+build-spidapter-dev:
+	cargo build -p spidapter --all-features
+
+.PHONY: build-spidapter
+build-spidapter:
+	cargo build --release -p spidapter --all-features
 
 .PHONY: ci
 ci:
@@ -68,35 +88,78 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-.PHONY: lint lint-go lint-rust
-lint: lint-go lint-rust
+.PHONY: lint lint-rust
+lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
 	cargo fmt --all
-	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
-
-lint-go:
-	go vet ./...
-	golangci-lint run
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
@@ -134,6 +197,12 @@ docker-run:
 	docker stop spiceai && docker rm spiceai || true
 	docker run --name spiceai -p 8090:8090 -p 50051:50051 spiceai-rust:local-dev
 
+.PHONY: docker-local
+docker-local:
+	cp ~/.spice/bin/spiced .spiced-local-tmp
+	docker build -f Dockerfile.local -t spiceai.org/spiceai:local .
+	rm .spiced-local-tmp
+
 .PHONY: deps-licenses
 dep-licenses:
 	@cargo install cargo-license --quiet
@@ -148,33 +217,87 @@ display-deps:
 ################################################################################
 # Target: install                                                              #
 ################################################################################
+# Default install includes models. Use -data suffix variants to build without models.
+# Data-only features (default features minus models)
+# Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+
 .PHONY: install
 install: build
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
-.PHONY: install-with-models
-install-with-models:
-	make install SPICED_NON_DEFAULT_FEATURES="models"
+.PHONY: install-dev
+install-dev: build-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
-.PHONY: install-with-models-dev
-install-with-models-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models"
+# Data-only variants (without models)
+.PHONY: install-data-only
+install-data-only:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
 
-.PHONY: install-with-models-metal-dev
-install-with-models-metal-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal"
+.PHONY: install-data-only-dev
+install-data-only-dev:
+	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
 
-install-with-models-metal:
-	make install SPICED_NON_DEFAULT_FEATURES="models,metal"
+# Metal variants (with GPU acceleration)
+.PHONY: install-metal
+install-metal:
+	make install SPICED_NON_DEFAULT_FEATURES="metal"
 
-install-with-models-cuda:
-	make install SPICED_NON_DEFAULT_FEATURES="models,cuda"
+.PHONY: install-metal-dev
+install-metal-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="metal"
 
-.PHONY: install-with-odbc
-install-with-odbc:
+.PHONY: install-data-only-metal
+install-data-only-metal:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
+
+.PHONY: install-data-only-metal-dev
+install-data-only-metal-dev:
+	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
+
+# CUDA variants
+.PHONY: install-cuda
+install-cuda:
+	make install SPICED_NON_DEFAULT_FEATURES="cuda"
+
+.PHONY: install-data-only-cuda
+install-data-only-cuda:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),cuda"
+
+# ODBC variants
+.PHONY: install-odbc
+install-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
+
+# NFS variants
+.PHONY: install-nfs
+install-nfs:
+	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+.PHONY: install-testoperator-dev
+install-testoperator-dev: build-testoperator-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-testoperator
+install-testoperator: build-testoperator
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-spidapter-dev
+install-spidapter-dev: build-spidapter-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/spidapter ~/.spice/bin/spidapter
+
+.PHONY: install-spidapter
+install-spidapter: build-spidapter
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-cli
 install-cli: build-cli
@@ -186,29 +309,23 @@ install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
-################################################################################
-# Target: install-dev                                                          #
-################################################################################
-.PHONY: install-dev
-install-dev: build-dev
-	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/debug/spiced ~/.spice/bin/spiced
-
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spice ~/.spice/bin/spice
 
 ################################################################################
-# Target: modtidy                                                              #
+# Target: distributed                                                          #
 ################################################################################
-.PHONY: modtidy
-modtidy:
-	go mod tidy
+.PHONY: distributed
+distributed:
+	make install SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
 
-
-
+.PHONY: distributed-dev
+distributed-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
 
 ################################################################################
 # Target: generate-acknowledgements                                            #
@@ -218,16 +335,8 @@ ACKNOWLEDGEMENTS_PATH := acknowledgements.md
 .PHONY: generate-acknowledgements
 generate-acknowledgements:
 	echo "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > $(ACKNOWLEDGEMENTS_PATH)
-	make generate-acknowledgements-go
 	make generate-acknowledgements-rust
 	make generate-acknowledgements-formatting
-
-.PHONY: generate-acknowledgements-go
-generate-acknowledgements-go:
-	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
-	go get github.com/google/go-licenses
-	go install github.com/google/go-licenses
-	cd bin/spice && go-licenses report --ignore github.com/spiceai/spiceai . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && cd ../../
 
 .PHONY: generate-acknowledgements-rust
 generate-acknowledgements-rust:

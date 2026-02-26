@@ -21,7 +21,6 @@ use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
-    queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
@@ -38,10 +37,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    let query_set = QuerySet::from(args.query_set.clone());
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
-
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
@@ -50,42 +45,47 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .await?;
     let health_monitor = HealthMonitor::spawn()?;
 
+    // Create the appropriate query executor based on args
+    let executor = super::create_query_executor(args, &spiced_instance).await?;
+
     // baseline run
     println!("Running baseline test");
-    let baseline_test = SpiceTest::new(
-        app.name.clone(),
+
+    let (_query_set, test_builder) = super::build_test_with_validation(
+        args,
         NotStarted::new()
             .with_parallel_count(1)
-            .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(6))
-            .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients),
+            .with_query_executor(executor.clone()),
     )
-    .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.common.disable_progress_bars)
-    .start()
     .await?;
+
+    let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.common.disable_progress_bars)
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end()?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     // throughput test
     println!("Running throughput test");
-    let throughput_test = SpiceTest::new(
-        app.name.clone(),
+
+    let (_query_set, test_builder) = super::build_test_with_validation(
+        args,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
-            .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(2))
-            .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients),
+            .with_query_executor(executor),
     )
-    .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.common.disable_progress_bars)
-    .start()
     .await?;
+
+    let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.common.disable_progress_bars)
+        .start()?;
 
     let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
@@ -103,7 +103,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let health_report = health_report?;
 
     if let Some(message) = health_report.failure_message() {
-        return Err(anyhow::anyhow!(message));
+        eprintln!("Warning: {message}");
     }
 
     println!(

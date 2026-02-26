@@ -33,6 +33,12 @@ use snafu::{ResultExt as _, Snafu};
 /// Maximum number of buckets, chosen to support large-scale partitioning while preventing excessive memory usage.
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
 
+/// Compile-time assertion that `MAX_NUM_BUCKETS` does not exceed `i32::MAX`
+const _: () = assert!(
+    MAX_NUM_BUCKETS <= i32::MAX as i64,
+    "MAX_NUM_BUCKETS exceeds i32::MAX"
+);
+
 /// Static `RandomState` for deterministic hashing.
 static RANDOM_STATE: LazyLock<RandomState> =
     LazyLock::new(|| RandomState::with_seeds(0x53, 0x50, 0x49, 0x43_45));
@@ -53,8 +59,10 @@ pub enum BucketError {
     #[snafu(display("DataFusion error: {source}"))]
     DataFusion { source: DataFusionError },
 
-    #[snafu(display("First argument must be a positive Int64, got {value}"))]
-    InvalidFirstArgType { value: ColumnarValue },
+    #[snafu(display(
+        "Bucket function first argument must be a positive number, got {description}. Ensure the function is called like `bucket(num_buckets, column)`, for example `bucket(10, my_column)`."
+    ))]
+    InvalidFirstArgType { description: String },
 
     #[snafu(display("Bucket value is larger than the storage type: {source}"))]
     BucketLargerThanType {
@@ -128,7 +136,10 @@ impl ScalarUDFImpl for Bucket {
                 *n
             }
             arg => {
-                return Err(BucketError::InvalidFirstArgType { value: arg.clone() }.into());
+                return Err(BucketError::InvalidFirstArgType {
+                    description: describe_columnar_value(arg),
+                }
+                .into());
             }
         };
 
@@ -147,6 +158,19 @@ impl ScalarUDFImpl for Bucket {
     }
 }
 
+/// Creates a human-readable description of a `ColumnarValue` for error messages.
+/// Avoids printing array contents which can be very long and confusing.
+fn describe_columnar_value(value: &ColumnarValue) -> String {
+    match value {
+        ColumnarValue::Array(array) => {
+            format!("a column of type {}", array.data_type())
+        }
+        ColumnarValue::Scalar(scalar) => {
+            format!("a scalar value {scalar}")
+        }
+    }
+}
+
 fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue, DataFusionError> {
     if scalar.is_null() {
         return Ok(ScalarValue::Int32(None));
@@ -161,7 +185,6 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue,
     )))
 }
 
-#[allow(clippy::missing_panics_doc)]
 fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
@@ -174,15 +197,12 @@ fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array
         &hash_array,
         &Int32Array::from_value(num_buckets, array.len()),
         |hash, n| {
-            const _: () = assert!(
-                MAX_NUM_BUCKETS <= i32::MAX as i64,
-                "MAX_NUM_BUCKETS exceeds i32::MAX"
-            );
-            #[allow(clippy::expect_used)]
-            // SAFETY: unwrap is safe because we restrict MAX_NUM_BUCKETS at compile time
-            u64::try_from(n)
-                .and_then(|n| i32::try_from(hash % n))
-                .expect("MAX_NUM_BUCKETS smaller than i32 positive maximum")
+            let Ok(n) = u64::try_from(n).and_then(|n| i32::try_from(hash % n)) else {
+                // MAX_NUM_BUCKETS is checked at compile-time to be less than i32::MAX
+                unreachable!("MAX_NUM_BUCKETS smaller than i32 positive maximum");
+            };
+
+            n
         },
     )?;
 
@@ -340,7 +360,7 @@ mod tests {
             config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
-        assert!(result.is_err());
+        result.expect_err("Should fail for invalid num_buckets");
     }
 
     #[test]
@@ -357,7 +377,7 @@ mod tests {
             config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
-        assert!(result.is_err());
+        result.expect_err("Should fail for invalid num_buckets");
     }
 
     #[test]
@@ -430,5 +450,72 @@ mod tests {
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("null_array_input", result);
+    }
+
+    #[test]
+    fn test_first_arg_column_error_message() {
+        // This test verifies the improved error message when the first argument
+        // is a column (array) instead of a scalar Int64 literal.
+        // See: https://github.com/spiceai/spiceai/issues/8238
+        let udf = Bucket::new();
+        let args = ScalarFunctionArgs {
+            args: vec![
+                // First argument is an array (column) instead of a scalar
+                ColumnarValue::Array(Arc::new(arrow::array::Int64Array::from(vec![
+                    0, 1, 2, 3, 4,
+                ]))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(10))),
+            ],
+            number_rows: 5,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        let result = udf.invoke_with_args(args);
+        let error = result.expect_err("Should fail when first argument is a column");
+        let error_msg = error.to_string();
+
+        // Verify the error message is helpful and doesn't dump array contents
+        assert!(
+            error_msg.contains("Bucket function first argument must be a positive number, got"),
+            "Error message should indicate the first argument must be a literal: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("bucket(10, my_column)"),
+            "Error message should provide a usage example: {error_msg}"
+        );
+        // Make sure we don't dump the array values
+        assert!(
+            !error_msg.contains("+---"),
+            "Error message should not contain table formatting: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn test_first_arg_wrong_scalar_type_error_message() {
+        // Test error message when first argument is a scalar but wrong type
+        let udf = Bucket::new();
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("not_a_number".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(10))),
+            ],
+            number_rows: 1,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        let result = udf.invoke_with_args(args);
+        let error = result.expect_err("Should fail when first argument is wrong scalar type");
+        let error_msg = error.to_string();
+
+        assert!(
+            error_msg.contains("Bucket function first argument must be a positive number"),
+            "Error message should indicate the first argument must be a literal: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("a scalar value"),
+            "Error message should describe what was received: {error_msg}"
+        );
     }
 }

@@ -44,7 +44,7 @@ impl DatasetCheckpoint {
                 );
                 conn.execute(&create_table, [])?;
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(Error::external)
@@ -73,7 +73,7 @@ impl DatasetCheckpoint {
                     )?;
                 }
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(Error::external)
@@ -95,7 +95,7 @@ impl DatasetCheckpoint {
                     format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
-                Ok(rows.next()?.is_some())
+                Ok::<bool, rusqlite::Error>(rows.next()?.is_some())
             })
             .await
             .map_err(Error::external)
@@ -122,7 +122,9 @@ impl DatasetCheckpoint {
             .call(move |conn| {
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([&dataset_name])?;
-                Ok(rows.next()?.map(|row| row.get(0)))
+                Ok::<Option<std::result::Result<DateTime<Utc>, rusqlite::Error>>, rusqlite::Error>(
+                    rows.next()?.map(|row| row.get(0)),
+                )
             })
             .await
             .map_err(Error::external)?
@@ -158,7 +160,7 @@ impl DatasetCheckpoint {
                 );
                 conn.execute(&upsert, [&dataset_name, &schema_json])?;
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(Error::external)
@@ -187,7 +189,7 @@ impl DatasetCheckpoint {
                 let mut rows = stmt.query([dataset_name])?;
 
                 if let Some(row) = rows.next()? {
-                    Ok(row.get(0)?)
+                    Ok::<Option<String>, rusqlite::Error>(Some(row.get(0)?))
                 } else {
                     Ok(None)
                 }
@@ -270,7 +272,7 @@ mod tests {
                     ["legacy_dataset"],
                 )?;
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .expect("Failed to create legacy table");
@@ -436,9 +438,7 @@ mod tests {
                     let updated_at: String = row.get(1)?;
                     Ok((created_at, updated_at))
                 } else {
-                    Err(tokio_rusqlite::Error::Other(
-                        "No checkpoint found".into(),
-                    ))
+                    Err(rusqlite::Error::QueryReturnedNoRows)
                 }
             })
             .await

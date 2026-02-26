@@ -56,14 +56,22 @@ impl DynamoDBRequestPlanBuilder {
         filters: &[Expr],
         projection_schema: &SchemaRef,
         limit: Option<usize>,
+        json_nesting_static_fields: Option<&HashSet<String>>,
     ) -> DataFusionResult<DynamoDBRequestPlan> {
         // Separate key filters from other filters
         let (key_filters, other_filters) = self.separate_key_filters(filters);
 
         let mut attribute_names = self.extract_attribute_names(filters);
-        self.add_projection_aliases(projection_schema, &mut attribute_names);
 
-        let projection_expr = self.build_projection_expression(projection_schema);
+        if json_nesting_static_fields.is_none() {
+            self.add_projection_aliases(projection_schema, &mut attribute_names);
+        }
+
+        let projection_expr = if json_nesting_static_fields.is_some() {
+            None
+        } else {
+            self.build_projection_expression(projection_schema)
+        };
 
         let limit_i32 = limit
             .map(|l| {
@@ -82,7 +90,7 @@ impl DynamoDBRequestPlanBuilder {
                 limit_i32,
             )
         } else {
-            Ok(self.build_scan_request(filters, projection_expr, attribute_names, limit_i32))
+            self.build_scan_request(filters, projection_expr, attribute_names, limit_i32)
         }
     }
 
@@ -111,7 +119,7 @@ impl DynamoDBRequestPlanBuilder {
                 query_params = query_params.limit(l);
             }
         } else {
-            let (filter_str, filter_values) = self.build_filter_expression(other_filters);
+            let (filter_str, filter_values) = self.build_filter_expression(other_filters)?;
             key_values.extend(filter_values);
             query_params = query_params.filter_expression(filter_str);
         }
@@ -138,7 +146,7 @@ impl DynamoDBRequestPlanBuilder {
         projection: Option<String>,
         attribute_names: HashMap<String, String>,
         limit: Option<i32>,
-    ) -> DynamoDBRequestPlan {
+    ) -> DataFusionResult<DynamoDBRequestPlan> {
         let mut scan_params =
             ScanParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
@@ -150,7 +158,7 @@ impl DynamoDBRequestPlanBuilder {
                 scan_params = scan_params.limit(l);
             }
         } else {
-            let (filter_str, attribute_values) = self.build_filter_expression(filters);
+            let (filter_str, attribute_values) = self.build_filter_expression(filters)?;
             if !filter_str.is_empty() {
                 scan_params = scan_params.filter_expression(filter_str);
             }
@@ -168,7 +176,7 @@ impl DynamoDBRequestPlanBuilder {
         }
 
         let scan = scan_params.build();
-        DynamoDBRequestPlan::Scan(scan)
+        Ok(DynamoDBRequestPlan::Scan(scan))
     }
 
     fn extract_attribute_names(&self, filters: &[Expr]) -> HashMap<String, String> {
@@ -233,9 +241,9 @@ impl DynamoDBRequestPlanBuilder {
     fn build_filter_expression(
         &self,
         filters: &[Expr],
-    ) -> (String, HashMap<String, AttributeValue>) {
+    ) -> DataFusionResult<(String, HashMap<String, AttributeValue>)> {
         if filters.is_empty() {
-            return (String::new(), HashMap::new());
+            return Ok((String::new(), HashMap::new()));
         }
 
         let mut attribute_values = HashMap::new();
@@ -243,18 +251,15 @@ impl DynamoDBRequestPlanBuilder {
 
         let filter_parts: Vec<String> = filters
             .iter()
-            .filter_map(|expr| {
-                self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter)
-                    .ok()
-            })
-            .collect();
+            .map(|expr| self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter))
+            .collect::<DataFusionResult<Vec<String>>>()?;
 
         if filter_parts.is_empty() {
-            return (String::new(), HashMap::new());
+            return Ok((String::new(), HashMap::new()));
         }
 
         let filter_expr = filter_parts.join(" AND ");
-        (filter_expr, attribute_values)
+        Ok((filter_expr, attribute_values))
     }
 
     fn expr_to_filter_string(
@@ -340,7 +345,7 @@ impl DynamoDBRequestPlanBuilder {
                 }
             } else {
                 // For non-flattened fields, add the full name
-                attribute_names.insert(format!("#{field_name}"), field_name.to_string());
+                attribute_names.insert(format!("#{field_name}"), field_name.clone());
             }
         }
     }
@@ -435,8 +440,10 @@ fn try_extract_key_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
     use aws_sdk_dynamodb::types::AttributeValue;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{col, lit};
     use std::sync::Arc;
 
@@ -448,6 +455,11 @@ mod tests {
             Field::new("age", DataType::Int64, true),
             Field::new("active", DataType::Boolean, true),
             Field::new("user.email", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
         ]));
 
         let mut flattened_fields = HashSet::new();
@@ -459,6 +471,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             flattened_fields,
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -480,7 +493,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -528,7 +541,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, Some(10))
+            .build_request_plan(&filters, &projection, Some(10), None)
             .expect("request plan");
 
         match result {
@@ -579,7 +592,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -627,7 +640,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, Some(10))
+            .build_request_plan(&filters, &projection, Some(10), None)
             .expect("request plan");
 
         match result {
@@ -678,7 +691,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -701,7 +714,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -743,7 +756,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -786,7 +799,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, Some(10))
+            .build_request_plan(&filters, &projection, Some(10), None)
             .expect("request plan");
 
         match result {
@@ -806,7 +819,8 @@ mod tests {
         let filters = vec![col("id").eq(lit("user123"))];
         let projection = create_projection_schema(&["id", "name"]);
 
-        let result = builder.build_request_plan(&filters, &projection, Some(i32::MAX as usize + 1));
+        let result =
+            builder.build_request_plan(&filters, &projection, Some(i32::MAX as usize + 1), None);
 
         assert!(result.is_err());
         assert!(
@@ -835,7 +849,7 @@ mod tests {
             let projection = create_projection_schema(&["id", "name"]);
 
             let result = builder
-                .build_request_plan(&filters, &projection, None)
+                .build_request_plan(&filters, &projection, None, None)
                 .expect("request plan");
 
             match result {
@@ -870,7 +884,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -910,7 +924,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -956,7 +970,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -985,7 +999,7 @@ mod tests {
         let projection = Arc::new(Schema::empty());
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -1014,7 +1028,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         // OR anywhere in the filter tree should force a scan
@@ -1044,6 +1058,7 @@ mod tests {
             "id".to_string(),
             None, // No sort key
             HashSet::new(),
+            "2006-01-02T15:04:05.000Z07:00",
         );
 
         let builder = DynamoDBRequestPlanBuilder::new(table_schema);
@@ -1052,7 +1067,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -1081,7 +1096,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, Some(25))
+            .build_request_plan(&filters, &projection, Some(25), None)
             .expect("request plan");
 
         match result {
@@ -1102,7 +1117,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -1131,7 +1146,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -1182,7 +1197,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -1227,7 +1242,7 @@ mod tests {
         let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, &projection, None)
+            .build_request_plan(&filters, &projection, None, None)
             .expect("request plan");
 
         match result {
@@ -1259,7 +1274,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filter = col("age").eq(lit(25i64));
-        let (expr, values) = builder.build_filter_expression(&[filter]);
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
 
         assert_eq!(expr, "(#age = :v0)");
         assert_eq!(values.len(), 1);
@@ -1274,7 +1289,9 @@ mod tests {
         let filter1 = col("age").gt(lit(18i64));
         let filter2 = col("active").eq(lit(true));
 
-        let (expr, values) = builder.build_filter_expression(&[filter1, filter2]);
+        let (expr, values) = builder
+            .build_filter_expression(&[filter1, filter2])
+            .expect("filter");
 
         assert_eq!(expr, "(#age > :v0) AND (#active = :v1)");
         assert_eq!(values.len(), 2);
@@ -1287,7 +1304,7 @@ mod tests {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
-        let (expr, values) = builder.build_filter_expression(&[]);
+        let (expr, values) = builder.build_filter_expression(&[]).expect("filter");
 
         assert!(expr.is_empty());
         assert!(values.is_empty());
@@ -1300,7 +1317,7 @@ mod tests {
 
         // (age > 18 AND active = true)
         let filter = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
-        let (expr, values) = builder.build_filter_expression(&[filter]);
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
 
         assert_eq!(expr, "((#age > :v0) AND (#active = :v1))");
         assert_eq!(values.len(), 2);
@@ -1402,6 +1419,68 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_with_timestamp_string_comparison() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filter = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        )));
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
+        assert_eq!(expr, "(#created_at > :v0)");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+
+        let filter = lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        ))
+        .eq(col("created_at"));
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
+        assert_eq!(expr, "(:v0 = #created_at)");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_filter_with_timestamp_string_comparison_complex() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        )));
+        let f2 = col("age").eq(lit(25)).and(f1);
+        let f3 = col("name").eq(lit("John"));
+        let (expr, values) = builder.build_filter_expression(&[f2, f3]).expect("filter");
+        assert_eq!(
+            expr,
+            "((#age = :v0) AND (#created_at > :v1)) AND (#name = :v2)"
+        );
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::N("25".to_string()))
+        );
+        assert_eq!(
+            values.get(":v1"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+        assert_eq!(
+            values.get(":v2"),
+            Some(&AttributeValue::S("John".to_string()))
+        );
+    }
+
+    #[test]
     fn test_filter_with_different_data_types() {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
@@ -1410,8 +1489,9 @@ mod tests {
         let int_filter = col("age").eq(lit(30i64));
         let bool_filter = col("active").eq(lit(true));
 
-        let (expr, values) =
-            builder.build_filter_expression(&[string_filter, int_filter, bool_filter]);
+        let (expr, values) = builder
+            .build_filter_expression(&[string_filter, int_filter, bool_filter])
+            .expect("filter");
 
         assert!(expr.contains("#name"));
         assert!(expr.contains("#age"));
@@ -1426,7 +1506,7 @@ mod tests {
 
         let filter = col(r#""user.email""#).eq(lit("john@example.com"));
 
-        let (expr, values) = builder.build_filter_expression(&[filter]);
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
 
         assert_eq!(expr, "(#user.#email = :v0)");
         assert_eq!(values.len(), 1);
@@ -1434,5 +1514,230 @@ mod tests {
             values.get(":v0"),
             Some(&AttributeValue::S("john@example.com".to_string()))
         );
+    }
+
+    #[test]
+    fn test_scan_with_json_nesting_no_filters() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![];
+        let projection = create_projection_schema(&["id", "name"]);
+
+        let static_fields = HashSet::from(["id".to_string(), "sort_key".to_string()]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None, Some(&static_fields))
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Scan(params) => {
+                assert_eq!(params.table_name, "test_table");
+
+                // No projection expression when json nesting is enabled
+                assert_eq!(params.projection_expression, None);
+
+                // No expression attribute names when no filters
+                assert!(
+                    params.expression_attribute_names.is_none()
+                        || params
+                            .expression_attribute_names
+                            .as_ref()
+                            .expect("value")
+                            .is_empty()
+                );
+
+                assert_eq!(params.filter_expression, None);
+                assert_eq!(params.expression_attribute_values, None);
+            }
+            DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[test]
+    fn test_scan_with_json_nesting_and_filters() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![col("age").gt(lit(18_i64))];
+        let projection = create_projection_schema(&["id", "name", "age"]);
+
+        let static_fields = HashSet::from(["id".to_string(), "sort_key".to_string()]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None, Some(&static_fields))
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Scan(params) => {
+                assert_eq!(params.table_name, "test_table");
+
+                // No projection expression when json nesting is enabled
+                assert_eq!(params.projection_expression, None);
+
+                // Should have attribute names ONLY from filters (not from projection)
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
+                assert_eq!(attr_names.get("#age"), Some(&"age".to_string()));
+                // Should NOT have projection fields
+                assert!(!attr_names.contains_key("#id"));
+                assert!(!attr_names.contains_key("#name"));
+
+                // Should have filter expression
+                assert_eq!(params.filter_expression, Some("(#age > :v0)".to_string()));
+
+                // Should have attribute values for filter
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::N("18".to_string()))
+                );
+            }
+            DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[test]
+    fn test_query_with_json_nesting() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![col("id").eq(lit("user123")), col("age").gt(lit(25_i64))];
+        let projection = create_projection_schema(&["id", "name", "age"]);
+
+        let static_fields = HashSet::from(["id".to_string(), "sort_key".to_string()]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None, Some(&static_fields))
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Query(params) => {
+                assert_eq!(params.table_name, "test_table");
+
+                // No projection expression when json nesting is enabled
+                assert_eq!(params.projection_expression, None);
+
+                // Key condition for partition key
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#id = :v1000)".to_string())
+                );
+
+                // Filter expression for non-key filter
+                assert_eq!(params.filter_expression, Some("(#age > :v0)".to_string()));
+
+                // Should have attribute names ONLY from filters
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
+                assert_eq!(attr_names.get("#id"), Some(&"id".to_string()));
+                assert_eq!(attr_names.get("#age"), Some(&"age".to_string()));
+                // Should NOT have projection-only fields
+                assert!(!attr_names.contains_key("#name"));
+
+                // Should have attribute values for both key condition and filter
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
+                assert_eq!(
+                    attr_values.get(":v1000"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::N("25".to_string()))
+                );
+            }
+            DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[test]
+    fn test_query_with_json_nesting_and_sort_key() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("sort_key").eq(lit("2024-01-01")),
+        ];
+        let projection = create_projection_schema(&["id", "sort_key", "name"]);
+
+        let static_fields = HashSet::from(["id".to_string(), "sort_key".to_string()]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None, Some(&static_fields))
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Query(params) => {
+                assert_eq!(params.table_name, "test_table");
+
+                // No projection expression when json nesting is enabled
+                assert_eq!(params.projection_expression, None);
+
+                // Both partition and sort keys in key condition
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#id = :v1000) AND (#sort_key = :v1001)".to_string())
+                );
+
+                // No additional filter expression
+                assert_eq!(params.filter_expression, None);
+
+                // Should have attribute names for keys only (not projection)
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
+                assert_eq!(attr_names.len(), 2);
+                assert_eq!(attr_names.get("#id"), Some(&"id".to_string()));
+                assert_eq!(attr_names.get("#sort_key"), Some(&"sort_key".to_string()));
+
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
+                assert_eq!(
+                    attr_values.get(":v1000"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1001"),
+                    Some(&AttributeValue::S("2024-01-01".to_string()))
+                );
+            }
+            DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[test]
+    fn test_without_json_nesting_has_projection() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![];
+        let projection = create_projection_schema(&["id", "name"]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None, None)
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Scan(params) => {
+                // Should have projection expression when json nesting is NOT enabled
+                assert!(params.projection_expression.is_some());
+
+                // Should have attribute names for projection
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
+                assert!(attr_names.contains_key("#id"));
+                assert!(attr_names.contains_key("#name"));
+            }
+            DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
+        }
     }
 }

@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
     LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::request_context_extension::get_current_datafusion, status::ComponentStatus,
+    datafusion::request_context_extension::get_current_datafusion,
 };
 use app::App;
 use axum::{
@@ -45,6 +46,9 @@ pub struct DatasetFilter {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema, utoipa::IntoParams))]
 pub struct DatasetQueryParams {
+    /// Whether to include the status field in the response. When `true`, the response includes
+    /// the current status of each dataset (e.g., `ready`, `initializing`, `refreshing`, `error`).
+    /// Defaults to `false`.
     #[serde(default)]
     status: bool,
 
@@ -53,33 +57,11 @@ pub struct DatasetQueryParams {
     format: Format,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub struct DatasetResponseItem {
-    /// The source where the dataset is located
-    pub from: String,
+// Re-export the shared type for backwards compatibility
+pub use runtime_api_types::v1::DatasetInfo as DatasetResponseItem;
 
-    /// The name of the dataset
-    pub name: String,
-
-    /// Whether replication is enabled for the dataset
-    pub replication_enabled: bool,
-
-    /// Whether acceleration is enabled for the dataset
-    pub acceleration_enabled: bool,
-
-    /// Optional status of the dataset
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<ComponentStatus>,
-
-    /// Custom properties for the dataset
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-    pub properties: HashMap<String, serde_json::Value>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
+#[expect(dead_code)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
     pub key: String,
@@ -91,6 +73,9 @@ pub(crate) struct Property {
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
 /// and additional filters can be applied using query parameters.
+///
+/// Use `status=true` query parameter to include the current status of each dataset in the response.
+/// Possible status values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/datasets",
@@ -98,35 +83,38 @@ pub(crate) struct Property {
     tag = "Datasets",
     params(DatasetQueryParams, DatasetFilter),
     responses(
-        (status = 200, description = "List of datasets", content((
+        (status = 200, description = "List of datasets. When `status=true` is specified, each dataset includes a `status` field.", content((
             DatasetResponseItem = "application/json",
             example = json!([
                 {
                     "from": "postgres:syncs",
                     "name": "daily_journal_accelerated",
                     "replication_enabled": false,
-                    "acceleration_enabled": true
+                    "acceleration_enabled": true,
+                    "status": "Ready"
                 },
                 {
                     "from": "databricks:hive_metastore.default.messages",
                     "name": "messages_accelerated",
                     "replication_enabled": false,
-                    "acceleration_enabled": true
+                    "acceleration_enabled": true,
+                    "status": "Refreshing"
                 },
                 {
                     "from": "postgres:aidemo_messages",
                     "name": "general",
                     "replication_enabled": false,
-                    "acceleration_enabled": false
+                    "acceleration_enabled": false,
+                    "status": "Initializing"
                 }
             ])
         ), (
             String = "text/csv",
             example = "
-from,name,replication_enabled,acceleration_enabled
-postgres:syncs,daily_journal_accelerated,false,true
-databricks:hive_metastore.default.messages,messages_accelerated,false,true
-postgres:aidemo_messages,general,false,false
+from,name,replication_enabled,acceleration_enabled,status
+postgres:syncs,daily_journal_accelerated,false,true,Ready
+databricks:hive_metastore.default.messages,messages_accelerated,false,true,Refreshing
+postgres:aidemo_messages,general,false,false,Initializing
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing datasets", content((
@@ -160,7 +148,7 @@ pub(crate) async fn get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
 
-    let valid_datasets = rt.get_valid_datasets(readable_app, LogErrors(false));
+    let valid_datasets = Arc::clone(&rt).get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()
@@ -171,17 +159,24 @@ pub(crate) async fn get(
 
     let resp: Vec<_> = datasets
         .iter()
-        .map(|d| DatasetResponseItem {
-            from: d.from.clone(),
-            name: d.name.to_quoted_string(),
-            replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
-            acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
-            properties: dataset_properties(d),
-            status: if params.status {
+        .map(|d| {
+            let status = if params.status {
                 Some(dataset_status(&df, d))
             } else {
                 None
-            },
+            };
+            let error_message = status
+                .as_ref()
+                .and_then(|s| s.error_message().map(String::from));
+            DatasetResponseItem {
+                from: d.from.clone(),
+                name: d.name.to_quoted_string(),
+                replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
+                acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
+                properties: dataset_properties(d),
+                status,
+                error_message,
+            }
         })
         .collect();
 
@@ -435,7 +430,11 @@ pub(crate) async fn acceleration(
 }
 
 fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
+    #[cfg_attr(not(feature = "models"), allow(unused_mut))]
     let mut properties = HashMap::new();
+
+    #[cfg(not(feature = "models"))]
+    let _ = ds;
 
     #[cfg(feature = "models")]
     properties.insert(

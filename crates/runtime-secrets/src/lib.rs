@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub use crate::stores::scheduler_rpc::ClusterSecretExpander;
+use crate::stores::scheduler_rpc::SchedulerRPCSecretStore;
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use lexer::SecretReplacementMatcher;
@@ -33,6 +35,7 @@ pub enum Error {
     #[snafu(display("Unable to load secrets: {source}"))]
     UnableToLoadSecrets { source: Box<dyn std::error::Error> },
 
+    #[cfg(feature = "aws-secrets-manager")]
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
     UnableToInitializeAwsSecretsManager {
         source: Box<stores::aws_secrets_manager::Error>,
@@ -81,6 +84,20 @@ impl Secrets {
         Self {
             stores: IndexMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn new_for_cluster_executor(
+        expander: Box<dyn crate::stores::scheduler_rpc::ClusterSecretExpander>,
+        executor_id: String,
+    ) -> Self {
+        let mut stores = IndexMap::new();
+        stores.insert(
+            "scheduler_rpc".to_string(),
+            Arc::new(SchedulerRPCSecretStore::new(expander, executor_id)) as Arc<dyn SecretStore>,
+        );
+
+        Self { stores }
     }
 
     /// Initializes the runtime secrets based on the provided secret store configuration.
@@ -225,6 +242,40 @@ impl Default for Secrets {
     }
 }
 
+/// Extract all secret references from a string (e.g., spicepod YAML content).
+///
+/// Returns a map where keys are secret keys and values are the store names they reference.
+/// For example, `${ env:MY_VAR }` returns `("MY_VAR", "env")` and
+/// `${ secrets:API_KEY }` returns `("API_KEY", "secrets")`.
+///
+/// # Example
+/// ```
+/// use runtime_secrets::extract_secret_references;
+///
+/// let yaml = r#"
+/// params:
+///   api_key: ${ secrets:OPENAI_KEY }
+///   user: ${ env:DB_USER }
+/// "#;
+///
+/// let refs = extract_secret_references(yaml);
+/// assert_eq!(refs.get("OPENAI_KEY"), Some(&"secrets".to_string()));
+/// assert_eq!(refs.get("DB_USER"), Some(&"env".to_string()));
+/// ```
+#[must_use]
+pub fn extract_secret_references(content: &str) -> std::collections::HashMap<String, String> {
+    let mut references = std::collections::HashMap::new();
+
+    for secret_replacement in SecretReplacementMatcher::new(content) {
+        references.insert(
+            secret_replacement.key.clone(),
+            secret_replacement.store_name.clone(),
+        );
+    }
+
+    references
+}
+
 pub enum SecretStoreType {
     Env,
     EnvCustomPath(String),
@@ -233,9 +284,10 @@ pub enum SecretStoreType {
     Kubernetes(String),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(String),
+    SchedulerRPC,
 }
 
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn get_params_with_secrets(
     secrets: Arc<RwLock<Secrets>>,
     params: &HashMap<String, String>,
@@ -254,7 +306,6 @@ pub async fn get_params_with_secrets(
     params_with_secrets
 }
 
-#[allow(clippy::result_large_err)]
 fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType> {
     let provider = secret_store_provider(&store.from);
     let selector = secret_selector(&store.from);
@@ -264,7 +315,7 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
             if let Some(params) = store.params.as_ref() {
                 let params = params.as_string_map();
                 if let Some(path) = params.get("file_path") {
-                    return Ok(SecretStoreType::EnvCustomPath(path.to_string()));
+                    return Ok(SecretStoreType::EnvCustomPath(path.clone()));
                 }
             }
             Ok(SecretStoreType::Env)
@@ -281,6 +332,10 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
         "aws_secrets_manager" => Ok(SecretStoreType::AwsSecretsManager(require_selector(
             provider, selector,
         )?)),
+        "scheduler_rpc" => {
+            require_no_selector(provider, selector)?;
+            Ok(SecretStoreType::SchedulerRPC)
+        }
         other => UnknownSecretStoreSnafu {
             store: other.to_string(),
         }
@@ -288,7 +343,6 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     let Some(selector) = selector else {
         return SecretStoreRequiresSecretSelectorSnafu {
@@ -300,7 +354,6 @@ fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     Ok(selector.to_string())
 }
 
-#[allow(clippy::result_large_err)]
 fn require_no_selector(provider: &str, selector: Option<&str>) -> Result<()> {
     if selector.is_some() {
         SecretStoreInvalidSecretSelectorSnafu {
@@ -377,6 +430,11 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
                 })?;
 
             Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
+        },
+        SecretStoreType::SchedulerRPC => {
+            Err(Error::UnableToLoadSecrets {
+                source: "The `scheduler_rpc` is automatically configured for cluster mode, and should not be specified in the Spicepod.".into()
+            })
         }
     }
 }
@@ -501,5 +559,65 @@ mod tests {
             )
             .await;
         assert_eq!("This is a secret: ! 🫡", result.expose_secret());
+    }
+
+    #[test]
+    fn test_extract_secret_references() {
+        let yaml = r"
+version: v1
+kind: Spicepod
+name: test
+
+models:
+  - from: openai:gpt-4o-mini
+    name: openai-gpt
+    params:
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+
+datasets:
+  - from: file:///path/to/data.jsonl
+    name: qs
+    params:
+      schema_source_path: ${ env:QS_SCHEMA_PATH }
+      pg_user: ${env:PG_USER}
+      api_key: ${ secrets:ANOTHER_SECRET }
+";
+
+        let refs = super::extract_secret_references(yaml);
+        assert_eq!(refs.len(), 4);
+        assert_eq!(
+            refs.get("SPICE_OPENAI_API_KEY"),
+            Some(&"secrets".to_string())
+        );
+        assert_eq!(refs.get("QS_SCHEMA_PATH"), Some(&"env".to_string()));
+        assert_eq!(refs.get("PG_USER"), Some(&"env".to_string()));
+        assert_eq!(refs.get("ANOTHER_SECRET"), Some(&"secrets".to_string()));
+    }
+
+    #[test]
+    fn test_extract_secret_references_empty() {
+        let yaml = r"
+version: v1
+kind: Spicepod
+name: test
+";
+
+        let refs = super::extract_secret_references(yaml);
+        assert_eq!(refs.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_secret_references_duplicates() {
+        let yaml = r"
+param1: ${ env:MY_VAR }
+param2: ${ env:MY_VAR }
+param3: ${ secrets:MY_VAR }
+";
+
+        let refs = super::extract_secret_references(yaml);
+        // MY_VAR appears with different stores, but since we use a HashMap keyed by secret key,
+        // only the last occurrence is kept
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs.get("MY_VAR"), Some(&"secrets".to_string()));
     }
 }

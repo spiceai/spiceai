@@ -23,13 +23,19 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_array::builder::ArrayBuilder;
 use aws_sdk_dynamodb::types::AttributeValue;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde_json::Value;
 use std::collections::HashMap;
+use util::time_format::{ParsedDateTime, parse_datetime};
+
+/// Maximum recursion depth for nested `DynamoDB` structures during JSON conversion.
+/// This limit prevents stack overflow from maliciously crafted deeply nested data.
+const MAX_RECURSION_DEPTH: usize = 100;
 
 pub fn dynamodb_items_to_arrow(
     items: &[HashMap<String, AttributeValue>],
     projected_schema: SchemaRef,
+    time_format: &str,
 ) -> Result<RecordBatch> {
     if items.is_empty() {
         return Ok(RecordBatch::new_empty(projected_schema));
@@ -40,15 +46,16 @@ pub fn dynamodb_items_to_arrow(
         StructBuilder::from_fields(projected_schema.fields().clone(), items.len());
 
     for item in items {
-        append_item_to_struct_builder(item, &mut struct_builder)?;
+        append_item_to_struct_builder(item, &mut struct_builder, time_format)?;
     }
 
     Ok(struct_builder.finish().into())
 }
 
-fn append_item_to_struct_builder(
+pub fn append_item_to_struct_builder(
     item: &HashMap<String, AttributeValue>,
     struct_builder: &mut StructBuilder,
+    time_format: &str,
 ) -> Result<(), Error> {
     // Always append a valid struct row
     struct_builder.append(true);
@@ -60,17 +67,17 @@ fn append_item_to_struct_builder(
         let value = item.get(field_name);
         let field_builder = struct_builder.field_builder_array(idx);
 
-        append_value_to_builder(field_builder, value, field.data_type())?;
+        append_value_to_builder(field_builder, value, field.data_type(), time_format)?;
     }
 
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn append_value_to_builder(
     builder: &mut dyn ArrayBuilder,
     value: Option<&AttributeValue>,
     data_type: &DataType,
+    time_format: &str,
 ) -> Result<(), Error> {
     match data_type {
         DataType::Boolean => {
@@ -357,7 +364,12 @@ fn append_value_to_builder(
                     for (idx, field) in fields.iter().enumerate() {
                         let nested_value = map.get(field.name());
                         let nested_builder = b.field_builder_array(idx);
-                        append_value_to_builder(nested_builder, nested_value, field.data_type())?;
+                        append_value_to_builder(
+                            nested_builder,
+                            nested_value,
+                            field.data_type(),
+                            time_format,
+                        )?;
                     }
                 }
                 Some(AttributeValue::Null(_)) | None => {
@@ -367,7 +379,12 @@ fn append_value_to_builder(
                     for idx in 0..fields.len() {
                         let nested_builder = b.field_builder_array(idx);
                         let nested_field = &fields[idx];
-                        append_value_to_builder(nested_builder, None, nested_field.data_type())?;
+                        append_value_to_builder(
+                            nested_builder,
+                            None,
+                            nested_field.data_type(),
+                            time_format,
+                        )?;
                     }
                 }
                 _ => {
@@ -404,10 +421,15 @@ fn append_value_to_builder(
                 })?;
             match value {
                 Some(AttributeValue::S(s)) => {
-                    // Parse ISO8601 string to timestamp (milliseconds since epoch)
-                    match parse_iso8601_timestamp(s) {
-                        Some(millis) => b.append_value(millis),
-                        None => b.append_null(),
+                    if let Some(ts) = parse_datetime(s, time_format) {
+                        match ts {
+                            ParsedDateTime::Naive(ts) => {
+                                b.append_value(ts.and_utc().timestamp_millis());
+                            }
+                            ParsedDateTime::WithOffset(ts) => b.append_value(ts.timestamp_millis()),
+                        }
+                    } else {
+                        b.append_null();
                     }
                 }
                 _ => b.append_null(),
@@ -443,20 +465,6 @@ fn append_value_to_builder(
     Ok(())
 }
 
-fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
-    // Try parsing as RFC3339 (most common ISO8601 format)
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp_millis());
-    }
-
-    // Try parsing as UTC timestamp without explicit timezone
-    if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-        return Some(dt.timestamp_millis());
-    }
-
-    None
-}
-
 fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
     // Parse YYYY-MM-DD format
     if s.len() == 10
@@ -472,14 +480,26 @@ fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
 }
 
 pub fn attribute_map_to_json(map: &HashMap<String, AttributeValue>) -> Value {
+    attribute_map_to_json_with_depth(map, 0)
+}
+
+fn attribute_map_to_json_with_depth(map: &HashMap<String, AttributeValue>, depth: usize) -> Value {
+    if depth > MAX_RECURSION_DEPTH {
+        // Return null for excessively nested structures to prevent stack overflow
+        return Value::Null;
+    }
     Value::Object(
         map.iter()
-            .map(|(k, v)| (k.clone(), attribute_value_to_json(v)))
+            .map(|(k, v)| (k.clone(), attribute_value_to_json_with_depth(v, depth)))
             .collect(),
     )
 }
 
-fn attribute_value_to_json(av: &AttributeValue) -> Value {
+fn attribute_value_to_json_with_depth(av: &AttributeValue, depth: usize) -> Value {
+    if depth > MAX_RECURSION_DEPTH {
+        // Return null for excessively nested structures to prevent stack overflow
+        return Value::Null;
+    }
     match av {
         AttributeValue::S(s) => Value::String(s.clone()),
         AttributeValue::N(n) => {
@@ -496,8 +516,12 @@ fn attribute_value_to_json(av: &AttributeValue) -> Value {
             }
         }
         AttributeValue::Bool(b) => Value::Bool(*b),
-        AttributeValue::L(list) => Value::Array(list.iter().map(attribute_value_to_json).collect()),
-        AttributeValue::M(map) => attribute_map_to_json(map),
+        AttributeValue::L(list) => Value::Array(
+            list.iter()
+                .map(|item| attribute_value_to_json_with_depth(item, depth + 1))
+                .collect(),
+        ),
+        AttributeValue::M(map) => attribute_map_to_json_with_depth(map, depth + 1),
         AttributeValue::Null(_) | _ => Value::Null,
     }
 }
@@ -523,7 +547,8 @@ mod tests {
         ]);
 
         let items: Vec<HashMap<String, AttributeValue>> = vec![];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 2);
@@ -556,7 +581,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
         assert_eq!(result.num_columns(), 5);
@@ -610,7 +636,8 @@ mod tests {
         // int_field is missing entirely
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -649,7 +676,8 @@ mod tests {
         item3.insert("value".to_string(), AttributeValue::Null(true));
 
         let items = vec![item1, item2, item3];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 3);
 
@@ -691,7 +719,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -731,7 +760,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -766,7 +796,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -800,7 +831,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -844,8 +876,8 @@ mod tests {
         item.insert("address".to_string(), AttributeValue::M(address_map));
 
         let items = vec![item];
-        let result =
-            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -904,8 +936,8 @@ mod tests {
         // No address field - should be null
 
         let items = vec![item];
-        let result =
-            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -955,8 +987,8 @@ mod tests {
         item.insert("address".to_string(), AttributeValue::M(address_map));
 
         let items = vec![item];
-        let result =
-            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -985,18 +1017,19 @@ mod tests {
     fn test_timestamp_millisecond() {
         let schema = create_test_schema(vec![Field::new(
             "created_at",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
             true,
         )]);
 
         let mut item = HashMap::new();
         item.insert(
             "created_at".to_string(),
-            AttributeValue::S("2024-01-15T10:30:00Z".to_string()),
+            AttributeValue::S("2024-01-15T10:30:00.123Z".to_string()),
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let ts_array = result
             .column(0)
@@ -1004,7 +1037,34 @@ mod tests {
             .downcast_ref::<TimestampMillisecondArray>()
             .expect("array");
         assert!(!ts_array.is_null(0));
-        // Value would depend on parse_iso8601_timestamp implementation
+        assert_eq!(ts_array.value(0), 1_705_314_600_123);
+    }
+
+    #[test]
+    fn test_naive_timestamp() {
+        let schema = create_test_schema(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]);
+
+        let mut item = HashMap::new();
+        item.insert(
+            "created_at".to_string(),
+            AttributeValue::S("2024-01-15T10:30:00".to_string()),
+        );
+
+        let items = vec![item];
+        let result =
+            dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05").expect("record_batch");
+
+        let ts_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("array");
+        assert!(!ts_array.is_null(0));
+        assert_eq!(ts_array.value(0), 1_705_314_600_000);
     }
 
     #[test]
@@ -1018,7 +1078,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let date_array = result
             .column(0)
@@ -1047,7 +1108,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let int_array = result
             .column(0)
@@ -1076,7 +1138,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let int_array = result
             .column(0)
@@ -1094,7 +1157,8 @@ mod tests {
         item.insert("null_field".to_string(), AttributeValue::Null(true));
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
         let null_array = result
@@ -1119,7 +1183,8 @@ mod tests {
         item.insert("tags".to_string(), AttributeValue::L(vec![]));
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -1149,7 +1214,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -1166,5 +1232,61 @@ mod tests {
         assert_eq!(string_values.value(0), "valid");
         assert!(string_values.is_null(1));
         assert_eq!(string_values.value(2), "also_valid");
+    }
+
+    #[test]
+    fn test_attribute_map_to_json_max_depth() {
+        // Build a deeply nested structure that exceeds MAX_RECURSION_DEPTH
+        let depth = super::MAX_RECURSION_DEPTH + 10;
+
+        // Start with the innermost map
+        let mut current_map = HashMap::new();
+        current_map.insert("leaf".to_string(), AttributeValue::S("value".to_string()));
+
+        // Wrap it in nested maps
+        for i in 0..depth {
+            let mut outer_map = HashMap::new();
+            outer_map.insert(format!("level_{i}"), AttributeValue::M(current_map));
+            current_map = outer_map;
+        }
+
+        // Should not panic - returns null for too-deep structures
+        let result = attribute_map_to_json(&current_map);
+
+        // The result should be a valid JSON value (we truncate at depth limit)
+        assert!(result.is_object());
+    }
+
+    #[test]
+    fn test_attribute_map_to_json_within_limit() {
+        // Build a nested structure within the limit
+        let depth = 50; // Well within MAX_RECURSION_DEPTH of 100
+
+        // Start with the innermost map
+        let mut current_map = HashMap::new();
+        current_map.insert("leaf".to_string(), AttributeValue::S("value".to_string()));
+
+        // Wrap it in nested maps
+        for i in 0..depth {
+            let mut outer_map = HashMap::new();
+            outer_map.insert(format!("level_{i}"), AttributeValue::M(current_map));
+            current_map = outer_map;
+        }
+
+        let result = attribute_map_to_json(&current_map);
+
+        // Should be valid object
+        assert!(result.is_object());
+
+        // Navigate to the leaf value
+        let mut current = &result;
+        for i in (0..depth).rev() {
+            let key = format!("level_{i}");
+            current = current.get(&key).expect("expected nested object");
+        }
+        assert_eq!(
+            current.get("leaf"),
+            Some(&Value::String("value".to_string()))
+        );
     }
 }

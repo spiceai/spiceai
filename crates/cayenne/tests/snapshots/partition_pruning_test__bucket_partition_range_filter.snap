@@ -2,5 +2,6 @@
 source: crates/cayenne/tests/partition_pruning_test.rs
 expression: explain_plan
 ---
-SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
-  DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/<FILE>.vortex]]}, projection=[id, name, value], file_type=vortex, predicate: id@0 >= 3 AND id@0 <= 7
+CayenneAccelerationExec
+  SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
+    DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/<FILE>.vortex]]}, projection=[id, name, value], file_type=vortex, predicate: id@0 >= 3 AND id@0 <= 7

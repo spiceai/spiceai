@@ -25,7 +25,6 @@ use datafusion::{
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use snafu::prelude::*;
 
-#[allow(clippy::result_large_err)]
 pub(crate) fn ensure_schema_exists(
     ctx: &SessionContext,
     catalog: &str,

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,6 +28,8 @@ pub enum CacheStatus {
     CacheHit,
     // The request was a cache miss.
     CacheMiss,
+    // The request was a cache hit, but the entry is stale and being revalidated in the background.
+    CacheStaleWhileRevalidate,
 }
 
 impl CacheStatus {
@@ -38,6 +40,7 @@ impl CacheStatus {
             CacheStatus::CacheBypass => Some("BYPASS".to_string()),
             CacheStatus::CacheHit => Some("HIT".to_string()),
             CacheStatus::CacheMiss => Some("MISS".to_string()),
+            CacheStatus::CacheStaleWhileRevalidate => Some("STALE".to_string()),
         }
     }
 }

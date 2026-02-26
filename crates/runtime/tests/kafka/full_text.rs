@@ -77,7 +77,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
 
             run_and_snapshot_query(
                 &rt,
-                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY score DESC LIMIT 10"),
+                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY _score DESC LIMIT 10"),
                 &data_snapshot,
             )
             .await?;
@@ -96,7 +96,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
         .await
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn stack_qa_json() -> Vec<serde_json::Value> {
     include_str!("./test_data/stack_qa.json")
         .lines()

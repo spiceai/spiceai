@@ -1,24 +1,34 @@
 [package]
-name = "datafusion-optimizer-rules"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
+name = "datafusion-optimizer-rules"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-datafusion.workspace = true
-datafusion-expr.workspace = true
-datafusion-table-providers.workspace = true
-r2d2 = { optional = true, workspace = true }
-duckdb = { optional = true, workspace = true }
+arrow = { workspace = true }
+chrono = { workspace = true }
+object_store = { workspace = true }
 async-stream.workspace = true
 async-trait.workspace = true
-tracing.workspace = true
-futures.workspace = true
 cache = { path = "../cache" }
+datafusion.workspace = true
+datafusion-federation.workspace = true
+datafusion-datasource = { workspace = true }
+datafusion-expr.workspace = true
+datafusion-table-providers.workspace = true
+tokio.workspace = true
+r2d2 = { optional = true, workspace = true }
+duckdb = { optional = true, workspace = true }
+futures.workspace = true
+itertools = { workspace = true }
+url = { workspace = true }
+snafu.workspace = true
+tracing.workspace = true
+
 
 [features]
 duckdb = [

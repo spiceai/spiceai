@@ -24,6 +24,7 @@ use arrow::{
 use datafusion::{
     common::DFSchema,
     datasource::listing::{PartitionedFile, helpers::expr_applicable_for_cols},
+    error::DataFusionError,
     execution::context::ExecutionProps,
     logical_expr::Expr,
     physical_expr::create_physical_expr,
@@ -45,12 +46,14 @@ pub(crate) fn prune_partitions(
     // We will use DataFusion itself to evaluate the filters on the partition values, so we need to
     // first extract the partition values from the `PartitionedFile`s and create a `RecordBatch`.
     // First verify all files have the correct number of partition values
-    assert!(
-        partitioned_files
-            .iter()
-            .all(|file| file.partition_values.len() == partition_cols.len()),
-        "PartitionedFile has a different number of partition values than the number of partition columns"
-    );
+    if !partitioned_files
+        .iter()
+        .all(|file| file.partition_values.len() == partition_cols.len())
+    {
+        return Err(DataFusionError::External(
+            super::Error::InvalidPartitionValueCount.into(),
+        ));
+    }
 
     let partition_arrays: Vec<ArrayRef> = (0..partition_cols.len())
         .map(|col_idx| {
@@ -97,7 +100,11 @@ pub(crate) fn prune_partitions(
     };
 
     // Sanity check
-    assert_eq!(prepared.len(), partitioned_files.len());
+    if prepared.len() != partitioned_files.len() {
+        return Err(DataFusionError::External(
+            super::Error::InvalidPartitionValueCount.into(),
+        ));
+    }
 
     // Filter the `PartitionedFile`s based on the mask
     let filtered = partitioned_files

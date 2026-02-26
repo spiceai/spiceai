@@ -1,0 +1,217 @@
+# TPC-H Point Lookup Stress Test
+# High-volume random point lookups for benchmarking index performance
+# Designed for 100+ concurrent clients
+name: tpch_point_lookup_stress
+
+queries:
+  # Customer random lookups (range 1-150000)
+  - name: customer_rand_1
+    sql: SELECT * FROM customer WHERE c_custkey = 7823
+  - name: customer_rand_2
+    sql: SELECT * FROM customer WHERE c_custkey = 42156
+  - name: customer_rand_3
+    sql: SELECT * FROM customer WHERE c_custkey = 89234
+  - name: customer_rand_4
+    sql: SELECT * FROM customer WHERE c_custkey = 123456
+  - name: customer_rand_5
+    sql: SELECT * FROM customer WHERE c_custkey = 3491
+  - name: customer_rand_6
+    sql: SELECT * FROM customer WHERE c_custkey = 78234
+  - name: customer_rand_7
+    sql: SELECT * FROM customer WHERE c_custkey = 145678
+  - name: customer_rand_8
+    sql: SELECT * FROM customer WHERE c_custkey = 56789
+  - name: customer_rand_9
+    sql: SELECT * FROM customer WHERE c_custkey = 98765
+  - name: customer_rand_10
+    sql: SELECT * FROM customer WHERE c_custkey = 11111
+  - name: customer_rand_11
+    sql: SELECT * FROM customer WHERE c_custkey = 22222
+  - name: customer_rand_12
+    sql: SELECT * FROM customer WHERE c_custkey = 33333
+  - name: customer_rand_13
+    sql: SELECT * FROM customer WHERE c_custkey = 44444
+  - name: customer_rand_14
+    sql: SELECT * FROM customer WHERE c_custkey = 55555
+  - name: customer_rand_15
+    sql: SELECT * FROM customer WHERE c_custkey = 66666
+  - name: customer_rand_16
+    sql: SELECT * FROM customer WHERE c_custkey = 77777
+  - name: customer_rand_17
+    sql: SELECT * FROM customer WHERE c_custkey = 88888
+  - name: customer_rand_18
+    sql: SELECT * FROM customer WHERE c_custkey = 99999
+  - name: customer_rand_19
+    sql: SELECT * FROM customer WHERE c_custkey = 111111
+  - name: customer_rand_20
+    sql: SELECT * FROM customer WHERE c_custkey = 135792
+
+  # Orders random lookups (sparse keys, multiples of ~32 work best)
+  - name: orders_rand_1
+    sql: SELECT * FROM orders WHERE o_orderkey = 1
+  - name: orders_rand_2
+    sql: SELECT * FROM orders WHERE o_orderkey = 32
+  - name: orders_rand_3
+    sql: SELECT * FROM orders WHERE o_orderkey = 64
+  - name: orders_rand_4
+    sql: SELECT * FROM orders WHERE o_orderkey = 128
+  - name: orders_rand_5
+    sql: SELECT * FROM orders WHERE o_orderkey = 256
+  - name: orders_rand_6
+    sql: SELECT * FROM orders WHERE o_orderkey = 512
+  - name: orders_rand_7
+    sql: SELECT * FROM orders WHERE o_orderkey = 1024
+  - name: orders_rand_8
+    sql: SELECT * FROM orders WHERE o_orderkey = 2048
+  - name: orders_rand_9
+    sql: SELECT * FROM orders WHERE o_orderkey = 4096
+  - name: orders_rand_10
+    sql: SELECT * FROM orders WHERE o_orderkey = 8192
+  - name: orders_rand_11
+    sql: SELECT * FROM orders WHERE o_orderkey = 100000
+  - name: orders_rand_12
+    sql: SELECT * FROM orders WHERE o_orderkey = 200000
+  - name: orders_rand_13
+    sql: SELECT * FROM orders WHERE o_orderkey = 300000
+  - name: orders_rand_14
+    sql: SELECT * FROM orders WHERE o_orderkey = 400000
+  - name: orders_rand_15
+    sql: SELECT * FROM orders WHERE o_orderkey = 500000
+  - name: orders_rand_16
+    sql: SELECT * FROM orders WHERE o_orderkey = 600000
+  - name: orders_rand_17
+    sql: SELECT * FROM orders WHERE o_orderkey = 700000
+  - name: orders_rand_18
+    sql: SELECT * FROM orders WHERE o_orderkey = 800000
+  - name: orders_rand_19
+    sql: SELECT * FROM orders WHERE o_orderkey = 900000
+  - name: orders_rand_20
+    sql: SELECT * FROM orders WHERE o_orderkey = 1000000
+
+  # Part random lookups (range 1-200000)
+  - name: part_rand_1
+    sql: SELECT * FROM part WHERE p_partkey = 12345
+  - name: part_rand_2
+    sql: SELECT * FROM part WHERE p_partkey = 23456
+  - name: part_rand_3
+    sql: SELECT * FROM part WHERE p_partkey = 34567
+  - name: part_rand_4
+    sql: SELECT * FROM part WHERE p_partkey = 45678
+  - name: part_rand_5
+    sql: SELECT * FROM part WHERE p_partkey = 56789
+  - name: part_rand_6
+    sql: SELECT * FROM part WHERE p_partkey = 67890
+  - name: part_rand_7
+    sql: SELECT * FROM part WHERE p_partkey = 78901
+  - name: part_rand_8
+    sql: SELECT * FROM part WHERE p_partkey = 89012
+  - name: part_rand_9
+    sql: SELECT * FROM part WHERE p_partkey = 90123
+  - name: part_rand_10
+    sql: SELECT * FROM part WHERE p_partkey = 101234
+  - name: part_rand_11
+    sql: SELECT * FROM part WHERE p_partkey = 112345
+  - name: part_rand_12
+    sql: SELECT * FROM part WHERE p_partkey = 123456
+  - name: part_rand_13
+    sql: SELECT * FROM part WHERE p_partkey = 134567
+  - name: part_rand_14
+    sql: SELECT * FROM part WHERE p_partkey = 145678
+  - name: part_rand_15
+    sql: SELECT * FROM part WHERE p_partkey = 156789
+  - name: part_rand_16
+    sql: SELECT * FROM part WHERE p_partkey = 167890
+  - name: part_rand_17
+    sql: SELECT * FROM part WHERE p_partkey = 178901
+  - name: part_rand_18
+    sql: SELECT * FROM part WHERE p_partkey = 189012
+  - name: part_rand_19
+    sql: SELECT * FROM part WHERE p_partkey = 199000
+  - name: part_rand_20
+    sql: SELECT * FROM part WHERE p_partkey = 200000
+
+  # Supplier random lookups (range 1-10000)
+  - name: supplier_rand_1
+    sql: SELECT * FROM supplier WHERE s_suppkey = 123
+  - name: supplier_rand_2
+    sql: SELECT * FROM supplier WHERE s_suppkey = 456
+  - name: supplier_rand_3
+    sql: SELECT * FROM supplier WHERE s_suppkey = 789
+  - name: supplier_rand_4
+    sql: SELECT * FROM supplier WHERE s_suppkey = 1234
+  - name: supplier_rand_5
+    sql: SELECT * FROM supplier WHERE s_suppkey = 2345
+  - name: supplier_rand_6
+    sql: SELECT * FROM supplier WHERE s_suppkey = 3456
+  - name: supplier_rand_7
+    sql: SELECT * FROM supplier WHERE s_suppkey = 4567
+  - name: supplier_rand_8
+    sql: SELECT * FROM supplier WHERE s_suppkey = 5678
+  - name: supplier_rand_9
+    sql: SELECT * FROM supplier WHERE s_suppkey = 6789
+  - name: supplier_rand_10
+    sql: SELECT * FROM supplier WHERE s_suppkey = 7890
+  - name: supplier_rand_11
+    sql: SELECT * FROM supplier WHERE s_suppkey = 8901
+  - name: supplier_rand_12
+    sql: SELECT * FROM supplier WHERE s_suppkey = 9012
+  - name: supplier_rand_13
+    sql: SELECT * FROM supplier WHERE s_suppkey = 9123
+  - name: supplier_rand_14
+    sql: SELECT * FROM supplier WHERE s_suppkey = 9234
+  - name: supplier_rand_15
+    sql: SELECT * FROM supplier WHERE s_suppkey = 9345
+
+  # Lineitem composite key lookups (using valid sparse orderkeys)
+  - name: lineitem_rand_1
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_linenumber = 1
+  - name: lineitem_rand_2
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 32 AND l_linenumber = 1
+  - name: lineitem_rand_3
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 100 AND l_linenumber = 1
+  - name: lineitem_rand_4
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 900 AND l_linenumber = 1
+  - name: lineitem_rand_5
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 9920 AND l_linenumber = 1
+  - name: lineitem_rand_6
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 100000 AND l_linenumber = 1
+  - name: lineitem_rand_7
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 200000 AND l_linenumber = 1
+  - name: lineitem_rand_8
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 300000 AND l_linenumber = 1
+  - name: lineitem_rand_9
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 400000 AND l_linenumber = 1
+  - name: lineitem_rand_10
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 500000 AND l_linenumber = 1
+  - name: lineitem_rand_11
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 600000 AND l_linenumber = 1
+  - name: lineitem_rand_12
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 700000 AND l_linenumber = 1
+  - name: lineitem_rand_13
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 800000 AND l_linenumber = 1
+  - name: lineitem_rand_14
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 900000 AND l_linenumber = 1
+  - name: lineitem_rand_15
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1000000 AND l_linenumber = 1
+
+  # Partsupp composite key lookups (pattern: suppkey = partkey + 1)
+  - name: partsupp_rand_1
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 2
+  - name: partsupp_rand_2
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 2502
+  - name: partsupp_rand_3
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 100 AND ps_suppkey = 101
+  - name: partsupp_rand_4
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1000 AND ps_suppkey = 1001
+  - name: partsupp_rand_5
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 10000 AND ps_suppkey = 1
+  - name: partsupp_rand_6
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 50000 AND ps_suppkey = 1
+  - name: partsupp_rand_7
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 100000 AND ps_suppkey = 1
+  - name: partsupp_rand_8
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 150000 AND ps_suppkey = 1
+  - name: partsupp_rand_9
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 199000 AND ps_suppkey = 9001
+  - name: partsupp_rand_10
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 200000 AND ps_suppkey = 1

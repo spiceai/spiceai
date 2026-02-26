@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use rand::Rng;
 use regex::Regex;
 use std::{
     fs,
@@ -46,16 +45,6 @@ where
     false
 }
 
-pub(crate) fn get_random_element<T>(vec: &[T]) -> Option<&T> {
-    if vec.is_empty() {
-        None
-    } else {
-        let mut rng = rand::rng();
-        let index = rng.random_range(0..vec.len());
-        Some(&vec[index])
-    }
-}
-
 pub fn hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -65,7 +54,7 @@ pub fn hash<T: Hash>(value: &T) -> u64 {
 // replace insta headers with an empty string
 const INSTA_HEADER_REGEX: &str = r"^---\n(([\w\W]*\n)+)---\n";
 static INSTA_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)] // the regex is valid
+    #[expect(clippy::expect_used)] // the regex is valid
     Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build")
 });
 

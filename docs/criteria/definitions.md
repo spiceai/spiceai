@@ -49,6 +49,7 @@ Core Connector Data Types depend on the specific connector, but in general can b
 Defines the supported access modes for a particular accelerator:
 
 - Arrow: in-memory only.
+- Cayenne: file based only.
 - DuckDB: in-memory or file based.
 - SQLite: in-memory or file based.
 - PostgreSQL: database only.

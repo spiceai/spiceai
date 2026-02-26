@@ -1,0 +1,39 @@
+##
+## Copyright 2026 The Spice.ai OSS Authors
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##      https://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+
+[package]
+name = "connector-snowflake"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Snowflake data connector for Spice.ai runtime"
+
+[dependencies]
+async-trait.workspace = true
+data_components = { path = "../../data_components", features = ["snowflake"] }
+datafusion.workspace = true
+datafusion-table-providers.workspace = true
+db_connection_pool = { path = "../../db_connection_pool", features = ["snowflake"] }
+itertools.workspace = true
+linkme.workspace = true
+paste.workspace = true
+runtime = { path = "../../runtime" }
+snowflake-api.workspace = true
+snafu.workspace = true
+
+[features]
+default = []

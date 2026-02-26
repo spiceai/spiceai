@@ -83,9 +83,7 @@ impl Extension for TpcExtension {
 
         if benchmark != "tpch" && benchmark != "tpcds" {
             return Err(ExtensionError::UnableToStartExtension {
-                source: Box::new(Error::InvalidBenchmark {
-                    benchmark: benchmark.clone(),
-                }),
+                source: Box::new(Error::InvalidBenchmark { benchmark }),
             });
         }
 

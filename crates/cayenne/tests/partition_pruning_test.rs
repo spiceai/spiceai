@@ -21,11 +21,17 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Int64Array, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::CayenneTableProvider;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
@@ -67,7 +73,6 @@ fn sanitize_file_paths(plan: &str) -> String {
 /// 2. Inserts data across multiple partitions
 /// 3. Queries with partition filters and validates EXPLAIN plan shows pruning
 /// 4. Validates that only relevant partitions are scanned
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_partition_pruning_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,6 +94,7 @@ async fn test_cayenne_partition_pruning_impl(
         table_name: "partitioned_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("region".to_string()),
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -365,7 +371,6 @@ test_with_backends!(test_cayenne_bucket_partitioning_impl);
 /// 1. Bucket partitioning works correctly
 /// 2. Filters are still pushed down to partitions (since each bucket contains multiple values)
 /// 3. Partition pruning works for filters on the bucketed column
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_bucket_partitioning_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -390,6 +395,7 @@ async fn test_cayenne_bucket_partitioning_impl(
         table_name: "bucket_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("id".to_string()), // In practice, runtime would use bucket(3, id)
         vortex_config: cayenne::metadata::VortexConfig::default(),

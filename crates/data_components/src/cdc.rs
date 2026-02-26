@@ -29,7 +29,7 @@ pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>
 
 #[derive(Debug, Snafu)]
 pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
+    #[snafu(display("Failed to commit CDC change to dataset: {source}"))]
     UnableToCommitChange {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -39,7 +39,7 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    #[snafu(display("Failed to process change data capture update: {source}"))]
     Arrow { source: ArrowError },
 }
 
@@ -56,6 +56,9 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
+    #[cfg(feature = "dynamodb")]
+    /// Error from `DynamoDB`, such as failure during streaming or subscription.
+    DynamoDB(crate::dynamodb::stream::StreamError),
 }
 
 impl std::error::Error for StreamError {}
@@ -69,6 +72,8 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
+            #[cfg(feature = "dynamodb")]
+            StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
         }
     }
 }
@@ -81,14 +86,20 @@ pub trait CommitChange {
 pub struct ChangeEnvelope {
     change_committer: Box<dyn CommitChange + Send>,
     pub change_batch: ChangeBatch,
+    is_dataset_ready: bool,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
+    pub fn new(
+        change_committer: Box<dyn CommitChange + Send>,
+        change_batch: ChangeBatch,
+        is_dataset_ready: bool,
+    ) -> Self {
         Self {
             change_committer,
             change_batch,
+            is_dataset_ready,
         }
     }
 
@@ -97,19 +108,30 @@ impl ChangeEnvelope {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
-        (self.change_committer, self.change_batch)
+    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch, bool) {
+        (
+            self.change_committer,
+            self.change_batch,
+            self.is_dataset_ready,
+        )
     }
 
     #[must_use]
     pub fn from_parts(
         change_committer: Box<dyn CommitChange + Send>,
         change_batch: ChangeBatch,
+        is_dataset_ready: bool,
     ) -> Self {
         Self {
             change_committer,
             change_batch,
+            is_dataset_ready,
         }
+    }
+
+    #[must_use]
+    pub fn is_dataset_ready(&self) -> bool {
+        self.is_dataset_ready
     }
 }
 

@@ -10,14 +10,11 @@ on:
         type: choice
         options:
           - 'all'
-          - 'gpt-4o'
-          - 'gpt-4o-mini'
-          - 'gpt-5'
-          - 'o1'
-          - 'o3_mini'
+          - 'gpt-5.2'
+          - 'o3-mini'
           - 'llama3-3B-Instruct'
-          - 'claude-3-5-sonnet'
-          - 'grok2'
+          - 'claude-3-5-haiku'
+          - 'grok-4-fast'
         default: 'all'
   schedule:
     - cron: '0 5 * * 2,5' # Every Monday and Thursday at 10pm PST (5am UTC next day)
@@ -32,68 +29,54 @@ jobs:
     name: Build testoperator
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
           install_to_system_path: 'false'
           upload_artifact: 'true'
+          force_rebuild: 'true'
+          download_from_minio: 'false'
 
   build-spiced:
     name: Build spiced
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        if: matrix.target.target_os != 'darwin'
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
-
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v5
+        uses: ./.github/actions/build-spiced
         with:
-          name: spiced
-          path: spiced
+          features: 'models'
+          upload_artifact: 'true'
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
             const matrix = [
-              { name: "gpt-4o" },
-              { name: "gpt-4o-mini" },
-              { name: "gpt-5" },
-              { name: "o1" },
-              { name: "o3_mini" },
+              { name: "gpt-5.2" },
+              { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
-              { name: "claude-3-5-sonnet"},
-              { name: "grok2" },
+              { name: "claude-3-5-haiku" },
+              { name: "grok-4-fast" },
             ];
 
             const model_option = context.payload.inputs?.model_option || 'all';
@@ -118,15 +101,15 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Download testoperator
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spiced
 

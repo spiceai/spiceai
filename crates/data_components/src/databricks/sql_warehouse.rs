@@ -15,17 +15,14 @@ limitations under the License.
 */
 
 use arrow::{
-    array::RecordBatch,
+    array::{Array, RecordBatch},
     datatypes::{Field, Schema, SchemaRef},
     ipc::reader::StreamReader,
 };
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider,
-    error::DataFusionError,
-    execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter,
-    sql::{TableReference, unparser::dialect},
+    datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -54,7 +51,7 @@ mod datatypes;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Not implemented"))]
+    #[snafu(display("This Databricks SQL Warehouse operation is not implemented"))]
     NotImplemented,
 
     #[snafu(display("HTTP client build failed: {source}"))]
@@ -245,11 +242,12 @@ impl SqlWarehouseApi {
         let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing catalog".into(),
         })?;
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_table = table.table().replace('\'', "''");
+        let escaped_schema = table_schema.replace('\'', "''");
+        let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}' AND table_catalog = '{}'",
-            table.table(),
-            table_schema,
-            table_catalog
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
@@ -313,7 +311,7 @@ impl SqlWarehouseApi {
             )));
         }
 
-        let token = token.to_string();
+        let token = token.clone();
         let stream = stream::unfold(initial_external_link, move |current_link| {
             let api = Arc::clone(&self);
             let token = token.clone();
@@ -511,7 +509,7 @@ impl SqlWarehouseApi {
 #[derive(Debug, Deserialize, Serialize)]
 struct ExternalLink {
     chunk_index: u64,
-    #[allow(clippy::struct_field_names)]
+    #[expect(clippy::struct_field_names)]
     external_link: String,
     next_chunk_internal_link: Option<String>,
 }
@@ -607,6 +605,66 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         Self { api }
     }
 
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "Databricks tables() not implemented".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let query = "SELECT schema_name FROM information_schema.schemata";
+
+        let token = self.api.token_provider.get_token();
+        let payload = json!({
+            "warehouse_id": self.api.sql_warehouse_id,
+            "format": "ARROW_STREAM",
+            "disposition": "EXTERNAL_LINKS",
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
+            "statement": query,
+        });
+
+        let response = self
+            .api
+            .execute_sql_statement(&token, &payload)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+        SqlWarehouseApi::verify_response_status(&response).map_err(|e| {
+            dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            }
+        })?;
+
+        let mut stream = Arc::clone(&self.api)
+            .fetch_external_links(response)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+        let mut schemas = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+            if let Some(name_column) = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+            {
+                for value in name_column.iter().flatten() {
+                    schemas.push(value.to_string());
+                }
+            }
+        }
+
+        Ok(schemas)
+    }
+
     async fn get_schema(
         &self,
         table_reference: &TableReference,
@@ -679,11 +737,8 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     }
 }
 
-fn databricks_dialect() -> dialect::CustomDialect {
-    dialect::CustomDialectBuilder::new()
-        .with_identifier_quote_style('`')
-        .with_interval_style(dialect::IntervalStyle::MySQL)
-        .build()
+fn databricks_dialect() -> super::dialect::DatabricksDialect {
+    super::dialect::DatabricksDialect::new()
 }
 
 #[async_trait]

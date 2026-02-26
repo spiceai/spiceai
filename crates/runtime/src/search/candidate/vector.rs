@@ -68,7 +68,6 @@ impl ChunkedNonIndexVectorGeneration {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn score_expr(&self, query: String) -> LogicalExpr {
         binary_expr(
             lit(1.0),
@@ -176,14 +175,13 @@ impl ChunkedNonIndexVectorGeneration {
         let lp_cols: Vec<_> = lp
             .schema()
             .columns()
-            .clone()
             .into_iter()
             .map(LogicalExpr::Column)
             .collect();
 
         // Then apply the window function separately
         let window_expr = row_number().alias(VSS_TEMP_GEN_ID_COLUMN);
-        let lp = lp.project(lp_cols.clone())?.window(vec![window_expr])?;
+        let lp = lp.project(lp_cols)?.window(vec![window_expr])?;
 
         // This is just the table with all the additional columns we may want to join on
         let additional_lp = lp.clone().alias("additional")?.build()?;
@@ -234,13 +232,16 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .project(
                 [
                     pks.iter().map(ident).collect(),
-                    vec![col("score"), col("offset")],
+                    vec![col(SEARCH_SCORE_COLUMN_NAME), col("offset")],
                 ]
                 .concat(),
             )?
             .filter(
-                LogicalExpr::ScalarFunction(ScalarFunction::new_udf(isnan(), vec![ident("score")]))
-                    .is_false(),
+                LogicalExpr::ScalarFunction(ScalarFunction::new_udf(
+                    isnan(),
+                    vec![ident(SEARCH_SCORE_COLUMN_NAME)],
+                ))
+                .is_false(),
             )?;
 
         // Filter out primary keys from additional columns if duplicated
@@ -261,7 +262,7 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
         // Then apply the window function in a separate step
         let window_expr = row_number()
             .partition_by(pks.iter().map(col).collect())
-            .order_by(vec![col("score").sort(false, false)])
+            .order_by(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])
             .build()?
             .alias("chunk_rank");
 
@@ -269,7 +270,10 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .window(vec![window_expr])?
             .alias("rank")?
             .filter(col("chunk_rank").eq(lit(1)))?
-            .sort(vec![col("rank.score").sort(false, false)])?
+            .sort(vec![
+                LogicalExpr::Column(Column::new(Some("rank"), SEARCH_SCORE_COLUMN_NAME))
+                    .sort(false, false),
+            ])?
             .join(
                 additional_table,
                 JoinType::Left,
@@ -296,7 +300,7 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
                             ),
                         )
                         .alias(SEARCH_VALUE_COLUMN_NAME),
-                        col("score"),
+                        col(SEARCH_SCORE_COLUMN_NAME),
                     ],
                 ]
                 .concat(),

@@ -62,13 +62,13 @@ on:
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -146,15 +146,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up wget
         if: matrix.target.target_os == 'linux'
@@ -170,10 +168,15 @@ jobs:
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Spiced CUDA Build
         uses: ./.github/actions/spiced-cuda-build
         with:
-          cuda-version: '12.4.1'
+          cuda-version: '12.6.0'
           cuda-compute-capability: ${{ matrix.target.compute_cap }}
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           target_os: ${{ matrix.target.target_os }}
@@ -192,17 +195,17 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         continue-on-error: true
         with:
-          pattern: spiced_models_cuda_*_linux_x86_64
+          pattern: spiced_cuda_*_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
           merge-multiple: true
 
@@ -215,7 +218,7 @@ jobs:
           mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
 
           # Upload any CUDA artifacts that were successfully built
-          for file in ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_*_linux_x86_64.tar.gz; do
+          for file in ${{ env.ARTIFACT_DIR }}/spiced_cuda_*_linux_x86_64.tar.gz; do
             if [ -f "$file" ]; then
               echo "Uploading $file to Minio..."
               mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
@@ -230,9 +233,9 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -242,7 +245,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}

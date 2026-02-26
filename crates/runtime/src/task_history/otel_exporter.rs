@@ -22,14 +22,21 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use tracing::Instrument;
 
-use futures::future::BoxFuture;
-use opentelemetry::trace::{SpanId, TraceError};
-use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+use opentelemetry::trace::SpanId;
+use opentelemetry_sdk::{
+    error::{OTelSdkError, OTelSdkResult},
+    trace::{SpanData, SpanExporter},
+};
 use spicepod::component::runtime::{TaskHistoryCapturedOutput, TaskHistoryCapturedPlan};
 
 use crate::datafusion::DataFusion;
 
 use super::TaskSpan;
+
+/// Label key used to identify plan capture spans in OpenTelemetry traces.
+/// This is used to override the default behavior of `captured_output` processing to ensure that
+/// plan capture spans always retain their output.
+const PLAN_CAPTURE_LABEL: &str = "plan_capture";
 
 macro_rules! extract_attr {
     ($span:expr, $key:expr) => {
@@ -50,6 +57,9 @@ pub struct TaskHistoryExporter {
     min_sql_duration_ms: Option<f64>,
     captured_plan: TaskHistoryCapturedPlan,
     min_plan_duration_ms: Option<f64>,
+    /// The scheduler ID (advertise address) for this node.
+    /// Only populated in cluster mode.
+    scheduler_id: Option<Arc<str>>,
 }
 
 impl Debug for TaskHistoryExporter {
@@ -65,6 +75,7 @@ impl TaskHistoryExporter {
         min_sql_duration_ms: Option<f64>,
         captured_plan: TaskHistoryCapturedPlan,
         min_plan_duration_ms: Option<f64>,
+        scheduler_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             df,
@@ -72,10 +83,15 @@ impl TaskHistoryExporter {
             min_sql_duration_ms,
             captured_plan,
             min_plan_duration_ms,
+            scheduler_id,
         }
     }
 
-    fn process_output(&self, output: Arc<str>) -> Arc<str> {
+    fn process_output(&self, output: Arc<str>, force_capture: bool) -> Arc<str> {
+        if force_capture {
+            return output;
+        }
+
         match self.captured_output {
             TaskHistoryCapturedOutput::None => "".into(),
             TaskHistoryCapturedOutput::Truncated => output,
@@ -121,7 +137,8 @@ impl TaskHistoryExporter {
                 tracing::Level::INFO,
                 "plan",
                 input = %explain_query,
-                runtime_query = true
+                runtime_query = true,
+                plan_capture = true
             );
             plan_span.record("parent_id", span.span_id.as_ref());
 
@@ -145,9 +162,6 @@ impl TaskHistoryExporter {
                             }
                         }
 
-                        // Format the batches as a pretty-printed string and capture it
-                        // This ensures the EXPLAIN output is always captured regardless of
-                        // the global captured_output setting
                         match pretty_format_batches(&batches) {
                             Ok(formatted) => {
                                 let output = formatted.to_string();
@@ -210,9 +224,6 @@ impl TaskHistoryExporter {
                 None
             });
 
-        let captured_output: Option<Arc<str>> =
-            extract_attr!(span, "captured_output").map(|output| self.process_output(output));
-
         let start_time = span.start_time;
         let end_time = span.end_time;
         let execution_duration_ms = end_time
@@ -258,6 +269,17 @@ impl TaskHistoryExporter {
             labels.insert("runtime_query".into(), "true".into());
         }
 
+        let plan_capture = span.attributes.iter().any(|kv| {
+            kv.key.as_str() == PLAN_CAPTURE_LABEL
+                && matches!(kv.value, opentelemetry::Value::Bool(true))
+        });
+        if plan_capture {
+            labels.insert(PLAN_CAPTURE_LABEL.into(), "true".into());
+        }
+
+        let captured_output: Option<Arc<str>> = extract_attr!(span, "captured_output")
+            .map(|output| self.process_output(output, plan_capture));
+
         // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
         labels.remove(&Into::<Arc<str>>::into("trace_id"));
         labels.remove(&Into::<Arc<str>>::into("parent_id"));
@@ -276,18 +298,27 @@ impl TaskHistoryExporter {
             execution_duration_ms,
             error_message,
             labels,
+            scheduler_id: self.scheduler_id.clone(),
         }
     }
 }
 
 impl SpanExporter for TaskHistoryExporter {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         let min_sql_duration_ms = self.min_sql_duration_ms;
         let captured_plan = self.captured_plan.clone();
         let min_plan_duration_ms = self.min_plan_duration_ms;
         let df = Arc::clone(&self.df);
 
         let should_include = |task_span: &TaskSpan| {
+            // Always include plan capture spans regardless of duration since they are already
+            // filtered by min_plan_duration when created.
+            if task_span.labels.contains_key(PLAN_CAPTURE_LABEL) {
+                return true;
+            }
             min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
         };
         let spans: Vec<TaskSpan> = batch
@@ -296,12 +327,12 @@ impl SpanExporter for TaskHistoryExporter {
             .filter(should_include)
             .collect();
 
-        Box::pin(async move {
+        async move {
             // Separate logic: if plan capture is disabled, write all spans directly
             if matches!(captured_plan, TaskHistoryCapturedPlan::None) {
                 return TaskSpan::write(Arc::clone(&df), spans)
                     .await
-                    .map_err(|e| TraceError::Other(Box::new(e)));
+                    .map_err(|e| OTelSdkError::InternalFailure(e.to_string()));
             }
 
             // Filter spans that need plan capture before cloning
@@ -333,7 +364,7 @@ impl SpanExporter for TaskHistoryExporter {
             // Write all spans first
             TaskSpan::write(Arc::clone(&df), spans)
                 .await
-                .map_err(|e| TraceError::Other(Box::new(e)))?;
+                .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?;
 
             // Spawn async task to capture plans for filtered spans
             // The task runs in the background without blocking the export operation
@@ -354,17 +385,18 @@ impl SpanExporter for TaskHistoryExporter {
             }
 
             Ok(())
-        })
+        }
     }
 }
 
-const AUTOGENERATED_LABELS: [&str; 11] = [
+const AUTOGENERATED_LABELS: [&str; 12] = [
     "thread.id",
     "code.namespace",
     "code.lineno",
     "idle_ns",
     "busy_ns",
     "runtime_query",
+    "plan_capture",
     "target",
     "code.filepath",
     "level",

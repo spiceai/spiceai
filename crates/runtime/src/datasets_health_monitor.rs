@@ -45,10 +45,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read the table. {source}"))]
+    #[snafu(display("Failed to read the dataset table for health check: {source}"))]
     UnableToGetTable { source: DataFusionError },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to query dataset health status: {source}"))]
     DataFusionQuery {
         source: crate::datafusion::query::Error,
     },
@@ -147,9 +147,9 @@ impl DatasetsHealthMonitor {
 
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.insert(
-            dataset_name.to_string(),
+            dataset_name.clone(),
             Arc::new(DatasetAvailabilityInfo::new(
-                dataset_name.to_string(),
+                dataset_name.clone(),
                 table_provider,
             )),
         );
@@ -290,7 +290,7 @@ AND labels.error_code IS NULL"
                                     Ok(()) => AvailabilityVerificationResult::Available,
                                     Err(err) => {
                                         let err_message = match err.find_root() {
-                                            DataFusionError::Execution(e) => e.to_string(),
+                                            DataFusionError::Execution(e) => e.clone(),
                                             _ => err.to_string(),
                                         };
 
@@ -345,8 +345,8 @@ async fn update_dataset_availability_info(
     }
 }
 
-fn report_dataset_unavailable_time(dataset_name: &String, last_available_time: Option<SystemTime>) {
-    let labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
+fn report_dataset_unavailable_time(dataset_name: &str, last_available_time: Option<SystemTime>) {
+    let labels = vec![KeyValue::new("dataset", dataset_name.to_owned())];
 
     match last_available_time {
         Some(last_available_time) => metrics::datasets::UNAVAILABLE_TIME_MS.record(
@@ -437,7 +437,10 @@ mod test {
 
         let monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
 
-        assert!(monitor.register_dataset(&dataset).await.is_ok());
+        monitor
+            .register_dataset(&dataset)
+            .await
+            .expect("should register dataset");
 
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }

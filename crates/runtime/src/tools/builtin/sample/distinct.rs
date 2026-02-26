@@ -21,6 +21,9 @@ use std::{
     fmt::{Display, Formatter},
     sync::Arc,
 };
+use tracing::Span;
+use tracing_futures::Instrument;
+use util::security::quote_table_reference;
 
 use crate::datafusion::DataFusion;
 use arrow::compute::concat;
@@ -69,19 +72,20 @@ impl DistinctColumnsParams {
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure that we still get `n` rows when `len(distinct(col)) < n`, whilst
         // stilling getting all possible distinct values.
+        let tbl_quoted = quote_table_reference(tbl);
+        let col = quote_identifier(column);
         Self::_sample_col(
             Arc::clone(&df),
             &format!(
                 "SELECT {col} FROM (
                 SELECT {col}, 1 as priority
-                FROM (SELECT DISTINCT {col} FROM {tbl})
+                FROM (SELECT DISTINCT {col} FROM {tbl_quoted})
                 UNION ALL
                 SELECT {col}, 2 as priority
-                FROM {tbl}
+                FROM {tbl_quoted}
             ) combined
             ORDER BY priority, {col}
-            LIMIT {n}",
-                col = quote_identifier(column)
+            LIMIT {n}"
             ),
         )
         .await
@@ -93,9 +97,10 @@ impl DistinctColumnsParams {
         col: &str,
         n: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+        let tbl_quoted = quote_table_reference(tbl);
         Self::_sample_col(
             Arc::clone(&df),
-            &format!("SELECT {col} FROM {tbl} LIMIT {n}"),
+            &format!("SELECT {col} FROM {tbl_quoted} LIMIT {n}"),
         )
         .await
     }
@@ -138,9 +143,12 @@ impl SampleFrom for DistinctColumnsParams {
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
+        let current_span = Span::current();
+
         let data_sample_futures = columns.iter().map(|column| {
             let tbl = tbl.clone();
             let df = Arc::clone(&df);
+            let span = current_span.clone();
             async move {
                 // Only sample distinctly from columns that are specified in the `cols` field, if `cols` is None and distinct sampling is supported
                 if column_supports_distinct_sampling(column)
@@ -155,6 +163,7 @@ impl SampleFrom for DistinctColumnsParams {
                     Self::sample_from_column(df, &tbl, column.name(), self.limit).await
                 }
             }
+            .instrument(span)
         });
 
         let data_samples = futures::stream::iter(data_sample_futures)

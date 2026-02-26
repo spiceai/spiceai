@@ -19,6 +19,7 @@ use std::{any::Any, fmt, sync::Arc};
 use crate::mssql::{ConnectionPoolSnafu, QuerySnafu, convert::rows_to_arrow};
 use arrow::datatypes::SchemaRef;
 use datafusion::{
+    common::utils::quote_identifier,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::Expr,
@@ -31,7 +32,7 @@ use datafusion::{
     },
     sql::{
         TableReference,
-        sqlparser::ast::DataType,
+        sqlparser::ast::{DataType, ExactNumberInfo},
         unparser::{
             Unparser,
             dialect::{CustomDialect, CustomDialectBuilder},
@@ -102,7 +103,7 @@ impl SqlServerExecPlan {
 
     fn dialect() -> CustomDialect {
         CustomDialectBuilder::new()
-            .with_float64_ast_dtype(DataType::Float(None))
+            .with_float64_ast_dtype(DataType::Float(ExactNumberInfo::None))
             .build()
     }
 
@@ -111,7 +112,7 @@ impl SqlServerExecPlan {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -140,7 +141,7 @@ impl SqlServerExecPlan {
 
         Ok(format!(
             "SELECT {top_expr}{columns} FROM {table_reference} {where_expr}",
-            table_reference = self.table_reference
+            table_reference = self.table_reference.to_quoted_string()
         ))
     }
 }
@@ -240,11 +241,10 @@ fn query_arrow(
     )) as SendableRecordBatchStream
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 fn to_datafusion_err(e: super::Error) -> datafusion::error::DataFusionError {

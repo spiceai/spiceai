@@ -68,9 +68,9 @@ use axum::{
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
-#[allow(clippy::needless_for_each)]
 #[derive(OpenApi)]
 #[openapi(
     servers(
@@ -86,16 +86,15 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::catalogs::get,
-        v1::iceberg::get_config,
-        v1::iceberg::get_namespaces,
-        v1::iceberg::head_namespace,
         v1::ready::get,
         v1::status::get,
         v1::spicepods::get,
         v1::embeddings::post,
         v1::search::post,
         v1::chat::post,
+        v1::responses::post,
         v1::models::get,
+        v1::workers::get,
         v1::nsql::post,
         v1::eval::list,
         v1::eval::post,
@@ -103,12 +102,18 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::inference::post,
         v1::tools::list,
         v1::tools::post,
+        v1::iceberg::get_config,
+        v1::iceberg::get_namespaces,
+        v1::iceberg::head_namespace,
+        v1::iceberg::get_namespace,
+        v1::iceberg::list_tables,
+        v1::iceberg::tables::head,
+        v1::iceberg::tables::get,
         v1::packages::generate,
     ),
 
     components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
-#[allow(clippy::needless_for_each)]
 pub(crate) struct ApiDoc;
 
 /// Returns the `OpenAPI` documentation for the HTTP API. Adds MCP endpoints if the feature is enabled.
@@ -186,7 +191,19 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
-#[allow(clippy::too_many_lines)]
+// Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
+// Applied at three levels:
+// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings, evals)
+//    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
+// 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
+//    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
+// 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
+//    Applied to unauthenticated routes to prevent DoS via health check endpoints
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
+#[cfg(feature = "mcp")]
+const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
+const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
+
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
@@ -206,6 +223,18 @@ pub(crate) fn routes(
         .route(
             "/v1/datasets/{name}/acceleration",
             patch(v1::datasets::acceleration),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots",
+            get(v1::snapshots::list_snapshots),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
+            get(v1::snapshots::get_snapshot),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots/current",
+            post(v1::snapshots::set_current_snapshot),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));
@@ -270,6 +299,32 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.responses_llms)));
     }
 
+    // Add async queries API routes - registered unconditionally for discoverability and consistency.
+    // Handlers check at runtime if cluster mode with scheduler role is enabled.
+    // This design ensures:
+    // 1. API endpoints are discoverable via OpenAPI/health checks regardless of cluster mode
+    // 2. Helpful 503 errors guide users on how to enable the feature
+    // 3. job_executor can be initialized asynchronously after routes are registered
+    let queries_router = Router::new()
+        .route("/v1/queries", post(v1::queries::submit))
+        .route("/v1/queries", get(v1::queries::list))
+        .route("/v1/queries/{query_id}", get(v1::queries::get_query))
+        .route(
+            "/v1/queries/{query_id}/status",
+            get(v1::queries::get_status),
+        )
+        .route(
+            "/v1/queries/{query_id}/results",
+            get(v1::queries::get_results),
+        )
+        .route(
+            "/v1/queries/{query_id}/results/chunks/{chunk_index}",
+            get(v1::queries::get_chunk),
+        )
+        .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel));
+
+    authenticated_router = authenticated_router.merge(queries_router);
+
     #[cfg(feature = "mcp")]
     {
         let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
@@ -283,6 +338,13 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let _cancellation_token =
             sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+
+        // Apply MCP-specific request body limit before merging
+        tracing::debug!(
+            "MCP request body size limit set to {} bytes",
+            MCP_REQUEST_BODY_LIMIT
+        );
+        let mcp_router = mcp_router.route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -291,16 +353,22 @@ pub(crate) fn routes(
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
 
+    // Apply request body size limit to prevent DoS attacks via unbounded request payloads
+    // This must be applied as a route layer before auth
+    authenticated_router =
+        authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
+
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
-        tracing::info!("Enabled authentication on HTTP routes");
+        tracing::info!("Enabled API key authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
-        .layer(Extension(Arc::clone(&rt.status)));
+        .layer(Extension(Arc::clone(&rt.status)))
+        .route_layer(RequestBodyLimitLayer::new(HEALTH_REQUEST_BODY_LIMIT));
 
     unauthenticated_router
         .merge(authenticated_router)

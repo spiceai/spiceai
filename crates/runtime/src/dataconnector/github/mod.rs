@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
+use crate::{
+    component::dataset::Dataset, dataconnector::github::members::MembersTableArgs,
+    register_data_connector,
+};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -42,6 +45,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use governor::Quota;
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
@@ -49,19 +53,21 @@ use issues::IssuesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
+use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::{StaticTokenProvider, TokenProvider};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, graphql::default_spice_client,
+    ParameterSpec, Parameters, default_spice_client,
 };
 
 mod commits;
@@ -71,9 +77,49 @@ mod projects;
 mod pull_requests;
 mod rate_limit;
 mod stargazers;
+mod workflow_runs;
+mod workflows;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
+    RwLock<HashMap<String, Arc<RateController>>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static UNAUTHENTICATED_AUTH_CONTEXT: &str = "unauthenticated";
+
+async fn get_github_auth_context_rate_controller(auth_context: String) -> Arc<RateController> {
+    let rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.read().await;
+    if let Some(controller) = rate_controllers.get(&auth_context) {
+        return Arc::clone(controller);
+    }
+
+    drop(rate_controllers);
+    let mut rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.write().await;
+
+    // GitHub secondary rate limit for GraphQL is 2000 points per minute
+    let Some(secondary_quota_per_minute) = NonZeroU32::new(2000) else {
+        unreachable!("2000 is non-zero");
+    };
+
+    // GitHub secondary rate limit for requests per minute cannot exceed 90 CPU time per 60 seconds wall time
+    let Some(cpu_time_limit) = NonZeroU32::new(90) else {
+        unreachable!("90 is non-zero");
+    };
+
+    let rate_controller = RateControllerBuilder::new()
+        .with_weighted_quota(Quota::per_minute(secondary_quota_per_minute))
+        .add_quota(Quota::per_minute(cpu_time_limit))
+        .with_jitter(JitterConfig::new(
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        ));
+
+    let controller = rate_controller.build();
+    rate_controllers.insert(auth_context.clone(), Arc::clone(&controller));
+
+    controller
+}
 
 const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
 
@@ -295,7 +341,7 @@ impl Github {
         }
     }
 
-    pub(crate) fn create_graphql_client(
+    pub(crate) async fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
@@ -307,6 +353,13 @@ impl Github {
             .token
             .as_ref()
             .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
+
+        let auth_context = token.as_ref().map_or_else(
+            || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
+            |t| t.dyn_hash(),
+        );
+
+        let rate_controller = get_github_auth_context_rate_controller(auth_context).await;
 
         let client = default_spice_client("application/json").boxed()?;
 
@@ -321,6 +374,7 @@ impl Github {
         .with_schema(gql_client_params.schema)
         .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
+        .with_rate_controller(Some(rate_controller))
         .build(client)
         .boxed()
     }
@@ -353,7 +407,7 @@ impl Github {
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self.create_graphql_client(&table_args).context(
+        let client = self.create_graphql_client(&table_args).await.context(
             super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),
@@ -592,6 +646,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("include_commits")
         .description("Whether to fetch commit information (created_at, updated_at) for files. Set to 'true' to enable.")
         .default("false"),
+    ParameterSpec::component("workflow_logs")
+        .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
+        .default("disabled"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -641,11 +698,8 @@ impl DataConnectorFactory for GithubFactory {
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
                 match (token, client_id, private_key, installation_id) {
                     (Some(token), _, _, _) => {
-                        let key = token.clone().expose_secret().to_string();
-                        (
-                            Some(Arc::new(StaticTokenProvider::new(token.clone()))),
-                            Some(key),
-                        )
+                        let key = token.expose_secret().to_string();
+                        (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
                     }
 
                     (None, Some(client_id), Some(private_key), Some(installation_id)) => {
@@ -694,6 +748,8 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
+register_data_connector!("github", GithubFactory);
+
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {
     Auto,
@@ -726,7 +782,7 @@ fn warn_if_provided(
     }
 }
 
-const MAX_COMMENTS_FETCHED: u32 = 100;
+const MAX_COMMENTS_FETCHED: u32 = 75;
 
 // Organization-level resources (2 segments: owner/resource_type)
 const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
@@ -739,6 +795,7 @@ const REPO_LEVEL_RESOURCES: &[&str] = &[
     "stargazers",
     "projects",
     "files",
+    "workflows",
 ];
 
 /// Parsed GitHub path components
@@ -793,7 +850,6 @@ fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
         self
@@ -942,7 +998,7 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     component,
                 });
-                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
+                self.create_gql_table_provider(Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>, Some(table_args), Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
             }
             ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
@@ -953,6 +1009,73 @@ impl DataConnector for Github {
                     dataset,
                 )
                 .await
+            }
+            ("workflows", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "workflows", &component);
+
+                let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                    connector_component: component.clone(),
+                })?;
+
+                // Check if there's a remaining path (workflow_id/runs)
+                match parsed.remaining.as_deref() {
+                    None | Some("") => {
+                        // No workflow ID specified - list all workflows
+                        // Warn if github_workflow_logs is set since it's not applicable
+                        if dataset
+                            .params
+                            .get("github_workflow_logs")
+                            .is_some_and(|value| value.as_str() == "enabled")
+                        {
+                            tracing::warn!(
+                                "The 'github_workflow_logs' parameter is only supported when retrieving workflow runs (e.g., github.com/{}/{}/workflows/workflow.yml/runs), not when listing workflows. It will be ignored for {component}.",
+                                parsed.owner,
+                                repo
+                            );
+                        }
+
+                        Ok(Arc::new(
+                            workflows::WorkflowsTableProvider::new(
+                                client,
+                                parsed.owner,
+                                repo,
+                                dataset,
+                            )
+                            .await?,
+                        ) as Arc<dyn TableProvider>)
+                    }
+                    Some(remaining) => {
+                        // Workflow ID specified - parse workflow_id/runs
+                        let parts: Vec<&str> = remaining.split('/').collect();
+                        if parts.len() != 2 || parts[1] != "runs" {
+                            return Err(DataConnectorError::UnableToGetReadProvider {
+                                dataconnector: "github".to_string(),
+                                source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
+                                connector_component: component,
+                            });
+                        }
+
+                        let workflow_id = parts[0];
+
+                        let fetch_logs = dataset
+                            .params
+                            .get("github_workflow_logs")
+                            .is_some_and(|value| value.as_str() == "enabled");
+
+                        Ok(Arc::new(
+                            workflow_runs::WorkflowRunsTableProvider::new(
+                                client,
+                                parsed.owner,
+                                repo,
+                                workflow_id,
+                                fetch_logs,
+                                dataset,
+                            )
+                            .await?,
+                        ) as Arc<dyn TableProvider>)
+                    }
+                }
             }
             ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
@@ -990,7 +1113,7 @@ impl DataConnector for Github {
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
-                    None,
+                    Some(table_args),
                     Github::get_health_check_for_org(parsed.owner)
                 )
                 .await

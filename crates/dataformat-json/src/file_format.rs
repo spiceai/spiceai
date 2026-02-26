@@ -74,13 +74,19 @@ pub struct SpiceJsonOptions {
 
 #[derive(Debug, Snafu)]
 pub enum FormatParseError {
-    #[snafu(display("Invalid JSON format '{s}'. Valid formats are: 'jsonl', 'ndjson', 'array'",))]
+    #[snafu(display(
+        "Invalid JSON format '{s}'. Valid formats are: 'jsonl', 'ndjson', 'ldjson', 'array'",
+    ))]
     InvalidFormat { s: String },
 }
 
 #[derive(Debug)]
 pub enum Format {
+    /// Line-delimited JSON format (JSONL/NDJSON/LDJSON).
+    /// Each line contains a valid JSON value separated by newlines.
+    /// Supports both `\n` and `\r\n` line endings.
     Jsonl,
+    /// JSON array format where the entire file is a single JSON array.
     Array,
 }
 
@@ -89,7 +95,9 @@ impl FromStr for Format {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "jsonl" | "ndjson" => Ok(Format::Jsonl),
+            // JSONL (JSON Lines), NDJSON (Newline Delimited JSON), and LDJSON (Line Delimited JSON)
+            // are all essentially the same format - one JSON value per line.
+            "jsonl" | "ndjson" | "ldjson" => Ok(Format::Jsonl),
             "array" => Ok(Format::Array),
             _ => InvalidFormatSnafu { s: s.to_string() }.fail(),
         }
@@ -271,7 +279,7 @@ impl FileFormat for SpiceJsonFormat {
     async fn create_physical_plan(
         &self,
         _state: &dyn Session,
-        mut conf: FileScanConfig,
+        conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let source = Arc::new(
             SpiceJsonSource::new()
@@ -289,18 +297,16 @@ impl FileFormat for SpiceJsonFormat {
             // In order to still allow parallel read for individual files, we wrap them into separate files groups
             let individual_file_groups: Vec<_> = conf
                 .file_groups
-                .into_iter()
+                .iter()
                 .flat_map(|group| {
                     group
-                        .into_inner()
-                        .into_iter()
-                        .map(|file_meta| FileGroup::new(vec![file_meta]))
+                        .iter()
+                        .map(|file_meta| FileGroup::new(vec![file_meta.clone()]))
                 })
                 .collect();
 
-            conf.file_groups = individual_file_groups;
-
             let conf = FileScanConfigBuilder::from(conf)
+                .with_file_groups(individual_file_groups)
                 .with_file_compression_type(FileCompressionType::from(self.options.compression))
                 .with_source(source)
                 .build();
@@ -461,8 +467,8 @@ impl DataSource for NonRepartitionedFileScanConfig {
     fn eq_properties(&self) -> EquivalenceProperties {
         self.inner.eq_properties()
     }
-    fn statistics(&self) -> Result<Statistics> {
-        self.inner.statistics()
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.inner.partition_statistics(partition)
     }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
         self.inner.with_fetch(limit)
@@ -478,5 +484,53 @@ impl DataSource for NonRepartitionedFileScanConfig {
         projection: &[ProjectionExpr],
     ) -> Result<Option<Arc<dyn DataSource>>> {
         self.inner.try_swapping_with_projection(projection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_parse_jsonl() {
+        assert!(matches!("jsonl".parse::<Format>(), Ok(Format::Jsonl)));
+        assert!(matches!("JSONL".parse::<Format>(), Ok(Format::Jsonl)));
+        assert!(matches!("Jsonl".parse::<Format>(), Ok(Format::Jsonl)));
+    }
+
+    #[test]
+    fn test_format_parse_ndjson() {
+        // NDJSON (Newline Delimited JSON) is treated the same as JSONL
+        assert!(matches!("ndjson".parse::<Format>(), Ok(Format::Jsonl)));
+        assert!(matches!("NDJSON".parse::<Format>(), Ok(Format::Jsonl)));
+        assert!(matches!("Ndjson".parse::<Format>(), Ok(Format::Jsonl)));
+    }
+
+    #[test]
+    fn test_format_parse_ldjson() {
+        // LDJSON (Line Delimited JSON) is treated the same as JSONL
+        assert!(matches!("ldjson".parse::<Format>(), Ok(Format::Jsonl)));
+        assert!(matches!("LDJSON".parse::<Format>(), Ok(Format::Jsonl)));
+        assert!(matches!("Ldjson".parse::<Format>(), Ok(Format::Jsonl)));
+    }
+
+    #[test]
+    fn test_format_parse_array() {
+        assert!(matches!("array".parse::<Format>(), Ok(Format::Array)));
+        assert!(matches!("ARRAY".parse::<Format>(), Ok(Format::Array)));
+        assert!(matches!("Array".parse::<Format>(), Ok(Format::Array)));
+    }
+
+    #[test]
+    fn test_format_parse_invalid() {
+        let _ = "json"
+            .parse::<Format>()
+            .expect_err("json should not parse as a valid format");
+        let _ = ""
+            .parse::<Format>()
+            .expect_err("empty format should be rejected");
+        let _ = "invalid"
+            .parse::<Format>()
+            .expect_err("invalid format should be rejected");
     }
 }

@@ -32,6 +32,8 @@ pub(crate) struct AppendConfig {
     pub(crate) load_steps: u16,
     pub(crate) load_interval: Duration,
     pub(crate) temp_directory: PathBuf,
+    pub(crate) with_conflict_data: bool,
+    pub(crate) with_retention_data: bool,
 }
 
 impl AppendConfig {
@@ -42,7 +44,29 @@ impl AppendConfig {
             load_steps: 10,
             load_interval: Duration::from_secs(60 * 4),
             temp_directory,
+            with_conflict_data: false,
+            with_retention_data: false,
         }
+    }
+
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = load_interval;
+        self
+    }
+
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = load_steps;
+        self
+    }
+
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
+        self
+    }
+
+    pub fn with_retention_test_data(mut self, with_retention_test_data: bool) -> Self {
+        self.with_retention_data = with_retention_test_data;
+        self
     }
 }
 
@@ -56,7 +80,6 @@ impl AppendWorker {
         Self { config, source }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn start(self) -> Result<JoinHandle<Result<()>>> {
         // Outside of the join handle, run some initial setup
         // This ensures the appendable dataset is ready before the workers start

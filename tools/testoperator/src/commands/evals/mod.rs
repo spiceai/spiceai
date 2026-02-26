@@ -92,7 +92,6 @@ impl EvalMetrics {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -112,6 +111,24 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+
+    // Build resource with attributes known upfront, before creating telemetry.
+    // This ensures the SdkMeterProvider is created with the correct resource.
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "model_benchmark"),
+            KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+            KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
+            KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+            KeyValue::new("branch_name", git::get_branch_name()),
+        ])
+        .build();
+
+    // Create telemetry with resource upfront, before any metrics calls
+    let telemetry =
+        Telemetry::new_with_resource(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
     let health_monitor = HealthMonitor::spawn()?;
 
     println!("Executing {eval} eval benchmark for model {model}. It might take several minutes...");
@@ -176,20 +193,9 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
     // Record benchmark results
-    let benchmark_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "model_benchmark"),
-        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
-        KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
-        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
-        KeyValue::new("branch_name", git::get_branch_name()),
-    ]);
-
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
-
     let attributes = vec![
-        KeyValue::new("model_name", model.to_string()),
-        KeyValue::new("benchmark_name", eval.to_string()),
+        KeyValue::new("model_name", model.clone()),
+        KeyValue::new("benchmark_name", eval.clone()),
     ];
     crate::metrics::STATUS.record(metrics.status.to_u64(), &attributes);
     crate::metrics::SCORE.record(metrics.score, &attributes);
@@ -227,7 +233,7 @@ async fn execute_sql(
     sql: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let res = spice_client
-        .query(sql)
+        .sql(sql)
         .await?
         .try_collect::<Vec<RecordBatch>>()
         .await?;

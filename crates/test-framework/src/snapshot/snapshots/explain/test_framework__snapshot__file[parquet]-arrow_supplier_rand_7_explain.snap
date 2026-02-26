@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: supplier_rand_7"
+---
++---------------+-------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                        |
++---------------+-------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: supplier.s_suppkey = Int64(4567)                                                                    |
+|               |   TableScan: supplier projection=[s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                 |
+|               |   FilterExec: s_suppkey@0 = 4567                                                                            |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
+|               |       SchemaCastScanExec                                                                                    |
+|               |         BytesProcessedExec                                                                                  |
+|               |           DataSourceExec: partitions=1, partition_sizes=[2]                                                 |
+|               |                                                                                                             |
++---------------+-------------------------------------------------------------------------------------------------------------+

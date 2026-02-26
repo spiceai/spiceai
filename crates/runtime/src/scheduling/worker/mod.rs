@@ -16,7 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
+use async_openai::types::chat::{
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+};
 use scheduler::Result;
 use scheduler::task::ScheduledTask;
 use tonic::async_trait;

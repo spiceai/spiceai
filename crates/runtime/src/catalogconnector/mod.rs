@@ -78,13 +78,20 @@ pub enum Error {
 
     #[snafu(transparent)]
     IcebergSnafu { source: iceberg::Error },
+
+    #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
+    RefreshTaskAlreadyStarted {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(not(windows))]
+pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
 pub mod glue;
 pub mod iceberg;
 pub mod spice_cloud;
@@ -162,6 +169,26 @@ pub async fn register_all() {
             spice_cloud::PARAMETERS,
         ),
     );
+
+    #[cfg(feature = "duckdb")]
+    registry.insert(
+        ducklake::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            ducklake::DuckLakeCatalog::new_connector,
+            ducklake::PREFIX,
+            ducklake::PARAMETERS,
+        ),
+    );
+
+    #[cfg(not(windows))]
+    registry.insert(
+        cayenne::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            cayenne::CayenneCatalogConnector::new_connector,
+            cayenne::PREFIX,
+            cayenne::PARAMETERS,
+        ),
+    );
 }
 
 pub async fn unregister_all() {
@@ -216,7 +243,7 @@ pub trait CatalogConnector: Send + Sync {
 
     /// Returns whether the catalog connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
     }
 }
 
@@ -239,7 +266,7 @@ pub async fn get_catalog_provider(
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )
-    .start_refresh(refresh_interval);
+    .start_refresh(refresh_interval)?;
     Ok(Arc::new(provider))
 }
 
@@ -251,13 +278,6 @@ pub struct RefreshingCatalogProvider {
 }
 
 impl RefreshingCatalogProvider {
-    pub fn new_with_refresh(
-        inner: Arc<dyn RefreshableCatalogProvider>,
-        refresh_interval: Duration,
-    ) -> Self {
-        Self::new(inner).start_refresh(Some(refresh_interval))
-    }
-
     fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
         Self {
             inner,
@@ -265,8 +285,11 @@ impl RefreshingCatalogProvider {
         }
     }
 
-    fn start_refresh(mut self, interval: Option<Duration>) -> Self {
-        assert!(self.refresh_task.is_none(), "Refresh task already running");
+    fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
+        if self.refresh_task.is_some() {
+            return Err(Error::RefreshTaskAlreadyStarted {});
+        }
+
         let interval = interval.unwrap_or(Duration::from_secs(60));
         let inner = Arc::clone(&self.inner);
         self.refresh_task = Some(tokio::spawn(async move {
@@ -280,7 +303,7 @@ impl RefreshingCatalogProvider {
                 }
             }
         }));
-        self
+        Ok(self)
     }
 }
 

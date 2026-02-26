@@ -18,3 +18,14 @@ pub mod common;
 pub mod logical_plan;
 pub mod pass_thru;
 pub mod physical_plan;
+
+use snafu::prelude::*;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Invalid input count. Expected only one input, got {input_len}."))]
+    InvalidInputCount { input_len: usize },
+
+    #[snafu(display("Invalid expression count. Expected no expressions, got {expr_len}."))]
+    InvalidExpressionCount { expr_len: usize },
+}

@@ -2,67 +2,74 @@
 
 This roadmap details the planned features and priorities for Spice.ai Open Source, aligning with the mission to empower developers to build decision-making, data-driven AI applications. It is regularly refined based on community feedback, customer needs, and strategic goals.
 
-To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Discord](https://github.com/spiceai/spiceai#-connect-with-us). Your input drives our direction.
+To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Slack](https://spiceai.org/slack). Your input drives our direction.
 
 ---
 
 ## Known Issues
 
 - Track active bugs on [GitHub](https://github.com/spiceai/spiceai/labels/bug).
-- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Discord for faster resolution.
+- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Slack for faster resolution.
 
 ---
 
 ## Release Timeline
 
-### [v1.9 (November 2025)](https://github.com/spiceai/spiceai/milestone/78)
+### v2.0 (March 2026)
 
-**Focus:** Real-Time Ingestion, Write, and Security.
+**Focus:** Production-Grade HA.
 
-- **Search**:
-  - Amazon S3 Vectors index spilling.
-  - Full-Text-Search Scalability.
-- **Security**:
-  - Authentication improvements.
-  - Security hardening.
-- **Data Connectors**:
-  - DynamoDB Streams Data Connector.
-- **Snapshots**:
-  - Resiliency improvements.
-  - Debezium and DynamoDB Streams support.
-- **DataFusion**: Upgrade to v50.
+- **Spice Cayenne (GA)**: Production-ready columnar storage format for accelerated datasets.
+- **Active-Active HA (GA)**: Production-ready multi-node deployment with zero-downtime failover.
+- **Distributed Query (GA)**: Stable multi-node query execution for large-scale workloads.
+- **Backup & Point-in-Time Recovery**: Snapshot restore for accelerated datasets.
+- **Accelerated Dataset Distribution**: Replicate accelerated datasets across executor nodes.
 
-### [v1.10 (December 2025)](https://github.com/spiceai/spiceai/milestone/79)
+### v2.1 (H2 2026)
 
-**Focus:** Lakehouse Architecture.
+**Focus:** Schema Management & Search.
 
-- **DuckDB**: Upgrade to v1.4.x.
-- **DataFusion**: Upgrade to v51.
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
+- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
+- **Hybrid Search Ranking**: Configurable fusion strategies (Reciprocal Rank Fusion (RRF) weights, learned ranking).
 
-### v1.1x (H1 2026)
+### v2.2 (H2 2026)
 
-**Focus:** Lakehouse Architecture.
+**Focus:** Reactive Actions & Event Processing.
 
-- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
-- **Write Support**:
-  - Apache Iceberg write support (expanded).
-  - PostgreSQL write support (expanded).
-  - Spice Cloud write support (expanded).
-- **DataFusion**: Upgrade to v52.
+- **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
+- **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
 
-**Focus:** Extensibility.
+### v2.3 (H2 2026)
 
-- **Resource Management**: Finer-grained runtime-wide control for optimized performance.
-- **Extensible Middleware**:
-  - Pluggable extensions for dynamic customization.
+**Focus:** Enterprise Security & Compliance.
 
-### v2.0 (H2 2026)
+- **Data Masking & Anonymization**: Dynamic PII redaction at query time.
+- **OIDC Token Verification**: Validate identity tokens from enterprise providers (Okta, Azure AD, etc.).
+
+### v2.4 (2027)
 
 **Focus:** Governance.
 
-- **Policy Engine**:
+- **Policy Engine (Cedar-based)**:
   - Role-based security for fine-grained access control.
   - Data access policies to enforce compliance and governance.
+- **Audit Logging**: Persistent, immutable query and access logs for compliance.
+- **Resource Quotas**: Per-user/tenant query limits and throttling.
+
+### v2.5 (2027)
+
+**Focus:** Extensibility & Plugin Architecture.
+
+- **Extensible Middleware**: Pluggable extensions for dynamic customization.
+- **Custom Tool Providers**: User-defined MCP tool implementations.
+
+### v2.6 (2027)
+
+**Focus:** Encryption.
+
+- **Customer-Managed Keys (BYOK)**: Encryption key management for sensitive workloads.
+- **Data-at-Rest Encryption**: Encrypted storage for accelerated datasets.
 
 ---
 
@@ -88,6 +95,17 @@ These are prioritized based on community demand and strategic alignment. Share y
 
 - **Vision Processing**: Support for image and video.
 - **Custom Model Integration**: Framework for user-defined ML models.
+- **Model Versioning & A/B Testing**: Canary deployments and version management for models.
+- **Hallucination Detection**: Fact-checking LLM responses against source data.
+
+### Search & Retrieval
+
+- **Faceted Search**: Aggregations, filters, and counts for enterprise search UX.
+
+### Data Platform
+
+- **Data Lineage**: Track data provenance and transformations across the pipeline.
+- **Schema Registry & Evolution**: Versioning and backward compatibility checks.
 
 ### Platform Enhancements
 

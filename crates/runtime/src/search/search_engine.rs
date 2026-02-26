@@ -23,12 +23,15 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::{DFSchema, SchemaError};
+use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast;
 use datafusion_expr::{Expr, LogicalPlan};
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
@@ -217,7 +220,13 @@ impl SearchEngine {
                         CacheStatus::CacheBypass,
                     )
                 }
-                (CacheControl::Cache(_), None) => {
+                (
+                    CacheControl::Cache(_)
+                    | CacheControl::MaxStale(_, _)
+                    | CacheControl::MinFresh(_, _)
+                    | CacheControl::OnlyIfCached(_),
+                    None,
+                ) => {
                     tracing::trace!("Search cache miss");
                     let results = self.search(req).await?;
                     (
@@ -225,7 +234,13 @@ impl SearchEngine {
                         CacheStatus::CacheMiss,
                     )
                 }
-                (CacheControl::Cache(_), Some(cached_result)) => {
+                (
+                    CacheControl::Cache(_)
+                    | CacheControl::MaxStale(_, _)
+                    | CacheControl::MinFresh(_, _)
+                    | CacheControl::OnlyIfCached(_),
+                    Some(cached_result),
+                ) => {
                     tracing::trace!("Search cache hit");
                     // each CachedAggregationResult needs to be re-mapped to an AggregationResult
                     let mut results = HashMap::new();
@@ -322,7 +337,7 @@ impl SearchEngine {
                         &tbl,
                         get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
                         table_cols,
-                        primary_keys.to_vec(),
+                        primary_keys.iter().map(|pk| Column::from_qualified_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
                         *limit
                     ).await.context(SearchPipelineSnafu)?;
@@ -495,12 +510,7 @@ fn wrap_cache_to_result(
         if results.is_empty() {
             tracing::trace!("No results to cache for tables: {expected_keys:?}");
             return;
-        } else if !expected_keys
-            .iter()
-            .filter(|key| !results.contains_key(key))
-            .collect::<Vec<_>>()
-            .is_empty()
-        {
+        } else if expected_keys.iter().any(|key| !results.contains_key(key)) {
             tracing::trace!(
                 "Not all expected keys were found in the cached results: {expected_keys:?}"
             );

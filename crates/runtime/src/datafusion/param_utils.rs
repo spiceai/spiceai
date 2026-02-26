@@ -8,7 +8,9 @@ use snafu::prelude::*;
 pub enum Error {
     #[snafu(display("Nested arrays or objects are not supported as parameter values"))]
     NestedValues,
-    #[snafu(display("Unsupported JSON number format"))]
+    #[snafu(display(
+        "Unsupported JSON number format in query parameter. Use integers or floating point values."
+    ))]
     UnsupportedJsonNumberFormat,
     #[snafu(display("Parameters must be a JSON array or an object"))]
     JsonArrayOrObjectRequired,
@@ -38,7 +40,7 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
                 let scalar = json_to_scalar(&val)?;
                 vec.push(scalar);
             }
-            Ok(ParamValues::List(vec))
+            Ok(ParamValues::from(vec))
         }
         Value::Object(obj) => {
             let mut map = HashMap::new();
@@ -46,7 +48,7 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
                 let scalar = json_to_scalar(&val)?;
                 map.insert(key, scalar);
             }
-            Ok(ParamValues::Map(map))
+            Ok(ParamValues::from(map))
         }
         _ => Err(Error::JsonArrayOrObjectRequired),
     }
@@ -97,10 +99,19 @@ mod tests {
     fn assert_eq_param_values(a: &ParamValues, b: &ParamValues) {
         match (a, b) {
             (ParamValues::Map(map_a), ParamValues::Map(map_b)) => {
-                assert_eq!(map_a, map_b);
+                // ScalarAndMetadata doesn't impl PartialEq, compare the value fields
+                assert_eq!(map_a.len(), map_b.len());
+                for (key, val_a) in map_a {
+                    let val_b = map_b.get(key).expect("key in both maps");
+                    assert_eq!(val_a.value(), val_b.value(), "mismatch for key {key}");
+                }
             }
             (ParamValues::List(vec_a), ParamValues::List(vec_b)) => {
-                assert_eq!(vec_a, vec_b);
+                // ScalarAndMetadata doesn't impl PartialEq, compare the value fields
+                assert_eq!(vec_a.len(), vec_b.len());
+                for (val_a, val_b) in vec_a.iter().zip(vec_b.iter()) {
+                    assert_eq!(val_a.value(), val_b.value(), "list element mismatch");
+                }
             }
             _ => {
                 panic!("ParamValues are different types: {a:?} and {b:?}");
@@ -112,7 +123,7 @@ mod tests {
     fn test_json_array() {
         let json = json!([1, "hello", true, null]);
         let got = convert_json_to_param_values(json).expect("convert to param values");
-        let want = ParamValues::List(vec![
+        let want = ParamValues::from(vec![
             ScalarValue::Int64(Some(1)),
             ScalarValue::Utf8(Some("hello".to_string())),
             ScalarValue::Boolean(Some(true)),
@@ -133,42 +144,45 @@ mod tests {
             ScalarValue::Utf8(Some("world".to_string())),
         );
         want.insert("z".to_string(), ScalarValue::Boolean(Some(false)));
-        assert_eq_param_values(&got, &ParamValues::Map(want));
+        assert_eq_param_values(&got, &ParamValues::from(want));
     }
 
     #[test]
     fn test_invalid_top_level() {
         let json = json!(42);
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on invalid top-level JSON");
     }
 
     #[test]
     fn test_array_with_nested_array() {
         let json = json!([1, [2, 3]]);
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested array");
     }
 
     #[test]
     fn test_object_with_nested_object() {
         let json = json!({"a": 1, "b": {"c": 2}});
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested object");
     }
 
     #[test]
     fn test_empty_array() {
         let json = json!([]);
         let result = convert_json_to_param_values(json).expect("convert to param values");
-        assert_eq_param_values(&result, &ParamValues::List(vec![]));
+        assert_eq_param_values(&result, &ParamValues::from(Vec::<ScalarValue>::new()));
     }
 
     #[test]
     fn test_empty_object() {
         let json = json!({});
         let result = convert_json_to_param_values(json).expect("convert to param values");
-        assert_eq_param_values(&result, &ParamValues::Map(HashMap::new()));
+        assert_eq_param_values(
+            &result,
+            &ParamValues::from(HashMap::<String, ScalarValue>::new()),
+        );
     }
 
     #[test]
@@ -177,7 +191,7 @@ mod tests {
         let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
             &result,
-            &ParamValues::List(vec![ScalarValue::Utf8(None), ScalarValue::Utf8(None)]),
+            &ParamValues::from(vec![ScalarValue::Utf8(None), ScalarValue::Utf8(None)]),
         );
     }
 
@@ -188,7 +202,7 @@ mod tests {
         let mut expected_map = HashMap::new();
         expected_map.insert("a".to_string(), ScalarValue::Utf8(None));
         expected_map.insert("b".to_string(), ScalarValue::Utf8(None));
-        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::from(expected_map));
     }
 
     #[test]
@@ -197,7 +211,7 @@ mod tests {
         let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
             &result,
-            &ParamValues::List(vec![
+            &ParamValues::from(vec![
                 ScalarValue::Float64(Some(1.5)),
                 ScalarValue::Float64(Some(2.0)),
             ]),
@@ -211,7 +225,7 @@ mod tests {
         let mut expected_map = HashMap::new();
         expected_map.insert("pi".to_string(), ScalarValue::Float64(Some(PI)));
         expected_map.insert("e".to_string(), ScalarValue::Float64(Some(E)));
-        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::from(expected_map));
     }
 
     #[test]
@@ -220,7 +234,7 @@ mod tests {
         let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
             &result,
-            &ParamValues::List(vec![
+            &ParamValues::from(vec![
                 ScalarValue::Utf8(Some("test".to_string())),
                 ScalarValue::Boolean(Some(true)),
                 ScalarValue::Boolean(Some(false)),
@@ -238,20 +252,20 @@ mod tests {
             ScalarValue::Utf8(Some("Alice".to_string())),
         );
         expected_map.insert("is_active".to_string(), ScalarValue::Boolean(Some(true)));
-        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::from(expected_map));
     }
 
     #[test]
     fn test_error_with_specific_index() {
         let json = json!([1, "two", [3]]);
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested array");
     }
 
     #[test]
     fn test_error_with_specific_key() {
         let json = json!({"a": 1, "b": "two", "c": {"d": 3}});
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested object");
     }
 }

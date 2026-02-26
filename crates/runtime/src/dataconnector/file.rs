@@ -18,6 +18,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
+use crate::register_data_connector;
 use async_trait::async_trait;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -234,6 +235,8 @@ impl ListingTableConnector for File {
         Ok(())
     }
 }
+
+register_data_connector!("file", FileFactory);
 
 fn get_path(dataset: &Dataset) -> PathBuf {
     PathBuf::from(dataset.path())

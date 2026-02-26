@@ -34,12 +34,38 @@ use datafusion::{
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
     sql::TableReference,
 };
+use datafusion_expr::select_expr::SelectExpr;
 use futures::future::BoxFuture;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
     index::{SearchIndex, chunking::ChunkedSearchIndex},
 };
+
+/// Tracks the original UDTF invocation that produced this `SearchQueryProvider`.
+///
+/// This is used for serialization during distributed query execution with Ballista.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UdtfSource {
+    /// Created by `text_search(tbl, query, [col], [limit], [include_score])`
+    TextSearch {
+        table: String,
+        query: String,
+        column: Option<String>,
+        limit: Option<usize>,
+        include_score: Option<bool>,
+    },
+    /// Created by `vector_search(tbl, query, [col], [limit], [include_score])`
+    VectorSearch {
+        table: String,
+        query: String,
+        column: Option<String>,
+        limit: Option<usize>,
+        include_score: Option<bool>,
+    },
+}
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
 /// if required by filters or additional columns in the projection.
@@ -57,6 +83,11 @@ pub struct SearchQueryProvider {
     /// immediately before the provider executes a scan operation. The callback is asynchronous and
     /// will be awaited before the scan proceeds. If `None`, no callback is invoked.
     pub scan_callback: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
+    /// Tracks the original UDTF invocation for distributed serialization.
+    ///
+    /// This is set when the provider is created via a UDTF like `text_search()` or `vector_search()`.
+    /// It enables `SpiceLogicalCodec` to serialize and reconstruct this provider on remote executors.
+    pub udtf_source: Option<UdtfSource>,
 }
 
 impl std::fmt::Debug for SearchQueryProvider {
@@ -67,6 +98,7 @@ impl std::fmt::Debug for SearchQueryProvider {
             .field("search_column", &self.search_column)
             .field("primary_key", &self.primary_key)
             .field("pre_limit", &self.pre_limit)
+            .field("udtf_source", &self.udtf_source)
             .finish_non_exhaustive()
     }
 }
@@ -87,6 +119,7 @@ impl SearchQueryProvider {
             pre_limit,
             scan_callback: None,
             constraints: None,
+            udtf_source: None,
         };
 
         // Create `constraints` based on [`Self::schema`]
@@ -114,6 +147,13 @@ impl SearchQueryProvider {
         func: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
     ) -> Self {
         self.scan_callback = Some(func);
+        self
+    }
+
+    /// Sets the UDTF source for distributed serialization.
+    #[must_use]
+    pub fn with_udtf_source(mut self, source: UdtfSource) -> Self {
+        self.udtf_source = Some(source);
         self
     }
 
@@ -149,22 +189,62 @@ impl SearchQueryProvider {
         for f in search_index_schema.fields() {
             base_table_cols.remove(f.name());
         }
+
         base_table_cols.extend(self.primary_key.clone());
 
-        // Also include any columns needed for filters on base table.
-        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
-        let base_table_cols: Vec<_> = base_table_cols.into_iter().collect();
-        let mut base_proj =
-            projection_from_columns(&self.table_provider.schema(), &base_table_cols);
-        base_proj.sort_unstable(); // Deterministic LogicalPlans
+        // Include columns for all filters.
+        let before_final_filter: Vec<String> = filters
+            .iter()
+            .flat_map(|f| {
+                f.column_refs()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            // Sort for deterministic LogicalPlans
+            .collect::<HashSet<String>>()
+            .union(&base_table_cols)
+            .cloned()
+            .collect::<Vec<String>>()
+            .into_iter()
+            .sorted()
+            .collect();
 
-        // Get filters that can be pushed down to the base table
+        let mut scan = LogicalPlanBuilder::scan(
+            "base_table",
+            Arc::new(DefaultTableSource::new(
+                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
+            )),
+            Some(projection_from_columns(
+                &self.table_provider.schema(),
+                &before_final_filter,
+            )),
+        )?;
+
+        if let Some(f) = self.base_table_filters(filters)? {
+            scan = scan.filter(f)?;
+        }
+
+        // Only return columns 1. asked for in projection or 2. Needed by filters but not in search schema.
+        // Previous projection `before_final_filter` included all columns needed by filters.
+        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
+        scan.project(
+            base_table_cols
+                .iter()
+                .map(|c| SelectExpr::Expression(ident(c)))
+                .sorted_by_key(ToString::to_string), // Sort for deterministic LogicalPlans
+        )?
+        .build()
+    }
+
+    // Get filters that can be pushed down to the base table
+    fn base_table_filters(&self, filters: &[Expr]) -> Result<Option<Expr>, DataFusionError> {
         let filter_refs: Vec<_> = filters.iter().collect();
         let supported_filters = self
             .table_provider
             .supports_filters_pushdown(filter_refs.as_slice())?;
 
-        let underlying_filter: Option<Expr> = filters
+        Ok(filters
             .iter()
             .zip(supported_filters.iter())
             .filter_map(|(f, supp)| {
@@ -175,20 +255,7 @@ impl SearchQueryProvider {
                     Some(f.clone())
                 }
             })
-            .reduce(Expr::and);
-
-        let mut scan = LogicalPlanBuilder::scan(
-            "base_table",
-            Arc::new(DefaultTableSource::new(
-                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
-            )),
-            Some(base_proj),
-        )?;
-
-        if let Some(f) = underlying_filter {
-            scan = scan.filter(f)?;
-        }
-        scan.build()
+            .reduce(Expr::and))
     }
 
     fn join_with_base(
@@ -251,8 +318,7 @@ impl SearchQueryProvider {
                         Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
                     }
                     None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
-                })
-                .collect::<Vec<Expr>>(),
+                }),
         )?;
 
         // Apply all filters after JOIN. This is to ensure that if a filter is pushed onto RHS,
@@ -304,7 +370,7 @@ impl SearchQueryProvider {
                 //   substring(
                 //      search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]),
                 //   ),
-                //  'Utf8') as 'match'
+                //  'Utf8') as '_match'
                 cast(
                     substring(
                         col(search_col),
@@ -313,7 +379,7 @@ impl SearchQueryProvider {
                     ),
                     DataType::Utf8,
                 )
-                .alias("match"),
+                .alias(SEARCH_MATCH_COLUMN_NAME),
             ],
         ]
         .concat()
@@ -332,7 +398,7 @@ impl SearchQueryProvider {
         let search_index_columns: HashSet<String> = search_index_schema
             .fields()
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect();
 
         // Check if projection can be satisfied
@@ -390,10 +456,14 @@ impl TableProvider for SearchQueryProvider {
             }
         }
 
-        // Add `match` only if its a chunked search field.
-        if fields_map.contains_key(&ChunkedSearchIndex::chunking_offset_col(
-            self.search_column.as_str(),
-        )) && fields_map.contains_key(&self.search_column)
+        // Add `match` only if its a chunked search field (chunking offsets must be from this search index).
+        if self
+            .search_index_query
+            .schema()
+            .has_column_with_unqualified_name(&ChunkedSearchIndex::chunking_offset_col(
+                self.search_column.as_str(),
+            ))
+            && fields_map.contains_key(&self.search_column)
         {
             fields_map.insert(
                 SEARCH_MATCH_COLUMN_NAME.to_string(),
@@ -422,7 +492,6 @@ impl TableProvider for SearchQueryProvider {
         Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -454,7 +523,7 @@ impl TableProvider for SearchQueryProvider {
             if !proj.contains(&match_idx) {
                 return proj;
             }
-            let mut proj2 = proj.clone();
+            let mut proj2 = proj;
             if let Some(search_idx) = self
                 .schema()
                 .column_with_name(self.search_column.as_str())
@@ -510,11 +579,9 @@ impl TableProvider for SearchQueryProvider {
                 schema_proj
                     .fields()
                     .into_iter()
-                    .map(|f| ident(f.name().clone()))
-                    .collect::<Vec<_>>(),
+                    .map(|f| ident(f.name().clone())),
             )?
             .build()?;
-
         state.create_physical_plan(&final_plan).await
     }
 }

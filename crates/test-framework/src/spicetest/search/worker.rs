@@ -127,7 +127,6 @@ pub(crate) struct VectorSearchWorkerResult {
     pub(crate) search_results: BTreeMap<String, SearchResult>,
 }
 
-#[allow(dead_code)]
 pub struct SearchResult {
     pub response: SearchResponse,
     pub score: f64,
@@ -141,14 +140,12 @@ pub(crate) struct VectorSearchWorker {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub struct SearchResponse {
     pub results: Vec<SearchResponseResult>,
     pub duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub struct SearchResponseResult {
     // `matches` is left as a generic JSON value (`serde_json::Value`) instead of a strongly typed struct.
     // The search API can return different sets of fields here depending on dataset or configuration
@@ -209,7 +206,7 @@ impl VectorSearchWorker {
                 // Trace progress every 10 seconds
                 if last_progress_time.elapsed() >= Duration::from_secs(10) {
                     let completed = index + 1;
-                    #[allow(clippy::cast_precision_loss)]
+                    #[expect(clippy::cast_precision_loss)]
                     let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
                     println!(
                         "[SearchWorker-{:02}]: {completed}/{total_requests} completed ({completed_percent:.1}%)",

@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration tests for streaming chat completions
 
-use async_openai::types::*;
+use async_openai::types::chat::*;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::collections::HashMap;

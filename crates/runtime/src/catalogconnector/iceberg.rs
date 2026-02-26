@@ -87,6 +87,10 @@ pub enum Error {
     #[snafu(display("Failed to build catalog: {source}"))]
     #[snafu(visibility(pub(crate)))]
     UnableToBuildCatalog { source: iceberg::Error },
+
+    #[snafu(display("Failed to build catalog client: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalogClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -149,8 +153,8 @@ impl IcebergCatalog {
     }
 }
 
-pub(crate) const ICEBERG_PARAM_LEN: usize = 17;
-pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
+pub const ICEBERG_PARAM_LEN: usize = 22;
+pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
         .description("Bearer token value to use for Authorization header."),
@@ -207,7 +211,21 @@ pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
         .description("The Amazon Resource Name (ARN) of the role to assume. If provided instead of s3_access_key_id and s3_secret_access_key, temporary credentials will be fetched by assuming this role")
         .secret(),
     ParameterSpec::component("s3_connect_timeout")
-        .description("Configure socket connection timeout, in seconds (default: 60).")
+        .description("Configure socket connection timeout, in seconds (default: 60)."),
+
+    // GCS storage options
+    ParameterSpec::component("gcs_project_id")
+        .description("The Google Cloud project ID for GCS storage."),
+    ParameterSpec::component("gcs_credentials")
+        .description("Base64-encoded Google Cloud service account credentials JSON for GCS storage.")
+        .secret(),
+    ParameterSpec::component("gcs_token")
+        .description("OAuth2 token to use for GCS authentication.")
+        .secret(),
+    ParameterSpec::component("gcs_service_path")
+        .description("Custom endpoint URL for GCS (for emulators or custom endpoints)."),
+    ParameterSpec::component("gcs_no_auth")
+        .description("Set to 'true' to allow anonymous access to GCS (for public buckets)."),
 ];
 
 /// Maps a Spice parameter name to an Iceberg property name.
@@ -243,6 +261,12 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
         "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
         "signing_region" => Some(vec!["rest.signing-region".to_string()]),
         "signing_name" => Some(vec!["rest.signing-name".to_string()]),
+        // GCS storage options
+        "gcs_project_id" => Some(vec!["gcs.project-id".to_string()]),
+        "gcs_credentials" => Some(vec!["gcs.credentials-json".to_string()]),
+        "gcs_token" => Some(vec!["gcs.oauth2.token".to_string()]),
+        "gcs_service_path" => Some(vec!["gcs.service.path".to_string()]),
+        "gcs_no_auth" => Some(vec!["gcs.no-auth".to_string()]),
         _ => None,
     }
 }
@@ -253,7 +277,6 @@ impl CatalogConnector for IcebergCatalog {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         _runtime: Arc<Runtime>,
@@ -323,6 +346,8 @@ impl CatalogConnector for IcebergCatalog {
         if catalog_id.starts_with("file://")
             || catalog_id.starts_with("s3://")
             || catalog_id.starts_with("s3a://")
+            || catalog_id.starts_with("gs://")
+            || catalog_id.starts_with("gcs://")
         {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
@@ -767,11 +792,11 @@ mod tests {
         // should deny unknown schemes, or schemes from warehouses that don't match
         let url = "ftp://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("ftp://my-bucket/my-prefix/warehouse"));
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
 
         let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
@@ -826,28 +851,27 @@ mod tests {
     fn test_invalid_scheme() {
         let url = "ftp://my.iceberg.com/v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_no_host() {
         let url = "https:///v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_missing_namespace_segment() {
         let url = "https://my.iceberg.com/v1/";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_empty_namespace_segment() {
         let url = "https://my.iceberg.com/v1/namespaces";
         let result = parse_catalog_url(url);
-        assert!(result.is_ok());
         assert!(result.expect("Failed to parse catalog URL").2.is_none());
     }
 

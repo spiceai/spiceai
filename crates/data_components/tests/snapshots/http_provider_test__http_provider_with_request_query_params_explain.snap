@@ -1,0 +1,16 @@
+---
+source: crates/data_components/tests/http_provider_test.rs
+description: HTTP provider - path and query parameter filters
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                      |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: httpbin.request_path = Utf8("/get") AND httpbin.request_query = Utf8("test=value")                                                                                |
+|               |   TableScan: httpbin projection=[request_path, request_query, content], partial_filters=[httpbin.request_path = Utf8("/get"), httpbin.request_query = Utf8("test=value")] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                                                               |
+|               |   FilterExec: request_path@0 = /get AND request_query@1 = test=value                                                                                                      |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                                 |
+|               |       CooperativeExec                                                                                                                                                     |
+|               |         HttpExec: base_url=https://httpbin.org/, format=json, partitions=[(path="/get", query="test=value", body="")]                                                     |
+|               |                                                                                                                                                                           |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

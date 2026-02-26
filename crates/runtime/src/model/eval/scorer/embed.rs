@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use async_trait::async_trait;
 use llms::embeddings::Embed;
 

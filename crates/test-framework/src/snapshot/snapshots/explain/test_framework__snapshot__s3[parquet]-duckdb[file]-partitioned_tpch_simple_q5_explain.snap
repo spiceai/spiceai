@@ -1,0 +1,73 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q5"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                               |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: total_price DESC NULLS FIRST                                                                                                                                                 |
+|               |   Projection: sum(o.o_totalprice) AS total_price, l.l_linestatus                                                                                                                   |
+|               |     Aggregate: groupBy=[[l.l_linestatus]], aggr=[[sum(o.o_totalprice)]]                                                                                                            |
+|               |       Projection: o.o_totalprice, l.l_linestatus                                                                                                                                   |
+|               |         Inner Join: o.o_orderkey = l.l_orderkey                                                                                                                                    |
+|               |           SubqueryAlias: o                                                                                                                                                         |
+|               |             TableScan: orders projection=[o_orderkey, o_totalprice]                                                                                                                |
+|               |           SubqueryAlias: l                                                                                                                                                         |
+|               |             TableScan: lineitem projection=[l_orderkey, l_linestatus]                                                                                                              |
+| physical_plan | SortPreservingMergeExec: [total_price@0 DESC]                                                                                                                                      |
+|               |   SortExec: expr=[total_price@0 DESC], preserve_partitioning=[true]                                                                                                                |
+|               |     ProjectionExec: expr=[sum(o.o_totalprice)@1 as total_price, l_linestatus@0 as l_linestatus]                                                                                    |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[l_linestatus@0 as l_linestatus], aggr=[sum(o.o_totalprice)]                                                                       |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                |
+|               |           RepartitionExec: partitioning=Hash([l_linestatus@0], 32), input_partitions=32                                                                                            |
+|               |             AggregateExec: mode=Partial, gby=[l_linestatus@1 as l_linestatus], aggr=[sum(o.o_totalprice)]                                                                          |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                          |
+|               |                 HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_totalprice@1, l_linestatus@3] |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                      |
+|               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                                                    |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=5                                                                                        |
+|               |                         SchemaCastScanExec                                                                                                                                         |
+|               |                           PartitionedUnionExec                                                                                                                                     |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM "expression=0/orders"                                                                    |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM "expression=1/orders"                                                                    |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM "expression=2/orders"                                                                    |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM "expression=3/orders"                                                                    |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM "expression=4/orders"                                                                    |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                      |
+|               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 32), input_partitions=32                                                                                    |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=7                                                                                        |
+|               |                         SchemaCastScanExec                                                                                                                                         |
+|               |                           PartitionedUnionExec                                                                                                                                     |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1992/lineitem"                                                               |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1993/lineitem"                                                               |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1994/lineitem"                                                               |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1995/lineitem"                                                               |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1996/lineitem"                                                               |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1997/lineitem"                                                               |
+|               |                             CooperativeExec                                                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM "expression=1998/lineitem"                                                               |
+|               |                                                                                                                                                                                    |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

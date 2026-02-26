@@ -8,13 +8,12 @@ description: "Query: tpch_simple_q3"
 | logical_plan  | Projection: ice.tpch_sf1.lineitem.l_comment, ice.tpch_sf1.lineitem.l_partkey                                         |
 |               |   Sort: ice.tpch_sf1.lineitem.l_linenumber DESC NULLS FIRST, fetch=10                                                |
 |               |     Projection: ice.tpch_sf1.lineitem.l_comment, ice.tpch_sf1.lineitem.l_partkey, ice.tpch_sf1.lineitem.l_linenumber |
-|               |       BytesProcessedNode                                                                                             |
-|               |         TableScan: ice.tpch_sf1.lineitem projection=[l_partkey, l_linenumber, l_comment]                             |
+|               |       TableScan: ice.tpch_sf1.lineitem projection=[l_partkey, l_linenumber, l_comment]                               |
 | physical_plan | ProjectionExec: expr=[l_comment@0 as l_comment, l_partkey@1 as l_partkey]                                            |
 |               |   SortExec: TopK(fetch=10), expr=[l_linenumber@2 DESC], preserve_partitioning=[false]                                |
 |               |     ProjectionExec: expr=[l_comment@2 as l_comment, l_partkey@0 as l_partkey, l_linenumber@1 as l_linenumber]        |
-|               |       BytesProcessedExec                                                                                             |
-|               |         CooperativeExec                                                                                              |
+|               |       CooperativeExec                                                                                                |
+|               |         BytesProcessedExec                                                                                           |
 |               |           IcebergTableScan projection:[l_partkey,l_linenumber,l_comment] predicate:[] limit:[]                       |
 |               |                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------+

@@ -1,7 +1,0 @@
-tests:
-  bench:
-    spicepod_path: accelerated/indexes/mysql-duckdb[file]-indexes.yaml
-    query_set: tpch
-    runner_type: spiceai-dev-large-runners
-    ready_wait: 6000
-    scale_factor: 100

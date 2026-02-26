@@ -2,17 +2,17 @@
 source: crates/runtime/tests/spark/mod.rs
 description: Spark Integration Test Results
 ---
-+------------------------------------------+-----------+
-| l_comment                                | l_partkey |
-+------------------------------------------+-----------+
-| t the quickly specia                     | 51489     |
-| heodolites integ                         | 48159     |
-| arefully permanent requests. carefully r | 133593    |
-| ttainments haggle furio                  | 181660    |
-| e slyly pending instructions s           | 124020    |
-| bold ideas. quickly pend                 | 112121    |
-| al platelets. asymptotes                 | 19527     |
-| sual requests!                           | 174767    |
-| packages boost blithely. req             | 85953     |
-| ithely special notornis use slyly. unusu | 142067    |
-+------------------------------------------+-----------+
++--------------------------------------------+-----------+
+| l_comment                                  | l_partkey |
++--------------------------------------------+-----------+
+|  slyly bold notornis wake quickly blithely | 37435     |
+| blithely even pearls was slyly regular in  | 3037      |
+| ravely busy pinto beans. regular, r        | 139247    |
+| ithely about                               | 157238    |
+| requests. b                                | 141233    |
+| ecial theodolites. slyly ironic            | 167828    |
+| ly. blithely unusual deposits against      | 117961    |
+| en hockey players. speci                   | 42134     |
+| ly pending packages wake slyly             | 168569    |
+| sly ironic requests. final                 | 4660      |
++--------------------------------------------+-----------+

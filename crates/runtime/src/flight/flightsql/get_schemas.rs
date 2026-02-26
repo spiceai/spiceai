@@ -66,7 +66,7 @@ pub(crate) async fn do_get(
     let catalog = &query.catalog;
     tracing::trace!("do_get: {query:?}");
     let filtered_catalogs = match catalog {
-        Some(catalog) => vec![catalog.to_string()],
+        Some(catalog) => vec![catalog.clone()],
         None => datafusion.ctx.catalog_names(),
     };
     let mut builder = query.into_builder();

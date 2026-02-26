@@ -81,14 +81,16 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Databricks](https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md)
      - [ ] [Dremio](https://github.com/spiceai/cookbook/blob/trunk/dremio/README.md)
      - [ ] [DuckDB](https://github.com/spiceai/cookbook/blob/trunk/duckdb/connector/README.md)
+     - [ ] [DynamoDB](https://github.com/spiceai/cookbook/blob/trunk/dynamodb/README.md)
+     - [ ] [DynamoDB (Stream)](https://github.com/spiceai/cookbook/blob/trunk/dynamodb/streams/README.md)
      - [ ] [FTP](https://github.com/spiceai/cookbook/blob/trunk/ftp/README.md)
      - [ ] [File Connector](https://github.com/spiceai/cookbook/blob/trunk/file/README.md)
      - [ ] [GitHub](https://github.com/spiceai/cookbook/blob/trunk/github/README.md)
      - [ ] [Glue](https://github.com/spiceai/cookbook/tree/trunk/glue/README.md)
      - [ ] [GraphQL](https://github.com/spiceai/cookbook/blob/trunk/graphql/README.md)
+     - [ ] [HTTP](https://github.com/spiceai/cookbook/blob/trunk/http/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
-     - [ ] [ODBC](https://github.com/spiceai/cookbook/blob/trunk/odbc/README.md)
      - [ ] [PostgreSQL](https://github.com/spiceai/cookbook/blob/trunk/postgres/connector/README.md)
      - [ ] [S3](https://github.com/spiceai/cookbook/blob/trunk/s3/README.md)
      - [ ] [SharePoint](https://github.com/spiceai/cookbook/blob/trunk/sharepoint/README.md)
@@ -105,6 +107,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
+     - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
@@ -123,6 +126,8 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Nvidia NIM](https://github.com/spiceai/cookbook/tree/trunk/nvidia-nim)
      - [ ] [LLM Memory](https://github.com/spiceai/cookbook/tree/trunk/llm-memory)
      - [ ] [Model-Context-Protocol (MCP)](https://github.com/spiceai/cookbook/tree/trunk/mcp)
+     - [ ] [AI SQL Function](https://github.com/spiceai/cookbook/blob/trunk/ai/README.md)
+     - [ ] [Hybrid Search & Real Time Indexing](https://github.com/spiceai/cookbook/blob/trunk/search/README.md)
 
    - **SDK Samples**
      - [ ] [Spice with gospice SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
@@ -143,7 +148,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Refresh Data Window](https://github.com/spiceai/cookbook/blob/trunk/refresh-data-window/README.md)
      - [ ] [Cron Dataset Schedules](https://github.com/spiceai/cookbook/blob/trunk/acceleration/cron/README.md)
      - [ ] [Acceleration Snapshots](https://github.com/spiceai/cookbook/blob/trunk/acceleration/snapshots/README.md)
-     - [ ] [Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/README.md)
+     - [ ] [SQL Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/sql_results/README.md)
      - [ ] [Encryption in transit via TLS](https://github.com/spiceai/cookbook/blob/trunk/tls/README.md)
      - [ ] [TPC-H Benchmarking](https://github.com/spiceai/cookbook/blob/trunk/tpc-h/README.md)
      - [ ] [API Key Authentication](https://github.com/spiceai/cookbook/blob/trunk/api_key/README.md)
@@ -151,6 +156,21 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Python ADBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/adbc/README.md)
      - [ ] [Java JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/java/README.md)
      - [ ] [Scala JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/scala/README.md)
+
+## Focus Areas
+
+Based on the [milestone](https://github.com/spiceai/spiceai/milestones) for this release, create testing focus areas and assign 1-2 DRIs responsible for each testing focus area.
+
+Testing focus DRIs are responsible for:
+
+* Reviewing or creating cookbooks for the focus area component
+* Reviewing or creating documentation for the focus area component
+* Running the cookbook for the focus area component
+* Performing additional ad-hoc testing for the focus area component
+
+* Focus area #1:
+  * [ ] DRI
+  * [ ] DRI
 
 ## Final Updates
 
@@ -193,6 +213,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
   - [ ] (Docs DRI) Tag the merged `trunk` commit `vX.Y.Z`.
 - [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
   - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
+- [ ] Ensure all newly released SDKs (mentioned in release notes) are published
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
   - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
@@ -200,6 +221,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_ai.yml)
+  - [ ] [E2E Test Release Installation (Helm)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_helm.yml)
   - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
     - Use parameters:
       - Branch: `trunk`

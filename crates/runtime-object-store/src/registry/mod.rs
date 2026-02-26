@@ -26,15 +26,19 @@ use datafusion::{
 };
 use object_store::{
     ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
-    client::SpawnedReqwestConnector, http::HttpBuilder,
+    client::SpawnedReqwestConnector, gcp::GoogleCloudStorageBuilder, http::HttpBuilder,
 };
 use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
 use crate::store::ftp::FTPObjectStore;
-#[cfg(feature = "ftp")]
+#[cfg(feature = "nfs")]
+use crate::store::nfs::NFSObjectStore;
+#[cfg(feature = "sftp")]
 use crate::store::sftp::SFTPObjectStore;
+#[cfg(feature = "smb")]
+use crate::store::smb::SMBObjectStore;
 
 #[derive(Debug)]
 pub struct SpiceObjectStoreRegistry {
@@ -220,7 +224,7 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
-    #[cfg(feature = "ftp")]
+    #[cfg(feature = "sftp")]
     fn prepare_sftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(host) = url.host() else {
             return Err(DataFusionError::Configuration(
@@ -260,8 +264,94 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
+    #[cfg(feature = "smb")]
+    fn prepare_smb_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for SMB".to_string(),
+            ));
+        };
+
+        // Extract share name from the first path segment
+        let path = url.path();
+        let share = path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .ok_or_else(|| {
+                DataFusionError::Configuration("No share name provided for SMB".to_string())
+            })?
+            .to_string();
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No user provided for SMB".to_string())
+        })?;
+        let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No password provided for SMB".to_string())
+        })?;
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
+
+        Ok(Arc::new(SMBObjectStore::new(
+            host.to_string(),
+            share,
+            user,
+            password,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
+    }
+
+    #[cfg(feature = "nfs")]
+    fn prepare_nfs_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for NFS".to_string(),
+            ));
+        };
+
+        // The path is the export path
+        let export_path = url.path().to_string();
+        if export_path.is_empty() || export_path == "/" {
+            return Err(DataFusionError::Configuration(
+                "No export path provided for NFS".to_string(),
+            ));
+        }
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
+
+        Ok(Arc::new(NFSObjectStore::new(
+            host.to_string(),
+            export_path,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
+    }
+
     // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
-    #[allow(clippy::too_many_lines)]
     fn prepare_azure_object_store(
         &self,
         url: &Url,
@@ -327,7 +417,7 @@ impl SpiceObjectStoreRegistry {
             builder = builder.with_tenant_id(tenant_id);
         }
         if let Some(endpoint) = params.get("endpoint") {
-            builder = builder.with_endpoint(endpoint.to_string());
+            builder = builder.with_endpoint(endpoint.clone());
         }
 
         if let Some(use_fabric_endpoint) = params.get("use_fabric_endpoint") {
@@ -447,6 +537,153 @@ impl SpiceObjectStoreRegistry {
         Ok(azure_store as Arc<dyn ObjectStore>)
     }
 
+    fn prepare_gcs_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(bucket_name) = url.host_str() else {
+            return Err(DataFusionError::Configuration(
+                "No bucket name provided".to_string(),
+            ));
+        };
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        // Check skip_signature first - if true, use new() instead of from_env() to avoid
+        // automatic credential loading attempts
+        let skip_signature = match params.get("skip_signature") {
+            Some(value) => value.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{value} is not a valid boolean for skip_signature"
+                ))
+            })?,
+            None => false,
+        };
+
+        let mut builder = if skip_signature {
+            GoogleCloudStorageBuilder::new()
+                .with_skip_signature(true)
+                .with_bucket_name(bucket_name)
+                .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
+        } else {
+            GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(bucket_name)
+                .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
+        };
+
+        let mut client_options = ClientOptions::default();
+
+        // Service account authentication (only if not skip_signature)
+        if !skip_signature {
+            // Prefer explicit service_account_path, but also accept legacy aliases:
+            // - service_account (canonicalized from google_service_account by Parameters::canonicalize_gcs_fragments)
+            // - google_service_account (for direct compatibility if not canonicalized)
+            if let Some(service_account_path) = params
+                .get("service_account_path")
+                .or_else(|| params.get("service_account"))
+                .or_else(|| params.get("google_service_account"))
+            {
+                builder = builder.with_service_account_path(service_account_path);
+            }
+            if let Some(service_account_key) = params.get("service_account_key") {
+                builder = builder.with_service_account_key(service_account_key);
+            }
+
+            // Application default credentials - use GOOGLE_APPLICATION_CREDENTIALS env var path
+            // with_application_credentials takes a path to the credentials file
+            if let Some(application_default_credentials) =
+                params.get("application_default_credentials")
+            {
+                let as_bool = application_default_credentials.parse::<bool>().map_err(|_| {
+                    DataFusionError::Configuration(format!(
+                        "{application_default_credentials} is not a valid boolean for application_default_credentials"
+                    ))
+                })?;
+                if as_bool {
+                    // Use GOOGLE_APPLICATION_CREDENTIALS environment variable if set
+                    if let Ok(creds_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+                        builder = builder.with_application_credentials(creds_path);
+                    }
+                    // If not set, the builder will attempt to use default credentials automatically
+                }
+            }
+        }
+
+        // Client options
+        if let Some(timeout) = params.get("client_timeout") {
+            client_options =
+                client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
+                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}"))
+                })?);
+        }
+
+        if let Some(allow_http) = params.get("allow_http") {
+            let as_bool = allow_http.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{allow_http} is not a valid boolean for allow_http"
+                ))
+            })?;
+            client_options = client_options.with_allow_http(as_bool);
+        }
+
+        // Retry and backoff configuration
+        let mut retry_config = RetryConfig::default();
+
+        if let Some(retry_timeout) = params.get("retry_timeout") {
+            let as_duration = fundu::parse_duration(retry_timeout).map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{retry_timeout} is not a valid duration for retry_timeout"
+                ))
+            })?;
+            retry_config.retry_timeout = as_duration;
+        }
+        if let Some(max_retries) = params.get("max_retries") {
+            let as_usize = max_retries.parse::<usize>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{max_retries} is not a valid usize for max_retries"
+                ))
+            })?;
+            retry_config.max_retries = as_usize;
+        }
+        if let Some(backoff_initial_duration) = params.get("backoff_initial_duration") {
+            let as_duration = fundu::parse_duration(backoff_initial_duration).map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{backoff_initial_duration} is not a valid duration for backoff_initial_duration"
+                ))
+            })?;
+            retry_config.backoff.init_backoff = as_duration;
+        }
+        if let Some(backoff_max_duration) = params.get("backoff_max_duration") {
+            let as_duration = fundu::parse_duration(backoff_max_duration).map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{backoff_max_duration} is not a valid duration for backoff_max_duration"
+                ))
+            })?;
+            retry_config.backoff.max_backoff = as_duration;
+        }
+        if let Some(backoff_base) = params.get("backoff_base") {
+            let as_f64 = backoff_base.parse::<f64>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{backoff_base} is not a valid f64 for backoff_base"
+                ))
+            })?;
+            retry_config.backoff.base = as_f64;
+        }
+        builder = builder.with_retry(retry_config);
+
+        builder = builder.with_client_options(client_options);
+
+        let gcs_store = Arc::new(
+            builder
+                .build()
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?,
+        );
+
+        Ok(gcs_store as Arc<dyn ObjectStore>)
+    }
+
     fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
             return self.prepare_https_object_store(url);
@@ -455,8 +692,12 @@ impl SpiceObjectStoreRegistry {
             return self.prepare_s3_object_store(url);
         }
 
-        if url.as_str().starts_with("abfs://") {
+        if url.as_str().starts_with("abfs://") || url.as_str().starts_with("abfss://") {
             return self.prepare_azure_object_store(url);
+        }
+
+        if url.as_str().starts_with("gs://") || url.as_str().starts_with("gcs://") {
+            return self.prepare_gcs_object_store(url);
         }
 
         #[cfg(feature = "ftp")]
@@ -464,9 +705,19 @@ impl SpiceObjectStoreRegistry {
             return Self::prepare_ftp_object_store(url);
         }
 
-        #[cfg(feature = "ftp")]
+        #[cfg(feature = "sftp")]
         if url.as_str().starts_with("sftp://") {
             return Self::prepare_sftp_object_store(url);
+        }
+
+        #[cfg(feature = "smb")]
+        if url.as_str().starts_with("smb://") {
+            return Self::prepare_smb_object_store(url);
+        }
+
+        #[cfg(feature = "nfs")]
+        if url.as_str().starts_with("nfs://") {
+            return Self::prepare_nfs_object_store(url);
         }
 
         Err(DataFusionError::Execution(format!(
@@ -488,7 +739,6 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
         self.inner.get_store(url).or_else(|_| {
             let store = self.get_feature_store(url)?;
             self.inner.register_store(url, Arc::clone(&store));
-
             Ok(store)
         })
     }

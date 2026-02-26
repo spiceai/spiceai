@@ -47,8 +47,8 @@ impl ReadablePath for SpicepodString {
 
 impl ReadableYaml for SpicepodString {}
 
-#[allow(clippy::missing_panics_doc)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::missing_panics_doc)]
+#[expect(clippy::expect_used)]
 pub async fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
     let spicepod_str = SpicepodString::new(Cow::Borrowed(spicepod_str));
     let spicepod = Spicepod::load_from(&spicepod_str, PathBuf::from("."))

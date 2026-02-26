@@ -14,6 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
+use crate::{
+    component::dataset::acceleration::{Engine, Mode},
+    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    datafusion::udf::deny_spice_specific_functions,
+    make_spice_data_directory,
+    parameters::ParameterSpec,
+    register_data_accelerator, spice_data_base_path,
+};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -24,21 +34,13 @@ use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
+use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
+use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use crate::{
-    component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    datafusion::udf::deny_spice_specific_functions,
-    make_spice_data_directory,
-    parameters::ParameterSpec,
-    spice_data_base_path,
-};
-
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,20 +95,29 @@ impl Default for SqliteAccelerator {
 }
 
 impl SqliteAccelerator {
+    /// Wrapper to align the decimal extension signature with `sqlite3_auto_extension`.
+    ///
+    /// SAFETY: The wrapper only casts the error message pointer to match the expected mutability.
+    unsafe extern "C" fn sqlite3_decimal_init_wrapper(
+        db: *mut rusqlite::ffi::sqlite3,
+        error_message: *mut *mut c_char,
+        api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int {
+        unsafe { sqlite3_decimal_init(db, error_message.cast(), api) }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
         unsafe {
-            sqlite3_auto_extension(Some(sqlite3_decimal_init));
+            sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
+                .with_batch_insert_use_prepared_statements(true)
                 .with_decimal_between(true)
-                // Prepared statements currently map timestamp values incorrectly (see spiceai#7629),
-                // so use the legacy insert path until the upstream fix lands.
-                .with_batch_insert_use_prepared_statements(false)
                 .with_function_support(deny_spice_specific_functions()),
         }
     }
@@ -156,7 +167,9 @@ impl SqliteAccelerator {
         })?;
 
         let mode = match acceleration.mode {
-            Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
+            Mode::File | Mode::FileCreate => {
+                datafusion_table_providers::sql::db_connection_pool::Mode::File
+            }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();
@@ -217,9 +230,9 @@ impl DataAccelerator for SqliteAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         let path = self.file_path(source)?;
@@ -245,12 +258,34 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "SQLite acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
+            let bootstrap_status = download_snapshot_if_needed(
+                acceleration,
+                source,
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
+                AccelerationEngine::Sqlite,
+            )
+            .await;
 
             self.get_shared_pool(source).await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -285,11 +320,10 @@ impl DataAccelerator for SqliteAccelerator {
             let attach_databases = datasets
                 .iter()
                 .filter_map(|other_dataset| {
-                    if other_dataset
-                        .acceleration
-                        .as_ref()
-                        .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
-                    {
+                    if other_dataset.acceleration.as_ref().is_some_and(|a| {
+                        a.engine == Engine::Sqlite
+                            && matches!(a.mode, Mode::File | Mode::FileCreate)
+                    }) {
                         if other_dataset.name() == source.name() {
                             None
                         } else {
@@ -321,11 +355,17 @@ impl DataAccelerator for SqliteAccelerator {
 
         let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
-        let cloned_writer = Arc::clone(&sqlite_writer);
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            sqlite_writer,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
         let table_provider = Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            sqlite_writer,
+            write_provider,
+            delete_provider,
             read_provider,
         ));
 
@@ -340,6 +380,8 @@ impl DataAccelerator for SqliteAccelerator {
         PARAMETERS
     }
 }
+
+register_data_accelerator!(Engine::Sqlite, SqliteAccelerator);
 
 #[cfg(test)]
 mod tests {
@@ -366,7 +408,7 @@ mod tests {
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_sqlite() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -380,6 +422,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -440,7 +483,9 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![1]);
+        // Expect 2 rows deleted: "1970-01-01" (epoch=0) and "2012-12-01T11:11:11Z" (1354360271000ms)
+        // both are < 1354360272000ms
+        let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
@@ -459,7 +504,9 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
+        // Only 1 row remains after the first delete (time_int=1354360272),
+        // which matches time_int < 1354360273
+        let expected = UInt64Array::from(vec![1]);
         assert_eq!(actual, &expected);
     }
 
@@ -493,7 +540,6 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());

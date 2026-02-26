@@ -17,14 +17,18 @@ limitations under the License.
 //! Test INSERT OVERWRITE functionality for Cayenne
 
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
+
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE functionality...");
 
@@ -50,6 +54,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         table_name: "test_overwrite".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig::default(),
@@ -178,7 +183,6 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE cleanup of old snapshots...");
 
@@ -204,6 +208,7 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
         table_name: "test_cleanup".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig::default(),

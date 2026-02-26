@@ -124,7 +124,7 @@ pub fn default_catalog_names<'a>() -> Vec<&'a str> {
 }
 
 /// Forge creates `Tooling` from a `Tool` component. It uses the `from` field to determine if it should create a [`SpiceToolCatalog`] or a [`SpiceModelTool`].
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn forge(
     component: &Tool,
     secrets: HashMap<String, SecretString>,

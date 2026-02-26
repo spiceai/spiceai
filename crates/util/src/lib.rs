@@ -21,6 +21,11 @@ use std::{
 };
 
 pub mod fibonacci_backoff;
+pub mod home_dir;
+pub mod levenshtein;
+pub mod retry_strategy;
+#[cfg(feature = "datafusion")]
+pub mod security;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
@@ -28,11 +33,18 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+#[cfg(feature = "datafusion")]
+pub mod expr;
+#[cfg(feature = "datafusion")]
+pub mod stream_utils;
+pub mod time_format;
+#[cfg(feature = "datafusion")]
+pub mod timestamp_filter;
 
-#[allow(clippy::cast_precision_loss)]
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_precision_loss)]
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_wrap)]
 #[must_use]
 pub fn human_readable_bytes(num: usize) -> String {
     let units = ["B", "kiB", "MiB", "GiB"];
@@ -175,7 +187,7 @@ async fn shutdown_signal_impl() {
 
 This function will propagate `SystemTimeError` from `time.elapsed()`
 */
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
     time.elapsed()
         .map(|elapsed| {
@@ -201,6 +213,25 @@ pub fn distribute_nulls<T>(data: Vec<T>, null_idxs: Vec<usize>) -> Vec<Option<T>
     }
 
     result
+}
+
+// Construct constant array by concatenating two input arrays.
+pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
+    a: [T; N],
+    b: [T; M],
+) -> [T; S] {
+    let mut out = [a[0]; S];
+    let mut i = 0;
+    while i < N {
+        out[i] = a[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < M {
+        out[N + j] = b[j];
+        j += 1;
+    }
+    out
 }
 
 #[cfg(test)]

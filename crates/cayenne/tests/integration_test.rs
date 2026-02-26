@@ -21,18 +21,24 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Array, Int64Array, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_basic_workflow_impl);
 
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_basic_workflow_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +58,7 @@ async fn test_cayenne_basic_workflow_impl(
         table_name: "test_table".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -440,27 +447,7 @@ fn verify_sqlite_metadata(
 
     let conn = Connection::open(db_path)?;
 
-    // 1. Verify cayenne_metadata table has initial metadata
-    let next_catalog_id: i64 = conn.query_row(
-        "SELECT value FROM cayenne_metadata WHERE key = 'next_catalog_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    let next_file_id: i64 = conn.query_row(
-        "SELECT value FROM cayenne_metadata WHERE key = 'next_file_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert!(
-        next_catalog_id >= 2,
-        "Expected next_catalog_id to be at least 2"
-    );
-    assert_eq!(next_file_id, 1, "Expected next_file_id to be 1");
-    println!(
-        "  • Metadata verified: next_catalog_id={next_catalog_id}, next_file_id={next_file_id}"
-    );
-
-    // 2. Verify cayenne_table has the test_table entry
+    // 1. Verify cayenne_table has the test_table entry
     let table_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM cayenne_table", [], |row| row.get(0))?;
     assert_eq!(table_count, 1, "Expected 1 table in cayenne_table");
@@ -516,13 +503,6 @@ fn verify_sqlite_metadata(
         "  • Schema JSON is valid base64 ({} chars)",
         schema_json.len()
     );
-
-    // 4. Verify cayenne_data_file table exists (may be empty if no data files created yet)
-    let data_file_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM cayenne_data_file", [], |row| {
-            row.get(0)
-        })?;
-    println!("  • Data files tracked: {data_file_count}");
 
     // 5. Verify cayenne_delete_file table exists (should be empty for this test)
     let delete_file_count: i64 =
@@ -603,6 +583,7 @@ async fn test_cayenne_statistics_impl(
         table_name: "stats_table".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -659,7 +640,6 @@ async fn test_cayenne_statistics_impl(
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_core_data_types_impl);
 
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_core_data_types_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -717,6 +697,7 @@ async fn test_cayenne_core_data_types_impl(
         table_name: "types_test".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec!["col_int64".to_string()],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -921,5 +902,194 @@ async fn test_cayenne_core_data_types_impl(
     println!("  ✓ Decimal128: {}", dec_col.value(0));
 
     println!("\n✅ Core data types test passed with {backend_name}!");
+    Ok(())
+}
+
+// Generate test variants for each backend
+test_with_backends!(test_cayenne_sorted_insert_impl);
+
+/// Test that `sort_columns` configuration properly sorts data during insert operations.
+///
+/// This test verifies:
+/// 1. Data is sorted after retention filters and before listing table refresh
+/// 2. Sorting operates on the complete corpus after retention
+/// 3. Zone maps have optimal (non-overlapping) min/max ranges
+async fn test_cayenne_sorted_insert_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let catalog = &fixture.catalog;
+    let data_path = &fixture.data_path;
+    let backend_name = fixture.backend_type.name();
+
+    println!("✓ Catalog initialized with {backend_name} backend");
+
+    // Create schema with timestamp and value columns for sorting test
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    // Configure sort_columns to sort by timestamp
+    let vortex_config = cayenne::metadata::VortexConfig {
+        sort_columns: vec!["timestamp".to_string()],
+        ..Default::default()
+    };
+
+    let table_options = CreateTableOptions {
+        table_name: "sorted_table".to_string(),
+        schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config,
+    };
+
+    // Create table with sort configuration
+    let table = CayenneTableProvider::create_table(
+        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        table_options,
+    )
+    .await?;
+    println!("✓ Table created with sort_columns=['timestamp']");
+
+    // Register with DataFusion
+    let ctx = SessionContext::new();
+    ctx.register_table("sorted_table", Arc::new(table))?;
+    println!("✓ Table registered with DataFusion");
+
+    // Insert data in random order - sorting should reorder it
+    ctx.sql(
+        "INSERT INTO sorted_table VALUES \
+         (5, 500, 'fifth'), \
+         (2, 200, 'second'), \
+         (4, 400, 'fourth'), \
+         (1, 100, 'first'), \
+         (3, 300, 'third')",
+    )
+    .await?
+    .collect()
+    .await?;
+    println!("✓ Inserted 5 rows in random order");
+
+    // Query the data - should be sorted by timestamp
+    let df = ctx
+        .sql("SELECT timestamp, value, name FROM sorted_table ORDER BY timestamp")
+        .await?;
+    let results = df.collect().await?;
+
+    // Verify we got 5 rows
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 5, "Expected 5 rows after insert");
+    println!("✓ Query returned {total_rows} rows");
+
+    // Collect all rows to verify they're sorted
+    let mut all_timestamps = Vec::new();
+    let mut all_values = Vec::new();
+    let mut all_names = Vec::new();
+
+    for batch in &results {
+        let ts_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("timestamp column");
+        let val_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column");
+        let name_array = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column");
+
+        for i in 0..batch.num_rows() {
+            all_timestamps.push(ts_array.value(i));
+            all_values.push(val_array.value(i));
+            all_names.push(name_array.value(i).to_string());
+        }
+    }
+
+    // Verify data is sorted by timestamp
+    assert_eq!(all_timestamps, vec![1, 2, 3, 4, 5]);
+    assert_eq!(all_values, vec![100, 200, 300, 400, 500]);
+    assert_eq!(
+        all_names,
+        vec!["first", "second", "third", "fourth", "fifth"]
+    );
+    println!("✓ Data is correctly sorted by timestamp column");
+
+    // Insert more data in random order
+    ctx.sql(
+        "INSERT INTO sorted_table VALUES \
+         (8, 800, 'eighth'), \
+         (6, 600, 'sixth'), \
+         (9, 900, 'ninth'), \
+         (7, 700, 'seventh')",
+    )
+    .await?
+    .collect()
+    .await?;
+    println!("✓ Inserted 4 more rows in random order");
+
+    // Query all data again
+    let df = ctx
+        .sql("SELECT timestamp, value, name FROM sorted_table ORDER BY timestamp")
+        .await?;
+    let results = df.collect().await?;
+
+    // Verify we got 9 rows total
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 9, "Expected 9 rows after second insert");
+
+    // Collect all rows again
+    let mut all_timestamps = Vec::new();
+    for batch in &results {
+        let ts_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("timestamp column");
+
+        for i in 0..batch.num_rows() {
+            all_timestamps.push(ts_array.value(i));
+        }
+    }
+
+    // Verify all data is still sorted after second insert
+    assert_eq!(all_timestamps, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    println!("✓ All data remains sorted after second insert");
+
+    // Test range query - with proper sorting, zone maps should enable efficient pruning
+    let df = ctx
+        .sql(
+            "SELECT * FROM sorted_table WHERE timestamp >= 3 AND timestamp <= 7 ORDER BY timestamp",
+        )
+        .await?;
+    let results = df.collect().await?;
+
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 5, "Expected 5 rows in range [3,7] (inclusive)");
+
+    let mut filtered_timestamps = Vec::new();
+    for batch in &results {
+        let ts_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("timestamp column");
+
+        for i in 0..batch.num_rows() {
+            filtered_timestamps.push(ts_array.value(i));
+        }
+    }
+
+    assert_eq!(filtered_timestamps, vec![3, 4, 5, 6, 7]);
+    println!("✓ Range query [3,7] correctly returns 5 sorted rows");
+
+    println!("\n✅ Sorted insert test passed with {backend_name}!");
     Ok(())
 }

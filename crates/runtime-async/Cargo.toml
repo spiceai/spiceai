@@ -14,3 +14,6 @@ futures.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 snafu.workspace = true
 num_cpus.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

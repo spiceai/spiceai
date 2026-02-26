@@ -16,13 +16,15 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-
-mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
+use clap::{ArgAction, Parser, Subcommand};
 
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
+
+#[cfg(feature = "append")]
+mod append;
+#[cfg(feature = "append")]
+pub use append::AppendTestArgs;
 
 pub mod dispatch;
 use dispatch::DispatchArgs;
@@ -33,30 +35,47 @@ pub use evals::EvalsTestArgs;
 mod search;
 pub use search::SearchTestArgs;
 
+mod text_to_sql;
+pub use text_to_sql::TextToSqlArgs;
+
+mod streaming;
+pub use streaming::{StreamingDynamodbDispatchArgs, StreamingDynamodbTestArgs};
+
 #[derive(Subcommand)]
 pub enum Commands {
-    // Run a test
+    /// Run a test
     #[command(subcommand)]
     Run(TestCommands),
-    // Export the spicepod environment that would run for a test
+    /// Export the spicepod environment that would run for a test
     #[command(subcommand)]
     Export(TestCommands),
-    // Dispatch a number of tests in GitHub Actions
+    /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
 }
 
 #[derive(Subcommand)]
 pub enum TestCommands {
+    /// Run a throughput test
     Throughput(DatasetTestArgs),
+    /// Run an extended load test
     Load(LoadTestArgs),
+    /// Run a single-run benchmark
     Bench(DatasetTestArgs),
+    /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    HttpConsistency(HttpConsistencyTestArgs),
-    HttpOverhead(HttpOverheadTestArgs),
+    /// Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
-    Append(DatasetTestArgs),
+    Append(AppendTestArgs),
     Search(SearchTestArgs),
+    /// Execute benchmark queries against a pre-existing spiced instance
+    Query(DatasetTestArgs),
+    /// Run a text-to-sql test
+    TextToSql(TextToSqlArgs),
+    /// Run multi-config `DynamoDB` streaming benchmarks (ingest once, benchmark many)
+    StreamingDynamodbDispatch(StreamingDynamodbDispatchArgs),
+    /// Run a streaming ingestion benchmark for `DynamoDB` Streams
+    StreamingDynamodb(StreamingDynamodbTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
@@ -73,9 +92,10 @@ pub struct CommonArgs {
     #[arg(long, default_value = "1")]
     pub(crate) concurrency: usize,
 
-    /// Path to the spiced binary
+    /// Path to the spiced binary, or URL to an already-running spiced instance's Flight endpoint
+    /// (e.g., `http://localhost:50051` to connect to an external instance)
     #[arg(short, long, default_value = "spiced")]
-    pub(crate) spiced_path: PathBuf,
+    pub(crate) spiced_path: String,
 
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
@@ -100,4 +120,33 @@ pub struct CommonArgs {
     /// Whether to enable scraping spiced metrics (automatically enables --metrics for spiced)
     #[arg(long)]
     pub(crate) scrape_spiced_metrics: bool,
+
+    /// OTLP metrics collector endpoint (HTTP or gRPC). If unset, falls back to Arrow telemetry.
+    #[arg(long)]
+    pub(crate) otlp_endpoint: Option<String>,
+
+    /// Additional OTLP headers in key=value form. Can be repeated.
+    #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, requires = "otlp_endpoint", value_name = "KEY=VALUE")]
+    pub(crate) otlp_header: Vec<(String, String)>,
+}
+
+impl CommonArgs {
+    /// Check if `spiced_path` is a URL to an external instance
+    #[must_use]
+    pub fn is_external_instance(&self) -> bool {
+        self.spiced_path.starts_with("http://") || self.spiced_path.starts_with("https://")
+    }
+
+    /// Get the spiced path as a `PathBuf` (only valid when not an external instance)
+    #[must_use]
+    pub fn spiced_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.spiced_path)
+    }
+}
+
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    let pos = s
+        .find('=')
+        .ok_or_else(|| "expected KEY=VALUE formatted header".to_string())?;
+    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
