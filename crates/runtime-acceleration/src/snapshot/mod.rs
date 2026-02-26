@@ -2044,9 +2044,6 @@ impl SnapshotManager {
             dataset_entry.snapshots.push(snapshot_entry);
             dataset_entry.current_snapshot_id = Some(next_snapshot_id);
 
-            // Remove metadata entries whose snapshot files no longer exist.
-            self.compact_metadata(dataset_entry).await;
-
             let serialized = serde_json::to_vec_pretty(&metadata).map_err(|source| {
                 SnapshotUploadError::UploadSerializeMetadata {
                     path: metadata_path_display.clone(),
@@ -2266,54 +2263,6 @@ impl SnapshotManager {
             );
             false
         })
-    }
-
-    /// Compacts dataset metadata by removing entries whose snapshot files no longer
-    /// exist in the object store. The current snapshot entry is always preserved.
-    async fn compact_metadata(&self, dataset_entry: &mut DatasetMetadata) {
-        let current_id = dataset_entry.current_snapshot_id;
-
-        let entries_to_check: Vec<_> = dataset_entry
-            .snapshots
-            .iter()
-            .filter(|e| Some(e.snapshot_id) != current_id)
-            .map(|e| (e.snapshot_id, e.snapshot.clone()))
-            .collect();
-
-        if entries_to_check.is_empty() {
-            return;
-        }
-
-        let existence_futures: Vec<_> = entries_to_check
-            .into_iter()
-            .map(|(id, uri)| async move {
-                let exists = self.snapshot_exists(&uri).await;
-                (id, exists)
-            })
-            .collect();
-
-        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
-            .buffer_unordered(10)
-            .collect()
-            .await;
-
-        let before = dataset_entry.snapshots.len();
-        dataset_entry.snapshots.retain(|e| {
-            Some(e.snapshot_id) == current_id
-                || existence_results
-                    .get(&e.snapshot_id)
-                    .copied()
-                    .unwrap_or(true)
-        });
-        let removed = before - dataset_entry.snapshots.len();
-
-        if removed > 0 {
-            tracing::info!(
-                dataset = %dataset_entry.name,
-                removed_count = removed,
-                "Compacted snapshot metadata: removed entries for non-existent snapshots"
-            );
-        }
     }
 
     /// Retrieves information about a specific snapshot by ID.
@@ -5155,110 +5104,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn compact_metadata_removes_stale_entries() {
-        let store = Arc::new(InMemory::new());
-
-        // Create a snapshot file for only one of the two entries
-        let existing_path = Path::from("snapshots/existing_snapshot.db");
-        store
-            .put(&existing_path, Bytes::from_static(b"snapshot data").into())
-            .await
-            .expect("write snapshot file");
-
-        let manager = build_manager_for_api_tests(Arc::clone(&store));
-
-        let existing_entry = SnapshotEntry {
-            snapshot_id: 1,
-            timestamp_ms: 1_000_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/existing_snapshot.db"),
-            snapshot_checksum: "aaa".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 100,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let stale_entry = SnapshotEntry {
-            snapshot_id: 0,
-            timestamp_ms: 900_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/deleted_snapshot.db"),
-            snapshot_checksum: "bbb".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 200,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let mut dataset_entry = DatasetMetadata {
-            name: DATASET_NAME.to_string(),
-            engine: None,
-            schemas: vec![],
-            current_schema_id: 0,
-            snapshots: vec![stale_entry, existing_entry],
-            current_snapshot_id: Some(1),
-            properties: HashMap::new(),
-        };
-
-        manager.compact_metadata(&mut dataset_entry).await;
-
-        assert_eq!(
-            dataset_entry.snapshots.len(),
-            1,
-            "Stale entry should be removed"
-        );
-        assert_eq!(dataset_entry.snapshots[0].snapshot_id, 1);
-    }
-
-    #[tokio::test]
-    async fn compact_metadata_preserves_current_snapshot_even_if_missing() {
-        let store = Arc::new(InMemory::new());
-        let manager = build_manager_for_api_tests(Arc::clone(&store));
-
-        // Both entries point to non-existent files, but the current one should be preserved
-        let current_entry = SnapshotEntry {
-            snapshot_id: 5,
-            timestamp_ms: 1_000_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/missing_current.db"),
-            snapshot_checksum: "aaa".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 100,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let old_entry = SnapshotEntry {
-            snapshot_id: 3,
-            timestamp_ms: 900_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/missing_old.db"),
-            snapshot_checksum: "bbb".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 200,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let mut dataset_entry = DatasetMetadata {
-            name: DATASET_NAME.to_string(),
-            engine: None,
-            schemas: vec![],
-            current_schema_id: 0,
-            snapshots: vec![old_entry, current_entry],
-            current_snapshot_id: Some(5),
-            properties: HashMap::new(),
-        };
-
-        manager.compact_metadata(&mut dataset_entry).await;
-
-        assert_eq!(
-            dataset_entry.snapshots.len(),
-            1,
-            "Only the current snapshot should remain"
-        );
-        assert_eq!(dataset_entry.snapshots[0].snapshot_id, 5);
-    }
 }
