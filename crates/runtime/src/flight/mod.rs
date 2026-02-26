@@ -71,7 +71,7 @@ mod handshake;
 mod metrics;
 pub mod middleware;
 mod session;
-mod session_auth;
+pub(crate) mod session_auth;
 mod util;
 
 pub use session::SessionStore;

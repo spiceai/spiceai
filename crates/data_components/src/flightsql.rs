@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::{
     array::{Array, RecordBatch, array},
+    compute::cast,
     datatypes::Schema,
 };
 use async_stream::stream;
@@ -531,14 +532,54 @@ impl ExecutionPlan for FlightSqlExec {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
+        let target_schema = self.schema();
 
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)),
+        let stream = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
+            move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)),
         );
+
+        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), stream);
 
         Ok(Box::pin(stream_adapter))
     }
+}
+
+/// Coerce a [`RecordBatch`] to match a target schema by casting columns whose types
+/// differ but are compatible (e.g. `Utf8` → `Utf8View`). This handles cases where
+/// the Flight IPC layer returns data with slightly different types than the declared schema.
+fn coerce_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    if batch.num_columns() != target_schema.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "FlightSQL batch column count mismatch: got {}, expected {}",
+            batch.num_columns(),
+            target_schema.fields().len()
+        )));
+    }
+
+    // Fast path: schemas already match.
+    if batch.schema().fields() == target_schema.fields() {
+        return Ok(batch.clone());
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target_schema.fields())
+        .map(|(col, target_field)| {
+            if col.data_type() == target_field.data_type() {
+                Ok(Arc::clone(col))
+            } else {
+                cast(col, target_field.data_type())
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            }
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+
+    RecordBatch::try_new(Arc::clone(target_schema), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 fn query_to_stream(

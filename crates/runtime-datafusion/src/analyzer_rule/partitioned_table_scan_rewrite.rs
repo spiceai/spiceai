@@ -140,6 +140,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     },
                 )));
             }
+
             Ok(Transformed::yes(LogicalPlan::Union(Union {
                 inputs: sub_scans,
                 schema: Arc::clone(plan.schema()),
