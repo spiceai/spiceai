@@ -461,7 +461,7 @@ impl DataConnector for AuthErrorDataConnector {
         dataset: &Dataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         Err(DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-            dataconnector: "s3".to_string(),
+            dataconnector: "auth-error".to_string(),
             connector_component: ConnectorComponent::from(dataset),
         })
     }

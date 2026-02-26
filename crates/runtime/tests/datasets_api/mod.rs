@@ -121,11 +121,6 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
                 "Dataset should be Ready in RuntimeStatus"
             );
 
-            status.update_dataset(
-                &dataset_ref,
-                ComponentStatus::error_with_message("UnableToConnectInvalidUsernameOrPassword"),
-            );
-
             // Call the /v1/datasets?status=true API
             let http_url = format!("http://127.0.0.1:{http_port}/v1/datasets?status=true");
             let response = http_client
@@ -142,6 +137,35 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             let datasets: Vec<DatasetResponse> = response.json().await?;
 
             // Find our test dataset
+            let test_dataset = datasets
+                .iter()
+                .find(|d| d.name == "test_dataset")
+                .expect("test_dataset should be in the response");
+
+            assert_eq!(
+                test_dataset.status,
+                Some("Ready".to_string()),
+                "API status should initially reflect RuntimeStatus (Ready)"
+            );
+
+            status.update_dataset(
+                &dataset_ref,
+                ComponentStatus::error_with_message("UnableToConnectInvalidUsernameOrPassword"),
+            );
+
+            let response = http_client
+                .get(&http_url)
+                .send()
+                .await
+                .expect("valid response");
+
+            assert!(
+                response.status().is_success(),
+                "API should return success status"
+            );
+
+            let datasets: Vec<DatasetResponse> = response.json().await?;
+
             let test_dataset = datasets
                 .iter()
                 .find(|d| d.name == "test_dataset")

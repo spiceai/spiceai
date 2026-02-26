@@ -238,11 +238,14 @@ impl RuntimeStatus {
                     Err(poisoned) => poisoned.into_inner(),
                 };
 
-                // Check if all registered components have been ready at least once
+                // OnLoad readiness: a component counts as ready if it has been ready at least once.
+                // All registered components must appear in the ever-ready set before we report ready.
                 statuses
                     .keys()
                     .all(|component| ever_ready.contains(component))
             }
+            // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
+            // Only components in ShuttingDown state block overall readiness.
             RuntimeReadyState::OnRegistration => statuses
                 .values()
                 .all(|status| !matches!(status, ComponentStatus::ShuttingDown)),
@@ -462,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ready_on_registration_requires_successful_registration() {
+    fn test_is_ready_on_registration_requires_registered_component() {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
 

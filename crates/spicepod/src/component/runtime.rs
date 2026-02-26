@@ -117,8 +117,9 @@ pub enum RuntimeReadyState {
     /// Runtime becomes ready after all registered components have reached `Ready` at least once.
     #[default]
     OnLoad,
-    /// Runtime becomes ready once all registered components are successfully registered,
-    /// even if they are not yet in `Ready` state.
+    /// Runtime becomes ready once all components have been registered/initialized at least once,
+    /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
+    /// as long as none is `ShuttingDown`.
     OnRegistration,
 }
 
