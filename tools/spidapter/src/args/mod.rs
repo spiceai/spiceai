@@ -36,4 +36,8 @@ pub struct StdioArgs {
     /// Timeout in seconds to wait for a Spice Cloud deployment to become ready.
     #[arg(long, default_value = "600")]
     pub ready_wait: u64,
+
+    /// Release channel for the spice.ai runtime image (stable, preview, nightly, internal).
+    #[arg(long)]
+    pub channel: Option<String>,
 }

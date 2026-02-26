@@ -165,7 +165,7 @@ impl Runtime {
                             if log_errors.0 {
                                 metrics::views::LOAD_ERROR.add(1, &[]);
                                 tracing::error!("View '{}' has invalid SQL: {}", view.name, e);
-                                status.update_view(&view.name, status::ComponentStatus::Error);
+                                status.update_view(&view.name, status::ComponentStatus::error_with_message(e.to_string()));
                             }
                             return None;
                         }
@@ -175,7 +175,7 @@ impl Runtime {
                         if log_errors.0 {
                             metrics::views::LOAD_ERROR.add(1, &[]);
                             tracing::error!("View '{}' has empty SQL statement", view.name);
-                            status.update_view(&view.name, status::ComponentStatus::Error);
+                            status.update_view(&view.name, status::ComponentStatus::error_with_message("Empty SQL statement".to_string()));
                         }
                         return None;
                     }
@@ -187,7 +187,7 @@ impl Runtime {
                                 "View '{}' contains multiple SQL statements. Only one SELECT statement is allowed per view",
                                 view.name
                             );
-                            status.update_view(&view.name, status::ComponentStatus::Error);
+                            status.update_view(&view.name, status::ComponentStatus::error_with_message("Multiple SQL statements".to_string()));
                         }
                         return None;
                     }
@@ -210,7 +210,7 @@ impl Runtime {
                                 "View '{}' must contain a SELECT query",
                                 view.name
                             );
-                            status.update_view(&view.name, status::ComponentStatus::Error);
+                            status.update_view(&view.name, status::ComponentStatus::error_with_message("View must contain a SELECT query".to_string()));
                         }
                         return None;
                     }
@@ -261,8 +261,10 @@ impl Runtime {
                 Ok(accelerator) => accelerator,
                 Err(err) => {
                     let view_name = &view.name;
-                    self.status
-                        .update_view(view_name, status::ComponentStatus::Error);
+                    self.status.update_view(
+                        view_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::views::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
                     continue;
@@ -279,8 +281,10 @@ impl Runtime {
                 }
                 Err(err) => {
                     let view_name = &view.name;
-                    self.status
-                        .update_view(view_name, status::ComponentStatus::Error);
+                    self.status.update_view(
+                        view_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::views::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
                 }
@@ -322,9 +326,11 @@ impl Runtime {
         let register_task = df
             .register_view(Arc::clone(view), secrets)
             .context(UnableToAttachViewSnafu)
-            .inspect_err(|_| {
-                self.status
-                    .update_view(&view.name, status::ComponentStatus::Error);
+            .inspect_err(|e| {
+                self.status.update_view(
+                    &view.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
             })?;
 
         let runtime = Arc::clone(&self);

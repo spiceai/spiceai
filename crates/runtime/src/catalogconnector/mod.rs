@@ -85,6 +85,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(not(windows))]
+pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
@@ -175,6 +177,16 @@ pub async fn register_all() {
             ducklake::DuckLakeCatalog::new_connector,
             ducklake::PREFIX,
             ducklake::PARAMETERS,
+        ),
+    );
+
+    #[cfg(not(windows))]
+    registry.insert(
+        cayenne::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            cayenne::CayenneCatalogConnector::new_connector,
+            cayenne::PREFIX,
+            cayenne::PARAMETERS,
         ),
     );
 }

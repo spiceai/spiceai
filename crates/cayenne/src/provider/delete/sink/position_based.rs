@@ -21,9 +21,10 @@ limitations under the License.
 //! row exclusion during Vortex scans.
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use super::{catalog_error_to_box, CayenneDeletionSink};
+use super::CayenneDeletionSink;
 use crate::provider::constants::DELETION_CACHE_LOCK_POISONED;
 use crate::provider::utils::convert_to_u64_box;
+use crate::provider::Error;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
@@ -69,16 +70,23 @@ impl CayenneDeletionSink {
         &self,
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> crate::provider::Result<u64> {
+        let table_name = &self.table_metadata.table_name;
+
         if self.filters.is_empty() {
-            return Err("Method requires a WHERE clause filter. No filter was specified.".into());
+            return Err(Error::Internal {
+                table: table_name.clone(),
+                message: "Method requires a WHERE clause filter. No filter was specified."
+                    .to_string(),
+            });
         }
 
         let mut per_file_row_ids: HashMap<String, Vec<u64>> = HashMap::new();
 
         // Build Vortex filter once - all tables share the same schema
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        let vortex_filter = build_vortex_filter(&self.filters, &df_schema)?;
+        let vortex_filter = build_vortex_filter(&self.filters, &df_schema)
+            .map_err(datafusion_common::DataFusionError::External)?;
 
         tracing::debug!(
             vortex_filter = ?vortex_filter,
@@ -105,14 +113,16 @@ impl CayenneDeletionSink {
                 .table_paths()
                 .first()
                 .map(datafusion_datasource::ListingTableUrl::object_store)
-                .ok_or("Table has no paths")?;
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Table has no paths".to_string(),
+                })?;
 
             // Get the object store from the runtime env
             let object_store = ctx
                 .runtime_env()
                 .object_store_registry
-                .get_store(object_store_url.as_ref())
-                .map_err(|e| format!("Failed to get object store: {e}"))?;
+                .get_store(object_store_url.as_ref())?;
 
             // Scan files in parallel with bounded concurrency using buffer_unordered
             let vortex_session = VortexSession::default();
@@ -196,16 +206,25 @@ impl CayenneDeletionSink {
         vortex_session: &VortexSession,
         object_store: &Arc<dyn ObjectStore>,
         vortex_filter: Option<&vortex::expr::Expression>,
-    ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> crate::provider::Result<Vec<u64>> {
+        let table_name = &self.table_metadata.table_name;
+
         // Get existing deletions for this file to exclude from scan
         let cached_deleted_row_ids = self
             .pk_deletion_strategy
             .position_based_cache()
-            .ok_or("scan_file_for_deletions called with incompatible PkDeletionStrategy")?;
+            .ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "scan_file_for_deletions called with incompatible PkDeletionStrategy"
+                    .to_string(),
+            })?;
         let already_deleted = {
             let guard = cached_deleted_row_ids
                 .read()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
 
             if let Some(existing_bitmap) = guard.get(file_path) {
                 // ExcludeRoaring is preferred over ExcludeByIndex: less memory (~2 bits vs 8 bytes/row)
@@ -223,10 +242,21 @@ impl CayenneDeletionSink {
             .open_options()
             .open_object_store(object_store, file_path)
             .await
-            .map_err(|e| format!("Failed to open Vortex file {file_path}: {e}"))?;
+            .map_err(|e| Error::Vortex {
+                operation: "open vortex file for deletion scan",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
 
         // Build the scan with row_idx() projection only - no data columns read.
-        let mut scan_builder = vxf.scan()?.with_projection(row_idx());
+        let mut scan_builder = vxf
+            .scan()
+            .map_err(|e| Error::Vortex {
+                operation: "build vortex scan for deletion",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?
+            .with_projection(row_idx());
 
         if let Some(selection) = already_deleted {
             scan_builder = scan_builder.with_selection(selection);
@@ -239,18 +269,27 @@ impl CayenneDeletionSink {
 
         // Execute the scan and collect row indices
         // All returned rows are NEW deletions (already-deleted rows were excluded by selection)
-        let mut stream = scan_builder.into_stream()?;
+        let mut stream = scan_builder.into_stream().map_err(|e| Error::Vortex {
+            operation: "start vortex scan stream for deletion",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
         let mut new_row_ids: Vec<u64> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk =
-                chunk_result.map_err(|e| format!("Failed to read chunk from {file_path}: {e}"))?;
+            let chunk = chunk_result.map_err(|e| Error::Vortex {
+                operation: "read vortex chunk for deletion",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
 
             // The chunk contains row indices as U64 primitive array
             // Convert Vortex array directly to Arrow array (not RecordBatch)
-            let arrow_array = chunk
-                .into_arrow_preferred()
-                .map_err(|e| format!("Failed to convert chunk to Arrow array: {e}"))?;
+            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+                operation: "convert vortex chunk to arrow array",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
 
             if arrow_array.is_empty() {
                 continue;
@@ -260,7 +299,10 @@ impl CayenneDeletionSink {
             let row_indices = arrow_array
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
-                .ok_or_else(|| "row_idx() did not return UInt64Array".to_string())?;
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "row_idx() did not return UInt64Array".to_string(),
+                })?;
 
             new_row_ids.extend_from_slice(row_indices.values());
         }
@@ -290,21 +332,32 @@ impl CayenneDeletionSink {
     pub(super) async fn persist_position_based_deletions(
         &self,
         row_ids: HashMap<String, Vec<u64>>,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> crate::provider::Result<u64> {
+        let table_name = &self.table_metadata.table_name;
+
         if row_ids.is_empty() {
             return Ok(0);
         }
 
         // Get the position-based cache from the PkDeletionStrategy (only valid for PositionBased)
-        let cached_deleted_row_ids = self.pk_deletion_strategy.position_based_cache().ok_or(
-            "persist_position_based_deletions called with incompatible PkDeletionStrategy",
-        )?;
+        let cached_deleted_row_ids = self
+            .pk_deletion_strategy
+            .position_based_cache()
+            .ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message:
+                    "persist_position_based_deletions called with incompatible PkDeletionStrategy"
+                        .to_string(),
+            })?;
 
         // Read existing deletions to merge with new ones
         let existing_deletions: Arc<HashMap<String, RoaringBitmap>> = {
             let guard = cached_deleted_row_ids
                 .read()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
             Arc::clone(&*guard)
         };
 
@@ -338,17 +391,17 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        let results = writer.write(specs).await.map_err(catalog_error_to_box)?;
+        let results = writer.write(specs).await?;
 
         for result in results {
-            self.catalog
-                .add_delete_file(result.delete_file)
-                .await
-                .map_err(catalog_error_to_box)?;
+            self.catalog.add_delete_file(result.delete_file).await?;
 
             // Validate we received position-based identifiers as expected
             if matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)) {
-                return Err("Unexpected key-based deletion in position-based sink".into());
+                return Err(Error::Internal {
+                    table: table_name.clone(),
+                    message: "Unexpected key-based deletion in position-based sink".to_string(),
+                });
             }
         }
 
@@ -369,14 +422,20 @@ impl CayenneDeletionSink {
         {
             let mut guard = cached_deleted_row_ids
                 .write()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
 
             let map: &mut HashMap<String, RoaringBitmap> = Arc::make_mut(&mut *guard);
             map.extend(cache_updates);
         }
 
         // Return count of NEW deletions
-        convert_to_u64_box(new_deletion_count, "new deletion count")
+        convert_to_u64_box(new_deletion_count, "new deletion count").map_err(|e| Error::Internal {
+            table: table_name.clone(),
+            message: e.to_string(),
+        })
     }
 }
 

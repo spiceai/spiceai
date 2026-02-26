@@ -687,6 +687,12 @@ impl RefreshTask {
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
 
+                                // Record incremental ingestion counters per batch.
+                                let labels = [KeyValue::new("dataset", ds_name.clone())];
+                                metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+                                metrics::REFRESH_BYTES_WRITTEN
+                                    .add(batch.get_array_memory_size() as u64, &labels);
+
                                 // Check memory usage after processing each batch
                                 if let Some(ref monitor) = resource_monitor {
                                     monitor.check_memory_usage(&ds_name);
@@ -734,8 +740,11 @@ impl RefreshTask {
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            self.set_refresh_status(sql, status::ComponentStatus::Error)
-                .await;
+            self.set_refresh_status(
+                sql,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            )
+            .await;
             return Err(e);
         }
 
@@ -744,6 +753,14 @@ impl RefreshTask {
         if let (Some(start_time), Some(stat)) = (start_time, &refresh_stat) {
             self.trace_load_completed(start_time, stat.num_rows, stat.memory_size)
                 .await;
+        }
+
+        if let Some(stat) = &refresh_stat {
+            for dataset_name in self.get_dataset_names().await {
+                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
+                metrics::REFRESH_PROCESSED_ROWS.add(stat.num_rows as u64, &labels);
+                metrics::REFRESH_PROCESSED_BYTES.add(stat.memory_size as u64, &labels);
+            }
         }
 
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
@@ -1286,17 +1303,20 @@ impl RefreshTask {
     }
 
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        let is_error = status.is_error();
+        let is_ready = status == status::ComponentStatus::Ready;
+
         // runtime status update
         self.update_component_status(status).await;
 
         // telemetry update
         for dataset_name in self.get_dataset_names().await {
-            if status == status::ComponentStatus::Error {
+            if is_error {
                 let labels = [KeyValue::new("dataset", dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
             }
 
-            if status == status::ComponentStatus::Ready {
+            if is_ready {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default();
@@ -1322,16 +1342,17 @@ impl RefreshTask {
     async fn update_component_status(&self, status: status::ComponentStatus) {
         // main component status update
         if self.is_view_acceleration() {
-            self.runtime_status.update_view(&self.dataset_name, status);
+            self.runtime_status
+                .update_view(&self.dataset_name, status.clone());
         } else {
             self.runtime_status
-                .update_dataset(&self.dataset_name, status);
+                .update_dataset(&self.dataset_name, status.clone());
         }
 
         // synchronized tables can be datasets only
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             self.runtime_status
-                .update_dataset(&synchronized_table.child_dataset_name(), status);
+                .update_dataset(&synchronized_table.child_dataset_name(), status.clone());
         }
     }
 
@@ -1366,8 +1387,11 @@ impl RefreshTask {
                 "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
                 self.component_type(),
             );
-            self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
-                .await;
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(error.to_string()),
+            )
+            .await;
             return;
         }
 
@@ -1397,8 +1421,11 @@ impl RefreshTask {
             self.component_type(),
             include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
         );
-        self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
-            .await;
+        self.set_refresh_status(
+            refresh_sql,
+            status::ComponentStatus::error_with_message(error.to_string()),
+        )
+        .await;
     }
 
     /// Updates `last_updated_at` timestamp based on refresh type and row count.

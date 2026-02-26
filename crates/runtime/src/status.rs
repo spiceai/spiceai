@@ -67,7 +67,7 @@ impl RuntimeStatus {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        statuses.insert(component_name.to_string(), status);
+        statuses.insert(component_name.to_string(), status.clone());
 
         if status == ComponentStatus::Ready {
             let mut ever_ready = match self.ever_ready_components.write() {
@@ -89,71 +89,81 @@ impl RuntimeStatus {
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
         let catalog_name = catalog_name.into();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("catalog:{catalog_name}"), status);
-        metrics::catalogs::STATUS.record(status as u64, &[KeyValue::new("catalog", catalog_name)]);
+        metrics::catalogs::STATUS.record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
         let ds_name = dataset.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
-        metrics::datasets::STATUS.record(status as u64, &[KeyValue::new("dataset", ds_name)]);
+        metrics::datasets::STATUS.record(metric_value, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("model:{model_name}"), status);
-        metrics::models::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
         let tool_name = tool_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("tool:{tool_name}"), status);
-        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool", tool_name)]);
+        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
     }
 
     pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
         let name = catalog_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("tool_catalog:{name}"), status);
-        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool_catalog", name)]);
+        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("llm:{model_name}"), status);
-        metrics::llms::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("embedding:{model_name}"), status);
-        metrics::embeddings::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("view:{view_name}"), status);
-        metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
+        metrics::views::STATUS.record(metric_value, &[KeyValue::new("view", view_name)]);
     }
 
     /// Update the status of a worker
     pub fn update_worker(&self, name: &str, status: ComponentStatus) {
         let worker_name = name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        metrics::models::STATUS.record(status as u64, &[KeyValue::new("worker", worker_name)]);
+        metrics::models::STATUS.record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 
     /// Update the status of a cluster node
     pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
         let cluster_node_name = node_name.to_string();
-        self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
 
         // Record cluster node status metric
         // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
-        let status_value = match status {
+        let status_value = match &status {
             ComponentStatus::Initializing => 0,
             ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
-            ComponentStatus::Disabled | ComponentStatus::Error => 2,
+            ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
             ComponentStatus::ShuttingDown => 3, // Draining
         };
+
+        self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
         metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
     }
 
@@ -165,7 +175,7 @@ impl RuntimeStatus {
             Err(poisoned) => poisoned.into_inner(),
         };
         let full_name = format!("worker:{name}");
-        components.get(&full_name).copied()
+        components.get(&full_name).cloned()
     }
 
     /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
@@ -256,7 +266,7 @@ impl RuntimeStatus {
 
         statuses
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), *v)))
+            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), v.clone())))
             .collect()
     }
 
@@ -272,7 +282,7 @@ impl RuntimeStatus {
             .statuses
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        statuses.get(component_name).copied()
+        statuses.get(component_name).cloned()
     }
 
     /// Gets or creates a notifier for a component, returning a receiver to watch for status changes.
