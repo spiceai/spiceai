@@ -33,6 +33,7 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
+use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -313,11 +314,16 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     if !schema_provider.table_exist(&table_name) {
                         let builder =
                             CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
-                        if let Ok(provider) = builder.open(&metadata_table_name).await
-                            && let Err(e) = schema_provider
-                                .register_table(table_name.clone(), Arc::new(provider))
-                        {
-                            tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
+                        if let Ok(provider) = builder.open(&metadata_table_name).await {
+                            let provider = Arc::new(provider);
+                            let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
+                            let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
+                                Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
+                            if let Err(e) =
+                                schema_provider.register_table(table_name.clone(), wrapped_provider)
+                            {
+                                tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
+                            }
                         }
                     }
 
@@ -368,6 +374,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 ))
             })?;
 
+            let provider = Arc::new(provider);
+            let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
+            let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
+                Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
+
             // Ensure the schema exists, creating it on demand if needed
             let schema_provider = if let Some(s) = cayenne_provider.schema_provider(&df_schema_name)
             {
@@ -384,7 +395,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
             };
 
-            schema_provider.register_table(table_name.clone(), Arc::new(provider))?;
+            schema_provider.register_table(table_name.clone(), wrapped_provider)?;
 
             // Forward the CREATE TABLE DDL to executor nodes
             if let Some(ref registry) = executor_registry {
