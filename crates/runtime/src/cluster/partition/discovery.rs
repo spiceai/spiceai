@@ -57,7 +57,7 @@ pub async fn table_partition_values(
     // Fast path: if every partition expression has a statically known value set,
     // generate partition values without querying the source table.
     if let Some(values) = try_static_partition_values(partitioning) {
-        tracing::info!(
+        tracing::debug!(
             table = %table_name,
             partition_count = values.len(),
             "Partition values resolved statically (skipping source query)"
