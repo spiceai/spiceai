@@ -29,6 +29,15 @@ use std::process::{Command, Stdio};
 use tar::Archive;
 use walkdir::WalkDir;
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum TagOption {
+    All,
+    #[value(name = "default")]
+    Default,
+    Odbc,
+    Metal,
+}
+
 #[derive(Parser)]
 #[command(name = "pr-builds")]
 #[command(about = "Manage PR builds for Spice.ai", long_about = None)]
@@ -52,6 +61,10 @@ enum Commands {
         /// PR number to resolve to a branch.
         #[arg(short, long)]
         pr: Option<u64>,
+
+        /// Build tag to trigger (all, default, odbc, metal). Defaults to all.
+        #[arg(short, long)]
+        tag: Option<TagOption>,
 
         /// Wait for the build to complete.
         ///
@@ -118,7 +131,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Trigger { branch, pr, wait } => trigger_build(branch.as_deref(), *pr, *wait),
+        Commands::Trigger {
+            branch,
+            pr,
+            tag,
+            wait,
+        } => trigger_build(branch.as_deref(), *pr, *tag, *wait),
         Commands::Install { branch, pr } => install_build(branch.as_deref(), *pr),
         Commands::Run {
             branch,
@@ -221,7 +239,12 @@ fn get_repo_owner_name() -> Result<String> {
 }
 
 #[cfg(unix)]
-fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()> {
+fn trigger_build(
+    branch: Option<&str>,
+    pr: Option<u64>,
+    tag: Option<TagOption>,
+    wait: bool,
+) -> Result<()> {
     let branch = resolve_branch_or_pr(branch, pr)?;
     validate_branch_name(&branch)?;
     let repo_owner_name = get_repo_owner_name()?;
@@ -335,16 +358,30 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
 
         println!("Requesting platform: {platform_option}");
 
+        let mut cmd_args = vec![
+            "workflow",
+            "run",
+            "build_and_release.yml",
+            "--ref",
+            &branch,
+            "-f",
+            &format!("platform_option={platform_option}"),
+        ];
+
+        if let Some(t) = tag {
+            let tag_str = match t {
+                TagOption::All => "all",
+                TagOption::Default => "default",
+                TagOption::Odbc => "odbc",
+                TagOption::Metal => "metal",
+            };
+            println!("Requesting tag: {tag_str}");
+            cmd_args.push("-f");
+            cmd_args.push(&format!("tag_option={tag_str}"));
+        }
+
         let status = Command::new("gh")
-            .args([
-                "workflow",
-                "run",
-                "build_and_release.yml",
-                "--ref",
-                &branch,
-                "-f",
-                &format!("platform_option={platform_option}"),
-            ])
+            .args(&cmd_args)
             .status()
             .context("Failed to execute gh workflow run")?;
 
