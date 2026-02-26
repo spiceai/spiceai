@@ -22,7 +22,6 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, RwLock, Weak};
 
-use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::CatalogProviderList;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
@@ -39,19 +38,6 @@ fn parse_qualified_schema_name(name: &str) -> (String, String) {
         Some((catalog_name, schema_name)) => (catalog_name.to_string(), schema_name.to_string()),
         None => (SPICE_DEFAULT_CATALOG.to_string(), name.to_string()),
     }
-}
-
-fn coerce_utf8view_to_utf8(schema: &Schema) -> Arc<Schema> {
-    let fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|field| match field.data_type() {
-            DataType::Utf8View => field.as_ref().clone().with_data_type(DataType::Utf8),
-            _ => field.as_ref().clone(),
-        })
-        .collect();
-
-    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Analyzer rule that rewrites DDL targeting Cayenne catalogs into
@@ -133,7 +119,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 let table_name = create.name.table().to_string();
 
                 // Extract the Arrow schema from the logical plan's input
-                let arrow_schema = coerce_utf8view_to_utf8(create.input.schema().inner().as_ref());
+                let arrow_schema = create.input.schema().inner().clone();
 
                 let node = CayenneCreateTableNode::new(
                     table_name,
@@ -207,9 +193,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    use super::coerce_utf8view_to_utf8;
     use super::parse_qualified_schema_name;
     use crate::datafusion::SPICE_DEFAULT_CATALOG;
 
@@ -225,20 +208,5 @@ mod tests {
         let (catalog, schema) = parse_qualified_schema_name("bench");
         assert_eq!(catalog, SPICE_DEFAULT_CATALOG);
         assert_eq!(schema, "bench");
-    }
-
-    #[test]
-    fn coerce_utf8view_to_utf8_converts_text_columns() {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("text_col", DataType::Utf8View, true),
-            Field::new("name", DataType::Utf8, true),
-        ]);
-
-        let coerced = coerce_utf8view_to_utf8(&schema);
-
-        assert_eq!(coerced.field(0).data_type(), &DataType::Int64);
-        assert_eq!(coerced.field(1).data_type(), &DataType::Utf8);
-        assert_eq!(coerced.field(2).data_type(), &DataType::Utf8);
     }
 }
