@@ -43,6 +43,7 @@ use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use runtime_request_context::RequestContext;
 use snafu::Snafu;
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 /// Default max message size (16MB matches typical default).
@@ -51,6 +52,22 @@ const MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Use block transfer mode instead of Arrow Flight for partition retrieval.
 /// Block transfer is more efficient for large result sets within a cluster.
 const USE_FLIGHT_TRANSFER: bool = false;
+
+/// Number of polls to retry when a Completed event arrives before terminal status persistence.
+const COMPLETED_STATUS_MAX_POLLS: usize = 20;
+
+/// Delay between scheduler status polls after receiving a Completed event.
+const COMPLETED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn describe_job_status(status: Option<&job_status::Status>) -> &'static str {
+    match status {
+        Some(job_status::Status::Queued(_)) => "queued",
+        Some(job_status::Status::Running(_)) => "running",
+        Some(job_status::Status::Successful(_)) => "successful",
+        Some(job_status::Status::Failed(_)) => "failed",
+        None => "unknown",
+    }
+}
 
 /// Status of a distributed query job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,52 +468,81 @@ impl QueryHandle {
         &self,
         scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
     ) -> Result<Vec<PartitionLocation>> {
-        let status = scheduler
-            .state
-            .task_manager
-            .get_job_status(&self.ballista_job_id)
-            .await
-            .map_err(|e| {
-                let err = QueryHandleError::StatusError {
-                    message: e.to_string(),
+        for attempt in 1..=COMPLETED_STATUS_MAX_POLLS {
+            let status = scheduler
+                .state
+                .task_manager
+                .get_job_status(&self.ballista_job_id)
+                .await
+                .map_err(|e| {
+                    let err = QueryHandleError::StatusError {
+                        message: e.to_string(),
+                    };
+                    self.finish_tracker_with_error(&err);
+                    err
+                })?;
+
+            let Some(job_status) = status else {
+                if attempt < COMPLETED_STATUS_MAX_POLLS {
+                    tracing::debug!(
+                        job_id = %self.ballista_job_id,
+                        attempt,
+                        max_attempts = COMPLETED_STATUS_MAX_POLLS,
+                        "Job reported as completed before status became visible; retrying status poll"
+                    );
+                    sleep(COMPLETED_STATUS_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                let err = QueryHandleError::JobNotFound {
+                    ballista_job_id: self.ballista_job_id.clone(),
                 };
                 self.finish_tracker_with_error(&err);
-                err
-            })?;
-
-        let Some(job_status) = status else {
-            let err = QueryHandleError::JobNotFound {
-                ballista_job_id: self.ballista_job_id.clone(),
+                return Err(err);
             };
-            self.finish_tracker_with_error(&err);
-            return Err(err);
-        };
 
-        match job_status.status {
-            Some(job_status::Status::Successful(success)) => {
-                let locations = self.convert_partition_locations(success.partition_location)?;
-                self.finish_tracker_success();
-                Ok(locations)
-            }
-            Some(job_status::Status::Failed(failed)) => {
-                let err = QueryHandleError::JobFailed {
-                    message: failed.error,
-                };
-                self.finish_tracker_with_error(&err);
-                Err(err)
-            }
-            _ => {
-                // This shouldn't happen - we got a Completed event but status isn't Successful
-                let err = QueryHandleError::StatusError {
-                    message: format!(
-                        "Job {} reported as completed but status is not successful",
-                        self.ballista_job_id
-                    ),
-                };
-                self.finish_tracker_with_error(&err);
-                Err(err)
+            match job_status.status {
+                Some(job_status::Status::Successful(success)) => {
+                    let locations = self.convert_partition_locations(success.partition_location)?;
+                    self.finish_tracker_success();
+                    return Ok(locations);
+                }
+                Some(job_status::Status::Failed(failed)) => {
+                    let err = QueryHandleError::JobFailed {
+                        message: failed.error,
+                    };
+                    self.finish_tracker_with_error(&err);
+                    return Err(err);
+                }
+                status @ (Some(job_status::Status::Queued(_) | job_status::Status::Running(_))
+                | None) => {
+                    if attempt < COMPLETED_STATUS_MAX_POLLS {
+                        tracing::debug!(
+                            job_id = %self.ballista_job_id,
+                            attempt,
+                            max_attempts = COMPLETED_STATUS_MAX_POLLS,
+                            status = describe_job_status(status.as_ref()),
+                            "Job reported as completed before terminal status was persisted; retrying status poll"
+                        );
+                        sleep(COMPLETED_STATUS_POLL_INTERVAL).await;
+                        continue;
+                    }
+
+                    let err = QueryHandleError::StatusError {
+                        message: format!(
+                            "Job {} reported as completed but status remained {} after {} polls",
+                            self.ballista_job_id,
+                            describe_job_status(status.as_ref()),
+                            COMPLETED_STATUS_MAX_POLLS
+                        ),
+                    };
+                    self.finish_tracker_with_error(&err);
+                    return Err(err);
+                }
             }
         }
+
+        unreachable!("status poll loop should always return");
     }
 
     /// Converts protobuf partition locations to core types.
