@@ -37,6 +37,7 @@ use snafu::prelude::*;
 use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
+use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use data_components::RefreshableCatalogProvider;
 
 #[derive(Debug, Snafu)]
@@ -291,7 +292,7 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
 
         if !new_schemas.is_empty() {
             let total_tables: usize = grouped.values().map(Vec::len).sum();
-            tracing::info!(
+            tracing::debug!(
                 "Loaded {total_tables} existing Cayenne table{} across {} namespace{}",
                 if total_tables == 1 { "" } else { "s" },
                 new_schemas.len(),
@@ -402,7 +403,13 @@ impl CayenneSchemaProvider {
                 let builder = CayenneTableProviderBuilder::new(Arc::clone(catalog));
 
                 match builder.open(table_name).await {
-                    Ok(provider) => Ok(Some(Arc::new(provider))),
+                    Ok(provider) => {
+                        let provider = Arc::new(provider);
+                        let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
+                        Ok(Some(Arc::new(DeletionTableProviderAdapter::new(
+                            deletion_provider,
+                        ))))
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to open Cayenne table '{table_name}': {e}");
                         Ok(None)
