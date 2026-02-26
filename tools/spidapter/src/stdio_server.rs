@@ -197,6 +197,7 @@ impl Handler for SpidapterHandler {
                 .as_ref()
                 .filter(|t| matches!(t, EtlSinkType::Adbc))
                 .map(|_| "spicebench.bench".to_string()),
+            read_driver: None,
         };
 
         self.runs.insert(run_id, state);
