@@ -41,6 +41,9 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
+use super::statement_update::{
+    execute_statement_update_on_executor, should_forward_cayenne_statement_update,
+};
 
 /// Static schema for `affected_rows` result to avoid allocation on each request.
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -127,12 +130,34 @@ pub(crate) async fn do_get(
         )));
     }
 
+    let has_parameters = parameters.is_some();
+
     let plan = if let Some(params) = parameters {
         plan.with_param_values(params)
             .map_err(|e| Status::internal(format!("Failed to bind parameters: {e}")))?
     } else {
         plan
     };
+
+    if should_forward_cayenne_statement_update(&plan, &datafusion) {
+        if has_parameters {
+            tracing::warn!(
+                "Prepared statement update with bound parameters is executing locally on scheduler; forwarding requires non-parameterized SQL"
+            );
+        } else {
+            let affected_rows = execute_statement_update_on_executor(&datafusion, &sql).await?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&AFFECTED_ROWS_SCHEMA),
+                vec![Arc::new(Int64Array::from(vec![affected_rows]))],
+            )
+            .map_err(|e| Status::internal(format!("Failed to create result batch: {e}")))?;
+
+            let output = super::super::record_batches_to_flight_stream(vec![batch]);
+            return Ok(Response::new(
+                Box::pin(output) as <Service as FlightService>::DoGetStream
+            ));
+        }
+    }
 
     let physical_plan = session
         .create_physical_plan(&plan)

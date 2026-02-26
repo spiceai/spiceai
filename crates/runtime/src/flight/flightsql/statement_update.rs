@@ -24,11 +24,15 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{CommandStatementUpdate, DoPutUpdateResult, ProstMessageExt},
 };
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+use futures::StreamExt;
 use prost::Message;
+use std::sync::Arc;
 use tonic::{Response, Status};
 
 use crate::{
     config::ClusterRole,
+    datafusion::DataFusion,
     datafusion::request_context_extension::get_current_datafusion,
     flight::{Service, metrics},
 };
@@ -92,6 +96,11 @@ pub(crate) async fn do_put(
         )));
     }
 
+    if should_forward_cayenne_statement_update(&plan, &datafusion) {
+        let affected_rows = execute_statement_update_on_executor(&datafusion, sql).await?;
+        return update_result_response(affected_rows);
+    }
+
     // Execute
     let physical_plan = session
         .create_physical_plan(&plan)
@@ -105,6 +114,12 @@ pub(crate) async fn do_put(
     // Extract affected rows count
     let affected_rows = extract_affected_rows(&results);
 
+    update_result_response(affected_rows)
+}
+
+fn update_result_response(
+    affected_rows: i64,
+) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     let result = DoPutUpdateResult {
         record_count: affected_rows,
     };
@@ -114,6 +129,130 @@ pub(crate) async fn do_put(
     })]);
 
     Ok(Response::new(Box::pin(output)))
+}
+
+pub(crate) async fn execute_statement_update_on_executor(
+    datafusion: &Arc<DataFusion>,
+    sql: &str,
+) -> Result<i64, Status> {
+    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
+        return Err(Status::failed_precondition(
+            "No executor registry available for distributed statement update",
+        ));
+    };
+
+    let (executor_id, mut client) = {
+        let clients = executor_registry.flight_sql_clients.read().await;
+        let Some((executor_id, client)) = clients.iter().next() else {
+            return Err(Status::failed_precondition(
+                "No connected executors available for distributed statement update",
+            ));
+        };
+        (executor_id.clone(), client.clone())
+    };
+
+    let flight_info = client
+        .execute(sql.to_string(), None)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to forward statement to executor: {e}")))?;
+
+    let mut results = Vec::new();
+    for endpoint in flight_info.endpoint {
+        let Some(ticket) = endpoint.ticket else {
+            continue;
+        };
+
+        let mut stream = client
+            .do_get(ticket)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to fetch executor update result: {e}")))?;
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch
+                .map_err(|e| Status::internal(format!("Executor returned invalid batch: {e}")))?;
+            results.push(batch);
+        }
+    }
+
+    tracing::debug!(executor_id, sql, "Forwarded statement update to executor");
+    Ok(extract_affected_rows(&results))
+}
+
+pub(crate) fn should_forward_cayenne_statement_update(
+    plan: &LogicalPlan,
+    datafusion: &Arc<DataFusion>,
+) -> bool {
+    if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
+        return false;
+    }
+
+    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
+        return false;
+    };
+
+    let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+        return false;
+    };
+    if clients.is_empty() {
+        return false;
+    }
+
+    match plan {
+        LogicalPlan::Dml(dml) => {
+            let target_catalog = dml
+                .table_name
+                .catalog()
+                .unwrap_or(crate::datafusion::SPICE_DEFAULT_CATALOG);
+            is_cayenne_catalog(datafusion, target_catalog)
+        }
+        LogicalPlan::Ddl(ddl) => {
+            let target_catalog = ddl_catalog_name(ddl)
+                .unwrap_or_else(|| crate::datafusion::SPICE_DEFAULT_CATALOG.to_string());
+            is_cayenne_catalog(datafusion, &target_catalog)
+        }
+        _ => false,
+    }
+}
+
+fn ddl_catalog_name(ddl: &DdlStatement) -> Option<String> {
+    match ddl {
+        DdlStatement::CreateExternalTable(create) => create.name.catalog().map(String::from),
+        DdlStatement::CreateMemoryTable(create) => create.name.catalog().map(String::from),
+        DdlStatement::DropTable(drop) => drop.name.catalog().map(String::from),
+        DdlStatement::CreateView(create) => create.name.catalog().map(String::from),
+        DdlStatement::DropView(drop) => drop.name.catalog().map(String::from),
+        DdlStatement::CreateCatalogSchema(create) => create
+            .schema_name
+            .split('.')
+            .next()
+            .filter(|_| create.schema_name.contains('.'))
+            .map(String::from),
+        DdlStatement::DropCatalogSchema(drop) => match &drop.name {
+            datafusion::common::SchemaReference::Full { catalog, .. } => Some(catalog.to_string()),
+            datafusion::common::SchemaReference::Bare { .. } => None,
+        },
+        DdlStatement::CreateCatalog(_)
+        | DdlStatement::CreateIndex(_)
+        | DdlStatement::CreateFunction(_)
+        | DdlStatement::DropFunction(_) => None,
+    }
+}
+
+fn is_cayenne_catalog(datafusion: &Arc<DataFusion>, catalog_name: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        datafusion
+            .ctx
+            .catalog(catalog_name)
+            .is_some_and(|catalog| crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = datafusion;
+        let _ = catalog_name;
+        false
+    }
 }
 
 fn allow_scheduler_trusted_executor_write(datafusion: &crate::datafusion::DataFusion) -> bool {
