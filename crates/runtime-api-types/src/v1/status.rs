@@ -314,3 +314,74 @@ impl<'de> Deserialize<'de> for ComponentStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ComponentError, ComponentErrorCategory, ComponentErrorType};
+
+    #[test]
+    fn test_component_error_type_from_message_classifies_expected_patterns() {
+        assert_eq!(
+            ComponentErrorType::from_message(Some("too many requests from upstream")),
+            ComponentErrorType::RateLimit
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("request timed out after 30s")),
+            ComponentErrorType::Timeout
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("resource not found")),
+            ComponentErrorType::NotFound
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("access denied by policy")),
+            ComponentErrorType::Permission
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("invalid_api_key")),
+            ComponentErrorType::Auth
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("tls handshake failed")),
+            ComponentErrorType::Connection
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("unsupported format in request")),
+            ComponentErrorType::Validation
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("unexpected internal failure")),
+            ComponentErrorType::Internal
+        );
+    }
+
+    #[test]
+    fn test_component_error_type_from_message_handles_ambiguous_and_missing_inputs() {
+        assert_eq!(
+            ComponentErrorType::from_message(Some("Invalid token provided")),
+            ComponentErrorType::Auth
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("INVALID INPUT payload")),
+            ComponentErrorType::Validation
+        );
+        assert_eq!(
+            ComponentErrorType::from_message(Some("")),
+            ComponentErrorType::Unknown
+        );
+        assert_eq!(ComponentErrorType::from_message(None), ComponentErrorType::Unknown);
+    }
+
+    #[test]
+    fn test_component_error_from_status_message_generates_stable_code() {
+        let dataset_auth =
+            ComponentError::from_status_message(ComponentErrorCategory::Dataset, Some("invalid_api_key"));
+        assert_eq!(dataset_auth.error_type, ComponentErrorType::Auth);
+        assert_eq!(dataset_auth.code, "dataset.auth");
+
+        let model_unknown =
+            ComponentError::from_status_message(ComponentErrorCategory::Model, Some("totally novel failure"));
+        assert_eq!(model_unknown.error_type, ComponentErrorType::Unknown);
+        assert_eq!(model_unknown.code, "model.unknown");
+    }
+}
