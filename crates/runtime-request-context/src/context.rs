@@ -53,6 +53,9 @@ pub struct RequestContext {
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
     nested_query_level: AtomicI16,
+    /// The raw `authorization` header value from the incoming request, if present.
+    /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
+    authorization_header: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -235,6 +238,12 @@ impl RequestContext {
         &self.trace_parent
     }
 
+    /// Returns the raw `authorization` header value from the incoming request, if present.
+    #[must_use]
+    pub fn authorization_header(&self) -> Option<&str> {
+        self.authorization_header.as_deref()
+    }
+
     pub fn extension<T>(&self) -> Option<T>
     where
         T: Extension + Clone,
@@ -301,6 +310,7 @@ pub struct RequestContextBuilder {
     baggage: Vec<KeyValue>,
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
+    authorization_header: Option<String>,
 }
 
 impl RequestContextBuilder {
@@ -315,6 +325,7 @@ impl RequestContextBuilder {
             baggage: vec![],
             extensions: Extensions::default(),
             trace_parent: None,
+            authorization_header: None,
         }
     }
 
@@ -353,6 +364,11 @@ impl RequestContextBuilder {
         };
 
         self.baggage.extend(baggage::from_headers(headers));
+
+        self.authorization_header = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
 
         match super::extract_trace_parent(headers) {
             Ok(trace_parent) => {
@@ -491,6 +507,7 @@ impl RequestContextBuilder {
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
             nested_query_level: AtomicI16::new(0),
+            authorization_header: self.authorization_header,
         }
     }
 

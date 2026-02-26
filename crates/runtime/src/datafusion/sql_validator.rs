@@ -29,8 +29,9 @@ use crate::datafusion::DataFusion;
 /// Reads (SELECT queries) are allowed on all tables.
 /// INSERT and DELETE operations are only allowed on datasets that are configured as writable,
 /// and are not allowed on internal Spice tables.
+/// UPDATE operations are only allowed on writable Cayenne catalog tables.
 /// DDL operations are only allowed on catalogs configured with `access: read_write_create`.
-/// DML (other than allowed INSERT/DELETE), COPY, and Statement operations are not permitted.
+/// DML (other than allowed INSERT/DELETE/UPDATE), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
 /// * `Ok(())` if the plan is valid
@@ -108,6 +109,35 @@ pub fn validate_sql_query_operations(
                         dml.table_name
                     )
                 }
+            } else if matches!(&dml.op, datafusion::logical_expr::WriteOp::Update) {
+                if super::is_spice_internal_dataset(&dml.table_name) {
+                    return plan_err!(
+                        "UPDATE operations are not allowed on Spice system dataset '{}'.",
+                        dml.table_name
+                    );
+                }
+
+                let target_catalog = dml
+                    .table_name
+                    .catalog()
+                    .unwrap_or(super::SPICE_DEFAULT_CATALOG);
+
+                if !df.is_catalog_writable(target_catalog) {
+                    return plan_err!(
+                        "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                        dml.table_name
+                    );
+                }
+
+                if !is_cayenne_catalog(df, target_catalog) {
+                    return plan_err!(
+                        "UPDATE operations are only supported on writable Cayenne catalog tables. Table '{}', catalog '{}' is not Cayenne-backed.",
+                        dml.table_name,
+                        target_catalog
+                    );
+                }
+
+                Ok(TreeNodeRecursion::Continue)
             } else { plan_err!("Operation is not allowed: {}", dml.name()) }
         }
         LogicalPlan::Copy(_) => {
@@ -125,6 +155,22 @@ pub fn validate_sql_query_operations(
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
+}
+
+fn is_cayenne_catalog(df: &Arc<DataFusion>, catalog_name: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        df.ctx
+            .catalog(catalog_name)
+            .is_some_and(|catalog| super::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = df;
+        let _ = catalog_name;
+        false
+    }
 }
 
 /// Validates DDL operations. DDL is only allowed on catalogs with `access: read_write_create`.

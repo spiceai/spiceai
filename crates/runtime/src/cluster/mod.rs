@@ -395,7 +395,7 @@ fn update_scheduler_pollers(
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-mod executor_registry;
+pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
 mod scheduler_registry;
