@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: odbc[athena]-arrow
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: odbc:tpch.customer
     name: customer

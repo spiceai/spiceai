@@ -3,6 +3,8 @@ kind: Spicepod
 name: mysql-federated-cache_1gb
 
 runtime:
+  telemetry:
+    enabled: false
   results_cache:
     enabled: true
     cache_max_size: 1Gib

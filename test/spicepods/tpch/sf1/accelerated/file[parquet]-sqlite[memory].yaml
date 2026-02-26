@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-sqlite[memory]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:data/customer.parquet
     name: customer

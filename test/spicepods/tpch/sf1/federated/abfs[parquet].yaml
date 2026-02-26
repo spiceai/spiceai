@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: abfs[parquet]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: abfs://data/tpch/customer/
     name: customer

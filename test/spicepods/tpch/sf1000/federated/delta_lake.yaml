@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: delta_lake
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/partsupp/
     name: partsupp

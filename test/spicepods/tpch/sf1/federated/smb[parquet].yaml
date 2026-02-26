@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: smb[parquet]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/customer.parquet
     name: customer

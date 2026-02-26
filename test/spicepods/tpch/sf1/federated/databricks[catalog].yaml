@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: databricks[catalog]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 catalogs:
   - from: databricks:spiceai_sandbox
     name: tpch

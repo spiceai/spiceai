@@ -2,6 +2,10 @@ version: v1beta1
 kind: Spicepod
 name: iceberg[catalog]-federated
 
+runtime:
+  telemetry:
+    enabled: false
+
 catalogs:
   - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces
     name: ice

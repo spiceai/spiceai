@@ -3,6 +3,8 @@ kind: Spicepod
 name: full-refresh-with-indexes
 
 runtime:
+  telemetry:
+    enabled: false
   task_history:
     enabled: true
     captured_output: truncated

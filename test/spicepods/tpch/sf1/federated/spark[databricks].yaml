@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: spark[databricks]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: spark:spiceai_sandbox.tpch.customer
     name: customer

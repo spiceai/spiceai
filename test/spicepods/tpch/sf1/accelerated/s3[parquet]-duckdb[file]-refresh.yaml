@@ -2,6 +2,8 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-duckdb[file]-refresh-1s
 runtime:
+  telemetry:
+    enabled: false
   params:
     dedicated_thread_pool: sql_engine
 datasets:

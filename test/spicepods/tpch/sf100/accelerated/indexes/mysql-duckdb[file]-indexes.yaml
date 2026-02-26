@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: mysql-duckdb[file]-indexes
 
+runtime:
+  telemetry:
+    enabled: false
+
 # Define common anchors
 definitions:
   # Common mysql parameters

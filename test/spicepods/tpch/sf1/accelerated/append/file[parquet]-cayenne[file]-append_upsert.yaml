@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: file[parquet]-cayenne[file]-append_upsert
 
+runtime:
+  telemetry:
+    enabled: false
+
 refresh_check_interval: &refresh_check_interval 30s
 
 datasets:

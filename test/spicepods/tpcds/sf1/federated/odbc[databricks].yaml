@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: odbc[databricks]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: odbc:spiceai_sandbox.tpcds.catalog_sales
     name: catalog_sales

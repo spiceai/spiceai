@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-mixed[duckdb[file]+sqlite[file]]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:data/customer.parquet
     name: customer

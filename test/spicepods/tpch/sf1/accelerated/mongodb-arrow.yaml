@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: mongodb-arrow
 
+runtime:
+  telemetry:
+    enabled: false
+
 # Define common anchors
 definitions:
   # Common mongodb parameters

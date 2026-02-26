@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: http_basic
 
+runtime:
+  telemetry:
+    enabled: false
+
 datasets:
   # Basic GET request - httpbin.org/json
   - from: https://httpbin.org/json

@@ -11,6 +11,8 @@ extensions:
       path: .spice/tpch.db
 
 runtime:
+  telemetry:
+    enabled: false
   task_history:
     enabled: true
     captured_output: truncated

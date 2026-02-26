@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: spark[databricks]-arrow
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: spark:spiceai_sandbox.tpcds.catalog_sales
     name: catalog_sales

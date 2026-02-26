@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: iceberg[hadoop[catalog]]-federated
 
+runtime:
+  telemetry:
+    enabled: false
+
 catalogs:
   - from: iceberg:s3a://benchmarks/hadoop
     name: hadoop

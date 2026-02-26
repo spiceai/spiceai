@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: mssql-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: mssql:customer
     name: customer

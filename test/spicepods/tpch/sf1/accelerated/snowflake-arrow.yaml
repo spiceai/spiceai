@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: snowflake-arrow
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.CUSTOMER
     name: customer

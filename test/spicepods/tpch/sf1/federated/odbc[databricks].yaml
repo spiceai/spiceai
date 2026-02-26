@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: odbc[databricks]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: odbc:spiceai_sandbox.tpch.customer
     name: customer

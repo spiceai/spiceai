@@ -2,6 +2,10 @@ version: v1beta1
 kind: Spicepod
 name: structured-output-sample
 
+runtime:
+  telemetry:
+    enabled: false
+
 datasets:
   - from: file:structured_output.jsonl
     name: structured_output

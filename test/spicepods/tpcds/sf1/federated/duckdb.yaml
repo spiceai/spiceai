@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: duckdb-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: duckdb:catalog_sales
     name: catalog_sales

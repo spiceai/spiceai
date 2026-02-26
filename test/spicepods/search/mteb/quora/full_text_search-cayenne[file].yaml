@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: full_text_search-cayenne[file]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.

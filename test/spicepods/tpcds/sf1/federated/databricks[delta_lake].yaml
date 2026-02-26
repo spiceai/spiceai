@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: databricks[delta_lake]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: databricks:spiceai_sandbox.tpcds.item
     name: item

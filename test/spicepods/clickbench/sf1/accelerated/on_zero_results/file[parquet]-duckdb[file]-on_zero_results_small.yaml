@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-duckdb[file]-on_zero_results_small
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:data/hits_0.parquet
     name: hits

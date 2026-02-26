@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: oracle-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: oracle:"TPCH_SF1"."CUSTOMER"
     name: customer

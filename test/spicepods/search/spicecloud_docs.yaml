@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: spicecloud_docs
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: spice.ai/spiceai/docs/datasets/spice.spiceai.cookbook
     name: cookbook

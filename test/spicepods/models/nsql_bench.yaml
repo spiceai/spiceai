@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: 'nsql_benchmark'
 
+runtime:
+  telemetry:
+    enabled: false
+
 default_acceleration: &default_acceleration
   enabled: true
   mode: file

@@ -2,6 +2,10 @@ version: v1beta1
 kind: Spicepod
 name: iceberg-duckdb[file]
 
+runtime:
+  telemetry:
+    enabled: false
+
 datasets:
   - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/partsupp
     name: partsupp

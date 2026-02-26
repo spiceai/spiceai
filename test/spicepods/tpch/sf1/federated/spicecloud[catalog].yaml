@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: spicecloud[catalog]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 catalogs:
   - from: spice.ai:spiceai/tpch
     name: tpch

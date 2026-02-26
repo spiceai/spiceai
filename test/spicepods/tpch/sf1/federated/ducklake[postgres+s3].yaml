@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: ducklake[postgres+s3]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: ducklake:customer
     name: customer

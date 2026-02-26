@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-duckdb[file]-on_zero_results
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:data/customer.parquet
     name: customer

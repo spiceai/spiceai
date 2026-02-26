@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: glue[catalog]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 catalogs:
   - from: glue
     name: glue

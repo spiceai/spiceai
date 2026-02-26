@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-cayenne[file]-indexes
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:data/customer.parquet
     name: customer

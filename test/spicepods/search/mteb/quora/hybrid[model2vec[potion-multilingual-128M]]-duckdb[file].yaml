@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.

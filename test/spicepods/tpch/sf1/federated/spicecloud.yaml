@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: spicecloud-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: spice.ai:spiceai/tpch/datasets/tpch.customer
     name: customer

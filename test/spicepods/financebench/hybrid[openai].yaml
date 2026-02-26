@@ -3,6 +3,8 @@ kind: Spicepod
 name: financebench_hybrid
 
 runtime:
+  telemetry:
+    enabled: false
   flight:
     max_message_size: 1G
 

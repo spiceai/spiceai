@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file_arrow_append
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:catalog_sales.parquet
     name: catalog_sales

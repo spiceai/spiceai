@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: dynamodb-scylladb-alternator-federated
 
+runtime:
+  telemetry:
+    enabled: false
+
 # This spicepod demonstrates using the DynamoDB connector with ScyllaDB Alternator.
 # ScyllaDB's Alternator is a DynamoDB-compatible API that allows applications
 # written for DynamoDB to run unmodified against ScyllaDB.

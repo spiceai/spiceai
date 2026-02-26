@@ -3,6 +3,10 @@ kind: Spicepod
 name: 'nsql_benchmark'
 # Used to run `test/nsql_bench` (or `test/spicepods/models/nsql_bench.yaml` spicepod) but configured to be run under `testoperator run text-to-sql` not `testoperator run evals`
 
+runtime:
+  telemetry:
+    enabled: false
+
 default_acceleration: &default_acceleration
   enabled: true
   mode: file

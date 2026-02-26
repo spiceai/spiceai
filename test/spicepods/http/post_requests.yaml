@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: http_post_requests
 
+runtime:
+  telemetry:
+    enabled: false
+
 datasets:
   # POST request with JSON body
   - from: https://jsonplaceholder.typicode.com

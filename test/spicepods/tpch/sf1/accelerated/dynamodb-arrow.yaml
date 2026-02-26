@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: dynamodb-arrow
 
+runtime:
+  telemetry:
+    enabled: false
+
 definitions:
   - &acceleration
     enabled: true

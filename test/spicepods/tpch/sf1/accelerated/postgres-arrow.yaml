@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: postgres-arrow
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: postgres:customer
     name: customer

@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: core-models
 
+runtime:
+  telemetry:
+    enabled: false
+
 model_system_prompt: &model_system_prompt |
   # Role and Objective
   You are a financial expert tasked with answering questions based solely on `financebench.data`.

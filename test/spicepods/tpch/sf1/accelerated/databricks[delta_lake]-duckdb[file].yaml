@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: databricks[delta_lake]-duckdb[file]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: databricks:spiceai_sandbox.tpch.partsupp
     name: partsupp

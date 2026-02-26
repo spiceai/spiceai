@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file_duckdb_file_append
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:hits_delayed.parquet
     name: hits

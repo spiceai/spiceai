@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: openai
 
+runtime:
+  telemetry:
+    enabled: false
+
 models:
   - from: openai:gpt-4o-mini
     name: gpt-4o-mini

@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: hf[all-minilm-l6-v2]-arrow
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.

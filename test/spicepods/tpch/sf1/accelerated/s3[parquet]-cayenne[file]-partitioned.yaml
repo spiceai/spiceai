@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: s3[parquet]-cayenne[file]-partitioned
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer.parquet
     name: customer

@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: s3[parquet]-cayenne[file]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: s3://benchmarks/tpcds_sf100/catalog_sales/
     name: catalog_sales

@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: glue[csv]-federated
 
+runtime:
+  telemetry:
+    enabled: false
+
 datasets:
   - from: glue:tpch.customer_csv
     name: customer

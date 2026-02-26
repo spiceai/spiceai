@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: iceberg-turso[memory]
 
+runtime:
+  telemetry:
+    enabled: false
+
 definitions:
   - &iceberg_params
     iceberg_catalog_type: rest

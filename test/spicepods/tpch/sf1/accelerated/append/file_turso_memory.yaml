@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file_turso_memory_append
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:customer.parquet
     name: customer

@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: postgres-sqlite[file]
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: postgres:customer
     name: customer

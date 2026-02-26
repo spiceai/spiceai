@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: s3[parquet]-duckdb[memory]-8gib
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: s3://benchmarks/tpch_sf5/customer/
     name: customer

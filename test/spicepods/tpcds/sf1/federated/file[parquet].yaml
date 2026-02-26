@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-federated
+
+runtime:
+  telemetry:
+    enabled: false
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales
