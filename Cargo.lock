@@ -18849,7 +18849,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=523a2fdcbee64982e14db992c8811207d370d05c#523a2fdcbee64982e14db992c8811207d370d05c"
+source = "git+https://github.com/spiceai/spicebench.git?rev=27754b5810745e3afc7bb703ecc13aa9835732ea#27754b5810745e3afc7bb703ecc13aa9835732ea"
 dependencies = [
  "arrow-schema",
  "async-trait",
