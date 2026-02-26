@@ -55,8 +55,7 @@ use runtime::{
     component::dataset::Dataset,
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-        NewDataConnectorResult,
-        parameters::ConnectorParams,
+        NewDataConnectorResult, parameters::ConnectorParams,
     },
     parameters::ParameterSpec,
 };
@@ -460,10 +459,12 @@ impl DataConnector for AuthErrorDataConnector {
         &self,
         dataset: &Dataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
-        Err(DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-            dataconnector: "auth-error".to_string(),
-            connector_component: ConnectorComponent::from(dataset),
-        })
+        Err(
+            DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                dataconnector: "auth-error".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )
     }
 }
 
@@ -513,8 +514,11 @@ async fn register_slow_loading_providers() {
 }
 
 async fn register_auth_error_provider() {
-    dataconnector::register_connector_factory("auth-error", AuthErrorDataConnectorProvider::new_arc())
-        .await;
+    dataconnector::register_connector_factory(
+        "auth-error",
+        AuthErrorDataConnectorProvider::new_arc(),
+    )
+    .await;
 }
 
 fn get_native_dataset(
@@ -1078,7 +1082,10 @@ async fn test_runtime_on_registration_ready_when_dataset_is_error() -> Result<()
 
             let app = AppBuilder::new("runtime_on_registration_dataset_error")
                 .with_runtime(runtime)
-                .with_dataset(SpicepodDataset::new("auth-error://dummy", "bad_s3_credentials"))
+                .with_dataset(SpicepodDataset::new(
+                    "auth-error://dummy",
+                    "bad_s3_credentials",
+                ))
                 .build();
 
             configure_test_datafusion();
@@ -1121,9 +1128,14 @@ async fn test_runtime_on_registration_ready_when_dataset_is_error() -> Result<()
                 .iter()
                 .find(|(name, _)| name.to_string() == "bad_s3_credentials")
                 .map(|(_, status)| status.clone())
-                .ok_or_else(|| anyhow::anyhow!("Dataset status for bad_s3_credentials not found"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Dataset status for bad_s3_credentials not found")
+                })?;
 
-            assert!(matches!(dataset_status, runtime::status::ComponentStatus::Error(_)));
+            assert!(matches!(
+                dataset_status,
+                runtime::status::ComponentStatus::Error(_)
+            ));
             assert!(rt.status().is_ready());
 
             Ok(())

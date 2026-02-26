@@ -114,7 +114,9 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             let status = rt.status();
             let dataset_statuses = status.get_dataset_statuses();
             let dataset_ref = datafusion::sql::TableReference::bare("test_dataset");
-            let runtime_status = dataset_statuses.get(&dataset_ref).expect("test_dataset should have a status");
+            let runtime_status = dataset_statuses
+                .get(&dataset_ref)
+                .expect("test_dataset should have a status");
             assert_eq!(
                 *runtime_status,
                 ComponentStatus::Ready,
@@ -284,7 +286,8 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
                 "error_message should be omitted when status=true is not provided"
             );
 
-            let datasets: Vec<DatasetResponse> = serde_json::from_value(Value::Array(datasets_json))?;
+            let datasets: Vec<DatasetResponse> =
+                serde_json::from_value(Value::Array(datasets_json))?;
 
             let test_dataset = datasets
                 .iter()

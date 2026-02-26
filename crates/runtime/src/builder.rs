@@ -215,12 +215,17 @@ impl RuntimeBuilder {
         let runtime_ready_state = self
             .app
             .as_ref()
-            .map_or(SpicepodRuntimeReadyState::default(), |app| app.runtime.ready_state);
+            .map_or(SpicepodRuntimeReadyState::default(), |app| {
+                app.runtime.ready_state
+            });
 
-        self.runtime_status.set_ready_state(match runtime_ready_state {
-            SpicepodRuntimeReadyState::OnLoad => status::RuntimeReadyState::OnLoad,
-            SpicepodRuntimeReadyState::OnRegistration => status::RuntimeReadyState::OnRegistration,
-        });
+        self.runtime_status
+            .set_ready_state(match runtime_ready_state {
+                SpicepodRuntimeReadyState::OnLoad => status::RuntimeReadyState::OnLoad,
+                SpicepodRuntimeReadyState::OnRegistration => {
+                    status::RuntimeReadyState::OnRegistration
+                }
+            });
 
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled = App::get_runtime_param_opt::<String>(&self.app, "url_tables")
