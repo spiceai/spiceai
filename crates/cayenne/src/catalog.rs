@@ -199,6 +199,9 @@ pub trait MetadataCatalog: Send + Sync {
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
 
+    /// List all table names in the catalog.
+    async fn list_table_names(&self) -> CatalogResult<Vec<String>>;
+
     /// Create a new table.
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<i64>;
 

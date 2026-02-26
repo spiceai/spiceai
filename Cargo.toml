@@ -142,7 +142,7 @@ candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
 charset = "0.1.5"
 chrono = "0.4.42"
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.5.60", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -314,7 +314,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 turso = { version = "0.4.4", default-features = false }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
-util = { path = "crates/util" }
+util = { path = "crates/util", default-features = false }
 uuid = "1"
 
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
@@ -383,11 +383,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc822e6e9e7a1d9a04b6cd5bae0339f46558616e" }              # spiceai-0.8.0
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc822e6e9e7a1d9a04b6cd5bae0339f46558616e" } # spiceai-0.8.0
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc822e6e9e7a1d9a04b6cd5bae0339f46558616e" } # spiceai-0.8.0
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc822e6e9e7a1d9a04b6cd5bae0339f46558616e" }   # spiceai-0.8.0
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc822e6e9e7a1d9a04b6cd5bae0339f46558616e" }   # spiceai-0.8.0
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "d9dd7af67f65380695a66b11ff8f073a020ca493" }              # spiceai-51
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "d9dd7af67f65380695a66b11ff8f073a020ca493" } # spiceai-51
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "d9dd7af67f65380695a66b11ff8f073a020ca493" } # spiceai-51
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "d9dd7af67f65380695a66b11ff8f073a020ca493" }   # spiceai-51
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "d9dd7af67f65380695a66b11ff8f073a020ca493" }   # spiceai-51
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 

@@ -41,7 +41,7 @@ tokenizers.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "4d40be8a2bd5b44710728124d0c32bc13d79beaa", optional = true } # branch: spiceai-upgrade
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "4d40be8a2bd5b44710728124d0c32bc13d79beaa", package = "mistralrs-core", optional = true } # branch: spiceai-upgrade

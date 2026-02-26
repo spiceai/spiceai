@@ -68,8 +68,10 @@ impl Runtime {
                     }
                     Err(e) => {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
-                        self.status
-                            .update_embedding(&in_embed.name, status::ComponentStatus::Error);
+                        self.status.update_embedding(
+                            &in_embed.name,
+                            status::ComponentStatus::error_with_message(e.to_string()),
+                        );
                         tracing::warn!(
                             "Failed to load Embedding Model {}. {} Verify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings",
                             in_embed.name,

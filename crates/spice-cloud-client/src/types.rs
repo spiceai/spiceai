@@ -62,7 +62,7 @@ pub struct CreateAppRequest {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -107,7 +107,7 @@ pub struct DeploymentsResponse {
     pub deployments: Vec<Deployment>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct CreateDeploymentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -124,33 +124,6 @@ pub struct CreateDeploymentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
     pub debug: bool,
-}
-
-// ============================================================================
-// Metrics
-// ============================================================================
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PodMetrics {
-    pub cpu_usage_percent: Option<f64>,
-    pub memory_usage_bytes: Option<u64>,
-    pub disk_read_bytes: Option<f64>,
-    pub disk_read_iops: Option<f64>,
-    pub disk_write_bytes: Option<f64>,
-    pub disk_write_iops: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct IngestionMetrics {
-    pub rows_ingested: Option<u64>,
-    pub bytes_ingested: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MetricsResponse {
-    pub metrics: BTreeMap<String, PodMetrics>,
-    #[serde(default)]
-    pub ingestion: Option<IngestionMetrics>,
 }
 
 // ============================================================================
@@ -259,6 +232,33 @@ pub struct RegenerateApiKeyResponse {
 #[derive(Debug, Serialize)]
 pub struct RegenerateApiKeyRequest {
     pub key_number: u8,
+}
+
+// ============================================================================
+// Metrics
+// ============================================================================
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PodMetrics {
+    pub cpu_usage_percent: Option<f64>,
+    pub memory_usage_bytes: Option<u64>,
+    pub disk_read_bytes: Option<f64>,
+    pub disk_read_iops: Option<f64>,
+    pub disk_write_bytes: Option<f64>,
+    pub disk_write_iops: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IngestionMetrics {
+    pub rows_ingested: Option<u64>,
+    pub bytes_ingested: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricsResponse {
+    pub metrics: BTreeMap<String, PodMetrics>,
+    #[serde(default)]
+    pub ingestion: Option<IngestionMetrics>,
 }
 
 // ============================================================================
