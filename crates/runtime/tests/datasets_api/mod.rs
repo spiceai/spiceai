@@ -24,7 +24,9 @@ use std::{
 
 use rand::Rng;
 use runtime::{Runtime, auth::EndpointAuth, config::Config, status::ComponentStatus};
+use runtime_api_types::v1::ComponentError;
 use serde::Deserialize;
+use serde_json::Value;
 use spicepod::component::dataset::Dataset;
 
 use crate::{
@@ -48,6 +50,8 @@ struct DatasetResponse {
     replication_enabled: bool,
     acceleration_enabled: bool,
     status: Option<String>,
+    error: Option<ComponentError>,
+    error_message: Option<String>,
 }
 
 /// Tests that the `/v1/datasets?status=true` endpoint returns the correct status
@@ -110,13 +114,16 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             let status = rt.status();
             let dataset_statuses = status.get_dataset_statuses();
             let dataset_ref = datafusion::sql::TableReference::bare("test_dataset");
-            let runtime_status = dataset_statuses
-                .get(&dataset_ref)
-                .expect("test_dataset should have a status");
+            let runtime_status = dataset_statuses.get(&dataset_ref).expect("test_dataset should have a status");
             assert_eq!(
                 *runtime_status,
                 ComponentStatus::Ready,
                 "Dataset should be Ready in RuntimeStatus"
+            );
+
+            status.update_dataset(
+                &dataset_ref,
+                ComponentStatus::error_with_message("UnableToConnectInvalidUsernameOrPassword"),
             );
 
             // Call the /v1/datasets?status=true API
@@ -143,8 +150,22 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             // Verify the status from the API matches RuntimeStatus
             assert_eq!(
                 test_dataset.status,
-                Some("Ready".to_string()),
-                "API status should match RuntimeStatus (Ready)"
+                Some("Error".to_string()),
+                "API status should match RuntimeStatus (Error)"
+            );
+            assert_eq!(
+                test_dataset.error,
+                Some(ComponentError {
+                    category: runtime_api_types::v1::ComponentErrorCategory::Dataset,
+                    error_type: runtime_api_types::v1::ComponentErrorType::Auth,
+                    code: "dataset.auth".to_string(),
+                }),
+                "API error should provide an error type/code when status=true"
+            );
+            assert_eq!(
+                test_dataset.error_message,
+                Some("UnableToConnectInvalidUsernameOrPassword".to_string()),
+                "API error_message should be included when status=true and status is Error"
             );
 
             // Additional checks
@@ -219,7 +240,27 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
 
             assert!(response.status().is_success());
 
-            let datasets: Vec<DatasetResponse> = response.json().await?;
+            let datasets_json: Vec<Value> = response.json().await?;
+
+            let test_dataset_json = datasets_json
+                .iter()
+                .find(|d| d.get("name").and_then(Value::as_str) == Some("test_dataset_no_status"))
+                .expect("test_dataset_no_status should be in the response");
+
+            assert!(
+                test_dataset_json.get("status").is_none(),
+                "status should be omitted when status=true is not provided"
+            );
+            assert!(
+                test_dataset_json.get("error").is_none(),
+                "error should be omitted when status=true is not provided"
+            );
+            assert!(
+                test_dataset_json.get("error_message").is_none(),
+                "error_message should be omitted when status=true is not provided"
+            );
+
+            let datasets: Vec<DatasetResponse> = serde_json::from_value(Value::Array(datasets_json))?;
 
             let test_dataset = datasets
                 .iter()
@@ -230,6 +271,14 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
             assert_eq!(
                 test_dataset.status, None,
                 "Status should be None when status param is not provided"
+            );
+            assert_eq!(
+                test_dataset.error, None,
+                "Error should be None when status param is not provided"
+            );
+            assert_eq!(
+                test_dataset.error_message, None,
+                "Error message should be None when status param is not provided"
             );
 
             rt.shutdown().await;

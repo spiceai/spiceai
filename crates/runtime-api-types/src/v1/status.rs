@@ -19,6 +19,166 @@ limitations under the License.
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentErrorCategory {
+    /// Error originating from a dataset component.
+    Dataset,
+    /// Error originating from a model component.
+    Model,
+    /// Error originating from a worker component.
+    Worker,
+    /// Error originating from runtime infrastructure.
+    Runtime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentErrorType {
+    /// Authentication or credential errors (invalid API key, username/password, token).
+    Auth,
+    /// Connectivity or transport errors (DNS/TLS/socket/network/connect failures).
+    Connection,
+    /// Timeout and deadline errors.
+    Timeout,
+    /// Invalid input or request validation errors.
+    Validation,
+    /// Missing resource errors.
+    NotFound,
+    /// Permission/authorization errors.
+    Permission,
+    /// Upstream rate limiting errors.
+    RateLimit,
+    /// Internal system errors.
+    Internal,
+    /// Unclassified error type.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ComponentError {
+    /// High-level component category where the error originated.
+    pub category: ComponentErrorCategory,
+    /// Canonical error type intended for programmatic handling.
+    #[serde(rename = "type")]
+    pub error_type: ComponentErrorType,
+    /// Stable machine-readable code (`{category}.{type}`), e.g. `dataset.auth`.
+    pub code: String,
+}
+
+impl ComponentError {
+    #[must_use]
+    pub fn from_status_message(category: ComponentErrorCategory, message: Option<&str>) -> Self {
+        let error_type = ComponentErrorType::from_message(message);
+        let code = format!("{}.{}", category.code_prefix(), error_type.code_suffix());
+
+        Self {
+            category,
+            error_type,
+            code,
+        }
+    }
+}
+
+impl ComponentErrorCategory {
+    fn code_prefix(&self) -> &'static str {
+        match self {
+            ComponentErrorCategory::Dataset => "dataset",
+            ComponentErrorCategory::Model => "model",
+            ComponentErrorCategory::Worker => "worker",
+            ComponentErrorCategory::Runtime => "runtime",
+        }
+    }
+}
+
+impl ComponentErrorType {
+    fn from_message(message: Option<&str>) -> Self {
+        let Some(message) = message else {
+            return ComponentErrorType::Unknown;
+        };
+
+        let message = message.to_lowercase();
+
+        if message.contains("rate limit") || message.contains("too many requests") {
+            return ComponentErrorType::RateLimit;
+        }
+
+        if message.contains("timeout") || message.contains("timed out") {
+            return ComponentErrorType::Timeout;
+        }
+
+        if message.contains("not found") || message.contains("does not exist") {
+            return ComponentErrorType::NotFound;
+        }
+
+        if message.contains("forbidden")
+            || message.contains("permission")
+            || message.contains("access denied")
+        {
+            return ComponentErrorType::Permission;
+        }
+
+        if message.contains("auth")
+            || message.contains("unauthorized")
+            || message.contains("invalid api key")
+            || message.contains("invalid_api_key")
+            || message.contains("credential")
+            || message.contains("username")
+            || message.contains("password")
+            || message.contains("token")
+        {
+            return ComponentErrorType::Auth;
+        }
+
+        if message.contains("connect")
+            || message.contains("connection")
+            || message.contains("network")
+            || message.contains("dns")
+            || message.contains("socket")
+            || message.contains("tls")
+            || message.contains("handshake")
+        {
+            return ComponentErrorType::Connection;
+        }
+
+        if message.contains("invalid")
+            || message.contains("malformed")
+            || message.contains("parse")
+            || message.contains("unsupported")
+            || message.contains("missing")
+            || message.contains("bad request")
+        {
+            return ComponentErrorType::Validation;
+        }
+
+        if message.contains("internal")
+            || message.contains("unexpected")
+            || message.contains("panic")
+        {
+            return ComponentErrorType::Internal;
+        }
+
+        ComponentErrorType::Unknown
+    }
+
+    fn code_suffix(&self) -> &'static str {
+        match self {
+            ComponentErrorType::Auth => "auth",
+            ComponentErrorType::Connection => "connection",
+            ComponentErrorType::Timeout => "timeout",
+            ComponentErrorType::Validation => "validation",
+            ComponentErrorType::NotFound => "not_found",
+            ComponentErrorType::Permission => "permission",
+            ComponentErrorType::RateLimit => "rate_limit",
+            ComponentErrorType::Internal => "internal",
+            ComponentErrorType::Unknown => "unknown",
+        }
+    }
+}
+
 /// Represents the status of a component (e.g. dataset, model, etc).
 ///
 /// The `Error` variant optionally carries a human-readable error message describing
