@@ -2533,7 +2533,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -5232,6 +5232,7 @@ dependencies = [
  "object_store",
  "opendal",
  "oracle",
+ "parquet",
  "rand 0.9.2",
  "rdkafka",
  "regex",
@@ -9330,7 +9331,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -9345,7 +9346,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=78c9b2cda9302c5b5afa9ac426491e0bd4dccee7#78c9b2cda9302c5b5afa9ac426491e0bd4dccee7"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6dc788084d94bcd90e61d26c496fb7056ae7a9c4#6dc788084d94bcd90e61d26c496fb7056ae7a9c4"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -9401,7 +9402,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=78c9b2cda9302c5b5afa9ac426491e0bd4dccee7#78c9b2cda9302c5b5afa9ac426491e0bd4dccee7"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6dc788084d94bcd90e61d26c496fb7056ae7a9c4#6dc788084d94bcd90e61d26c496fb7056ae7a9c4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9416,7 +9417,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=78c9b2cda9302c5b5afa9ac426491e0bd4dccee7#78c9b2cda9302c5b5afa9ac426491e0bd4dccee7"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6dc788084d94bcd90e61d26c496fb7056ae7a9c4#6dc788084d94bcd90e61d26c496fb7056ae7a9c4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9442,7 +9443,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=78c9b2cda9302c5b5afa9ac426491e0bd4dccee7#78c9b2cda9302c5b5afa9ac426491e0bd4dccee7"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6dc788084d94bcd90e61d26c496fb7056ae7a9c4#6dc788084d94bcd90e61d26c496fb7056ae7a9c4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9457,7 +9458,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=78c9b2cda9302c5b5afa9ac426491e0bd4dccee7#78c9b2cda9302c5b5afa9ac426491e0bd4dccee7"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=6dc788084d94bcd90e61d26c496fb7056ae7a9c4#6dc788084d94bcd90e61d26c496fb7056ae7a9c4"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -17997,6 +17998,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "flate2",
+ "fundu",
  "futures",
  "humantime",
  "nix 0.29.0",
@@ -18015,6 +18017,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-cloud-client",
  "spiceai",
  "spicepod",
  "tar",
@@ -18042,6 +18045,16 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "spice-cloud-client"
+version = "2.0.0-unstable"
+dependencies = [
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "snafu",
 ]
 
 [[package]]
@@ -18210,29 +18223,18 @@ dependencies = [
 name = "spidapter"
 version = "2.0.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow",
- "arrow-json",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
- "bollard",
  "clap",
- "duckdb",
- "futures",
- "hf-hub",
- "itertools 0.14.0",
- "rand 0.9.2",
  "reqwest 0.12.24",
  "runtime-secrets",
- "serde",
+ "rustls 0.23.36",
  "serde_json",
- "spiceai",
+ "spice-cloud-client",
  "spicepod",
  "system-adapter-protocol",
- "test-framework",
  "tokio",
- "tokio-util",
  "uuid 1.21.0",
  "yaml",
 ]
@@ -18888,7 +18890,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=5cbdb2a84ba47de959a395777e721b4a2d3a172c#5cbdb2a84ba47de959a395777e721b4a2d3a172c"
+source = "git+https://github.com/spiceai/spicebench.git?rev=523a2fdcbee64982e14db992c8811207d370d05c#523a2fdcbee64982e14db992c8811207d370d05c"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -22428,7 +22430,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

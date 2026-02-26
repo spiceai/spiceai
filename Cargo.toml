@@ -400,11 +400,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "78c9b2cda9302c5b5afa9ac426491e0bd4dccee7" }              # spiceai-52
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "78c9b2cda9302c5b5afa9ac426491e0bd4dccee7" } # spiceai-52
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "78c9b2cda9302c5b5afa9ac426491e0bd4dccee7" } # spiceai-52
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "78c9b2cda9302c5b5afa9ac426491e0bd4dccee7" }   # spiceai-52
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "78c9b2cda9302c5b5afa9ac426491e0bd4dccee7" }   # spiceai-52
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" }              # spiceai-52
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" } # spiceai-52
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" } # spiceai-52
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" }   # spiceai-52
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" }   # spiceai-52
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
