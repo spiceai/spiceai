@@ -302,8 +302,6 @@ async fn post_setup_sink_action(
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
             loop {
-                attempts += 1;
-
                 let response = sql_client
                     .post(&sql_url)
                     .header("X-API-Key", api_key)
@@ -314,6 +312,8 @@ async fn post_setup_sink_action(
                 if response.status().is_success() {
                     break;
                 }
+
+                attempts += 1;
 
                 if attempts >= 3 {
                     let status = response.status();
@@ -382,7 +382,7 @@ fn generate_adbc_create_table_statement(
     }
 
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
         column_definitions.join(", ")
     ))
 }
