@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "aca49d35e9f1",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-26/build_and_release",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/pr-builds/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ac/a49d35e9f1/0/metadata.json",
+      "transcript": "/ac/a49d35e9f1/0/full.jsonl",
+      "context": "/ac/a49d35e9f1/0/context.md",
+      "content_hash": "/ac/a49d35e9f1/0/content_hash.txt",
+      "prompt": "/ac/a49d35e9f1/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 234,
+    "cache_creation_tokens": 41522,
+    "cache_read_tokens": 1196960,
+    "output_tokens": 2668,
+    "api_call_count": 28
+  }
+}

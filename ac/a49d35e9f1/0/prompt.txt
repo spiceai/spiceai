@@ -1,0 +1,21 @@
+in `.github/workflows/build_and_release.yml` we build certain spiced tags per matrix type. on manual dispatch, add the option to only run one of the allowed tags so that we don't build binaries when we don't need to
+
+---
+
+make a commit comand for me
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Instead, look at `tools/pr-builds`. Can we use this here, maybe as a flag?
+
+---
+
+what is default when no `--tag`? Just all available?
+
+---
+
+` tag: Option<String>,` is a bit messy. can we use a string enum?
