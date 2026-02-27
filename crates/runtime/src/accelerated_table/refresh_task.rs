@@ -1726,7 +1726,7 @@ fn schema_evolution_mismatch_refresh_message(
     }
 
     Some(format!(
-        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema. Acceleration doesn't apply this schema evolution automatically. Delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; fully featured schema evolution is on the roadmap, and acceleration does not apply this schema evolution automatically today; delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
     ))
 }
 
@@ -1806,7 +1806,8 @@ mod tests {
         let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
             .expect("should detect schema mismatch");
         assert!(message.contains("schema mismatch"));
-        assert!(message.contains("Delete the existing acceleration data"));
+        assert!(message.contains("on the roadmap"));
+        assert!(message.contains("delete the existing acceleration data"));
     }
 
     #[test]
