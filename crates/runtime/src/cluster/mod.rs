@@ -848,6 +848,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 rt.datafusion(),
                 Arc::clone(&partition_manager),
                 Arc::clone(&scheduler_executor_registry),
+                Arc::clone(&rt.status),
                 pm_config,
                 pm_shutdown.clone(),
             );

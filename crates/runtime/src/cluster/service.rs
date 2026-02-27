@@ -75,7 +75,6 @@ use tonic::{
 
 use crate::cluster::{
     executor_registry::{ExecutorRegistry, TablePartitions},
-    partition::PartitionManager,
     {SchedulerPeers, partition::partition_value_to_bytes},
 };
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};

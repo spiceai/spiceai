@@ -35,7 +35,10 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::{
+    accelerated_table::AcceleratedTable,
+    cluster::{PartitionManager, partition::executor_selection},
+};
 #[cfg(not(windows))]
 use cayenne::CayenneTableProvider;
 
@@ -374,10 +377,10 @@ impl TablePartitionProvider for ExecutorRegistry {
                 "No partition assignments found for accelerated table {table:?}; routing query to executor '{executor_id}'"
             );
 
-            vec![(
-                flight_sql_table_provider(executor_id, client.clone(), table, schema),
+            return vec![(
+                flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
                 Vec::new(),
-            )]
+            )];
         };
 
         // Build set of all required partitions (for now, all partitions in table)
