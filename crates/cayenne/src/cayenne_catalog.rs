@@ -246,16 +246,16 @@ impl MetadataCatalog for CayenneCatalog {
                         return Ok(table_id);
                     }
 
-                    // Configuration changed - drop table metadata so it can be recreated with new config
-                    self.drop_table(&table_name).await?;
+                    // Configuration changed - return error to prevent accidental reuse of existing table with incompatible schema or settings
+                    return Err(CatalogError::ChangedConfiguration {
+                        table_name: table_name.clone(),
+                    });
                 }
                 Err(e) => {
-                    // Cannot load stored metadata (possibly corrupted or schema mismatch).
-                    // Drop and recreate to ensure consistency.
-                    tracing::warn!(
-                        "Failed to load existing Cayenne table '{table_name}' metadata: {e}. Dropping and recreating."
-                    );
-                    self.drop_table(&table_name).await?;
+                    return Err(CatalogError::InvalidMetadata {
+                        table_name: table_name.clone(),
+                        source: Box::new(e),
+                    });
                 }
             }
         }
