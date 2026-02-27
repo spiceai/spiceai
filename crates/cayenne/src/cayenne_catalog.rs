@@ -246,25 +246,7 @@ impl MetadataCatalog for CayenneCatalog {
                         return Ok(table_id);
                     }
 
-                    // Configuration changed - drop old table and data, then recreate
-                    tracing::warn!(
-                        "Cayenne table '{table_name}' configuration has changed. Dropping existing acceleration and recreating. Data will be re-synced from the source."
-                    );
-                    log_configuration_differences(&table_name, &stored_metadata, &options);
-
-                    // Clean up old data directory (local paths only)
-                    let old_data_dir = std::path::PathBuf::from(&stored_metadata.path)
-                        .join(stored_metadata.table_id.to_string());
-                    if !stored_metadata.path.starts_with("s3://") && old_data_dir.exists() {
-                        if let Err(e) = tokio::fs::remove_dir_all(&old_data_dir).await {
-                            tracing::warn!(
-                                "Failed to clean up old Cayenne data directory '{}': {e}. Orphaned data may remain.",
-                                old_data_dir.display()
-                            );
-                        }
-                    }
-
-                    // Drop the table metadata so it can be recreated with new config
+                    // Configuration changed - drop table metadata so it can be recreated with new config
                     self.drop_table(&table_name).await?;
                 }
                 Err(e) => {
@@ -1208,66 +1190,6 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
 }
 
 /// Logs the specific configuration differences between stored and new options at debug level.
-fn log_configuration_differences(
-    table_name: &str,
-    stored: &TableMetadata,
-    options: &CreateTableOptions,
-) {
-    if stored.primary_key != options.primary_key {
-        tracing::debug!(
-            "Cayenne table '{table_name}' primary_key changed: {:?} -> {:?}",
-            stored.primary_key,
-            options.primary_key
-        );
-    }
-
-    let stored_oc = stored.on_conflict.as_ref().map(ToString::to_string);
-    let new_oc = options.on_conflict.as_ref().map(ToString::to_string);
-    if stored_oc != new_oc {
-        tracing::debug!(
-            "Cayenne table '{table_name}' on_conflict changed: {:?} -> {:?}",
-            stored_oc,
-            new_oc
-        );
-    }
-
-    if stored.partition_column != options.partition_column {
-        tracing::debug!(
-            "Cayenne table '{table_name}' partition_column changed: {:?} -> {:?}",
-            stored.partition_column,
-            options.partition_column
-        );
-    }
-
-    if stored.schema.as_ref() != options.schema.as_ref() {
-        tracing::debug!("Cayenne table '{table_name}' schema has changed");
-    }
-
-    if stored.vortex_config.sort_columns != options.vortex_config.sort_columns {
-        tracing::debug!(
-            "Cayenne table '{table_name}' sort_columns changed: {:?} -> {:?}",
-            stored.vortex_config.sort_columns,
-            options.vortex_config.sort_columns
-        );
-    }
-
-    if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
-        tracing::debug!(
-            "Cayenne table '{table_name}' compression_strategy changed: {:?} -> {:?}",
-            stored.vortex_config.compression_strategy,
-            options.vortex_config.compression_strategy
-        );
-    }
-
-    if stored.path != options.base_path {
-        tracing::debug!(
-            "Cayenne table '{table_name}' base_path changed: {:?} -> {:?}",
-            stored.path,
-            options.base_path
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
