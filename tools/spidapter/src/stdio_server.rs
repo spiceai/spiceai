@@ -302,7 +302,6 @@ async fn post_setup_sink_action(
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
             loop {
-                attempts += 1;
 
                 let response = sql_client
                     .post(&sql_url)
@@ -314,6 +313,8 @@ async fn post_setup_sink_action(
                 if response.status().is_success() {
                     break;
                 }
+
+                attempts += 1;
 
                 if attempts >= 3 {
                     let status = response.status();
