@@ -224,10 +224,18 @@ impl Handler for SpidapterHandler {
             ResourceMetrics {
                 cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
-                disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
-                disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
-                disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
-                disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
+                disk_read_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes).unwrap_or_default(),
+                ),
+                disk_write_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes).unwrap_or_default(),
+                ),
+                disk_read_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops).unwrap_or_default(),
+                ),
+                disk_write_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops).unwrap_or_default(),
+                ),
             }
         };
 
