@@ -37,7 +37,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use datafusion_datasource::metadata::MetadataColumn;
+use datafusion::datasource::metadata::MetadataColumn;
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
