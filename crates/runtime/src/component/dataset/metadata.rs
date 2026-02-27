@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
-use datafusion::datasource::metadata::MetadataColumn;
+use data_components::object::metadata_column::MetadataColumn;
 
 use super::Dataset;
 

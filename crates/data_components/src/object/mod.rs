@@ -18,6 +18,7 @@ use std::{path::PathBuf, sync::Arc};
 
 pub mod filter;
 pub mod metadata;
+pub mod metadata_column;
 pub mod text;
 
 use object_store::{ObjectMeta, ObjectStore};
