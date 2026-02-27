@@ -27,11 +27,10 @@ use test_framework::{
 ///
 /// For example, `federated/postgres[catalog].yaml` becomes `postgres[catalog]`.
 fn snapshot_name_from_spicepod(spicepod_path: &std::path::Path) -> String {
-    spicepod_path
-        .file_stem().map_or_else(
-            || "unknown".to_string(),
-            |s| s.to_string_lossy().to_string(),
-        )
+    spicepod_path.file_stem().map_or_else(
+        || "unknown".to_string(),
+        |s| s.to_string_lossy().to_string(),
+    )
 }
 
 /// Run a schema test that queries the `information_schema` for all tables and their columns
