@@ -47,7 +47,7 @@ limitations under the License.
 
 use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
 use super::super::deletion_strategy::PkDeletionStrategyWithCache;
-use super::super::utils::{convert_to_i64_box, convert_to_u64_box};
+use super::super::utils::convert_to_u64_box;
 use super::super::Error;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
@@ -257,14 +257,6 @@ impl CayenneDeletionSink {
         const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 
         let table_name = &self.table_metadata.table_name;
-
-        let _flush_batch_size_i64 =
-            convert_to_i64_box(PK_DELETE_FLUSH_BATCH_SIZE, "pk delete flush batch size").map_err(
-                |e| Error::Internal {
-                    table: table_name.clone(),
-                    message: e.to_string(),
-                },
-            )?;
 
         // For position-based deletion, use the streaming per-file approach directly.
         // This avoids loading all data into memory and provides correct file-local row IDs.
