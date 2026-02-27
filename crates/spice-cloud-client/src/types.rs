@@ -243,9 +243,9 @@ pub struct PodMetrics {
     pub cpu_usage_percent: Option<f64>,
     pub memory_usage_bytes: Option<u64>,
     pub disk_read_bytes: Option<f64>,
-    pub disk_read_iops: Option<f64>,
+    pub disk_read_operations: Option<f64>,
     pub disk_write_bytes: Option<f64>,
-    pub disk_write_iops: Option<f64>,
+    pub disk_write_operations: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

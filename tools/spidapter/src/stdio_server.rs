@@ -231,10 +231,10 @@ impl Handler for SpidapterHandler {
                     sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes).unwrap_or_default(),
                 ),
                 disk_read_iops: Some(
-                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops).unwrap_or_default(),
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations).unwrap_or_default(),
                 ),
                 disk_write_iops: Some(
-                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops).unwrap_or_default(),
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations).unwrap_or_default(),
                 ),
             }
         };
