@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "b1ed0ae2ce9a",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-26/clippy",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "Makefile"
+  ],
+  "sessions": [
+    {
+      "metadata": "/b1/ed0ae2ce9a/0/metadata.json",
+      "transcript": "/b1/ed0ae2ce9a/0/full.jsonl",
+      "context": "/b1/ed0ae2ce9a/0/context.md",
+      "content_hash": "/b1/ed0ae2ce9a/0/content_hash.txt",
+      "prompt": "/b1/ed0ae2ce9a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 170,
+    "cache_creation_tokens": 32306,
+    "cache_read_tokens": 726057,
+    "output_tokens": 15262,
+    "api_call_count": 20
+  }
+}

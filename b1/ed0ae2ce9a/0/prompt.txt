@@ -1,0 +1,85 @@
+This PR isn't working.
+
+make lint-rust-fix FEATURES="duckdb"
+cargo fmt --all
+## All except metal, cuda, nfs (nfs requires system libnfs library)
+CLIPPY_CONF_DIR=".ci" cargo clippy  --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+                -Dwarnings \
+                -Dclippy::pedantic \
+                -Dclippy::unwrap_used \
+                -Dclippy::expect_used \
+                -Dclippy::clone_on_ref_ptr \
+                -Aclippy::module_name_repetitions \
+                -Aclippy::large_futures \
+                -Aclippy::too_many_lines \
+                -Dclippy::equatable_if_let \
+                -Dclippy::needless_collect \
+                -Dclippy::redundant_clone \
+                -Dclippy::todo \
+                -Dclippy::assertions_on_result_states \
+                -Dclippy::allow_attributes
+
+
+PR: https://github.com/spiceai/spiceai/pull/9511
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+no the issue is that the new FEATURES override is only applied in the PACKAGES branch; if someone runs make lint-rust-fix FEATURES=... without PACKAGES, the override is ignored and the hard-coded feature list is still used. Also, the comment says it “defaults to all workspace features when unset”, but the PACKAGES branch currently passes no feature flags at all when FEATURES is empty (which is not “all workspace features” and not the existing default feature set). Consider applying the FEATURES override in both branches, and when FEATURES is empty, default to the same feature set as before (or explicitly use --all-features if that’s the intended behavior) and update the comment accordingly.
+
+---
+
+`
+
+---
+
+[Request interrupted by user]
+
+---
+
+```
+make lint-rust-fix PACKAGES="pr-builds"
+cargo fmt -p pr-builds
+## All except metal, cuda, nfs (nfs requires system libnfs library)
+CLIPPY_CONF_DIR=".ci" cargo clippy  --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp -p pr-builds -- \
+                -Dwarnings \
+                -Dclippy::pedantic \
+                -Dclippy::unwrap_used \
+                -Dclippy::expect_used \
+                -Dclippy::clone_on_ref_ptr \
+                -Aclippy::module_name_repetitions \
+                -Aclippy::large_futures \
+                -Aclippy::too_many_lines \
+                -Dclippy::equatable_if_let \
+                -Dclippy::needless_collect \
+                -Dclippy::redundant_clone \
+                -Dclippy::todo \
+                -Dclippy::assertions_on_result_states \
+                -Dclippy::allow_attributes
+error: the package 'pr-builds' does not contain these features: aws-secrets-manager, keyring-secret-store, mcp, models, odbc, release
+help: packages with the missing features: spice, test-framework, spiced, data_components, db_connection_pool, runtime, runtime-secrets, runtime-datafusion-udfs, tools, testoperator
+make: *** [lint-rust-fix] Error 101
+```
+
+---
+
+to check your work. run each one of these for a few seconds, cancle them and check what commands get called in their stdout
+
+  make lint-rust-fix FEATURES="duckdb" 
+  make lint-rust-fix PACKAGES="runtime" FEATURES="postgres"
+  make lint-rust-fix
+  make lint-rust-fix PACKAGES="testoperator" 
+  make lint-rust-fix PACKAGES="runtime" FEATURES="anonymous_telemetry"
+
+---
+
+Sorry one more test case that doesn't work
+
+  make lint-rust-fix FEATURES="duckdb" 
+  make lint-rust-fix PACKAGES="runtime" FEATURES="postgres"
+  make lint-rust-fix
+  make lint-rust-fix PACKAGES="testoperator" 
+  make lint-rust-fix PACKAGES="testoperator" FEATURES="anonymous_telemetry"
