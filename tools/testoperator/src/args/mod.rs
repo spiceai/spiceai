@@ -29,9 +29,6 @@ pub use append::AppendTestArgs;
 pub mod dispatch;
 use dispatch::DispatchArgs;
 
-mod evals;
-pub use evals::EvalsTestArgs;
-
 mod search;
 pub use search::SearchTestArgs;
 
@@ -63,8 +60,6 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    /// Run a models evaluations test
-    Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(AppendTestArgs),
     Search(SearchTestArgs),
