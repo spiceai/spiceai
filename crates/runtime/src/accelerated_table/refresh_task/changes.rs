@@ -127,7 +127,7 @@ impl RefreshTask {
                         Err(e) => {
                             self.set_refresh_status(
                                 refresh.read().await.sql.clone().as_deref(),
-                                status::ComponentStatus::Error,
+                                status::ComponentStatus::error_with_message(e.to_string()),
                             )
                             .await;
                             if !self.runtime_status.is_shutdown() {
@@ -144,7 +144,7 @@ impl RefreshTask {
 
                     self.set_refresh_status(
                         refresh.read().await.sql.clone().as_deref(),
-                        status::ComponentStatus::Error,
+                        status::ComponentStatus::error_with_message(e.to_string()),
                     )
                     .await;
                 }

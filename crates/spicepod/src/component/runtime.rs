@@ -72,6 +72,10 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
 
+    /// Controls when the runtime is considered ready for the `/v1/ready` endpoint.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ready_state: RuntimeReadyState,
+
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +106,21 @@ impl Runtime {
             Ok(None)
         }
     }
+}
+
+/// Controls when the runtime readiness probe reports the runtime as ready.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeReadyState {
+    /// Runtime becomes ready after all registered components have reached `Ready` at least once.
+    #[default]
+    OnLoad,
+    /// Runtime becomes ready once all components have been registered/initialized at least once,
+    /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
+    /// as long as none is `ShuttingDown`.
+    OnRegistration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -280,10 +299,24 @@ impl Default for TelemetryConfig {
     }
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Flight {
     pub max_message_size: Option<String>,
+
+    /// Whether to enable rate limiting on Flight `DoPut` (write) requests.
+    /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
+    #[serde(default = "default_true")]
+    pub do_put_rate_limit_enabled: bool,
+}
+
+impl Default for Flight {
+    fn default() -> Self {
+        Self {
+            max_message_size: None,
+            do_put_rate_limit_enabled: true,
+        }
+    }
 }
 
 impl Flight {
@@ -756,6 +789,9 @@ pub struct RuntimeDeserializer {
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
+    /// Controls when the runtime is considered ready for the `/v1/ready` endpoint.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ready_state: RuntimeReadyState,
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -834,6 +870,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             cors: deserializer.cors,
             flight: deserializer.flight,
             shutdown_timeout: deserializer.shutdown_timeout,
+            ready_state: deserializer.ready_state,
             output_level: deserializer.output_level,
             query: if query == Query::default() {
                 None
@@ -1719,5 +1756,25 @@ mod tests {
             "caching.sql_results should take priority"
         );
         assert_eq!(sql_results.item_ttl, Some("30s".to_string()));
+    }
+
+    #[test]
+    fn test_runtime_ready_state_default() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.ready_state, RuntimeReadyState::OnLoad);
+    }
+
+    #[test]
+    fn test_runtime_ready_state_on_registration() {
+        let yaml = r"
+            ready_state: on_registration
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.ready_state, RuntimeReadyState::OnRegistration);
     }
 }

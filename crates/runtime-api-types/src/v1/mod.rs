@@ -28,5 +28,5 @@ pub mod workers;
 pub use catalogs::CatalogInfo;
 pub use datasets::DatasetInfo;
 pub use models::{ModelInfo, ModelListResponse, ModelMetadata};
-pub use status::ComponentStatus;
+pub use status::{ComponentError, ComponentErrorCategory, ComponentErrorType, ComponentStatus};
 pub use workers::{WorkerInfo, WorkerListResponse};
