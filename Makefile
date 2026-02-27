@@ -127,7 +127,8 @@ lint-rust:
 		-Aunfulfilled_lint_expectations
 
 ## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
-## Optional: FEATURES="feat1,feat2" to override features (defaults to all workspace features when unset)
+## Optional: FEATURES="feat1,feat2" to override features
+## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp for workspace (unless PACKAGES is set, then uses package defaults)
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
@@ -135,17 +136,23 @@ ifdef PACKAGES
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
-_FEATURES_FLAGS := $(if $(FEATURES),--features $(FEATURES),)
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs
 _FMT_FLAGS := --all
+endif
+# Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
+ifdef FEATURES
+_FEATURES_FLAGS := --features $(FEATURES)
+else ifdef PACKAGES
+_FEATURES_FLAGS :=
+else
 _FEATURES_FLAGS := --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp
 endif
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --all-targets --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
