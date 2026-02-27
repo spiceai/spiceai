@@ -558,6 +558,16 @@ impl std::fmt::Display for AccelerationEngine {
     }
 }
 
+/// Result of checking a snapshot file in the object store.
+enum SnapshotFileStatus {
+    /// File exists and size matches metadata.
+    Verified,
+    /// File exists but size does not match metadata.
+    Unverified,
+    /// File not found in the object store.
+    NotFound,
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -2161,25 +2171,28 @@ impl SnapshotManager {
             .map(|entry| {
                 let snapshot_uri = entry.snapshot.clone();
                 let snapshot_id = entry.snapshot_id;
+                let snapshot_size = entry.snapshot_size;
                 async move {
-                    let exists = self.snapshot_exists(&snapshot_uri).await;
+                    let exists = self.snapshot_exists(&snapshot_uri, snapshot_size).await;
                     (snapshot_id, exists)
                 }
             })
             .collect();
 
-        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
-            .buffer_unordered(10)
-            .collect()
-            .await;
+        let existence_results: HashMap<u64, SnapshotFileStatus> =
+            futures::stream::iter(existence_futures)
+                .buffer_unordered(10)
+                .collect()
+                .await;
 
         let snapshots: Vec<api::SnapshotInfo> = windowed_entries
             .iter()
             .map(|entry| {
-                let exists = existence_results
-                    .get(&entry.snapshot_id)
-                    .copied()
-                    .unwrap_or(false);
+                let status = match existence_results.get(&entry.snapshot_id) {
+                    Some(SnapshotFileStatus::Verified) => "verified".to_string(),
+                    Some(SnapshotFileStatus::Unverified) => "unverified".to_string(),
+                    _ => String::new(),
+                };
                 api::SnapshotInfo {
                     snapshot_id: entry.snapshot_id,
                     timestamp_ms: entry.timestamp_ms,
@@ -2190,11 +2203,7 @@ impl SnapshotManager {
                     engine: entry.snapshot_engine.clone(),
                     row_count: entry.snapshot_row_count,
                     is_current: Some(entry.snapshot_id) == current_snapshot_id,
-                    status: if exists {
-                        "verified".to_string()
-                    } else {
-                        String::new()
-                    },
+                    status,
                 }
             })
             .collect();
@@ -2238,16 +2247,23 @@ impl SnapshotManager {
         .await
     }
 
-    /// Checks if a snapshot exists in the object store, with retry for transient errors.
-    async fn snapshot_exists(&self, snapshot_uri: &str) -> bool {
+    /// Checks if a snapshot exists in the object store and whether its size matches,
+    /// with retry for transient errors.
+    async fn snapshot_exists(&self, snapshot_uri: &str, expected_size: u64) -> SnapshotFileStatus {
         let Ok(object_path) = self.snapshot_uri_to_object_path(snapshot_uri) else {
-            return false;
+            return SnapshotFileStatus::NotFound;
         };
 
         retry(self.network_retry_strategy.clone(), || async {
             match self.object_store.head(&object_path).await {
-                Ok(_) => Ok(true),
-                Err(object_store::Error::NotFound { .. }) => Ok(false),
+                Ok(res) => {
+                    if res.size == expected_size {
+                        Ok(SnapshotFileStatus::Verified)
+                    } else {
+                        Ok(SnapshotFileStatus::Unverified)
+                    }
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(SnapshotFileStatus::NotFound),
                 Err(err) => {
                     tracing::warn!(
                         "Transient error checking snapshot existence, retrying. dataset={} path={object_path} error={err}",
@@ -2263,7 +2279,7 @@ impl SnapshotManager {
                 "Failed to check snapshot existence after retries. dataset={} path={object_path} error={err}",
                 self.dataset_name,
             );
-            false
+            SnapshotFileStatus::NotFound
         })
     }
 
@@ -2315,7 +2331,14 @@ impl SnapshotManager {
             });
         };
 
-        let exists = self.snapshot_exists(&entry.snapshot).await;
+        let status = match self
+            .snapshot_exists(&entry.snapshot, entry.snapshot_size)
+            .await
+        {
+            SnapshotFileStatus::Verified => "verified".to_string(),
+            SnapshotFileStatus::Unverified => "unverified".to_string(),
+            SnapshotFileStatus::NotFound => String::new(),
+        };
 
         Ok(api::SnapshotInfo {
             snapshot_id: entry.snapshot_id,
@@ -2327,11 +2350,7 @@ impl SnapshotManager {
             engine: entry.snapshot_engine.clone(),
             row_count: entry.snapshot_row_count,
             is_current: Some(entry.snapshot_id) == dataset_metadata.current_snapshot_id,
-            status: if exists {
-                "verified".to_string()
-            } else {
-                String::new()
-            },
+            status,
         })
     }
 
@@ -4286,7 +4305,7 @@ mod tests {
             snapshot: "snapshots/test_snapshot.db".to_string(),
             snapshot_checksum: "abc123".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 1024,
+            snapshot_size: 13,
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
@@ -4315,7 +4334,7 @@ mod tests {
 
         write_metadata(&store, &metadata_path, &metadata).await;
 
-        // Create the actual snapshot file so it passes the existence check
+        // Create the actual snapshot file so it passes the existence check (13 bytes)
         let snapshot_path = Path::from("snapshots/test_snapshot.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
@@ -4354,7 +4373,7 @@ mod tests {
             snapshot: "snapshots/existing.db".to_string(),
             snapshot_checksum: "aaa".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 100,
+            snapshot_size: 4,
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
@@ -4429,6 +4448,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_snapshot_summary_returns_unverified_when_size_mismatches() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        let entry = SnapshotEntry {
+            snapshot_id: 1,
+            timestamp_ms: 1_000_000,
+            snapshot: "snapshots/wrong_size.db".to_string(),
+            snapshot_checksum: "aaa".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 100,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+
+        let mut datasets = HashMap::new();
+        datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                engine: None,
+                schemas: vec![],
+                current_schema_id: 0,
+                snapshots: vec![entry],
+                current_snapshot_id: Some(1),
+                properties: HashMap::new(),
+            },
+        );
+
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 1_000_000,
+            datasets,
+        };
+
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        // Write a file with different size than metadata expects (100 vs 4 bytes)
+        store
+            .put(
+                &Path::from("snapshots/wrong_size.db"),
+                Bytes::from_static(b"data").into(),
+            )
+            .await
+            .expect("write snapshot file");
+
+        let manager = build_manager_for_api_tests(Arc::clone(&store));
+        let summary = manager
+            .get_snapshot_summary(100)
+            .await
+            .expect("get_snapshot_summary should succeed");
+
+        assert_eq!(summary.snapshots.len(), 1);
+        assert_eq!(
+            summary.snapshots[0].status, "unverified",
+            "file exists but size doesn't match, should be unverified"
+        );
+    }
+
+    #[tokio::test]
     async fn get_snapshot_summary_respects_limit() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
@@ -4443,7 +4525,7 @@ mod tests {
                 snapshot: filename.clone(),
                 snapshot_checksum: format!("checksum_{i}"),
                 snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-                snapshot_size: 100,
+                snapshot_size: 4,
                 snapshot_engine: None,
                 snapshot_row_count: None,
                 snapshot_last_updated_at_ms: None,

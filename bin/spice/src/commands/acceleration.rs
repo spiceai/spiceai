@@ -101,7 +101,6 @@ pub struct SnapshotInfo {
     pub engine: Option<String>,
     pub row_count: Option<u64>,
     pub is_current: bool,
-    #[serde(default)]
     pub status: String,
 }
 
