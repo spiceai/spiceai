@@ -358,26 +358,30 @@ fn trigger_build(
 
         println!("Requesting platform: {platform_option}");
 
-        let mut cmd_args = vec![
-            "workflow",
-            "run",
-            "build_and_release.yml",
-            "--ref",
-            &branch,
-            "-f",
-            &format!("platform_option={platform_option}"),
+        let mut cmd_args: Vec<String> = vec![
+            "workflow".to_string(),
+            "run".to_string(),
+            "build_and_release.yml".to_string(),
+            "--ref".to_string(),
+            branch.to_string(),
+            "-f".to_string(),
+            format!("platform_option={platform_option}"),
         ];
 
         if let Some(t) = tag {
-            let tag_str = match t {
-                TagOption::All => "all",
-                TagOption::Default => "default",
-                TagOption::Odbc => "odbc",
-                TagOption::Metal => "metal",
-            };
-            println!("Requesting tag: {tag_str}");
-            cmd_args.push("-f");
-            cmd_args.push(&format!("tag_option={tag_str}"));
+            let tag_option = format!(
+                "tag_option={}",
+                match t {
+                    TagOption::All => "all",
+                    TagOption::Default => "default",
+                    TagOption::Odbc => "odbc",
+                    TagOption::Metal => "metal",
+                }
+            );
+            println!("Requesting {tag_option}");
+            cmd_args.push("-f".to_string());
+
+            cmd_args.push(tag_option);
         }
 
         let status = Command::new("gh")
