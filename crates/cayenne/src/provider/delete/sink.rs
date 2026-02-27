@@ -60,11 +60,14 @@ use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::physical_plan::{collect, execute_stream};
 use datafusion_catalog::TableProvider;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::DFSchema;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::Expr;
-use datafusion_physical_plan::collect;
+use datafusion_physical_expr::{create_physical_expr, PhysicalExpr};
+use futures::StreamExt;
 use std::sync::{Arc, RwLock};
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -251,10 +254,17 @@ impl CayenneDeletionSink {
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
     ) -> super::super::Result<u64> {
-        use arrow::array::{Array, Int64Array};
-        use arrow::datatypes::{DataType, Field};
+        const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 
         let table_name = &self.table_metadata.table_name;
+
+        let _flush_batch_size_i64 =
+            convert_to_i64_box(PK_DELETE_FLUSH_BATCH_SIZE, "pk delete flush batch size").map_err(
+                |e| Error::Internal {
+                    table: table_name.clone(),
+                    message: e.to_string(),
+                },
+            )?;
 
         // For position-based deletion, use the streaming per-file approach directly.
         // This avoids loading all data into memory and provides correct file-local row IDs.
@@ -262,151 +272,269 @@ impl CayenneDeletionSink {
             return self.delete_filtered_rows_position_based(ctx, tables).await;
         }
 
-        // PK-based strategies (Int64Pk, RowConverterBased) need to scan all data
-        // to extract primary key values for deletion.
+        let coerced_filters = self.coerce_filters_for_schema()?;
+        let physical_filters = self.build_physical_filters(&coerced_filters)?;
 
-        // Collect batches from all tables
-        let mut all_batches = Vec::new();
-        for table in tables {
-            let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-            let batches = collect(scan_plan, ctx.task_ctx()).await?;
-            all_batches.extend(batches);
-        }
-
-        // If no data, nothing to delete
-        if all_batches.is_empty() {
-            return Ok(0);
-        }
-
-        // Flatten all batches into one for simpler processing
-        let concatenated_batch = arrow::compute::concat_batches(&self.schema, &all_batches)?;
-        let total_rows = concatenated_batch.num_rows();
-
-        // Create a batch with row_id column added (needed for filtering)
-        let total_rows_i64 =
-            convert_to_i64_box(total_rows, "total rows").map_err(|e| Error::Internal {
-                table: table_name.clone(),
-                message: e.to_string(),
-            })?;
-        let row_id_array = Int64Array::from_iter_values(0..total_rows_i64);
-
-        let mut fields = vec![Field::new("__row_id", DataType::Int64, false)];
-        for field in self.schema.fields() {
-            fields.push((**field).clone());
-        }
-        let schema_with_rowid = Arc::new(arrow::datatypes::Schema::new(fields));
-
-        let mut columns_with_rowid = vec![Arc::new(row_id_array) as Arc<dyn Array>];
-        columns_with_rowid.extend_from_slice(concatenated_batch.columns());
-
-        let batch_with_rowid =
-            arrow::array::RecordBatch::try_new(Arc::clone(&schema_with_rowid), columns_with_rowid)?;
-
-        // Create a new session context with the row_id data
-        let ctx_new = SessionContext::new();
-        let mem_table_with_rowid = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema_with_rowid),
-            vec![vec![batch_with_rowid]],
-        )?;
-        ctx_new.register_table("data_with_rowid", Arc::new(mem_table_with_rowid))?;
-
-        // Start with selecting all columns so filters can reference them
-        let mut filtered_df = ctx_new.sql("SELECT * FROM data_with_rowid").await?;
-
-        // Apply all filters with type coercion
-        // The filter expressions may have been parsed with different literal types (e.g., Int64)
-        // than the actual column types in the data (e.g., Int32). We use TypeCoercionRewriter
-        // to insert appropriate CAST operations to make the comparison valid.
-        let df_schema = DFSchema::try_from(schema_with_rowid.as_ref().clone())?;
-        for filter in &self.filters {
-            let mut rewriter = TypeCoercionRewriter::new(&df_schema);
-            let coerced_filter = filter.clone().rewrite(&mut rewriter)?.data;
-            filtered_df = filtered_df.filter(coerced_filter)?;
-        }
-
-        // Collect filtered results (includes __row_id and all original columns)
-        let filtered_batches = filtered_df.collect().await?;
-
-        if filtered_batches.is_empty() {
-            return Ok(0);
-        }
-
-        // Use the appropriate deletion strategy based on table configuration
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                // Int64 PK deletion - extract PK values directly
-                // Note: column indices are offset by 1 because __row_id is at index 0
-                let first_batch = filtered_batches.first().ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message: "Expected at least one batch after filtering (checked above)"
-                        .to_string(),
-                })?;
-                let filtered_concat =
-                    arrow::compute::concat_batches(&first_batch.schema(), &filtered_batches)?;
+                let mut pending_pk_values: Vec<i64> =
+                    Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut delete_sequence: Option<i64> = None;
+                let mut deleted_rows: u64 = 0;
 
-                let pk_column_index =
-                    self.pk_column_indices
-                        .first()
-                        .ok_or_else(|| Error::Internal {
-                            table: table_name.clone(),
-                            message: "Int64 PK strategy requires exactly one PK column index"
-                                .to_string(),
-                        })?;
+                for table in tables {
+                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
-                let pk_column = filtered_concat.column(*pk_column_index + 1); // +1 for __row_id offset
-                let pk_array =
-                    pk_column
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| Error::Internal {
-                            table: table_name.clone(),
-                            message: format!(
-                                "Expected Int64Array for PK column at index {pk_column_index}, got {:?}",
-                                pk_column.data_type()
-                            ),
-                        })?;
+                    while let Some(batch_result) = stream.next().await {
+                        let batch =
+                            self.apply_physical_filters_to_batch(batch_result?, &physical_filters)?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
 
-                let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
-                self.persist_int64_pk_deletions(pk_values).await
+                        pending_pk_values.extend(self.extract_int64_pk_values(&batch)?);
+
+                        if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
+                            let chunk_values = std::mem::take(&mut pending_pk_values);
+                            let chunk_deleted = self
+                                .persist_int64_pk_chunk_with_shared_sequence(
+                                    chunk_values,
+                                    &mut delete_sequence,
+                                )
+                                .await?;
+                            deleted_rows =
+                                deleted_rows.checked_add(chunk_deleted).ok_or_else(|| {
+                                    Error::Internal {
+                                        table: table_name.clone(),
+                                        message: "Deleted row count overflowed u64".to_string(),
+                                    }
+                                })?;
+                        }
+                    }
+                }
+
+                if !pending_pk_values.is_empty() {
+                    let chunk_values = std::mem::take(&mut pending_pk_values);
+                    let chunk_deleted = self
+                        .persist_int64_pk_chunk_with_shared_sequence(
+                            chunk_values,
+                            &mut delete_sequence,
+                        )
+                        .await?;
+                    deleted_rows =
+                        deleted_rows
+                            .checked_add(chunk_deleted)
+                            .ok_or_else(|| Error::Internal {
+                                table: table_name.clone(),
+                                message: "Deleted row count overflowed u64".to_string(),
+                            })?;
+                }
+
+                Ok(deleted_rows)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                // RowConverter-based deletion for composite/non-integer PKs
-                if let Some(ref row_converter) = self.pk_row_converter {
-                    let filtered_concat = arrow::compute::concat_batches(
-                        &filtered_batches[0].schema(),
-                        &filtered_batches,
-                    )?;
-
-                    let pk_columns: Vec<ArrayRef> = self
-                        .pk_column_indices
-                        .iter()
-                        .map(|&idx| Arc::clone(filtered_concat.column(idx + 1))) // +1 for __row_id offset
-                        .collect();
-
-                    let rows = row_converter.convert_columns(&pk_columns)?;
-                    let row_keys: Vec<Box<[u8]>> = rows
-                        .iter()
-                        .map(|row| row.as_ref().to_vec().into_boxed_slice())
-                        .collect();
-
-                    self.persist_key_based_deletions(row_keys).await
-                } else {
-                    Err(Error::Internal {
+                let Some(row_converter) = self.pk_row_converter.as_ref() else {
+                    return Err(Error::Internal {
                         table: table_name.clone(),
                         message: "RowConverter not available for RowConverterBased strategy"
                             .to_string(),
-                    })
+                    });
+                };
+
+                let mut pending_row_keys: Vec<Box<[u8]>> =
+                    Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut delete_sequence: Option<i64> = None;
+                let mut deleted_rows: u64 = 0;
+
+                for table in tables {
+                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+
+                    while let Some(batch_result) = stream.next().await {
+                        let batch =
+                            self.apply_physical_filters_to_batch(batch_result?, &physical_filters)?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+
+                        pending_row_keys.extend(self.extract_row_keys(&batch, row_converter)?);
+
+                        if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
+                            let chunk_keys = std::mem::take(&mut pending_row_keys);
+                            let chunk_deleted = self
+                                .persist_key_based_chunk_with_shared_sequence(
+                                    chunk_keys,
+                                    &mut delete_sequence,
+                                )
+                                .await?;
+                            deleted_rows =
+                                deleted_rows.checked_add(chunk_deleted).ok_or_else(|| {
+                                    Error::Internal {
+                                        table: table_name.clone(),
+                                        message: "Deleted row count overflowed u64".to_string(),
+                                    }
+                                })?;
+                        }
+                    }
                 }
+
+                if !pending_row_keys.is_empty() {
+                    let chunk_keys = std::mem::take(&mut pending_row_keys);
+                    let chunk_deleted = self
+                        .persist_key_based_chunk_with_shared_sequence(
+                            chunk_keys,
+                            &mut delete_sequence,
+                        )
+                        .await?;
+                    deleted_rows =
+                        deleted_rows
+                            .checked_add(chunk_deleted)
+                            .ok_or_else(|| Error::Internal {
+                                table: table_name.clone(),
+                                message: "Deleted row count overflowed u64".to_string(),
+                            })?;
+                }
+
+                Ok(deleted_rows)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
-                unreachable!("PositionBased strategy should have returned early via delete_filtered_rows_streaming_position_based")
+                unreachable!(
+                    "PositionBased strategy should have returned early via delete_filtered_rows_position_based"
+                )
             }
         }
+    }
+
+    fn coerce_filters_for_schema(&self) -> super::super::Result<Vec<Expr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let mut coerced_filters = Vec::with_capacity(self.filters.len());
+
+        for filter in &self.filters {
+            let mut rewriter = TypeCoercionRewriter::new(&df_schema);
+            coerced_filters.push(filter.clone().rewrite(&mut rewriter)?.data);
+        }
+
+        Ok(coerced_filters)
+    }
+
+    fn build_physical_filters(
+        &self,
+        filters: &[Expr],
+    ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let execution_props = ExecutionProps::new();
+
+        let physical_filters = filters
+            .iter()
+            .map(|filter| create_physical_expr(filter, &df_schema, &execution_props))
+            .collect::<datafusion_common::Result<Vec<_>>>()?;
+
+        Ok(physical_filters)
+    }
+
+    fn apply_physical_filters_to_batch(
+        &self,
+        mut batch: arrow::record_batch::RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> super::super::Result<arrow::record_batch::RecordBatch> {
+        let table_name = &self.table_metadata.table_name;
+
+        for filter in physical_filters {
+            if batch.num_rows() == 0 {
+                break;
+            }
+
+            let filter_value = filter.evaluate(&batch)?;
+            let filter_array = filter_value.into_array(batch.num_rows())?;
+            let filter_array = filter_array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: format!(
+                        "Filter expression did not evaluate to BooleanArray, got {:?}",
+                        filter_array.data_type()
+                    ),
+                })?;
+
+            batch = arrow::compute::filter_record_batch(&batch, filter_array)?;
+        }
+
+        Ok(batch)
+    }
+
+    async fn persist_key_based_chunk_with_shared_sequence(
+        &self,
+        row_keys: Vec<Box<[u8]>>,
+        delete_sequence: &mut Option<i64>,
+    ) -> super::super::Result<u64> {
+        if row_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let sequence = if let Some(sequence) = delete_sequence {
+            *sequence
+        } else {
+            let sequence = self
+                .catalog
+                .increment_sequence_number(self.table_metadata.table_id)
+                .await?;
+            *delete_sequence = Some(sequence);
+            sequence
+        };
+
+        self.persist_key_based_deletions_with_sequence(row_keys, sequence)
+            .await
+    }
+
+    async fn persist_int64_pk_chunk_with_shared_sequence(
+        &self,
+        pk_values: Vec<i64>,
+        delete_sequence: &mut Option<i64>,
+    ) -> super::super::Result<u64> {
+        if pk_values.is_empty() {
+            return Ok(0);
+        }
+
+        let sequence = if let Some(sequence) = delete_sequence {
+            *sequence
+        } else {
+            let sequence = self
+                .catalog
+                .increment_sequence_number(self.table_metadata.table_id)
+                .await?;
+            *delete_sequence = Some(sequence);
+            sequence
+        };
+
+        self.persist_int64_pk_deletions_with_sequence(pk_values, sequence)
+            .await
     }
 
     async fn persist_key_based_deletions(
         &self,
         row_keys: Vec<Box<[u8]>>,
+    ) -> super::super::Result<u64> {
+        let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
+
+        if filtered_row_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let delete_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await?;
+
+        self.persist_key_based_deletions_with_sequence(filtered_row_keys, delete_sequence)
+            .await
+    }
+
+    async fn persist_key_based_deletions_with_sequence(
+        &self,
+        row_keys: Vec<Box<[u8]>>,
+        delete_sequence: i64,
     ) -> super::super::Result<u64> {
         let table_name = &self.table_metadata.table_name;
 
@@ -421,9 +549,7 @@ impl CayenneDeletionSink {
                             .to_string(),
                 })?;
 
-        let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
-
-        if filtered_row_keys.is_empty() {
+        if row_keys.is_empty() {
             return Ok(0);
         }
 
@@ -436,29 +562,19 @@ impl CayenneDeletionSink {
                     table: table_name.clone(),
                     lock: DELETION_CACHE_LOCK_POISONED,
                 })?;
-            filtered_row_keys
+            row_keys
                 .iter()
                 .filter(|key| !guard.contains_key(key.as_ref()))
                 .count()
         };
 
-        // Get a fresh sequence number from the catalog for this deletion operation.
-        // This ensures each delete has a unique, monotonically increasing sequence number
-        // that's higher than any previous operation.
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
-            .await?;
-
-        // Create a temporary metadata with the fresh sequence number
+        // Create a temporary metadata with the delete sequence number
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = delete_sequence;
 
         let writer = DeletionVectorWriter::new(&temp_metadata);
         let mut results = writer
-            .write(vec![DeletionVectorWriteSpec::new_key_based(
-                filtered_row_keys,
-            )])
+            .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
             .await?;
 
         let Some(result) = results.pop() else {
@@ -518,6 +634,26 @@ impl CayenneDeletionSink {
     }
 
     async fn persist_int64_pk_deletions(&self, pk_values: Vec<i64>) -> super::super::Result<u64> {
+        let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
+
+        if filtered_pk_values.is_empty() {
+            return Ok(0);
+        }
+
+        let delete_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await?;
+
+        self.persist_int64_pk_deletions_with_sequence(filtered_pk_values, delete_sequence)
+            .await
+    }
+
+    async fn persist_int64_pk_deletions_with_sequence(
+        &self,
+        pk_values: Vec<i64>,
+        delete_sequence: i64,
+    ) -> super::super::Result<u64> {
         let table_name = &self.table_metadata.table_name;
 
         // Get the int64 pk cache from the PkDeletionStrategy (only valid for Int64Pk)
@@ -531,9 +667,7 @@ impl CayenneDeletionSink {
                             .to_string(),
                 })?;
 
-        let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
-
-        if filtered_pk_values.is_empty() {
+        if pk_values.is_empty() {
             return Ok(0);
         }
 
@@ -546,29 +680,21 @@ impl CayenneDeletionSink {
                     table: table_name.clone(),
                     lock: DELETION_CACHE_LOCK_POISONED,
                 })?;
-            filtered_pk_values
+            pk_values
                 .iter()
                 .filter(|pk| !guard.contains_key(*pk))
                 .count()
         };
 
-        // Get a fresh sequence number from the catalog for this deletion operation.
-        // This ensures each delete has a unique, monotonically increasing sequence number
-        // that's higher than any previous operation.
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
-            .await?;
-
         // For Int64 PK deletions, we store them as key-based deletions
         // where each key is the 8-byte big-endian representation of the i64 value.
         // This allows efficient storage and lookup.
-        let row_keys: Vec<Box<[u8]>> = filtered_pk_values
+        let row_keys: Vec<Box<[u8]>> = pk_values
             .iter()
             .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
             .collect();
 
-        // Create a temporary metadata with the fresh sequence number
+        // Create a temporary metadata with the delete sequence number
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = delete_sequence;
 
@@ -593,7 +719,7 @@ impl CayenneDeletionSink {
                 })?;
 
             let mut updated_map = (**guard).clone();
-            for &pk_value in &filtered_pk_values {
+            for &pk_value in &pk_values {
                 // Update with max sequence if key already exists
                 updated_map
                     .entry(pk_value)
