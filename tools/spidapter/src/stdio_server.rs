@@ -79,22 +79,6 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(ToString::to_string)
 }
 
-/// Average non-`None` `f64` values extracted from pods.
-#[expect(clippy::cast_precision_loss)]
-fn avg_opt(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
-) -> Option<f64> {
-    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
-        if let Some(v) = f(p) {
-            (s + v, c + 1)
-        } else {
-            (s, c)
-        }
-    });
-    (count > 0).then_some(sum / (count as f64))
-}
-
 /// Sum non-`None` `u64` values extracted from pods.
 fn sum_opt_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
@@ -222,7 +206,13 @@ impl Handler for SpidapterHandler {
             ResourceMetrics::default()
         } else {
             ResourceMetrics {
-                cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                // Sum cumulative CPU seconds across all pods
+                cpu_usage_percent: Some(
+                    pods.iter()
+                        .filter_map(|p| p.cpu_usage_percent)
+                        .sum::<f64>()
+                        .max(0.0),
+                ),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
                 disk_read_bytes: Some(
                     sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes).unwrap_or_default(),
