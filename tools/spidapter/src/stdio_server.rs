@@ -30,6 +30,7 @@ use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
     ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::args::StdioArgs;
@@ -298,24 +299,37 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
+        let mut attempts = 0; // global attempt counter, not per-table, to avoid compounding retries
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
-            let response = sql_client
-                .post(&sql_url)
-                .header("X-API-Key", api_key)
-                .body(statement.clone())
-                .send()
-                .await?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<failed to read error body>".to_string());
-                return Err(anyhow::anyhow!(
-                    "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
-                ));
+            loop {
+                attempts += 1;
+
+                let response = sql_client
+                    .post(&sql_url)
+                    .header("X-API-Key", api_key)
+                    .body(statement.clone())
+                    .send()
+                    .await?;
+
+                if response.status().is_success() {
+                    break;
+                }
+
+                if attempts >= 3 {
+                    let status = response.status();
+                    let body = response.text().await?;
+                    return Err(anyhow::anyhow!(
+                        "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
+                    ));
+                }
+
+                let backoff_seconds = attempts * 2;
+                eprintln!(
+                    "[stdio] Post-setup SQL failed, retrying in {backoff_seconds}s (attempt {attempts}/3)"
+                );
+                sleep(Duration::from_secs(backoff_seconds)).await;
             }
         }
 
