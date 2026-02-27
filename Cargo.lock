@@ -15933,6 +15933,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "snowflake-api",
  "spice-cloud",
  "spiceai",
  "spicepod",

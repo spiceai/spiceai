@@ -24,7 +24,7 @@ use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::Con
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::oracle::connection::{
-    OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
+    OracleConnectionParams, OracleDirectConnectionParamsBuilder,
 };
 use data_components::oracle::provider::OracleCatalogProvider;
 use runtime_parameters::Parameters;

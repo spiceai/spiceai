@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! MySQL catalog connector.
+//! `MySQL` catalog connector.
 //!
-//! Connects to a MySQL database and provides schema/table
+//! Connects to a `MySQL` database and provides schema/table
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
@@ -57,8 +57,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
 ];
 
-/// A catalog connector for MySQL, providing access to schemas and tables
-/// within a MySQL database.
+/// A catalog connector for `MySQL`, providing access to schemas and tables
+/// within a `MySQL` database.
 #[derive(Clone)]
 pub struct MySQLCatalog {
     params: ConnectorParams,
@@ -148,14 +148,13 @@ impl MySQLCatalog {
             .get("pass")
             .map(|s| s.expose_secret().to_string())
             .unwrap_or_default();
-        let host = secret_map
-            .get("host")
-            .map(|s| s.expose_secret().to_string())
-            .unwrap_or_else(|| "localhost".to_string());
+        let host = secret_map.get("host").map_or_else(
+            || "localhost".to_string(),
+            |s| s.expose_secret().to_string(),
+        );
         let port = secret_map
             .get("tcp_port")
-            .map(|s| s.expose_secret().to_string())
-            .unwrap_or_else(|| "3306".to_string());
+            .map_or_else(|| "3306".to_string(), |s| s.expose_secret().to_string());
         let db = secret_map
             .get("db")
             .map(|s| s.expose_secret().to_string())

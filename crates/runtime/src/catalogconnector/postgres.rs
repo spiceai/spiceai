@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! PostgreSQL catalog connector.
+//! `PostgreSQL` catalog connector.
 //!
-//! Connects to a PostgreSQL (or Redshift) database and provides schema/table
+//! Connects to a `PostgreSQL` (or Redshift) database and provides schema/table
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
@@ -57,8 +57,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
 ];
 
-/// A catalog connector for PostgreSQL, providing access to schemas and tables
-/// within a PostgreSQL database. Also usable for Redshift.
+/// A catalog connector for `PostgreSQL`, providing access to schemas and tables
+/// within a `PostgreSQL` database. Also usable for Redshift.
 #[derive(Clone)]
 pub struct PostgresCatalog {
     params: ConnectorParams,
