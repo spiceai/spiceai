@@ -27,6 +27,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
+use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
@@ -35,7 +36,8 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::cluster::partition::{PartitionManager, executor_selection};
+#[cfg(not(windows))]
+use cayenne::CayenneTableProvider;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -275,64 +277,69 @@ impl ExecutorRegistry {
             })
         }
     }
+}
 
-    /// Legacy implementation of `get_partitions` without validation or optimization.
-    /// Returns all executors that have any partition for the table.
-    fn get_partitions_legacy(
-        &self,
-        table: &TableReference,
-        schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
-        let Ok(partitions) = self.partitions.try_read() else {
-            tracing::warn!(
-                "For table {table:?}, failed to acquire read lock on ExecutorRegistry partitions"
-            );
-            return Vec::new();
-        };
-
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!(
-                "For table {table:?}, failed to acquire read lock on ExecutorRegistry flight_sql_clients"
-            );
-            return Vec::new();
-        };
-
-        partitions
-            .iter()
-            .filter_map(|(executor_id, table_map)| {
-                let parts = table_map.get(table)?;
-                let Some(client) = flight_sql_clients.get(executor_id) else {
-                    tracing::warn!(
-                        "Executor '{executor_id}' registered with partitions for table {table:?}, but no FlightSQL client found."
-                    );
-                    return None;
-                };
-                let table_provider = Arc::new(FlightSQLTable::create_with_schema(
-                    "flightsql",
-                    executor_id,
-                    client.clone(),
-                    table.clone(),
-                    Arc::clone(schema),
-                    Arc::new(CookieStore::new()),
-                )) as Arc<dyn TableProvider>;
-
-                Some((table_provider, parts.clone()))
-            })
-            .collect()
+fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
+    if table_provider
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .is_some()
+    {
+        return true;
     }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return inner_provider
+            .as_any()
+            .downcast_ref::<AcceleratedTable>()
+            .is_some();
+    }
+
+    false
+}
+
+fn flight_sql_table_provider(
+    executor_id: &str,
+    client: FlightSqlClient,
+    table: &TableReference,
+    schema: SchemaRef,
+) -> Arc<dyn TableProvider> {
+    Arc::new(FlightSQLTable::create_with_schema(
+        "flightsql",
+        executor_id,
+        client,
+        table.clone(),
+        schema,
+        Arc::new(CookieStore::new()),
+    )) as Arc<dyn TableProvider>
 }
 
 impl TablePartitionProvider for ExecutorRegistry {
-    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
+    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables and Cayenne tables.
     fn should_partition(&self, tbl: &TableScan) -> bool {
         let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
             return false;
         };
-        default
+
+        if is_accelerated_table_provider(&default.table_provider) {
+            return true;
+        }
+
+        #[cfg(not(windows))]
+        if default
             .table_provider
             .as_any()
-            .downcast_ref::<AcceleratedTable>()
+            .downcast_ref::<CayenneTableProvider>()
             .is_some()
+        {
+            return true;
+        }
+
+        false
     }
 
     /// Enhanced implementation with partition completeness validation and executor optimization.
@@ -344,10 +351,33 @@ impl TablePartitionProvider for ExecutorRegistry {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+
         // Get partition metadata from manager (async call, requires runtime)
         let Some(table_metadata) = self.partition_manager.get_cached_table_metadata(table) else {
-            // TODO: better on this cache miss. Should not exist.
-            return self.get_partitions_legacy(table, schema);
+            // Non-partitioned accelerated tables don't register partition assignments.
+            // Route to a single executor to avoid duplicate results in multi-executor clusters.
+            let Some((executor_id, client)) = flight_sql_clients
+                .iter()
+                .min_by(|(lhs_id, _), (rhs_id, _)| lhs_id.cmp(rhs_id))
+            else {
+                tracing::warn!(
+                    "For non-partitioned accelerated table {table:?}, no connected executors with FlightSQL clients were found"
+                );
+                return Vec::new();
+            };
+
+            tracing::debug!(
+                "No partition assignments found for accelerated table {table:?}; routing query to executor '{executor_id}'"
+            );
+
+            vec![(
+                flight_sql_table_provider(executor_id, client.clone(), table, schema),
+                Vec::new(),
+            )]
         };
 
         // Build set of all required partitions (for now, all partitions in table)
@@ -405,11 +435,6 @@ impl TablePartitionProvider for ExecutorRegistry {
         // Build result using only selected executors
         let Ok(executor_partitions) = self.partitions.try_read() else {
             tracing::warn!("Failed to acquire read lock on partitions");
-            return Vec::new();
-        };
-
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
             return Vec::new();
         };
 

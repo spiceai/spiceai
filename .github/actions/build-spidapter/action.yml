@@ -131,7 +131,7 @@ runs:
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')
       shell: bash
       run: |
-        cargo build -p spidapter --release --features models
+        cargo build -p spidapter --release
       env:
         RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}

@@ -61,7 +61,7 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
@@ -74,7 +74,9 @@ use tonic::{
 };
 
 use crate::cluster::{
-    SchedulerPeers, executor_registry::ExecutorRegistry, partition::partition_value_to_bytes,
+    executor_registry::{ExecutorRegistry, TablePartitions},
+    partition::PartitionManager,
+    {SchedulerPeers, partition::partition_value_to_bytes},
 };
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
@@ -638,27 +640,36 @@ impl ClusterService for ClusterServiceImpl {
 
         // Register the allocated partitions in the executor registry so the scheduler knows where they are
         {
-            let mut executor_partitions = self.executor_registry.partitions.write().await;
-            executor_partitions.insert(
-                executor_id.to_string(),
-                table_partitions
-                    .iter()
-                    .map(|(tbl, sa)| {
-                        let exprs = sa
-                            .items
-                            .iter()
-                            .filter_map(|bytes| match Expr::from_bytes(bytes) {
+            let registry = self.datafusion.ctx.as_ref();
+            let mut partition_map: TablePartitions = table_partitions
+                .iter()
+                .map(|(tbl, sa)| {
+                    let exprs = sa
+                        .items
+                        .iter()
+                        .filter_map(
+                            |bytes| match Expr::from_bytes_with_registry(bytes, registry) {
                                 Ok(expr) => Some(expr),
                                 Err(e) => {
                                     tracing::error!("Failed to deserialize expr: {e}");
                                     None
                                 }
-                            })
-                            .collect();
-                        (TableReference::parse_str(tbl), exprs)
-                    })
-                    .collect(),
-            );
+                            },
+                        )
+                        .collect();
+                    (TableReference::parse_str(tbl), exprs)
+                })
+                .collect();
+
+            // Register Cayenne tables as single unpartitioned entries (empty filter expressions).
+            // This tells the scheduler that queries targeting these tables should be forwarded to this executor.
+            #[cfg(not(windows))]
+            for table_ref in discover_cayenne_tables(&self.datafusion).await {
+                partition_map.entry(table_ref).or_default();
+            }
+
+            let mut executor_partitions = self.executor_registry.partitions.write().await;
+            executor_partitions.insert(executor_id.to_string(), partition_map);
         }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
@@ -762,6 +773,74 @@ async fn notify_scheduler_executor_shutdown(
 
     Ok(())
 }
+/// Discovers all Cayenne table references registered in the `DataFusion` catalog.
+///
+/// Iterates through all catalogs, identifies Cayenne-backed catalogs, and returns
+/// fully qualified [`TableReference`]s for each table found. These are used to
+/// register unpartitioned entries in the executor's partition map so that queries
+/// for Cayenne tables are forwarded to the executor.
+#[cfg(not(windows))]
+async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+    use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
+
+    let mut tables = Vec::new();
+    let mut seen = HashSet::new();
+    for catalog_name in datafusion.ctx.catalog_names() {
+        let Some(catalog) = datafusion.ctx.catalog(&catalog_name) else {
+            continue;
+        };
+        if !is_cayenne_catalog(catalog.as_ref()) {
+            continue;
+        }
+        for schema_name in catalog.schema_names() {
+            let Some(schema) = catalog.schema(&schema_name) else {
+                continue;
+            };
+
+            // Prefer metadata-catalog discovery to avoid relying on in-memory schema cache.
+            if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
+                let namespace_prefix = format!("{}/", cayenne_schema.namespace());
+                match cayenne_schema.metadata_catalog().list_table_names().await {
+                    Ok(all_table_names) => {
+                        for full_name in all_table_names {
+                            let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
+                                continue;
+                            };
+                            let key = (
+                                catalog_name.clone(),
+                                schema_name.clone(),
+                                short_name.to_string(),
+                            );
+                            if seen.insert(key.clone()) {
+                                tables.push(TableReference::full(key.0, key.1, key.2));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to list Cayenne metadata tables for {catalog_name}.{schema_name}: {e}"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            for table_name in schema.table_names() {
+                let key = (
+                    catalog_name.clone(),
+                    schema_name.clone(),
+                    table_name.clone(),
+                );
+                if seen.insert(key.clone()) {
+                    tables.push(TableReference::full(key.0, key.1, key.2));
+                }
+            }
+        }
+    }
+    tables
+}
+
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///
 /// Returns an empty vec if no batches are provided.

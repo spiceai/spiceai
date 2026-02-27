@@ -395,7 +395,7 @@ fn update_scheduler_pollers(
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-mod executor_registry;
+pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
 mod scheduler_registry;
@@ -1307,6 +1307,7 @@ pub async fn initialize_cluster_executor(
         let initial_partitions = executor_request_initial_partitions(
             cluster_client.clone(),
             rt.datafusion().cluster_config.node_advertise_url(),
+            rt.datafusion().ctx.as_ref(),
         )
         .await
         .map_err(|status| FailedToStartClusterExecutor {

@@ -106,6 +106,9 @@ fn generate_metadata(
 /// List Models
 ///
 /// List all models, both machine learning and language models, available in the runtime.
+/// When `status=true` and a model is in `Error`, the response also includes:
+/// - `error`: structured code object with `category`, `type`, and stable `code`
+/// - `error_message`: user-visible details
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models",
@@ -123,23 +126,31 @@ fn generate_metadata(
                         "object": "model",
                         "owned_by": "openai",
                         "datasets": null,
-                        "status": "ready"
+                        "status": "ready",
+                        "error": null,
+                        "error_message": null
                     },
                     {
                         "id": "text-embedding-ada-002",
                         "object": "model",
                         "owned_by": "openai-internal",
                         "datasets": ["text-dataset-1", "text-dataset-2"],
-                        "status": "ready"
+                        "status": "error",
+                        "error": {
+                            "category": "model",
+                            "type": "auth",
+                            "code": "model.auth"
+                        },
+                        "error_message": "Invalid API key"
                     }
                 ]
             })
         ), (
             String = "text/csv",
             example = "
-id,object,owned_by,datasets,status
-gpt-4,model,openai,,ready
-text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",ready
+id,object,owned_by,datasets,status,error,error_message
+gpt-4,model,openai,,ready,,
+text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",error,model.auth,Invalid API key
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing models", content((
@@ -186,12 +197,28 @@ pub(crate) async fn get(
                 } else {
                     Some(m.datasets.clone())
                 };
+                let status = statuses.get(&m.name).cloned();
+                let error = status.as_ref().and_then(|s| {
+                    if s.is_error() {
+                        Some(runtime_api_types::v1::ComponentError::from_status_message(
+                            runtime_api_types::v1::ComponentErrorCategory::Model,
+                            s.error_message(),
+                        ))
+                    } else {
+                        None
+                    }
+                });
+                let error_message = status
+                    .as_ref()
+                    .and_then(|s| s.error_message().map(String::from));
                 OpenAIModel {
                     id: m.name.clone(),
                     object: "model".to_string(),
                     owned_by: m.from.clone(),
                     datasets: d,
-                    status: statuses.get(&m.name).copied(),
+                    status,
+                    error,
+                    error_message,
                     metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
                 }
             })
@@ -213,12 +240,28 @@ pub(crate) async fn get(
     let worker_registry = rt.workers.read().await;
     models.extend(worker_registry.iter().filter_map(|(name, worker)| {
         Arc::clone(worker).as_model()?;
+        let status = worker_statuses.get(name).cloned();
+        let error = status.as_ref().and_then(|s| {
+            if s.is_error() {
+                Some(runtime_api_types::v1::ComponentError::from_status_message(
+                    runtime_api_types::v1::ComponentErrorCategory::Worker,
+                    s.error_message(),
+                ))
+            } else {
+                None
+            }
+        });
+        let error_message = status
+            .as_ref()
+            .and_then(|s| s.error_message().map(String::from));
         Some(OpenAIModel {
             id: name.clone(),
             object: "model".to_string(),
             owned_by: "spiceai".to_string(),
             datasets: None,
-            status: worker_statuses.get(name).copied(),
+            status,
+            error,
+            error_message,
             metadata: generate_metadata(name, &metadata_keys, &responses_models),
         })
     }));

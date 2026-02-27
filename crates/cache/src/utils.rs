@@ -37,6 +37,7 @@ pub fn to_cached_record_batch_stream(
     input_tables: Arc<HashSet<TableReference>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
+    let cache_schema = Arc::clone(&schema);
 
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
@@ -64,6 +65,7 @@ pub fn to_cached_record_batch_stream(
 
             match CachedQueryResult::from_batches(
                 &records,
+                cache_schema,
                 input_tables,
                 cached_at,
                 encoder,

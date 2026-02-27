@@ -451,7 +451,7 @@ impl Query {
         cache_key: &RawCacheKey,
         cache_key_u64: u64,
         batches: Vec<arrow::record_batch::RecordBatch>,
-        _schema: arrow::datatypes::SchemaRef,
+        schema: arrow::datatypes::SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
     ) {
         if let Some(cache_provider) = df.results_cache_provider() {
@@ -460,6 +460,7 @@ impl Query {
 
             match cache::result::query::CachedQueryResult::from_batches(
                 &batches,
+                schema,
                 input_tables,
                 cached_at,
                 encoder,
