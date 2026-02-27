@@ -24,8 +24,10 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, MetadataCatalog};
 use common::TestFixture;
+use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::{col, lit, Expr};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -106,6 +108,22 @@ async fn get_ids(ctx: &SessionContext, table_name: &str) -> TestResult<Vec<i64>>
         }
     }
     Ok(ids)
+}
+
+async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
+    let ctx = SessionContext::new();
+    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(results
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .unwrap_or(0))
 }
 
 // =============================================================================
@@ -619,3 +637,173 @@ async fn test_protected_snapshots_readable_with_pending_deletions_impl(
 }
 
 test_with_backends!(test_protected_snapshots_readable_with_pending_deletions_impl);
+
+// =============================================================================
+// Test: Upsert after explicit DELETE must not create duplicate PKs
+// =============================================================================
+//
+// Regression test for stale insert_records bug. The bug scenario:
+// 1. Upsert key=K: writes to protected snapshot S_A, updates cached_insert_records[K]
+// 2. Explicit DELETE key=K: updates cached_deleted_pk[K] to higher seq,
+//    but cached_insert_records[K] stays stale
+// 3. Upsert key=K: load_existing_keyset() checks key=K from S_A using stale
+//    insert_records → decides key is "not visible" → no conflict detected →
+//    writes to new snapshot S_B without deleting S_A's copy
+// 4. Upsert key=K: same → writes to S_C
+// 5. Scan: S_B and S_C both visible → duplicate rows
+//
+// The fix: load_existing_keyset() no longer uses insert_records. It uses only
+// deleted_pk maps with sequence thresholds per snapshot.
+
+async fn test_upsert_after_explicit_delete_no_duplicates_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_upsert_table(&fixture, "delete_upsert").await?;
+
+    // Step 1: Initial insert - PKs 1, 2, 3
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_706_000_000_000_000_i64,
+                1_706_000_000_000_000_i64,
+                1_706_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch1).await?;
+
+    assert_eq!(
+        get_row_count(&ctx, "delete_upsert").await?,
+        3,
+        "After initial insert: should have 3 rows"
+    );
+
+    // Step 2: Upsert key=2 - creates pending deletion + protected snapshot S_A
+    // This updates cached_insert_records[2] and cached_deleted_pk[2]
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(StringArray::from(vec!["beta_v2"])),
+            Arc::new(Int64Array::from(vec![201])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_709_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch2).await?;
+
+    assert_eq!(
+        get_row_count(&ctx, "delete_upsert").await?,
+        3,
+        "After upsert id=2: should still have 3 rows"
+    );
+
+    // Step 3: Explicit DELETE key=2 - THE CRUCIAL STEP
+    // This updates cached_deleted_pk[2] to a higher sequence number,
+    // but cached_insert_records[2] retains the stale value from step 2.
+    // Note: delete_records may return 0 because the deletion sink counts
+    // only PKs NOT already in the deletion cache, and id=2 was added to
+    // the cache by the upsert in step 2. The deletion vector IS still
+    // written with a higher sequence number.
+    delete_records(&table, col("id").eq(lit(2i64))).await?;
+
+    assert_eq!(
+        get_row_count(&ctx, "delete_upsert").await?,
+        2,
+        "After explicit DELETE id=2: should have 2 rows (ids 1, 3)"
+    );
+
+    // Step 4: Upsert key=2 again - BEFORE THE FIX, this would NOT detect the
+    // conflict because load_existing_keyset() used stale insert_records to
+    // conclude key=2 was "not visible", skipping it in the keyset. The upsert
+    // would write to a new snapshot S_B without removing S_A's copy.
+    let batch3 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(StringArray::from(vec!["beta_v3"])),
+            Arc::new(Int64Array::from(vec![202])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_711_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch3).await?;
+
+    assert_eq!(
+        get_row_count(&ctx, "delete_upsert").await?,
+        3,
+        "After re-upsert id=2: should have 3 rows (ids 1, 2, 3)"
+    );
+
+    // Step 5: Upsert key=2 one more time - before the fix, this created yet
+    // another snapshot S_C, also without removing prior copies.
+    let batch4 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(StringArray::from(vec!["beta_v4"])),
+            Arc::new(Int64Array::from(vec![203])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_714_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch4).await?;
+
+    // CRITICAL ASSERTION: Must still have exactly 3 rows, not 5
+    // Before the fix, S_B and S_C would both be visible, producing duplicates.
+    let count = get_row_count(&ctx, "delete_upsert").await?;
+    assert_eq!(
+        count, 3,
+        "After final upsert id=2: should have 3 rows (no duplicates), got {count}"
+    );
+
+    // Verify unique IDs - no duplicates
+    let ids = get_ids(&ctx, "delete_upsert").await?;
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "Should have exactly ids 1, 2, 3 with no duplicates, got {ids:?}"
+    );
+
+    // Verify id=2 has the latest value (203 from step 5)
+    let df = ctx
+        .sql("SELECT id, name, value FROM delete_upsert WHERE id = 2")
+        .await?;
+    let results = df.collect().await?;
+    assert_eq!(
+        results.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1,
+        "id=2 should appear exactly once"
+    );
+    let values = results[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value column should be Int64Array");
+    assert_eq!(
+        values.value(0),
+        203,
+        "id=2 should have latest value 203 from step 5"
+    );
+    let names = results[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name column should be StringArray");
+    assert_eq!(
+        names.value(0),
+        "beta_v4",
+        "id=2 should have latest name 'beta_v4' from step 5"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_upsert_after_explicit_delete_no_duplicates_impl);

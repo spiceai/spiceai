@@ -76,6 +76,9 @@ pub(crate) struct Property {
 ///
 /// Use `status=true` query parameter to include the current status of each dataset in the response.
 /// Possible status values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.
+/// When `status=true` and a dataset is in `Error`, the response also includes:
+/// - `error`: structured code object with `category`, `type`, and stable `code`
+/// - `error_message`: user-visible details
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/datasets",
@@ -83,7 +86,7 @@ pub(crate) struct Property {
     tag = "Datasets",
     params(DatasetQueryParams, DatasetFilter),
     responses(
-        (status = 200, description = "List of datasets. When `status=true` is specified, each dataset includes a `status` field.", content((
+        (status = 200, description = "List of datasets. When `status=true` is specified, each dataset includes `status` and error metadata (`error`, `error_message`) when applicable.", content((
             DatasetResponseItem = "application/json",
             example = json!([
                 {
@@ -91,30 +94,40 @@ pub(crate) struct Property {
                     "name": "daily_journal_accelerated",
                     "replication_enabled": false,
                     "acceleration_enabled": true,
-                    "status": "Ready"
+                    "status": "Ready",
+                    "error": null,
+                    "error_message": null
                 },
                 {
                     "from": "databricks:hive_metastore.default.messages",
                     "name": "messages_accelerated",
                     "replication_enabled": false,
                     "acceleration_enabled": true,
-                    "status": "Refreshing"
+                    "status": "Error",
+                    "error": {
+                        "category": "dataset",
+                        "type": "auth",
+                        "code": "dataset.auth"
+                    },
+                    "error_message": "Unable to authenticate with datasource credentials"
                 },
                 {
                     "from": "postgres:aidemo_messages",
                     "name": "general",
                     "replication_enabled": false,
                     "acceleration_enabled": false,
-                    "status": "Initializing"
+                    "status": "Initializing",
+                    "error": null,
+                    "error_message": null
                 }
             ])
         ), (
             String = "text/csv",
             example = "
-from,name,replication_enabled,acceleration_enabled,status
-postgres:syncs,daily_journal_accelerated,false,true,Ready
-databricks:hive_metastore.default.messages,messages_accelerated,false,true,Refreshing
-postgres:aidemo_messages,general,false,false,Initializing
+from,name,replication_enabled,acceleration_enabled,status,error,error_message
+postgres:syncs,daily_journal_accelerated,false,true,Ready,,
+databricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials
+postgres:aidemo_messages,general,false,false,Initializing,,
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing datasets", content((
@@ -165,6 +178,16 @@ pub(crate) async fn get(
             } else {
                 None
             };
+            let error = status.as_ref().and_then(|s| {
+                if s.is_error() {
+                    Some(runtime_api_types::v1::ComponentError::from_status_message(
+                        runtime_api_types::v1::ComponentErrorCategory::Dataset,
+                        s.error_message(),
+                    ))
+                } else {
+                    None
+                }
+            });
             let error_message = status
                 .as_ref()
                 .and_then(|s| s.error_message().map(String::from));
@@ -175,6 +198,7 @@ pub(crate) async fn get(
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
                 properties: dataset_properties(d),
                 status,
+                error,
                 error_message,
             }
         })

@@ -3,6 +3,7 @@ use app::AppBuilder;
 use insta::assert_json_snapshot;
 use reqwest::Client;
 use runtime::{Runtime, auth::EndpointAuth, status::ComponentStatus};
+use runtime_api_types::v1::ComponentError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -25,6 +26,12 @@ pub(crate) struct OpenAIModel {
     datasets: Option<Vec<String>>,
 
     status: Option<ComponentStatus>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ComponentError>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<Metadata>,
@@ -115,6 +122,43 @@ async fn test_models_http_endpoint() -> Result<(), Error> {
                 response.json().await.map_err(anyhow::Error::from)?;
 
             assert_json_snapshot!("models_response_with_status", &models_response);
+
+            rt.status().update_model(
+                "chat_model",
+                ComponentStatus::error_with_message("invalid_api_key"),
+            );
+
+            let url = format!("{http_base_url}/v1/models?status=true");
+            let response = client.get(&url).send().await.map_err(anyhow::Error::from)?;
+
+            assert!(
+                response.status().is_success(),
+                "Expected 200 OK, got {}",
+                response.status()
+            );
+
+            let models_response: OpenAIModelResponse =
+                response.json().await.map_err(anyhow::Error::from)?;
+
+            let chat_model = models_response
+                .data
+                .iter()
+                .find(|model| model.id == "chat_model")
+                .expect("chat_model should be returned by /v1/models");
+
+            assert_eq!(chat_model.status, Some(ComponentStatus::Error(None)));
+            assert_eq!(
+                chat_model.error,
+                Some(ComponentError {
+                    category: runtime_api_types::v1::ComponentErrorCategory::Model,
+                    error_type: runtime_api_types::v1::ComponentErrorType::Auth,
+                    code: "model.auth".to_string(),
+                })
+            );
+            assert_eq!(
+                chat_model.error_message,
+                Some("invalid_api_key".to_string())
+            );
 
             let url = format!("{http_base_url}/v1/models?metadata_fields=supports_responses_api");
             let response = client.get(&url).send().await.map_err(anyhow::Error::from)?;
