@@ -508,39 +508,6 @@ impl CayenneTableProvider {
             })
     }
 
-    fn snapshot_object_store_prefix(&self, snapshot_id: &str) -> Result<Option<ObjectStorePath>> {
-        if !self.table_metadata.path.starts_with("s3://") {
-            return Ok(None);
-        }
-
-        let snapshot_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            snapshot_id,
-        );
-
-        let url = url::Url::parse(&snapshot_url).map_err(|source| Error::UrlParse {
-            url: snapshot_url.clone(),
-            source,
-        })?;
-
-        let host = url.host_str().unwrap_or_default();
-        let config = self.require_object_store()?;
-        let config_host = config.url.host_str().unwrap_or_default();
-
-        if !config_host.is_empty() && !host.is_empty() && config_host != host {
-            return Err(Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!(
-                    "Snapshot host {host} does not match configured object store host {config_host}"
-                ),
-            });
-        }
-
-        let path = url.path().trim_start_matches('/');
-        Ok(Some(ObjectStorePath::from(path)))
-    }
-
     async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> Result<()> {
         let config = self.require_object_store()?;
         let objects: Vec<_> = config
@@ -2501,13 +2468,16 @@ impl CayenneTableProvider {
         Ok(sorted_stream)
     }
 
-    /// Sort and rewrite data on disk by reading from the listing table.
+    /// Sort and rewrite data by reading from the current listing table, writing
+    /// sorted data to a new snapshot, and atomically swapping.
     ///
     /// This method:
-    /// 1. Reads all data from the current listing table (includes retention filter results)
+    /// 1. Reads all data from the current listing table
     /// 2. Sorts the data using `DataFusion`'s `SortExec` (with disk spilling)
-    /// 3. Deletes the old unsorted files
-    /// 4. Writes the sorted data back in optimally-sized chunks
+    /// 3. Writes sorted data to a **new** snapshot directory (avoids deleting
+    ///    files that the lazy `SortExec` stream still needs to read)
+    /// 4. Atomically commits the new snapshot in the catalog
+    /// 5. Updates in-memory state and triggers old snapshot cleanup
     ///
     /// This ensures zone maps have non-overlapping min/max ranges for optimal pruning.
     ///
@@ -2540,69 +2510,73 @@ impl CayenneTableProvider {
         // Sort the stream using our existing sort logic
         let sorted_stream = self.sort_stream(stream)?;
 
-        // Delete all existing Vortex files in the snapshot directory before rewriting
-        // Note: For S3 paths, we skip deletion and let new files coexist (may need future cleanup)
-        let is_s3_path = self.table_metadata.path.starts_with("s3://");
-        let current_snapshot = self.get_current_snapshot_id()?;
+        // Write sorted data to a new snapshot directory. Because SortExec lazily
+        // reads input files via DataSourceExec, writing to a separate directory
+        // avoids the need to either:
+        //  - delete old files first (which would break the lazy read), or
+        //  - collect all sorted data into memory before writing
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
 
-        if is_s3_path {
-            if let Some(prefix) = self.snapshot_object_store_prefix(&current_snapshot)? {
-                self.delete_prefix_with_object_store(&prefix).await?;
-            } else {
-                tracing::warn!(
-                    "S3 path detected but no object store prefix could be derived for sorted rewrite cleanup"
-                );
-            }
-        } else {
-            let snapshot_dir = Self::snapshot_dir_path(
-                &self.table_metadata.path,
-                self.table_metadata.table_id,
-                &current_snapshot,
-            );
-            self.delete_snapshot_files(&snapshot_dir).await?;
+        // For local paths, ensure the snapshot directory exists.
+        // S3 doesn't require directory creation (object storage creates paths on write).
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        // Write the sorted data back in chunks
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(sorted_stream, target_size_bytes)
+            .chunk_and_write_parallel_to_snapshot(
+                sorted_stream,
+                target_size_bytes,
+                &new_snapshot_id,
+            )
             .await?;
+
+        if total_rows == 0 {
+            tracing::debug!(
+                "No data to sort-rewrite for table {}",
+                self.table_metadata.table_name
+            );
+            // Clean up empty snapshot directory for local paths
+            if !is_s3 {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                let _ = tokio::fs::remove_dir(&snapshot_dir).await;
+            }
+            return Ok(());
+        }
+
+        // Sync the snapshot directory for durability before committing metadata.
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
+
+        // Atomically update the catalog to point to the new sorted snapshot.
+        // commit_compaction clears delete files and insert records, which is
+        // correct here since the sort rewrites all live data into the new snapshot.
+        self.commit_overwrite(&new_snapshot_id).await?;
+
+        // Update in-memory state to match the new catalog
+        self.update_current_snapshot_id(&new_snapshot_id)?;
+
+        if let Err(e) = self.clear_all_deletion_caches() {
+            tracing::warn!(
+                "Failed to clear deletion caches after sort rewrite for table {}: {e}",
+                self.table_metadata.table_name
+            );
+        }
+
+        self.update_listing_table_for_snapshot(&new_snapshot_id)?;
+
+        // Old snapshot directories are cleaned up in the background
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
         tracing::info!(
             "Rewrote {} rows in {} sorted chunk(s) for table {}",
             total_rows,
             chunk_count,
             self.table_metadata.table_name
-        );
-
-        Ok(())
-    }
-
-    /// Delete all Vortex files in a snapshot directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if files cannot be deleted.
-    async fn delete_snapshot_files(&self, snapshot_dir: &std::path::Path) -> Result<()> {
-        if !snapshot_dir.exists() {
-            return Ok(());
-        }
-
-        let mut read_dir = tokio::fs::read_dir(snapshot_dir).await?;
-
-        let mut deleted_count = 0;
-        while let Some(entry) = read_dir.next_entry().await? {
-            let path = entry.path();
-
-            // Only delete files (Vortex files), not subdirectories
-            if path.is_file() {
-                tokio::fs::remove_file(&path).await?;
-                deleted_count += 1;
-            }
-        }
-
-        tracing::debug!(
-            "Deleted {} Vortex file(s) from snapshot directory before rewriting sorted data",
-            deleted_count
         );
 
         Ok(())
@@ -3269,6 +3243,22 @@ impl CayenneTableProvider {
             self.table_metadata.table_id,
             &current_snapshot,
         );
+
+        eprintln!("[DEBUG-REFRESH] snapshot_dir_url={}", snapshot_dir_url);
+
+        // List files in the snapshot directory for debugging
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &current_snapshot,
+        );
+        if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
+            let files: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            eprintln!("[DEBUG-REFRESH] Files in snapshot dir: {:?}", files);
+        }
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
