@@ -29,6 +29,26 @@ or:
 cargo run -p spidapter -- stdio
 ```
 
+### `setup()` backend selection
+
+By default, `setup()` provisions Spice Cloud (`SPIDAPTER_BACKEND=scp`).
+
+To run against a local scheduler + executor topology instead, set:
+
+```sh
+SPIDAPTER_BACKEND=local
+```
+
+When `SPIDAPTER_BACKEND=local`, `spidapter`:
+
+- starts a local `spiced --role scheduler`
+- starts exactly one local `spiced --role executor`
+- returns FlightSQL ADBC connection params pointing at the local scheduler
+
+This mode requires `spice` and `spiced` binaries to be available in `PATH`.
+
+`spidapter` local mode binds local cluster services on `0.0.0.0`, uses `127.0.0.1` for local client connectivity, and starts one scheduler plus one executor. Use this mode only for local development on trusted machines.
+
 ### Protocol
 
 - Transport: stdio
