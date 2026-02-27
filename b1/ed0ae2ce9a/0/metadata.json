@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "b1ed0ae2ce9a",
+  "session_id": "81e1eb8a-8d28-4ec3-9e39-aa8767275300",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-27T02:29:48.199987Z",
+  "branch": "jeadie/26-02-26/clippy",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "Makefile"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "95fccf1a02af",
+  "token_usage": {
+    "input_tokens": 170,
+    "cache_creation_tokens": 32306,
+    "cache_read_tokens": 726057,
+    "output_tokens": 15262,
+    "api_call_count": 20
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-27T02:29:48.028278Z",
+    "agent_lines": 10,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 10,
+    "agent_percentage": 100
+  }
+}
