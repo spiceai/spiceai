@@ -94,6 +94,7 @@ pub mod api {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub row_count: Option<u64>,
         pub is_current: bool,
+        pub status: String,
     }
 
     /// Request body for setting the current snapshot.
@@ -2106,14 +2107,16 @@ impl SnapshotManager {
         &self.dataset_name
     }
 
-    /// Retrieves the snapshot summary for this dataset, including all available snapshots.
-    ///
-    /// Only snapshots that actually exist in the object store are returned.
+    /// Retrieves the snapshot summary for this dataset, returning the most recent
+    /// `limit` snapshots.
     ///
     /// # Errors
     ///
     /// Returns an error if reading or parsing the metadata fails.
-    pub async fn get_snapshot_summary(&self) -> Result<api::SnapshotSummary, SnapshotApiError> {
+    pub async fn get_snapshot_summary(
+        &self,
+        limit: usize,
+    ) -> Result<api::SnapshotSummary, SnapshotApiError> {
         let handle = self.load_metadata().await.map_err(|e| match e {
             MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
                 path,
@@ -2144,11 +2147,16 @@ impl SnapshotManager {
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
         let dataset_engine = dataset_metadata.engine.clone();
 
+        // Take only the last `limit` entries (most recent) to avoid unnecessary
+        // HEAD requests for old snapshots we won't return.
+        let total = dataset_metadata.snapshots.len();
+        let start = total.saturating_sub(limit);
+        let windowed_entries = &dataset_metadata.snapshots[start..];
+
         // Check which snapshots actually exist in the object store (with bounded concurrency).
         // Eagerly collect futures into a Vec so the closure doesn't capture `&self` lazily,
         // which would cause higher-ranked lifetime issues with axum handlers.
-        let existence_futures: Vec<_> = dataset_metadata
-            .snapshots
+        let existence_futures: Vec<_> = windowed_entries
             .iter()
             .map(|entry| {
                 let snapshot_uri = entry.snapshot.clone();
@@ -2165,34 +2173,28 @@ impl SnapshotManager {
             .collect()
             .await;
 
-        let snapshots: Vec<api::SnapshotInfo> = dataset_metadata
-            .snapshots
+        let snapshots: Vec<api::SnapshotInfo> = windowed_entries
             .iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 let exists = existence_results
                     .get(&entry.snapshot_id)
                     .copied()
                     .unwrap_or(false);
-                if exists {
-                    Some(api::SnapshotInfo {
-                        snapshot_id: entry.snapshot_id,
-                        timestamp_ms: entry.timestamp_ms,
-                        location: entry.snapshot.clone(),
-                        checksum: entry.snapshot_checksum.clone(),
-                        checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
-                        size_bytes: entry.snapshot_size,
-                        engine: entry.snapshot_engine.clone(),
-                        row_count: entry.snapshot_row_count,
-                        is_current: Some(entry.snapshot_id) == current_snapshot_id,
-                    })
-                } else {
-                    tracing::debug!(
-                        dataset = %self.dataset_name,
-                        snapshot_id = entry.snapshot_id,
-                        location = %entry.snapshot,
-                        "Snapshot referenced in metadata does not exist in object store"
-                    );
-                    None
+                api::SnapshotInfo {
+                    snapshot_id: entry.snapshot_id,
+                    timestamp_ms: entry.timestamp_ms,
+                    location: entry.snapshot.clone(),
+                    checksum: entry.snapshot_checksum.clone(),
+                    checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+                    size_bytes: entry.snapshot_size,
+                    engine: entry.snapshot_engine.clone(),
+                    row_count: entry.snapshot_row_count,
+                    is_current: Some(entry.snapshot_id) == current_snapshot_id,
+                    status: if exists {
+                        "verified".to_string()
+                    } else {
+                        String::new()
+                    },
                 }
             })
             .collect();
@@ -2313,6 +2315,8 @@ impl SnapshotManager {
             });
         };
 
+        let exists = self.snapshot_exists(&entry.snapshot).await;
+
         Ok(api::SnapshotInfo {
             snapshot_id: entry.snapshot_id,
             timestamp_ms: entry.timestamp_ms,
@@ -2323,6 +2327,11 @@ impl SnapshotManager {
             engine: entry.snapshot_engine.clone(),
             row_count: entry.snapshot_row_count,
             is_current: Some(entry.snapshot_id) == dataset_metadata.current_snapshot_id,
+            status: if exists {
+                "verified".to_string()
+            } else {
+                String::new()
+            },
         })
     }
 
@@ -4254,7 +4263,7 @@ mod tests {
         let manager = build_manager_for_api_tests(Arc::clone(&store));
 
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -4315,7 +4324,7 @@ mod tests {
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -4513,7 +4522,7 @@ mod tests {
 
         // Verify the change by reading the summary
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -4618,7 +4627,7 @@ mod tests {
             .expect("write metadata");
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
-        let result = manager.get_snapshot_summary().await;
+        let result = manager.get_snapshot_summary(100).await;
 
         assert!(result.is_err());
         let err = result.expect_err("should return error");
@@ -4643,7 +4652,7 @@ mod tests {
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 

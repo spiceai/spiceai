@@ -63,6 +63,10 @@ pub enum AccelerationCommand {
 pub struct SnapshotsArgs {
     /// The dataset name
     pub dataset: String,
+
+    /// Maximum number of snapshots to return (most recent first)
+    #[arg(long, default_value = "10")]
+    pub limit: usize,
 }
 
 /// Arguments for the snapshot subcommand.
@@ -97,6 +101,8 @@ pub struct SnapshotInfo {
     pub engine: Option<String>,
     pub row_count: Option<u64>,
     pub is_current: bool,
+    #[serde(default)]
+    pub status: String,
 }
 
 /// Snapshot summary from the API.
@@ -130,11 +136,20 @@ struct SnapshotTableRow {
     rows: String,
     checksum: String,
     current: String,
+    status: String,
 }
 
 impl TableRow for SnapshotTableRow {
     fn headers() -> Vec<&'static str> {
-        vec!["ID", "TIMESTAMP", "SIZE", "ROWS", "CHECKSUM", "CURRENT"]
+        vec![
+            "ID",
+            "TIMESTAMP",
+            "SIZE",
+            "ROWS",
+            "CHECKSUM",
+            "CURRENT",
+            "STATUS",
+        ]
     }
 
     fn values(&self) -> Vec<String> {
@@ -145,6 +160,7 @@ impl TableRow for SnapshotTableRow {
             self.rows.clone(),
             self.checksum.clone(),
             self.current.clone(),
+            self.status.clone(),
         ]
     }
 }
@@ -165,7 +181,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &AccelerationArgs) -> Result<()
 
 /// Execute the snapshots subcommand.
 async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result<()> {
-    let url = format!("/v1/datasets/{}/acceleration/snapshots", args.dataset);
+    let url = format!(
+        "/v1/datasets/{}/acceleration/snapshots?limit={}",
+        args.dataset, args.limit
+    );
 
     let response = ctx.get(&url).await.map_err(|_| {
         RuntimeUnavailableSnafu {
@@ -221,6 +240,7 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
             } else {
                 String::new()
             },
+            status: s.status.clone(),
         })
         .collect();
 
