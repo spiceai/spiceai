@@ -2069,10 +2069,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_detects_config_change() {
-        let test_db = format!(
-            "sqlite://./.test_config_change_{}.db",
-            uuid::Uuid::now_v7()
-        );
+        let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
@@ -2157,10 +2154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_detects_sort_columns_change() {
-        let test_db = format!(
-            "sqlite://./.test_sort_change_{}.db",
-            uuid::Uuid::now_v7()
-        );
+        let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
@@ -2219,16 +2213,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_cache_change_does_not_recreate() {
-        let test_db = format!(
-            "sqlite://./.test_cache_change_{}.db",
-            uuid::Uuid::now_v7()
-        );
+        let test_db = format!("sqlite://./.test_cache_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
 
         // Create table with default cache settings
         let options = CreateTableOptions {
