@@ -28,12 +28,13 @@ use test_framework::{
 /// For example, `federated/postgres[catalog].yaml` becomes `postgres[catalog]`.
 fn snapshot_name_from_spicepod(spicepod_path: &std::path::Path) -> String {
     spicepod_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .file_stem().map_or_else(
+            || "unknown".to_string(),
+            |s| s.to_string_lossy().to_string(),
+        )
 }
 
-/// Run a schema test that queries the information_schema for all tables and their columns
+/// Run a schema test that queries the `information_schema` for all tables and their columns
 /// in the catalogs defined by the spicepod.
 ///
 /// This validates that catalog connectors correctly discover and register tables and schemas.

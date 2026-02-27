@@ -17,7 +17,7 @@ limitations under the License.
 //! MSSQL catalog provider implementation.
 //!
 //! Discovers schemas and tables in a SQL Server database using
-//! `INFORMATION_SCHEMA` queries and provides them as DataFusion catalog/schema providers.
+//! `INFORMATION_SCHEMA` queries and provides them as `DataFusion` catalog/schema providers.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -124,10 +124,11 @@ impl MssqlCatalogProvider {
         let mut names = Vec::new();
         while let Some(row_result) = stream.next().await {
             let row = row_result.context(QueryFailedSnafu)?;
-            if let Some(name) = row.get::<&str, _>(0) {
-                if !SYSTEM_SCHEMAS.contains(&name) && !name.starts_with("db_") {
-                    names.push(name.to_string());
-                }
+            if let Some(name) = row.get::<&str, _>(0)
+                && !SYSTEM_SCHEMAS.contains(&name)
+                && !name.starts_with("db_")
+            {
+                names.push(name.to_string());
             }
         }
 

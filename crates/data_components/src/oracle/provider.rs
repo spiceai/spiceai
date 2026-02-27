@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! Discovers schemas (owners) and tables in an Oracle database using
 //! `ALL_USERS` and `ALL_TABLES`/`ALL_VIEWS` queries, and provides them
-//! as DataFusion catalog/schema providers.
+//! as `DataFusion` catalog/schema providers.
 
 use std::any::Any;
 use std::collections::HashMap;

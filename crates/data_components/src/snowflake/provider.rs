@@ -17,7 +17,7 @@ limitations under the License.
 //! Snowflake catalog provider implementation.
 //!
 //! Discovers schemas and tables in a Snowflake database using
-//! `INFORMATION_SCHEMA` queries and provides them as DataFusion catalog/schema providers.
+//! `INFORMATION_SCHEMA` queries and provides them as `DataFusion` catalog/schema providers.
 
 use std::any::Any;
 use std::collections::HashMap;

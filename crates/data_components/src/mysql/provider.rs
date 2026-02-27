@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! MySQL catalog provider implementation.
+//! `MySQL` catalog provider implementation.
 //!
-//! Discovers schemas and tables in a MySQL server using
-//! `information_schema` queries and provides them as DataFusion catalog/schema providers.
+//! Discovers schemas and tables in a `MySQL` server using
+//! `information_schema` queries and provides them as `DataFusion` catalog/schema providers.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -48,7 +48,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// System schemas to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
 
-/// A catalog provider for MySQL that discovers schemas and tables
+/// A catalog provider for `MySQL` that discovers schemas and tables
 /// by querying `information_schema`.
 pub struct MySQLCatalogProvider {
     pool: mysql_async::Pool,
@@ -154,7 +154,7 @@ impl RefreshableCatalogProvider for MySQLCatalogProvider {
     }
 }
 
-/// A schema provider for MySQL that discovers tables within a schema.
+/// A schema provider for `MySQL` that discovers tables within a schema.
 pub struct MySQLSchemaProvider {
     pool: mysql_async::Pool,
     schema_name: String,

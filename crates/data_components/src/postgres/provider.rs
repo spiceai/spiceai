@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! PostgreSQL catalog provider implementation.
+//! `PostgreSQL` catalog provider implementation.
 //!
-//! Discovers schemas and tables in a PostgreSQL database using
-//! `information_schema` queries and provides them as DataFusion catalog/schema providers.
+//! Discovers schemas and tables in a `PostgreSQL` database using
+//! `information_schema` queries and provides them as `DataFusion` catalog/schema providers.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// System schemas to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
 
-/// A catalog provider for PostgreSQL that discovers schemas and tables
+/// A catalog provider for `PostgreSQL` that discovers schemas and tables
 /// by querying `information_schema`.
 pub struct PostgresCatalogProvider {
     pool: Arc<PostgresConnectionPool>,
@@ -171,7 +171,7 @@ impl RefreshableCatalogProvider for PostgresCatalogProvider {
     }
 }
 
-/// A schema provider for PostgreSQL that discovers tables within a schema.
+/// A schema provider for `PostgreSQL` that discovers tables within a schema.
 pub struct PostgresSchemaProvider {
     pool: Arc<PostgresConnectionPool>,
     schema_name: String,
