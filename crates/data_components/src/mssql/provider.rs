@@ -241,8 +241,7 @@ impl MssqlSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
-        let query =
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+        let query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
              WHERE TABLE_SCHEMA = @P1 \
              AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
              ORDER BY TABLE_NAME";

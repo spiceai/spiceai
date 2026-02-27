@@ -47,6 +47,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+fn escape_sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// A catalog provider for Snowflake that discovers schemas and tables
 /// by querying Snowflake's `INFORMATION_SCHEMA`.
 pub struct SnowflakeCatalogProvider {
@@ -286,7 +290,7 @@ impl SnowflakeSchemaProvider {
     /// Lists table names in this schema using `INFORMATION_SCHEMA`.
     async fn list_tables(&self) -> Result<Vec<String>> {
         let escaped_db = self.database.replace('"', "\"\"");
-        let escaped_schema = self.schema_name.replace('\'', "''");
+        let escaped_schema = escape_sql_string_literal(&self.schema_name);
         let query = format!(
             "SELECT TABLE_NAME FROM \"{escaped_db}\".INFORMATION_SCHEMA.TABLES \
              WHERE TABLE_SCHEMA = '{escaped_schema}' \
@@ -355,5 +359,28 @@ impl SchemaProvider for SnowflakeSchemaProvider {
             Err(e) => e.into_inner(),
         };
         guard.contains_key(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_sql_string_literal;
+
+    #[test]
+    fn test_escape_sql_string_literal_no_quotes() {
+        assert_eq!(escape_sql_string_literal("schema_name"), "schema_name");
+    }
+
+    #[test]
+    fn test_escape_sql_string_literal_single_quote() {
+        assert_eq!(escape_sql_string_literal("schema'name"), "schema''name");
+    }
+
+    #[test]
+    fn test_escape_sql_string_literal_multiple_single_quotes() {
+        assert_eq!(
+            escape_sql_string_literal("o'brien'schema"),
+            "o''brien''schema"
+        );
     }
 }
