@@ -30,6 +30,7 @@ use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
     ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::args::StdioArgs;
@@ -77,22 +78,6 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-}
-
-/// Average non-`None` `f64` values extracted from pods.
-#[expect(clippy::cast_precision_loss)]
-fn avg_opt(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
-) -> Option<f64> {
-    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
-        if let Some(v) = f(p) {
-            (s + v, c + 1)
-        } else {
-            (s, c)
-        }
-    });
-    (count > 0).then_some(sum / (count as f64))
 }
 
 /// Sum non-`None` `u64` values extracted from pods.
@@ -222,12 +207,26 @@ impl Handler for SpidapterHandler {
             ResourceMetrics::default()
         } else {
             ResourceMetrics {
-                cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                // Sum cumulative CPU seconds across all pods
+                cpu_usage_percent: Some(
+                    pods.iter()
+                        .filter_map(|p| p.cpu_usage_percent)
+                        .sum::<f64>()
+                        .max(0.0),
+                ),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
-                disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
-                disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
-                disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
-                disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
+                disk_read_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes).unwrap_or_default(),
+                ),
+                disk_write_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes).unwrap_or_default(),
+                ),
+                disk_read_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations).unwrap_or_default(),
+                ),
+                disk_write_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations).unwrap_or_default(),
+                ),
             }
         };
 
@@ -298,24 +297,37 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
+        let mut attempts = 0; // global attempt counter, not per-table, to avoid compounding retries
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
-            let response = sql_client
-                .post(&sql_url)
-                .header("X-API-Key", api_key)
-                .body(statement.clone())
-                .send()
-                .await?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<failed to read error body>".to_string());
-                return Err(anyhow::anyhow!(
-                    "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
-                ));
+            loop {
+                attempts += 1;
+
+                let response = sql_client
+                    .post(&sql_url)
+                    .header("X-API-Key", api_key)
+                    .body(statement.clone())
+                    .send()
+                    .await?;
+
+                if response.status().is_success() {
+                    break;
+                }
+
+                if attempts >= 3 {
+                    let status = response.status();
+                    let body = response.text().await?;
+                    return Err(anyhow::anyhow!(
+                        "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
+                    ));
+                }
+
+                let backoff_seconds = attempts * 2;
+                eprintln!(
+                    "[stdio] Post-setup SQL failed, retrying in {backoff_seconds}s (attempt {attempts}/3)"
+                );
+                sleep(Duration::from_secs(backoff_seconds)).await;
             }
         }
 
