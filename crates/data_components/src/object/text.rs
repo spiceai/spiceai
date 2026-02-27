@@ -37,6 +37,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
+use datafusion_datasource::metadata::MetadataColumn;
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
@@ -46,7 +47,7 @@ use std::{any::Any, fmt, sync::Arc};
 
 use crate::object::filter::filter_object_meta;
 
-use super::{ObjectStoreContext, metadata_column::MetadataColumn};
+use super::ObjectStoreContext;
 use url::Url;
 
 pub struct ObjectStoreTextTable {

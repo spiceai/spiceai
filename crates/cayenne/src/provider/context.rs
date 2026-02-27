@@ -21,7 +21,7 @@ use std::sync::Arc;
 use datafusion_execution::config::SessionConfig;
 use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{VortexFormat, VortexOptions};
+use vortex_datafusion::{VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
 use crate::metadata::VortexConfig;
@@ -127,10 +127,10 @@ impl CayenneContext {
         let vortex_session = VortexSession::default();
 
         // Configure VortexFormat - it creates its own VortexFileCache internally
-        let vortex_opts = VortexOptions {
-            footer_cache_size_mb: config.footer_cache_mb,
-            segment_cache_size_mb: config.segment_cache_mb,
-            ..VortexOptions::default()
+        let vortex_opts = VortexTableOptions {
+            footer_initial_read_size_bytes: config.footer_cache_mb * 1024 * 1024,
+            target_file_size_mb: config.target_vortex_file_size_mb,
+            ..VortexTableOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))

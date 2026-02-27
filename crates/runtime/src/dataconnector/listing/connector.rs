@@ -42,7 +42,7 @@ use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::{PartitionedFile, TableSchema};
+use datafusion_datasource::{PartitionedFile, TableSchema, metadata::MetadataColumn};
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
@@ -191,6 +191,14 @@ impl TableProvider for LocationPruningListingTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let Some(locations) = extract_location_predicates(filters) else {
+            if !self.inner.options().table_partition_cols.is_empty()
+                && !self.inner.options().metadata_cols.is_empty()
+            {
+                return Err(DataFusionError::Execution(
+                    "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.".to_string(),
+                ));
+            }
+
             return self.inner.scan(state, projection, filters, limit).await;
         };
 
@@ -1022,7 +1030,23 @@ pub trait ListingTableConnector: DataConnector {
             return Ok(Arc::new(cached_table));
         }
 
-        Ok(table_arc)
+        let has_location_metadata = table_arc
+            .options()
+            .metadata_cols
+            .iter()
+            .any(|c| matches!(c, MetadataColumn::Location(_)));
+
+        if has_location_metadata {
+            let wrapped = LocationPruningListingTable::new(
+                table_arc,
+                Arc::clone(&object_store),
+                table_path,
+                file_schema,
+            );
+            Ok(Arc::new(wrapped))
+        } else {
+            Ok(table_arc)
+        }
     }
 
     fn deduplicate_partition_columns_expressed_in_file(
@@ -1151,11 +1175,12 @@ fn add_metadata_columns_if_required(
 ) -> ListingOptions {
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
-        tracing::warn!(
-            "Listing metadata columns are not supported on DataFusion v52.2; ignoring requested columns for '{}': {:?}",
+        tracing::debug!(
+            "Enabling metadata columns for '{}': {:?}",
             dataset.name,
             columns
         );
+        return options.with_metadata_cols(columns);
     }
 
     options
@@ -1879,6 +1904,7 @@ mod tests {
         let file_format = Arc::new(ParquetFormat::default());
         let options = ListingOptions::new(file_format)
             .with_file_extension(".parquet")
+            .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))])
             .with_table_partition_cols(vec![]);
 
         let file_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1922,10 +1948,10 @@ mod tests {
         );
     }
 
-    /// Regression test for projection behavior when querying location metadata on partitioned listing tables.
+    /// Regression test for metadata-column projection with partition columns.
     ///
-    /// `DataFusion` v52.2 no longer exposes listing metadata columns.
-    /// Runtime must fail safely with a clear planner error instead of panicking.
+    /// `DataFusion` v52 can panic in this path during physical planning.
+    /// Runtime must fail safely with a clear error instead of panicking.
     #[tokio::test]
     async fn test_location_metadata_column_projection_order() {
         use datafusion::parquet::arrow::ArrowWriter;
@@ -1966,15 +1992,18 @@ mod tests {
         ctx.runtime_env()
             .register_object_store(&store_url, Arc::new(object_store));
 
-        // Create listing options with partition columns. DataFusion v52.2 does not support
-        // injecting listing metadata columns through ListingOptions.
+        // Create listing options with partition columns and location metadata
         let file_format = Arc::new(ParquetFormat::default());
         let options = ListingOptions::new(file_format)
             .with_file_extension(".parquet")
-            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)]);
+            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
+            .with_metadata_cols(vec![MetadataColumn::Location(Some(
+                table_url.clone().into(),
+            ))]);
 
         // Note: We only provide the file schema here. The ListingTable automatically
-        // adds partition columns (day) to form the full table schema.
+        // adds partition columns (day) and metadata columns (location) to form the
+        // full table schema.
         let listing = ListingTable::try_new(
             ListingTableConfig::new(table_path.clone())
                 .with_listing_options(options)
@@ -1994,7 +2023,7 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .expect("register table");
 
-        // Test 1: SELECT with non-existent location metadata fails safely (no panic).
+        // Test 1: SELECT with metadata + partition columns fails safely (no panic).
         let df = ctx
             .sql("SELECT location, day, compression FROM test_table")
             .await
@@ -2002,13 +2031,15 @@ mod tests {
         let err = df
             .collect()
             .await
-            .expect_err("query with missing location column should fail safely");
+            .expect_err("metadata+partition scan should fail safely");
         assert!(
-            err.to_string().contains("location") || err.to_string().contains("No field named"),
-            "expected missing location-column error, got: {err}"
+            err.to_string().contains(
+                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
+            ),
+            "expected a clear metadata+partition error, got: {err}"
         );
 
-        // Test 2: SELECT with location and day also fails safely.
+        // Test 2: SELECT with just location and day also fails safely.
         let df = ctx
             .sql("SELECT location, day FROM test_table")
             .await
@@ -2016,10 +2047,12 @@ mod tests {
         let err = df
             .collect()
             .await
-            .expect_err("query with missing location column should fail safely");
+            .expect_err("metadata+partition scan should fail safely");
         assert!(
-            err.to_string().contains("location") || err.to_string().contains("No field named"),
-            "expected missing location-column error, got: {err}"
+            err.to_string().contains(
+                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
+            ),
+            "expected a clear metadata+partition error, got: {err}"
         );
 
         // Test 3: File-column-only projection also fails safely for this unsupported combination.
