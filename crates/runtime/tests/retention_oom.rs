@@ -87,8 +87,7 @@ async fn run_outer_container_repro() -> Result<(), anyhow::Error> {
     let payload_bytes = env_usize(INNER_PAYLOAD_BYTES_ENV, DEFAULT_PAYLOAD_BYTES)?;
 
     eprintln!(
-        "Running containerized retention delete regression with rows={rows}, payload_bytes={payload_bytes}, memory_limit={}MiB",
-        CONTAINER_MEMORY_LIMIT_MB
+        "Running containerized retention delete regression with rows={rows}, payload_bytes={payload_bytes}, memory_limit={CONTAINER_MEMORY_LIMIT_MB}MiB"
     );
 
     let image_tag = format!(
