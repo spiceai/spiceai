@@ -1938,7 +1938,8 @@ mod tests {
             .await
             .expect("scan with location predicate");
 
-        assert_eq!(plan.schema().fields().len(), 1);
+        // 2 fields: the file column ("value") + the metadata column ("location")
+        assert_eq!(plan.schema().fields().len(), 2);
 
         assert!(
             !no_list_store
