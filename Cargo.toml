@@ -57,8 +57,6 @@ members = [
     "crates/workers",
     "crates/yaml",
     "crates/scheduler",
-    "tools/eval",
-    "tools/evalconverter",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
     "tools/flight-cookie-server/",
