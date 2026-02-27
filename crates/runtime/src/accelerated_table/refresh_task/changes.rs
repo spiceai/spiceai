@@ -16,7 +16,7 @@ limitations under the License.
 use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
-use crate::datafusion::error::find_datafusion_root;
+use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::DataType;
@@ -125,9 +125,10 @@ impl RefreshTask {
                             }
                         }
                         Err(e) => {
+                            let error_message = format_datafusion_error(&e);
                             self.set_refresh_status(
                                 refresh.read().await.sql.clone().as_deref(),
-                                status::ComponentStatus::error_with_message(e.to_string()),
+                                status::ComponentStatus::error_with_message(error_message),
                             )
                             .await;
                             if !self.runtime_status.is_shutdown() {
@@ -142,9 +143,10 @@ impl RefreshTask {
                         continue;
                     }
 
+                    let error_message = format_datafusion_error(&e);
                     self.set_refresh_status(
                         refresh.read().await.sql.clone().as_deref(),
-                        status::ComponentStatus::error_with_message(e.to_string()),
+                        status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
                 }

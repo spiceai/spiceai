@@ -23,10 +23,14 @@ use itertools::Itertools;
 use object_store::path::{DELIMITER, Path};
 use object_store::{ObjectMeta, ObjectStore};
 use snafu::prelude::*;
+use crate::datafusion::error::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to list files when inferring data partitions: {source}"))]
+    #[snafu(display(
+        "Failed to list files when inferring data partitions: {}",
+        format_datafusion_error(source)
+    ))]
     ListAllFiles { source: DataFusionError },
 
     #[snafu(display("Inconsistent partition columns found across files: {sorted_diff:?}"))]
@@ -35,7 +39,10 @@ pub enum Error {
     #[snafu(display("File path '{file_path}' is not under the expected prefix '{prefix}'"))]
     FileNotContainedInPrefix { prefix: Path, file_path: Path },
 
-    #[snafu(display("Failed to access the object store: {source}"))]
+    #[snafu(display(
+        "Failed to access the object store: {}",
+        format_datafusion_error(source)
+    ))]
     ObjectStore { source: DataFusionError },
 }
 

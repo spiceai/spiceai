@@ -41,6 +41,16 @@ pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
 
+pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues.";
+
+#[must_use]
+pub fn sanitize_datafusion_error_message(message: &str) -> String {
+    message
+        .replace(DATAFUSION_BUG_REPORT_MESSAGE, "")
+        .trim()
+        .to_string()
+}
+
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::cast_sign_loss)]
 #[expect(clippy::cast_possible_truncation)]
@@ -238,7 +248,9 @@ pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usi
 mod tests {
     // generate test for human_readable_bytes
 
-    use crate::distribute_nulls;
+    use crate::{
+        DATAFUSION_BUG_REPORT_MESSAGE, distribute_nulls, sanitize_datafusion_error_message,
+    };
 
     #[test]
     fn test_human_readable_bytes() {
@@ -365,5 +377,19 @@ mod tests {
             distribute_nulls(vec![1, 2], vec![3, 0, 1]),
             vec![None, None, Some(1), None, Some(2)]
         );
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_removes_bug_report_suffix() {
+        let input = format!("Internal error: foo. {DATAFUSION_BUG_REPORT_MESSAGE}");
+        let sanitized = sanitize_datafusion_error_message(&input);
+        assert_eq!(sanitized, "Internal error: foo.");
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_keeps_other_messages() {
+        let input = "Error during planning: table x not found";
+        let sanitized = sanitize_datafusion_error_message(input);
+        assert_eq!(sanitized, input);
     }
 }

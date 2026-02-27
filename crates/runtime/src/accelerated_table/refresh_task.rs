@@ -23,7 +23,9 @@ use crate::accelerated_table::caching::CacheRefreshHelper;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
-use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
+use crate::datafusion::error::{
+    SpiceExternalError, find_datafusion_root, format_datafusion_error, get_spice_df_error,
+};
 use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
@@ -740,9 +742,10 @@ impl RefreshTask {
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
+            let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
-                status::ComponentStatus::error_with_message(e.to_string()),
+                status::ComponentStatus::error_with_message(error_message),
             )
             .await;
             return Err(e);
@@ -1383,16 +1386,17 @@ impl RefreshTask {
         // Check for S3 Express One Zone upload speed error and provide user-friendly message.
         // ClientUploadSpeedTooSlow is specific to S3 Express One Zone (directory buckets).
         if self.is_s3_express_acceleration && is_s3_express_upload_speed_error(&error.to_string()) {
+            let error_message = format_datafusion_error(error);
             let table_name =
                 include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref());
             tracing::warn!(
-                error = %error,
+                error = %error_message,
                 "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
                 self.component_type(),
             );
             self.set_refresh_status(
                 refresh_sql,
-                status::ComponentStatus::error_with_message(error.to_string()),
+                status::ComponentStatus::error_with_message(error_message),
             )
             .await;
             return;
@@ -1433,14 +1437,16 @@ impl RefreshTask {
             return;
         }
 
+        let error_message = format_datafusion_error(error);
         tracing::warn!(
-            "Failed to load data for {} {}: {error}",
+            "Failed to load data for {} {}: {}",
             self.component_type(),
             include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            error_message,
         );
         self.set_refresh_status(
             refresh_sql,
-            status::ComponentStatus::error_with_message(error.to_string()),
+            status::ComponentStatus::error_with_message(error_message),
         )
         .await;
     }

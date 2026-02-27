@@ -77,7 +77,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use error::find_datafusion_root;
+use error::{find_datafusion_root, format_datafusion_error};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use query::QueryBuilder;
@@ -164,7 +164,7 @@ pub enum Error {
     #[snafu(display("Unable to delete table: {reason}"))]
     UnableToDeleteTable { reason: String },
 
-    #[snafu(display("Unable to parse SQL: {source}"))]
+    #[snafu(display("Unable to parse SQL: {}", format_datafusion_error(source)))]
     UnableToParseSql { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -173,10 +173,10 @@ pub enum Error {
     #[snafu(display("{source}"))]
     RetentionSql { source: retention_sql::Error },
 
-    #[snafu(display("Unable to get table: {source}"))]
+    #[snafu(display("Unable to get table: {}", format_datafusion_error(source)))]
     UnableToGetTable { source: DataFusionError },
 
-    #[snafu(display("Unable to list tables: {source}"))]
+    #[snafu(display("Unable to list tables: {}", format_datafusion_error(source)))]
     UnableToGetTables { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
@@ -192,10 +192,16 @@ pub enum Error {
     ))]
     MetadataProviderNotImplemented { table_name: String },
 
-    #[snafu(display("Unable to register table in DataFusion: {source}"))]
+    #[snafu(display(
+        "Unable to register table in DataFusion: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
 
-    #[snafu(display("Unable to register {schema} table in DataFusion: {source}"))]
+    #[snafu(display(
+        "Unable to register {schema} table in DataFusion: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterTableToDataFusionSchema {
         schema: String,
         source: DataFusionError,
@@ -212,13 +218,19 @@ pub enum Error {
     #[snafu(display("The table {table_name} is not writable"))]
     TableNotWritable { table_name: String },
 
-    #[snafu(display("Unable to plan the table insert for {table_name}: {source}"))]
+    #[snafu(display(
+        "Unable to plan the table insert for {table_name}: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToPlanTableInsert {
         table_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to execute the table insert for {table_name}: {source}"))]
+    #[snafu(display(
+        "Unable to execute the table insert for {table_name}: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToExecuteTableInsert {
         table_name: String,
         source: DataFusionError,
@@ -254,7 +266,10 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
-    #[snafu(display("Unable to get {schema} schema: {source}"))]
+    #[snafu(display(
+        "Unable to get {schema} schema: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGetSchema {
         schema: String,
         source: DataFusionError,
@@ -291,7 +306,10 @@ pub enum Error {
     ))]
     ChangeSchemaWithoutDataField { source: ArrowError },
 
-    #[snafu(display("Unable to create streaming data update: {source}"))]
+    #[snafu(display(
+        "Unable to create streaming data update: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
@@ -329,7 +347,8 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {source}"
+        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
+        format_datafusion_error(source)
     ))]
     UnableToSetUnderlyingTableProvider {
         component_name: String,

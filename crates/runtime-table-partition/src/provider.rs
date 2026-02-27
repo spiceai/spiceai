@@ -47,6 +47,7 @@ use datafusion::{
 use pruning::prune_partition;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use util::format_datafusion_error;
 
 use crate::{
     Partition,
@@ -66,7 +67,10 @@ pub enum Error {
     CreatingPartition { source: super::creator::Error },
     #[snafu(display("Validating expressions failed: {source}"))]
     ValidatingExpressions { source: super::expression::Error },
-    #[snafu(display("Failed to convert schema to DFSchema: {source}"))]
+    #[snafu(display(
+        "Failed to convert schema to DFSchema: {}",
+        format_datafusion_error(source)
+    ))]
     SchemaConversion { source: DataFusionError },
     #[snafu(display("Expected array from partition expression, got scalar"))]
     InvalidPartitionExpression,

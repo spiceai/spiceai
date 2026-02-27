@@ -28,13 +28,15 @@ use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
+use crate::datafusion::error::format_datafusion_error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Refresh SQL could not be parsed. {source} Check the SQL for syntax errors."
+        "The provided Refresh SQL could not be parsed. {} Check the SQL for syntax errors.",
+        format_datafusion_error(source)
     ))]
     UnableToParseSql { source: DataFusionError },
 

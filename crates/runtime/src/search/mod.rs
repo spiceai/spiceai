@@ -22,6 +22,7 @@ pub mod types;
 pub mod util;
 
 use arrow_schema::ArrowError;
+use crate::datafusion::error::format_datafusion_error;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
 use search::aggregation;
@@ -44,7 +45,10 @@ pub enum Error {
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
-    #[snafu(display("Failed to execute search query: {source}"))]
+    #[snafu(display(
+        "Failed to execute search query: {}",
+        format_datafusion_error(source)
+    ))]
     DataFusionError {
         source: datafusion::error::DataFusionError,
     },

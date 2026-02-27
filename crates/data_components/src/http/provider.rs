@@ -57,6 +57,7 @@ use util::{
     RetryError, retry,
     retry_strategy::{BackoffMethod, RetryBackoff, RetryBackoffBuilder},
 };
+use util::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -80,7 +81,10 @@ pub enum Error {
     #[snafu(display("Failed to process HTTP response data: {source}"))]
     Arrow { source: ArrowError },
 
-    #[snafu(display("Failed to execute HTTP query: {source}"))]
+    #[snafu(display(
+        "Failed to execute HTTP query: {}",
+        format_datafusion_error(source)
+    ))]
     DataFusion { source: DataFusionError },
 
     #[snafu(display("Filter rejected: {message}"))]

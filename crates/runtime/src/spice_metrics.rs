@@ -23,6 +23,7 @@ use datafusion::sql::TableReference;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use crate::datafusion::error::format_datafusion_error;
 
 use crate::Runtime;
 use crate::accelerated_table::Retention;
@@ -40,7 +41,10 @@ pub enum Error {
     #[snafu(display("Failed to create the internal metrics table: {source}"))]
     UnableToCreateMetricsTable { source: InternalTableError },
 
-    #[snafu(display("Failed to register the internal metrics table: {source}"))]
+    #[snafu(display(
+        "Failed to register the internal metrics table: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterToMetricsTable { source: DataFusionError },
 }
 

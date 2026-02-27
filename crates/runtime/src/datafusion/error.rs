@@ -21,6 +21,7 @@ use std::{fmt::Display, sync::Arc};
 use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
 use datafusion_table_providers::util::retriable_error::RetriableError;
+pub use util::{DATAFUSION_BUG_REPORT_MESSAGE, format_datafusion_error, sanitize_datafusion_error_message};
 
 #[derive(Debug)]
 pub enum SpiceExternalError {
@@ -124,3 +125,4 @@ pub fn find_datafusion_root(e: DataFusionError) -> DataFusionError {
         }
     }
 }
+

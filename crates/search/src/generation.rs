@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use snafu::Snafu;
+use ::util::format_datafusion_error;
 
 #[cfg(feature = "text_search")]
 pub mod text_search;
@@ -31,7 +32,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to execute search query: {source}"))]
+    #[snafu(display(
+        "Failed to execute search query: {}",
+        format_datafusion_error(source)
+    ))]
     QueryError { source: DataFusionError },
 
     #[cfg(feature = "text_search")]

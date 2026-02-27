@@ -20,6 +20,7 @@ use std::{
 };
 
 use super::SampleFrom;
+use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::DataFusion;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
@@ -44,7 +45,10 @@ use tracing_futures::Instrument;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to parse order_by '{order_by}' for top_n_sample: {source}"))]
+    #[snafu(display(
+        "Failed to parse order_by '{order_by}' for top_n_sample: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToParseOrderBy {
         source: DataFusionError,
         order_by: String,

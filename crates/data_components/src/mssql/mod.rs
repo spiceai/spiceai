@@ -31,6 +31,7 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
+use util::format_datafusion_error;
 
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
@@ -70,7 +71,10 @@ pub enum Error {
     #[snafu(display("Failed to process SQL Server query result: unsupported type '{mssql_type}'"))]
     FailedToDowncastBuilder { mssql_type: String },
 
-    #[snafu(display("Failed to generate SQL for SQL Server query: {source}"))]
+    #[snafu(display(
+        "Failed to generate SQL for SQL Server query: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGenerateSQL { source: DataFusionError },
 }
 
