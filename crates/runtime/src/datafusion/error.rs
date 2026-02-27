@@ -125,4 +125,3 @@ pub fn find_datafusion_root(e: DataFusionError) -> DataFusionError {
         }
     }
 }
-
