@@ -18,7 +18,7 @@ limitations under the License.
 
 use serde::{Deserialize, Serialize};
 
-use super::status::ComponentStatus;
+use super::status::{ComponentError, ComponentStatus};
 
 /// Response wrapper for the `/v1/models` endpoint (OpenAI-compatible format).
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,6 +61,19 @@ pub struct ModelInfo {
     /// The status of the model (e.g., `Ready`, `Initializing`, `Error`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
+
+    /// An optional error type/code for the model status.
+    /// Only populated when `status=true` and the model status is `Error`.
+    /// Example:
+    /// `{ "category": "model", "type": "auth", "code": "model.auth" }`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ComponentError>,
+
+    /// An optional error message describing why the model entered an error state.
+    /// Only populated when `status=true`, the model status is `Error`, and an error message was recorded.
+    /// This value is intended for user-visible display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 
     /// Optional metadata fields, included when requested via query parameters
     #[serde(skip_serializing_if = "Option::is_none")]

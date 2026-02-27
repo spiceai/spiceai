@@ -20,9 +20,10 @@ use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
+use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{Runtime, TelemetryConfig};
+use spicepod::component::runtime::{Flight, Runtime, TelemetryConfig};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
@@ -196,6 +197,7 @@ impl Handler for SpidapterHandler {
                 .as_ref()
                 .filter(|t| matches!(t, EtlSinkType::Adbc))
                 .map(|_| "spicebench.bench".to_string()),
+            read_driver: None,
         };
 
         self.runs.insert(run_id, state);
@@ -561,15 +563,17 @@ fn generate_adbc_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
             enabled: false,
             ..TelemetryConfig::default()
         },
+        flight: Some(Flight {
+            do_put_rate_limit_enabled: false,
+            ..Flight::default()
+        }),
         ..Runtime::default()
     };
 
-    spicepod
-        .catalogs
-        .push(ComponentOrReference::Component(Catalog::new(
-            "cayenne".to_string(),
-            "spicebench".to_string(),
-        )));
+    spicepod.catalogs.push(ComponentOrReference::Component(
+        Catalog::new("cayenne".to_string(), "spicebench".to_string())
+            .with_access(AccessMode::ReadWriteCreate),
+    ));
     yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
