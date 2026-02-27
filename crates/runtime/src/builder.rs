@@ -190,15 +190,11 @@ impl RuntimeBuilder {
         document_parse::register_all().await;
 
         // Resolve the effective spicepod runtime config: config override > app > default.
-        let spicepod_rt = self
-            .runtime_config
-            .runtime
-            .clone()
-            .unwrap_or_else(|| {
-                self.app
-                    .as_ref()
-                    .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
-            });
+        let spicepod_rt = self.runtime_config.runtime.clone().unwrap_or_else(|| {
+            self.app
+                .as_ref()
+                .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
+        });
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
 
@@ -221,11 +217,8 @@ impl RuntimeBuilder {
             });
 
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
-        let url_tables_enabled = spicepod_rt
-            .params
-            .get("url_tables")
-            .map(String::as_str)
-            == Some("enabled");
+        let url_tables_enabled =
+            spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());

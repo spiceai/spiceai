@@ -76,21 +76,13 @@ async fn query_scalar_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
 
 /// Creates a Cayenne `Catalog` component with `read_write_create` access, pointing
 /// at the given temp directories.
-fn make_cayenne_catalog(
-    catalog_name: &str,
-    data_dir: &str,
-    metadata_dir: &str,
-) -> Catalog {
-    let mut catalog =
-        Catalog::new("cayenne".to_string(), catalog_name.to_string())
-            .with_access(AccessMode::ReadWriteCreate);
+fn make_cayenne_catalog(catalog_name: &str, data_dir: &str, metadata_dir: &str) -> Catalog {
+    let mut catalog = Catalog::new("cayenne".to_string(), catalog_name.to_string())
+        .with_access(AccessMode::ReadWriteCreate);
     catalog.params = Some(Params::from_string_map(
         vec![
             ("cayenne_data_dir".to_string(), data_dir.to_string()),
-            (
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_string(),
-            ),
+            ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
         ]
         .into_iter()
         .collect::<HashMap<String, String>>(),
@@ -170,11 +162,8 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             );
 
             // Verify table is empty.
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 0, "Table should be empty after creation");
 
             // -----------------------------------------------------------------
@@ -192,11 +181,8 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             .await?;
 
             // Validate row count.
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 5, "Expected 5 rows after initial insert");
 
             // Validate specific rows.
@@ -232,53 +218,33 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             )
             .await?;
 
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 7, "Expected 7 rows after second insert");
 
             // -----------------------------------------------------------------
             // Step 4: DELETE specific rows
             // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "DELETE FROM test_cat.myschema.users WHERE id = 3",
-            )
-            .await?;
+            exec(&rt, "DELETE FROM test_cat.myschema.users WHERE id = 3").await?;
 
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 6, "Expected 6 rows after deleting id=3");
 
             // Verify the deleted row is gone.
-            let batches = run_query(
-                &rt,
-                "SELECT id FROM test_cat.myschema.users WHERE id = 3",
-            )
-            .await?;
+            let batches =
+                run_query(&rt, "SELECT id FROM test_cat.myschema.users WHERE id = 3").await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 0, "id=3 should no longer exist");
 
             // -----------------------------------------------------------------
             // Step 5: DELETE multiple rows with a range filter
             // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "DELETE FROM test_cat.myschema.users WHERE age < 26",
-            )
-            .await?;
+            exec(&rt, "DELETE FROM test_cat.myschema.users WHERE age < 26").await?;
 
             // Bob (25) and Eve (22) should be deleted.
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 4, "Expected 4 rows after deleting age < 26");
 
             let batches = run_query(
@@ -302,7 +268,120 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             );
 
             // -----------------------------------------------------------------
-            // Step 6: INSERT after DELETE — verify correctness
+            // Step 6: UPDATE single row — modify a column value
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "UPDATE test_cat.myschema.users SET age = 31 WHERE id = 1",
+            )
+            .await?;
+
+            // Alice's age should now be 31 (was 30).
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, age FROM test_cat.myschema.users WHERE id = 1",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------+-----+",
+                    "| id | name  | age |",
+                    "+----+-------+-----+",
+                    "| 1  | Alice | 31  |",
+                    "+----+-------+-----+",
+                ],
+                &batches
+            );
+
+            // Row count should remain the same after UPDATE.
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
+            assert_eq!(count, 4, "UPDATE should not change row count");
+
+            // -----------------------------------------------------------------
+            // Step 7: UPDATE multiple rows — bulk modification
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "UPDATE test_cat.myschema.users SET age = age + 10 WHERE age > 30",
+            )
+            .await?;
+
+            // Alice(31→41), Diana(28 unchanged), Frank(40→50), Grace(33→43)
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, age FROM test_cat.myschema.users ORDER BY id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------+-----+",
+                    "| id | name  | age |",
+                    "+----+-------+-----+",
+                    "| 1  | Alice | 41  |",
+                    "| 4  | Diana | 28  |",
+                    "| 6  | Frank | 50  |",
+                    "| 7  | Grace | 43  |",
+                    "+----+-------+-----+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 8: UPDATE with NULL — set a column to NULL
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "UPDATE test_cat.myschema.users SET email = NULL WHERE id = 4",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, email FROM test_cat.myschema.users WHERE id = 4",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------+-------+",
+                    "| id | name  | email |",
+                    "+----+-------+-------+",
+                    "| 4  | Diana |       |",
+                    "+----+-------+-------+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 9: UPDATE multiple columns at once
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "UPDATE test_cat.myschema.users SET name = 'Grace Updated', age = 99 WHERE id = 7",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, age FROM test_cat.myschema.users WHERE id = 7",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+---------------+-----+",
+                    "| id | name          | age |",
+                    "+----+---------------+-----+",
+                    "| 7  | Grace Updated | 99  |",
+                    "+----+---------------+-----+",
+                ],
+                &batches
+            );
+
+            // Restore ages for subsequent steps: Alice=41, Diana=28, Frank=50, Grace=99
+            // Overall state: 4 rows
+
+            // -----------------------------------------------------------------
+            // Step 10: INSERT after UPDATE — verify correctness
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -311,15 +390,12 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             )
             .await?;
 
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 5, "Expected 5 rows after inserting Heidi");
 
             // -----------------------------------------------------------------
-            // Step 7: Aggregation queries — validate computations
+            // Step 11: Aggregation queries — validate computations
             // -----------------------------------------------------------------
             let avg_age = {
                 let batches = run_query(
@@ -335,36 +411,27 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     .expect("avg_age column")
                     .value(0)
             };
-            // Remaining: Alice(30), Diana(28), Frank(40), Grace(33), Heidi(29)
-            // Average = (30 + 28 + 40 + 33 + 29) / 5 = 160 / 5 = 32.0
+            // Remaining: Alice(41), Diana(28), Frank(50), Grace Updated(99), Heidi(29)
+            // Average = (41 + 28 + 50 + 99 + 29) / 5 = 247 / 5 = 49.4
             assert!(
-                (avg_age - 32.0).abs() < f64::EPSILON,
-                "Expected AVG(age) = 32.0, got {avg_age}"
+                (avg_age - 49.4).abs() < f64::EPSILON,
+                "Expected AVG(age) = 49.4, got {avg_age}"
             );
 
-            let max_age = query_scalar_i64(
-                &rt,
-                "SELECT MAX(age) FROM test_cat.myschema.users",
-            )
-            .await?;
-            assert_eq!(max_age, 40, "Expected MAX(age) = 40 (Frank)");
+            let max_age =
+                query_scalar_i64(&rt, "SELECT MAX(age) FROM test_cat.myschema.users").await?;
+            assert_eq!(max_age, 99, "Expected MAX(age) = 99 (Grace Updated)");
 
-            let min_age = query_scalar_i64(
-                &rt,
-                "SELECT MIN(age) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let min_age =
+                query_scalar_i64(&rt, "SELECT MIN(age) FROM test_cat.myschema.users").await?;
             assert_eq!(min_age, 28, "Expected MIN(age) = 28 (Diana)");
 
-            let sum_age = query_scalar_i64(
-                &rt,
-                "SELECT SUM(age) FROM test_cat.myschema.users",
-            )
-            .await?;
-            assert_eq!(sum_age, 160, "Expected SUM(age) = 160");
+            let sum_age =
+                query_scalar_i64(&rt, "SELECT SUM(age) FROM test_cat.myschema.users").await?;
+            assert_eq!(sum_age, 247, "Expected SUM(age) = 247");
 
             // -----------------------------------------------------------------
-            // Step 8: NULL handling validation
+            // Step 12: NULL handling validation
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -373,22 +440,16 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             .await?;
 
             // COUNT(*) counts all rows; COUNT(email) should exclude NULLs.
-            let count_star = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count_star =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count_star, 6, "COUNT(*) should be 6");
 
-            let count_email = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(email) FROM test_cat.myschema.users",
-            )
-            .await?;
-            // Ivan has NULL email; all others have emails.
+            let count_email =
+                query_scalar_i64(&rt, "SELECT COUNT(email) FROM test_cat.myschema.users").await?;
+            // Ivan has NULL email, Diana has NULL email (set in Step 8); all others have emails.
             assert_eq!(
-                count_email, 5,
-                "COUNT(email) should be 5 (Ivan has NULL email)"
+                count_email, 4,
+                "COUNT(email) should be 4 (Ivan and Diana have NULL email)"
             );
 
             // Query rows where email IS NULL.
@@ -399,29 +460,27 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             .await?;
             assert_batches_eq!(
                 &[
-                    "+----+------+",
-                    "| id | name |",
-                    "+----+------+",
-                    "| 9  | Ivan |",
-                    "+----+------+",
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 4  | Diana |",
+                    "| 9  | Ivan  |",
+                    "+----+-------+",
                 ],
                 &batches
             );
 
             // -----------------------------------------------------------------
-            // Step 9: DELETE all remaining rows
+            // Step 13: DELETE all remaining rows
             // -----------------------------------------------------------------
             exec(&rt, "DELETE FROM test_cat.myschema.users WHERE true").await?;
 
-            let count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM test_cat.myschema.users",
-            )
-            .await?;
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
             assert_eq!(count, 0, "Table should be empty after DELETE WHERE true");
 
             // -----------------------------------------------------------------
-            // Step 10: INSERT into empty table after full delete
+            // Step 14: INSERT into empty table after full delete
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -515,11 +574,8 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
                 "Data should be preserved after CREATE IF NOT EXISTS"
             );
 
-            let batches = run_query(
-                &rt,
-                "SELECT id, val FROM cat_idempotent.s1.t1 ORDER BY id",
-            )
-            .await?;
+            let batches =
+                run_query(&rt, "SELECT id, val FROM cat_idempotent.s1.t1 ORDER BY id").await?;
             assert_batches_eq!(
                 &[
                     "+----+-----+",
@@ -761,17 +817,10 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             )
             .await?;
 
-            exec(
-                &rt,
-                "INSERT INTO cat_drop.ns.ephemeral VALUES (10, 'new')",
-            )
-            .await?;
+            exec(&rt, "INSERT INTO cat_drop.ns.ephemeral VALUES (10, 'new')").await?;
 
-            let batches = run_query(
-                &rt,
-                "SELECT id, val FROM cat_drop.ns.ephemeral ORDER BY id",
-            )
-            .await?;
+            let batches =
+                run_query(&rt, "SELECT id, val FROM cat_drop.ns.ephemeral ORDER BY id").await?;
             assert_batches_eq!(
                 &[
                     "+----+-----+",
@@ -893,17 +942,10 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             );
 
             // Delete from one schema, verify the other is untouched.
-            exec(
-                &rt,
-                "DELETE FROM cat_schemas.finance.records WHERE id = 1",
-            )
-            .await?;
+            exec(&rt, "DELETE FROM cat_schemas.finance.records WHERE id = 1").await?;
 
-            let finance_count = query_scalar_i64(
-                &rt,
-                "SELECT COUNT(*) FROM cat_schemas.finance.records",
-            )
-            .await?;
+            let finance_count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_schemas.finance.records").await?;
             assert_eq!(finance_count, 1, "finance.records should have 1 row");
 
             let hr_count =
