@@ -129,6 +129,7 @@ impl MySQLCatalog {
             let url = conn_string.expose_secret();
             let opts = mysql_async::Opts::from_url(url)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let opts = Self::with_metadata_pool_constraints(opts)?;
             return Ok(mysql_async::Pool::new(opts));
         }
 
@@ -183,7 +184,26 @@ impl MySQLCatalog {
 
         let opts = mysql_async::Opts::from_url(url.as_str())
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let opts = Self::with_metadata_pool_constraints(opts)?;
         Ok(mysql_async::Pool::new(opts))
+    }
+
+    fn with_metadata_pool_constraints(
+        opts: mysql_async::Opts,
+    ) -> std::result::Result<mysql_async::Opts, Box<dyn std::error::Error + Send + Sync>> {
+        use std::io;
+
+        let constraints = mysql_async::PoolConstraints::new(0, 5).ok_or_else(|| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid MySQL metadata pool constraints",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+        let pool_opts = mysql_async::PoolOpts::default().with_constraints(constraints);
+        let builder = mysql_async::OptsBuilder::from_opts(opts).pool_opts(pool_opts);
+
+        Ok(mysql_async::Opts::from(builder))
     }
 }
 

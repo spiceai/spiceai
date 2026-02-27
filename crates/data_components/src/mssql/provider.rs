@@ -241,13 +241,11 @@ impl MssqlSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
-        let escaped_schema = self.schema_name.replace('\'', "''");
-        let query = format!(
+        let query =
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = '{escaped_schema}' \
+             WHERE TABLE_SCHEMA = @P1 \
              AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
-             ORDER BY TABLE_NAME"
-        );
+             ORDER BY TABLE_NAME";
 
         let mut conn = self
             .pool
@@ -257,7 +255,7 @@ impl MssqlSchemaProvider {
             .context(ConnectionFailedSnafu)?;
 
         let mut stream = conn
-            .simple_query(query)
+            .query(query, &[&self.schema_name.as_str()])
             .await
             .context(QueryFailedSnafu)?
             .into_row_stream();
