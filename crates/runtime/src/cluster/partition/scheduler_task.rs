@@ -37,6 +37,7 @@ use crate::cluster::partition::{
 };
 use crate::datafusion::DataFusion;
 use crate::datafusion::resolved_equality;
+use crate::status::{ComponentStatus, RuntimeStatus};
 use app::App;
 
 #[derive(Debug, Snafu)]
@@ -185,6 +186,7 @@ pub struct PartitionManagementTask {
     df: Arc<DataFusion>,
     partition_manager: Arc<PartitionManager>,
     executor_registry: Arc<ExecutorRegistry>,
+    status: Arc<RuntimeStatus>,
 
     /// Configuration
     config: PartitionManagementConfig,
@@ -233,6 +235,7 @@ impl PartitionManagementTask {
         df: Arc<DataFusion>,
         partition_manager: Arc<PartitionManager>,
         executor_registry: Arc<ExecutorRegistry>,
+        status: Arc<RuntimeStatus>,
         config: PartitionManagementConfig,
         cancel: CancellationToken,
     ) -> Self {
@@ -241,6 +244,7 @@ impl PartitionManagementTask {
             df,
             partition_manager,
             executor_registry,
+            status,
             config,
             cancel,
         }
@@ -248,6 +252,32 @@ impl PartitionManagementTask {
 
     pub async fn run(self) -> Result<()> {
         tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} in background");
+
+        // Seed partition metadata for tables that don't have it yet.
+        // This runs once before the periodic loop and is cancellation-aware
+        // so it can be interrupted during shutdown (the discovery query against
+        // a large source table like S3 can take a long time).
+        //
+        // The scheduler's `/v1/ready` endpoint will report "not ready" until this completes
+        tokio::select! {
+            () = self.cancel.cancelled() => {
+                tracing::info!("Partition metadata initialization cancelled during shutdown");
+                self.status.update_component_status("partition_metadata", ComponentStatus::error_with_message("Cancelled during shutdown"));
+                return Ok(());
+            }
+            result = self.initialize_metadata() => {
+                match result {
+                    Ok(()) => {
+                        self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to initialize partition metadata: {err}");
+                        self.status.update_component_status("partition_metadata", ComponentStatus::error_with_message(format!("Failed to initialize: {err}")));
+                    }
+                }
+            }
+        }
+
         let mut interval = tokio::time::interval(self.config.interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -261,11 +291,16 @@ impl PartitionManagementTask {
                 _ = interval.tick() => {
                     let cycle_start = Instant::now();
 
-                    if let Err(e) = self.run_management_cycle().await {
-                        tracing::warn!(
-                            error = %e,
-                            "Partition management cycle failed"
-                        );
+                    match self.run_management_cycle().await {
+                        Ok(()) => {
+                            self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Partition management cycle failed"
+                            );
+                        }
                     }
 
                     let cycle_duration = cycle_start.elapsed();
@@ -323,6 +358,23 @@ impl PartitionManagementTask {
         }
 
         Ok(())
+    }
+
+    /// Seed partition metadata for all accelerated tables that don't have metadata yet.
+    ///
+    /// This delegates to [`super::initialize_partition_metadata`] which discovers partition
+    /// values from the federated source and writes them as unassigned in the object store.
+    async fn initialize_metadata(&self) -> std::result::Result<(), super::Error> {
+        let Some(app) = &*self.app.read().await else {
+            tracing::debug!("App not initialized, skipping partition metadata seeding");
+            return Ok(());
+        };
+        super::initialize_partition_metadata(
+            Arc::clone(&self.df),
+            Arc::clone(app),
+            &self.partition_manager,
+        )
+        .await
     }
 
     async fn refresh_state(&self) -> Result<CycleState> {
