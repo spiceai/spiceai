@@ -1419,6 +1419,20 @@ impl RefreshTask {
             _ => (),
         }
 
+        if let Some(message) = schema_evolution_mismatch_refresh_message(
+            self.component_type(),
+            &include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            error,
+        ) {
+            tracing::warn!("{message}");
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(message),
+            )
+            .await;
+            return;
+        }
+
         tracing::warn!(
             "Failed to load data for {} {}: {error}",
             self.component_type(),
@@ -1691,6 +1705,31 @@ fn is_s3_express_upload_speed_error(error_message: &str) -> bool {
     error_message.contains("ClientUploadSpeedTooSlow")
 }
 
+fn is_insert_schema_mismatch_error(error_message: &str) -> bool {
+    error_message.contains("Inserting query must have the same schema length as the table")
+        || error_message.contains("Inserting query must have same schema length as the table")
+}
+
+fn schema_evolution_mismatch_refresh_message(
+    component_type: &str,
+    table_name: &str,
+    error: &super::Error,
+) -> Option<String> {
+    let source = match error {
+        super::Error::FailedToWriteData { source }
+        | super::Error::FailedToRefreshDataset { source } => source,
+        _ => return None,
+    };
+
+    if !is_insert_schema_mismatch_error(&source.to_string()) {
+        return None;
+    }
+
+    Some(format!(
+        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema. Acceleration doesn't apply this schema evolution automatically. Delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,7 +1770,6 @@ mod tests {
         assert!(is_s3_express_upload_speed_error(
             "Error: ClientUploadSpeedTooSlow: Upload speed is below minimum threshold"
         ));
-
         // Should detect when error is part of a larger message
         assert!(is_s3_express_upload_speed_error(
             "Failed to upload: S3 returned ClientUploadSpeedTooSlow for bucket mybucket--usw2-az1--x-s3"
@@ -1745,5 +1783,38 @@ mod tests {
         // Should not match partial error names
         assert!(!is_s3_express_upload_speed_error("ClientUpload"));
         assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    #[test]
+    fn test_is_insert_schema_mismatch_error() {
+        assert!(is_insert_schema_mismatch_error(
+            "Error during planning: Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5"
+        ));
+        assert!(!is_insert_schema_mismatch_error(
+            "Error during planning: failed to parse expression"
+        ));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_for_write_error() {
+        let error = super::super::Error::FailedToWriteData {
+            source: DataFusionError::Execution(
+                "Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5".to_string(),
+            ),
+        };
+
+        let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
+            .expect("should detect schema mismatch");
+        assert!(message.contains("schema mismatch"));
+        assert!(message.contains("Delete the existing acceleration data"));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_non_schema_error() {
+        let error = super::super::Error::FailedToRefreshDataset {
+            source: DataFusionError::Execution("other failure".to_string()),
+        };
+
+        assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
     }
 }
