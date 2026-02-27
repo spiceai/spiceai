@@ -302,7 +302,6 @@ async fn post_setup_sink_action(
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
             loop {
-
                 let response = sql_client
                     .post(&sql_url)
                     .header("X-API-Key", api_key)
