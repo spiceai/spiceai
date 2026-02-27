@@ -38,7 +38,6 @@ use crate::{
 use app::App;
 use datafusion::optimizer::AnalyzerRule;
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
-use spicepod::component::caching::{CacheConfig, Caching, SQLResultsCacheConfig};
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
@@ -66,11 +65,6 @@ pub struct RuntimeBuilder {
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
     resolved_cluster_config: Option<ResolvedClusterConfig>,
-    /// Optional override for the spicepod runtime configuration. When set,
-    /// these settings take precedence over the corresponding fields in the
-    /// `App`'s runtime config. This allows programmatic control of caching,
-    /// query settings, task history, and other runtime parameters.
-    spicepod_runtime_config: Option<SpicepodRuntime>,
 }
 
 impl RuntimeBuilder {
@@ -92,7 +86,6 @@ impl RuntimeBuilder {
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
             resolved_cluster_config: None,
-            spicepod_runtime_config: None,
         }
     }
 
@@ -183,52 +176,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the spicepod runtime configuration, overriding the corresponding
-    /// settings from the `App`.
-    ///
-    /// This allows programmatic control of runtime parameters including caching,
-    /// query settings, task history, and other runtime behavior independent of
-    /// the spicepod YAML configuration.
-    pub fn with_spicepod_runtime_config(mut self, config: SpicepodRuntime) -> Self {
-        self.spicepod_runtime_config = Some(config);
-        self
-    }
-
-    /// Disables all caching (SQL results, plans, search, and embeddings).
-    ///
-    /// Equivalent to setting all cache `enabled` flags to `false`. Useful in tests
-    /// or scenarios where deterministic, non-cached results are required.
-    ///
-    /// This merges with any existing spicepod runtime config override, only
-    /// replacing the caching settings.
-    pub fn with_caching_disabled(mut self) -> Self {
-        let caching = Caching {
-            sql_results: Some(SQLResultsCacheConfig {
-                enabled: false,
-                ..SQLResultsCacheConfig::default()
-            }),
-            search_results: Some(CacheConfig {
-                enabled: false,
-                ..CacheConfig::default()
-            }),
-            embeddings: Some(CacheConfig {
-                enabled: false,
-                ..CacheConfig::default()
-            }),
-        };
-        self.spicepod_runtime_config = Some(match self.spicepod_runtime_config {
-            Some(mut config) => {
-                config.caching = caching;
-                config
-            }
-            None => SpicepodRuntime {
-                caching,
-                ..SpicepodRuntime::default()
-            },
-        });
-        self
-    }
-
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -242,12 +189,16 @@ impl RuntimeBuilder {
         catalogconnector::register_all().await;
         document_parse::register_all().await;
 
-        // Resolve the effective spicepod runtime config: builder override > app > default.
-        let spicepod_rt = self.spicepod_runtime_config.clone().unwrap_or_else(|| {
-            self.app
-                .as_ref()
-                .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
-        });
+        // Resolve the effective spicepod runtime config: config override > app > default.
+        let spicepod_rt = self
+            .runtime_config
+            .runtime
+            .clone()
+            .unwrap_or_else(|| {
+                self.app
+                    .as_ref()
+                    .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
+            });
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
 

@@ -32,6 +32,7 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
+use runtime::config::Config;
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::param::Params;
@@ -125,7 +126,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_caching_disabled()
+                .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -477,7 +478,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_caching_disabled()
+                .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -563,7 +564,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_caching_disabled()
+                .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -715,7 +716,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_caching_disabled()
+                .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -815,7 +816,7 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_caching_disabled()
+                .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
