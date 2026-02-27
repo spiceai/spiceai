@@ -382,7 +382,7 @@ fn generate_adbc_create_table_statement(
     }
 
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
         column_definitions.join(", ")
     ))
 }
