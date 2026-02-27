@@ -1335,6 +1335,33 @@ async fn create_delete_physical_plan(
     deletion_provider.delete_from(session_state, &filters).await
 }
 
+/// Creates a physical plan for `DELETE` and `UPDATE` DML plans when they need
+/// custom execution support.
+///
+/// Returns `Ok(Some(plan))` for supported DML operations and `Ok(None)` for
+/// all other logical plans.
+pub(crate) async fn create_dml_statement_physical_plan(
+    plan: &LogicalPlan,
+    df: &Arc<DataFusion>,
+    session_state: &SessionState,
+) -> std::result::Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+    if let LogicalPlan::Dml(dml) = plan {
+        if matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete) {
+            return create_delete_physical_plan(dml, df, session_state)
+                .await
+                .map(Some);
+        }
+
+        if matches!(&dml.op, datafusion::logical_expr::WriteOp::Update) {
+            return create_update_physical_plan(dml, df, session_state)
+                .await
+                .map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
 /// Extract filter expressions from a DML source logical plan.
 ///
 /// The source plan is generally `Filter(predicate, scan)`, and for `UPDATE`

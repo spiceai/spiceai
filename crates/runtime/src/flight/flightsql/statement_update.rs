@@ -33,6 +33,7 @@ use tonic::{Response, Status};
 use crate::{
     config::ClusterRole,
     datafusion::DataFusion,
+    datafusion::query::create_dml_statement_physical_plan,
     datafusion::request_context_extension::get_current_datafusion,
     flight::{Service, metrics},
 };
@@ -102,10 +103,18 @@ pub(crate) async fn do_put(
     }
 
     // Execute
-    let physical_plan = session
-        .create_physical_plan(&plan)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?;
+    let physical_plan = if let Some(dml_plan) =
+        create_dml_statement_physical_plan(&plan, &datafusion, &session)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?
+    {
+        dml_plan
+    } else {
+        session
+            .create_physical_plan(&plan)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?
+    };
 
     let results = datafusion::physical_plan::collect(physical_plan, datafusion.ctx.task_ctx())
         .await

@@ -33,6 +33,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     datafusion::{
+        query::create_dml_statement_physical_plan,
         request_context_extension::get_current_datafusion,
         sql_validator::validate_sql_query_operations,
     },
@@ -159,10 +160,18 @@ pub(crate) async fn do_get(
         }
     }
 
-    let physical_plan = session
-        .create_physical_plan(&plan)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?;
+    let physical_plan = if let Some(dml_plan) =
+        create_dml_statement_physical_plan(&plan, &datafusion, &session)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?
+    {
+        dml_plan
+    } else {
+        session
+            .create_physical_plan(&plan)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?
+    };
 
     // Execute the plan and collect the result (which should be a count for DML statements)
     let results = datafusion::physical_plan::collect(physical_plan, datafusion.ctx.task_ctx())
