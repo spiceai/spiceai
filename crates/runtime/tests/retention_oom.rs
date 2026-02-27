@@ -57,10 +57,6 @@ enum ExecutableFormat {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(not(target_os = "windows"))]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
 async fn test_cayenne_pk_delete_oom_repro() -> Result<(), anyhow::Error> {
     init_tracing();
 
@@ -134,7 +130,6 @@ async fn run_outer_container_repro() -> Result<(), anyhow::Error> {
         .arg("-e")
         .arg(format!("{INNER_PAYLOAD_BYTES_ENV}={payload_bytes}"))
         .arg(&image_tag)
-        .arg("--ignored")
         .arg("--exact")
         .arg(TEST_NAME)
         .arg("--nocapture")
