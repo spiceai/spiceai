@@ -202,7 +202,9 @@ impl MySQLSchemaProvider {
             }
 
             // Use backtick-quoted identifiers for MySQL.
-            let quoted_path = format!("`{}`.`{table_name}`", self.schema_name);
+            let escaped_schema = self.schema_name.replace('`', "``");
+            let escaped_table = table_name.replace('`', "``");
+            let quoted_path = format!("`{escaped_schema}`.`{escaped_table}`");
             let table_ref: TableReference = quoted_path.clone().into();
 
             match self.table_creator.table_provider(table_ref).await {

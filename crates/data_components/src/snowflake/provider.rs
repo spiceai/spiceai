@@ -128,14 +128,21 @@ impl SnowflakeCatalogProvider {
             snowflake_api::QueryResult::Arrow(batches) => {
                 let mut names = Vec::new();
                 for batch in batches {
-                    if let Some(col) = batch.column_by_name("SCHEMA_NAME")
-                        && let Some(array) =
-                            col.as_any().downcast_ref::<arrow::array::StringArray>()
-                    {
-                        for value in array.iter().flatten() {
-                            if value != "INFORMATION_SCHEMA" {
-                                names.push(value.to_string());
-                            }
+                    let col = batch.column_by_name("SCHEMA_NAME").context(
+                        UnexpectedResponseSnafu {
+                            reason: "Missing SCHEMA_NAME column in Arrow response for schema listing",
+                        },
+                    )?;
+
+                    let array = col.as_any().downcast_ref::<arrow::array::StringArray>().context(
+                        UnexpectedResponseSnafu {
+                            reason: "SCHEMA_NAME column has unexpected data type in Arrow response for schema listing; expected Utf8",
+                        },
+                    )?;
+
+                    for value in array.iter().flatten() {
+                        if value != "INFORMATION_SCHEMA" {
+                            names.push(value.to_string());
                         }
                     }
                 }
@@ -242,10 +249,11 @@ impl SnowflakeSchemaProvider {
 
             // Quote each part with double quotes for Snowflake SQL, matching the
             // pattern used by the Snowflake data connector.
-            let quoted_path = format!(
-                "\"{}\".\"{}\".\"{table_name}\"",
-                self.database, self.schema_name
-            );
+            let escaped_database = self.database.replace('"', "\"\"");
+            let escaped_schema = self.schema_name.replace('"', "\"\"");
+            let escaped_table = table_name.replace('"', "\"\"");
+            let quoted_path =
+                format!("\"{escaped_database}\".\"{escaped_schema}\".\"{escaped_table}\"");
             let table_ref: TableReference = quoted_path.clone().into();
 
             match self.table_creator.table_provider(table_ref).await {
@@ -292,13 +300,20 @@ impl SnowflakeSchemaProvider {
             snowflake_api::QueryResult::Arrow(batches) => {
                 let mut names = Vec::new();
                 for batch in batches {
-                    if let Some(col) = batch.column_by_name("TABLE_NAME")
-                        && let Some(array) =
-                            col.as_any().downcast_ref::<arrow::array::StringArray>()
-                    {
-                        for value in array.iter().flatten() {
-                            names.push(value.to_string());
-                        }
+                    let col = batch.column_by_name("TABLE_NAME").context(
+                        UnexpectedResponseSnafu {
+                            reason: "Missing TABLE_NAME column in Arrow response for table listing",
+                        },
+                    )?;
+
+                    let array = col.as_any().downcast_ref::<arrow::array::StringArray>().context(
+                        UnexpectedResponseSnafu {
+                            reason: "TABLE_NAME column has unexpected data type in Arrow response for table listing; expected Utf8",
+                        },
+                    )?;
+
+                    for value in array.iter().flatten() {
+                        names.push(value.to_string());
                     }
                 }
                 Ok(names)

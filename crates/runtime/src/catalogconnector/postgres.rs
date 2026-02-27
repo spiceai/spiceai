@@ -26,19 +26,10 @@ use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::PostgresCatalogProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
 
 pub const PREFIX: &str = "pg";
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to create PostgreSQL connection pool: {source}"))]
-    UnableToCreateConnectionPool {
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
-    },
-}
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")

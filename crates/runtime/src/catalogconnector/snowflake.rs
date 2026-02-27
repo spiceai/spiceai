@@ -54,6 +54,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .secret()
         .description("The Snowflake password for authentication."),
+    ParameterSpec::component("private_key")
+        .secret()
+        .description("The private key content for key pair authentication."),
     ParameterSpec::component("private_key_path")
         .secret()
         .description("The path to a private key file for key pair authentication."),

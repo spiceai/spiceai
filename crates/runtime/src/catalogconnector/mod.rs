@@ -392,9 +392,15 @@ impl Drop for RefreshingCatalogProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    static REGISTRY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[tokio::test]
     async fn test_catalog_connector_registry_lifecycle() {
+        let _test_guard = REGISTRY_TEST_LOCK.lock().await;
+
         // Start clean
         unregister_all().await;
         {
@@ -496,6 +502,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_new_connector_unknown_returns_none() {
+        let _test_guard = REGISTRY_TEST_LOCK.lock().await;
+
         unregister_all().await;
         register_all().await;
 
@@ -505,5 +513,8 @@ mod tests {
             guard.get("nonexistent_connector").is_none(),
             "unknown connector name should not be found"
         );
+
+        drop(guard);
+        unregister_all().await;
     }
 }

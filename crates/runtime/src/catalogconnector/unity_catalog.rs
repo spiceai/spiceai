@@ -218,11 +218,15 @@ mod tests {
         let table = make_uc_table(Some("s3://my-bucket/warehouse/table"));
         let reference = table_reference_creator(&table)
             .expect("should return Some when storage_location is present");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
         match reference {
             TableReference::Bare { table } => {
                 assert_eq!(table.as_ref(), "s3://my-bucket/warehouse/table/");
             }
-            _ => panic!("Expected Bare table reference"),
+            _ => unreachable!("already asserted to be Bare table reference"),
         }
     }
 
@@ -239,6 +243,10 @@ mod tests {
     fn test_table_reference_creator_appends_trailing_slash() {
         let table = make_uc_table(Some("gs://bucket/path"));
         let reference = table_reference_creator(&table).expect("should return Some");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
         match reference {
             TableReference::Bare { table } => {
                 assert!(
@@ -246,7 +254,7 @@ mod tests {
                     "reference should end with trailing slash"
                 );
             }
-            _ => panic!("Expected Bare table reference"),
+            _ => unreachable!("already asserted to be Bare table reference"),
         }
     }
 
@@ -256,6 +264,10 @@ mod tests {
             "abfss://container@account.dfs.core.windows.net/warehouse/table",
         ));
         let reference = table_reference_creator(&table).expect("should return Some for abfss URI");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
         match reference {
             TableReference::Bare { table } => {
                 assert_eq!(
@@ -263,7 +275,7 @@ mod tests {
                     "abfss://container@account.dfs.core.windows.net/warehouse/table/"
                 );
             }
-            _ => panic!("Expected Bare table reference"),
+            _ => unreachable!("already asserted to be Bare table reference"),
         }
     }
 }

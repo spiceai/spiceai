@@ -403,6 +403,10 @@ mod tests {
         let table = make_uc_table(Some("s3://bucket/path"));
         let reference =
             table_reference_creator_spark(&table).expect("spark creator should always return Some");
+        assert!(
+            matches!(reference, TableReference::Full { .. }),
+            "Expected Full table reference"
+        );
         match reference {
             TableReference::Full {
                 catalog,
@@ -413,7 +417,7 @@ mod tests {
                 assert_eq!(schema.as_ref(), "my_schema");
                 assert_eq!(table.as_ref(), "my_table");
             }
-            _ => panic!("Expected Full table reference"),
+            _ => unreachable!("already asserted to be Full table reference"),
         }
     }
 
@@ -422,6 +426,10 @@ mod tests {
         let table = make_uc_table(None);
         let reference = table_reference_creator_spark(&table)
             .expect("spark creator should return Some regardless of storage_location");
+        assert!(
+            matches!(reference, TableReference::Full { .. }),
+            "Expected Full table reference"
+        );
         match reference {
             TableReference::Full {
                 catalog,
@@ -432,7 +440,7 @@ mod tests {
                 assert_eq!(schema.as_ref(), "my_schema");
                 assert_eq!(table.as_ref(), "my_table");
             }
-            _ => panic!("Expected Full table reference"),
+            _ => unreachable!("already asserted to be Full table reference"),
         }
     }
 
@@ -441,11 +449,15 @@ mod tests {
         let table = make_uc_table(Some("s3://bucket/path"));
         let reference = table_reference_creator_delta_lake(&table)
             .expect("should return Some when storage_location is present");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
         match reference {
             TableReference::Bare { table } => {
                 assert_eq!(table.as_ref(), "s3://bucket/path/");
             }
-            _ => panic!("Expected Bare table reference"),
+            _ => unreachable!("already asserted to be Bare table reference"),
         }
     }
 
@@ -462,6 +474,10 @@ mod tests {
     fn test_table_reference_creator_delta_lake_appends_trailing_slash() {
         let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/path"));
         let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
         match reference {
             TableReference::Bare { table } => {
                 assert!(
@@ -469,7 +485,7 @@ mod tests {
                     "delta lake reference should end with trailing slash"
                 );
             }
-            _ => panic!("Expected Bare table reference"),
+            _ => unreachable!("already asserted to be Bare table reference"),
         }
     }
 
@@ -486,6 +502,10 @@ mod tests {
         };
         let reference =
             table_reference_creator_spark(&table).expect("spark creator should always return Some");
+        assert!(
+            matches!(reference, TableReference::Full { .. }),
+            "Expected Full table reference"
+        );
         match reference {
             TableReference::Full {
                 catalog,
@@ -496,7 +516,7 @@ mod tests {
                 assert_eq!(schema.as_ref(), "sales");
                 assert_eq!(table.as_ref(), "orders");
             }
-            _ => panic!("Expected Full table reference"),
+            _ => unreachable!("already asserted to be Full table reference"),
         }
     }
 
@@ -504,6 +524,10 @@ mod tests {
     fn test_table_reference_creator_delta_lake_preserves_full_storage_uri() {
         let table = make_uc_table(Some("s3://my-bucket/warehouse/catalog/schema/table"));
         let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
         match reference {
             TableReference::Bare { table } => {
                 assert_eq!(
@@ -511,7 +535,7 @@ mod tests {
                     "s3://my-bucket/warehouse/catalog/schema/table/"
                 );
             }
-            _ => panic!("Expected Bare table reference"),
+            _ => unreachable!("already asserted to be Bare table reference"),
         }
     }
 }

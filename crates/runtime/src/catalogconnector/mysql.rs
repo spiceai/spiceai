@@ -26,19 +26,10 @@ use data_components::RefreshableCatalogProvider;
 use data_components::mysql::provider::MySQLCatalogProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
-use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
 
 pub const PREFIX: &str = "mysql";
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to create MySQL connection pool: {source}"))]
-    UnableToCreateConnectionPool {
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
-    },
-}
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
@@ -129,6 +120,7 @@ impl MySQLCatalog {
         params: &ConnectorParams,
     ) -> std::result::Result<mysql_async::Pool, Box<dyn std::error::Error + Send + Sync>> {
         use secrecy::ExposeSecret;
+        use std::io;
 
         let secret_map = params.parameters.to_secret_map();
 
@@ -152,16 +144,44 @@ impl MySQLCatalog {
             || "localhost".to_string(),
             |s| s.expose_secret().to_string(),
         );
-        let port = secret_map
-            .get("tcp_port")
-            .map_or_else(|| "3306".to_string(), |s| s.expose_secret().to_string());
+        let port = secret_map.get("tcp_port").map_or(Ok(3306_u16), |s| {
+            s.expose_secret().parse::<u16>().map_err(|e| {
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid tcp_port '{}': {e}", s.expose_secret()),
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })
+        })?;
         let db = secret_map
             .get("db")
             .map(|s| s.expose_secret().to_string())
             .unwrap_or_default();
 
-        let url = format!("mysql://{user}:{pass}@{host}:{port}/{db}");
-        let opts = mysql_async::Opts::from_url(&url)
+        let mut url = url::Url::parse("mysql://localhost")
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        url.set_host(Some(&host))
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        url.set_port(Some(port)).map_err(|()| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid tcp_port value: {port}"),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        url.set_username(&user).map_err(|()| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid MySQL username for connection URL",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        url.set_password(Some(&pass)).map_err(|()| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid MySQL password for connection URL",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        url.set_path(&format!("/{db}"));
+
+        let opts = mysql_async::Opts::from_url(url.as_str())
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         Ok(mysql_async::Pool::new(opts))
     }

@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::args::SchemaTestArgs;
-use std::panic;
 use std::sync::Arc;
 use test_framework::{
     anyhow,
@@ -69,22 +68,13 @@ pub(crate) async fn run(args: &SchemaTestArgs) -> anyhow::Result<()> {
     let tables_pretty = pretty_format_batches(&table_batches)?;
     {
         let snapshot_name = format!("{name}_schema_tables");
-        let tables_str = tables_pretty.to_string();
-        let result = panic::catch_unwind(|| {
-            insta::with_settings!({
-                description => format!("Schema tables for {name}"),
-                omit_expression => true,
-                snapshot_path => "snapshots/schema",
-            }, {
-                insta::assert_snapshot!(snapshot_name, tables_str);
-            });
+        insta::with_settings!({
+            description => format!("Schema tables for {name}"),
+            omit_expression => true,
+            snapshot_path => "snapshots/schema",
+        }, {
+            insta::assert_snapshot!(snapshot_name, tables_pretty.to_string());
         });
-        if result.is_err() {
-            eprintln!("Snapshot assertion failed for {name} schema tables");
-            return Err(anyhow::anyhow!(
-                "Snapshot assertion failed for {name} schema tables"
-            ));
-        }
     }
 
     // Query information_schema.columns to get all column schemas
@@ -113,22 +103,13 @@ pub(crate) async fn run(args: &SchemaTestArgs) -> anyhow::Result<()> {
     let columns_pretty = pretty_format_batches(&column_batches)?;
     {
         let snapshot_name = format!("{name}_schema_columns");
-        let columns_str = columns_pretty.to_string();
-        let result = panic::catch_unwind(|| {
-            insta::with_settings!({
-                description => format!("Schema columns for {name}"),
-                omit_expression => true,
-                snapshot_path => "snapshots/schema",
-            }, {
-                insta::assert_snapshot!(snapshot_name, columns_str);
-            });
+        insta::with_settings!({
+            description => format!("Schema columns for {name}"),
+            omit_expression => true,
+            snapshot_path => "snapshots/schema",
+        }, {
+            insta::assert_snapshot!(snapshot_name, columns_pretty.to_string());
         });
-        if result.is_err() {
-            eprintln!("Snapshot assertion failed for {name} schema columns");
-            return Err(anyhow::anyhow!(
-                "Snapshot assertion failed for {name} schema columns"
-            ));
-        }
     }
 
     // If a minimum table count is specified, validate against it
