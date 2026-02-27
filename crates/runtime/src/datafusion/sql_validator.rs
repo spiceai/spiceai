@@ -19,7 +19,7 @@ use std::sync::Arc;
 use datafusion::{
     common::{plan_err, tree_node::TreeNodeRecursion},
     error::DataFusionError,
-    logical_expr::{LogicalPlan, Statement},
+    logical_expr::{DdlStatement, LogicalPlan, Statement},
 };
 
 use crate::datafusion::DataFusion;
@@ -27,9 +27,11 @@ use crate::datafusion::DataFusion;
 /// Validates that a logical plan only performs allowed operations on datasets.
 ///
 /// Reads (SELECT queries) are allowed on all tables.
-/// INSERT operations are only allowed on datasets that are configured as writable,
+/// INSERT and DELETE operations are only allowed on datasets that are configured as writable,
 /// and are not allowed on internal Spice tables.
-/// DDL, DML (other than allowed INSERT), COPY, and Statement operations are not permitted.
+/// UPDATE operations are only allowed on writable Cayenne catalog tables.
+/// DDL operations are only allowed on catalogs configured with `access: read_write_create`.
+/// DML (other than allowed INSERT/DELETE/UPDATE), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
 /// * `Ok(())` if the plan is valid
@@ -42,7 +44,7 @@ pub fn validate_sql_query_operations(
     plan.apply_with_subqueries(|node| match node {
         // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
         LogicalPlan::Ddl(ddl) => {
-            plan_err!("Operation is not allowed: {}", ddl.name())
+            validate_ddl_operation(ddl, df)
         }
         // Data Manipulation Language (DML): Insert / Update / Delete
         LogicalPlan::Dml(dml) => {
@@ -58,11 +60,38 @@ pub fn validate_sql_query_operations(
                     );
                 }
 
-                // Check if attempting to write into a catalog. The default catalog name indicates writing to a table registered as a dataset, not via a catalog.
+                // Check if attempting to write into a catalog.
+                if let Some(catalog) = dml.table_name.catalog()
+                    && df.is_catalog_writable(catalog)
+                {
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+
+                // Fall back to per-table writable check
+                if df.is_writable(&dml.table_name) {
+                    Ok(TreeNodeRecursion::Continue)
+                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                    // No catalog specified but default catalog is writable
+                    Ok(TreeNodeRecursion::Continue)
+                } else {
+                    plan_err!(
+                        "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
+                        dml.table_name
+                    )
+                }
+            } else if matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete) {
+                if super::is_spice_internal_dataset(&dml.table_name) {
+                    return plan_err!(
+                        "DELETE operations are not allowed on Spice system dataset '{}'.",
+                        dml.table_name
+                    );
+                }
+
+                // Check if attempting to delete from a catalog table.
                 if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
                     if !df.is_catalog_writable(catalog) {
                         return plan_err!(
-                            "INSERT operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                            "DELETE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
                             dml.table_name
                         );
                     }
@@ -71,12 +100,44 @@ pub fn validate_sql_query_operations(
 
                 if df.is_writable(&dml.table_name) {
                     Ok(TreeNodeRecursion::Continue)
+                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                    // No catalog specified but default catalog is writable
+                    Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
-                        "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
+                        "DELETE operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
                         dml.table_name
                     )
                 }
+            } else if matches!(&dml.op, datafusion::logical_expr::WriteOp::Update) {
+                if super::is_spice_internal_dataset(&dml.table_name) {
+                    return plan_err!(
+                        "UPDATE operations are not allowed on Spice system dataset '{}'.",
+                        dml.table_name
+                    );
+                }
+
+                let target_catalog = dml
+                    .table_name
+                    .catalog()
+                    .unwrap_or(super::SPICE_DEFAULT_CATALOG);
+
+                if !df.is_catalog_writable(target_catalog) {
+                    return plan_err!(
+                        "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                        dml.table_name
+                    );
+                }
+
+                if !is_cayenne_catalog(df, target_catalog) {
+                    return plan_err!(
+                        "UPDATE operations are only supported on writable Cayenne catalog tables. Table '{}', catalog '{}' is not Cayenne-backed.",
+                        dml.table_name,
+                        target_catalog
+                    );
+                }
+
+                Ok(TreeNodeRecursion::Continue)
             } else { plan_err!("Operation is not allowed: {}", dml.name()) }
         }
         LogicalPlan::Copy(_) => {
@@ -94,6 +155,84 @@ pub fn validate_sql_query_operations(
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
+}
+
+fn is_cayenne_catalog(df: &Arc<DataFusion>, catalog_name: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        df.ctx
+            .catalog(catalog_name)
+            .is_some_and(|catalog| super::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = df;
+        let _ = catalog_name;
+        false
+    }
+}
+
+/// Validates DDL operations. DDL is only allowed on catalogs with `access: read_write_create`.
+fn validate_ddl_operation(
+    ddl: &DdlStatement,
+    df: &Arc<DataFusion>,
+) -> Result<TreeNodeRecursion, DataFusionError> {
+    // Extract the catalog name from the DDL statement's table reference
+    let catalog_name = match ddl {
+        DdlStatement::CreateExternalTable(create) => create.name.catalog().map(String::from),
+        DdlStatement::CreateMemoryTable(create) => create.name.catalog().map(String::from),
+        DdlStatement::DropTable(drop) => drop.name.catalog().map(String::from),
+        DdlStatement::CreateView(create) => create.name.catalog().map(String::from),
+        DdlStatement::DropView(drop) => drop.name.catalog().map(String::from),
+        // Schema-level operations - schema_name is a string that may contain catalog.schema format
+        DdlStatement::CreateCatalogSchema(create) => {
+            // schema_name may be in format "catalog.schema" or just "schema"
+            create
+                .schema_name
+                .split('.')
+                .next()
+                .filter(|_| create.schema_name.contains('.'))
+                .map(String::from)
+        }
+        DdlStatement::DropCatalogSchema(drop) => {
+            // Extract catalog from SchemaReference if it's a full reference
+            match &drop.name {
+                datafusion::common::SchemaReference::Full { catalog, .. } => {
+                    Some(catalog.to_string())
+                }
+                datafusion::common::SchemaReference::Bare { .. } => None,
+            }
+        }
+        // Catalog-level operations - use the catalog name directly
+        DdlStatement::CreateCatalog(_)
+        | DdlStatement::CreateIndex(_)
+        | DdlStatement::CreateFunction(_)
+        | DdlStatement::DropFunction(_) => None,
+    };
+
+    // Check if the operation is targeting a DDL-enabled catalog
+    if let Some(catalog) = catalog_name {
+        if df.is_catalog_ddl_enabled(&catalog) {
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        return plan_err!(
+            "DDL operation '{}' is not allowed on catalog '{}'. Verify the catalog is configured with 'access: read_write_create' and try again.",
+            ddl.name(),
+            catalog
+        );
+    }
+
+    // No catalog specified — check if the default catalog is DDL-enabled
+    if df.is_catalog_ddl_enabled(super::SPICE_DEFAULT_CATALOG) {
+        return Ok(TreeNodeRecursion::Continue);
+    }
+
+    // DDL on the default catalog or without a catalog is not allowed
+    plan_err!(
+        "DDL operation '{}' is not allowed. DDL operations are only supported on catalogs configured with 'access: read_write_create'.",
+        ddl.name()
+    )
 }
 
 #[cfg(test)]
@@ -205,6 +344,22 @@ mod tests {
         // Mark writable_catalog as writable
         df.mark_catalog_writable("writable_catalog")
             .expect("catalog should be marked as writable");
+
+        // Add a DDL-enabled catalog for testing DDL operations
+        df.ctx.register_catalog(
+            "ddl_enabled_catalog".to_string(),
+            Arc::new(MemoryCatalogProvider::new()),
+        );
+
+        df.ctx
+            .catalog("ddl_enabled_catalog")
+            .expect("catalog should be found")
+            .register_schema("public", Arc::new(SpiceSchemaProvider::new()))
+            .expect("schema should be registered");
+
+        // Mark ddl_enabled_catalog as DDL-enabled (which also makes it writable)
+        df.mark_catalog_ddl_enabled("ddl_enabled_catalog")
+            .expect("catalog should be marked as DDL-enabled");
 
         df
     }
@@ -318,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_delete_operation_blocked() {
+    async fn test_validate_delete_on_writable_dataset_allowed() {
         let df = create_test_datafusion();
 
         let sql = "DELETE FROM tbl_writable WHERE id = 1";
@@ -329,9 +484,49 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        // DELETE operations should be blocked
+        // DELETE operations should be allowed on writable datasets
         let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_err(), "DELETE operations should be blocked");
+        assert!(
+            result.is_ok(),
+            "DELETE should be allowed on writable dataset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_delete_on_readonly_dataset_blocked() {
+        let df = create_test_datafusion();
+
+        let sql = "DELETE FROM tbl_read_only WHERE id = 1";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        // DELETE operations should be blocked on read-only datasets
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(result.is_err(), "DELETE should fail on read-only dataset");
+    }
+
+    #[tokio::test]
+    async fn test_validate_delete_on_internal_table_blocked() {
+        let df = create_test_datafusion();
+
+        let sql = "DELETE FROM runtime.spice_table WHERE id = 1";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        // DELETE operations should be blocked on internal tables
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_err(),
+            "DELETE should fail on Spice internal dataset"
+        );
     }
 
     #[tokio::test]
@@ -349,6 +544,76 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_err(), "CREATE TABLE should be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_validate_ddl_operations_allowed_on_ddl_enabled_catalog() {
+        let df = create_test_datafusion();
+
+        // Test CREATE TABLE on DDL-enabled catalog
+        let sql = "CREATE TABLE ddl_enabled_catalog.public.new_table (id INT, name VARCHAR(50))";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "CREATE TABLE should be allowed on DDL-enabled catalog"
+        );
+
+        // Test DROP TABLE on DDL-enabled catalog
+        let sql = "DROP TABLE IF EXISTS ddl_enabled_catalog.public.some_table";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "DROP TABLE should be allowed on DDL-enabled catalog"
+        );
+
+        // Test CREATE SCHEMA on DDL-enabled catalog
+        let sql = "CREATE SCHEMA ddl_enabled_catalog.new_schema";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "CREATE SCHEMA should be allowed on DDL-enabled catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_ddl_blocked_on_writable_but_not_ddl_enabled_catalog() {
+        let df = create_test_datafusion();
+
+        // Test CREATE TABLE on writable_catalog (which is only read_write, not read_write_create)
+        let sql = "CREATE TABLE writable_catalog.public.new_table (id INT, name VARCHAR(50))";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_err(),
+            "CREATE TABLE should be blocked on writable (but not DDL-enabled) catalog"
+        );
     }
 
     #[tokio::test]
@@ -501,6 +766,93 @@ mod tests {
         assert!(
             result.is_err(),
             "INSERT should fail on read-only dataset in default catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_ddl_on_default_catalog_when_ddl_enabled() {
+        let df = create_test_datafusion();
+
+        // Mark the default catalog as DDL-enabled (simulates Iceberg catalog override)
+        df.mark_catalog_ddl_enabled("spice")
+            .expect("should mark default catalog as DDL-enabled");
+
+        // CREATE TABLE on default catalog (bare name) should be allowed
+        let sql = "CREATE TABLE new_table (id INT, name VARCHAR(50))";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "CREATE TABLE should be allowed on DDL-enabled default catalog (bare name)"
+        );
+
+        // CREATE TABLE with explicit spice catalog should also work
+        let sql = "CREATE TABLE spice.public.another_table (id INT, name VARCHAR(50))";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "CREATE TABLE should be allowed on DDL-enabled default catalog (explicit name)"
+        );
+
+        // DROP TABLE should also work
+        let sql = "DROP TABLE IF EXISTS new_table";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "DROP TABLE should be allowed on DDL-enabled default catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_dml_on_default_catalog_when_writable() {
+        let df = create_test_datafusion();
+
+        // Mark the default catalog as DDL-enabled (which also marks it writable)
+        df.mark_catalog_ddl_enabled("spice")
+            .expect("should mark default catalog as DDL-enabled");
+
+        // Register a test table to INSERT into
+        let mem_table = Arc::new(
+            MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
+        );
+        df.ctx
+            .register_table("catalog_table", mem_table)
+            .expect("table should be registered");
+
+        // INSERT on a catalog-managed table (not individually marked writable) should work
+        // because the default catalog is writable
+        let sql = "INSERT INTO catalog_table VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "INSERT should be allowed on table in writable default catalog"
         );
     }
 }

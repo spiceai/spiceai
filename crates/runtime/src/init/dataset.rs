@@ -158,8 +158,12 @@ impl Runtime {
                     path_table_ref,
                     path_table_ref
                 );
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(format!(
+                        "Parent dataset '{path_table_ref}' doesn't exist"
+                    )),
+                );
             }
         }
 
@@ -234,8 +238,10 @@ impl Runtime {
             Ok(data_connector) => data_connector,
             Err(err) => {
                 let ds_name = &ds.name;
-                self.status
-                    .update_dataset(ds_name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    ds_name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(
                     spaced_tracer,
@@ -285,8 +291,10 @@ impl Runtime {
             let ds_name = &ds.name;
             metrics::datasets::LOAD_ERROR.add(1, &[]);
             error_spaced!(spaced_tracer, "{}{err}", "");
-            self.status
-                .update_dataset(ds_name, status::ComponentStatus::Error);
+            self.status.update_dataset(
+                ds_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
             return;
         }
 
@@ -306,9 +314,10 @@ impl Runtime {
                     }
 
                     let ds_name = &ds.name;
-                    runtime
-                        .status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    runtime.status.update_dataset(
+                        ds_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
@@ -371,8 +380,10 @@ impl Runtime {
                     );
                     federated_table
                 } else {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     if let DataConnectorError::UnsupportedDataType { .. } = err {
                         error_spaced!(spaced_tracer, "{}{err}", "");
@@ -446,8 +457,10 @@ impl Runtime {
                 Ok(())
             }
             Err(err) => {
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: crate::datafusion::Error::RefreshSql { .. },
@@ -542,7 +555,7 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if Arc::clone(&self)
+                if let Err(e) = Arc::clone(&self)
                     .register_loaded_dataset(
                         Arc::clone(&ds),
                         Arc::clone(&connector),
@@ -550,16 +563,19 @@ impl Runtime {
                         BootstrapStatus::None,
                     )
                     .await
-                    .is_err()
                 {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                 }
             }
             Err(e) => {
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
             }
         }
     }
@@ -958,7 +974,10 @@ impl Runtime {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        status.update_dataset(
+                            ds_name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         return (ds.name.clone(), Err(err));
@@ -978,7 +997,10 @@ impl Runtime {
                     }
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        status.update_dataset(
+                            ds_name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         (ds.name.clone(), Err(err))

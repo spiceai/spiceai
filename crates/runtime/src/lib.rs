@@ -1056,6 +1056,7 @@ impl Runtime {
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
+        let executor_endpoint_auth = endpoint_auth.clone();
         let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
             if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
                 Box::pin(
@@ -1066,6 +1067,7 @@ impl Runtime {
                             cluster::start_executor_flight_server(
                                 config.flight_bind_address,
                                 Arc::clone(&self_ref),
+                                executor_endpoint_auth,
                                 Some(flight_shutdown),
                             )
                             .await

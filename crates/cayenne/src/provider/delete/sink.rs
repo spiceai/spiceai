@@ -48,8 +48,9 @@ limitations under the License.
 use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
 use super::super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::super::utils::{convert_to_i64_box, convert_to_u64_box};
+use super::super::Error;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use crate::catalog::{CatalogError, MetadataCatalog};
+use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
 use arrow::array::ArrayRef;
 use arrow_row::RowConverter;
@@ -127,7 +128,8 @@ impl CayenneDeletionSink {
         &self,
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> super::super::Result<u64> {
+        let table_name = &self.table_metadata.table_name;
         // For position-based deletions, we need per-file row tracking
         // For PK-based deletions, we can still batch across all files
         match &self.pk_deletion_strategy {
@@ -152,7 +154,11 @@ impl CayenneDeletionSink {
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 // RowConverter-based deletion for composite/non-integer PKs
                 let Some(ref row_converter) = self.pk_row_converter else {
-                    return Err("RowConverter not available for RowConverterBased strategy".into());
+                    return Err(Error::Internal {
+                        table: table_name.clone(),
+                        message: "RowConverter not available for RowConverterBased strategy"
+                            .to_string(),
+                    });
                 };
 
                 let mut all_batches = Vec::new();
@@ -174,7 +180,10 @@ impl CayenneDeletionSink {
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based deletion for "delete all" (delete w/o filters)
                 // Note: Delete all is NOT available using retention so this is unreachable
-                Err("Position-based deletion without primary key is not yet supported for delete-all operations".into())
+                Err(Error::Internal {
+                    table: table_name.clone(),
+                    message: "Position-based deletion without primary key is not yet supported for delete-all operations".to_string(),
+                })
             }
         }
     }
@@ -185,24 +194,30 @@ impl CayenneDeletionSink {
     fn extract_int64_pk_values(
         &self,
         batch: &arrow::array::RecordBatch,
-    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> super::super::Result<Vec<i64>> {
         use arrow::array::Int64Array;
+
+        let table_name = &self.table_metadata.table_name;
 
         // For Int64 PK strategy, we only have one PK column
         let pk_column_index = self
             .pk_column_indices
             .first()
-            .ok_or("Int64 PK strategy requires exactly one PK column index")?;
+            .ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "Int64 PK strategy requires exactly one PK column index".to_string(),
+            })?;
 
         let pk_column = batch.column(*pk_column_index);
         let pk_array = pk_column
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                format!(
+            .ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: format!(
                     "Expected Int64Array for PK column at index {pk_column_index}, got {:?}",
                     pk_column.data_type()
-                )
+                ),
             })?;
 
         let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
@@ -214,7 +229,7 @@ impl CayenneDeletionSink {
         &self,
         batch: &arrow::array::RecordBatch,
         row_converter: &RowConverter,
-    ) -> Result<Vec<Box<[u8]>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> super::super::Result<Vec<Box<[u8]>>> {
         let pk_columns: Vec<ArrayRef> = self
             .pk_column_indices
             .iter()
@@ -235,9 +250,11 @@ impl CayenneDeletionSink {
         &self,
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> super::super::Result<u64> {
         use arrow::array::{Array, Int64Array};
         use arrow::datatypes::{DataType, Field};
+
+        let table_name = &self.table_metadata.table_name;
 
         // For position-based deletion, use the streaming per-file approach directly.
         // This avoids loading all data into memory and provides correct file-local row IDs.
@@ -266,8 +283,12 @@ impl CayenneDeletionSink {
         let total_rows = concatenated_batch.num_rows();
 
         // Create a batch with row_id column added (needed for filtering)
-        let row_id_array =
-            Int64Array::from_iter_values(0..convert_to_i64_box(total_rows, "total rows")?);
+        let total_rows_i64 =
+            convert_to_i64_box(total_rows, "total rows").map_err(|e| Error::Internal {
+                table: table_name.clone(),
+                message: e.to_string(),
+            })?;
+        let row_id_array = Int64Array::from_iter_values(0..total_rows_i64);
 
         let mut fields = vec![Field::new("__row_id", DataType::Int64, false)];
         for field in self.schema.fields() {
@@ -315,27 +336,34 @@ impl CayenneDeletionSink {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 // Int64 PK deletion - extract PK values directly
                 // Note: column indices are offset by 1 because __row_id is at index 0
-                let first_batch = filtered_batches
-                    .first()
-                    .ok_or("Expected at least one batch after filtering (checked above)")?;
+                let first_batch = filtered_batches.first().ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Expected at least one batch after filtering (checked above)"
+                        .to_string(),
+                })?;
                 let filtered_concat =
                     arrow::compute::concat_batches(&first_batch.schema(), &filtered_batches)?;
 
-                let pk_column_index = self
-                    .pk_column_indices
-                    .first()
-                    .ok_or("Int64 PK strategy requires exactly one PK column index")?;
+                let pk_column_index =
+                    self.pk_column_indices
+                        .first()
+                        .ok_or_else(|| Error::Internal {
+                            table: table_name.clone(),
+                            message: "Int64 PK strategy requires exactly one PK column index"
+                                .to_string(),
+                        })?;
 
                 let pk_column = filtered_concat.column(*pk_column_index + 1); // +1 for __row_id offset
                 let pk_array =
                     pk_column
                         .as_any()
                         .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            format!(
-                        "Expected Int64Array for PK column at index {pk_column_index}, got {:?}",
-                        pk_column.data_type()
-                    )
+                        .ok_or_else(|| Error::Internal {
+                            table: table_name.clone(),
+                            message: format!(
+                                "Expected Int64Array for PK column at index {pk_column_index}, got {:?}",
+                                pk_column.data_type()
+                            ),
                         })?;
 
                 let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
@@ -363,7 +391,11 @@ impl CayenneDeletionSink {
 
                     self.persist_key_based_deletions(row_keys).await
                 } else {
-                    Err("RowConverter not available for RowConverterBased strategy".into())
+                    Err(Error::Internal {
+                        table: table_name.clone(),
+                        message: "RowConverter not available for RowConverterBased strategy"
+                            .to_string(),
+                    })
                 }
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
@@ -375,12 +407,19 @@ impl CayenneDeletionSink {
     async fn persist_key_based_deletions(
         &self,
         row_keys: Vec<Box<[u8]>>,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> super::super::Result<u64> {
+        let table_name = &self.table_metadata.table_name;
+
         // Get the row keys cache from the PkDeletionStrategy (only valid for RowConverterBased)
-        let cached_deleted_row_keys = self
-            .pk_deletion_strategy
-            .row_keys_cache()
-            .ok_or("persist_key_based_deletions called with incompatible PkDeletionStrategy")?;
+        let cached_deleted_row_keys =
+            self.pk_deletion_strategy
+                .row_keys_cache()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message:
+                        "persist_key_based_deletions called with incompatible PkDeletionStrategy"
+                            .to_string(),
+                })?;
 
         let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
 
@@ -393,7 +432,10 @@ impl CayenneDeletionSink {
         let new_deletion_count = {
             let guard = cached_deleted_row_keys
                 .read()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
             filtered_row_keys
                 .iter()
                 .filter(|key| !guard.contains_key(key.as_ref()))
@@ -406,8 +448,7 @@ impl CayenneDeletionSink {
         let delete_sequence = self
             .catalog
             .increment_sequence_number(self.table_metadata.table_id)
-            .await
-            .map_err(catalog_error_to_box)?;
+            .await?;
 
         // Create a temporary metadata with the fresh sequence number
         let mut temp_metadata = self.table_metadata.clone();
@@ -418,23 +459,22 @@ impl CayenneDeletionSink {
             .write(vec![DeletionVectorWriteSpec::new_key_based(
                 filtered_row_keys,
             )])
-            .await
-            .map_err(catalog_error_to_box)?;
+            .await?;
 
         let Some(result) = results.pop() else {
             return Ok(0);
         };
 
-        self.catalog
-            .add_delete_file(result.delete_file)
-            .await
-            .map_err(catalog_error_to_box)?;
+        self.catalog.add_delete_file(result.delete_file).await?;
 
         // Extract row keys from the result
         let written_row_keys = match &result.identifiers {
             DeletionIdentifier::KeyBased(keys) => keys,
             DeletionIdentifier::PositionBased { .. } => {
-                return Err("Unexpected position-based deletion in key-based sink".into());
+                return Err(Error::Internal {
+                    table: table_name.clone(),
+                    message: "Unexpected position-based deletion in key-based sink".to_string(),
+                });
             }
         };
 
@@ -442,7 +482,10 @@ impl CayenneDeletionSink {
         {
             let mut guard = cached_deleted_row_keys
                 .write()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
 
             let mut updated_map = (**guard).clone();
             for key in written_row_keys {
@@ -456,7 +499,13 @@ impl CayenneDeletionSink {
             *guard = Arc::new(updated_map);
         }
 
-        let deleted_count = convert_to_u64_box(new_deletion_count, "deleted row count")?;
+        let deleted_count =
+            convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
+                Error::Internal {
+                    table: table_name.clone(),
+                    message: e.to_string(),
+                }
+            })?;
 
         tracing::debug!(
             "Key-based deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
@@ -468,15 +517,19 @@ impl CayenneDeletionSink {
         Ok(deleted_count)
     }
 
-    async fn persist_int64_pk_deletions(
-        &self,
-        pk_values: Vec<i64>,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn persist_int64_pk_deletions(&self, pk_values: Vec<i64>) -> super::super::Result<u64> {
+        let table_name = &self.table_metadata.table_name;
+
         // Get the int64 pk cache from the PkDeletionStrategy (only valid for Int64Pk)
-        let cached_deleted_pk_i64 = self
-            .pk_deletion_strategy
-            .int64_pk_cache()
-            .ok_or("persist_int64_pk_deletions called with incompatible PkDeletionStrategy")?;
+        let cached_deleted_pk_i64 =
+            self.pk_deletion_strategy
+                .int64_pk_cache()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message:
+                        "persist_int64_pk_deletions called with incompatible PkDeletionStrategy"
+                            .to_string(),
+                })?;
 
         let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
 
@@ -489,7 +542,10 @@ impl CayenneDeletionSink {
         let new_deletion_count = {
             let guard = cached_deleted_pk_i64
                 .read()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
             filtered_pk_values
                 .iter()
                 .filter(|pk| !guard.contains_key(*pk))
@@ -502,8 +558,7 @@ impl CayenneDeletionSink {
         let delete_sequence = self
             .catalog
             .increment_sequence_number(self.table_metadata.table_id)
-            .await
-            .map_err(catalog_error_to_box)?;
+            .await?;
 
         // For Int64 PK deletions, we store them as key-based deletions
         // where each key is the 8-byte big-endian representation of the i64 value.
@@ -520,23 +575,22 @@ impl CayenneDeletionSink {
         let writer = DeletionVectorWriter::new(&temp_metadata);
         let mut results = writer
             .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
-            .await
-            .map_err(catalog_error_to_box)?;
+            .await?;
 
         let Some(result) = results.pop() else {
             return Ok(0);
         };
 
-        self.catalog
-            .add_delete_file(result.delete_file)
-            .await
-            .map_err(catalog_error_to_box)?;
+        self.catalog.add_delete_file(result.delete_file).await?;
 
         // Update the cached Int64 PK deletion map with sequence number
         {
             let mut guard = cached_deleted_pk_i64
                 .write()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+                .map_err(|_| Error::LockPoisoned {
+                    table: table_name.clone(),
+                    lock: DELETION_CACHE_LOCK_POISONED,
+                })?;
 
             let mut updated_map = (**guard).clone();
             for &pk_value in &filtered_pk_values {
@@ -550,7 +604,13 @@ impl CayenneDeletionSink {
             *guard = Arc::new(updated_map);
         }
 
-        let deleted_count = convert_to_u64_box(new_deletion_count, "deleted row count")?;
+        let deleted_count =
+            convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
+                Error::Internal {
+                    table: table_name.clone(),
+                    message: e.to_string(),
+                }
+            })?;
 
         tracing::debug!(
             "Int64 PK deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
@@ -583,20 +643,16 @@ impl CayenneDeletionSink {
     }
 }
 
-pub(super) fn catalog_error_to_box(err: CatalogError) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(err)
-}
-
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
 
         let listing_table = {
-            let guard = self
-                .listing_table
-                .read()
-                .map_err(|_| LISTING_TABLE_LOCK_POISONED.to_string())?;
+            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
+                table: self.table_metadata.table_name.clone(),
+                lock: LISTING_TABLE_LOCK_POISONED,
+            })?;
             Arc::clone(&guard)
         };
 
@@ -607,10 +663,14 @@ impl DeletionSink for CayenneDeletionSink {
         }
 
         if self.filters.is_empty() {
-            return self.delete_all_rows_from_tables(&ctx, &all_tables).await;
+            return self
+                .delete_all_rows_from_tables(&ctx, &all_tables)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         }
 
         self.delete_filtered_rows_from_tables(&ctx, &all_tables)
             .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }

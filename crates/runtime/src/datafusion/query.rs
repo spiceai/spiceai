@@ -21,17 +21,21 @@ use ::cache::{
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
+use arrow::array::UInt64Array;
 use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
+    datasource::memory::MemorySourceConfig,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::LogicalPlan,
+    logical_expr::dml::InsertOp,
+    logical_expr::{Expr, LogicalPlan},
     physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
 };
+use datafusion_expr::expr_rewriter::unnormalize_col;
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
 use tokio::time::Instant;
@@ -67,6 +71,7 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use data_components::delete::get_deletion_provider;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
@@ -682,6 +687,83 @@ impl Query {
                         }
                     };
                     (stream, df_plan)
+                } else if let LogicalPlan::Dml(dml) = &*plan
+                    && matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete)
+                {
+                    // DELETE operations need special handling because DataFusion doesn't
+                    // support DELETE natively. We intercept the DML Delete plan, extract
+                    // the filter predicates, and delegate to the DeletionTableProvider.
+                    let delete_plan =
+                        match create_delete_physical_plan(dml, &ctx.df, &session).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let error_code = ErrorCode::from(&e);
+                                handle_error!(
+                                    tracker,
+                                    &request_context,
+                                    error_code,
+                                    e,
+                                    UnableToExecuteQuery
+                                )
+                            }
+                        };
+
+                    let task_ctx = Arc::new(TaskContext::from(&session));
+                    let stream = match execute_stream(Arc::clone(&delete_plan), task_ctx) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+                    (stream, delete_plan)
+                } else if let LogicalPlan::Dml(dml) = &*plan
+                    && matches!(&dml.op, datafusion::logical_expr::WriteOp::Update)
+                {
+                    // UPDATE operations are rewritten to an execution plan that:
+                    // 1) materializes updated rows from the DML input,
+                    // 2) deletes matched rows,
+                    // 3) inserts updated rows back.
+                    let update_plan =
+                        match create_update_physical_plan(dml, &ctx.df, &session).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let error_code = ErrorCode::from(&e);
+                                handle_error!(
+                                    tracker,
+                                    &request_context,
+                                    error_code,
+                                    e,
+                                    UnableToExecuteQuery
+                                )
+                            }
+                        };
+
+                    let task_ctx = Arc::new(TaskContext::from(&session));
+                    let stream = match execute_stream(Arc::clone(&update_plan), task_ctx) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+                    (stream, update_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
                     let physical_plan = match session.create_physical_plan(&plan).await {
@@ -718,9 +800,20 @@ impl Query {
                     (stream, physical_plan)
                 };
 
-            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE)
-            // as their logical plan schema may differ from the actual execution result
-            if !matches!(&*plan, LogicalPlan::Statement(_)) {
+            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
+            // DDL plans (CREATE TABLE/DROP TABLE), and DML Delete plans, as their logical
+            // plan schema may differ from the actual execution result (DDL plans may be
+            // rewritten by analyzer rules into extension nodes with different output schemas)
+            let res_stream = if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
+                && !matches!(
+                    &*plan,
+                    LogicalPlan::Dml(dml)
+                        if matches!(
+                            &dml.op,
+                            datafusion::logical_expr::WriteOp::Delete
+                                | datafusion::logical_expr::WriteOp::Update
+                        )
+                ) {
                 let plan_schema = Arc::clone(plan.schema().inner());
                 let res_schema = res_stream.schema();
 
@@ -733,7 +826,17 @@ impl Query {
                         SchemaMismatch
                     )
                 }
-            }
+                // The AggregateStatistics physical optimizer may replace an
+                // AggregateExec with a ProjectionExec containing a literal
+                // value, which changes the output nullability (literals report
+                // nullable = value.is_null()).  Reconcile the execution result
+                // schema with the logical plan schema so downstream consumers
+                // (e.g. FlightSQL GetFlightInfo vs DoGet) see consistent
+                // nullability.
+                reconcile_stream_nullability(res_stream, &plan_schema)
+            } else {
+                res_stream
+            };
 
             let final_stream = if cache_manager.should_cache_results() {
                 Self::wrap_stream_with_cache(
@@ -820,14 +923,51 @@ impl Query {
 
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
-            QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
-                Ok(plan) => Box::new(plan),
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    self.handle_schema_error(&request_context, &e);
-                    return Err(e);
+            QueryMethod::Text { ref sql, .. } => {
+                // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning
+                let preprocessed =
+                    match super::iceberg_ddl::preprocess::preprocess_create_table_with_options(
+                        sql,
+                        self.df.ddl_options_store(),
+                    ) {
+                        Ok(preprocessed) => preprocessed,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            self.handle_schema_error(&request_context, &e);
+                            return Err(e);
+                        }
+                    };
+
+                let (effective_sql, store_key) = match &preprocessed {
+                    super::iceberg_ddl::preprocess::PreprocessResult::Modified {
+                        sql: modified,
+                        store_key,
+                    } => (modified.as_str(), Some(store_key.as_str())),
+                    super::iceberg_ddl::preprocess::PreprocessResult::Unchanged => {
+                        (sql.as_ref(), None)
+                    }
+                };
+
+                match session.create_logical_plan(effective_sql).await {
+                    Ok(plan) => Box::new(plan),
+                    Err(e) => {
+                        if let Some(store_key) = store_key
+                            && let Err(cleanup_err) =
+                                super::iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
+                                    self.df.ddl_options_store(),
+                                    store_key,
+                                )
+                        {
+                            let cleanup_err = find_datafusion_root(cleanup_err);
+                            self.handle_schema_error(&request_context, &cleanup_err);
+                            return Err(cleanup_err);
+                        }
+                        let e = find_datafusion_root(e);
+                        self.handle_schema_error(&request_context, &e);
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
 
         // Verify the plan against the restricted options
@@ -1088,6 +1228,339 @@ pub fn write_to_json_string(
     writer.finish()?;
 
     String::from_utf8(writer.into_inner()).boxed()
+}
+
+/// Reconciles the nullability of a result stream with the logical plan schema.
+///
+/// Physical optimizer rules (e.g. `AggregateStatistics`) may replace aggregate
+/// execution plans with literal projections whose nullability differs from the
+/// logical plan.  For example, `MAX(int64)` is logically nullable (empty input
+/// → NULL) but the optimized literal `ScalarValue::Int64(Some(v))` is
+/// non-nullable.
+///
+/// This function widens non-nullable fields to nullable when the logical plan
+/// schema says they should be nullable, and wraps the stream so every batch
+/// conforms.  This uses the same `try_cast_to` mechanism as `SchemaCastScanExec`.
+fn reconcile_stream_nullability(
+    stream: SendableRecordBatchStream,
+    plan_schema: &Arc<Schema>,
+) -> SendableRecordBatchStream {
+    let exec_schema = stream.schema();
+
+    if exec_schema.fields().len() != plan_schema.fields().len() {
+        tracing::warn!(
+            "Schema field count mismatch during nullability reconciliation: \
+             execution schema has {} fields, logical plan has {}",
+            exec_schema.fields().len(),
+            plan_schema.fields().len(),
+        );
+        return stream;
+    }
+
+    let mut needs_reconciliation = false;
+    for (exec_field, plan_field) in exec_schema.fields().iter().zip(plan_schema.fields()) {
+        if plan_field.is_nullable() && !exec_field.is_nullable() {
+            needs_reconciliation = true;
+            break;
+        }
+    }
+
+    if !needs_reconciliation {
+        return stream;
+    }
+
+    // Build a reconciled schema: widen to nullable where the logical plan says
+    // so, but keep data types and metadata from the execution schema.
+    let reconciled_fields: Vec<Field> = exec_schema
+        .fields()
+        .iter()
+        .zip(plan_schema.fields())
+        .map(|(exec_field, plan_field)| {
+            if plan_field.is_nullable() && !exec_field.is_nullable() {
+                exec_field.as_ref().clone().with_nullable(true)
+            } else {
+                exec_field.as_ref().clone()
+            }
+        })
+        .collect();
+
+    let reconciled =
+        Arc::new(Schema::new(reconciled_fields).with_metadata(exec_schema.metadata().clone()));
+    let target = Arc::clone(&reconciled);
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        reconciled,
+        stream.map(move |batch| {
+            batch.and_then(|b| {
+                arrow_tools::record_batch::try_cast_to(b, Arc::clone(&target)).map_err(Into::into)
+            })
+        }),
+    ))
+}
+
+/// Creates a physical execution plan for a `DELETE FROM` DML statement.
+///
+/// `DataFusion` does not natively support `DELETE` operations, so we intercept
+/// the logical `DmlStatement` with `WriteOp::Delete`, extract the filter
+/// predicate from the source plan, look up the table's `DeletionTableProvider`,
+/// and call `delete_from` to produce the physical plan.
+///
+/// The source plan in the `DmlStatement` is either:
+/// - `Filter(predicate, TableScan)` — when `DELETE FROM t WHERE <predicate>`
+/// - `TableScan` — when `DELETE FROM t` (no WHERE clause)
+async fn create_delete_physical_plan(
+    dml: &datafusion::logical_expr::DmlStatement,
+    df: &Arc<DataFusion>,
+    session_state: &SessionState,
+) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    // Extract filter expressions from the source plan
+    let filters = extract_dml_filters(&dml.input);
+
+    // Look up the table provider
+    let table_provider = df.get_table(&dml.table_name).await.ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Table '{}' not found for DELETE operation",
+            dml.table_name
+        ))
+    })?;
+
+    // Get the DeletionTableProvider
+    let deletion_provider = get_deletion_provider(table_provider).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Table '{}' does not support DELETE operations",
+            dml.table_name
+        ))
+    })?;
+
+    deletion_provider.delete_from(session_state, &filters).await
+}
+
+/// Extract filter expressions from a DML source logical plan.
+///
+/// The source plan is generally `Filter(predicate, scan)`, and for `UPDATE`
+/// may be wrapped as `Projection(Filter(...))`.
+/// Returns the individual conjunctive filter expressions, or an empty
+/// vec if there is no WHERE clause.
+fn extract_dml_filters(source: &LogicalPlan) -> Vec<Expr> {
+    use datafusion_expr::utils::split_conjunction_owned;
+
+    match source {
+        LogicalPlan::Filter(filter) => {
+            split_conjunction_owned(unnormalize_col(filter.predicate.clone()))
+        }
+        LogicalPlan::Projection(projection) => extract_dml_filters(projection.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => extract_dml_filters(alias.input.as_ref()),
+        _ => vec![],
+    }
+}
+
+/// Create a physical execution plan for an `UPDATE` statement.
+///
+/// The returned plan executes update semantics as:
+/// 1) materialize updated rows from `dml.input`,
+/// 2) delete matched source rows,
+/// 3) insert updated rows with append mode.
+async fn create_update_physical_plan(
+    dml: &datafusion::logical_expr::DmlStatement,
+    df: &Arc<DataFusion>,
+    session_state: &SessionState,
+) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let table_provider = df.get_table(&dml.table_name).await.ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Table '{}' not found for UPDATE operation",
+            dml.table_name
+        ))
+    })?;
+
+    let deletion_provider =
+        get_deletion_provider(Arc::clone(&table_provider)).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Table '{}' does not support UPDATE operations",
+                dml.table_name
+            ))
+        })?;
+
+    let source_plan = session_state.create_physical_plan(&dml.input).await?;
+    let filters = extract_dml_filters(&dml.input);
+
+    Ok(Arc::new(UpdateExec::new(
+        source_plan,
+        table_provider,
+        deletion_provider,
+        session_state.clone(),
+        filters,
+    )))
+}
+
+struct UpdateExec {
+    source_plan: Arc<dyn ExecutionPlan>,
+    table_provider: Arc<dyn datafusion::datasource::TableProvider>,
+    deletion_provider: Arc<dyn data_components::delete::DeletionTableProvider>,
+    session_state: SessionState,
+    filters: Vec<Expr>,
+    properties: datafusion::physical_plan::PlanProperties,
+}
+
+impl UpdateExec {
+    fn new(
+        source_plan: Arc<dyn ExecutionPlan>,
+        table_provider: Arc<dyn datafusion::datasource::TableProvider>,
+        deletion_provider: Arc<dyn data_components::delete::DeletionTableProvider>,
+        session_state: SessionState,
+        filters: Vec<Expr>,
+    ) -> Self {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
+        ]));
+        let properties = datafusion::physical_plan::PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(Arc::clone(&schema)),
+            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        );
+        Self {
+            source_plan,
+            table_provider,
+            deletion_provider,
+            session_state,
+            filters,
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for UpdateExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateExec").finish_non_exhaustive()
+    }
+}
+
+impl datafusion::physical_plan::DisplayAs for UpdateExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "UpdateExec")
+    }
+}
+
+impl ExecutionPlan for UpdateExec {
+    fn name(&self) -> &'static str {
+        "UpdateExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.source_plan]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "UpdateExec requires exactly one child, got {}",
+                children.len()
+            )));
+        }
+
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            Arc::clone(&self.table_provider),
+            Arc::clone(&self.deletion_provider),
+            self.session_state.clone(),
+            self.filters.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> std::result::Result<SendableRecordBatchStream, DataFusionError> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "UpdateExec only supports partition 0, got {partition}"
+            )));
+        }
+
+        let source_plan = Arc::clone(&self.source_plan);
+        let table_provider = Arc::clone(&self.table_provider);
+        let deletion_provider = Arc::clone(&self.deletion_provider);
+        let session_state = self.session_state.clone();
+        let filters = self.filters.clone();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
+        ]));
+
+        let stream = futures::stream::once(async move {
+            use futures::TryStreamExt;
+
+            let source_stream = execute_stream(Arc::clone(&source_plan), Arc::clone(&context))?;
+            let updated_batches: Vec<RecordBatch> = source_stream.try_collect().await?;
+
+            // Normalize update output to match the target table schema (including nullability)
+            // before performing any destructive operation.
+            let target_schema = table_provider.schema();
+            let normalized_batches = updated_batches
+                .into_iter()
+                .map(|batch| {
+                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DataFusionError::from)?;
+
+            let delete_plan = deletion_provider
+                .delete_from(&session_state, &filters)
+                .await?;
+            let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+            let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+
+            let deleted_count = delete_batches
+                .iter()
+                .flat_map(RecordBatch::columns)
+                .find_map(|arr| {
+                    arr.as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .and_then(|counts| counts.values().first().copied())
+                })
+                .unwrap_or(0);
+
+            if !normalized_batches.is_empty() {
+                let input_exec = MemorySourceConfig::try_new_exec(
+                    &[normalized_batches],
+                    Arc::clone(&target_schema),
+                    None,
+                )?;
+                let insert_plan = table_provider
+                    .insert_into(&session_state, input_exec, InsertOp::Append)
+                    .await?;
+                let insert_stream = execute_stream(insert_plan, Arc::clone(&context))?;
+                let _insert_batches: Vec<RecordBatch> = insert_stream.try_collect().await?;
+            }
+
+            let result = RecordBatch::try_from_iter_with_nullable(vec![(
+                "count",
+                Arc::new(UInt64Array::from(vec![deleted_count])) as arrow::array::ArrayRef,
+                false,
+            )])
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+            Ok(result)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
 }
 
 #[cfg(test)]
@@ -1505,5 +1978,205 @@ mod tests {
         assert_eq!(totals.produced_spills, 40);
         assert_eq!(totals.spilled_bytes, 0);
         assert_eq!(totals.spilled_rows, 200);
+    }
+
+    /// Helper: build a `SendableRecordBatchStream` from a schema and batches.
+    fn stream_from_batches(
+        schema: &Arc<Schema>,
+        batches: Vec<RecordBatch>,
+    ) -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), {
+            futures::stream::iter(batches.into_iter().map(Ok))
+        }))
+    }
+
+    /// Collect all batches from a `SendableRecordBatchStream`.
+    async fn collect_stream(mut stream: SendableRecordBatchStream) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result.expect("unexpected error in stream"));
+        }
+        batches
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_widens_non_nullable() {
+        // Simulates AggregateStatistics replacing MAX(id) with a literal:
+        // execution schema has non-nullable field, plan schema has nullable.
+        let exec_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let plan_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&exec_schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        // Schema should now be nullable
+        assert!(
+            reconciled.schema().field(0).is_nullable(),
+            "field should be nullable after reconciliation"
+        );
+
+        // Batch data should be preserved
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert!(
+            batches[0].schema().field(0).is_nullable(),
+            "batch schema should also be nullable"
+        );
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 array");
+        assert_eq!(col.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_no_op_when_already_matching() {
+        // Both schemas agree: nullable. No wrapping needed.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &schema);
+
+        // Schema unchanged
+        assert_eq!(reconciled.schema(), schema);
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_no_op_when_non_nullable_in_both() {
+        // Both schemas agree: non-nullable. No wrapping needed.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &schema);
+
+        assert!(!reconciled.schema().field(0).is_nullable());
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_mixed_fields() {
+        // Multiple fields: only some need reconciliation.
+        let exec_schema = Arc::new(Schema::new(vec![
+            Field::new("name", arrow::datatypes::DataType::Utf8, true), // already nullable
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, false), // needs widening
+            Field::new("count", arrow::datatypes::DataType::Int64, false), // stays non-nullable
+        ]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, true), // nullable in plan
+            Field::new("count", arrow::datatypes::DataType::Int64, false),  // non-nullable in plan
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&exec_schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        let schema = reconciled.schema();
+        assert!(schema.field(0).is_nullable(), "name stays nullable");
+        assert!(schema.field(1).is_nullable(), "max(id) widened to nullable");
+        assert!(!schema.field(2).is_nullable(), "count stays non-nullable");
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].schema(), schema);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_field_count_mismatch() {
+        // Different field counts: return stream unchanged.
+        let exec_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("a", arrow::datatypes::DataType::Int64, true),
+            Field::new("b", arrow::datatypes::DataType::Int64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&exec_schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        // Should be unchanged — no widening when field counts differ
+        assert!(!reconciled.schema().field(0).is_nullable());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_empty_stream() {
+        let exec_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let plan_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let stream = stream_from_batches(&exec_schema, vec![]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        assert!(reconciled.schema().field(0).is_nullable());
+
+        let batches = collect_stream(reconciled).await;
+        assert!(batches.is_empty());
     }
 }

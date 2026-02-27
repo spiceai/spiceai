@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod cancel_tasks;
+mod distributed_acceleration;
 mod in_memory_shuffle;
 mod job_store;
 mod simple;

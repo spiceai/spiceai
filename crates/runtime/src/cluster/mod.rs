@@ -395,7 +395,7 @@ fn update_scheduler_pollers(
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-mod executor_registry;
+pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
 mod scheduler_registry;
@@ -819,20 +819,8 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 rt.set_partition_manager(Arc::clone(&partition_manager))
                     .await;
 
-                // Initialize partition metadata for all accelerated tables
-                if let Err(err) = partition::initialize_partition_metadata(
-                    rt.datafusion(),
-                    Arc::clone(&app),
-                    &partition_manager,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to initialize partition metadata during scheduler startup: {err}"
-                    );
-                }
-
-                // Start partition management task
+                // Start partition management task (which also seeds initial partition
+                // metadata as its first step, before entering the periodic loop).
                 let pm_shutdown = CancellationToken::new();
                 let pm_config = match config
                     .partition_management
@@ -849,11 +837,17 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     }
                 };
 
+                // Register partition_metadata as Initializing so `/v1/ready`
+                // waits for metadata seeding to complete before reporting ready.
+                rt.status
+                    .update_component_status("partition_metadata", ComponentStatus::Initializing);
+
                 let pm_task = PartitionManagementTask::new(
                     rt.app(),
                     rt.datafusion(),
                     Arc::clone(&partition_manager),
                     Arc::clone(&scheduler_executor_registry),
+                    Arc::clone(&rt.status),
                     pm_config,
                     pm_shutdown.clone(),
                 );
@@ -1317,6 +1311,7 @@ pub async fn initialize_cluster_executor(
         let initial_partitions = executor_request_initial_partitions(
             cluster_client.clone(),
             rt.datafusion().cluster_config.node_advertise_url(),
+            rt.datafusion().ctx.as_ref(),
         )
         .await
         .map_err(|status| FailedToStartClusterExecutor {

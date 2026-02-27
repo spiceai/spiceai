@@ -95,7 +95,7 @@ pub enum Error {
     ))]
     PartitionByRequired,
 
-    #[snafu(display("Cayenne acceleration S3 storage error: {source}"))]
+    #[snafu(display("Cayenne S3 acceleration error: {source}"))]
     S3Error { source: s3::Error },
 }
 
@@ -124,7 +124,7 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
 /// Transform schema according to `unsupported_type_action` policy
 /// Always converts Float16 to Float32 and normalizes timestamps to Microsecond (these are compatible transformations)
 /// Handles truly unsupported types according to the action: String (convert to Utf8) or Error (return error)
-fn transform_schema_for_vortex(
+pub(crate) fn transform_schema_for_vortex(
     schema: &arrow::datatypes::Schema,
     unsupported_type_action: UnsupportedTypeAction,
 ) -> Result<arrow::datatypes::Schema> {
@@ -1394,7 +1394,6 @@ impl PartitionCreator for CayennePartitionCreator {
         std::fs::create_dir_all(&partition_dir)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
         let partition_column_names = self.partition_column_labels();
 
         // Create composite key for table naming (slash-separated values)

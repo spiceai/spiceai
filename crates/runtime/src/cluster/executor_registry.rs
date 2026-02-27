@@ -27,6 +27,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
+use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
@@ -35,6 +36,8 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::accelerated_table::AcceleratedTable;
+#[cfg(not(windows))]
+use cayenne::CayenneTableProvider;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -265,17 +268,67 @@ impl ExecutorRegistry {
     }
 }
 
+fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
+    if table_provider
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .is_some()
+    {
+        return true;
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return inner_provider
+            .as_any()
+            .downcast_ref::<AcceleratedTable>()
+            .is_some();
+    }
+
+    false
+}
+
+fn flight_sql_table_provider(
+    executor_id: &str,
+    client: FlightSqlClient,
+    table: &TableReference,
+    schema: SchemaRef,
+) -> Arc<dyn TableProvider> {
+    Arc::new(FlightSQLTable::create_with_schema(
+        "flightsql",
+        executor_id,
+        client,
+        table.clone(),
+        schema,
+        Arc::new(CookieStore::new()),
+    )) as Arc<dyn TableProvider>
+}
+
 impl TablePartitionProvider for ExecutorRegistry {
-    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
+    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables and Cayenne tables.
     fn should_partition(&self, tbl: &TableScan) -> bool {
         let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
             return false;
         };
-        default
+
+        if is_accelerated_table_provider(&default.table_provider) {
+            return true;
+        }
+
+        #[cfg(not(windows))]
+        if default
             .table_provider
             .as_any()
-            .downcast_ref::<AcceleratedTable>()
+            .downcast_ref::<CayenneTableProvider>()
             .is_some()
+        {
+            return true;
+        }
+
+        false
     }
 
     fn get_partitions(
@@ -297,29 +350,53 @@ impl TablePartitionProvider for ExecutorRegistry {
             return Vec::new();
         };
 
-        partitions
+        let mut has_partition_entries = false;
+        let mut providers = Vec::new();
+
+        for (executor_id, table_map) in partitions.iter() {
+            let Some(parts) = table_map.get(table) else {
+                continue;
+            };
+
+            has_partition_entries = true;
+
+            let Some(client) = flight_sql_clients.get(executor_id) else {
+                tracing::warn!(
+                    "Executor '{executor_id}' registered with partitions for table {table:?}, but no FlightSQL client found."
+                );
+                continue;
+            };
+
+            providers.push((
+                flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(&schema)),
+                parts.clone(),
+            ));
+        }
+
+        if !providers.is_empty() || has_partition_entries {
+            return providers;
+        }
+
+        // Non-partitioned accelerated tables don't register partition assignments.
+        // Route to a single executor to avoid duplicate results in multi-executor clusters.
+        let Some((executor_id, client)) = flight_sql_clients
             .iter()
-            .filter_map(|(executor_id, table_map)| {
-                let parts = table_map.get(table)?;
-                let Some(client) = flight_sql_clients.get(executor_id) else {
-                    tracing::warn!(
-                        "Executor '{executor_id}' registered with partitions for table {table:?}, but no FlightSQL client found."
-                    );
-                    return None;
-                };
-                let table_provider = Arc::new(FlightSQLTable::create_with_schema(
-                    "flightsql",
-                    executor_id,
-                    client.clone(),
-                    table.clone(),
-                    Arc::clone(&schema),
-                    Arc::new(CookieStore::new()),
+            .min_by(|(lhs_id, _), (rhs_id, _)| lhs_id.cmp(rhs_id))
+        else {
+            tracing::warn!(
+                "For non-partitioned accelerated table {table:?}, no connected executors with FlightSQL clients were found"
+            );
+            return Vec::new();
+        };
 
-                )) as Arc<dyn TableProvider>;
+        tracing::debug!(
+            "No partition assignments found for accelerated table {table:?}; routing query to executor '{executor_id}'"
+        );
 
-                Some((table_provider, parts.clone()))
-            })
-            .collect()
+        vec![(
+            flight_sql_table_provider(executor_id, client.clone(), table, schema),
+            Vec::new(),
+        )]
     }
 }
 

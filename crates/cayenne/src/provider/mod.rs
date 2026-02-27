@@ -65,17 +65,116 @@ pub use vortex_format::{attach_deletion_vectors_to_config, DeletionFilteringVort
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;
 
+use crate::catalog::CatalogError;
 use snafu::prelude::*;
 
-#[expect(missing_docs)]
+/// Result type for Cayenne table provider operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Error types for Cayenne table provider operations.
 #[derive(Debug, Snafu)]
+#[expect(missing_docs)]
 pub enum Error {
-    /// Invalid number of children provided to execution plan
+    /// Catalog operation failed (DB commit, sequence increment, partition ops).
+    #[snafu(display("{source}"))]
+    Catalog { source: CatalogError },
+
+    /// `DataFusion` plan/execution error (scan, sort, insert, listing table ops).
+    #[snafu(transparent)]
+    DataFusion {
+        source: datafusion_common::DataFusionError,
+    },
+
+    /// Filesystem I/O error.
+    #[snafu(transparent)]
+    IoError { source: std::io::Error },
+
+    /// Object store operation failure (list, delete, put).
+    #[snafu(display("Failed to {operation} for table '{table}': {source}"))]
+    ObjectStore {
+        /// What operation was attempted (e.g., "list objects for snapshot cleanup").
+        operation: &'static str,
+        table: String,
+        source: object_store::Error,
+    },
+
+    /// Vortex file operation failure (open, scan, read).
+    #[snafu(display("Failed to {operation} for table '{table}': {source}"))]
+    Vortex {
+        /// What operation was attempted (e.g., "open vortex file for deletion scan").
+        operation: &'static str,
+        table: String,
+        source: Box<vortex::error::VortexError>,
+    },
+
+    /// Data constraint violation: null PK, duplicate PK, row overflow.
+    #[snafu(display("Data validation failed for table '{table}': {message}"))]
+    DataValidation { table: String, message: String },
+
+    /// Failed to parse a snapshot or table URL.
+    #[snafu(display("Failed to parse URL '{url}': {source}"))]
+    UrlParse {
+        url: String,
+        source: url::ParseError,
+    },
+
+    /// Arrow error during schema or type conversion.
+    #[snafu(transparent)]
+    Arrow { source: arrow::error::ArrowError },
+
+    /// RwLock/Mutex poisoned or semaphore closed. Requires table reload or process restart.
+    #[snafu(display("Lock poisoned for table '{table}': {lock}"))]
+    LockPoisoned { table: String, lock: &'static str },
+
+    /// Spawned task panicked (`JoinSet` or `spawn_blocking`).
+    #[snafu(display("Task panicked for table '{table}': {source}"))]
+    TaskPanicked {
+        table: String,
+        source: tokio::task::JoinError,
+    },
+
+    /// Internal invariant violation or missing configuration. Should never happen in normal operation.
+    #[snafu(display("Internal error in table '{table}': {message}"))]
+    Internal { table: String, message: String },
+
+    /// Operation is not yet implemented.
+    #[snafu(display("Unsupported operation: {operation}"))]
+    Unsupported { operation: &'static str },
+
+    /// Invalid number of children provided to an execution plan.
     #[snafu(display(
-        "Invalid number of children for CayenneAccelerationExec: expected 1, got {}",
-        children_count
+        "Invalid number of children for CayenneAccelerationExec: expected 1, got {children_count}"
     ))]
     InvalidChildrenCount { children_count: usize },
+}
+
+impl From<CatalogError> for Error {
+    fn from(source: CatalogError) -> Self {
+        Error::Catalog { source }
+    }
+}
+
+impl From<Error> for datafusion_common::DataFusionError {
+    fn from(err: Error) -> Self {
+        match err {
+            // Unwrap DataFusion errors back to their original form
+            Error::DataFusion { source } => source,
+            other => datafusion_common::DataFusionError::External(Box::new(other)),
+        }
+    }
+}
+
+impl From<Error> for CatalogError {
+    fn from(err: Error) -> Self {
+        match err {
+            // Unwrap catalog errors back to their original form
+            Error::Catalog { source } => source,
+            other => CatalogError::InvalidOperation {
+                message: other.to_string(),
+                source: Box::new(other),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
