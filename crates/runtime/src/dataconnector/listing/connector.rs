@@ -2034,7 +2034,7 @@ mod tests {
             .expect_err("metadata+partition scan should fail safely");
         assert!(
             err.to_string().contains(
-                "Listing metadata columns with partition columns are currently unsupported"
+                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
             ),
             "expected a clear metadata+partition error, got: {err}"
         );
@@ -2050,7 +2050,7 @@ mod tests {
             .expect_err("metadata+partition scan should fail safely");
         assert!(
             err.to_string().contains(
-                "Listing metadata columns with partition columns are currently unsupported"
+                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
             ),
             "expected a clear metadata+partition error, got: {err}"
         );
@@ -2067,7 +2067,7 @@ mod tests {
             .expect_err("metadata+partition scan should fail safely");
         assert!(
             err.to_string().contains(
-                "Listing metadata columns with partition columns are currently unsupported"
+                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
             ),
             "expected a clear metadata+partition error, got: {err}"
         );

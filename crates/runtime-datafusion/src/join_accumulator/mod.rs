@@ -154,7 +154,7 @@ impl ColumnBounds for ExactColumnBounds {
         let col_index = left_expr
             .as_any()
             .downcast_ref::<datafusion::physical_plan::expressions::Column>()
-            .map_or(0, |c| c.index());
+            .map_or(0, datafusion::physical_expr::expressions::Column::index);
 
         let mut fields: Vec<Field> = (0..col_index)
             .map(|i| Field::new(format!("_pad{i}"), arrow::datatypes::DataType::Null, true))
