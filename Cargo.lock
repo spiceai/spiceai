@@ -19185,6 +19185,7 @@ dependencies = [
  "arrow",
  "arrow-json",
  "arrow-schema",
+ "arrow_tools",
  "async-channel 2.5.0",
  "async-openai",
  "async-trait",

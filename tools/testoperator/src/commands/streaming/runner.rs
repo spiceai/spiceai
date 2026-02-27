@@ -14,75 +14,71 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `DynamoDB` Streams ingestion benchmark runner.
+//! Unified `DynamoDB` Streams performance benchmark.
 //!
-//! This module contains the DynamoDB-specific benchmark orchestration logic.
-//! It uses snapshot-based checkpoint capture to ensure fair benchmarking.
+//! Self-contained benchmark that creates tables, inserts TPC-H data, starts Spice,
+//! measures ingestion throughput and stream lag, and optionally verifies data
+//! correctness with TPC-H queries.
 //!
-//! ## Workflow
-//!
-//! The streaming benchmark uses a two-phase approach:
-//!
-//! 1. **Preparation phase** (`streaming-dynamodb-dispatch` command):
-//!    - Creates `DynamoDB` tables
-//!    - Inserts data and captures snapshots for each config
-//!    - Tables and snapshots identified by a shared `run_id`
-//!
-//! 2. **Benchmark phase** (`streaming-dynamodb` command, this module):
-//!    - Starts Spice from snapshot (using same `run_id`)
-//!    - Inserts markers, waits for ingestion
-//!    - Reports results with telemetry
+//! ## Flow
+//! 1. Create `DynamoDB` tables with unique prefix
+//! 2. Generate TPC-H data and insert initial records (for schema inference)
+//! 3. Transform and write spicepod, start Spice with metrics
+//! 4. Insert remaining data and marker records
+//! 5. Poll for markers to measure stream lag and ingestion duration
+//! 6. Delete markers and confirm deletions
+//! 7. Fetch `DynamoDB` metrics from Prometheus
+//! 8. Optionally restart Spice and run TPC-H verification
+//! 9. Emit telemetry and report results
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::RecordBatch;
+use futures::future::try_join_all;
 use test_framework::anyhow::{self, Result};
 use test_framework::git;
-use test_framework::metrics::QueryStatus;
 use test_framework::opentelemetry::KeyValue;
 use test_framework::opentelemetry_sdk::Resource;
 use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
 use super::query_liveness::QueryLivenessMonitor;
-use super::sources::{DynamoDbConfig, DynamoDbStreamsSource};
-use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingSource};
+use super::sources::{DynamoDbConfig, DynamoDbStreamsSource, transform_spicepod};
+use super::traits::StreamingSource;
+use super::utils;
 use super::utils::{
-    get_dynamodb_metrics, load_spicepod_definition, poll_for_all_markers,
+    DatasetInfo, generate_run_id, load_spicepod_definition, poll_for_all_markers, skip_rows,
     wait_for_all_marker_deletions, write_temp_spicepod,
 };
-use super::verification;
-use crate::args::StreamingDynamodbTestArgs;
+use crate::args::StreamingDynamodbArgs;
 use crate::commands::create_telemetry_with_resource;
 use crate::health::HealthMonitor;
 
-/// Run the `DynamoDB` streaming ingestion benchmark from a snapshot.
+/// Run the unified `DynamoDB` streaming performance benchmark.
 ///
-/// This requires that `dispatch-dynamodb` has already:
-/// 1. Created tables and inserted data
-/// 2. Captured checkpoint snapshots for all configs
-///
-/// The benchmark:
-/// 1. Starts Spice from the snapshot
-/// 2. Inserts marker records
-/// 3. Waits for markers to be ingested
-/// 4. Reports results with telemetry
-pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
-    let run_id = &args.run_id;
-    let spicepod_path = &args.common.spicepod_path;
+/// This is a self-contained benchmark that handles the full lifecycle:
+/// table creation, data insertion, Spice startup, ingestion measurement,
+/// optional verification, and telemetry emission.
+#[expect(clippy::too_many_lines)]
+pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
+    let run_id = generate_run_id();
     let datasets = args.queryset.get_datasets();
 
-    let config_name = spicepod_path
+    let config_name = args
+        .common
+        .spicepod_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
 
-    println!("Starting DynamoDB streaming ingestion benchmark");
-    println!("Query set: {}", args.queryset);
-    println!("Config: {config_name}");
+    println!("Starting DynamoDB streaming performance benchmark");
     println!("Run ID: {run_id}");
+    println!("Config: {config_name}");
+    println!("Query set: {}", args.queryset);
+    println!("Scale factor: {}", args.scale_factor);
+    println!("Initial records: {}", args.initial_records);
     println!(
         "Datasets: {}",
         datasets
@@ -92,38 +88,88 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
             .join(", ")
     );
 
-    // Create source and set table prefix (for marker operations)
+    // Phase 1: Create DynamoDB source and prepare
+    println!("\nPhase 1: Preparing DynamoDB source");
     let config = DynamoDbConfig::from_env()?;
     let mut source = DynamoDbStreamsSource::new(config);
     source.set_table_prefix(run_id.clone());
     source.set_scale_factor(args.scale_factor);
-
-    let snapshot_config = build_snapshot_config().ok_or_else(|| {
-        anyhow::anyhow!("DynamoDB benchmarks require SNAPSHOT_S3_LOCATION environment variable")
-    })?;
-
-    // Prepare source (connects to DynamoDB)
     source.prepare().await?;
 
-    let source: Arc<dyn DynamoDBStreamingSource> = Arc::from(source);
+    // Phase 2: Create tables in parallel
+    println!("\nPhase 2: Creating tables for all datasets (parallel)");
+    let table_creation_futures: Vec<_> = datasets
+        .iter()
+        .map(|dataset| {
+            let source = &source;
+            let dataset_type = dataset.dataset_type();
+            async move { source.create_table(dataset_type).await }
+        })
+        .collect();
 
-    // Generate markers for each dataset
-    let mut dataset_markers = Vec::new();
+    try_join_all(table_creation_futures).await?;
+    println!("All tables created");
+
+    // Brief sleep for table propagation
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Phase 3: Generate TPC-H data for all datasets
+    println!("\nPhase 3: Generating data for all datasets");
+    let mut dataset_infos = Vec::new();
+
     for dataset in datasets {
+        let dataset_type = dataset.dataset_type();
+        println!("  Generating data for {dataset_type}");
+        let records = dataset.generate(args.scale_factor)?;
+        let record_count: usize = records.iter().map(RecordBatch::num_rows).sum();
+        println!("  Generated {record_count} records for {dataset_type}");
+
         let marker = dataset.marker_record()?;
-        dataset_markers.push((dataset.dataset_type(), marker));
+        dataset_infos.push(DatasetInfo {
+            dataset,
+            marker,
+            record_count,
+            generated_data: records,
+        });
     }
 
-    // Load and transform spicepod
-    let spicepod_def = load_spicepod_definition(spicepod_path)?;
-    let transformed =
-        source.prepare_benchmark_spicepod(spicepod_def, run_id, &config_name, &snapshot_config)?;
+    // Phase 4: Insert initial records per dataset (for schema inference)
+    println!(
+        "\nPhase 4: Inserting {} initial records per dataset (for schema inference)",
+        args.initial_records
+    );
+    for info in &dataset_infos {
+        let table_name = source.get_table_name(info.dataset.table_name());
+        let mut rows_inserted = 0;
+        let rows_to_insert = args.initial_records;
 
-    // Write transformed spicepod to temp file
-    let temp_path = write_temp_spicepod(&transformed, run_id, &config_name, "benchmark")?;
-    println!("Spicepod written to temp file: {}", temp_path.display());
+        for batch in &info.generated_data {
+            if rows_inserted >= rows_to_insert {
+                break;
+            }
+            let remaining = rows_to_insert - rows_inserted;
+            let take = remaining.min(batch.num_rows());
+            if take > 0 {
+                let slice = batch.slice(0, take);
+                source.insert(&table_name, &[slice]).await?;
+                rows_inserted += take;
+            }
+        }
+        println!(
+            "  Inserted {rows_inserted} initial records for {}",
+            info.dataset.dataset_type()
+        );
+    }
 
-    // Start Spice with metrics enabled for record count tracking
+    // Phase 5: Load and transform spicepod
+    println!("\nPhase 5: Loading and transforming spicepod");
+    let spicepod_def = load_spicepod_definition(&args.common.spicepod_path)?;
+    let transformed = transform_spicepod(spicepod_def, &run_id, &config_name, true);
+
+    let temp_path = write_temp_spicepod(&transformed, &run_id, &config_name, "benchmark")?;
+
+    // Phase 6: Start Spice with metrics enabled
+    println!("\nPhase 6: Starting Spice");
     let mut start_request = StartRequest::new(args.common.spiced_path_buf(), transformed)?
         .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
 
@@ -137,13 +183,13 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    // Track when Spice became ready (for CDC catchup timing)
     let spice_ready_time = Instant::now();
 
-    // Get spiced version for telemetry (now that instance is started)
+    // Get spiced version for telemetry
     let spiced_version = spiced_instance.version().to_string();
 
-    // Build telemetry resource with benchmark attributes
+    // Phase 7: Build telemetry resource
+    println!("\nPhase 7: Building telemetry resource");
     let testoperator_commit_sha = git::get_commit_sha();
     let spiced_commit_sha =
         std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
@@ -166,7 +212,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
 
     let telemetry = create_telemetry_with_resource(&args.common, benchmark_resource);
 
-    // Start liveness monitors if enabled
+    // Phase 8: Start liveness monitors if enabled
     let health_monitor = if args.enable_liveness {
         println!("Starting health liveness monitor");
         Some(HealthMonitor::spawn()?)
@@ -186,25 +232,50 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         None
     };
 
-    // Insert markers
-    for (dataset_type, marker) in &dataset_markers {
-        let table_name = source.get_table_name(dataset_type.table_name());
+    // Phase 9: Insert remaining data
+    println!("\nPhase 9: Inserting remaining data");
+    for info in &dataset_infos {
+        let dataset_type = info.dataset.dataset_type();
+        let table_name = source.get_table_name(info.dataset.table_name());
+
+        // Skip the initial_records already inserted
+        let remaining_data = skip_rows(&info.generated_data, args.initial_records);
+        let remaining_count: usize = remaining_data.iter().map(RecordBatch::num_rows).sum();
+
+        if remaining_count > 0 {
+            println!("  Inserting {remaining_count} remaining records for {dataset_type}");
+            source.insert(&table_name, &remaining_data).await?;
+        } else {
+            println!("  No remaining records to insert for {dataset_type}");
+        }
+    }
+
+    // Phase 10: Insert markers for each dataset
+    println!("\nPhase 10: Inserting marker records");
+    for info in &dataset_infos {
+        let table_name = source.get_table_name(info.dataset.table_name());
         source
-            .insert(&table_name, std::slice::from_ref(marker))
+            .insert(&table_name, std::slice::from_ref(&info.marker))
             .await?;
     }
 
     let marker_insertion_time = Instant::now();
 
-    // Wait for markers
-    let marker_queries: HashMap<DatasetType, String> = dataset_markers
+    // Phase 11: Poll for markers
+    println!("\nPhase 11: Polling for marker detection");
+    let marker_queries: HashMap<DatasetType, String> = dataset_infos
         .iter()
-        .map(|(dt, _)| (*dt, dt.create_dataset().marker_detection_query()))
+        .map(|info| {
+            (
+                info.dataset.dataset_type(),
+                info.dataset.marker_detection_query(),
+            )
+        })
         .collect();
 
-    let marker_counts: HashMap<DatasetType, usize> = dataset_markers
+    let marker_counts: HashMap<DatasetType, usize> = dataset_infos
         .iter()
-        .map(|(dt, _)| (*dt, dt.create_dataset().marker_count()))
+        .map(|info| (info.dataset.dataset_type(), info.dataset.marker_count()))
         .collect();
 
     let timeout = Duration::from_secs(args.common.ready_wait);
@@ -222,20 +293,27 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         ));
     }
 
-    // Delete markers
-    for (dataset_type, _) in &dataset_markers {
-        source.delete_marker(*dataset_type).await?;
+    println!("All markers detected");
+    println!("  Stream lag: {:.2}s", stream_lag.as_secs_f64());
+    println!(
+        "  Ingestion duration: {:.2}s",
+        ingestion_duration.as_secs_f64()
+    );
+
+    // Phase 12: Delete markers and wait for deletions
+    println!("\nPhase 12: Deleting markers");
+    for info in &dataset_infos {
+        source.delete_marker(info.dataset.dataset_type()).await?;
     }
 
-    // Wait for deletions
     wait_for_all_marker_deletions(&spiced_instance, &marker_queries, Duration::from_secs(30))
         .await?;
 
-    // Stop liveness monitors and record metrics
+    // Phase 13: Stop liveness monitors and record metrics
+    println!("\nPhase 13: Collecting monitor metrics");
     if let Some(monitor) = health_monitor {
         let report = monitor.stop().await?;
 
-        // Record health liveness metrics
         let mut total_failures: u64 = 0;
         let mut max_latency_ms: f64 = 0.0;
 
@@ -261,7 +339,6 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         let report = monitor.stop().await?;
         report.print_summary();
 
-        // Record query liveness metrics
         let aggregate = report.aggregate_stats();
         crate::metrics::QUERY_LIVENESS_TOTAL.record(aggregate.total_queries, &[]);
         crate::metrics::QUERY_LIVENESS_FAILURES.record(aggregate.failed_queries, &[]);
@@ -278,8 +355,9 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
             .record(aggregate.p99().as_secs_f64() * 1000.0, &[]);
     }
 
-    // Fetch DynamoDB metrics from Spice's Prometheus endpoint before restart
-    let dynamodb_metrics = match get_dynamodb_metrics().await {
+    // Phase 14: Fetch DynamoDB metrics from Prometheus
+    println!("\nPhase 14: Fetching DynamoDB metrics");
+    let dynamodb_metrics = match utils::get_dynamodb_metrics().await {
         Ok(metrics) => {
             println!(
                 "DynamoDB records consumed: {}",
@@ -295,83 +373,13 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         }
         Err(e) => {
             println!("Warning: Failed to fetch DynamoDB metrics: {e}");
-            super::utils::DynamoDbMetrics::default()
+            utils::DynamoDbMetrics::default()
         }
     };
 
-    // Restart Spice before verification to ensure clean state with all data loaded
-    let spiced_instance = if args.verify {
-        println!("Restarting Spice before verification...");
-        spiced_instance.stop()?;
-
-        // Reload spicepod from temp file
-        let spicepod_for_restart = load_spicepod_definition(&temp_path)?;
-        let mut start_request =
-            StartRequest::new(args.common.spiced_path_buf(), spicepod_for_restart)?;
-        if let Some(ref data_dir) = args.common.data_dir {
-            start_request = start_request.with_data_dir(data_dir.clone());
-        }
-
-        let mut new_instance = SpicedInstance::start(start_request).await?;
-        new_instance
-            .wait_for_ready(Duration::from_secs(args.common.ready_wait))
-            .await?;
-
-        println!("Spice restarted successfully");
-        new_instance
-    } else {
-        spiced_instance
-    };
-
-    // Run verification if requested
-    let mut failures = Vec::new();
-    let (mut spiced_instance, verification_passed) = if args.verify {
-        let verification_result =
-            verification::run_verification(spiced_instance, &config_name, 1, args.scale_factor)
-                .await?;
-
-        // Emit per-query metrics and collect failures
-        for query in &verification_result.metrics.metrics {
-            let query_name = &query.query_name;
-            let row_count = verification_result.row_counts.get(query_name).unwrap_or(&0);
-            let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
-
-            let status: u64 = u64::from(match &query.query_status {
-                QueryStatus::Passed => true,
-                QueryStatus::Failed(reason) => {
-                    if let Some(reason) = reason {
-                        failures.push(format!("{query_name}: {reason}"));
-                    } else {
-                        failures.push(format!("{query_name}: failed with an undetermined error"));
-                    }
-                    false
-                }
-            });
-
-            crate::metrics::QUERY_STATUS.record(status, &attributes);
-            crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
-            crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
-            crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
-            crate::metrics::ITERATIONS
-                .record(query.iterations.try_into().unwrap_or(u64::MAX), &attributes);
-            crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
-            crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
-            crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
-            crate::metrics::ROW_COUNT
-                .record((*row_count).try_into().unwrap_or(u64::MAX), &attributes);
-        }
-
-        (
-            verification_result.spiced_instance,
-            verification_result.all_passed,
-        )
-    } else {
-        (spiced_instance, true)
-    };
-
+    // Phase 15: Record streaming metrics
     let record_count = dynamodb_metrics.records_consumed_total;
 
-    // Calculate throughput
     #[expect(clippy::cast_precision_loss)]
     let throughput = if ingestion_duration.as_secs_f64() > 0.0 && record_count > 0 {
         record_count as f64 / ingestion_duration.as_secs_f64()
@@ -379,13 +387,6 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         0.0
     };
 
-    // Stop Spice
-    spiced_instance.stop()?;
-
-    // Cleanup temp file
-    let _ = std::fs::remove_file(&temp_path);
-
-    // Record streaming metrics
     crate::metrics::STREAM_LAG.record(stream_lag.as_millis().try_into().unwrap_or(u64::MAX), &[]);
     crate::metrics::INGESTION_DURATION.record(
         ingestion_duration
@@ -398,44 +399,30 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     crate::metrics::RECORD_COUNT.record(record_count, &[]);
     crate::metrics::DYNAMODB_TRANSIENT_ERRORS.record(dynamodb_metrics.errors_transient_total, &[]);
 
-    // Emit telemetry
+    // Phase 16: Emit telemetry
     telemetry.emit().await?;
 
-    // Report result
-    println!("\nBenchmark Result:");
+    // Phase 17: Stop Spice and cleanup
+    spiced_instance.stop()?;
+    let _ = std::fs::remove_file(&temp_path);
+
+    // Report results
+    println!("\n{}\nBenchmark Result\n{}", "=".repeat(60), "=".repeat(60));
     println!("  Config: {config_name}");
+    println!("  Run ID: {run_id}");
     println!(
         "  Ingestion Duration: {:.2}s",
         ingestion_duration.as_secs_f64()
     );
     println!("  Stream Lag: {:.2}s", stream_lag.as_secs_f64());
-    println!(
-        "  Verification: {}",
-        if verification_passed { "PASS" } else { "FAIL" }
-    );
-
-    if !verification_passed {
-        return Err(anyhow::anyhow!(
-            "Verification failed due to failed queries:\n{}",
-            failures.join("\n")
-        ));
+    println!("  Records Consumed: {record_count}");
+    println!("  Throughput: {throughput:.1} records/s");
+    if dynamodb_metrics.errors_transient_total > 0 {
+        println!(
+            "  Transient Errors: {}",
+            dynamodb_metrics.errors_transient_total
+        );
     }
 
     Ok(())
-}
-
-/// Build snapshot configuration from environment variables.
-///
-/// Environment variables:
-/// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
-/// - `SNAPSHOT_S3_ACCESS_KEY_ID`: S3 access key ID (optional)
-/// - `SNAPSHOT_S3_SECRET_ACCESS_KEY`: S3 secret access key (optional)
-/// - `SNAPSHOT_S3_REGION`: S3 region (optional)
-pub fn build_snapshot_config() -> Option<SnapshotConfig> {
-    let location = std::env::var("SNAPSHOT_S3_LOCATION").ok()?;
-
-    Some(SnapshotConfig {
-        location,
-        region: std::env::var("SNAPSHOT_S3_REGION").ok(),
-    })
 }

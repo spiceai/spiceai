@@ -1,5 +1,5 @@
-name: testoperator streaming dynamodb dispatch
-run-name: streaming-dispatch - ${{ github.event.inputs.queryset }} - sf${{ github.event.inputs.scale_factor }}
+name: testoperator streaming dynamodb correctness
+run-name: streaming-correctness - ${{ github.event.inputs.queryset }} - sf${{ github.event.inputs.scale_factor }}
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
       spiced_commit:
         description: 'spiced build commit'
         required: false
+        type: string
+      spicepod_path:
+        description: 'Spicepod file path (relative to repo root)'
+        required: true
         type: string
       queryset:
         description: 'Query set type'
@@ -21,7 +25,7 @@ on:
         default: '0.01'
         type: string
       ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
+        description: 'How long (in seconds) to wait for spiced to start and markers to be ingested'
         required: true
         default: '60'
         type: string
@@ -33,47 +37,55 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
-      verify:
-        description: 'Run TPCH queries to verify data integrity'
-        required: false
-        type: boolean
-        default: true
-      mutation_ratio:
-        description: 'Ratio of rows to mutate for CDC testing (0.0-1.0)'
+      rounds:
+        description: 'Number of correctness rounds'
         required: false
         type: string
-        default: '0.01'
-      wait_for_workflows:
-        description: 'Wait for each triggered workflow to complete'
+        default: '3'
+      mutation_ratio:
+        description: 'Ratio of rows to mutate (0.0-1.0)'
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: '0.3'
+      mutation_seed:
+        description: 'Base mutation seed'
+        required: false
+        type: string
+        default: '42'
 
 jobs:
-  run-streaming-dispatch:
-    name: Run DynamoDB streaming dispatch
+  run-streaming-correctness:
+    name: Run DynamoDB streaming correctness test
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 180
     permissions:
       id-token: write
       contents: read
-      actions: write
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Load secrets from AWS
         uses: ./.github/actions/load-aws-secrets
 
-      - name: Validate spicepod directory exists
+      - name: Set spicepod path
+        id: set_spicepod_path
         run: |
-          SPICEPOD_DIR="./test/spicepods/streaming/dynamodb"
-          if [ ! -d "${SPICEPOD_DIR}" ]; then
-            echo "Error: Spicepod directory not found at ${SPICEPOD_DIR}"
+          # Support both relative paths (from repo root) and paths with ./ prefix
+          INPUT_PATH="${{ github.event.inputs.spicepod_path }}"
+          if [[ "${INPUT_PATH}" == ./* ]]; then
+            SPICEPOD_PATH="${INPUT_PATH}"
+          else
+            SPICEPOD_PATH="./${INPUT_PATH}"
+          fi
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
             exit 1
           fi
-          echo "Spicepod directory found at ${SPICEPOD_DIR}"
-          echo "YAML files in directory:"
-          ls -la "${SPICEPOD_DIR}"/*.yaml "${SPICEPOD_DIR}"/*.yml 2>/dev/null || echo "No YAML files found"
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -98,39 +110,23 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
-      - name: Run DynamoDB streaming dispatch
+      - name: Run DynamoDB streaming correctness test
         run: |
-          VERIFY_FLAG=""
-          if [ "${{ github.event.inputs.verify }}" = "true" ]; then
-            VERIFY_FLAG="--verify"
-          fi
-
-          WAIT_FLAG=""
-          if [ "${{ github.event.inputs.wait_for_workflows }}" = "true" ]; then
-            WAIT_FLAG="--wait-for-workflows"
-          fi
-
-          testoperator run streaming-dynamodb-dispatch \
+          testoperator run streaming-dynamodb-correctness \
             -s /usr/local/bin/spiced \
-            -p ./test/spicepods/streaming/dynamodb \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             --queryset ${{ github.event.inputs.queryset }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --rounds ${{ github.event.inputs.rounds }} \
             --mutation-ratio ${{ github.event.inputs.mutation_ratio }} \
-            --workflow testoperator_run_streaming_dynamodb.yml \
-            ${WAIT_FLAG} \
-            ${VERIFY_FLAG}
+            --mutation-seed ${{ github.event.inputs.mutation_seed }} \
+            --metrics
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # DynamoDB credentials
-          DYNAMODB_AWS_REGION: ${{ secrets.DYNAMODB_AWS_REGION || 'us-east-1' }}
-          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
-          # Snapshot storage
-          SNAPSHOT_S3_LOCATION: ${{ secrets.STREAMING_SNAPSHOT_S3_LOCATION || 's3://spice-streaming-benchmark-snapshots' }}
-          SNAPSHOT_S3_ACCESS_KEY_ID: ${{ secrets.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
-          SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ secrets.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
-          SNAPSHOT_S3_REGION: ${{ secrets.STREAMING_SNAPSHOT_S3_REGION || 'us-east-1' }}
+          DYNAMODB_AWS_REGION: us-east-1
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           # Metrics
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
