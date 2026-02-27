@@ -317,17 +317,17 @@ mod tests {
 
     #[test]
     fn test_parse_catalog_slug_single_part_fails() {
-        assert!(parse_catalog_slug("justorg").is_err());
+        parse_catalog_slug("justorg").expect_err("single-part slug should be invalid");
     }
 
     #[test]
     fn test_parse_catalog_slug_four_parts_fails() {
-        assert!(parse_catalog_slug("a/b/c/d").is_err());
+        parse_catalog_slug("a/b/c/d").expect_err("four-part slug should be invalid");
     }
 
     #[test]
     fn test_parse_catalog_slug_empty_fails() {
-        assert!(parse_catalog_slug("").is_err());
+        parse_catalog_slug("").expect_err("empty slug should be invalid");
     }
 
     #[test]
