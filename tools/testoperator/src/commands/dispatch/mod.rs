@@ -123,6 +123,28 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
+            TestType::Streaming => {
+                for streaming in &test_file.tests.streaming_bench {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: streaming.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::StreamingCorrectness => {
+                for correctness in &test_file.tests.streaming_correctness {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: correctness.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
             _ => {
                 println!("Test type {test_type} not supported for dispatching");
             }
@@ -192,7 +214,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         };
 
         if let Err(e) = result {
-            eprintln!("Failed to dispatch {}. Error: {e}", path.display());
+            eprintln!("Failed to dispatch {}. Error: {e:?}", path.display());
             failed_dispatches.push((path.display().to_string(), e));
             continue;
         }
