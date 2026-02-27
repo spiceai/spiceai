@@ -363,7 +363,7 @@ fn trigger_build(
             "run".to_string(),
             "build_and_release.yml".to_string(),
             "--ref".to_string(),
-            branch.to_string(),
+            branch.clone(),
             "-f".to_string(),
             format!("platform_option={platform_option}"),
         ];
