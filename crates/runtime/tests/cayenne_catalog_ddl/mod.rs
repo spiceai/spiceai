@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration tests for Cayenne Catalog DDL operations.
 //!
-//! Validates that the Cayenne Catalog supports DataFrame DDL (CREATE TABLE via SQL),
+//! Validates that the Cayenne Catalog supports `DataFrame` DDL (CREATE TABLE via SQL),
 //! and that INSERT, UPDATE (upsert), and DELETE operations produce correct results.
 
 use std::collections::HashMap;
@@ -234,7 +234,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             // Verify the deleted row is gone.
             let batches =
                 run_query(&rt, "SELECT id FROM test_cat.myschema.users WHERE id = 3").await?;
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 0, "id=3 should no longer exist");
 
             // -----------------------------------------------------------------
