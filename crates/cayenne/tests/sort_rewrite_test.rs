@@ -20,7 +20,7 @@ limitations under the License.
 //!
 //! These tests exercise the full sort-and-rewrite pipeline:
 //! 1. Read all data from the current listing table
-//! 2. Sort via DataFusion's `SortExec`
+//! 2. Sort via `DataFusion`'s `SortExec`
 //! 3. Write sorted data to a NEW snapshot directory
 //! 4. Atomically swap the catalog to the new snapshot
 //! 5. Verify data correctness and ordering after the rewrite
@@ -71,7 +71,8 @@ async fn create_sorted_table(
         vortex_config,
     };
 
-    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let catalog_arc = Arc::clone(&fixture.catalog);
+    let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
     Arc::new(
         CayenneTableProviderBuilder::new(catalog_arc)
             .with_context(context)
@@ -103,14 +104,12 @@ async fn query_ordered(
     let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>)
         .expect("table should be registered");
-    ctx.sql(&format!(
-        "SELECT * FROM {table_name} ORDER BY {order_col}"
-    ))
-    .await
-    .expect("query should succeed")
-    .collect()
-    .await
-    .expect("collect should succeed")
+    ctx.sql(&format!("SELECT * FROM {table_name} ORDER BY {order_col}"))
+        .await
+        .expect("query should succeed")
+        .collect()
+        .await
+        .expect("collect should succeed")
 }
 
 /// SQL insert helper.
@@ -298,7 +297,7 @@ async fn test_sort_rewrite_with_nulls_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true), // nullable
+        Field::new("id", DataType::Int64, true),  // nullable
         Field::new("name", DataType::Utf8, true), // nullable
     ]));
 
@@ -329,18 +328,9 @@ async fn test_sort_rewrite_with_nulls_impl(
     let ids = collect_i64_column(&results, "id");
     // Non-null values should be sorted ascending, NULLs at the end
     // i64::MIN is our sentinel for NULL
-    assert_eq!(
-        ids[0], 1,
-        "first non-null id should be 1"
-    );
-    assert_eq!(
-        ids[1], 2,
-        "second non-null id should be 2"
-    );
-    assert_eq!(
-        ids[2], 3,
-        "third non-null id should be 3"
-    );
+    assert_eq!(ids[0], 1, "first non-null id should be 1");
+    assert_eq!(ids[1], 2, "second non-null id should be 2");
+    assert_eq!(ids[2], 3, "third non-null id should be 3");
     // The last two should be NULLs (i64::MIN sentinel)
     assert_eq!(ids[3], i64::MIN, "fourth should be NULL");
     assert_eq!(ids[4], i64::MIN, "fifth should be NULL");
@@ -394,7 +384,10 @@ async fn test_sort_rewrite_idempotent_impl(
     let ids_second = collect_i64_column(&after_second, "id");
     let data_second = collect_string_column(&after_second, "data");
 
-    assert_eq!(ids_first, ids_second, "ids should be identical after re-sort");
+    assert_eq!(
+        ids_first, ids_second,
+        "ids should be identical after re-sort"
+    );
     assert_eq!(
         data_first, data_second,
         "data should be identical after re-sort"
@@ -410,11 +403,7 @@ test_with_backends!(test_sort_rewrite_empty_table_impl);
 async fn test_sort_rewrite_empty_table_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "x",
-        DataType::Int64,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
 
     let table = create_sorted_table(
         &fixture,
@@ -441,9 +430,7 @@ test_with_backends!(test_sort_rewrite_snapshot_changes_impl);
 async fn test_sort_rewrite_snapshot_changes_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
     let table = create_sorted_table(
         &fixture,
@@ -503,12 +490,7 @@ async fn test_sort_rewrite_then_insert_impl(
     .await;
 
     // Initial unsorted data
-    sql_insert(
-        &table,
-        "sort_then_ins",
-        "(30, 'c'), (10, 'a'), (20, 'b')",
-    )
-    .await;
+    sql_insert(&table, "sort_then_ins", "(30, 'c'), (10, 'a'), (20, 'b')").await;
 
     // Sort
     table
@@ -691,7 +673,8 @@ async fn test_sort_rewrite_reopen_table_impl(
         vortex_config: vortex_config.clone(),
     };
 
-    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let catalog_arc = Arc::clone(&fixture.catalog);
+    let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
 
     let table = Arc::new(
         CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc))
@@ -726,7 +709,11 @@ async fn test_sort_rewrite_reopen_table_impl(
     assert_eq!(total_rows(&results), 3, "should have 3 rows");
 
     let ids = collect_i64_column(&results, "id");
-    assert_eq!(ids, vec![10, 20, 30], "data should still be sorted after re-open");
+    assert_eq!(
+        ids,
+        vec![10, 20, 30],
+        "data should still be sorted after re-open"
+    );
 
     let txt = collect_string_column(&results, "txt");
     assert_eq!(

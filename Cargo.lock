@@ -18187,26 +18187,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spidapter"
-version = "2.0.0-unstable"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "clap",
- "reqwest 0.12.24",
- "runtime-secrets",
- "rustls 0.23.36",
- "serde_json",
- "spice-cloud-client",
- "spicepod",
- "system-adapter-protocol",
- "tokio",
- "uuid 1.20.0",
- "yaml",
-]
-
-[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18852,20 +18832,6 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
-]
-
-[[package]]
-name = "system-adapter-protocol"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=27754b5810745e3afc7bb703ecc13aa9835732ea#27754b5810745e3afc7bb703ecc13aa9835732ea"
-dependencies = [
- "arrow-schema",
- "async-trait",
- "reqwest 0.12.24",
- "serde",
- "serde_json",
- "tokio",
- "uuid 1.20.0",
 ]
 
 [[package]]
@@ -23475,3 +23441,33 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=f3e15e0d22cccbda0e4b
 name = "datafusion-ffi"
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=f3e15e0d22cccbda0e4be92208f61f966a4adc31#f3e15e0d22cccbda0e4be92208f61f966a4adc31"
+
+[[patch.unused]]
+name = "vortex"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+
+[[patch.unused]]
+name = "vortex-array"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+
+[[patch.unused]]
+name = "vortex-datafusion"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+
+[[patch.unused]]
+name = "vortex-scan"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+
+[[patch.unused]]
+name = "vortex-session"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+
+[[patch.unused]]
+name = "vortex-utils"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"

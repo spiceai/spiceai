@@ -4776,17 +4776,13 @@ mod tests {
             "{}/metadata",
             temp_dir.path().to_str().expect("should be str")
         );
-        let data_dir = format!(
-            "{}/data",
-            temp_dir.path().to_str().expect("should be str")
-        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
 
         std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
 
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(
-            CayenneCatalog::new(connection_string).expect("catalog created"),
-        ) as Arc<dyn MetadataCatalog>;
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
         catalog.init().await.expect("catalog initialized");
 
         let vortex_config = VortexConfig {
@@ -4820,12 +4816,8 @@ mod tests {
         let ctx = SessionContext::new();
         let schema = batch.schema();
 
-        let mem_exec = MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
-            Arc::clone(&schema),
-            None,
-        )
-        .expect("memory exec created");
+        let mem_exec = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("memory exec created");
 
         let insert_plan = provider
             .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
@@ -4923,7 +4915,11 @@ mod tests {
             }
         }
 
-        assert_eq!(all_ids, vec![10, 20, 30, 40, 50], "ids should be sorted ascending");
+        assert_eq!(
+            all_ids,
+            vec![10, 20, 30, 40, 50],
+            "ids should be sorted ascending"
+        );
         assert_eq!(
             all_values,
             vec![100, 200, 300, 400, 500],
@@ -4935,9 +4931,7 @@ mod tests {
     async fn test_sort_and_rewrite_data_empty_table() {
         use arrow::datatypes::{DataType, Field, Schema};
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         let (provider, _temp_dir) = create_sorted_cayenne_table(
             "sort_empty_test",
