@@ -20,7 +20,7 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
         Result,
-        tree_node::{Transformed, TransformedResult, TreeNode},
+        tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
@@ -94,7 +94,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
         plan: LogicalPlan,
         _config: &ConfigOptions,
     ) -> Result<LogicalPlan, DataFusionError> {
-        plan.transform_up(|plan| {
+        plan.transform_up_with_subqueries(|plan| {
             let LogicalPlan::TableScan(scan) = &plan else {
                 return Ok(Transformed::no(plan));
             };
@@ -140,6 +140,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     },
                 )));
             }
+
             Ok(Transformed::yes(LogicalPlan::Union(Union {
                 inputs: sub_scans,
                 schema: Arc::clone(plan.schema()),

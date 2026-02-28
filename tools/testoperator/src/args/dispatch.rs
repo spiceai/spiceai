@@ -60,6 +60,8 @@ pub enum Workflow {
     Append,
     DataConsistency,
     TextToSql,
+    StreamingBench,
+    StreamingCorrectness,
 }
 
 impl From<Workflow> for TestType {
@@ -71,6 +73,8 @@ impl From<Workflow> for TestType {
             Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
             Workflow::TextToSql => TestType::TextToSql,
+            Workflow::StreamingBench => TestType::Streaming,
+            Workflow::StreamingCorrectness => TestType::StreamingCorrectness,
         }
     }
 }
@@ -97,6 +101,10 @@ pub struct DispatchTests {
     pub append: Vec<AppendArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub text_to_sql: Vec<TextToSqlArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub streaming_bench: Vec<StreamingBenchDispatchArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub streaming_correctness: Vec<StreamingCorrectnessDispatchArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -336,6 +344,60 @@ pub enum BenchmarkQueryset {
     BirdBenchSmallThrombosisPrediction,
     #[serde(rename = "bird-bench-small[toxicology]")]
     BirdBenchSmallToxicology,
+}
+
+/// Streaming `DynamoDB` benchmark workflow arguments.
+///
+/// Mirrors the inputs of `testoperator_run_streaming_dynamodb.yml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StreamingBenchDispatchArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    #[serde(default = "default_queryset")]
+    pub queryset: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_scale_factor"
+    )]
+    pub scale_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_wait: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_liveness: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_query_liveness: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_liveness_interval_ms: Option<u64>,
+}
+
+/// Streaming `DynamoDB` correctness workflow arguments.
+///
+/// Mirrors the inputs of `testoperator_run_streaming_dynamodb_correctness.yml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StreamingCorrectnessDispatchArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    #[serde(default = "default_queryset")]
+    pub queryset: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_scale_factor"
+    )]
+    pub scale_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_wait: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_seed: Option<u64>,
+}
+
+fn default_queryset() -> String {
+    "tpch".to_string()
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects

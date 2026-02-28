@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/flight/do_put.rs
+expression: results_str
+---
++-----------+
+| row_count |
++-----------+
+| 35006     |
++-----------+

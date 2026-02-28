@@ -25,7 +25,7 @@ secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-util.workspace = true
+util = { workspace = true, default-features = false, features = [] }
 url.workspace = true
 
 [dev-dependencies]

@@ -50,8 +50,10 @@ impl Runtime {
             Ok(worker) => worker,
             Err(e) => {
                 tracing::error!("Failed to load worker [{}]: {e}", cfg.name);
-                self.status
-                    .update_worker(&cfg.name, status::ComponentStatus::Error);
+                self.status.update_worker(
+                    &cfg.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
                 return;
             }
         };
@@ -77,8 +79,10 @@ impl Runtime {
             .await
         {
             tracing::error!("Failed to create scheduler for worker [{}]: {e}", cfg.name);
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            self.status.update_worker(
+                &cfg.name,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            );
         } else {
             tracing::info!("Scheduler for worker [{}] created successfully", cfg.name);
         }
@@ -93,8 +97,10 @@ impl Runtime {
             .await
         {
             tracing::error!("Failed to remove scheduler for worker [{}]: {e}", cfg.name);
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            self.status.update_worker(
+                &cfg.name,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            );
             return;
         }
 

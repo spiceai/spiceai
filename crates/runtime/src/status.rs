@@ -33,6 +33,13 @@ use crate::metrics;
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeReadyState {
+    #[default]
+    OnLoad,
+    OnRegistration,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
     /// Stores the current status of all components.
@@ -41,6 +48,8 @@ pub struct RuntimeStatus {
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
+    /// Controls how runtime readiness is computed.
+    ready_state: Arc<RwLock<RuntimeReadyState>>,
     /// Per-component notifiers for status change subscriptions.
     notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
 }
@@ -52,8 +61,17 @@ impl RuntimeStatus {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
+            ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             notifiers: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn set_ready_state(&self, ready_state: RuntimeReadyState) {
+        let mut configured_ready_state = self
+            .ready_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured_ready_state = ready_state;
     }
 
     #[must_use]
@@ -62,12 +80,12 @@ impl RuntimeStatus {
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
-    fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
         let mut statuses = match self.statuses.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        statuses.insert(component_name.to_string(), status);
+        statuses.insert(component_name.to_string(), status.clone());
 
         if status == ComponentStatus::Ready {
             let mut ever_ready = match self.ever_ready_components.write() {
@@ -89,71 +107,81 @@ impl RuntimeStatus {
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
         let catalog_name = catalog_name.into();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("catalog:{catalog_name}"), status);
-        metrics::catalogs::STATUS.record(status as u64, &[KeyValue::new("catalog", catalog_name)]);
+        metrics::catalogs::STATUS.record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
         let ds_name = dataset.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
-        metrics::datasets::STATUS.record(status as u64, &[KeyValue::new("dataset", ds_name)]);
+        metrics::datasets::STATUS.record(metric_value, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("model:{model_name}"), status);
-        metrics::models::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
         let tool_name = tool_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("tool:{tool_name}"), status);
-        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool", tool_name)]);
+        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
     }
 
     pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
         let name = catalog_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("tool_catalog:{name}"), status);
-        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool_catalog", name)]);
+        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("llm:{model_name}"), status);
-        metrics::llms::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("embedding:{model_name}"), status);
-        metrics::embeddings::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("view:{view_name}"), status);
-        metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
+        metrics::views::STATUS.record(metric_value, &[KeyValue::new("view", view_name)]);
     }
 
     /// Update the status of a worker
     pub fn update_worker(&self, name: &str, status: ComponentStatus) {
         let worker_name = name.to_string();
+        let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
-        metrics::models::STATUS.record(status as u64, &[KeyValue::new("worker", worker_name)]);
+        metrics::models::STATUS.record(metric_value, &[KeyValue::new("worker", worker_name)]);
     }
 
     /// Update the status of a cluster node
     pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
         let cluster_node_name = node_name.to_string();
-        self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
 
         // Record cluster node status metric
         // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
-        let status_value = match status {
+        let status_value = match &status {
             ComponentStatus::Initializing => 0,
             ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
-            ComponentStatus::Disabled | ComponentStatus::Error => 2,
+            ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
             ComponentStatus::ShuttingDown => 3, // Draining
         };
+
+        self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
         metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
     }
 
@@ -165,7 +193,7 @@ impl RuntimeStatus {
             Err(poisoned) => poisoned.into_inner(),
         };
         let full_name = format!("worker:{name}");
-        components.get(&full_name).copied()
+        components.get(&full_name).cloned()
     }
 
     /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
@@ -189,11 +217,12 @@ impl RuntimeStatus {
             return false;
         }
 
+        let ready_state = *self
+            .ready_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let statuses = match self.statuses.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let ever_ready = match self.ever_ready_components.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -202,10 +231,25 @@ impl RuntimeStatus {
             return false; // No components registered yet
         }
 
-        // Check if all registered components have been ready at least once
-        statuses
-            .keys()
-            .all(|component| ever_ready.contains(component))
+        match ready_state {
+            RuntimeReadyState::OnLoad => {
+                let ever_ready = match self.ever_ready_components.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                // OnLoad readiness: a component counts as ready if it has been ready at least once.
+                // All registered components must appear in the ever-ready set before we report ready.
+                statuses
+                    .keys()
+                    .all(|component| ever_ready.contains(component))
+            }
+            // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
+            // Only components in ShuttingDown state block overall readiness.
+            RuntimeReadyState::OnRegistration => statuses
+                .values()
+                .all(|status| !matches!(status, ComponentStatus::ShuttingDown)),
+        }
     }
 
     /// Returns the status of all registered components.
@@ -256,7 +300,7 @@ impl RuntimeStatus {
 
         statuses
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), *v)))
+            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), v.clone())))
             .collect()
     }
 
@@ -272,7 +316,7 @@ impl RuntimeStatus {
             .statuses
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        statuses.get(component_name).copied()
+        statuses.get(component_name).cloned()
     }
 
     /// Gets or creates a notifier for a component, returning a receiver to watch for status changes.
@@ -418,6 +462,105 @@ mod tests {
             status.get_component_status("dataset:test_dataset"),
             Some(ComponentStatus::Ready)
         );
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_requires_registered_component() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        // Empty statuses are not ready.
+        assert!(!status.is_ready());
+
+        // Initializing still counts as registered.
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(status.is_ready());
+
+        // Refreshing stays ready.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
+
+        // Error still counts as registered for on_registration mode.
+        status.update_dataset(&dataset, ComponentStatus::error());
+        assert!(status.is_ready());
+
+        // Explicit shutting down state for a component is not ready.
+        status.update_dataset(&dataset, ComponentStatus::ShuttingDown);
+        assert!(!status.is_ready());
+
+        // Runtime-level shutdown always forces not ready.
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        status.mark_shutdown();
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_allows_mixed_component_states() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        status.update_dataset(&dataset, ComponentStatus::error());
+        status.update_model("test_model", ComponentStatus::Initializing);
+        status.update_tool("test_tool", ComponentStatus::Disabled);
+
+        assert!(status.is_ready());
+
+        status.update_tool("test_tool", ComponentStatus::ShuttingDown);
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_all_component_types() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("dataset_a");
+        let view = TableReference::bare("view_a");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        status.update_catalog("catalog_a", ComponentStatus::Initializing);
+        status.update_dataset(&dataset, ComponentStatus::error());
+        status.update_model("model_a", ComponentStatus::Disabled);
+        status.update_tool("tool_a", ComponentStatus::Refreshing);
+        status.update_tool_catalog("tool_catalog_a", ComponentStatus::Ready);
+        status.update_llm("llm_a", ComponentStatus::error());
+        status.update_embedding("embedding_a", ComponentStatus::Initializing);
+        status.update_view(&view, ComponentStatus::Ready);
+        status.update_worker("worker_a", ComponentStatus::Disabled);
+        status.update_cluster("cluster_node_a", ComponentStatus::error());
+
+        assert!(
+            status.is_ready(),
+            "on_registration should be ready when all components are registered and none are ShuttingDown"
+        );
+
+        status.update_embedding("embedding_a", ComponentStatus::ShuttingDown);
+        assert!(
+            !status.is_ready(),
+            "any component in ShuttingDown should make runtime not ready"
+        );
+    }
+
+    #[test]
+    fn test_is_ready_on_load_still_requires_ever_ready() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(!status.is_ready());
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        // Once ever-ready is achieved, transient non-ready states still satisfy OnLoad mode.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
     }
 
     #[tokio::test]

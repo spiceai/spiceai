@@ -502,3 +502,29 @@ pub static QUERY_LIVENESS_P99_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("ms")
         .build()
 });
+
+// Correctness test metrics
+
+pub static CORRECTNESS_ROUNDS_TOTAL: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("correctness_rounds_total")
+        .with_description("Total number of correctness rounds executed.")
+        .with_unit("rounds")
+        .build()
+});
+
+pub static CORRECTNESS_ROUNDS_PASSED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("correctness_rounds_passed")
+        .with_description("Number of correctness rounds that passed verification.")
+        .with_unit("rounds")
+        .build()
+});
+
+pub static CORRECTNESS_ROUNDS_FAILED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("correctness_rounds_failed")
+        .with_description("Number of correctness rounds that failed verification.")
+        .with_unit("rounds")
+        .build()
+});

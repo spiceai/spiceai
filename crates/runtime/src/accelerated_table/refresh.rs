@@ -1261,11 +1261,15 @@ mod tests {
             delay: Duration,
         ) -> bool {
             for _attempt in 0..max_attempts {
+                let Ok(desired_discriminant) = u8::try_from(desired.discriminant()) else {
+                    return false;
+                };
+
                 let metrics = registry.gather();
                 if let Some(metric) = metrics.iter().find(|m| {
                     m.name() == "dataset_load_state" && m.get_field_type() == MetricType::GAUGE
                 }) && let Some(gauge) = metric.get_metric()[0].get_gauge().as_ref()
-                    && gauge.value().is_eq(f64::from(desired as i32))
+                    && gauge.value().is_eq(f64::from(desired_discriminant))
                 {
                     return true;
                 }

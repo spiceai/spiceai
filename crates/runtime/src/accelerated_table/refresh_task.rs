@@ -740,8 +740,11 @@ impl RefreshTask {
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            self.set_refresh_status(sql, status::ComponentStatus::Error)
-                .await;
+            self.set_refresh_status(
+                sql,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            )
+            .await;
             return Err(e);
         }
 
@@ -750,6 +753,14 @@ impl RefreshTask {
         if let (Some(start_time), Some(stat)) = (start_time, &refresh_stat) {
             self.trace_load_completed(start_time, stat.num_rows, stat.memory_size)
                 .await;
+        }
+
+        if let Some(stat) = &refresh_stat {
+            for dataset_name in self.get_dataset_names().await {
+                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
+                metrics::REFRESH_PROCESSED_ROWS.add(stat.num_rows as u64, &labels);
+                metrics::REFRESH_PROCESSED_BYTES.add(stat.memory_size as u64, &labels);
+            }
         }
 
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
@@ -1082,6 +1093,9 @@ impl RefreshTask {
         let default_catalog = state.config_options().catalog.default_catalog.clone();
         let ctx = SessionContext::new_with_state(state);
 
+        // Register core scalar UDFs (e.g. bucket())
+        crate::datafusion::udf::register_core_scalar_udfs(&ctx);
+
         match schema::ensure_schema_exists(&ctx, &default_catalog, dataset_name) {
             Ok(()) => (),
             Err(_) => {
@@ -1292,17 +1306,20 @@ impl RefreshTask {
     }
 
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        let is_error = status.is_error();
+        let is_ready = status == status::ComponentStatus::Ready;
+
         // runtime status update
         self.update_component_status(status).await;
 
         // telemetry update
         for dataset_name in self.get_dataset_names().await {
-            if status == status::ComponentStatus::Error {
+            if is_error {
                 let labels = [KeyValue::new("dataset", dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
             }
 
-            if status == status::ComponentStatus::Ready {
+            if is_ready {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default();
@@ -1328,16 +1345,17 @@ impl RefreshTask {
     async fn update_component_status(&self, status: status::ComponentStatus) {
         // main component status update
         if self.is_view_acceleration() {
-            self.runtime_status.update_view(&self.dataset_name, status);
+            self.runtime_status
+                .update_view(&self.dataset_name, status.clone());
         } else {
             self.runtime_status
-                .update_dataset(&self.dataset_name, status);
+                .update_dataset(&self.dataset_name, status.clone());
         }
 
         // synchronized tables can be datasets only
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             self.runtime_status
-                .update_dataset(&synchronized_table.child_dataset_name(), status);
+                .update_dataset(&synchronized_table.child_dataset_name(), status.clone());
         }
     }
 
@@ -1372,8 +1390,11 @@ impl RefreshTask {
                 "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
                 self.component_type(),
             );
-            self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
-                .await;
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(error.to_string()),
+            )
+            .await;
             return;
         }
 
@@ -1398,13 +1419,30 @@ impl RefreshTask {
             _ => (),
         }
 
+        if let Some(message) = schema_evolution_mismatch_refresh_message(
+            self.component_type(),
+            &include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            error,
+        ) {
+            tracing::warn!("{message}");
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(message),
+            )
+            .await;
+            return;
+        }
+
         tracing::warn!(
             "Failed to load data for {} {}: {error}",
             self.component_type(),
             include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
         );
-        self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
-            .await;
+        self.set_refresh_status(
+            refresh_sql,
+            status::ComponentStatus::error_with_message(error.to_string()),
+        )
+        .await;
     }
 
     /// Updates `last_updated_at` timestamp based on refresh type and row count.
@@ -1667,6 +1705,31 @@ fn is_s3_express_upload_speed_error(error_message: &str) -> bool {
     error_message.contains("ClientUploadSpeedTooSlow")
 }
 
+fn is_insert_schema_mismatch_error(error_message: &str) -> bool {
+    error_message.contains("Inserting query must have the same schema length as the table")
+        || error_message.contains("Inserting query must have same schema length as the table")
+}
+
+fn schema_evolution_mismatch_refresh_message(
+    component_type: &str,
+    table_name: &str,
+    error: &super::Error,
+) -> Option<String> {
+    let source = match error {
+        super::Error::FailedToWriteData { source }
+        | super::Error::FailedToRefreshDataset { source } => source,
+        _ => return None,
+    };
+
+    if !is_insert_schema_mismatch_error(&source.to_string()) {
+        return None;
+    }
+
+    Some(format!(
+        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; fully featured schema evolution is on the roadmap, and acceleration does not apply this schema evolution automatically today; delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1707,7 +1770,6 @@ mod tests {
         assert!(is_s3_express_upload_speed_error(
             "Error: ClientUploadSpeedTooSlow: Upload speed is below minimum threshold"
         ));
-
         // Should detect when error is part of a larger message
         assert!(is_s3_express_upload_speed_error(
             "Failed to upload: S3 returned ClientUploadSpeedTooSlow for bucket mybucket--usw2-az1--x-s3"
@@ -1721,5 +1783,39 @@ mod tests {
         // Should not match partial error names
         assert!(!is_s3_express_upload_speed_error("ClientUpload"));
         assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    #[test]
+    fn test_is_insert_schema_mismatch_error() {
+        assert!(is_insert_schema_mismatch_error(
+            "Error during planning: Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5"
+        ));
+        assert!(!is_insert_schema_mismatch_error(
+            "Error during planning: failed to parse expression"
+        ));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_for_write_error() {
+        let error = super::super::Error::FailedToWriteData {
+            source: DataFusionError::Execution(
+                "Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5".to_string(),
+            ),
+        };
+
+        let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
+            .expect("should detect schema mismatch");
+        assert!(message.contains("schema mismatch"));
+        assert!(message.contains("on the roadmap"));
+        assert!(message.contains("delete the existing acceleration data"));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_non_schema_error() {
+        let error = super::super::Error::FailedToRefreshDataset {
+            source: DataFusionError::Execution("other failure".to_string()),
+        };
+
+        assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
     }
 }

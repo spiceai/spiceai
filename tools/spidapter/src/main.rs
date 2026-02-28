@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use clap::Parser;
-use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
