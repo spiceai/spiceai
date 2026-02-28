@@ -4521,6 +4521,7 @@ mod tests {
             let filename = format!("snapshots/snap_{i}.db");
             snapshots.push(SnapshotEntry {
                 snapshot_id: i,
+                #[expect(clippy::cast_possible_wrap)]
                 timestamp_ms: (i as i64) * 1_000_000,
                 snapshot: filename.clone(),
                 snapshot_checksum: format!("checksum_{i}"),
