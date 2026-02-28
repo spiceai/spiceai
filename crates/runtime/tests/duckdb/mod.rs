@@ -286,7 +286,7 @@ async fn duckdb_regexp() -> Result<(), String> {
 
             runtime_ready_check(&rt).await;
 
-            let regex_metachar_semantics = r#"
+            let regex_metachar_semantics = r"
                 WITH duckdb_regex AS (
                     SELECT region FROM csv_test WHERE regexp_like(region, 'A.*A')
                 ), arrow_regex AS (
@@ -303,7 +303,7 @@ async fn duckdb_regexp() -> Result<(), String> {
                 SELECT region FROM missing_in_duckdb
                 UNION ALL
                 SELECT region FROM missing_in_arrow
-            "#;
+            ";
 
             let regex_semantic_diff: Vec<RecordBatch> = rt
                 .datafusion()
