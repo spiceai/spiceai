@@ -40,11 +40,6 @@ pub enum Error {
         "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/catalogs/snowflake"
     ))]
     MissingParameter { parameter: String },
-
-    #[snafu(display("Failed to create Snowflake connection pool: {source}"))]
-    UnableToCreateConnectionPool {
-        source: db_connection_pool::snowflakepool::Error,
-    },
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[

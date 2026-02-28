@@ -38,11 +38,6 @@ pub enum Error {
     #[snafu(display("Missing required parameter: '{parameter}'. Specify a value."))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to create MSSQL connection pool: {source}"))]
-    UnableToCreateConnectionPool {
-        source: data_components::mssql::Error,
-    },
-
     #[snafu(display("Invalid connection string: {source}"))]
     InvalidConnectionString { source: tiberius::error::Error },
 

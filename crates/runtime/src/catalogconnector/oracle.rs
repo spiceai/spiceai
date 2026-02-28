@@ -22,6 +22,7 @@ limitations under the License.
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
+use base64::Engine;
 use data_components::RefreshableCatalogProvider;
 use data_components::oracle::connection::{
     OracleConnectionParams, OracleDirectConnectionParamsBuilder,
@@ -30,22 +31,35 @@ use data_components::oracle::provider::OracleCatalogProvider;
 use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use std::any::Any;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 pub const PREFIX: &str = "oracle";
+const DEFAULT_WALLET_PATH: &str = ".oracle";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Missing required parameter: '{parameter}'. Specify a value."))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to create Oracle connection pool: {source}"))]
-    UnableToCreateConnectionPool {
-        source: data_components::oracle::Error,
-    },
-
     #[snafu(display("Invalid port value: {port}"))]
     FailedToParsePort { port: String },
+
+    #[snafu(display("Failed to create Oracle wallet directory: {path}. {source}"))]
+    FailedToCreateWalletDirectory {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to decode Oracle wallet certificate from base64. {source}"))]
+    FailedToDecodeWalletCert { source: base64::DecodeError },
+
+    #[snafu(display("Failed to write Oracle wallet certificate file: {path}. {source}"))]
+    FailedToWriteWalletFile {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[
@@ -126,6 +140,30 @@ impl OracleCatalog {
 
         Ok(builder.build())
     }
+
+    fn save_wallet_cert(
+        cert_base64_str: &str,
+        wallet_path: &str,
+    ) -> std::result::Result<(), Error> {
+        let wallet_dir = Path::new(wallet_path);
+
+        if !wallet_dir.exists() {
+            fs::create_dir_all(wallet_dir).context(FailedToCreateWalletDirectorySnafu {
+                path: wallet_path.to_string(),
+            })?;
+        }
+
+        let cert_bytes = base64::engine::general_purpose::STANDARD
+            .decode(cert_base64_str)
+            .context(FailedToDecodeWalletCertSnafu)?;
+
+        let wallet_file = wallet_dir.join("cwallet.sso");
+        fs::write(&wallet_file, cert_bytes).context(FailedToWriteWalletFileSnafu {
+            path: wallet_file.display().to_string(),
+        })?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -150,8 +188,17 @@ impl CatalogConnector for OracleCatalog {
         })?;
 
         let mut wallet_path_opt = self.params.parameters.get("wallet").expose().ok();
-        if wallet_path_opt.is_none() {
-            wallet_path_opt = self.params.parameters.get("wallet_sso_cert").expose().ok();
+
+        if let Some(wallet_sso_cert) = self.params.parameters.get("wallet_sso_cert").expose().ok() {
+            let wallet_path = wallet_path_opt.unwrap_or(DEFAULT_WALLET_PATH);
+            Self::save_wallet_cert(wallet_sso_cert, wallet_path).map_err(|e| {
+                super::Error::UnableToGetCatalogProvider {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    source: Box::new(e),
+                }
+            })?;
+            wallet_path_opt = Some(wallet_path);
         }
 
         let pool = data_components::oracle::connection::connect(&conn_params, wallet_path_opt)
