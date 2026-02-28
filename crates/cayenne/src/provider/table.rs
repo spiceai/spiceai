@@ -2518,6 +2518,46 @@ impl CayenneTableProvider {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_metadata.path.starts_with("s3://");
 
+        let cleanup_failed_snapshot = async {
+            if is_s3 {
+                let snapshot_url = Self::snapshot_dir_url(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &new_snapshot_id,
+                );
+
+                match url::Url::parse(&snapshot_url) {
+                    Ok(url) => {
+                        let path = url.path().trim_start_matches('/');
+                        let prefix = ObjectStorePath::from(path);
+                        if let Err(e) = self.delete_prefix_with_object_store(&prefix).await {
+                            tracing::warn!(
+                                "Failed to clean up failed sort-rewrite snapshot {} for table {}: {e}",
+                                new_snapshot_id,
+                                self.table_metadata.table_name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse snapshot URL for failed sort-rewrite cleanup {} on table {}: {e}",
+                            snapshot_url,
+                            self.table_metadata.table_name
+                        );
+                    }
+                }
+            } else {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
+                    tracing::warn!(
+                        "Failed to clean up failed sort-rewrite snapshot dir {} for table {}: {e}",
+                        snapshot_dir.display(),
+                        self.table_metadata.table_name
+                    );
+                }
+            }
+        };
+
         // For local paths, ensure the snapshot directory exists.
         // S3 doesn't require directory creation (object storage creates paths on write).
         if !is_s3 {
@@ -2549,13 +2589,21 @@ impl CayenneTableProvider {
         // Sync the snapshot directory for durability before committing metadata.
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                cleanup_failed_snapshot.await;
+                return Err(Error::Catalog { source: e });
+            }
         }
 
         // Atomically update the catalog to point to the new sorted snapshot.
         // commit_compaction clears delete files and insert records, which is
         // correct here since the sort rewrites all live data into the new snapshot.
-        self.commit_overwrite(&new_snapshot_id).await?;
+        if let Err(e) = self.commit_overwrite(&new_snapshot_id).await {
+            cleanup_failed_snapshot.await;
+            return Err(Error::Catalog { source: e });
+        }
+
+        self.update_listing_table_for_snapshot(&new_snapshot_id)?;
 
         // Update in-memory state to match the new catalog
         self.update_current_snapshot_id(&new_snapshot_id)?;
@@ -2566,8 +2614,6 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name
             );
         }
-
-        self.update_listing_table_for_snapshot(&new_snapshot_id)?;
 
         // Old snapshot directories are cleaned up in the background
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;

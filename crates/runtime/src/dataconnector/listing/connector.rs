@@ -190,15 +190,15 @@ impl TableProvider for LocationPruningListingTable {
         filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let Some(locations) = extract_location_predicates(filters) else {
-            if !self.inner.options().table_partition_cols.is_empty()
-                && !self.inner.options().metadata_cols.is_empty()
-            {
-                return Err(DataFusionError::Execution(
-                    "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.".to_string(),
-                ));
-            }
+        if !self.inner.options().table_partition_cols.is_empty()
+            && !self.inner.options().metadata_cols.is_empty()
+        {
+            return Err(DataFusionError::Execution(
+                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.".to_string(),
+            ));
+        }
 
+        let Some(locations) = extract_location_predicates(filters) else {
             return self.inner.scan(state, projection, filters, limit).await;
         };
 
