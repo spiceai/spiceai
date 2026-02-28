@@ -23475,33 +23475,3 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=f3e15e0d22cccbda0e4b
 name = "datafusion-ffi"
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=f3e15e0d22cccbda0e4be92208f61f966a4adc31#f3e15e0d22cccbda0e4be92208f61f966a4adc31"
-
-[[patch.unused]]
-name = "vortex"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
-
-[[patch.unused]]
-name = "vortex-array"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
-
-[[patch.unused]]
-name = "vortex-datafusion"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
-
-[[patch.unused]]
-name = "vortex-scan"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
-
-[[patch.unused]]
-name = "vortex-session"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
-
-[[patch.unused]]
-name = "vortex-utils"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
