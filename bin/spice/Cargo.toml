@@ -81,6 +81,9 @@ rand = "0.9"
 # Open URLs in browser
 open = "5"
 
+# Platform keyring for credential storage
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
+
 # URL encoding
 urlencoding = "2"
 

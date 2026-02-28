@@ -17938,6 +17938,7 @@ dependencies = [
  "fundu",
  "futures",
  "humantime",
+ "keyring",
  "nix 0.29.0",
  "open",
  "opentelemetry",
