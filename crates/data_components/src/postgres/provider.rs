@@ -393,7 +393,8 @@ mod tests {
         async fn table_provider(
             &self,
             table_reference: TableReference,
-        ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
+        {
             let (schema, table) = match table_reference {
                 TableReference::Partial { schema, table } => {
                     (schema.to_string(), table.to_string())
@@ -476,7 +477,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_table_providers_returns_empty_when_all_factory_calls_fail() {
-        let fail_tables = HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
+        let fail_tables =
+            HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
         let read = Arc::new(MockRead::new(fail_tables));
         let table_creator: Arc<dyn Read> = read.clone();
 
