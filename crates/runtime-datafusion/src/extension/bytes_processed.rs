@@ -468,4 +468,35 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_allow_repartition_for_unordered_input() -> Result<()> {
+        let ctx = SessionContext::new();
+        let test_table = make_test_table()?;
+
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        let final_plan: Arc<dyn ExecutionPlan> = Arc::new(BytesProcessedExec::new(
+            data_source_exec,
+            Arc::new(Box::new(|_, _| {})),
+        ));
+
+        let optimizer = PhysicalOptimizer::new();
+        let config = Arc::clone(ctx.state().config_options());
+
+        let optimized = optimizer
+            .rules
+            .iter()
+            .fold(Arc::clone(&final_plan), |plan, rule| {
+                rule.optimize(plan, &config).expect("Must optimize plan")
+            });
+
+        let optimized_plan = displayable(optimized.as_ref()).tree_render().to_string();
+        assert!(
+            optimized_plan.contains("RepartitionExec"),
+            "Expected RepartitionExec for unordered input, got: {optimized_plan}"
+        );
+
+        Ok(())
+    }
 }
