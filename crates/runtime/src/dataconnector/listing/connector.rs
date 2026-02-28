@@ -191,14 +191,6 @@ impl TableProvider for LocationPruningListingTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let Some(locations) = extract_location_predicates(filters) else {
-            if !self.inner.options().table_partition_cols.is_empty()
-                && !self.inner.options().metadata_cols.is_empty()
-            {
-                return Err(DataFusionError::Execution(
-                    "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.".to_string(),
-                ));
-            }
-
             return self.inner.scan(state, projection, filters, limit).await;
         };
 
@@ -1948,10 +1940,10 @@ mod tests {
         );
     }
 
-    /// Regression test for metadata-column projection with partition columns.
+    /// Test that metadata-column projection with partition columns works correctly.
     ///
-    /// `DataFusion` v52 can panic in this path during physical planning.
-    /// Runtime must fail safely with a clear error instead of panicking.
+    /// The DataFusion fork includes the `InsertColumn` fix for `ExtendedColumnProjector`
+    /// that correctly interleaves partition and metadata columns by schema index.
     #[tokio::test]
     async fn test_location_metadata_column_projection_order() {
         use datafusion::parquet::arrow::ArrowWriter;
@@ -2023,54 +2015,29 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .expect("register table");
 
-        // Test 1: SELECT with metadata + partition columns fails safely (no panic).
+        // Test 1: SELECT with metadata + partition + file columns succeeds.
         let df = ctx
             .sql("SELECT location, day, compression FROM test_table")
             .await
             .expect("execute query");
-        let err = df
-            .collect()
-            .await
-            .expect_err("metadata+partition scan should fail safely");
-        assert!(
-            err.to_string().contains(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
-            ),
-            "expected a clear metadata+partition error, got: {err}"
-        );
+        let batches = df.collect().await.expect("collect results");
+        assert!(!batches.is_empty(), "expected at least one batch");
 
-        // Test 2: SELECT with just location and day also fails safely.
+        // Test 2: SELECT with just location and day succeeds.
         let df = ctx
             .sql("SELECT location, day FROM test_table")
             .await
             .expect("execute query");
-        let err = df
-            .collect()
-            .await
-            .expect_err("metadata+partition scan should fail safely");
-        assert!(
-            err.to_string().contains(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
-            ),
-            "expected a clear metadata+partition error, got: {err}"
-        );
+        let batches = df.collect().await.expect("collect results");
+        assert!(!batches.is_empty(), "expected at least one batch");
 
-        // Test 3: File-column-only projection also fails safely for this unsupported combination.
+        // Test 3: File-column-only projection succeeds.
         let df = ctx
             .sql("SELECT compression FROM test_table")
             .await
             .expect("execute query");
-
-        let err = df
-            .collect()
-            .await
-            .expect_err("metadata+partition scan should fail safely");
-        assert!(
-            err.to_string().contains(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
-            ),
-            "expected a clear metadata+partition error, got: {err}"
-        );
+        let batches = df.collect().await.expect("collect results");
+        assert!(!batches.is_empty(), "expected at least one batch");
     }
 
     #[tokio::test]

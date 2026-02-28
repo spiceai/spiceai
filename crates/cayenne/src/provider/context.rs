@@ -129,7 +129,11 @@ impl CayenneContext {
         // Configure VortexFormat - it creates its own VortexFileCache internally
         let vortex_opts = VortexTableOptions {
             footer_initial_read_size_bytes: config.footer_cache_mb * 1024 * 1024,
-            target_file_size_mb: config.target_vortex_file_size_mb,
+            // Disable Vortex-level file splitting. The new Vortex write path uses deterministic
+            // file names (part-00000.vortex, etc.) which causes data loss when multiple INSERTs
+            // each overwrite the same file. Cayenne handles its own file chunking via
+            // chunk_and_write_parallel(), so Vortex's splitting is redundant.
+            target_file_size_mb: 0,
             ..VortexTableOptions::default()
         };
 
