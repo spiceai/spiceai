@@ -187,6 +187,10 @@ pub struct LogsArgs {
     /// Follow logs in real-time
     #[arg(short, long)]
     pub follow: bool,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -206,6 +210,10 @@ pub struct DeployArgs {
     /// Enable debug mode
     #[arg(long)]
     pub debug: bool,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -228,6 +236,10 @@ pub struct RollbackArgs {
     /// Target deployment ID to rollback to
     #[arg(long)]
     pub target: Option<i64>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -287,6 +299,10 @@ pub struct SecretsSetArgs {
 
     /// Secret value
     pub value: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -311,6 +327,10 @@ pub struct SecretsDeleteArgs {
 
     /// Secret name
     pub name: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -338,6 +358,10 @@ pub struct CreateAppArgs {
     /// App visibility (public or private)
     #[arg(long, default_value = "private")]
     pub visibility: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -357,6 +381,10 @@ pub struct CreateDeploymentArgs {
     /// Enable debug mode
     #[arg(long)]
     pub debug: bool,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -414,6 +442,10 @@ pub struct UpdateAppArgs {
     /// Deployment region
     #[arg(long)]
     pub region: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -434,6 +466,10 @@ pub struct DeleteAppArgs {
     /// Skip confirmation prompt
     #[arg(long, short)]
     pub yes: bool,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -796,6 +832,9 @@ async fn execute_secrets(cmd: &SecretsCommands) -> Result<()> {
             client
                 .set_secret(&app_name, &args.name, &args.value)
                 .await?;
+            if args.output == OutputFormat::Json {
+                return write_json(&serde_json::json!({"name": args.name, "status": "set"}));
+            }
             println!("\x1b[32m✓ Secret '{}' set successfully\x1b[0m", args.name);
         }
         SecretsCommands::Get(args) => {
@@ -811,6 +850,9 @@ async fn execute_secrets(cmd: &SecretsCommands) -> Result<()> {
             let client = CloudClient::new()?;
             let app_name = require_app(args.app.as_deref())?;
             client.delete_secret(&app_name, &args.name).await?;
+            if args.output == OutputFormat::Json {
+                return write_json(&serde_json::json!({"name": args.name, "status": "deleted"}));
+            }
             println!("\x1b[32m✓ Secret '{}' deleted\x1b[0m", args.name);
         }
     }
@@ -831,6 +873,10 @@ async fn execute_logs(args: &LogsArgs) -> Result<()> {
     let logs = client
         .get_deployment_logs(&app_name, deployment_id, args.limit, None)
         .await?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&logs);
+    }
 
     for entry in logs.logs {
         let level_color = match entry.level.as_deref() {
@@ -861,6 +907,9 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
             let app = client
                 .create_app(&args.name, args.description.as_deref(), &args.visibility)
                 .await?;
+            if args.output == OutputFormat::Json {
+                return write_json(&app);
+            }
             println!("\x1b[32m✓ Created app {}\x1b[0m", app.full_name());
             if let Some(api_key) = app.api_key {
                 println!("\nAPI Key: {api_key}");
@@ -873,6 +922,9 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
             let deployment = client
                 .create_deployment(&app_name, args.image.as_deref(), args.replicas, args.debug)
                 .await?;
+            if args.output == OutputFormat::Json {
+                return write_json(&deployment);
+            }
             println!(
                 "\x1b[32m✓ Created deployment {} (status: {})\x1b[0m",
                 deployment.id, deployment.status
@@ -927,6 +979,9 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
                 )
                 .await?;
 
+            if args.output == OutputFormat::Json {
+                return write_json(&app);
+            }
             println!("\x1b[32m✓ Updated app {}\x1b[0m", app.full_name());
         }
     }
@@ -963,6 +1018,9 @@ async fn execute_delete(cmd: &DeleteCommands) -> Result<()> {
 
             let client = CloudClient::new()?;
             client.delete_app(&args.app).await?;
+            if args.output == OutputFormat::Json {
+                return write_json(&serde_json::json!({"app": args.app, "status": "deleted"}));
+            }
             println!("\x1b[32m✓ Deleted app {}\x1b[0m", args.app);
         }
     }
@@ -973,12 +1031,15 @@ async fn execute_deploy(args: &DeployArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let app_name = require_app(args.app.as_deref())?;
 
-    println!("Deploying to {app_name}...");
-
     let deployment = client
         .create_deployment(&app_name, args.image.as_deref(), args.replicas, args.debug)
         .await?;
 
+    if args.output == OutputFormat::Json {
+        return write_json(&deployment);
+    }
+
+    println!("Deploying to {app_name}...");
     println!(
         "\x1b[32m✓ Deployment {} started (status: {})\x1b[0m",
         deployment.id, deployment.status
@@ -1049,6 +1110,11 @@ async fn execute_rollback(args: &RollbackArgs) -> Result<()> {
     };
 
     let deployment = client.rollback(&app_name, target_id).await?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&deployment);
+    }
+
     println!(
         "\x1b[32m✓ Rollback to deployment {} initiated (new deployment: {})\x1b[0m",
         target_id, deployment.id
