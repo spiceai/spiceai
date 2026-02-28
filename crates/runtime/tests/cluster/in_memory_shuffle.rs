@@ -254,6 +254,7 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             // Start scheduler
@@ -313,6 +314,7 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     node_mtls_key_file: Some(executor1_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor1_rt = Arc::new(
@@ -371,6 +373,7 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     node_mtls_key_file: Some(executor2_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor2_rt = Arc::new(

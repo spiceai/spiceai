@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use clap::{ArgAction, ValueEnum};
+use spicepod::component::caching::{CacheConfig, Caching, SQLResultsCacheConfig};
+use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone, clap::Parser)]
@@ -40,6 +42,13 @@ pub struct Config {
     /// All cluster related arguments
     #[clap(flatten)]
     pub cluster: ClusterConfig,
+
+    /// Optional override for the spicepod runtime configuration. When set,
+    /// these settings take precedence over the corresponding fields in the
+    /// `App`'s runtime config. This allows programmatic control of caching,
+    /// query settings, task history, and other runtime parameters.
+    #[clap(skip)]
+    pub runtime: Option<SpicepodRuntime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -55,6 +64,7 @@ impl Config {
             http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090),
             flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
             cluster: ClusterConfig::default(),
+            runtime: None,
         }
     }
 
@@ -67,6 +77,54 @@ impl Config {
     #[must_use]
     pub fn with_flight_bind_address(mut self, bind_addr: SocketAddr) -> Self {
         self.flight_bind_address = bind_addr;
+        self
+    }
+
+    /// Sets the spicepod runtime configuration, overriding the corresponding
+    /// settings from the `App`.
+    ///
+    /// This allows programmatic control of runtime parameters including caching,
+    /// query settings, task history, and other runtime behavior independent of
+    /// the spicepod YAML configuration.
+    #[must_use]
+    pub fn with_spicepod_runtime(mut self, config: SpicepodRuntime) -> Self {
+        self.runtime = Some(config);
+        self
+    }
+
+    /// Disables all caching (SQL results, plans, search, and embeddings).
+    ///
+    /// Equivalent to setting all cache `enabled` flags to `false`. Useful in tests
+    /// or scenarios where deterministic, non-cached results are required.
+    ///
+    /// This merges with any existing spicepod runtime config override, only
+    /// replacing the caching settings.
+    #[must_use]
+    pub fn with_caching_disabled(mut self) -> Self {
+        let caching = Caching {
+            sql_results: Some(SQLResultsCacheConfig {
+                enabled: false,
+                ..SQLResultsCacheConfig::default()
+            }),
+            search_results: Some(CacheConfig {
+                enabled: false,
+                ..CacheConfig::default()
+            }),
+            embeddings: Some(CacheConfig {
+                enabled: false,
+                ..CacheConfig::default()
+            }),
+        };
+        self.runtime = Some(match self.runtime {
+            Some(mut config) => {
+                config.caching = caching;
+                config
+            }
+            None => SpicepodRuntime {
+                caching,
+                ..SpicepodRuntime::default()
+            },
+        });
         self
     }
 }

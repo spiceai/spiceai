@@ -196,6 +196,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let scheduler_rt = Arc::new(
@@ -253,6 +254,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor_rt = Arc::new(

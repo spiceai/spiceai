@@ -154,6 +154,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                     node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let scheduler_rt = Arc::new(
@@ -225,6 +226,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                     node_mtls_key_file: Some(executor1_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor1_rt = Arc::new(
