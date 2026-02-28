@@ -276,6 +276,10 @@ impl CatalogConnector for SpiceCloudPlatformCatalog {
 fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = catalog_slug.split('/').collect();
 
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(Error::InvalidPath);
+    }
+
     match parts.len() {
         2 | 3 => {
             let org = parts[0].to_string();
@@ -332,12 +336,7 @@ mod tests {
 
     #[test]
     fn test_parse_catalog_slug_trailing_slash() {
-        // "org/app/" splits into ["org", "app", ""], treated as 3 parts
-        let (org, app, catalog) =
-            parse_catalog_slug("org/app/").expect("valid three-part slug with empty catalog");
-        assert_eq!(org, "org");
-        assert_eq!(app, "app");
-        assert_eq!(catalog, "");
+        parse_catalog_slug("org/app/").expect_err("trailing slash should produce invalid slug");
     }
 
     #[test]
