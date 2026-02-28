@@ -194,7 +194,7 @@ impl TableProvider for LocationPruningListingTable {
             && !self.inner.options().metadata_cols.is_empty()
         {
             return Err(DataFusionError::Execution(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.".to_string(),
+                format!("Table '{}': tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.", self.table_path),
             ));
         }
 

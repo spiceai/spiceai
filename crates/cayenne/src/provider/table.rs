@@ -2618,6 +2618,21 @@ impl CayenneTableProvider {
             }
         }
 
+        // Pre-create the listing table before committing to catalog.
+        // This ensures that if listing table creation fails, we haven't committed
+        // the catalog yet, avoiding an inconsistent state.
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+        )?;
+
         // Atomically update the catalog to point to the new sorted snapshot.
         // commit_compaction clears delete files and insert records, which is
         // correct here since the sort rewrites all live data into the new snapshot.
@@ -2626,7 +2641,17 @@ impl CayenneTableProvider {
             return Err(Error::Catalog { source: e });
         }
 
-        self.update_listing_table_for_snapshot(&new_snapshot_id)?;
+        // Now that catalog is committed, update the in-memory listing table.
+        {
+            let mut listing_table_guard =
+                self.listing_table
+                    .write()
+                    .map_err(|_| Error::LockPoisoned {
+                        table: self.table_metadata.table_name.clone(),
+                        lock: LISTING_TABLE_LOCK_POISONED,
+                    })?;
+            *listing_table_guard = new_listing_table;
+        }
 
         // Update in-memory state to match the new catalog
         self.update_current_snapshot_id(&new_snapshot_id)?;
