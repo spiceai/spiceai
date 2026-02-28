@@ -136,8 +136,21 @@ impl CayenneContext {
         // part-00001, ...) that collide when multiple INSERT operations write to the
         // same directory. Cayenne handles file splitting itself in
         // `chunk_and_write_parallel`, so the Vortex-level splitting is not needed.
+        let default_config = VortexConfig::default();
+        if config.footer_cache_mb != default_config.footer_cache_mb {
+            tracing::warn!(
+                footer_cache_mb = config.footer_cache_mb,
+                "Vortex config `footer_cache_mb` is currently ignored on DataFusion v52"
+            );
+        }
+        if config.segment_cache_mb != default_config.segment_cache_mb {
+            tracing::warn!(
+                segment_cache_mb = config.segment_cache_mb,
+                "Vortex config `segment_cache_mb` is currently ignored on DataFusion v52"
+            );
+        }
+
         let vortex_opts = VortexTableOptions {
-            footer_initial_read_size_bytes: config.footer_cache_mb * 1024 * 1024,
             target_file_size_mb: 0,
             ..VortexTableOptions::default()
         };
