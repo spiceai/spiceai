@@ -61,6 +61,12 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("host").description("The Oracle host address."),
     ParameterSpec::component("port").description("The Oracle port number."),
     ParameterSpec::component("service_name").description("The Oracle service name."),
+    ParameterSpec::component("wallet_sso_cert")
+        .secret()
+        .description("Path to Oracle wallet certificate file or wallet directory."),
+    ParameterSpec::component("wallet")
+        .secret()
+        .description("Path to Oracle wallet directory for mTLS connections."),
 ];
 
 /// A catalog connector for Oracle, providing access to schemas and tables
@@ -143,7 +149,12 @@ impl CatalogConnector for OracleCatalog {
             }
         })?;
 
-        let pool = data_components::oracle::connection::connect(&conn_params, None)
+        let mut wallet_path_opt = self.params.parameters.get("wallet").expose().ok();
+        if wallet_path_opt.is_none() {
+            wallet_path_opt = self.params.parameters.get("wallet_sso_cert").expose().ok();
+        }
+
+        let pool = data_components::oracle::connection::connect(&conn_params, wallet_path_opt)
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),

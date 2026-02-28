@@ -107,6 +107,7 @@ pub struct DispatchTests {
     pub streaming_bench: Vec<StreamingBenchDispatchArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub streaming_correctness: Vec<StreamingCorrectnessDispatchArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub schema: Vec<SchemaArgs>,
 }
 

@@ -124,6 +124,7 @@ impl MySQLCatalog {
     ) -> std::result::Result<mysql_async::Pool, Box<dyn std::error::Error + Send + Sync>> {
         use secrecy::ExposeSecret;
         use std::io;
+        use std::path::PathBuf;
 
         let secret_map = params.parameters.to_secret_map();
 
@@ -161,6 +162,30 @@ impl MySQLCatalog {
             .map(|s| s.expose_secret().to_string())
             .unwrap_or_default();
 
+        let ssl_mode = secret_map
+            .get("sslmode")
+            .map(|s| s.expose_secret().to_lowercase())
+            .unwrap_or_else(|| "required".to_string());
+        if ssl_mode != "disabled" && ssl_mode != "required" && ssl_mode != "preferred" {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid sslmode '{ssl_mode}'; expected disabled, required, or preferred"),
+            )));
+        }
+
+        let ssl_rootcert_path = if let Some(root_cert) = secret_map.get("sslrootcert") {
+            let root_cert_path = root_cert.expose_secret();
+            if !std::path::Path::new(root_cert_path).exists() {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid sslrootcert path '{root_cert_path}'"),
+                )));
+            }
+            Some(PathBuf::from(root_cert_path))
+        } else {
+            None
+        };
+
         let mut builder = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::default());
         if !user.is_empty() {
             builder = builder.user(Some(user));
@@ -175,6 +200,7 @@ impl MySQLCatalog {
             builder = builder.db_name(Some(db));
         }
         builder = builder.tcp_port(port);
+        builder = builder.ssl_opts(Self::metadata_pool_ssl_opts(&ssl_mode, ssl_rootcert_path));
 
         let opts = mysql_async::Opts::from(builder);
         let opts = Self::with_metadata_pool_constraints(opts)?;
@@ -197,6 +223,29 @@ impl MySQLCatalog {
         let builder = mysql_async::OptsBuilder::from_opts(opts).pool_opts(pool_opts);
 
         Ok(mysql_async::Opts::from(builder))
+    }
+
+    fn metadata_pool_ssl_opts(
+        ssl_mode: &str,
+        rootcert_path: Option<std::path::PathBuf>,
+    ) -> Option<mysql_async::SslOpts> {
+        if ssl_mode == "disabled" {
+            return None;
+        }
+
+        let mut opts = mysql_async::SslOpts::default();
+
+        if let Some(rootcert_path) = rootcert_path {
+            opts = opts.with_root_certs(vec![rootcert_path.into()]);
+        }
+
+        if ssl_mode == "preferred" {
+            opts = opts
+                .with_danger_accept_invalid_certs(true)
+                .with_danger_skip_domain_validation(true);
+        }
+
+        Some(opts)
     }
 }
 

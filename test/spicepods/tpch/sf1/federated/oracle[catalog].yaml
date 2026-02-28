@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: oracle-catalog-federated
+name: oracle[catalog]-federated
 catalogs:
   - from: oracle
     name: oracle_tpch
