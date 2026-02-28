@@ -158,32 +158,22 @@ impl MySQLCatalog {
             .map(|s| s.expose_secret().to_string())
             .unwrap_or_default();
 
-        let mut url = url::Url::parse("mysql://localhost")
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        url.set_host(Some(&host))
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        url.set_port(Some(port)).map_err(|()| {
-            Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid tcp_port value: {port}"),
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        url.set_username(&user).map_err(|()| {
-            Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid MySQL username for connection URL",
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        url.set_password(Some(&pass)).map_err(|()| {
-            Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid MySQL password for connection URL",
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        url.set_path(&format!("/{db}"));
+        let mut builder = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::default());
+        if !user.is_empty() {
+            builder = builder.user(Some(user));
+        }
+        if !pass.is_empty() {
+            builder = builder.pass(Some(pass));
+        }
+        if !host.is_empty() {
+            builder = builder.ip_or_hostname(host);
+        }
+        if !db.is_empty() {
+            builder = builder.db_name(Some(db));
+        }
+        builder = builder.tcp_port(port);
 
-        let opts = mysql_async::Opts::from_url(url.as_str())
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let opts = mysql_async::Opts::from(builder);
         let opts = Self::with_metadata_pool_constraints(opts)?;
         Ok(mysql_async::Pool::new(opts))
     }
