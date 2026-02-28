@@ -68,7 +68,7 @@ fn decimal_queries(snapshot_name: &str, query_type: DecimalQuery) -> QueryTests<
                 }),
             ),
             (
-                "AggregateExec",
+                "AggregateExec: mode=Final",
                 Box::new(|plan| {
                     plan.contains("sum(decimal.small_decimal)")
                         && plan.contains("sum(decimal.medium_decimal)")
