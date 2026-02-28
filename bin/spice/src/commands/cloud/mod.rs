@@ -270,6 +270,10 @@ pub struct MetricsArgs {
     /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
     #[arg(long, value_parser = parse_window)]
     pub window: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 // ============================================================================
@@ -706,6 +710,7 @@ fn execute_unlink() -> Result<()> {
 
 async fn execute_apps(args: &AppsArgs) -> Result<()> {
     let client = CloudClient::new()?;
+    let context = client.get_auth_context().await?;
     let apps = client.list_apps().await?;
 
     if apps.is_empty() {
@@ -724,13 +729,20 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
         "VISIBILITY",
         "CREATED",
     ]);
-    for app in apps {
+    for app in &apps {
+        let display_name = if app.org.is_empty() {
+            format!("{}/{}", context.org_name, app.name)
+        } else {
+            app.full_name()
+        };
         table.add_row(vec![
-            app.full_name(),
-            app.description.unwrap_or_default(),
-            app.region.unwrap_or_else(|| "-".to_string()),
-            app.visibility.unwrap_or_else(|| "private".to_string()),
-            app.created_at.unwrap_or_else(|| "-".to_string()),
+            display_name,
+            app.description.clone().unwrap_or_default(),
+            app.region.clone().unwrap_or_else(|| "-".to_string()),
+            app.visibility
+                .clone()
+                .unwrap_or_else(|| "private".to_string()),
+            app.created_at.clone().unwrap_or_else(|| "-".to_string()),
         ]);
     }
     table.print();
@@ -1185,6 +1197,10 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     let response = client
         .get_app_metrics(app.id, args.window.as_deref())
         .await?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&response);
+    }
 
     if response.metrics.is_empty() {
         println!("No metrics available for {app_name}");

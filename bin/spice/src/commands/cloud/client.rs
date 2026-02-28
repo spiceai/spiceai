@@ -93,11 +93,25 @@ impl CloudClient {
     }
 
     pub async fn get_app(&self, org_app: &str) -> Result<App> {
-        let apps = self.list_apps().await?;
         let (org, name) = parse_org_app(org_app);
 
+        if org.is_empty() {
+            return InvalidArgumentSnafu {
+                message: format!("App name must be in org/app format, got '{org_app}'"),
+            }
+            .fail();
+        }
+
+        let context = self.get_auth_context().await?;
+        let apps = self.list_apps().await?;
+
         for app in apps {
-            if app.name == name && (org.is_empty() || app.org == org) {
+            let app_org = if app.org.is_empty() {
+                &context.org_name
+            } else {
+                &app.org
+            };
+            if app.name == name && app_org.eq_ignore_ascii_case(&org) {
                 return self.get_app_by_id(app.id).await;
             }
         }
