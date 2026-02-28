@@ -1050,11 +1050,11 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
                 .map_or_else(|| "-".to_string(), format_bytes),
             m.disk_read_bytes
                 .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_read_iops
+            m.disk_read_operations
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
             m.disk_write_bytes
                 .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_write_iops
+            m.disk_write_operations
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
         ]);
     }

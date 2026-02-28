@@ -652,19 +652,22 @@ impl ClusterService for ClusterServiceImpl {
 
         // Register the allocated partitions in the executor registry so the scheduler knows where they are
         {
+            let registry = self.datafusion.ctx.as_ref();
             let mut partition_map: TablePartitions = table_partitions
                 .iter()
                 .map(|(tbl, sa)| {
                     let exprs = sa
                         .items
                         .iter()
-                        .filter_map(|bytes| match Expr::from_bytes(bytes) {
-                            Ok(expr) => Some(expr),
-                            Err(e) => {
-                                tracing::error!("Failed to deserialize expr: {e}");
-                                None
-                            }
-                        })
+                        .filter_map(
+                            |bytes| match Expr::from_bytes_with_registry(bytes, registry) {
+                                Ok(expr) => Some(expr),
+                                Err(e) => {
+                                    tracing::error!("Failed to deserialize expr: {e}");
+                                    None
+                                }
+                            },
+                        )
                         .collect();
                     (TableReference::parse_str(tbl), exprs)
                 })
