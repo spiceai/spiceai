@@ -2484,7 +2484,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if reading, sorting, or rewriting fails.
-    pub(crate) async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> Result<()> {
+    pub async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> Result<()> {
         tracing::info!(
             "Sorting and rewriting data for table {} by columns {:?}",
             self.table_metadata.table_name,
@@ -3243,22 +3243,6 @@ impl CayenneTableProvider {
             self.table_metadata.table_id,
             &current_snapshot,
         );
-
-        eprintln!("[DEBUG-REFRESH] snapshot_dir_url={}", snapshot_dir_url);
-
-        // List files in the snapshot directory for debugging
-        let snapshot_dir = Self::snapshot_dir_path(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &current_snapshot,
-        );
-        if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
-            let files: Vec<String> = entries
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            eprintln!("[DEBUG-REFRESH] Files in snapshot dir: {:?}", files);
-        }
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -4777,5 +4761,276 @@ mod tests {
 
         assert_eq!(keyset.len(), 3, "all rows should be in keyset");
         assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
+    }
+
+    /// Helper to create a `CayenneTableProvider` with sort columns configured.
+    ///
+    /// Returns the provider and the temp dir (must be kept alive for the test duration).
+    async fn create_sorted_cayenne_table(
+        table_name: &str,
+        schema: SchemaRef,
+        sort_columns: Vec<String>,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!(
+            "{}/data",
+            temp_dir.path().to_str().expect("should be str")
+        );
+
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string).expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let vortex_config = VortexConfig {
+            sort_columns,
+            ..VortexConfig::default()
+        };
+
+        let context = CayenneContext::new(&vortex_config);
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+
+        let provider = CayenneTableProviderBuilder::new(catalog)
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        (provider, temp_dir)
+    }
+
+    /// Helper to insert a `RecordBatch` into a `CayenneTableProvider`.
+    async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let schema = batch.schema();
+
+        let mem_exec = MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("memory exec created");
+
+        let insert_plan = provider
+            .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
+            .await
+            .expect("insert plan created");
+
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert done");
+    }
+
+    /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
+    async fn read_all(provider: &CayenneTableProvider, table_name: &str) -> Vec<RecordBatch> {
+        let ctx = SessionContext::new();
+        ctx.register_table(table_name, Arc::new(provider.clone_for_write()))
+            .expect("table registered");
+        let df = ctx
+            .sql(&format!("SELECT * FROM {table_name}"))
+            .await
+            .expect("query created");
+        df.collect().await.expect("collect succeeded")
+    }
+
+    #[tokio::test]
+    async fn test_sort_and_rewrite_data_sorts_by_column() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "sort_rewrite_test",
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+        )
+        .await;
+
+        // Insert data in deliberately unsorted order across multiple batches
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![30, 10, 50])),
+                Arc::new(Int64Array::from(vec![300, 100, 500])),
+            ],
+        )
+        .expect("valid batch");
+        insert_batch(&provider, batch1).await;
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![20, 40])),
+                Arc::new(Int64Array::from(vec![200, 400])),
+            ],
+        )
+        .expect("valid batch");
+        insert_batch(&provider, batch2).await;
+
+        // Verify data is present but unsorted before rewrite
+        let before = read_all(&provider, "sort_rewrite_test").await;
+        let total_rows_before: usize = before.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows_before, 5, "should have 5 rows before sort");
+
+        // Sort and rewrite
+        provider
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("sort_and_rewrite_data should succeed");
+
+        // Read back and verify data is sorted by "id" ascending
+        let after = read_all(&provider, "sort_rewrite_test").await;
+        let total_rows_after: usize = after.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows_after, 5, "should still have 5 rows after sort");
+
+        // Collect all id values in order
+        let mut all_ids: Vec<i64> = Vec::new();
+        let mut all_values: Vec<i64> = Vec::new();
+        for batch in &after {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column should be Int64");
+            let val_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column should be Int64");
+            for i in 0..batch.num_rows() {
+                all_ids.push(id_col.value(i));
+                all_values.push(val_col.value(i));
+            }
+        }
+
+        assert_eq!(all_ids, vec![10, 20, 30, 40, 50], "ids should be sorted ascending");
+        assert_eq!(
+            all_values,
+            vec![100, 200, 300, 400, 500],
+            "values should follow their corresponding ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_and_rewrite_data_empty_table() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "sort_empty_test",
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+        )
+        .await;
+
+        // Sort and rewrite on empty table should succeed without error
+        provider
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("sort_and_rewrite_data on empty table should succeed");
+
+        let after = read_all(&provider, "sort_empty_test").await;
+        let total_rows: usize = after.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 0, "empty table should remain empty after sort");
+    }
+
+    #[tokio::test]
+    async fn test_sort_and_rewrite_data_preserves_all_rows() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "sort_preserve_test",
+            Arc::clone(&schema),
+            vec!["ts".to_string()],
+        )
+        .await;
+
+        // Insert multiple batches with overlapping timestamp ranges
+        for i in (0..5).rev() {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![i * 10 + 5, i * 10])),
+                    Arc::new(StringArray::from(vec![
+                        format!("row_{}", i * 10 + 5),
+                        format!("row_{}", i * 10),
+                    ])),
+                ],
+            )
+            .expect("valid batch");
+            insert_batch(&provider, batch).await;
+        }
+
+        // Sort and rewrite
+        provider
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("sort_and_rewrite_data should succeed");
+
+        // Read back and verify all 10 rows are present and sorted
+        let after = read_all(&provider, "sort_preserve_test").await;
+        let total_rows: usize = after.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 10, "all 10 rows should be preserved");
+
+        let mut all_ts: Vec<i64> = Vec::new();
+        let mut all_names: Vec<String> = Vec::new();
+        for batch in &after {
+            let ts_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ts column should be Int64");
+            let name_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column should be Utf8");
+            for i in 0..batch.num_rows() {
+                all_ts.push(ts_col.value(i));
+                all_names.push(name_col.value(i).to_string());
+            }
+        }
+
+        // Verify sorted by ts ascending
+        let expected_ts: Vec<i64> = (0..10).map(|i| i * 5).collect();
+        assert_eq!(all_ts, expected_ts, "timestamps should be sorted ascending");
+
+        // Verify each name corresponds to its timestamp
+        for (ts, name) in all_ts.iter().zip(all_names.iter()) {
+            assert_eq!(
+                name,
+                &format!("row_{ts}"),
+                "name should match its timestamp"
+            );
+        }
     }
 }

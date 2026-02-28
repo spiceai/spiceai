@@ -127,9 +127,18 @@ impl CayenneContext {
         let vortex_session = VortexSession::default();
 
         // Configure VortexFormat - it creates its own VortexFileCache internally
+        //
+        // target_file_size_mb is set to 0 so the Vortex sink delegates to DataFusion's
+        // file demuxer for output file naming. DataFusion's demuxer generates random
+        // write IDs (e.g., "aB3D5fG7hJ9K0mN1_0.vortex"), ensuring unique filenames
+        // across multiple append writes to the same snapshot directory. Without this,
+        // the Vortex sink's built-in file splitting uses sequential names (part-00000,
+        // part-00001, ...) that collide when multiple INSERT operations write to the
+        // same directory. Cayenne handles file splitting itself in
+        // `chunk_and_write_parallel`, so the Vortex-level splitting is not needed.
         let vortex_opts = VortexTableOptions {
             footer_initial_read_size_bytes: config.footer_cache_mb * 1024 * 1024,
-            target_file_size_mb: config.target_vortex_file_size_mb,
+            target_file_size_mb: 0,
             ..VortexTableOptions::default()
         };
 
