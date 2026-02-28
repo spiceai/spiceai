@@ -92,6 +92,10 @@ impl SnowflakeCatalogProvider {
     }
 
     /// Discovers schemas in the Snowflake database and populates the cache.
+    ///
+    /// This refresh is intentionally all-or-nothing: a fully rebuilt map is swapped
+    /// into the cache only after discovery and table-provider creation succeeds for
+    /// every discovered schema. This avoids exposing partially refreshed metadata.
     async fn refresh_schemas(&self) -> Result<()> {
         let schema_names = self.list_schemas().await?;
 
