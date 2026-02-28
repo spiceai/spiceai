@@ -1,5 +1,5 @@
 name: testoperator streaming dynamodb benchmark
-run-name: streaming - ${{ github.event.inputs.queryset }}
+run-name: streaming - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
