@@ -242,11 +242,11 @@ pub enum CompressionStrategy {
 pub struct VortexConfig {
     /// Footer cache size in MB.
     ///
-    /// Currently ignored on `DataFusion` v52.
+    /// Currently ignored in Spice.ai `<version>`.
     pub footer_cache_mb: usize,
     /// Segment cache size in MB.
     ///
-    /// Currently ignored on `DataFusion` v52.
+    /// Currently ignored in Spice.ai `<version>`.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows

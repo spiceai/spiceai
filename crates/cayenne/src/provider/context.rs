@@ -140,13 +140,13 @@ impl CayenneContext {
         if config.footer_cache_mb != default_config.footer_cache_mb {
             tracing::warn!(
                 footer_cache_mb = config.footer_cache_mb,
-                "Vortex config `footer_cache_mb` is currently ignored on DataFusion v52"
+                "Vortex config `footer_cache_mb` is currently ignored in Spice.ai <version>"
             );
         }
         if config.segment_cache_mb != default_config.segment_cache_mb {
             tracing::warn!(
                 segment_cache_mb = config.segment_cache_mb,
-                "Vortex config `segment_cache_mb` is currently ignored on DataFusion v52"
+                "Vortex config `segment_cache_mb` is currently ignored in Spice.ai <version>"
             );
         }
 
