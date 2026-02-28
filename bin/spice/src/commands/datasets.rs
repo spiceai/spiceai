@@ -42,7 +42,14 @@ pub struct DatasetsArgs {
 
 impl TableRow for DatasetInfo {
     fn headers() -> Vec<&'static str> {
-        vec!["NAME", "FROM", "REPLICATION", "ACCELERATION", "STATUS"]
+        vec![
+            "NAME",
+            "FROM",
+            "REPLICATION",
+            "ACCELERATION",
+            "STATUS",
+            "ERROR",
+        ]
     }
 
     fn values(&self) -> Vec<String> {
@@ -54,6 +61,7 @@ impl TableRow for DatasetInfo {
             self.status
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
+            self.error_message.clone().unwrap_or_default(),
         ]
     }
 }

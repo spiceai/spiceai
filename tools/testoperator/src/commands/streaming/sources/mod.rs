@@ -18,4 +18,4 @@ limitations under the License.
 
 mod dynamodb;
 
-pub use dynamodb::{DynamoDbConfig, DynamoDbStreamsSource};
+pub use dynamodb::{DynamoDbConfig, DynamoDbStreamsSource, transform_spicepod};

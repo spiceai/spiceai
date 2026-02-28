@@ -39,6 +39,7 @@ use app::App;
 use datafusion::optimizer::AnalyzerRule;
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 use spicepod::component::caching::Caching;
+use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -211,6 +212,21 @@ impl RuntimeBuilder {
             .as_ref()
             .is_none_or(|app| app.runtime.task_history.enabled);
 
+        let runtime_ready_state = self
+            .app
+            .as_ref()
+            .map_or(SpicepodRuntimeReadyState::default(), |app| {
+                app.runtime.ready_state
+            });
+
+        self.runtime_status
+            .set_ready_state(match runtime_ready_state {
+                SpicepodRuntimeReadyState::OnLoad => status::RuntimeReadyState::OnLoad,
+                SpicepodRuntimeReadyState::OnRegistration => {
+                    status::RuntimeReadyState::OnRegistration
+                }
+            });
+
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled = App::get_runtime_param_opt::<String>(&self.app, "url_tables")
             .as_deref()
@@ -262,10 +278,12 @@ impl RuntimeBuilder {
             executor_registry, ..
         }) = distributed.as_ref()
         {
-            df_builder =
-                df_builder.with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
-                ))
+            df_builder = df_builder
+                .with_executor_registry(Arc::clone(executor_registry))
+                .with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(Arc::clone(
+                    executor_registry,
+                )
+                    as Arc<dyn TablePartitionProvider>))
                     as Arc<dyn AnalyzerRule + Send + Sync>]);
         }
 
@@ -284,6 +302,7 @@ impl RuntimeBuilder {
         }
 
         let df = Arc::new(df);
+        df.set_self_ref();
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self

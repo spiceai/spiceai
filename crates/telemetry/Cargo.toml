@@ -21,7 +21,7 @@ snafu.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
 [features]
 anonymous_telemetry = []

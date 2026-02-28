@@ -22,19 +22,9 @@ limitations under the License.
 //! - [`DynamoDBStreamingSource`]: DynamoDB-specific extension with snapshot/checkpoint support
 
 use arrow::array::RecordBatch;
-use spicepod::spec::SpicepodDefinition;
 use test_framework::anyhow::Result;
 
 use super::datasets::DatasetType;
-
-/// Configuration for snapshot storage (S3).
-#[derive(Debug, Clone)]
-pub struct SnapshotConfig {
-    /// Base S3 location for snapshots (e.g., "<s3://bucket/snapshots>/")
-    pub location: String,
-    /// S3 region
-    pub region: Option<String>,
-}
 
 /// Represents a table that can be generated and inserted into a streaming source.
 ///
@@ -80,7 +70,6 @@ pub trait StreamingDataset: Send + Sync {
 /// This is the generic interface for all streaming sources (`DynamoDB`, Kafka, etc.).
 /// Sources match on `DatasetType` to determine source-specific configuration
 /// like key schemas, topic settings, etc.
-#[expect(dead_code)]
 #[async_trait::async_trait]
 pub trait StreamingSource: Send + Sync {
     /// Set a table name prefix for isolated test runs.
@@ -124,40 +113,4 @@ pub trait StreamingSource: Send + Sync {
 
     /// Cleanup resources (stop containers, etc.).
     async fn cleanup(&self) -> Result<()>;
-}
-
-/// DynamoDB-specific streaming source with snapshot/checkpoint support.
-///
-/// This trait extends [`StreamingSource`] with methods for transforming spicepods
-/// to capture checkpoints and restore from snapshots. This is required for `DynamoDB`
-/// benchmarks because `DynamoDB` Streams has limited retention (24 hours) and shard
-/// lifecycle issues that require snapshot-based checkpoint capture.
-pub trait DynamoDBStreamingSource: StreamingSource {
-    /// Transform spicepod for checkpoint capture phase.
-    ///
-    /// This method:
-    /// - Renames datasets with `run_id` prefix to match `DynamoDB` table names
-    /// - Sets `acceleration.snapshots: create_only` to capture checkpoint
-    /// - Configures runtime snapshot location
-    fn prepare_checkpoint_spicepod(
-        &self,
-        spicepod: SpicepodDefinition,
-        run_id: &str,
-        config_name: &str,
-        snapshot_config: &SnapshotConfig,
-    ) -> Result<SpicepodDefinition>;
-
-    /// Transform spicepod for benchmark phase.
-    ///
-    /// This method:
-    /// - Renames datasets with `run_id` prefix to match `DynamoDB` table names
-    /// - Sets `acceleration.snapshots: bootstrap_only` to restore from snapshot
-    /// - Configures runtime snapshot location
-    fn prepare_benchmark_spicepod(
-        &self,
-        spicepod: SpicepodDefinition,
-        run_id: &str,
-        config_name: &str,
-        snapshot_config: &SnapshotConfig,
-    ) -> Result<SpicepodDefinition>;
 }

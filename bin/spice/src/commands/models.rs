@@ -42,7 +42,7 @@ pub struct ModelsArgs {
 
 impl TableRow for ModelInfo {
     fn headers() -> Vec<&'static str> {
-        vec!["ID", "OWNED_BY", "STATUS"]
+        vec!["ID", "OWNED_BY", "STATUS", "ERROR"]
     }
 
     fn values(&self) -> Vec<String> {
@@ -52,6 +52,7 @@ impl TableRow for ModelInfo {
             self.status
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
+            self.error_message.clone().unwrap_or_default(),
         ]
     }
 }
