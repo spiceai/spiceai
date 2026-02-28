@@ -286,6 +286,43 @@ async fn duckdb_regexp() -> Result<(), String> {
 
             runtime_ready_check(&rt).await;
 
+            let regex_metachar_semantics = r#"
+                WITH duckdb_regex AS (
+                    SELECT region FROM csv_test WHERE regexp_like(region, 'A.*A')
+                ), arrow_regex AS (
+                    SELECT region FROM csv_test_arrow WHERE regexp_like(region, 'A.*A')
+                ), missing_in_duckdb AS (
+                    SELECT region FROM arrow_regex
+                    EXCEPT
+                    SELECT region FROM duckdb_regex
+                ), missing_in_arrow AS (
+                    SELECT region FROM duckdb_regex
+                    EXCEPT
+                    SELECT region FROM arrow_regex
+                )
+                SELECT region FROM missing_in_duckdb
+                UNION ALL
+                SELECT region FROM missing_in_arrow
+            "#;
+
+            let regex_semantic_diff: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(regex_metachar_semantics)
+                .build()
+                .run()
+                .await
+                .expect("regex metachar semantic comparison query is successful")
+                .data
+                .try_collect()
+                .await
+                .expect("collects regex metachar semantic comparison results");
+
+            assert_eq!(
+                regex_semantic_diff.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                0,
+                "regexp_like regex metacharacter semantics diverged between DuckDB and Arrow"
+            );
+
             let cases = vec![
                 (
                     "test_regexp_like_is_case_sensitive",

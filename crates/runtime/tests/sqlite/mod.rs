@@ -60,12 +60,21 @@ enum DecimalQuery {
 
 fn decimal_queries(snapshot_name: &str, query_type: DecimalQuery) -> QueryTests<'static> {
     let expected_plan: CheckFunction = match query_type {
-        DecimalQuery::Federated => CheckFunction::ValidateSubPlan(vec![(
-            "SQLiteSqlExec",
-            Box::new(|plan| {
-                plan.contains("sql=SELECT \"small_decimal\", \"medium_decimal\", \"large_decimal\", \"precise_decimal\" FROM decimal")
-            }),
-        )]),
+        DecimalQuery::Federated => CheckFunction::ValidateSubPlan(vec![
+            (
+                "SQLiteSqlExec",
+                Box::new(|plan| {
+                    plan.contains("sql=SELECT \"small_decimal\", \"medium_decimal\", \"large_decimal\", \"precise_decimal\" FROM decimal")
+                }),
+            ),
+            (
+                "AggregateExec",
+                Box::new(|plan| {
+                    plan.contains("sum(decimal.small_decimal)")
+                        && plan.contains("sum(decimal.medium_decimal)")
+                }),
+            ),
+        ]),
         DecimalQuery::NonFederated => {
             CheckFunction::ValidateFullPlan(format!("{snapshot_name}_non_federated"))
         }

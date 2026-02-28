@@ -435,9 +435,9 @@ parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ca671dd37d73
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "dad51c34f7da7ab49b86a778c345821edad7ccc4" } # spiceai-52
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52
+vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52

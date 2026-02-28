@@ -2528,6 +2528,29 @@ impl CayenneTableProvider {
 
                 match url::Url::parse(&snapshot_url) {
                     Ok(url) => {
+                        let Some(config) = self.object_store_config.as_ref() else {
+                            tracing::warn!(
+                                "Skipping failed sort-rewrite S3 cleanup for table {} because object_store_config is missing",
+                                self.table_metadata.table_name
+                            );
+                            return;
+                        };
+
+                        let snapshot_host = url.host_str().unwrap_or_default();
+                        let config_host = config.url.host_str().unwrap_or_default();
+                        if !snapshot_host.is_empty()
+                            && !config_host.is_empty()
+                            && snapshot_host != config_host
+                        {
+                            tracing::warn!(
+                                "Skipping failed sort-rewrite S3 cleanup for table {} because snapshot host {} does not match configured object store host {}",
+                                self.table_metadata.table_name,
+                                snapshot_host,
+                                config_host
+                            );
+                            return;
+                        }
+
                         let path = url.path().trim_start_matches('/');
                         let prefix = ObjectStorePath::from(path);
                         if let Err(e) = self.delete_prefix_with_object_store(&prefix).await {

@@ -124,6 +124,15 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
             let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!("duckdb_query_explain", pretty);
+            let pretty = pretty.to_string();
+            assert!(
+                pretty.contains("DuckSqlExec"),
+                "Expected federated DuckDB scan in explain plan"
+            );
+            assert!(
+                pretty.contains("SortExec"),
+                "Expected DataFusion-side sort stage for DF52 plan"
+            );
 
             // Test query output
             let query_result = rt
