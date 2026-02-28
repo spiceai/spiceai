@@ -435,7 +435,7 @@ mod tests {
     async fn test_build_table_providers_applies_include_filter_before_factory() {
         let read = Arc::new(MockRead::new(HashSet::new()));
         let include = make_include(&["public.orders"]);
-        let table_creator: Arc<dyn Read> = read.clone();
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
 
         let tables = build_table_providers_for_schema(
             "public",
@@ -455,7 +455,7 @@ mod tests {
         let mut fail_tables = HashSet::new();
         fail_tables.insert("public.orders".to_string());
         let read = Arc::new(MockRead::new(fail_tables));
-        let table_creator: Arc<dyn Read> = read.clone();
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
 
         let tables = build_table_providers_for_schema(
             "public",
@@ -480,7 +480,7 @@ mod tests {
         let fail_tables =
             HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
         let read = Arc::new(MockRead::new(fail_tables));
-        let table_creator: Arc<dyn Read> = read.clone();
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = build_table_providers_for_schema(
             "public",

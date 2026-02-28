@@ -162,10 +162,10 @@ impl MySQLCatalog {
             .map(|s| s.expose_secret().to_string())
             .unwrap_or_default();
 
-        let ssl_mode = secret_map
-            .get("sslmode")
-            .map(|s| s.expose_secret().to_lowercase())
-            .unwrap_or_else(|| "required".to_string());
+        let ssl_mode = secret_map.get("sslmode").map_or_else(
+            || "required".to_string(),
+            |s| s.expose_secret().to_lowercase(),
+        );
         if ssl_mode != "disabled" && ssl_mode != "required" && ssl_mode != "preferred" {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::InvalidInput,
