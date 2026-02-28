@@ -181,6 +181,11 @@ impl CayenneDataSink {
     ///
     /// Returns an error if the data cannot be inserted.
     async fn write_all_append(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
+        // Ensure no incomplete write from a previous crash before proceeding.
+        // A leftover staging WAL indicates an interrupted file-move operation,
+        // meaning the table may contain partial data. Block all writes until resolved.
+        self.table.ensure_no_incomplete_write().await?;
+
         // Check for pending PK-based deletions (from explicit DELETE operations).
         //
         // POSITION-BASED STRATEGY: No compaction/new snapshot needed on insert.
@@ -286,8 +291,14 @@ impl CayenneDataSink {
                 }
             };
 
-            // Step 3: Move files from staging into current snapshot (atomic on local FS)
+            // Step 3: Write staging WAL (records intent before the non-atomic move)
+            self.table.write_staging_wal().await?;
+
+            // Step 4: Move files from staging into current snapshot (atomic on local FS)
             self.table.move_files_to_current_snapshot().await?;
+
+            // Step 5: Remove staging WAL (signals successful move)
+            self.table.remove_staging_wal().await?;
 
             tracing::debug!(
                 "Insert completed, wrote {} rows to Vortex in {} chunk(s)",

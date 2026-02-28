@@ -21,7 +21,8 @@ limitations under the License.
 
 use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
-    PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, WRITE_SEMAPHORE_CLOSED,
+    PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, STAGING_WAL_FILENAME,
+    WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -465,7 +466,11 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_path(table_path: &str, table_id: i64, snapshot_id: &str) -> std::path::PathBuf {
+    pub(super) fn snapshot_dir_path(
+        table_path: &str,
+        table_id: i64,
+        snapshot_id: &str,
+    ) -> std::path::PathBuf {
         std::path::PathBuf::from(table_path)
             .join(table_id.to_string())
             .join(snapshot_id)
@@ -499,7 +504,7 @@ impl CayenneTableProvider {
         }
     }
 
-    fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
+    pub(super) fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
         self.object_store_config
             .as_ref()
             .ok_or_else(|| Error::Internal {
@@ -508,7 +513,10 @@ impl CayenneTableProvider {
             })
     }
 
-    fn snapshot_object_store_prefix(&self, snapshot_id: &str) -> Result<Option<ObjectStorePath>> {
+    pub(super) fn snapshot_object_store_prefix(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ObjectStorePath>> {
         if !self.table_metadata.path.starts_with("s3://") {
             return Ok(None);
         }
@@ -732,8 +740,10 @@ impl CayenneTableProvider {
                 self.table_metadata.table_id,
                 STAGING_DIR_NAME,
             );
-            if staging_dir.exists() {
-                tokio::fs::remove_dir_all(&staging_dir).await?;
+            match tokio::fs::remove_dir_all(&staging_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
             tokio::fs::create_dir_all(&staging_dir).await?;
         }
@@ -788,6 +798,13 @@ impl CayenneTableProvider {
             }
 
             let file_name = entry.file_name();
+
+            // Skip the WAL file — it is managed separately (removed after
+            // all data files have been successfully moved).
+            if file_name == STAGING_WAL_FILENAME {
+                continue;
+            }
+
             let src = staging_dir.join(&file_name);
             let dst = target_dir.join(&file_name);
 
@@ -838,14 +855,27 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        // Phase 1: copy all objects to target prefix
+        // Phase 1: copy data objects to target prefix (skip WAL file)
         let mut copied_locations = Vec::with_capacity(objects.len());
         for meta in &objects {
             let relative = meta
                 .location
                 .as_ref()
                 .strip_prefix(staging_prefix.as_ref())
-                .unwrap_or(meta.location.as_ref());
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "Staging object '{}' does not have expected prefix '{}'",
+                        meta.location,
+                        staging_prefix.as_ref(),
+                    ),
+                })?;
+
+            // Skip the WAL file — it is managed separately (removed after
+            // all data files have been successfully copied/deleted).
+            if relative == STAGING_WAL_FILENAME {
+                continue;
+            }
             let target_path =
                 ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
 
@@ -1152,7 +1182,7 @@ impl CayenneTableProvider {
             Self::load_protected_snapshots(Arc::clone(&catalog), table_id, &pk_deletion_strategy)
                 .await?;
 
-        Ok(Self {
+        let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
@@ -1166,7 +1196,13 @@ impl CayenneTableProvider {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
-        })
+        };
+
+        // Fail construction if a staging WAL exists — the table may contain
+        // partial data from an interrupted append and must be resolved first.
+        provider.ensure_no_incomplete_write().await?;
+
+        Ok(provider)
     }
 
     /// Create a new table in Cayenne.
@@ -3363,7 +3399,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the lock is poisoned.
-    fn get_current_snapshot_id(&self) -> Result<String> {
+    pub(super) fn get_current_snapshot_id(&self) -> Result<String> {
         let guard = self
             .current_snapshot_id
             .read()

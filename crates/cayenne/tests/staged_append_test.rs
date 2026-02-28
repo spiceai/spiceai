@@ -31,7 +31,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{CayenneTableProvider, MetadataCatalog, STAGING_DIR_NAME};
+use cayenne::{CayenneTableProvider, MetadataCatalog, STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
@@ -223,6 +223,185 @@ async fn test_staged_append_multi_append_accumulates_impl(
     assert_eq!(rows.len(), 9);
     assert_eq!(rows[0], (1, "A".to_string()));
     assert_eq!(rows[8], (9, "I".to_string()));
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 5: WAL presence blocks table construction (open)
+// ============================================================================
+
+test_with_backends!(test_wal_blocks_table_open_impl);
+
+async fn test_wal_blocks_table_open_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_open").await;
+
+    // Insert data so table dirs exist
+    ctx.sql("INSERT INTO wal_open VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+
+    // Plant a fake WAL file in _staging/ to simulate interrupted move
+    let staging = staging_dir(&table);
+    std::fs::create_dir_all(&staging)?;
+    let wal_content = serde_json::json!({
+        "table_name": "wal_open",
+        "target_snapshot": "fake_snapshot_id",
+        "staged_files": ["part-0.vortex", "part-1.vortex"],
+        "created_at": "2026-02-28T00:00:00Z"
+    });
+    std::fs::write(
+        staging.join(STAGING_WAL_FILENAME),
+        serde_json::to_string_pretty(&wal_content)?,
+    )?;
+    assert!(staging.join(STAGING_WAL_FILENAME).exists());
+
+    // Try to re-open the table — should fail with IncompleteWrite
+    let meta = table.metadata();
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let open_result = cayenne::CayenneTableProviderBuilder::new(catalog)
+        .open(&meta.table_name)
+        .await;
+
+    assert!(
+        open_result.is_err(),
+        "Opening a table with a leftover WAL should fail"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 6: WAL presence blocks new writes
+// ============================================================================
+
+test_with_backends!(test_wal_blocks_new_writes_impl);
+
+async fn test_wal_blocks_new_writes_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_write").await;
+
+    // Insert initial data
+    ctx.sql("INSERT INTO wal_write VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(row_count(&ctx, "wal_write").await, 1);
+
+    // Plant a WAL file
+    let staging = staging_dir(&table);
+    std::fs::create_dir_all(&staging)?;
+    let wal_content = serde_json::json!({
+        "table_name": "wal_write",
+        "target_snapshot": "fake_snapshot_id",
+        "staged_files": ["part-0.vortex"],
+        "created_at": "2026-02-28T00:00:00Z"
+    });
+    std::fs::write(
+        staging.join(STAGING_WAL_FILENAME),
+        serde_json::to_string_pretty(&wal_content)?,
+    )?;
+
+    // Attempt another write — should fail
+    let result = ctx
+        .sql("INSERT INTO wal_write VALUES (2, 'Bob')")
+        .await?
+        .collect()
+        .await;
+
+    assert!(result.is_err(), "Write with a leftover WAL should fail");
+
+    // Original data should still be intact
+    assert_eq!(row_count(&ctx, "wal_write").await, 1);
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 7: Successful append removes WAL file
+// ============================================================================
+
+test_with_backends!(test_wal_removed_on_successful_append_impl);
+
+async fn test_wal_removed_on_successful_append_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_lifecycle").await;
+
+    // Perform a successful append
+    ctx.sql("INSERT INTO wal_lifecycle VALUES (1, 'Alice'), (2, 'Bob')")
+        .await?
+        .collect()
+        .await?;
+
+    // After successful write, WAL must NOT exist
+    let staging = staging_dir(&table);
+    let wal_path = staging.join(STAGING_WAL_FILENAME);
+    assert!(
+        !wal_path.exists(),
+        "WAL file should be removed after successful append"
+    );
+
+    // Staging dir should be empty
+    assert_staging_empty(&staging);
+
+    Ok(())
+}
+
+// ============================================================================
+// Test 8: Corrupted snapshot dir causes move failure — WAL persists
+// ============================================================================
+
+test_with_backends!(test_wal_persists_on_move_failure_impl);
+
+async fn test_wal_persists_on_move_failure_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "wal_move_fail").await;
+
+    // Step 1: Insert initial data so snapshot directory exists
+    ctx.sql("INSERT INTO wal_move_fail VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(row_count(&ctx, "wal_move_fail").await, 1);
+
+    // Step 2: Corrupt the target snapshot directory — replace it with a regular file.
+    //
+    // This simulates a real filesystem corruption where the target snapshot
+    // directory is unusable, causing the move phase to fail while the WAL
+    // has already been written.
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(meta.table_id.to_string())
+        .join(&meta.current_snapshot_id);
+    std::fs::remove_dir_all(&snapshot_dir)?;
+    std::fs::write(&snapshot_dir, b"not a directory")?;
+
+    // Step 3: Attempt another insert — should fail during the move phase
+    let result = ctx
+        .sql("INSERT INTO wal_move_fail VALUES (2, 'Bob')")
+        .await?
+        .collect()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Insert should fail when snapshot directory is corrupted"
+    );
+
+    // Step 4: Verify WAL persists in _staging/ after the failed move
+    let staging = staging_dir(&table);
+    let wal_path = staging.join(STAGING_WAL_FILENAME);
+    assert!(
+        wal_path.exists(),
+        "WAL file should persist after a failed move — indicates incomplete write"
+    );
 
     Ok(())
 }
