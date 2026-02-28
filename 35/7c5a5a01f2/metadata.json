@@ -5,6 +5,7 @@
   "branch": "jeadie/26-02-21/keyring",
   "checkpoints_count": 1,
   "files_touched": [
+    "Cargo.lock",
     "bin/spice/Cargo.toml",
     "bin/spice/src/commands/cloud/client.rs",
     "bin/spice/src/commands/login/auth_config.rs",
@@ -17,13 +18,20 @@
       "context": "/35/7c5a5a01f2/0/context.md",
       "content_hash": "/35/7c5a5a01f2/0/content_hash.txt",
       "prompt": "/35/7c5a5a01f2/0/prompt.txt"
+    },
+    {
+      "metadata": "/35/7c5a5a01f2/1/metadata.json",
+      "transcript": "/35/7c5a5a01f2/1/full.jsonl",
+      "context": "/35/7c5a5a01f2/1/context.md",
+      "content_hash": "/35/7c5a5a01f2/1/content_hash.txt",
+      "prompt": "/35/7c5a5a01f2/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 35,
-    "cache_creation_tokens": 23678,
-    "cache_read_tokens": 1073933,
-    "output_tokens": 7873,
-    "api_call_count": 29
+    "input_tokens": 47,
+    "cache_creation_tokens": 46502,
+    "cache_read_tokens": 1403857,
+    "output_tokens": 10133,
+    "api_call_count": 39
   }
 }

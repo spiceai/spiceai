@@ -1,0 +1,36 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "357c5a5a01f2",
+  "session_id": "54c8b261-017b-4bbf-8674-cb5e9df71346",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-28T04:50:14.343013Z",
+  "branch": "jeadie/26-02-21/keyring",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "Cargo.lock",
+    "bin/spice/Cargo.toml",
+    "bin/spice/src/commands/cloud/client.rs",
+    "bin/spice/src/commands/login/auth_config.rs",
+    "bin/spice/src/commands/login/mod.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "120fa72cbc7f",
+  "checkpoint_transcript_start": 164,
+  "transcript_lines_at_start": 164,
+  "token_usage": {
+    "input_tokens": 12,
+    "cache_creation_tokens": 22824,
+    "cache_read_tokens": 329924,
+    "output_tokens": 2260,
+    "api_call_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-28T04:50:14.262726Z",
+    "agent_lines": 123,
+    "human_added": 0,
+    "human_modified": 6,
+    "human_removed": 7,
+    "total_committed": 129,
+    "agent_percentage": 95.34883720930233
+  }
+}
