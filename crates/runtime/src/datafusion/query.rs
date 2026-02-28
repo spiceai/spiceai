@@ -65,7 +65,10 @@ use datafusion::prelude::SessionContext;
 use async_stream::stream;
 use futures::StreamExt;
 
-use super::{SPICE_RUNTIME_SCHEMA, error::{find_datafusion_root, format_datafusion_error}};
+use super::{
+    SPICE_RUNTIME_SCHEMA,
+    error::{find_datafusion_root, format_datafusion_error},
+};
 
 use super::managed_runtime;
 use crate::datafusion::{
@@ -82,10 +85,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Failed to execute query: {}",
-        format_datafusion_error(source)
-    ))]
+    #[snafu(display("Failed to execute query: {}", format_datafusion_error(source)))]
     UnableToExecuteQuery { source: DataFusionError },
 
     #[snafu(display("Failed to access query results cache: {source}"))]

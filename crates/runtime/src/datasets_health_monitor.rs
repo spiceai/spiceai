@@ -32,7 +32,10 @@ use tracing_futures::Instrument;
 
 use crate::{
     component::dataset::{CheckAvailability, Dataset},
-    datafusion::{DataFusion, error::{find_datafusion_root, format_datafusion_error}},
+    datafusion::{
+        DataFusion,
+        error::{find_datafusion_root, format_datafusion_error},
+    },
     metrics,
     search::util::find_concrete_table_provider,
 };
@@ -57,7 +60,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to get recently access datasets. {}",
+        "Failed to get recently accessed datasets. {}",
         format_datafusion_error(source)
     ))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },

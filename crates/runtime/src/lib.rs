@@ -333,10 +333,7 @@ pub enum Error {
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
 
-    #[snafu(display(
-        "Unable to create metrics table: {}",
-        format_datafusion_error(source)
-    ))]
+    #[snafu(display("Unable to create metrics table: {}", format_datafusion_error(source)))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to create eval runs table: {source}"))]

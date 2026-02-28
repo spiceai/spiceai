@@ -51,6 +51,11 @@ pub fn sanitize_datafusion_error_message(message: &str) -> String {
         .to_string()
 }
 
+#[must_use]
+pub fn format_datafusion_error(e: &(impl std::fmt::Display + ?Sized)) -> String {
+    sanitize_datafusion_error_message(&e.to_string())
+}
+
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::cast_sign_loss)]
 #[expect(clippy::cast_possible_truncation)]
@@ -249,7 +254,8 @@ mod tests {
     // generate test for human_readable_bytes
 
     use crate::{
-        DATAFUSION_BUG_REPORT_MESSAGE, distribute_nulls, sanitize_datafusion_error_message,
+        DATAFUSION_BUG_REPORT_MESSAGE, distribute_nulls, format_datafusion_error,
+        sanitize_datafusion_error_message,
     };
 
     #[test]
@@ -391,5 +397,27 @@ mod tests {
         let input = "Error during planning: table x not found";
         let sanitized = sanitize_datafusion_error_message(input);
         assert_eq!(sanitized, input);
+    }
+
+    #[test]
+    fn format_datafusion_error_removes_bug_report_suffix() {
+        let input = format!("Internal error: bar. {DATAFUSION_BUG_REPORT_MESSAGE}");
+        let formatted = format_datafusion_error(&input);
+        assert_eq!(formatted, "Internal error: bar.");
+    }
+
+    #[test]
+    fn format_datafusion_error_keeps_other_messages() {
+        let input = "Error during planning: column y not found";
+        let formatted = format_datafusion_error(input);
+        assert_eq!(formatted, input);
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_removes_bug_report_with_newline_separator() {
+        let input =
+            format!("Internal error: baz.\n\n{DATAFUSION_BUG_REPORT_MESSAGE}");
+        let sanitized = sanitize_datafusion_error_message(&input);
+        assert_eq!(sanitized, "Internal error: baz.");
     }
 }

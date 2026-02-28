@@ -29,6 +29,7 @@ use datafusion::{
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
 };
 
+use ::util::format_datafusion_error;
 use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
@@ -40,7 +41,6 @@ use tantivy::{
     schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
 };
-use ::util::format_datafusion_error;
 
 use super::{
     CandidateGeneration, Error as GenerationError, Result as GenerationResult,

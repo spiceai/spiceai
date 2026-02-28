@@ -266,10 +266,7 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
-    #[snafu(display(
-        "Unable to get {schema} schema: {}",
-        format_datafusion_error(source)
-    ))]
+    #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
         schema: String,
         source: DataFusionError,

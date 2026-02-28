@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
@@ -28,7 +29,6 @@ use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
-use crate::datafusion::error::format_datafusion_error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

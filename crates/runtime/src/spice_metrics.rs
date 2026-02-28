@@ -17,13 +17,13 @@ limitations under the License.
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
-use crate::datafusion::error::format_datafusion_error;
 
 use crate::Runtime;
 use crate::accelerated_table::Retention;

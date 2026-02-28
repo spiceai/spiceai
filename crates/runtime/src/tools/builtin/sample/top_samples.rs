@@ -20,8 +20,8 @@ use std::{
 };
 
 use super::SampleFrom;
-use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::DataFusion;
+use crate::datafusion::error::format_datafusion_error;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
     error::DataFusionError,

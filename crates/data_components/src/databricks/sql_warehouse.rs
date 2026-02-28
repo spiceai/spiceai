@@ -96,10 +96,7 @@ pub enum Error {
     #[snafu(display("Failed to read Arrow stream: {source}"))]
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
 
-    #[snafu(display(
-        "Failed to create table provider: {}",
-        format_datafusion_error(source)
-    ))]
+    #[snafu(display("Failed to create table provider: {}", format_datafusion_error(source)))]
     TableProviderCreationFailed { source: DataFusionError },
 
     #[snafu(display("Failed to initialize SQL table: {source}"))]

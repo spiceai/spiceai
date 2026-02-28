@@ -56,10 +56,7 @@ pub enum StreamError {
     #[snafu(display("Failed to build ChangeBatch: {source}"))]
     FailedToCreateRecordBatch { source: ArrowError },
 
-    #[snafu(display(
-        "Failed to read RecordBatch: {}",
-        format_datafusion_error(source)
-    ))]
+    #[snafu(display("Failed to read RecordBatch: {}", format_datafusion_error(source)))]
     FailedToReadRecordBatch { source: DataFusionError },
 }
 
