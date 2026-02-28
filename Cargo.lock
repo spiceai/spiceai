@@ -18190,31 +18190,19 @@ dependencies = [
 name = "spidapter"
 version = "2.0.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow",
- "arrow-json",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
- "bollard",
  "clap",
- "duckdb",
- "futures",
- "hf-hub",
- "itertools 0.14.0",
- "rand 0.9.2",
  "reqwest 0.12.24",
  "runtime-secrets",
- "serde",
+ "rustls 0.23.36",
  "serde_json",
  "spice-cloud-client",
- "spiceai",
  "spicepod",
  "system-adapter-protocol",
- "test-framework",
  "tokio",
- "tokio-util",
- "uuid 1.21.0",
+ "uuid 1.20.0",
  "yaml",
 ]
 
@@ -18869,7 +18857,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=523a2fdcbee64982e14db992c8811207d370d05c#523a2fdcbee64982e14db992c8811207d370d05c"
+source = "git+https://github.com/spiceai/spicebench.git?rev=27754b5810745e3afc7bb703ecc13aa9835732ea#27754b5810745e3afc7bb703ecc13aa9835732ea"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -18877,7 +18865,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "uuid 1.21.0",
+ "uuid 1.20.0",
 ]
 
 [[package]]
