@@ -242,6 +242,9 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![true; self.children().len()]
     }
 
+    /// Only allow optimizer-introduced repartitioning when the child has no
+    /// output ordering. This keeps order-sensitive plans stable by avoiding
+    /// repartition on already ordered inputs.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![self.input_exec.properties().output_ordering().is_none()]
     }
@@ -389,10 +392,10 @@ mod tests {
     use datafusion::physical_expr::expressions::col as physical_col;
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
-    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use std::sync::{Arc, Mutex};
 
     use crate::extension::bytes_processed::{BytesEmittedCallback, BytesProcessedExec};
@@ -407,10 +410,14 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
+    fn make_test_context() -> SessionContext {
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2))
+    }
+
     #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = make_test_context();
         let test_table = make_test_table()?;
 
         let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
@@ -472,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_allow_repartition_for_unordered_input() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = make_test_context();
         let test_table = make_test_table()?;
 
         let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
@@ -503,13 +510,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_bytes_processed_total_preserved_with_repartition() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = make_test_context();
         let test_table = make_test_table()?;
 
         let build_test_plan = |callback: Arc<BytesEmittedCallback>| async {
             let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
-            let bytes_processed_exec = BytesProcessedExec::new(data_source_exec, callback)
-                .fallback_to_new_context();
+            let bytes_processed_exec =
+                BytesProcessedExec::new(data_source_exec, callback).fallback_to_new_context();
             Result::<Arc<dyn ExecutionPlan>>::Ok(Arc::new(bytes_processed_exec))
         };
 
@@ -545,12 +552,9 @@ mod tests {
         let optimizer = PhysicalOptimizer::new();
         let config = Arc::clone(ctx.state().config_options());
 
-        let optimized = optimizer
-            .rules
-            .iter()
-            .fold(final_plan, |plan, rule| {
-                rule.optimize(plan, &config).expect("Must optimize plan")
-            });
+        let optimized = optimizer.rules.iter().fold(final_plan, |plan, rule| {
+            rule.optimize(plan, &config).expect("Must optimize plan")
+        });
 
         let optimized_plan = displayable(optimized.as_ref()).tree_render().to_string();
         assert!(
