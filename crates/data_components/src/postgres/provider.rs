@@ -208,32 +208,13 @@ impl PostgresSchemaProvider {
     async fn refresh_tables(&self) -> Result<()> {
         let table_names = self.list_tables().await?;
 
-        let mut tables = HashMap::new();
-        for table_name in table_names {
-            let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
-                continue;
-            }
-
-            let table_ref = TableReference::partial(self.schema_name.clone(), table_name.clone());
-
-            match self.table_creator.table_provider(table_ref).await {
-                Ok(provider) => {
-                    tables.insert(table_name, provider);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        schema = %self.schema_name,
-                        table = %table_name,
-                        error = %e,
-                        "Failed to create table provider for PostgreSQL table {schema_with_table}, skipping"
-                    );
-                }
-            }
-        }
+        let tables = build_table_providers_for_schema(
+            &self.schema_name,
+            table_names,
+            &self.table_creator,
+            self.include.as_deref(),
+        )
+        .await;
 
         {
             let mut guard = match self.tables.write() {
@@ -270,6 +251,46 @@ impl PostgresSchemaProvider {
     }
 }
 
+fn is_table_included(schema_name: &str, table_name: &str, include: Option<&GlobSet>) -> bool {
+    let schema_with_table = format!("{schema_name}.{table_name}");
+    include.is_none_or(|globset| globset.is_match(&schema_with_table))
+}
+
+async fn build_table_providers_for_schema(
+    schema_name: &str,
+    table_names: Vec<String>,
+    table_creator: &Arc<dyn Read>,
+    include: Option<&GlobSet>,
+) -> HashMap<String, Arc<dyn TableProvider>> {
+    let mut tables = HashMap::new();
+
+    for table_name in table_names {
+        let schema_with_table = format!("{schema_name}.{table_name}");
+        if !is_table_included(schema_name, &table_name, include) {
+            tracing::debug!("Table {schema_with_table} is not included, skipping");
+            continue;
+        }
+
+        let table_ref = TableReference::partial(schema_name.to_owned(), table_name.clone());
+
+        match table_creator.table_provider(table_ref).await {
+            Ok(provider) => {
+                tables.insert(table_name, provider);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    schema = %schema_name,
+                    table = %table_name,
+                    error = %e,
+                    "Failed to create table provider for PostgreSQL table {schema_with_table}, skipping"
+                );
+            }
+        }
+    }
+
+    tables
+}
+
 #[async_trait]
 impl SchemaProvider for PostgresSchemaProvider {
     fn as_any(&self) -> &dyn Any {
@@ -298,5 +319,175 @@ impl SchemaProvider for PostgresSchemaProvider {
             Err(e) => e.into_inner(),
         };
         guard.contains_key(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_table_providers_for_schema, is_table_included};
+    use crate::Read;
+    use async_trait::async_trait;
+    use datafusion::catalog::Session;
+    use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::Expr;
+    use datafusion::sql::TableReference;
+    use globset::{Glob, GlobSetBuilder};
+    use std::any::Any;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct MockTableProvider;
+
+    #[async_trait]
+    impl TableProvider for MockTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::new(arrow::datatypes::Schema::empty())
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            unimplemented!("Not needed for tests")
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockRead {
+        fail_tables: HashSet<String>,
+        seen_tables: Mutex<Vec<String>>,
+    }
+
+    impl MockRead {
+        fn new(fail_tables: HashSet<String>) -> Self {
+            Self {
+                fail_tables,
+                seen_tables: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen_tables(&self) -> Vec<String> {
+            self.seen_tables
+                .lock()
+                .expect("seen_tables mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl Read for MockRead {
+        async fn table_provider(
+            &self,
+            table_reference: TableReference,
+        ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+            let (schema, table) = match table_reference {
+                TableReference::Partial { schema, table } => {
+                    (schema.to_string(), table.to_string())
+                }
+                _ => return Err("expected partial table reference".into()),
+            };
+
+            let full_name = format!("{schema}.{table}");
+            self.seen_tables
+                .lock()
+                .expect("seen_tables mutex should not be poisoned")
+                .push(full_name.clone());
+
+            if self.fail_tables.contains(&full_name) {
+                return Err("simulated table provider creation failure".into());
+            }
+
+            Ok(Arc::new(MockTableProvider))
+        }
+    }
+
+    fn make_include(patterns: &[&str]) -> Arc<globset::GlobSet> {
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            builder.add(Glob::new(pattern).expect("glob pattern should parse"));
+        }
+        Arc::new(builder.build().expect("glob set should build"))
+    }
+
+    #[test]
+    fn test_is_table_included_with_glob_filter() {
+        let include = make_include(&["public.orders"]);
+        assert!(is_table_included("public", "orders", Some(&include)));
+        assert!(!is_table_included("public", "lineitem", Some(&include)));
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_applies_include_filter_before_factory() {
+        let read = Arc::new(MockRead::new(HashSet::new()));
+        let include = make_include(&["public.orders"]);
+        let table_creator: Arc<dyn Read> = read.clone();
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &table_creator,
+            Some(&include),
+        )
+        .await;
+
+        assert_eq!(tables.len(), 1);
+        assert!(tables.contains_key("orders"));
+        assert_eq!(read.seen_tables(), vec!["public.orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_skips_failed_table_provider_creation() {
+        let mut fail_tables = HashSet::new();
+        fail_tables.insert("public.orders".to_string());
+        let read = Arc::new(MockRead::new(fail_tables));
+        let table_creator: Arc<dyn Read> = read.clone();
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &table_creator,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            tables.keys().cloned().collect::<HashSet<String>>(),
+            HashSet::from(["lineitem".to_string()])
+        );
+        assert_eq!(
+            read.seen_tables().into_iter().collect::<HashSet<String>>(),
+            HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_returns_empty_when_all_factory_calls_fail() {
+        let fail_tables = HashSet::from(["public.orders".to_string(), "public.lineitem".to_string()]);
+        let read = Arc::new(MockRead::new(fail_tables));
+        let table_creator: Arc<dyn Read> = read.clone();
+
+        let tables: HashMap<String, Arc<dyn TableProvider>> = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &table_creator,
+            None,
+        )
+        .await;
+
+        assert!(tables.is_empty(), "all failing tables should be skipped");
     }
 }

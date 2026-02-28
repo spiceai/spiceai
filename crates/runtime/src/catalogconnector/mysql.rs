@@ -87,6 +87,9 @@ impl CatalogConnector for MySQLCatalog {
         let table_factory = Arc::new(MySQLTableFactory::new(Arc::clone(&pool)));
 
         // Create a separate mysql_async::Pool for metadata queries.
+        // `MySQLTableFactory` requires `MySQLConnectionPool` while metadata discovery uses
+        // `mysql_async`; until these abstractions converge, constrain metadata connections to
+        // avoid excessive combined connection usage.
         let metadata_pool = Self::create_metadata_pool(&self.params).map_err(|e| {
             super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
@@ -183,7 +186,7 @@ impl MySQLCatalog {
     ) -> std::result::Result<mysql_async::Opts, Box<dyn std::error::Error + Send + Sync>> {
         use std::io;
 
-        let constraints = mysql_async::PoolConstraints::new(0, 5).ok_or_else(|| {
+        let constraints = mysql_async::PoolConstraints::new(0, 1).ok_or_else(|| {
             Box::new(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid MySQL metadata pool constraints",

@@ -47,8 +47,26 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-fn escape_sql_string_literal(value: &str) -> String {
-    value.replace('\'', "''")
+fn quote_sql_identifier(value: &str) -> Result<String> {
+    ensure!(
+        !value.contains('\0'),
+        UnexpectedResponseSnafu {
+            reason: "Snowflake identifier contains NUL byte"
+        }
+    );
+
+    Ok(format!("\"{}\"", value.replace('"', "\"\"")))
+}
+
+fn quote_sql_string_literal(value: &str) -> Result<String> {
+    ensure!(
+        !value.contains('\0'),
+        UnexpectedResponseSnafu {
+            reason: "Snowflake string literal contains NUL byte"
+        }
+    );
+
+    Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
 /// A catalog provider for Snowflake that discovers schemas and tables
@@ -125,9 +143,9 @@ impl SnowflakeCatalogProvider {
 
     /// Lists schema names in the configured database, excluding system schemas.
     async fn list_schemas(&self) -> Result<Vec<String>> {
+        let quoted_db = quote_sql_identifier(&self.database)?;
         let query = format!(
-            "SELECT SCHEMA_NAME FROM \"{}\".INFORMATION_SCHEMA.SCHEMATA ORDER BY SCHEMA_NAME",
-            self.database.replace('"', "\"\"")
+            "SELECT SCHEMA_NAME FROM {quoted_db}.INFORMATION_SCHEMA.SCHEMATA ORDER BY SCHEMA_NAME"
         );
 
         let result = self.api.exec(&query).await.context(QueryFailedSnafu)?;
@@ -293,11 +311,14 @@ impl SnowflakeSchemaProvider {
 
     /// Lists table names in this schema using `INFORMATION_SCHEMA`.
     async fn list_tables(&self) -> Result<Vec<String>> {
-        let escaped_db = self.database.replace('"', "\"\"");
-        let escaped_schema = escape_sql_string_literal(&self.schema_name);
+        // snowflake-api currently exposes only SQL-string execution APIs (`exec`, `exec_raw`,
+        // `exec_streamed`) and does not expose bind-parameter APIs for metadata queries.
+        // Build metadata SQL with explicit identifier/literal quoting and validation instead.
+        let quoted_db = quote_sql_identifier(&self.database)?;
+        let quoted_schema_literal = quote_sql_string_literal(&self.schema_name)?;
         let query = format!(
-            "SELECT TABLE_NAME FROM \"{escaped_db}\".INFORMATION_SCHEMA.TABLES \
-             WHERE TABLE_SCHEMA = '{escaped_schema}' \
+            "SELECT TABLE_NAME FROM {quoted_db}.INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = {quoted_schema_literal} \
              AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
              ORDER BY TABLE_NAME"
         );
@@ -368,23 +389,57 @@ impl SchemaProvider for SnowflakeSchemaProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_sql_string_literal;
+    use super::{quote_sql_identifier, quote_sql_string_literal};
 
     #[test]
-    fn test_escape_sql_string_literal_no_quotes() {
-        assert_eq!(escape_sql_string_literal("schema_name"), "schema_name");
-    }
-
-    #[test]
-    fn test_escape_sql_string_literal_single_quote() {
-        assert_eq!(escape_sql_string_literal("schema'name"), "schema''name");
-    }
-
-    #[test]
-    fn test_escape_sql_string_literal_multiple_single_quotes() {
+    fn test_quote_sql_identifier_no_quotes() {
         assert_eq!(
-            escape_sql_string_literal("o'brien'schema"),
-            "o''brien''schema"
+            quote_sql_identifier("schema_name").expect("identifier should be quoted"),
+            "\"schema_name\""
+        );
+    }
+
+    #[test]
+    fn test_quote_sql_identifier_embedded_quote() {
+        assert_eq!(
+            quote_sql_identifier("schema\"name").expect("identifier should be quoted"),
+            "\"schema\"\"name\""
+        );
+    }
+
+    #[test]
+    fn test_quote_sql_string_literal_no_quotes() {
+        assert_eq!(
+            quote_sql_string_literal("schema_name").expect("string literal should be quoted"),
+            "'schema_name'"
+        );
+    }
+
+    #[test]
+    fn test_quote_sql_string_literal_single_quote() {
+        assert_eq!(
+            quote_sql_string_literal("schema'name").expect("string literal should be quoted"),
+            "'schema''name'"
+        );
+    }
+
+    #[test]
+    fn test_quote_sql_string_literal_multiple_single_quotes() {
+        assert_eq!(
+            quote_sql_string_literal("o'brien'schema").expect("string literal should be quoted"),
+            "'o''brien''schema'"
+        );
+    }
+
+    #[test]
+    fn test_quote_helpers_reject_nul_byte() {
+        assert!(
+            quote_sql_identifier("schema\0name").is_err(),
+            "identifier containing NUL should be rejected"
+        );
+        assert!(
+            quote_sql_string_literal("schema\0name").is_err(),
+            "string literal containing NUL should be rejected"
         );
     }
 }
