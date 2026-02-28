@@ -1,0 +1,259 @@
+Implement the following plan:
+
+# Add `-o=json` support to 9 cloud commands
+
+## Context
+Several `spice cloud` subcommands lack the `-o=json` output format flag that other cloud commands already support. The pattern is well-established in the codebase.
+
+## File to modify
+`bin/spice/src/commands/cloud/mod.rs`
+
+## Pattern
+Each command needs two changes:
+1. Add `#[arg(long, short = 'o', default_value = "table")] pub output: OutputFormat` to the Args struct
+2. Add early-return JSON branch in the handler: `if args.output == OutputFormat::Json { return write_json(&data); }`
+
+## Changes
+
+### 1. `LogsArgs` (line 174) — add `output` field
+Handler `execute_logs` (line 820): after fetching `logs`, add JSON check before the for-loop that prints colored log lines. Serialize `logs` (the full response).
+
+### 2. `DeployArgs` (line 193) — add `output` field
+Handler `execute_deploy` (line 972): after creating the deployment, add JSON check. Serialize `deployment`. Remove the "Deploying to..." println when JSON mode (move it after the check, or gate it).
+
+### 3. `RollbackArgs` (line 223) — add `output` field
+Handler `execute_rollback` (line 1033): after getting `deployment` from rollback, add JSON check. Serialize `deployment`.
+
+### 4. `SecretsSetArgs` (line 280) — add `output` field
+Handler in `execute_secrets` `Set` branch (line 793): the `set_secret` call returns no meaningful data. Serialize a confirmation object: `json!({"name": args.name, "status": "set"})`.
+
+### 5. `SecretsDeleteArgs` (line 307) — add `output` field
+Handler in `execute_secrets` `Delete` branch (line 810): same pattern. Serialize `json!({"name": args.name, "status": "deleted"})`.
+
+### 6. `CreateAppArgs` (line 330) — add `output` field
+Handler in `execute_create` `App` branch (line 859): after creating `app`, add JSON check. Serialize `app`.
+
+### 7. `CreateDeploymentArgs` (line 344) — add `output` field
+Handler in `execute_create` `Deployment` branch (line 870): after creating `deployment`, add JSON check. Serialize `deployment`.
+
+### 8. `UpdateAppArgs` (line 393) — add `output` field
+Handler in `execute_update` `App` branch (line 915): after updating `app`, add JSON check. Serialize `app`.
+
+### 9. `DeleteAppArgs` (line 430) — add `output` field
+Handler in `execute_delete` `App` branch (line 940): after deleting, add JSON check. Serialize `json!({"app": args.app, "status": "deleted"})`. Note: when `-o json` is used, still respect `--yes` for confirmation, but output JSON instead of the success message.
+
+## Verification
+- `cargo check -p spice-cli` (or equivalent package name) to verify compilation
+- `cargo clippy -p spice-cli` for lint
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/jeadie/.REDACTED.jsonl
+
+---
+
+where / how does `spice login` set variables. Similiarly `spice cloud login`. ALso why are there two?
+
+---
+
+for spice cloud login, hmmm i get a redirect to `https://spice.ai/v1/auth/device?code=BQSPV26X` byt that 404
+
+---
+
+Maybe its meant to be /Users/jeadie/Github/cloud/apps/portal/app/auth/callback/route.ts?
+
+---
+
+no, can you try using `spice login`, then `spice cloud apps`. the latter is getting an error?
+
+---
+
+make org optional
+
+---
+
+I reverted your `spice cloud apps` changes and merged from trunk. some build issues. I think someone else was fixing this bug
+
+error[E0277]: the trait bound `AuthContext: serde::Serialize` is not satisfied
+   --> bin/spice/src/commands/cloud/mod.rs:663:27
+    |
+663 |         return write_json(&context);
+    |                ---------- ^^^^^^^^ the trait `Serialize` is not implemented for `AuthContext`
+    |                |
+    |                required by a bound introduced by this call
+    |
+    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `AuthContext` type
+    = note: for types from other crates check whether the crate offers a `serde` feature flag
+    = help: the following other types implement trait `Serialize`:
+              &'a T
+              &'a mut T
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+              (T0, T1, T2, T3)
+              (T0, T1, T2, T3, T4)
+            and 1058 others
+note: required by a bound in `write_json`
+   --> bin/spice/src/output/mod.rs:38:22
+    |
+ 38 | pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+    |                      ^^^^^^^^^ required by this bound in `write_json`
+
+error[E0277]: the trait bound `ContainerImagesResponse: serde::Serialize` is not satisfied
+   --> bin/spice/src/commands/cloud/mod.rs:803:27
+    |
+803 |         return write_json(&images_resp);
+    |                ---------- ^^^^^^^^^^^^ the trait `Serialize` is not implemented for `ContainerImagesResponse`
+    |                |
+    |                required by a bound introduced by this call
+    |
+    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `ContainerImagesResponse` type
+    = note: for types from other crates check whether the crate offers a `serde` feature flag
+    = help: the following other types implement trait `Serialize`:
+              &'a T
+              &'a mut T
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+              (T0, T1, T2, T3)
+              (T0, T1, T2, T3, T4)
+            and 1058 others
+note: required by a bound in `write_json`
+   --> bin/spice/src/output/mod.rs:38:22
+    |
+ 38 | pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+    |                      ^^^^^^^^^ required by this bound in `write_json`
+
+error[E0277]: the trait bound `LogsResponse: serde::Serialize` is not satisfied
+   --> bin/spice/src/commands/cloud/mod.rs:894:27
+    |
+894 |         return write_json(&logs);
+    |                ---------- ^^^^^ the trait `Serialize` is not implemented for `LogsResponse`
+    |                |
+    |                required by a bound introduced by this call
+    |
+    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `LogsResponse` type
+    = note: for types from other crates check whether the crate offers a `serde` feature flag
+    = help: the following other types implement trait `Serialize`:
+              &'a T
+              &'a mut T
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+              (T0, T1, T2, T3)
+              (T0, T1, T2, T3, T4)
+            and 1058 others
+note: required by a bound in `write_json`
+   --> bin/spice/src/output/mod.rs:38:22
+    |
+ 38 | pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+    |                      ^^^^^^^^^ required by this bound in `write_json`
+
+error[E0277]: the trait bound `RegenerateApiKeyResponse: serde::Serialize` is not satisfied
+    --> bin/spice/src/commands/cloud/mod.rs:1155:31
+     |
+1155 |             return write_json(&response);
+     |                    ---------- ^^^^^^^^^ the trait `Serialize` is not implemented for `RegenerateApiKeyResponse`
+     |                    |
+     |                    required by a bound introduced by this call
+     |
+     = note: for local types consider adding `#[derive(serde::Serialize)]` to your `RegenerateApiKeyResponse` type
+     = note: for types from other crates check whether the crate offers a `serde` feature flag
+     = help: the following other types implement trait `Serialize`:
+               &'a T
+               &'a mut T
+               ()
+               (T,)
+               (T0, T1)
+               (T0, T1, T2)
+               (T0, T1, T2, T3)
+               (T0, T1, T2, T3, T4)
+             and 1058 others
+note: required by a bound in `write_json`
+    --> bin/spice/src/output/mod.rs:38:22
+     |
+  38 | pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+     |                      ^^^^^^^^^ required by this bound in `write_json`
+
+error[E0277]: the trait bound `ApiKeysResponse: serde::Serialize` is not satisfied
+    --> bin/spice/src/commands/cloud/mod.rs:1167:31
+     |
+1167 |             return write_json(&keys);
+     |                    ---------- ^^^^^ the trait `Serialize` is not implemented for `ApiKeysResponse`
+     |                    |
+     |                    required by a bound introduced by this call
+     |
+     = note: for local types consider adding `#[derive(serde::Serialize)]` to your `ApiKeysResponse` type
+     = note: for types from other crates check whether the crate offers a `serde` feature flag
+     = help: the following other types implement trait `Serialize`:
+               &'a T
+               &'a mut T
+               ()
+               (T,)
+               (T0, T1)
+               (T0, T1, T2)
+               (T0, T1, T2, T3)
+               (T0, T1, T2, T3, T4)
+             and 1058 others
+note: required by a bound in `write_json`
+    --> bin/spice/src/output/mod.rs:38:22
+     |
+  38 | pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+     |                      ^^^^^^^^^ required by this bound in `write_json`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `spice` (lib) due to 5 previous errors
+warning: build failed, waiting for other jobs to finish...
+make: *** [build-cli-dev] Error 101
+
+---
+
+okay it compiles, but list_apps needs to get auth_context so it can prefix app names with <org_name>/<app_name>. Since `App` struct is None for org_id
+
+---
+
+OKay, so what's left to add JSON support for?
+
+---
+
+yep
+
+---
+
+Im getting ```
+spice cloud metrics --app jeadie/chatgpt
+Spice.ai OSS CLI v2.0.0-unstable (8b194c91d)
+ERROR Invalid HTTP response: App 'jeadie/chatgpt' not found
+```
+
+It could be that its assuming the org from list_apps. We always need to get org from auth context
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Don't skip, use auth_context to find what org is now
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+No `let apps = self.list_apps().await?;` will returns apps without orgs. if there is no org in these, infer as org from self.get_auth_context. User must be explicit on their org/app
+
+---
+
+Okay so for all commands now, which don't have json format support
+
+---
+
+what about comamnds in general (i.e. `spice ...`).
+
+---
+
+Okay instead, we need to make `spice login` less interactive. We want apps to call it and store it in keychain. but they cant access env variables from environment after they run `spice login` (dumb macos reasons).
