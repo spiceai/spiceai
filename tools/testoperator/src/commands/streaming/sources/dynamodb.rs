@@ -44,7 +44,7 @@ use tokio::time::sleep;
 const BATCH_SIZE: usize = 25;
 
 /// Number of concurrent batch write requests.
-const CONCURRENT_BATCHES: usize = 20;
+const CONCURRENT_BATCHES: usize = 10;
 
 /// Tag key for creation timestamp (Unix seconds).
 const TAG_CREATED_AT: &str = "testoperator:created_at";
