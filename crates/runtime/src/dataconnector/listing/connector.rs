@@ -1921,16 +1921,31 @@ mod tests {
             file_schema,
         );
 
-        let filters = vec![datafusion_expr::col("location").eq(datafusion_expr::lit(
-            "s3://bucket/prefix/day=2025-01-01/file.parquet",
-        ))];
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register table");
 
-        let plan = provider
-            .scan(&ctx.state(), None, &filters, None)
+        let df = ctx
+            .sql("SELECT value FROM test_table WHERE location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
             .await
-            .expect("scan with location predicate");
+            .expect("execute query");
 
-        assert_eq!(plan.schema().fields().len(), 1);
+        // Use create_physical_plan instead of collect — this triggers
+        // the scan/listing logic without actually reading parquet data
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("create physical plan");
+
+        assert_eq!(
+            plan.schema().fields().len(),
+            1,
+            "should project only the 'value' column"
+        );
+        assert_eq!(
+            plan.schema().field(0).name(),
+            "value",
+            "column should be 'value'"
+        );
 
         assert!(
             !no_list_store
