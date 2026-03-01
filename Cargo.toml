@@ -385,43 +385,6 @@ datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev 
 datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "a3e8a1e0c530a3deb200cc462d6b8c5ec3540776" }   # spiceai-52
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "a3e8a1e0c530a3deb200cc462d6b8c5ec3540776" }                # spiceai-52
 
-# datafusion = { path = "../other/datafusion/datafusion/core" }                                              # LOCAL dev override
-# datafusion-catalog = { path = "../other/datafusion/datafusion/catalog" }                                      # LOCAL dev override
-# datafusion-catalog-listing = { path = "../other/datafusion/datafusion/catalog-listing" }                      # LOCAL dev override
-# datafusion-common = { path = "../other/datafusion/datafusion/common" }                                        # LOCAL dev override
-# datafusion-common-runtime = { path = "../other/datafusion/datafusion/common-runtime" }                        # LOCAL dev override
-# datafusion-datasource = { path = "../other/datafusion/datafusion/datasource" }                                # LOCAL dev override
-# datafusion-datasource-avro = { path = "../other/datafusion/datafusion/datasource-avro" }                      # LOCAL dev override
-# datafusion-datasource-csv = { path = "../other/datafusion/datafusion/datasource-csv" }                        # LOCAL dev override
-# datafusion-datasource-json = { path = "../other/datafusion/datafusion/datasource-json" }                      # LOCAL dev override
-# datafusion-datasource-parquet = { path = "../other/datafusion/datafusion/datasource-parquet" }                # LOCAL dev override
-# datafusion-doc = { path = "../other/datafusion/datafusion/doc" }                                              # LOCAL dev override
-# datafusion-execution = { path = "../other/datafusion/datafusion/execution" }                                  # LOCAL dev override
-# datafusion-expr = { path = "../other/datafusion/datafusion/expr" }                                            # LOCAL dev override
-# datafusion-expr-common = { path = "../other/datafusion/datafusion/expr-common" }                              # LOCAL dev override
-# datafusion-functions = { path = "../other/datafusion/datafusion/functions" }                                  # LOCAL dev override
-# datafusion-physical-expr = { path = "../other/datafusion/datafusion/physical-expr" }                          # LOCAL dev override
-# datafusion-physical-expr-adapter = { path = "../other/datafusion/datafusion/physical-expr-adapter" }          # LOCAL dev override
-# datafusion-physical-expr-common = { path = "../other/datafusion/datafusion/physical-expr-common" }            # LOCAL dev override
-# datafusion-physical-plan = { path = "../other/datafusion/datafusion/physical-plan" }                          # LOCAL dev override
-# datafusion-proto = { path = "../other/datafusion/datafusion/proto" }                                          # LOCAL dev override
-# datafusion-proto-common = { path = "../other/datafusion/datafusion/proto-common" }                            # LOCAL dev override
-# datafusion-pruning = { path = "../other/datafusion/datafusion/pruning" }                                      # LOCAL dev override
-# datafusion-session = { path = "../other/datafusion/datafusion/session" }                                      # LOCAL dev override
-# datafusion-sql = { path = "../other/datafusion/datafusion/sql" }                                              # LOCAL dev override
-# datafusion-datasource-arrow = { path = "../other/datafusion/datafusion/datasource-arrow" }                    # LOCAL dev override
-# datafusion-ffi = { path = "../other/datafusion/datafusion/ffi" }                                              # LOCAL dev override
-# datafusion-functions-aggregate = { path = "../other/datafusion/datafusion/functions-aggregate" }              # LOCAL dev override
-# datafusion-functions-aggregate-common = { path = "../other/datafusion/datafusion/functions-aggregate-common" } # LOCAL dev override
-# datafusion-functions-nested = { path = "../other/datafusion/datafusion/functions-nested" }                    # LOCAL dev override
-# datafusion-functions-table = { path = "../other/datafusion/datafusion/functions-table" }                      # LOCAL dev override
-# datafusion-functions-window = { path = "../other/datafusion/datafusion/functions-window" }                    # LOCAL dev override
-# datafusion-functions-window-common = { path = "../other/datafusion/datafusion/functions-window-common" }      # LOCAL dev override
-# datafusion-macros = { path = "../other/datafusion/datafusion/macros" }                                        # LOCAL dev override
-# datafusion-optimizer = { path = "../other/datafusion/datafusion/optimizer" }                                  # LOCAL dev override
-# datafusion-physical-optimizer = { path = "../other/datafusion/datafusion/physical-optimizer" }                # LOCAL dev override
-# datafusion-spark = { path = "../other/datafusion/datafusion/spark" }                                          # LOCAL dev override
-
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "759b567bcff9968648a9d0d3f7f535e9731dc331" } # spiceai-52
 
