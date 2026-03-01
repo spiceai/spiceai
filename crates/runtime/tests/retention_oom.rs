@@ -360,7 +360,7 @@ async fn build_image_from_host_binary(
 }
 
 fn dockerfile_for_host_binary() -> &'static str {
-    r#"FROM rust:1.91-slim-bookworm
+    r#"FROM rust:1.91-slim-trixie
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -378,7 +378,7 @@ ENTRYPOINT ["/usr/local/bin/retention_oom"]
 }
 
 fn dockerfile_for_source_build() -> &'static str {
-    r#"FROM rust:1.91-slim-bookworm
+    r#"FROM rust:1.91-slim-trixie
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
