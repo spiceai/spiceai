@@ -20,7 +20,7 @@ limitations under the License.
 //! that cover all required partitions for a query, and validates that
 //! all required partitions are available.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::metadata::PartitionValue;
 

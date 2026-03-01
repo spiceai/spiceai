@@ -837,11 +837,15 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 None => PartitionManagementConfig::default(),
                 Some(Err(err)) => {
                     tracing::warn!(
-                        "Failed to parse partition management config, partition management task will not be started: {err
-                    }");
+                        "Failed to parse partition management config, partition management task will not be started: {err}"
+                    );
                     return Ok(None);
                 }
             };
+            // Register partition_metadata as Initializing so `/v1/ready`
+            // waits for metadata seeding to complete before reporting ready.
+            rt.status
+                .update_component_status("partition_metadata", ComponentStatus::Initializing);
 
             let pm_task = PartitionManagementTask::new(
                 rt.app(),

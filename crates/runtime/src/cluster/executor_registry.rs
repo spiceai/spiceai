@@ -143,7 +143,6 @@ pub struct ExecutorRegistry {
 
     /// Manager for partition metadata. Used to validate partition completeness
     /// and optimize executor selection. If None, fallback to legacy behavior.
-    /// Uses `RwLock` for interior mutability so it can be set after construction.
     partition_manager: Arc<PartitionManager>,
 }
 

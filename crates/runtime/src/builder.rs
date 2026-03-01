@@ -268,6 +268,9 @@ impl RuntimeBuilder {
                         }
                     }
                 } else {
+                    tracing::warn!(
+                        "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml."
+                    );
                     None
                 }
             }
