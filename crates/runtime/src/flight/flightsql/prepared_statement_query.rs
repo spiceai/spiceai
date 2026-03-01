@@ -1214,8 +1214,7 @@ mod tests {
 
     #[expect(
         clippy::similar_names,
-        clippy::redundant_closure_for_method_calls,
-        clippy::too_many_lines
+        clippy::redundant_closure_for_method_calls
     )]
     #[tokio::test]
     async fn test_prepare_execute_with_dataframe_api() {
