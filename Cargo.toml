@@ -154,7 +154,7 @@ datafusion-common-runtime = "52.0.0"
 datafusion-datasource = "52.0.0"
 datafusion-execution = "52.0.0"
 datafusion-expr = "52.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "43c04ebdf80eafc199ebe9262c50fd4b2ac6f048", features = ["sql"] }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "43c04eb", features = ["sql"] } # Must use short rev to match datafusion-table-providers
 datafusion-functions = "52.0.0"
 datafusion-functions-json = "0.52"
 datafusion-physical-expr = "52.0.0"
