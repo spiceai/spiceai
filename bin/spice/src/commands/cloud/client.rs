@@ -45,15 +45,17 @@ impl CloudClient {
     pub fn new() -> Result<Self> {
         let token = get_auth_token()?;
         Ok(Self {
-            inner: InnerCloudClient::new(&get_base_url()).with_token(token),
+            inner: InnerCloudClient::new(&get_base_url())
+                .map_err(into_cli)?
+                .with_token(token),
         })
     }
 
     /// Create a new unauthenticated cloud client (for the login flow).
-    pub fn new_unauthenticated() -> Self {
-        Self {
-            inner: InnerCloudClient::new(&get_base_url()),
-        }
+    pub fn new_unauthenticated() -> Result<Self> {
+        Ok(Self {
+            inner: InnerCloudClient::new(&get_base_url()).map_err(into_cli)?,
+        })
     }
 
     /// Get the auth URL for the login flow.
@@ -70,6 +72,11 @@ impl CloudClient {
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
         self.inner.get_auth_context().await.map_err(into_cli)
     }
+
+    // ========================================================================
+    // Apps
+    // ========================================================================
+
     pub async fn get_app_metrics(
         &self,
         app_id: i64,
@@ -81,47 +88,17 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    // ========================================================================
-    // Apps
-    // ========================================================================
-
     pub async fn list_apps(&self) -> Result<Vec<App>> {
-        let mut apps = self.inner.list_apps().await.map_err(into_cli)?;
-        // The API does not return `org`; populate from auth context.
-        let org_name = self.get_auth_context().await?.org_name;
-        for app in &mut apps {
-            if app.org.is_empty() {
-                app.org.clone_from(&org_name);
-            }
-        }
-        Ok(apps)
+        self.inner.list_apps().await.map_err(into_cli)
     }
 
     pub async fn get_app(&self, org_app: &str) -> Result<App> {
+        let apps = self.list_apps().await?;
         let (org, name) = parse_org_app(org_app);
 
-        // list_apps populates org from auth context.
-        let apps = self.list_apps().await?;
-
-        if !org.is_empty() {
-            // Validate against the org returned by list_apps (populated from auth context).
-            if let Some(first) = apps.first()
-                && first.org != org
-            {
-                return InvalidResponseSnafu {
-                    message: format!("App '{org_app}' not found"),
-                }
-                .fail();
-            }
-        }
-
-        for app in &apps {
-            if app.name == name {
-                let mut app = self.get_app_by_id(app.id).await?;
-                if app.org.is_empty() {
-                    app.org.clone_from(&apps[0].org);
-                }
-                return Ok(app);
+        for app in apps {
+            if app.name == name && (org.is_empty() || app.org == org) {
+                return self.get_app_by_id(app.id).await;
             }
         }
 
@@ -147,6 +124,7 @@ impl CloudClient {
             visibility: visibility.to_string(),
             cname: None,
             tags: None,
+            resources: None,
         };
         self.inner.create_app(&request).await.map_err(into_cli)
     }
@@ -168,6 +146,7 @@ impl CloudClient {
             image_tag: image_tag.map(String::from),
             region: region.map(String::from),
             spicepod: None,
+            resources: None,
         };
         self.inner
             .update_app(app.id, &request)

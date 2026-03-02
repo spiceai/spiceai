@@ -208,6 +208,18 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
+    async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT table_name FROM cayenne_table ORDER BY table_name",
+                    params: vec![],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+    }
+
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<i64> {
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
@@ -338,9 +350,9 @@ impl MetadataCatalog for CayenneCatalog {
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
         let table_name_owned = table_name.to_string();
 
-        self.metastore
-            .query_row_helper(
-                QueryRowParams {
+        let results = self.metastore
+            .query_helper(
+                QueryParams {
                     sql: r"
                     SELECT table_id, table_uuid,
                            table_name, path, path_is_relative, schema_json, primary_key_json,
@@ -446,6 +458,13 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .map_err(|e| CatalogError::FailedToGetTable {
                 source: Box::new(e),
+            })?;
+
+        results
+            .into_iter()
+            .next()
+            .ok_or(CatalogError::TableNotFound {
+                table_name: table_name_owned,
             })
     }
 

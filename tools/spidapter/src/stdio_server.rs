@@ -20,20 +20,33 @@ use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
+use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{Runtime, TelemetryConfig};
+use spicepod::component::runtime::{Flight, Runtime, TelemetryConfig};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
     ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
-use test_framework::anyhow;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::args::StdioArgs;
 use crate::commands;
+
+/// State for an active benchmark run provisioned via `setup`.
+struct RunState {
+    /// Spice Cloud app ID.
+    app_id: i64,
+    /// API key for the app (used for Flight SQL authentication).
+    api_key: String,
+    /// Flight SQL endpoint URL derived from the cname.
+    flight_url: String,
+    /// Cloud client used during provisioning (reused for teardown).
+    cloud: CloudClient,
+}
 
 #[derive(Debug, Clone)]
 struct SetupConfig {
@@ -67,22 +80,6 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(ToString::to_string)
 }
 
-/// Average non-`None` `f64` values extracted from pods.
-#[expect(clippy::cast_precision_loss)]
-fn avg_opt(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
-) -> Option<f64> {
-    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
-        if let Some(v) = f(p) {
-            (s + v, c + 1)
-        } else {
-            (s, c)
-        }
-    });
-    (count > 0).then_some(sum / (count as f64))
-}
-
 /// Sum non-`None` `u64` values extracted from pods.
 fn sum_opt_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
@@ -113,18 +110,6 @@ fn sum_opt_f64_as_u64(
         }
     });
     any.then_some(sum.round() as u64)
-}
-
-/// State for an active benchmark run provisioned via `setup`.
-struct RunState {
-    /// Spice Cloud app ID.
-    app_id: i64,
-    /// API key for the app (used for Flight SQL authentication).
-    api_key: String,
-    /// Flight SQL endpoint URL derived from the cname.
-    flight_url: String,
-    /// Spice Cloud client for API calls (metrics, teardown).
-    cloud: CloudClient,
 }
 
 /// System adapter handler that provisions Spice Cloud apps.
@@ -197,6 +182,7 @@ impl Handler for SpidapterHandler {
                 .as_ref()
                 .filter(|t| matches!(t, EtlSinkType::Adbc))
                 .map(|_| "spicebench.bench".to_string()),
+            read_driver: None,
         };
 
         self.runs.insert(run_id, state);
@@ -221,12 +207,26 @@ impl Handler for SpidapterHandler {
             ResourceMetrics::default()
         } else {
             ResourceMetrics {
-                cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                // Sum cumulative CPU seconds across all pods
+                cpu_usage_percent: Some(
+                    pods.iter()
+                        .filter_map(|p| p.cpu_usage_percent)
+                        .sum::<f64>()
+                        .max(0.0),
+                ),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
-                disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
-                disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
-                disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
-                disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
+                disk_read_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes).unwrap_or_default(),
+                ),
+                disk_write_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes).unwrap_or_default(),
+                ),
+                disk_read_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations).unwrap_or_default(),
+                ),
+                disk_write_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations).unwrap_or_default(),
+                ),
             }
         };
 
@@ -253,7 +253,11 @@ impl Handler for SpidapterHandler {
             return Ok(TeardownResponse { ok: true });
         };
 
-        eprintln!("[stdio] teardown: deleting app {}", state.app_id);
+        eprintln!(
+            "[stdio] teardown: deleting app {} at {}",
+            state.app_id,
+            state.cloud.base_url()
+        );
 
         commands::delete_app(&state.cloud, state.app_id)
             .await
@@ -271,6 +275,155 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
         .run_stdio()
         .await
         .map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
+}
+
+async fn post_setup_sink_action(
+    setup_config: &SetupConfig,
+    datasets: &HashMap<String, DatasetConfig>,
+    cname: &str,
+    api_key: &str,
+) -> anyhow::Result<()> {
+    if setup_config.sink_type == Some(EtlSinkType::Adbc) {
+        eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
+
+        let create_table_statements = generate_adbc_create_table_statements(datasets)?;
+        if create_table_statements.is_empty() {
+            eprintln!("[stdio] No datasets configured for ADBC sink, skipping table creation");
+            return Ok(());
+        }
+
+        let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
+        let sql_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?;
+
+        let mut attempts = 0; // global attempt counter, not per-table, to avoid compounding retries
+        for statement in create_table_statements {
+            eprintln!("[stdio] Running post-setup SQL: {statement}");
+
+            loop {
+                let response = sql_client
+                    .post(&sql_url)
+                    .header("X-API-Key", api_key)
+                    .body(statement.clone())
+                    .send()
+                    .await?;
+
+                if response.status().is_success() {
+                    break;
+                }
+
+                attempts += 1;
+
+                if attempts >= 3 {
+                    let status = response.status();
+                    let body = response.text().await?;
+                    return Err(anyhow::anyhow!(
+                        "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
+                    ));
+                }
+
+                let backoff_seconds = attempts * 2;
+                eprintln!(
+                    "[stdio] Post-setup SQL failed, retrying in {backoff_seconds}s (attempt {attempts}/3)"
+                );
+                sleep(Duration::from_secs(backoff_seconds)).await;
+            }
+        }
+
+        eprintln!("[stdio] ADBC post-setup table creation complete");
+    } else {
+        eprintln!(
+            "[stdio] No ETL sink type specified or ETL sink requires no additional steps, skipping post-setup actions"
+        );
+    }
+    Ok(())
+}
+
+fn generate_adbc_create_table_statements(
+    datasets: &HashMap<String, DatasetConfig>,
+) -> anyhow::Result<Vec<String>> {
+    let mut dataset_names = datasets.keys().cloned().collect::<Vec<_>>();
+    dataset_names.sort_unstable();
+
+    dataset_names
+        .into_iter()
+        .map(|dataset_name| {
+            let dataset = datasets
+                .get(&dataset_name)
+                .ok_or_else(|| anyhow::anyhow!("Dataset '{dataset_name}' was not found"))?;
+            generate_adbc_create_table_statement(&dataset_name, dataset)
+        })
+        .collect()
+}
+
+fn generate_adbc_create_table_statement(
+    dataset_name: &str,
+    dataset: &DatasetConfig,
+) -> anyhow::Result<String> {
+    let quoted_dataset_name = quote_identifier(dataset_name);
+
+    let column_definitions = dataset
+        .schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column_name = quote_identifier(field.name());
+            let data_type = adbc_sql_type_for_arrow(field.data_type())?;
+            let nullable = if field.is_nullable() { "" } else { " NOT NULL" };
+            Ok(format!("{column_name} {data_type}{nullable}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    if column_definitions.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Dataset '{dataset_name}' has no columns; cannot generate CREATE TABLE statement"
+        ));
+    }
+
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
+        column_definitions.join(", ")
+    ))
+}
+
+fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
+    let sql_type = match data_type {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INT".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt8 => "TINYINT UNSIGNED".to_string(),
+        DataType::UInt16 => "SMALLINT UNSIGNED".to_string(),
+        DataType::UInt32 => "INT UNSIGNED".to_string(),
+        DataType::UInt64 => "BIGINT UNSIGNED".to_string(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => format!("DECIMAL({precision}, {scale})"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "TEXT".to_string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "BLOB".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unsupported Arrow type for ADBC sink table creation: {data_type:?}"
+            ));
+        }
+    };
+
+    Ok(sql_type)
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 // ── Spice Cloud provisioning ─────────────────────────────────────────
@@ -355,142 +508,6 @@ async fn provision_spice_cloud_app(
     })
 }
 
-async fn post_setup_sink_action(
-    setup_config: &SetupConfig,
-    datasets: &HashMap<String, DatasetConfig>,
-    cname: &str,
-    api_key: &str,
-) -> anyhow::Result<()> {
-    if setup_config.sink_type == Some(EtlSinkType::Adbc) {
-        eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
-
-        let create_table_statements = generate_adbc_create_table_statements(datasets)?;
-        if create_table_statements.is_empty() {
-            eprintln!("[stdio] No datasets configured for ADBC sink, skipping table creation");
-            return Ok(());
-        }
-
-        let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
-        let sql_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
-
-        for statement in create_table_statements {
-            eprintln!("[stdio] Running post-setup SQL: {statement}");
-            let response = sql_client
-                .post(&sql_url)
-                .header("X-API-Key", api_key)
-                .body(statement.clone())
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<failed to read error body>".to_string());
-                return Err(anyhow::anyhow!(
-                    "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
-                ));
-            }
-        }
-
-        eprintln!("[stdio] ADBC post-setup table creation complete");
-    } else {
-        eprintln!(
-            "[stdio] No ETL sink type specified or ETL sink requires no additional steps, skipping post-setup actions"
-        );
-    }
-    Ok(())
-}
-
-fn generate_adbc_create_table_statements(
-    datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<Vec<String>> {
-    let mut dataset_names = datasets.keys().cloned().collect::<Vec<_>>();
-    dataset_names.sort_unstable();
-
-    dataset_names
-        .into_iter()
-        .map(|dataset_name| {
-            let dataset = datasets
-                .get(&dataset_name)
-                .ok_or_else(|| anyhow::anyhow!("Dataset '{dataset_name}' was not found"))?;
-            generate_adbc_create_table_statement(&dataset_name, dataset)
-        })
-        .collect()
-}
-
-fn generate_adbc_create_table_statement(
-    dataset_name: &str,
-    dataset: &DatasetConfig,
-) -> anyhow::Result<String> {
-    let quoted_dataset_name = quote_identifier(dataset_name);
-
-    let column_definitions = dataset
-        .schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let column_name = quote_identifier(field.name());
-            let data_type = adbc_sql_type_for_arrow(field.data_type())?;
-            let nullable = if field.is_nullable() { "" } else { " NOT NULL" };
-            Ok(format!("{column_name} {data_type}{nullable}"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    if column_definitions.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Dataset '{dataset_name}' has no columns; cannot generate CREATE TABLE statement"
-        ));
-    }
-
-    Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
-        column_definitions.join(", ")
-    ))
-}
-
-fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
-    let sql_type = match data_type {
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int8 => "TINYINT".to_string(),
-        DataType::Int16 => "SMALLINT".to_string(),
-        DataType::Int32 => "INT".to_string(),
-        DataType::Int64 => "BIGINT".to_string(),
-        DataType::UInt8 => "TINYINT UNSIGNED".to_string(),
-        DataType::UInt16 => "SMALLINT UNSIGNED".to_string(),
-        DataType::UInt32 => "INT UNSIGNED".to_string(),
-        DataType::UInt64 => "BIGINT UNSIGNED".to_string(),
-        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
-        DataType::Float64 => "DOUBLE".to_string(),
-        DataType::Decimal32(precision, scale)
-        | DataType::Decimal64(precision, scale)
-        | DataType::Decimal128(precision, scale)
-        | DataType::Decimal256(precision, scale) => format!("DECIMAL({precision}, {scale})"),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "TEXT".to_string(),
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => "BLOB".to_string(),
-        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
-        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Unsupported Arrow type for ADBC sink table creation: {data_type:?}"
-            ));
-        }
-    };
-
-    Ok(sql_type)
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
 fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -558,19 +575,21 @@ fn generate_adbc_spicepod(run_id: &Uuid) -> anyhow::Result<String> {
             enabled: false,
             ..TelemetryConfig::default()
         },
+        flight: Some(Flight {
+            do_put_rate_limit_enabled: false,
+            ..Flight::default()
+        }),
         ..Runtime::default()
     };
 
-    spicepod
-        .catalogs
-        .push(ComponentOrReference::Component(Catalog::new(
-            "cayenne".to_string(),
-            "spicebench".to_string(),
-        )));
+    spicepod.catalogs.push(ComponentOrReference::Component(
+        Catalog::new("cayenne".to_string(), "spicebench".to_string())
+            .with_access(AccessMode::ReadWriteCreate),
+    ));
     yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
-/// Generate a minimal initial spicepod YAML with no datasets.
+/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
 fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -579,5 +598,146 @@ fn generate_initial_spicepod(
     match setup_config.sink_type {
         Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn setup_config_parses_metadata() {
+        let metadata = HashMap::from([(
+            "etl_region".to_string(),
+            serde_json::Value::String("us-west-2".to_string()),
+        )]);
+
+        let config = SetupConfig::from_metadata(&metadata);
+        assert_eq!(config.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn generate_spicepod_includes_dataset_entries() {
+        let setup_config = SetupConfig {
+            region: Some("us-west-2".to_string()),
+            endpoint: Some("http://localhost:9000".to_string()),
+            sink_type: None,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let datasets = HashMap::from([(
+            "my_table".to_string(),
+            DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/my_table/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )]);
+
+        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
+            .expect("spicepod should generate");
+
+        assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
+        assert!(spicepod.contains("name: my_table"));
+        assert!(spicepod.contains("file_format: parquet"));
+        assert!(spicepod.contains("s3_region: us-west-2"));
+        assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
+        assert!(spicepod.contains("engine: cayenne"));
+        assert!(spicepod.contains("mode: file"));
+        assert!(spicepod.contains("refresh_mode: full"));
+        assert!(spicepod.contains("refresh_check_interval: 1s"));
+        assert!(spicepod.contains("telemetry:"));
+        assert!(spicepod.contains("enabled: false"));
+    }
+
+    #[test]
+    fn generate_spicepod_errors_on_missing_dataset_source() {
+        let setup_config = SetupConfig {
+            region: None,
+            endpoint: None,
+            sink_type: None,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let datasets = HashMap::from([(
+            "missing_table".to_string(),
+            DatasetConfig {
+                schema,
+                location: None,
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )]);
+
+        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets)
+            .expect_err("missing source should fail");
+        assert!(
+            err.to_string().contains("missing_table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_uses_namespace_and_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            "orders",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/orders/".to_string()),
+                primary_key_columns: vec!["id".to_string()],
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(statement.contains("CREATE TABLE IF NOT EXISTS spicebench.bench.\"orders\""));
+        assert!(statement.contains("\"id\" BIGINT NOT NULL"));
+        assert!(statement.contains("\"name\" TEXT"));
+        assert!(statement.contains("\"price\" DECIMAL(10, 2)"));
+        assert!(statement.contains("\"created_at\" TIMESTAMP"));
+        assert!(statement.contains("PRIMARY KEY (\"id\")"));
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_for_unsupported_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "metadata",
+            DataType::Struct(vec![Field::new("k", DataType::Utf8, true)].into()),
+            true,
+        )]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )
+        .expect_err("unsupported Arrow type should fail");
+
+        assert!(
+            err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
     }
 }

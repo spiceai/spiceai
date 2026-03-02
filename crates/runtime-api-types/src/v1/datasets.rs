@@ -19,7 +19,7 @@ limitations under the License.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::status::ComponentStatus;
+use super::status::{ComponentError, ComponentStatus};
 
 /// Dataset information returned by the `/v1/datasets` endpoint.
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,8 +43,17 @@ pub struct DatasetInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
 
+    /// An optional error type/code for the dataset status.
+    /// Only populated when `status=true` and the dataset status is `Error`.
+    /// Example:
+    /// `{ "category": "dataset", "type": "auth", "code": "dataset.auth" }`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ComponentError>,
+
     /// An optional error message describing why the dataset entered an error state.
-    /// Only populated when the dataset status is `Error` and an error message was recorded.
+    /// Only populated when `status=true`, the dataset status is `Error`, and an error message was recorded.
+    /// This value is intended for user-visible display.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 
     /// Custom properties for the dataset

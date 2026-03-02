@@ -130,6 +130,22 @@ Failed command execution returns JSON-RPC error code `-32001` with `data` contai
 - `command`
 - `args`
 
+### Setup metadata for ETL sink mode
+
+`spidapter` now honors `setup(run_id, metadata)` values from SpiceBench to configure the runtime catalog for ETL:
+
+- `etl_sink_mode`: `adbc` (default) or `iceberg-object-store`
+- `etl_iceberg_warehouse_uri`: required when `etl_sink_mode=iceberg-object-store` (for example `s3://my-bucket/etl-iceberg-output/tpch/<run-id>`)
+- `etl_iceberg_namespace`: optional namespace string (currently logged for visibility)
+- `etl_region`: optional S3 region override for Iceberg object-store catalog access
+- `etl_endpoint`: optional S3 endpoint override (for MinIO/LocalStack)
+
+Behavior changes:
+
+- For `etl_sink_mode=iceberg-object-store`, `setup()` generates a spicepod Iceberg catalog from `etl_iceberg_warehouse_uri`.
+- For `etl_sink_mode=iceberg-object-store`, `create_tables()` is a no-op (ETL writes Iceberg tables directly to object storage).
+- For `etl_sink_mode=adbc`, existing Glue-catalog behavior is unchanged.
+
 ## Use cases
 
 ### Running Benchmarks

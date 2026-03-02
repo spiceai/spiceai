@@ -62,6 +62,7 @@ pub enum TestType {
     Search,
     TextToSql,
     Streaming,
+    StreamingCorrectness,
 }
 
 impl TestType {
@@ -75,7 +76,8 @@ impl TestType {
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::Search => "testoperator_run_search.yml",
             TestType::TextToSql => "testoperator_run_texttosql.yml",
-            TestType::Streaming => "testoperator_run_streaming_dynamodb.yml",
+            TestType::Streaming => "testoperator_run_streaming_bench.yml",
+            TestType::StreamingCorrectness => "testoperator_run_streaming_correctness.yml",
         }
     }
 }
@@ -91,6 +93,7 @@ impl Display for TestType {
             TestType::Search => write!(f, "search"),
             TestType::TextToSql => write!(f, "text_to_sql"),
             TestType::Streaming => write!(f, "streaming"),
+            TestType::StreamingCorrectness => write!(f, "streaming_correctness"),
         }
     }
 }
