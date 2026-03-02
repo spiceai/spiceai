@@ -238,8 +238,26 @@ impl MetadataCatalog for CayenneCatalog {
             .ok();
 
         if let Some(table_id) = existing_table_id {
-            // Table already exists, return its ID
-            return Ok(table_id);
+            // Table already exists - check if configuration has changed
+            match self.get_table(&table_name).await {
+                Ok(stored_metadata) => {
+                    if configuration_matches(&stored_metadata, &options) {
+                        // Configuration unchanged, reuse existing table
+                        return Ok(table_id);
+                    }
+
+                    // Configuration changed - return error to prevent accidental reuse of existing table with incompatible schema or settings
+                    return Err(CatalogError::ChangedConfiguration {
+                        table_name: table_name.clone(),
+                    });
+                }
+                Err(e) => {
+                    return Err(CatalogError::InvalidMetadata {
+                        table_name: table_name.clone(),
+                        source: Box::new(e),
+                    });
+                }
+            }
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -1127,6 +1145,51 @@ impl MetadataCatalog for CayenneCatalog {
     }
 }
 
+/// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
+///
+/// Returns `true` if the configuration matches (no recreation needed).
+/// Only compares data-affecting fields; runtime tuning parameters like cache sizes
+/// and upload concurrency are excluded since they don't affect data correctness.
+fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
+    // Compare primary keys
+    if stored.primary_key != options.primary_key {
+        return false;
+    }
+
+    // Compare on-conflict behavior via string representation
+    let stored_oc = stored.on_conflict.as_ref().map(ToString::to_string);
+    let new_oc = options.on_conflict.as_ref().map(ToString::to_string);
+    if stored_oc != new_oc {
+        return false;
+    }
+
+    // Compare partition column
+    if stored.partition_column != options.partition_column {
+        return false;
+    }
+
+    // Compare Arrow schema
+    if stored.schema.as_ref() != options.schema.as_ref() {
+        return false;
+    }
+
+    // Compare data-affecting Vortex config fields
+    if stored.vortex_config.sort_columns != options.vortex_config.sort_columns {
+        return false;
+    }
+    if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
+        return false;
+    }
+
+    // Compare base path (path change means data is in a different location)
+    if stored.path != options.base_path {
+        return false;
+    }
+
+    true
+}
+
+/// Logs the specific configuration differences between stored and new options at debug level.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1921,6 +1984,209 @@ mod tests {
         }
 
         // Cleanup
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_detects_config_change() {
+        let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        // Create initial table with no primary key
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_config_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_1 = catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        // Verify table was created
+        let metadata = catalog
+            .get_table("test_table")
+            .await
+            .expect("Failed to get table");
+        assert!(metadata.primary_key.is_empty());
+        assert_eq!(metadata.table_id, table_id_1);
+
+        // Now recreate with a primary key change — should get a new table_id
+        let options_changed = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_config_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_2 = catalog
+            .create_table(options_changed)
+            .await
+            .expect("Failed to create table after config change");
+
+        // Should have gotten a new table_id (old one was dropped)
+        assert_ne!(table_id_1, table_id_2);
+
+        // Verify new config is stored
+        let metadata = catalog
+            .get_table("test_table")
+            .await
+            .expect("Failed to get table");
+        assert_eq!(metadata.primary_key, vec!["id".to_string()]);
+        assert_eq!(metadata.table_id, table_id_2);
+
+        // Recreate with the SAME config — should return the same table_id
+        let options_same = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_config_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_3 = catalog
+            .create_table(options_same)
+            .await
+            .expect("Failed to create table with same config");
+
+        // Should reuse the existing table
+        assert_eq!(table_id_2, table_id_3);
+
+        // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_detects_sort_columns_change() {
+        let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("ts", arrow_schema::DataType::Int64, false),
+        ]));
+
+        // Create table with no sort columns
+        let mut vortex_config = crate::metadata::VortexConfig::default();
+        let options = CreateTableOptions {
+            table_name: "sorted_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_sort_test".to_string(),
+            partition_column: None,
+            vortex_config: vortex_config.clone(),
+        };
+        let table_id_1 = catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        // Add sort columns — should trigger recreation
+        vortex_config.sort_columns = vec!["ts".to_string()];
+        let options_sorted = CreateTableOptions {
+            table_name: "sorted_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_sort_test".to_string(),
+            partition_column: None,
+            vortex_config,
+        };
+        let table_id_2 = catalog
+            .create_table(options_sorted)
+            .await
+            .expect("Failed to create table after sort_columns change");
+
+        assert_ne!(table_id_1, table_id_2);
+
+        // Verify new config
+        let metadata = catalog
+            .get_table("sorted_table")
+            .await
+            .expect("Failed to get table");
+        assert_eq!(metadata.vortex_config.sort_columns, vec!["ts".to_string()]);
+
+        // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_cache_change_does_not_recreate() {
+        let test_db = format!("sqlite://./.test_cache_change_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        // Create table with default cache settings
+        let options = CreateTableOptions {
+            table_name: "cache_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_cache_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_1 = catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        // Change only cache sizes (non-data-affecting) — should NOT trigger recreation
+        let vortex_config = crate::metadata::VortexConfig {
+            footer_cache_mb: 512,
+            segment_cache_mb: 1024,
+            upload_concurrency: 8,
+            target_vortex_file_size_mb: 512,
+            ..Default::default()
+        };
+        let options_cache_changed = CreateTableOptions {
+            table_name: "cache_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_cache_test".to_string(),
+            partition_column: None,
+            vortex_config,
+        };
+        let table_id_2 = catalog
+            .create_table(options_cache_changed)
+            .await
+            .expect("Failed to create table with cache change");
+
+        // Should reuse the same table (cache changes don't affect data)
+        assert_eq!(table_id_1, table_id_2);
+
+        // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
