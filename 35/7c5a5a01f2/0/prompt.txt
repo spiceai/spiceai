@@ -1,0 +1,82 @@
+Implement the following plan:
+
+# Add `--output` flag to `spice login` with env/json/keychain modes
+
+## Context
+Apps calling `spice login` programmatically can't access `.env` file contents afterwards on macOS. We need `spice login` to support multiple credential storage backends via an `--output` flag: `env` (current default), `json` (print to stdout), and `keychain` (macOS Keychain / platform keyring).
+
+## Changes
+
+### 1. Add `keyring` dependency to `bin/spice/Cargo.toml`
+```toml
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
+```
+Already used in the workspace at `crates/runtime-secrets/Cargo.toml`.
+
+### 2. Add `LoginOutput` enum to `bin/spice/src/commands/login/mod.rs`
+A new enum (not reusing `OutputFormat` since the semantics differ — this controls *storage*, not display format):
+```rust
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
+pub enum LoginOutput {
+    #[default]
+    Env,
+    Json,
+    Keychain,
+}
+```
+
+### 3. Add `--output` flag to `LoginArgs`
+```rust
+#[arg(long, short = 'o', default_value = "env")]
+pub output: LoginOutput,
+```
+Thread `args.output` through to `login_spiceai()`.
+
+### 4. Modify `login_spiceai()` in `mod.rs` (~line 108)
+After obtaining `access_token` and `auth_context`, branch on `output`:
+
+- **`Env`** (current behaviour): call `merge_auth_config(...)`, print success message
+- **`Json`**: print `{"token": "...", "api_key": "...", "username": "...", "org": "...", "app": "..."}` to stdout; no `.env` write; suppress all other println output (only JSON on stdout)
+- **`Keychain`**: store `SPICE_SPICEAI_TOKEN` and `SPICE_SPICEAI_API_KEY` in the platform keyring via `keyring::Entry`; print success message
+
+For the `--key` direct API key path (line 109), apply the same branching.
+
+### 5. Add keychain helpers to `auth_config.rs`
+```rust
+pub fn store_keychain(auth_type: &str, params: &[(&str, &str)]) -> Result<()>
+```
+Uses `keyring::Entry::new(&format!("SPICE_{auth_type}_{key}"), "spice")` and `entry.set_password(value)`.
+
+### 6. Update `get_auth_token()` in `cloud/client.rs` (~line 337)
+Add keychain as a fallback source between env var and `.env` file:
+1. Check `SPICE_SPICEAI_TOKEN` env var
+2. Try keychain: `keyring::Entry::new("SPICE_SPICEAI_TOKEN", "spice").get_password()`
+3. Try `.env.local` / `.env` file
+
+### 7. Suppress interactive output in JSON mode
+In `login_spiceai()`, gate all `println!` calls (auth code display, browser prompt, success messages) behind `output != LoginOutput::Json`. The browser still opens (user needs to authenticate), but stdout is clean JSON only.
+
+## Files to modify
+- `bin/spice/Cargo.toml` — add `keyring` dep
+- `bin/spice/src/commands/login/mod.rs` — `LoginOutput` enum, `--output` flag, branch credential storage
+- `bin/spice/src/commands/login/auth_config.rs` — add `store_keychain()` helper
+- `bin/spice/src/commands/cloud/client.rs` — update `get_auth_token()` to check keychain
+
+## Verification
+- `cargo check -p spice` compiles
+- `cargo clippy -p spice` passes
+- `spice login` (no flag) — same behaviour as before, writes `.env`
+- `spice login -o json` — outputs JSON to stdout, no `.env` write
+- `spice login -o keychain` — stores in keychain, verify with `security find-generic-password -s spice -a SPICE_SPICEAI_TOKEN`
+- `spice cloud apps` works after `spice login -o keychain` (token resolved from keychain)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/jeadie/.REDACTED.jsonl
+
+---
+
+what are the values in the keychain
+
+---
+
+what is the service name?

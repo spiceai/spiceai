@@ -1,0 +1,58 @@
+Implement the following plan:
+
+# Add `-o=json` support to 9 cloud commands
+
+## Context
+Several `spice cloud` subcommands lack the `-o=json` output format flag that other cloud commands already support. The pattern is well-established in the codebase.
+
+## File to modify
+`bin/spice/src/commands/cloud/mod.rs`
+
+## Pattern
+Each command needs two changes:
+1. Add `#[arg(long, short = 'o', default_value = "table")] pub output: OutputFormat` to the Args struct
+2. Add early-return JSON branch in the handler: `if args.output == OutputFormat::Json { return write_json(&data); }`
+
+## Changes
+
+### 1. `LogsArgs` (line 174) — add `output` field
+Handler `execute_logs` (line 820): after fetching `logs`, add JSON check before the for-loop that prints colored log lines. Serialize `logs` (the full response).
+
+### 2. `DeployArgs` (line 193) — add `output` field
+Handler `execute_deploy` (line 972): after creating the deployment, add JSON check. Serialize `deployment`. Remove the "Deploying to..." println when JSON mode (move it after the check, or gate it).
+
+### 3. `RollbackArgs` (line 223) — add `output` field
+Handler `execute_rollback` (line 1033): after getting `deployment` from rollback, add JSON check. Serialize `deployment`.
+
+### 4. `SecretsSetArgs` (line 280) — add `output` field
+Handler in `execute_secrets` `Set` branch (line 793): the `set_secret` call returns no meaningful data. Serialize a confirmation object: `json!({"name": args.name, "status": "set"})`.
+
+### 5. `SecretsDeleteArgs` (line 307) — add `output` field
+Handler in `execute_secrets` `Delete` branch (line 810): same pattern. Serialize `json!({"name": args.name, "status": "deleted"})`.
+
+### 6. `CreateAppArgs` (line 330) — add `output` field
+Handler in `execute_create` `App` branch (line 859): after creating `app`, add JSON check. Serialize `app`.
+
+### 7. `CreateDeploymentArgs` (line 344) — add `output` field
+Handler in `execute_create` `Deployment` branch (line 870): after creating `deployment`, add JSON check. Serialize `deployment`.
+
+### 8. `UpdateAppArgs` (line 393) — add `output` field
+Handler in `execute_update` `App` branch (line 915): after updating `app`, add JSON check. Serialize `app`.
+
+### 9. `DeleteAppArgs` (line 430) — add `output` field
+Handler in `execute_delete` `App` branch (line 940): after deleting, add JSON check. Serialize `json!({"app": args.app, "status": "deleted"})`. Note: when `-o json` is used, still respect `--yes` for confirmation, but output JSON instead of the success message.
+
+## Verification
+- `cargo check -p spice-cli` (or equivalent package name) to verify compilation
+- `cargo clippy -p spice-cli` for lint
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/jeadie/.REDACTED.jsonl
+
+---
+
+where / how does `spice login` set variables. Similiarly `spice cloud login`. ALso why are there two?
+
+---
+
+for spice cloud login, hmmm i get a redirect to `https://spice.ai/v1/auth/device?code=BQSPV26X` byt that 404
