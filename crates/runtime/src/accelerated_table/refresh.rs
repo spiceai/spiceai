@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -121,12 +122,10 @@ impl RefreshSQL {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            use std::fmt::Write;
             let _ = write!(sql, " WHERE {where_clause}");
         }
 
         if let Some(limit) = self.limit {
-            use std::fmt::Write;
             let _ = write!(sql, " LIMIT {limit}");
         }
 
