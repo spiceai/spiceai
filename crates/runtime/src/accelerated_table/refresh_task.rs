@@ -27,6 +27,7 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spi
 use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
+use crate::datafusion::refresh_sql;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::metrics::telemetry::track_bytes_processed;
@@ -952,9 +953,33 @@ impl RefreshTask {
             RefreshMode::Caching => UpdateType::Overwrite,
         };
 
+        // If an override SQL string was provided, parse it into a RefreshSQL,
+        // preserving partition filters from the base refresh.
+        let effective_sql = if let Some(override_raw) = &refresh.override_sql_raw {
+            let source_schema = federated_provider.schema();
+            match refresh_sql::parse_refresh_sql(dataset_name.clone(), override_raw, source_schema)
+            {
+                Ok((mut parsed, _schema)) => {
+                    // Preserve partition filters from base refresh
+                    if let Some(base) = &refresh.sql {
+                        parsed.set_partition_filters(base.partition_filters().to_vec());
+                    }
+                    Some(parsed)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse override refresh_sql for {dataset_name}, falling back to base: {e}"
+                    );
+                    refresh.sql.clone()
+                }
+            }
+        } else {
+            refresh.sql.clone()
+        };
+
         // Extract SQL string and partition filters from RefreshSQL
-        let sql_string = refresh.sql.as_ref().map(|s| s.to_sql());
-        if let Some(ref s) = refresh.sql {
+        let sql_string = effective_sql.as_ref().map(|s| s.to_sql());
+        if let Some(ref s) = effective_sql {
             filters.extend(s.partition_filters().iter().cloned());
         }
 

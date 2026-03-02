@@ -36,7 +36,7 @@ use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
-use crate::datafusion::{DataFusion, resolved_equality};
+use crate::datafusion::DataFusion;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{

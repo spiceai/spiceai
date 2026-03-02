@@ -111,31 +111,7 @@ pub fn parse_refresh_sql(
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
 
-                let limit_value = if let Some(limit) = &query.limit_clause {
-                    let LimitClause::LimitOffset {
-                        limit: limit_expr,
-                        offset,
-                        limit_by,
-                    } = limit
-                    else {
-                        return UnexpectedExpressionSnafu {
-                            expr: "LIMIT <offset>, <limit>",
-                            expected_table,
-                        }
-                        .fail();
-                    };
-
-                    ensure_no_expr!(limit_by.is_empty(), "LIMIT BY", expected_table);
-                    ensure_no_expr!(offset.is_none(), "OFFSET", expected_table);
-
-                    // Extract the numeric LIMIT value if present
-                    limit_expr.as_ref().and_then(|e| match e {
-                        Expr::Value(v) => v.to_string().parse::<usize>().ok(),
-                        _ => None,
-                    })
-                } else {
-                    None
-                };
+                let limit_value = parse_limit(query.limit_clause.as_deref())?;
 
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
@@ -234,6 +210,49 @@ pub fn parse_refresh_sql(
             _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
         },
         _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+    }
+}
+
+/// Extract and validate the LIMIT clause, ensuring it is a simple non-negative integer literal if present, and that no unsupported features like OFFSET or LIMIT BY are used.
+fn parse_limit(limit: Option<&LimitClause>) -> Result<Option<usize>> {
+    let (limit, offset, limit_by) = match limit {
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => (limit, offset, limit_by),
+        None => return Ok(None), // No LIMIT clause specified, treated as no limit
+        _ => {
+            return UnexpectedExpressionSnafu {
+                expr: "LIMIT <offset>, <limit>",
+                expected_table: TableReference::bare("unknown"),
+            }
+            .fail();
+        }
+    };
+
+    ensure_no_expr!(
+        limit_by.is_empty(),
+        "LIMIT BY",
+        TableReference::bare("unknown")
+    );
+    ensure_no_expr!(offset.is_none(), "OFFSET", TableReference::bare("unknown"));
+
+    match &limit {
+        Some(Expr::Value(v)) => v
+            .to_string()
+            .parse::<usize>()
+            .context(UnexpectedExpressionSnafu {
+                expr: "non-negative integer literal LIMIT",
+                expected_table: TableReference::bare("unknown"),
+            })
+            .map(Some),
+        None => Ok(None), // No LIMIT value specified, treated as no limit
+        _ => UnexpectedExpressionSnafu {
+            expr: "non-negative integer literal LIMIT",
+            expected_table: TableReference::bare("unknown"),
+        }
+        .fail(),
     }
 }
 
