@@ -179,6 +179,15 @@ pub enum CatalogError {
         /// Description of why the partition metadata is invalid
         message: String,
     },
+
+    #[snafu(display("Table '{table_name}' already exists with different configuration. Delete the acceleration, and try again."))]
+    ChangedConfiguration { table_name: String },
+
+    #[snafu(display("Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"))]
+    InvalidMetadata {
+        table_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Result type for catalog operations.
