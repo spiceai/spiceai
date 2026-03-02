@@ -14,8 +14,8 @@ description: "SELECT id, answer FROM vector_search(qs_view, 'second', answer) or
 |               |     SortExec: TopK(fetch=4), expr=[_score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                            |
 |               |       ProjectionExec: expr=[CAST(key@1 AS Int64) as id, answer@0 as answer, 1 - distance@2 as _score]                                                                           |
 |               |         CooperativeExec                                                                                                                                                         |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                  |
-|               |             BytesProcessedExec                                                                                                                                                  |
+|               |           BytesProcessedExec                                                                                                                                                    |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                |
 |               |               CooperativeExec                                                                                                                                                   |
 |               |                 S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                                                    |
 |               |                                                                                                                                                                                 |
