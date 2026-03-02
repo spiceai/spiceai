@@ -2161,11 +2161,13 @@ mod tests {
             .expect("Failed to create table");
 
         // Change only cache sizes (non-data-affecting) — should NOT trigger recreation
-        let mut vortex_config = crate::metadata::VortexConfig::default();
-        vortex_config.footer_cache_mb = 512;
-        vortex_config.segment_cache_mb = 1024;
-        vortex_config.upload_concurrency = 8;
-        vortex_config.target_vortex_file_size_mb = 512;
+        let vortex_config = crate::metadata::VortexConfig {
+            footer_cache_mb: 512,
+            segment_cache_mb: 1024,
+            upload_concurrency: 8,
+            target_vortex_file_size_mb: 512,
+            ..Default::default()
+        };
         let options_cache_changed = CreateTableOptions {
             table_name: "cache_table".to_string(),
             schema: Arc::clone(&schema),
