@@ -1,0 +1,27 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "65ae03bd4e4a",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-03-03/partition-acceleration",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/runtime/src/dataaccelerator/mod.rs",
+    "crates/runtime/src/dataaccelerator/partitioned_arrow.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/65/ae03bd4e4a/0/metadata.json",
+      "transcript": "/65/ae03bd4e4a/0/full.jsonl",
+      "context": "/65/ae03bd4e4a/0/context.md",
+      "content_hash": "/65/ae03bd4e4a/0/content_hash.txt",
+      "prompt": "/65/ae03bd4e4a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 40,
+    "cache_creation_tokens": 30725,
+    "cache_read_tokens": 1266610,
+    "output_tokens": 6442,
+    "api_call_count": 34
+  }
+}

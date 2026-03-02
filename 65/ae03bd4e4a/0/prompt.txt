@@ -1,0 +1,264 @@
+Implement the following plan:
+
+# Plan: Add Partitioning Support to Arrow In-Memory Acceleration
+
+## Context
+The Arrow acceleration engine is the default in-memory accelerator in Spice. Currently it rejects any `partition_by` configuration with an error. DuckDB and Cayenne already support partitioning via a separate `PartitionCreator` implementation that wraps the engine's `TableProvider` in a `PartitionTableProvider`. We want the same capability for Arrow (in-memory).
+
+The key difference vs DuckDB: Arrow is purely in-memory, so there are no files to persist or infer from disk. `infer_existing_partitions()` always returns `vec![]`.
+
+---
+
+## Files to Modify/Create
+
+| File | Change |
+|------|--------|
+| `crates/runtime-acceleration/src/engine.rs` | Add `PartitionedArrow` variant |
+| `crates/runtime/src/component/dataset/acceleration.rs` | Route Arrow + non-empty `partition_by` → `PartitionedArrow` |
+| `crates/runtime/src/dataaccelerator/mod.rs` | Add `pub mod partitioned_arrow;` |
+| `crates/runtime/src/dataaccelerator/arrow.rs` | Remove the `ensure!(partition_by.is_empty(), ...)` guard |
+| `crates/runtime/src/dataaccelerator/partitioned_arrow.rs` | **New file** — implement `PartitionedArrowAccelerator` + `ArrowPartitionCreator` |
+
+---
+
+## Step-by-Step Changes
+
+### 1. `crates/runtime-acceleration/src/engine.rs`
+
+Add `PartitionedArrow` to the `Engine` enum:
+```rust
+pub enum Engine {
+    #[default]
+    Arrow,
+    PartitionedArrow,  // new
+    DuckDB,
+    ...
+}
+```
+
+Update `to_unpartitioned()`:
+```rust
+Engine::PartitionedArrow => Engine::Arrow,
+Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => Engine::DuckDB,
+```
+
+Update `Display` (show "arrow" for `PartitionedArrow`):
+```rust
+Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
+```
+
+### 2. `crates/runtime/src/component/dataset/acceleration.rs`
+
+Inside the `Engine::try_from(engine_str)` match block (around line 403), add a new arm analogous to the DuckDB one:
+```rust
+Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
+```
+
+### 3. `crates/runtime/src/dataaccelerator/mod.rs`
+
+Add:
+```rust
+pub mod partitioned_arrow;
+```
+
+### 4. `crates/runtime/src/dataaccelerator/arrow.rs`
+
+Remove the guard that rejects `partition_by` (lines 77–82). The routing in step 2 ensures `ArrowAccelerator::create_external_table` is only called when `partition_by` is empty.
+
+### 5. `crates/runtime/src/dataaccelerator/partitioned_arrow.rs` (new)
+
+Implement two structs:
+
+**`ArrowPartitionCreator`** — implements `PartitionCreator`:
+- Stores: `cmd: CreateExternalTable`, `partition_by: Vec<PartitionedBy>`, `schema: SchemaRef`
+- `create_partition(values)`: calls `ArrowFactory::create()` (via `TableProviderFactory::create`) with the stored `cmd` to create a new in-memory MemTable, wraps it in a `Partition { partition_values: values, table_provider }`
+- `infer_existing_partitions()`: returns `Ok(vec![])` — Arrow is in-memory, no prior state to recover
+- `supports_filters_pushdown(filters)`: returns `Inexact` for all filters (same as Arrow MemTable default)
+
+**`PartitionedArrowAccelerator`** — implements `DataAccelerator`:
+- `name()` → `"partitioned_arrow"`
+- `prefix()` → `"arrow"` (same as ArrowAccelerator)
+- `parameters()` → reuse PARAMETERS from `arrow.rs` (move to a shared const or duplicate)
+- `create_external_table(cmd, source, partition_by)`:
+  1. `ensure!(!partition_by.is_empty(), ...)`
+  2. Build `schema` from `cmd.schema.as_arrow()`
+  3. Create `Arc<ArrowPartitionCreator>`
+  4. Wrap in `PartitionTableProvider::new(creator, partition_by, schema).await?`
+  5. Return as `Arc<dyn TableProvider>`
+- Register: `register_data_accelerator!(Engine::PartitionedArrow, PartitionedArrowAccelerator);`
+
+---
+
+## Verification
+
+1. Add `partition_by` to the `arrow` acceleration in `spicepod.yaml` (or create a test spicepod).
+2. Run `spiced` and confirm the partitioned Arrow table is created without error.
+3. Insert data across multiple partition values and query back with a filter on the partition column — verify partition pruning works.
+4. Confirm `infer_existing_partitions` returns empty (restart should give empty table — consistent with normal Arrow behavior).
+5. Run existing tests: `cargo test -p runtime --test '*'` and `cargo test -p runtime-table-partition`.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/jeadie/.REDACTED.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+<task-notification>
+<task-id>bnokjvxlb</task-id>
+<tool-use-id>toolu_011Y4Ndyfxq44JwkmmS1XDV6</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-jeadie-Github-spiceai/tasks/bnokjvxlb.output</output-file>
+<status>killed</status>
+<summary>Background command "Check tail of compilation output for errors" was stopped</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-jeadie-Github-spiceai/tasks/bnokjvxlb.output
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3682:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+3682 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2717:23
+     |
+2717 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2738:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+2738 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2781:23
+     |
+2781 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2808:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+2808 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2874:23
+     |
+2874 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2908:23
+     |
+2908 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:2981:23
+     |
+2981 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3043:23
+     |
+3043 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3086:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+3086 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3125:23
+     |
+3125 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3154:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+3154 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3193:23
+     |
+3193 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3222:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+3222 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3261:23
+     |
+3261 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0599]: no variant or associated item named `DuckDB` found for enum `snapshot::AccelerationEngine` in the current scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3290:81
+     |
+ 522 | pub enum AccelerationEngine {
+     | --------------------------- variant or associated item `DuckDB` not found for this enum
+...
+3290 |         let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+     |                                                                                 ^^^^^^ variant or associated item not found in `snapshot::AccelerationEngine`
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3336:23
+     |
+3336 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3437:23
+     |
+3437 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `build_manager` in this scope
+    --> crates/runtime-acceleration/src/snapshot/mod.rs:3460:23
+     |
+3460 |         let manager = build_manager(
+     |                       ^^^^^^^^^^^^^ not found in this scope
+
+Some errors have detailed explanations: E0425, E0599.
+For more information about an error, try `rustc --explain E0425`.
+
+---
+
+[Request interrupted by user for tool use]
