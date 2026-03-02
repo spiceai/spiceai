@@ -414,6 +414,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
         | DataFusionError::ParquetError(_)
         | DataFusionError::Substrait(_)
         | DataFusionError::Configuration(_)
+        | DataFusionError::Ffi(_)
         | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
     }
 }

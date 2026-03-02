@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(dead_code, clippy::allow_attributes)]
 
 //! TPC-DS integration tests with S3 source and `PostgreSQL` acceleration.
 //!
@@ -113,7 +114,6 @@ mod q86;
 /// Initialized once and reused across all TPC-DS query tests.
 struct SharedTestEnv {
     rt: Arc<Runtime>,
-    #[expect(dead_code)]
     running_container: RunningContainer<'static>,
 }
 

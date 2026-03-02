@@ -80,7 +80,7 @@ impl RuntimeStatus {
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
-    fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
         let mut statuses = match self.statuses.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

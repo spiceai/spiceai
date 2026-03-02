@@ -24,12 +24,13 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
 use datafusion_physical_plan::{
     execution_plan::{check_default_invariants, CardinalityEffect, InvariantLevel},
+    expressions::PhysicalSortExpr,
     filter_pushdown::{
         ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
     },
     metrics::MetricsSet,
     projection::ProjectionExec,
-    DisplayAs, ExecutionPlan, PlanProperties,
+    DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
 };
 
 /// Wrapper for Cayenne acceleration execution plans.
@@ -206,6 +207,13 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }
 

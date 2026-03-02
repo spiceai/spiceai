@@ -132,6 +132,31 @@ fn write_env_file(path: &str, vars: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// Store authentication credentials in the platform keyring.
+///
+/// Credentials are stored with the service name `spice` and account name
+/// `SPICE_{AUTH_TYPE}_{PARAM}`.
+///
+/// # Errors
+///
+/// Returns an error if the keyring operation fails.
+pub fn store_keychain(auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
+    for (key, value) in params {
+        let account = format!("SPICE_{auth_type}_{key}");
+        let entry = keyring::Entry::new(&account, "spice").map_err(|e| {
+            crate::error::Error::InvalidArgument {
+                message: format!("Failed to create keychain entry for {account}: {e}"),
+            }
+        })?;
+        entry
+            .set_password(value)
+            .map_err(|e| crate::error::Error::InvalidArgument {
+                message: format!("Failed to store {account} in keychain: {e}"),
+            })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

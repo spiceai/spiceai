@@ -36,7 +36,8 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, EmptyRecordBatchStream, ExecutionPlan,
-    ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties,
+    ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties, SortOrderPushdownResult,
+    expressions::PhysicalSortExpr,
 };
 use runtime_proto::UdtfArgs;
 use std::any::Any;
@@ -285,6 +286,13 @@ impl ExecutionPlan for UdtfExec {
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
+    }
 }
 
 /// A placeholder execution plan used during deserialization.
@@ -460,5 +468,12 @@ impl ExecutionPlan for PlaceholderExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }
