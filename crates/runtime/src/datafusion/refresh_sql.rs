@@ -111,7 +111,7 @@ pub fn parse_refresh_sql(
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
 
-                let limit_value = parse_limit(query.limit_clause.as_deref())?;
+                let limit_value = parse_limit(query.limit_clause.as_deref(), &expected_table)?;
 
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
@@ -214,7 +214,7 @@ pub fn parse_refresh_sql(
 }
 
 /// Extract and validate the LIMIT clause, ensuring it is a simple non-negative integer literal if present, and that no unsupported features like OFFSET or LIMIT BY are used.
-fn parse_limit(limit: Option<&LimitClause>) -> Result<Option<usize>> {
+fn parse_limit(limit: Option<&LimitClause>, tbl: &TableReference) -> Result<Option<usize>> {
     let (limit, offset, limit_by) = match limit {
         Some(LimitClause::LimitOffset {
             limit,
@@ -225,32 +225,28 @@ fn parse_limit(limit: Option<&LimitClause>) -> Result<Option<usize>> {
         _ => {
             return UnexpectedExpressionSnafu {
                 expr: "LIMIT <offset>, <limit>",
-                expected_table: TableReference::bare("unknown"),
+                expected_table: tbl.clone(),
             }
             .fail();
         }
     };
 
-    ensure_no_expr!(
-        limit_by.is_empty(),
-        "LIMIT BY",
-        TableReference::bare("unknown")
-    );
-    ensure_no_expr!(offset.is_none(), "OFFSET", TableReference::bare("unknown"));
+    ensure_no_expr!(limit_by.is_empty(), "LIMIT BY", tbl.clone());
+    ensure_no_expr!(offset.is_none(), "OFFSET", tbl.clone());
 
     match &limit {
         Some(Expr::Value(v)) => v
             .to_string()
             .parse::<usize>()
-            .context(UnexpectedExpressionSnafu {
+            .map_err(|_| Error::UnexpectedExpression {
                 expr: "non-negative integer literal LIMIT",
-                expected_table: TableReference::bare("unknown"),
+                expected_table: tbl.clone(),
             })
             .map(Some),
         None => Ok(None), // No LIMIT value specified, treated as no limit
         _ => UnexpectedExpressionSnafu {
             expr: "non-negative integer literal LIMIT",
-            expected_table: TableReference::bare("unknown"),
+            expected_table: tbl.clone(),
         }
         .fail(),
     }
