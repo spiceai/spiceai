@@ -201,7 +201,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                     .map(|q| {
                         serde_json::json!({
                             "query_id": q.query_id,
-                            "status": q.status.to_string(),
+                            "status": q.state.clone(),
                             "created_at": q.created_at,
                             "sql_preview": q.sql_preview,
                         })
