@@ -26,9 +26,11 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::OrderingRequirements;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::SortOrderPushdownResult;
 use datafusion::physical_plan::execution_plan::{
     CardinalityEffect, InvariantLevel, check_default_invariants,
 };
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
@@ -378,6 +380,13 @@ impl ExecutionPlan for BytesProcessedExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }
 

@@ -459,6 +459,13 @@ impl ExecutionPlan for IndexerExec {
         CardinalityEffect::Equal
     }
 
+    fn try_pushdown_sort(
+        &self,
+        _order: &[datafusion::physical_expr::PhysicalSortExpr],
+    ) -> Result<datafusion::physical_plan::SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(datafusion::physical_plan::SortOrderPushdownResult::Unsupported)
+    }
+
     fn execute(
         &self,
         partition: usize,
