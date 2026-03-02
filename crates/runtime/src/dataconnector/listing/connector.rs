@@ -191,17 +191,6 @@ impl TableProvider for LocationPruningListingTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let Some(locations) = extract_location_predicates(filters) else {
-            // No location predicates — fall back to inner ListingTable scan.
-            // DF52's ListingTable does not support combining partition columns
-            // with metadata columns in its scan plan.
-            if !self.inner.options().table_partition_cols.is_empty()
-                && !self.inner.options().metadata_cols.is_empty()
-            {
-                return Err(DataFusionError::Execution(format!(
-                    "Table '{}': tables with both partition columns and listing metadata columns are unsupported on DataFusion v52. Disable listing metadata columns (e.g. `location`) for this dataset, or remove partition columns.",
-                    self.table_path
-                )));
-            }
             return self.inner.scan(state, projection, filters, limit).await;
         };
 
@@ -286,16 +275,16 @@ impl TableProvider for LocationPruningListingTable {
         );
         let file_source = self.inner.options().format.file_source(table_schema);
 
-        // Note: We intentionally do NOT pass projection indices to the FileScanConfigBuilder.
-        // The projection indices from the table scan are relative to the full table schema
-        // (file columns + partition columns + metadata columns), but FileScanConfigBuilder
-        // expects indices relative to only the file schema. Passing table-level indices would
-        // cause index-out-of-bounds errors. By omitting projection, DataFusion will read all
-        // columns and apply projections at a higher level.
         let mut builder = FileScanConfigBuilder::new(self.object_store_url(), file_source)
             .with_file_groups(file_groups)
             .with_limit(limit)
             .with_metadata_cols(self.inner.options().metadata_cols.clone())
+            .with_projection_indices(projection.cloned())
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to apply projection indices: {e}"
+                ))
+            })?
             .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
 
         if let Some(constraints) = self.inner.constraints() {
@@ -1905,10 +1894,10 @@ mod tests {
         let table_path =
             ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
         let file_format = Arc::new(ParquetFormat::default());
-        let options = ListingOptions::new(file_format)
+        let mut options = ListingOptions::new(file_format)
             .with_file_extension(".parquet")
-            .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))])
-            .with_table_partition_cols(vec![]);
+            .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))]);
+        options = options.with_table_partition_cols(vec![]);
 
         let file_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1932,17 +1921,31 @@ mod tests {
             file_schema,
         );
 
-        let filters = vec![datafusion_expr::col("location").eq(datafusion_expr::lit(
-            "s3://bucket/prefix/day=2025-01-01/file.parquet",
-        ))];
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register table");
 
-        let plan = provider
-            .scan(&ctx.state(), None, &filters, None)
+        let df = ctx
+            .sql("SELECT value FROM test_table WHERE location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
             .await
-            .expect("scan with location predicate");
+            .expect("execute query");
 
-        // 2 fields: the file column ("value") + the metadata column ("location")
-        assert_eq!(plan.schema().fields().len(), 2);
+        // Use create_physical_plan instead of collect — this triggers
+        // the scan/listing logic without actually reading parquet data
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("create physical plan");
+
+        assert_eq!(
+            plan.schema().fields().len(),
+            1,
+            "should project only the 'value' column"
+        );
+        assert_eq!(
+            plan.schema().field(0).name(),
+            "value",
+            "column should be 'value'"
+        );
 
         assert!(
             !no_list_store
@@ -1952,10 +1955,26 @@ mod tests {
         );
     }
 
-    /// Regression test for metadata-column projection with partition columns.
+    /// Regression test for issue where SELECT with metadata columns (like `location`)
+    /// appearing before partition columns in the projection would fail with
+    /// "column types must match schema types" error.
     ///
-    /// `DataFusion` v52 can panic in this path during physical planning.
-    /// Runtime must fail safely with a clear error instead of panicking.
+    /// The root cause was in `DataFusion`'s `ExtendedColumnProjector::project()` which
+    /// inserted partition columns first, then metadata columns, without accounting
+    /// for index position shifts when metadata columns had lower schema indices
+    /// than partition columns.
+    ///
+    /// For example, with schema [compression, day, location] where:
+    /// - compression is a file column (index 0)
+    /// - day is a partition column (index 1)
+    /// - location is a metadata column (index 2)
+    ///
+    /// `SELECT location, day, compression` would request projection [2, 1, 0] which
+    /// maps to output positions [0, 1, 2]. The old code would:
+    /// 1. Insert partition column `day` at position 1 → [compression, day]
+    /// 2. Insert metadata column `location` at position 0 → [location, compression, day]
+    ///
+    /// But the correct output should be [location, day, compression].
     #[tokio::test]
     async fn test_location_metadata_column_projection_order() {
         use datafusion::parquet::arrow::ArrowWriter;
@@ -2027,53 +2046,106 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .expect("register table");
 
-        // Test 1: SELECT with metadata + partition columns fails safely (no panic).
+        // Test 1: SELECT with location first (this was failing before the fix)
         let df = ctx
             .sql("SELECT location, day, compression FROM test_table")
             .await
             .expect("execute query");
-        let err = df
-            .collect()
-            .await
-            .expect_err("metadata+partition scan should fail safely");
-        assert!(
-            err.to_string().contains(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
-            ),
-            "expected a clear metadata+partition error, got: {err}"
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+
+        let result = &batches[0];
+        assert_eq!(result.num_columns(), 3, "should have 3 columns");
+        assert_eq!(result.num_rows(), 1, "should have 1 row");
+
+        // Verify column order is correct
+        assert_eq!(
+            result.schema().field(0).name(),
+            "location",
+            "first column should be location"
+        );
+        assert_eq!(
+            result.schema().field(1).name(),
+            "day",
+            "second column should be day"
+        );
+        assert_eq!(
+            result.schema().field(2).name(),
+            "compression",
+            "third column should be compression"
         );
 
-        // Test 2: SELECT with just location and day also fails safely.
+        // Verify data types are correct
+        let location_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("location should be string array");
+        let day_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("day should be string array");
+        let compression_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("compression should be string array");
+
+        // Verify values
+        assert!(
+            location_col
+                .value(0)
+                .contains("day=2025-01-01/data.parquet"),
+            "location should contain file path, got: {}",
+            location_col.value(0)
+        );
+        assert_eq!(day_col.value(0), "2025-01-01", "day should be 2025-01-01");
+        assert_eq!(
+            compression_col.value(0),
+            "gzip",
+            "compression should be gzip"
+        );
+
+        // Test 2: SELECT with just location and day (was causing panic before fix)
         let df = ctx
             .sql("SELECT location, day FROM test_table")
             .await
             .expect("execute query");
-        let err = df
-            .collect()
-            .await
-            .expect_err("metadata+partition scan should fail safely");
-        assert!(
-            err.to_string().contains(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
-            ),
-            "expected a clear metadata+partition error, got: {err}"
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "location",
+            "first column should be location"
+        );
+        assert_eq!(
+            batches[0].schema().field(1).name(),
+            "day",
+            "second column should be day"
         );
 
-        // Test 3: File-column-only projection also fails safely for this unsupported combination.
+        // Test 3: SELECT with reversed order (day, location) - should also work
         let df = ctx
-            .sql("SELECT compression FROM test_table")
+            .sql("SELECT day, location FROM test_table")
             .await
             .expect("execute query");
 
-        let err = df
-            .collect()
-            .await
-            .expect_err("metadata+partition scan should fail safely");
-        assert!(
-            err.to_string().contains(
-                "Tables with both partition columns and listing metadata columns are unsupported on DataFusion v52"
-            ),
-            "expected a clear metadata+partition error, got: {err}"
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "day",
+            "first column should be day"
+        );
+        assert_eq!(
+            batches[0].schema().field(1).name(),
+            "location",
+            "second column should be location"
         );
     }
 
