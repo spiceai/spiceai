@@ -21,7 +21,8 @@ limitations under the License.
 
 use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
-    PROTECTED_SNAPSHOTS_LOCK_POISONED, WRITE_SEMAPHORE_CLOSED,
+    PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, STAGING_WAL_FILENAME,
+    WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -44,7 +45,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::sink::DataSinkExec;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
@@ -465,7 +466,11 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_path(table_path: &str, table_id: i64, snapshot_id: &str) -> std::path::PathBuf {
+    pub(super) fn snapshot_dir_path(
+        table_path: &str,
+        table_id: i64,
+        snapshot_id: &str,
+    ) -> std::path::PathBuf {
         std::path::PathBuf::from(table_path)
             .join(table_id.to_string())
             .join(snapshot_id)
@@ -499,13 +504,49 @@ impl CayenneTableProvider {
         }
     }
 
-    fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
+    pub(super) fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
         self.object_store_config
             .as_ref()
             .ok_or_else(|| Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "S3 storage requires an object_store_config".to_string(),
             })
+    }
+
+    pub(super) fn snapshot_object_store_prefix(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ObjectStorePath>> {
+        if !self.table_metadata.path.starts_with("s3://") {
+            return Ok(None);
+        }
+
+        let snapshot_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            snapshot_id,
+        );
+
+        let url = url::Url::parse(&snapshot_url).map_err(|source| Error::UrlParse {
+            url: snapshot_url.clone(),
+            source,
+        })?;
+
+        let host = url.host_str().unwrap_or_default();
+        let config = self.require_object_store()?;
+        let config_host = config.url.host_str().unwrap_or_default();
+
+        if !config_host.is_empty() && !host.is_empty() && config_host != host {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "Snapshot host {host} does not match configured object store host {config_host}"
+                ),
+            });
+        }
+
+        let path = url.path().trim_start_matches('/');
+        Ok(Some(ObjectStorePath::from(path)))
     }
 
     async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> Result<()> {
@@ -570,11 +611,14 @@ impl CayenneTableProvider {
         for common_prefix in list_result.common_prefixes {
             if let Some(snapshot_id) = common_prefix.parts().last() {
                 let snapshot_id_str = snapshot_id.as_ref();
-                // Skip current snapshot and protected snapshots
+                // Skip current snapshot, protected snapshots, and the staging directory
                 if snapshot_id_str == current_snapshot
                     || protected_snapshot_ids.contains(snapshot_id_str)
+                    || snapshot_id_str == STAGING_DIR_NAME
                 {
-                    tracing::debug!("Keeping snapshot: {snapshot_id_str} (current or protected)");
+                    tracing::debug!(
+                        "Keeping snapshot: {snapshot_id_str} (current, protected, or staging)"
+                    );
                     continue;
                 }
                 self.delete_prefix_with_object_store(&common_prefix).await?;
@@ -675,6 +719,200 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Clear the staging directory, removing any leftover files.
+    ///
+    /// Called at the start of each staged append to guarantee a clean slate.
+    /// If the directory does not exist it is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be cleaned or created.
+    pub(crate) async fn clear_staging_dir(&self) -> Result<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            // S3: delete all objects under the staging prefix
+            if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
+                self.delete_prefix_with_object_store(&prefix).await?;
+            }
+        } else {
+            // Local FS: remove and recreate the directory
+            let staging_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                STAGING_DIR_NAME,
+            );
+            match tokio::fs::remove_dir_all(&staging_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            tokio::fs::create_dir_all(&staging_dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Move all files from the staging directory into the current snapshot directory.
+    ///
+    /// On local filesystems `rename()` is used, which is atomic on the same filesystem
+    /// (staging and snapshot dirs share `{table_path}/{table_id}/`).
+    ///
+    /// On S3, files are copied to the current snapshot prefix first, then the staging
+    /// originals are deleted (copy-all-then-delete-all ordering to avoid data loss if
+    /// the operation is interrupted).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any file move/copy fails.
+    pub(crate) async fn move_files_to_current_snapshot(&self) -> Result<()> {
+        let current_snapshot = self.get_current_snapshot_id()?;
+
+        if self.table_metadata.path.starts_with("s3://") {
+            self.move_staging_files_s3(&current_snapshot).await
+        } else {
+            self.move_staging_files_local(&current_snapshot).await
+        }
+    }
+
+    /// Move staging files to the current snapshot on local filesystem.
+    async fn move_staging_files_local(&self, current_snapshot: &str) -> Result<()> {
+        let staging_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            STAGING_DIR_NAME,
+        );
+        let target_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            current_snapshot,
+        );
+
+        // Ensure target directory exists
+        Self::ensure_snapshot_dir_exists(&target_dir).await?;
+
+        let mut entries = tokio::fs::read_dir(&staging_dir).await?;
+        let mut moved_count = 0usize;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let file_name = entry.file_name();
+
+            // Skip the WAL file — it is managed separately (removed after
+            // all data files have been successfully moved).
+            if file_name == STAGING_WAL_FILENAME {
+                continue;
+            }
+
+            let src = staging_dir.join(&file_name);
+            let dst = target_dir.join(&file_name);
+
+            tokio::fs::rename(&src, &dst).await?;
+            moved_count += 1;
+        }
+
+        tracing::debug!(
+            "Moved {moved_count} file(s) from staging to snapshot {current_snapshot} for table {table_name}",
+            table_name = self.table_metadata.table_name,
+        );
+
+        Ok(())
+    }
+
+    /// Move staging files to the current snapshot on S3.
+    ///
+    /// Uses copy-all-then-delete-all ordering: all files are copied to the target
+    /// prefix first, then staging originals are deleted. If interrupted after copies
+    /// but before deletes, data exists in both locations (safe — deduplicated by PK
+    /// or idempotent for append-only tables).
+    async fn move_staging_files_s3(&self, current_snapshot: &str) -> Result<()> {
+        let config = self.require_object_store()?;
+
+        let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? else {
+            return Ok(());
+        };
+        let Some(target_prefix) = self.snapshot_object_store_prefix(current_snapshot)? else {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("Cannot compute S3 prefix for snapshot '{current_snapshot}'"),
+            });
+        };
+
+        // List all objects in staging
+        let objects: Vec<_> = config
+            .store
+            .list(Some(&staging_prefix))
+            .try_collect()
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "list staging objects for move",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?;
+
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: copy data objects to target prefix (skip WAL file)
+        let mut copied_locations = Vec::with_capacity(objects.len());
+        for meta in &objects {
+            let relative = meta
+                .location
+                .as_ref()
+                .strip_prefix(staging_prefix.as_ref())
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "Staging object '{}' does not have expected prefix '{}'",
+                        meta.location,
+                        staging_prefix.as_ref(),
+                    ),
+                })?;
+
+            // Skip the WAL file — it is managed separately (removed after
+            // all data files have been successfully copied/deleted).
+            if relative == STAGING_WAL_FILENAME {
+                continue;
+            }
+            let target_path =
+                ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+
+            config
+                .store
+                .copy(&meta.location, &target_path)
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "copy staging file to snapshot",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+            copied_locations.push(meta.location.clone());
+        }
+
+        // Phase 2: delete staging originals
+        for location in &copied_locations {
+            config
+                .store
+                .delete(location)
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "delete staging file after copy",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+        }
+
+        tracing::debug!(
+            "Moved {} file(s) from staging to snapshot {current_snapshot} (S3) for table {}",
+            copied_locations.len(),
+            self.table_metadata.table_name,
+        );
+
+        Ok(())
+    }
+
     /// Sync a directory to ensure all files are durably written to disk.
     ///
     /// This is critical for crash safety: we must ensure all data files are
@@ -771,9 +1009,15 @@ impl CayenneTableProvider {
                 continue;
             };
 
-            // Skip the current snapshot and protected snapshots
-            if snapshot_id == current_snapshot_id || protected_snapshot_ids.contains(snapshot_id) {
-                tracing::debug!("Keeping snapshot: {} (current or protected)", snapshot_id);
+            // Skip the current snapshot, protected snapshots, and the staging directory
+            if snapshot_id == current_snapshot_id
+                || protected_snapshot_ids.contains(snapshot_id)
+                || snapshot_id == STAGING_DIR_NAME
+            {
+                tracing::debug!(
+                    "Keeping snapshot: {} (current, protected, or staging)",
+                    snapshot_id
+                );
                 continue;
             }
 
@@ -938,7 +1182,7 @@ impl CayenneTableProvider {
             Self::load_protected_snapshots(Arc::clone(&catalog), table_id, &pk_deletion_strategy)
                 .await?;
 
-        Ok(Self {
+        let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
@@ -952,7 +1196,13 @@ impl CayenneTableProvider {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
-        })
+        };
+
+        // Fail construction if a staging WAL exists — the table may contain
+        // partial data from an interrupted append and must be resolved first.
+        provider.ensure_no_incomplete_write().await?;
+
+        Ok(provider)
     }
 
     /// Create a new table in Cayenne.
@@ -1349,6 +1599,10 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
+        // Create session context once with object store registered (if S3),
+        // then share the session state across all parallel write tasks.
+        let session_state = Arc::new(self.create_session_context().state());
+
         // Bounded parallelism: configurable concurrent writes to optimize I/O
         let semaphore = Arc::clone(self.context.upload_semaphore());
 
@@ -1409,6 +1663,7 @@ impl CayenneTableProvider {
                 let table_name = self.table_metadata.table_name.clone();
                 let start = start_time;
                 let current_chunk_num = chunk_count;
+                let state = Arc::clone(&session_state);
 
                 if is_s3 {
                     tracing::info!(
@@ -1420,9 +1675,12 @@ impl CayenneTableProvider {
                 }
 
                 write_tasks.spawn(async move {
-                    let result =
-                        Self::write_chunk_to_listing_table(&listing_table_clone, chunk_to_write)
-                            .await;
+                    let result = Self::write_chunk_to_listing_table(
+                        &listing_table_clone,
+                        chunk_to_write,
+                        &state,
+                    )
+                    .await;
 
                     if is_s3 {
                         total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
@@ -1481,10 +1739,12 @@ impl CayenneTableProvider {
             let total_bytes = Arc::clone(&total_bytes_written);
             let files_count = Arc::clone(&files_written);
             let is_s3 = is_s3_storage;
+            let state = Arc::clone(&session_state);
 
             write_tasks.spawn(async move {
                 let result =
-                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk).await;
+                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk, &state)
+                        .await;
 
                 if is_s3 {
                     total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
@@ -1535,9 +1795,16 @@ impl CayenneTableProvider {
     /// Write a chunk of record batches to a specific `ListingTable`.
     ///
     /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
+    ///
+    /// # Arguments
+    ///
+    /// * `listing_table` - The listing table to write to
+    /// * `chunk` - Record batches to write
+    /// * `state` - Shared session state (with object store already registered for S3)
     async fn write_chunk_to_listing_table(
         listing_table: &ListingTable,
         chunk: Vec<RecordBatch>,
+        state: &SessionState,
     ) -> Result<u64> {
         if chunk.is_empty() {
             return Ok(0);
@@ -1555,11 +1822,8 @@ impl CayenneTableProvider {
             Box::pin(chunk_stream),
         ));
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         let insert_plan = listing_table
-            .insert_into(&state, stream_exec, InsertOp::Append)
+            .insert_into(state, stream_exec, InsertOp::Append)
             .await?;
 
         collect(insert_plan, state.task_ctx()).await?;
@@ -3236,7 +3500,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the lock is poisoned.
-    fn get_current_snapshot_id(&self) -> Result<String> {
+    pub(super) fn get_current_snapshot_id(&self) -> Result<String> {
         let guard = self
             .current_snapshot_id
             .read()
