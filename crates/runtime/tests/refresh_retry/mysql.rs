@@ -225,7 +225,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             rt.datafusion()
                 .update_refresh_sql(
                     TableReference::parse_str("lineitem_retries"),
-                    Some("SELECT * from lineitem_retries limit 10".to_string()),
+                    "SELECT * from lineitem_retries limit 10".to_string(),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
