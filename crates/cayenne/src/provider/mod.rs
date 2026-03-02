@@ -40,7 +40,7 @@ limitations under the License.
 //! - [`utils`]: Numeric conversion utilities
 //! - [`constants`]: Shared constants
 //! - [`context`]: Shared context for Cayenne operations
-
+//! - [`staging_wal`]: Staging WAL for crash-safe staged appends
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
@@ -49,6 +49,7 @@ pub(crate) mod deletion_strategy;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
+pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod utils;
@@ -136,6 +137,12 @@ pub enum Error {
     /// Internal invariant violation or missing configuration. Should never happen in normal operation.
     #[snafu(display("Internal error in table '{table}': {message}"))]
     Internal { table: String, message: String },
+
+    /// A previous write was interrupted, leaving the table in a potentially
+    /// inconsistent state. The staging WAL file must be resolved before the
+    /// table can be used.
+    #[snafu(display("Table '{table}' may be in an inconsistent state: {message}"))]
+    IncompleteWrite { table: String, message: String },
 
     /// Operation is not yet implemented.
     #[snafu(display("Unsupported operation: {operation}"))]

@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::CatalogInfo;
 
@@ -30,10 +30,15 @@ use runtime_api_types::v1::CatalogInfo;
 
 Examples:
   spice catalogs
+  spice catalogs -o json
 
 See more at: https://spiceai.org/docs/"#
 )]
-pub struct CatalogsArgs {}
+pub struct CatalogsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
 
 impl TableRow for CatalogInfo {
     fn headers() -> Vec<&'static str> {
@@ -46,7 +51,7 @@ impl TableRow for CatalogInfo {
 }
 
 /// Execute the catalogs command.
-pub async fn execute(ctx: &RuntimeContext, _args: &CatalogsArgs) -> Result<()> {
+pub async fn execute(ctx: &RuntimeContext, args: &CatalogsArgs) -> Result<()> {
     let response = ctx.get("/v1/catalogs").await.map_err(|_| {
         RuntimeUnavailableSnafu {
             endpoint: ctx.http_endpoint().to_string(),
@@ -68,7 +73,10 @@ pub async fn execute(ctx: &RuntimeContext, _args: &CatalogsArgs) -> Result<()> {
         .build()
     })?;
 
-    write_table(&catalogs);
+    match args.output {
+        OutputFormat::Table => write_table(&catalogs),
+        OutputFormat::Json => write_json(&catalogs)?,
+    }
 
     Ok(())
 }
