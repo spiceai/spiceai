@@ -567,12 +567,12 @@ mod tests {
         use sqlparser::ast::{BinaryOperator, Value};
 
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Value(Value::Number("1".to_string(), false))),
+            left: Box::new(Expr::Value(Value::Number("1".to_string(), false).into())),
             op: BinaryOperator::And,
             right: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Value(Value::Number("2".to_string(), false))),
+                left: Box::new(Expr::Value(Value::Number("2".to_string(), false).into())),
                 op: BinaryOperator::And,
-                right: Box::new(Expr::Value(Value::Number("3".to_string(), false))),
+                right: Box::new(Expr::Value(Value::Number("3".to_string(), false).into())),
             }),
         };
 
