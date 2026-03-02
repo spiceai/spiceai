@@ -1987,7 +1987,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
@@ -2117,7 +2116,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
