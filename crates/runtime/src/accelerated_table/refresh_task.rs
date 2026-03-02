@@ -953,28 +953,26 @@ impl RefreshTask {
             RefreshMode::Caching => UpdateType::Overwrite,
         };
 
-        // If an override SQL string was provided, parse it into a RefreshSQL,
-        // preserving partition filters from the base refresh.
-        let effective_sql = if let Some(override_raw) = &refresh.override_sql_raw {
-            let source_schema = federated_provider.schema();
-            match refresh_sql::parse_refresh_sql(dataset_name.clone(), override_raw, source_schema)
-            {
-                Ok((mut parsed, _schema)) => {
-                    // Preserve partition filters from base refresh
-                    if let Some(base) = &refresh.sql {
-                        parsed.set_partition_filters(base.partition_filters().to_vec());
-                    }
-                    Some(parsed)
+        // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
+        // spicepod), parse and use it. Transfer partition filters from the base refresh SQL.
+        let effective_sql = match refresh.override_sql_raw.map(|s| {
+            refresh_sql::parse_refresh_sql(dataset_name.clone(), &s, federated_provider.schema())
+        }) {
+            Some(Ok((mut parsed, _schema))) => {
+                if let Some(base) = &refresh.sql {
+                    parsed.set_partition_filters(base.partition_filters().to_vec());
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse override refresh_sql for {dataset_name}, falling back to base: {e}"
-                    );
-                    refresh.sql.clone()
-                }
+                Some(parsed)
             }
-        } else {
-            refresh.sql.clone()
+            Some(Err(e)) => {
+                tracing::error!("Failed to parse override refresh_sql for {dataset_name}: {e}");
+                return Err(RetryError::permanent(
+                    super::Error::FailedToRefreshDataset {
+                        source: DataFusionError::Plan(format!("Invalid override refresh_sql: {e}")),
+                    },
+                ));
+            }
+            None => refresh.sql.clone(),
         };
 
         // Extract SQL string and partition filters from RefreshSQL

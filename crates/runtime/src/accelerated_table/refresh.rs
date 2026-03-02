@@ -334,8 +334,9 @@ impl Refresh {
     /// Apply overrides from a refresh request.
     ///
     /// Note: if the override includes a `sql` string, it is stored as the raw override.
-    /// The caller is responsible for parsing it into a `RefreshSQL` via
-    /// `RefreshSQL::parse()` before use (this requires table name and schema context).
+    /// The caller is responsible for parsing it into a `RefreshSQL` using
+    /// `crate::datafusion::refresh_sql::parse_refresh_sql` before use
+    /// (this requires table name and schema context).
     #[must_use]
     pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
         if let Some(sql_str) = &overrides.sql {

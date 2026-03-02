@@ -224,7 +224,7 @@ fn parse_limit(limit: &Option<LimitClause>, tbl: &TableReference) -> Result<Opti
         None => return Ok(None), // No LIMIT clause specified, treated as no limit
         _ => {
             return UnexpectedExpressionSnafu {
-                expr: "LIMIT <offset>, <limit>",
+                expr: "unsupported LIMIT clause; expected LIMIT <non-negative integer literal>",
                 expected_table: tbl.clone(),
             }
             .fail();

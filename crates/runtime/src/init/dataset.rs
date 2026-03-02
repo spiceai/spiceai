@@ -637,6 +637,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
+                    vec![],
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -829,6 +830,7 @@ impl Runtime {
                     accelerated_table,
                     secrets: self.secrets(),
                     bootstrap_status,
+                    initial_partition_filters,
                 },
             )
             .await
@@ -836,20 +838,6 @@ impl Runtime {
                 data_connector: source.clone(),
                 connector_component: ConnectorComponent::from(&ds),
             })?;
-
-        // Apply initial partition filters after registration
-        if !initial_partition_filters.is_empty() {
-            if let Err(e) = self
-                .df
-                .update_partition_filters(ds.name.clone(), initial_partition_filters)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to set initial partition filters for {}: {e}",
-                    ds.name
-                );
-            }
-        }
 
         if let Some(notifier) = notifier {
             // spawn a background task to wait for the accelerated table to be ready before creating schedules

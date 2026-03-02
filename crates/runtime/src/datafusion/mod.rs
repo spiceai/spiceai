@@ -386,6 +386,10 @@ pub enum Table {
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        /// Initial partition filter expressions to apply before the refresher starts.
+        /// These are set on the `Refresh` during table registration to avoid a race
+        /// where the first refresh runs before partition filters are applied.
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -633,6 +637,7 @@ impl DataFusion {
                 accelerated_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -666,6 +671,7 @@ impl DataFusion {
                         federated_read_table,
                         secrets,
                         bootstrap_status,
+                        initial_partition_filters,
                     )
                     .await?
                 }
@@ -1527,6 +1533,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1694,6 +1701,20 @@ impl DataFusion {
         refresh
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
+
+        // Apply initial partition filters before the refresher starts to avoid a race
+        // where the first refresh runs without partition filters.
+        if !initial_partition_filters.is_empty() {
+            use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+            if let Some(ref mut sql) = refresh.sql {
+                sql.set_partition_filters(initial_partition_filters);
+            } else {
+                let mut sql =
+                    RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
+                sql.set_partition_filters(initial_partition_filters);
+                refresh = refresh.refresh_sql(sql);
+            }
+        }
 
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -1988,6 +2009,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -1996,6 +2018,7 @@ impl DataFusion {
                 federated_read_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
