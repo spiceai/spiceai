@@ -43,9 +43,9 @@ use tokio::sync::RwLock;
 pub mod arrow;
 #[cfg(not(windows))]
 pub mod cayenne;
-pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
 #[cfg(feature = "postgres-accel")]

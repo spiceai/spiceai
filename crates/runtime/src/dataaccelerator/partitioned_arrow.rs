@@ -36,9 +36,7 @@ use runtime_table_partition::{
 use snafu::prelude::*;
 
 use crate::{
-    component::dataset::acceleration::Engine,
-    parameters::ParameterSpec,
-    register_data_accelerator,
+    component::dataset::acceleration::Engine, parameters::ParameterSpec, register_data_accelerator,
 };
 
 use super::{AccelerationSource, DataAccelerator};
