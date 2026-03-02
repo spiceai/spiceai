@@ -22,7 +22,7 @@ mod startup;
 
 use std::collections::HashMap;
 
-use datafusion::sql::{TableReference, unparser::expr_to_sql};
+use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
 pub use manager::PartitionManager;
 pub use metadata::{
@@ -88,28 +88,24 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Extract partition filter expressions for a table from the assignments map.
+/// Multiple assigned partitions are combined with OR (union semantics), then returned
+/// as a single-element `Vec<Expr>` so that applying them via `.filter()` is correct.
+/// Returns an empty `Vec` if no partitions are assigned.
 #[expect(clippy::implicit_hasher)]
-pub fn update_partitioning_filter_in_refresh_sql(
-    current_sql: Option<&str>,
+pub fn get_partition_filter_exprs(
     tbl: &TableReference,
     assignments: &HashMap<TableReference, Vec<Expr>>,
-) -> Result<Option<String>, datafusion::error::DataFusionError> {
+) -> Vec<Expr> {
     let partitions = assignments.get(tbl).cloned().unwrap_or_default();
     if partitions.is_empty() {
-        return Ok(current_sql.map(ToString::to_string));
+        return vec![];
     }
-    let filter_expr = partitions
-        .iter()
-        .cloned()
+    // Combine multiple partition expressions with OR (union of partitions),
+    // then wrap in a single-element Vec so `.filter()` applies it as one predicate.
+    let combined = partitions
+        .into_iter()
         .reduce(Expr::or)
         .unwrap_or_else(|| unreachable!("partitions is not empty"));
-
-    let filter_sql = expr_to_sql(&filter_expr).map(|ast| ast.to_string())?;
-
-    let sql = if let Some(sql) = current_sql {
-        format!("SELECT * FROM ({sql}) AS _partitioned_source WHERE {filter_sql}")
-    } else {
-        format!("SELECT * FROM {tbl} WHERE {filter_sql}")
-    };
-    Ok(Some(sql))
+    vec![combined]
 }
