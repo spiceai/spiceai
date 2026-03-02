@@ -23,7 +23,25 @@ use crate::context::RuntimeContext;
 use crate::error::Result;
 use clap::{Args, Subcommand};
 
-pub use auth_config::merge_auth_config;
+pub use auth_config::{merge_auth_config, store_keychain};
+
+/// Credential storage backend for `spice login`.
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
+pub enum LoginOutput {
+    /// Write credentials to .env file (default)
+    #[default]
+    Env,
+    /// Print credentials as JSON to stdout
+    Json,
+    /// Store credentials in the platform keychain
+    Keychain,
+}
+
+impl PartialEq for LoginOutput {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
 
 /// Arguments for the login command.
 #[derive(Args, Debug)]
@@ -31,6 +49,10 @@ pub struct LoginArgs {
     /// API key for direct authentication (bypasses OAuth flow)
     #[arg(short = 'k', long)]
     pub key: Option<String>,
+
+    /// Credential storage backend
+    #[arg(long, short = 'o', default_value = "env")]
+    pub output: LoginOutput,
 
     #[command(subcommand)]
     pub command: Option<LoginCommands>,
@@ -99,17 +121,45 @@ pub async fn execute(ctx: &RuntimeContext, args: LoginArgs) -> Result<()> {
         Some(LoginCommands::Abfs(provider_args)) => providers::login_abfs(ctx, provider_args).await,
         None => {
             // Main Spice.ai login with OAuth flow
-            login_spiceai(ctx, args.key).await
+            login_spiceai(ctx, args.key, args.output).await
         }
     }
 }
 
+/// Save credentials using the specified output backend.
+fn save_credentials(output: &LoginOutput, auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
+    match output {
+        LoginOutput::Env => merge_auth_config(auth_type, params),
+        LoginOutput::Json => {
+            let mut map = serde_json::Map::new();
+            for (key, value) in params {
+                let secret_key = format!("SPICE_{auth_type}_{key}");
+                map.insert(secret_key, serde_json::Value::String((*value).to_string()));
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default()
+            );
+            Ok(())
+        }
+        LoginOutput::Keychain => store_keychain(auth_type, params),
+    }
+}
+
 /// Login to Spice.ai using OAuth flow or direct API key.
-async fn login_spiceai(_ctx: &RuntimeContext, api_key: Option<String>) -> Result<()> {
+async fn login_spiceai(
+    _ctx: &RuntimeContext,
+    api_key: Option<String>,
+    output: LoginOutput,
+) -> Result<()> {
+    let is_json = output == LoginOutput::Json;
+
     if let Some(key) = api_key {
         // Direct API key authentication
-        merge_auth_config("SPICEAI", &[("API_KEY", key.as_str())])?;
-        println!("\x1b[32mSuccessfully logged in to Spice.ai with API key\x1b[0m");
+        save_credentials(&output, "SPICEAI", &[("API_KEY", key.as_str())])?;
+        if !is_json {
+            println!("\x1b[32mSuccessfully logged in to Spice.ai with API key\x1b[0m");
+        }
         return Ok(());
     }
 
@@ -119,11 +169,13 @@ async fn login_spiceai(_ctx: &RuntimeContext, api_key: Option<String>) -> Result
 
     let auth_url = format!("{base_url}/auth/token?code={auth_code}");
 
-    println!("Attempting to open Spice.ai authorization page in your default browser");
-    println!("\nYour auth code:\n");
-    println!("{}-{}", &auth_code[..4], &auth_code[4..]);
-    println!("\nIf the browser does not open, visit the following URL manually:");
-    println!("\n{auth_url}\n");
+    if !is_json {
+        println!("Attempting to open Spice.ai authorization page in your default browser");
+        println!("\nYour auth code:\n");
+        println!("{}-{}", &auth_code[..4], &auth_code[4..]);
+        println!("\nIf the browser does not open, visit the following URL manually:");
+        println!("\n{auth_url}\n");
+    }
 
     // Try to open browser automatically
     let _ = open::that(&auth_url);
@@ -185,24 +237,36 @@ async fn login_spiceai(_ctx: &RuntimeContext, api_key: Option<String>) -> Result
     )
     .await?;
 
-    // Save credentials
-    merge_auth_config(
-        "SPICEAI",
-        &[
-            ("TOKEN", &access_token),
-            ("API_KEY", &auth_context.app_api_key.unwrap_or_default()),
-        ],
-    )?;
+    let api_key_value = auth_context.app_api_key.unwrap_or_default();
 
-    println!(
-        "\x1b[32mSuccessfully logged in to Spice.ai as {} ({})\x1b[0m",
-        auth_context.username, auth_context.email
-    );
-    println!(
-        "\x1b[32mUsing app {}/{}\x1b[0m",
-        auth_context.org_name,
-        auth_context.app_name.unwrap_or_default()
-    );
+    // Save credentials
+    if is_json {
+        // In JSON mode, include auth context fields alongside credentials
+        let json = serde_json::json!({
+            "SPICE_SPICEAI_TOKEN": &access_token,
+            "SPICE_SPICEAI_API_KEY": &api_key_value,
+            "username": &auth_context.username,
+            "org": &auth_context.org_name,
+            "app": auth_context.app_name.as_deref().unwrap_or_default(),
+        });
+        println!("{}", serde_json::to_string(&json).unwrap_or_default());
+    } else {
+        save_credentials(
+            &output,
+            "SPICEAI",
+            &[("TOKEN", &access_token), ("API_KEY", &api_key_value)],
+        )?;
+
+        println!(
+            "\x1b[32mSuccessfully logged in to Spice.ai as {} ({})\x1b[0m",
+            auth_context.username, auth_context.email
+        );
+        println!(
+            "\x1b[32mUsing app {}/{}\x1b[0m",
+            auth_context.org_name,
+            auth_context.app_name.unwrap_or_default()
+        );
+    }
 
     Ok(())
 }

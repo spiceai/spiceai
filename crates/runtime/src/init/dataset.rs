@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
+use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -637,6 +637,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
+                    vec![],
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -758,6 +759,7 @@ impl Runtime {
 
         // Apply partition filters if assigned (Executor mode)
         let mut ds = ds;
+        let mut initial_partition_filters = vec![];
         // Only apply partition logic if the dataset is configured for partitioning
         if ds
             .acceleration
@@ -766,22 +768,17 @@ impl Runtime {
             && let Some(assignments) = self.partition_assignments()
         {
             let assignments = assignments.read().await;
-            let mut ds_mod = (*ds).clone();
-            if let Some(new_sql) = update_partitioning_filter_in_refresh_sql(
-                ds.acceleration
-                    .as_ref()
-                    .and_then(|acc| acc.refresh_sql.as_deref()),
-                &ds.name,
-                &assignments,
-            )
-            .context(crate::UnableToConvertPartitionExprSnafu)?
-            {
+            let partition_filters = get_partition_filter_exprs(&ds.name, &assignments);
+            if !partition_filters.is_empty() {
                 tracing::debug!(
-                    "For table={}, adding filters to refresh_sql for assigned partitions. New refresh_sql={new_sql}",
+                    "For table={}, extracted {} partition filter(s) for assigned partitions.",
                     ds.name,
+                    partition_filters.len(),
                 );
+                initial_partition_filters = partition_filters;
+                // Clear partition_by and convert engine to unpartitioned
+                let mut ds_mod = (*ds).clone();
                 if let Some(acc) = ds_mod.acceleration.as_mut() {
-                    acc.refresh_sql = Some(new_sql);
                     acc.partition_by = vec![];
                     acc.engine = acc.engine.to_unpartitioned();
                 }
@@ -833,6 +830,7 @@ impl Runtime {
                     accelerated_table,
                     secrets: self.secrets(),
                     bootstrap_status,
+                    initial_partition_filters,
                 },
             )
             .await

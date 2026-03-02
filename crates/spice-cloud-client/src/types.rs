@@ -209,7 +209,7 @@ pub struct ContainerImage {
     pub channel: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContainerImagesResponse {
     pub images: Vec<ContainerImage>,
     pub default: Option<String>,
@@ -251,7 +251,7 @@ pub struct LogEntry {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LogsResponse {
     pub logs: Vec<LogEntry>,
 }
@@ -260,13 +260,13 @@ pub struct LogsResponse {
 // API keys
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiKeysResponse {
     pub api_key: Option<String>,
     pub api_key_2: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegenerateApiKeyResponse {
     pub api_key: Option<String>,
     pub api_key_2: Option<String>,
@@ -292,13 +292,13 @@ pub struct PodMetrics {
     pub disk_write_operations: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionMetrics {
     pub rows_ingested: Option<u64>,
     pub bytes_ingested: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MetricsResponse {
     pub metrics: BTreeMap<String, PodMetrics>,
     #[serde(default)]
@@ -324,7 +324,7 @@ pub struct AuthExchangeResponse {
     pub access_denied: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AuthContext {
     pub username: String,
     pub email: String,

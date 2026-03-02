@@ -231,7 +231,7 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
             run_and_snapshot_query(
                 &rt,
                 r#"select 
-                    round("ID") as ID, 
+                    "ID"::BIGINT as ID,
                     "VAL_NUMBER", 
                     "VAL_DECIMAL", 
                     "VAL_FLOAT", 

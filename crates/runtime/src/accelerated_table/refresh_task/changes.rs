@@ -82,7 +82,7 @@ impl RefreshTask {
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
-        let sql = refresh.read().await.sql.clone();
+        let sql = refresh.read().await.display_sql();
 
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
@@ -126,7 +126,7 @@ impl RefreshTask {
                         }
                         Err(e) => {
                             self.set_refresh_status(
-                                refresh.read().await.sql.clone().as_deref(),
+                                refresh.read().await.display_sql().as_deref(),
                                 status::ComponentStatus::error_with_message(e.to_string()),
                             )
                             .await;
@@ -143,7 +143,7 @@ impl RefreshTask {
                     }
 
                     self.set_refresh_status(
-                        refresh.read().await.sql.clone().as_deref(),
+                        refresh.read().await.display_sql().as_deref(),
                         status::ComponentStatus::error_with_message(e.to_string()),
                     )
                     .await;
@@ -294,11 +294,14 @@ impl RefreshTask {
             let session_state = ctx.state();
 
             let _lock_guard = self.accelerator_write_mutex.lock().await;
-            let delete_plan = deletion_provider
-                .delete_from(&session_state, &[combined])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            let delete_plan = DeletionTableProvider::delete_from(
+                deletion_provider.as_ref(),
+                &session_state,
+                &[combined],
+            )
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
             collect(delete_plan, ctx.task_ctx())
                 .await
                 .map_err(find_datafusion_root)

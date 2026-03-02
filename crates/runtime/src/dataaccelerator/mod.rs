@@ -890,7 +890,7 @@ mod accelerator_compat_tests {
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
@@ -1987,7 +1987,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
@@ -2117,7 +2116,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
@@ -2137,8 +2135,7 @@ mod accelerator_compat_tests {
 
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
-            let plan = table
-                .delete_from(&ctx.state(), &[filter])
+            let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
                 .await
                 .expect("deletion should be successful");
 
@@ -2910,7 +2907,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_overwrite_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Turso/SQLite doesn't support INSERT OVERWRITE in the same way - it appends instead

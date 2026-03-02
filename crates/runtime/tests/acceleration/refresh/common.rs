@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::allow_attributes)]
+
 use crate::postgres::common;
 use crate::postgres::common::get_pg_params;
 use crate::utils::{register_test_connectors, runtime_ready_check};
@@ -92,7 +94,6 @@ pub(crate) fn get_dataset_no_time_column(port: usize) -> Dataset {
 }
 
 /// Get dataset with Unix timestamp column (INT) to work around Vortex v0.52.1 timestamp metadata bug
-#[expect(dead_code)]
 pub(crate) fn get_dataset_unix_time(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:test_table", "test_table");
     ds.params = Some(Params::from_string_map(
@@ -187,7 +188,6 @@ pub(crate) async fn start_test_runtime(
     start_test_runtime_with_dataset(port, acceleration, get_dataset(port)).await
 }
 
-#[expect(dead_code)]
 pub(crate) async fn start_test_runtime_no_time_column(
     port: usize,
     acceleration: Acceleration,
@@ -195,7 +195,6 @@ pub(crate) async fn start_test_runtime_no_time_column(
     start_test_runtime_with_dataset(port, acceleration, get_dataset_no_time_column(port)).await
 }
 
-#[expect(dead_code)]
 pub(crate) async fn start_test_runtime_unix_time(
     port: usize,
     acceleration: Acceleration,
