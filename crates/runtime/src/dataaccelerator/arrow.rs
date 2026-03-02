@@ -72,7 +72,7 @@ impl DataAccelerator for ArrowAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<PartitionedBy>,
+        _partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
         // which overwrites the entire table. Primary key constraints cause uniqueness validation
