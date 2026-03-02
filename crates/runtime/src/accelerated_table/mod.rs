@@ -994,10 +994,7 @@ impl AcceleratedTable {
         Arc::clone(&self.synchronized_children)
     }
 
-    pub async fn update_refresh_sql(
-        &self,
-        refresh_sql: Option<crate::accelerated_table::refresh::RefreshSQL>,
-    ) -> Result<()> {
+    pub async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
@@ -1008,23 +1005,16 @@ impl AcceleratedTable {
             .map(|s| s.partition_filters().to_vec())
             .unwrap_or_default();
 
-        if let Some(mut new_sql) = refresh_sql {
-            if !existing_partition_filters.is_empty() {
-                new_sql.set_partition_filters(existing_partition_filters);
-            }
-            if !is_spice_internal_dataset(&self.dataset_name) {
-                tracing::info!(
-                    "[refresh] Updated refresh SQL for {dataset_name} to {}",
-                    new_sql.display_sql()
-                );
-            }
-            refresh.sql = Some(new_sql);
-        } else {
-            if !is_spice_internal_dataset(&self.dataset_name) {
-                tracing::info!("[refresh] Removed refresh SQL for {dataset_name}");
-            }
-            refresh.sql = None;
+        if !existing_partition_filters.is_empty() {
+            refresh_sql.set_partition_filters(existing_partition_filters);
         }
+        if !is_spice_internal_dataset(&self.dataset_name) {
+            tracing::info!(
+                "[refresh] Updated refresh SQL for {dataset_name} to {}",
+                refresh_sql.display_sql()
+            );
+        }
+        refresh.sql = Some(refresh_sql);
 
         Ok(())
     }

@@ -58,8 +58,8 @@ use tokio::time::sleep;
 pub enum RefreshSQLColumns {
     /// SELECT * — all columns from source.
     All,
-    /// SELECT col1, col2, ... — specific columns by name.
-    Named(Vec<String>),
+    /// SELECT col1, col2, ... — specific columns preserving original quoting/case.
+    Named(Vec<sqlparser::ast::Ident>),
 }
 
 /// Structured representation of refresh SQL, decomposed into validated parts.
@@ -105,7 +105,11 @@ impl RefreshSQL {
     pub fn to_sql(&self) -> String {
         let columns_str = match &self.columns {
             RefreshSQLColumns::All => "*".to_string(),
-            RefreshSQLColumns::Named(cols) => cols.join(", "),
+            RefreshSQLColumns::Named(idents) => idents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
         };
 
         let mut sql = format!("SELECT {columns_str} FROM {}", self.table);

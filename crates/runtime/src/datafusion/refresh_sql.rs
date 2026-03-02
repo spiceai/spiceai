@@ -111,7 +111,7 @@ pub fn parse_refresh_sql(
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
 
-                let limit_value = parse_limit(query.limit_clause.as_deref(), &expected_table)?;
+                let limit_value = parse_limit(&query.limit_clause, &expected_table)?;
 
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
@@ -214,7 +214,7 @@ pub fn parse_refresh_sql(
 }
 
 /// Extract and validate the LIMIT clause, ensuring it is a simple non-negative integer literal if present, and that no unsupported features like OFFSET or LIMIT BY are used.
-fn parse_limit(limit: Option<&LimitClause>, tbl: &TableReference) -> Result<Option<usize>> {
+fn parse_limit(limit: &Option<LimitClause>, tbl: &TableReference) -> Result<Option<usize>> {
     let (limit, offset, limit_by) = match limit {
         Some(LimitClause::LimitOffset {
             limit,
@@ -264,7 +264,7 @@ fn validate_and_extract_columns(
     }
 
     let mut fields = vec![];
-    let mut column_names = vec![];
+    let mut column_idents = vec![];
     for select_item in select {
         match select_item {
             SelectItem::UnnamedExpr(expr) => match expr {
@@ -281,7 +281,7 @@ fn validate_and_extract_columns(
                         .fail();
                     };
                     fields.push(field.clone());
-                    column_names.push(column_name.to_string());
+                    column_idents.push(ident.clone());
                 }
                 _ => {
                     return OnlyColumnReferencesSnafu {
@@ -306,7 +306,7 @@ fn validate_and_extract_columns(
     fields = include_computed_columns(&fields, &source_schema);
 
     Ok((
-        RefreshSQLColumns::Named(column_names),
+        RefreshSQLColumns::Named(column_idents),
         Arc::new(Schema::new(fields)),
     ))
 }
@@ -586,5 +586,29 @@ mod tests {
 
         let parts = split_conjunction(expr);
         assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn test_quoted_identifiers_preserved() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("MyCol", DataType::Int64, false),
+            Field::new("another col", DataType::Utf8, false),
+        ]));
+        let table = TableReference::parse_str("test_table");
+        let sql = r#"SELECT "MyCol", "another col" FROM test_table"#;
+
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 2);
+        // to_sql() should preserve the double-quoting
+        let reconstructed = refresh_sql.to_sql();
+        assert!(
+            reconstructed.contains(r#""MyCol""#),
+            "Expected quoted identifier in: {reconstructed}"
+        );
+        assert!(
+            reconstructed.contains(r#""another col""#),
+            "Expected quoted identifier in: {reconstructed}"
+        );
+        Ok(())
     }
 }

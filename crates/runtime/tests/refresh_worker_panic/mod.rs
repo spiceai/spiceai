@@ -137,7 +137,9 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
 
     let refresh_defaults = Refresh::new(RefreshMode::Append).refresh_sql(RefreshSQL::new(
         dataset_name.clone(),
-        runtime::accelerated_table::refresh::RefreshSQLColumns::Named(vec!["value".to_string()]),
+        runtime::accelerated_table::refresh::RefreshSQLColumns::Named(vec![
+            datafusion::sql::sqlparser::ast::Ident::new("value"),
+        ]),
         vec![],
         None,
     ));

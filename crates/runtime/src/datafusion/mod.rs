@@ -2051,7 +2051,7 @@ impl DataFusion {
     pub async fn update_refresh_sql(
         &self,
         dataset_name: TableReference,
-        refresh_sql: Option<String>,
+        refresh_sql: String,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
@@ -2059,29 +2059,24 @@ impl DataFusion {
 
         let refresh_schema = table.schema();
 
-        let parsed = if let Some(sql) = &refresh_sql {
-            let (parsed_sql, selected_schema) = refresh_sql::parse_refresh_sql(
-                dataset_name.clone(),
-                sql,
-                Arc::clone(&refresh_schema),
-            )
-            .context(RefreshSqlSnafu)?;
-            if selected_schema != refresh_schema {
-                return RefreshSqlSchemaChangeDisallowedSnafu {
-                    dataset_name: Arc::from(dataset_name.to_string()),
-                    selected_columns: Arc::from(
-                        selected_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                    refresh_columns: Arc::from(
-                        refresh_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                }
-                .fail();
+        let (parsed, selected_schema) = refresh_sql::parse_refresh_sql(
+            dataset_name.clone(),
+            &refresh_sql,
+            Arc::clone(&refresh_schema),
+        )
+        .context(RefreshSqlSnafu)?;
+        if selected_schema != refresh_schema {
+            return RefreshSqlSchemaChangeDisallowedSnafu {
+                dataset_name: Arc::from(dataset_name.to_string()),
+                selected_columns: Arc::from(
+                    selected_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
+                refresh_columns: Arc::from(
+                    refresh_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
             }
-            Some(parsed_sql)
-        } else {
-            None
-        };
+            .fail();
+        }
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table.update_refresh_sql(parsed).await.context(
