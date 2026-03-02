@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
-async-compression = { version = "=0.4.19", features = [
+async-compression = { version = "0.4", features = [
     "tokio",
     "zstd",
 ], default-features = false }

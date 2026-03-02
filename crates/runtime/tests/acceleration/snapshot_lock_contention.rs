@@ -358,7 +358,6 @@ async fn run_query_workload(
 }
 
 /// Run snapshot creation workload
-#[expect(clippy::too_many_arguments, reason = "test helper function")]
 async fn run_snapshot_workload(
     snapshot_manager: &Arc<SnapshotManager>,
     checkpointer: &Arc<dyn DatasetCheckpointer>,

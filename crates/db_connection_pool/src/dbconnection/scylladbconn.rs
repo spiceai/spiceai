@@ -48,7 +48,7 @@ use snafu::prelude::*;
 pub enum Error {
     #[snafu(display("Failed to execute query: {source}"))]
     QueryError {
-        source: scylla::errors::PagerExecutionError,
+        source: Box<scylla::errors::PagerExecutionError>,
     },
 
     #[snafu(display("Failed to execute statement: {source}"))]
@@ -224,7 +224,11 @@ impl<'a> AsyncDbConnection<Arc<Session>, &'a dyn Sync> for ScyllaDbConnection {
         let session = Arc::clone(&self.session);
 
         // Execute query and get pager for streaming results
-        let rows_iter = session.query_iter(sql, &[]).await.context(QuerySnafu)?;
+        let rows_iter = session
+            .query_iter(sql, &[])
+            .await
+            .map_err(Box::new)
+            .context(QuerySnafu)?;
 
         // Get schema from column specs or use projected schema
         let schema = if let Some(schema) = projected_schema {

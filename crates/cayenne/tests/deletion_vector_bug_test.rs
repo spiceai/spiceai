@@ -117,7 +117,8 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table_provider.as_ref(), &ctx.state(), &[filter])
+        .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 

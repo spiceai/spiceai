@@ -21,7 +21,6 @@ use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::{DFSchema, exec_err};
-use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
@@ -294,7 +293,11 @@ impl DeltaTable {
                 })
                 .collect::<Vec<_>>()
         });
-        let parquet_source = ParquetSource::new(TableParquetOptions::default())
+        let table_schema = datafusion_datasource::TableSchema::new(
+            Arc::clone(schema),
+            partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
+        );
+        let parquet_source = ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
@@ -307,15 +310,12 @@ impl DeltaTable {
         ))
         .context(DeltaTableExecutionSnafu)?;
 
-        let file_scan_config_builder = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::clone(schema),
-            Arc::new(parquet_source),
-        )
-        .with_limit(limit)
-        .with_projection_indices(new_projections)
-        .with_table_partition_cols(partition_cols.to_vec())
-        .with_file_group(FileGroup::new(partitioned_files.to_vec()));
+        let file_scan_config_builder =
+            FileScanConfigBuilder::new(object_store_url, Arc::new(parquet_source))
+                .with_limit(limit)
+                .with_projection_indices(new_projections)
+                .context(DeltaTableExecutionSnafu)?
+                .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 
         Ok(DataSourceExec::from_data_source(
             file_scan_config_builder.build(),
