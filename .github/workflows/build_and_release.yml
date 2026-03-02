@@ -39,6 +39,16 @@ on:
           - 'Windows x64'
           - 'macOS x64 (Intel)'
         default: 'all'
+      tag_option:
+        description: 'Which build tag to include? (Default is all available tags per platform)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'default'
+          - 'odbc'
+          - 'metal'
+        default: 'all'
       profile_option:
         description: 'Which Rust build profile to use? (Default is release)'
         required: false
@@ -131,15 +141,28 @@ jobs:
               });
             }
 
-            // If running via workflow_dispatch, filter based on input
+            // If running via workflow_dispatch, filter based on inputs
             if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
+              const tag_option = context.payload.inputs.tag_option;
 
-              if (platform_option === 'all') {
-                return matrix;
+              // Filter by platform
+              let filtered = matrix;
+              if (platform_option !== 'all') {
+                filtered = filtered.filter(m => m.name === platform_option);
               }
 
-              return matrix.filter(m => m.name === platform_option);
+              // Filter by tag
+              if (tag_option !== 'all') {
+                filtered = filtered.map(m => ({
+                  ...m,
+                  tags: m.tags.filter(t => t === tag_option)
+                }));
+                // Remove entries that have no matching tags
+                filtered = filtered.filter(m => m.tags.length > 0);
+              }
+
+              return filtered;
             }
 
             return matrix;
