@@ -477,6 +477,7 @@ mod tests {
         Ok(())
     }
 
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_allow_repartition_for_unordered_input() -> Result<()> {
         let ctx = make_test_context();
@@ -508,6 +509,7 @@ mod tests {
         Ok(())
     }
 
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_bytes_processed_total_preserved_with_repartition() -> Result<()> {
         let ctx = make_test_context();
@@ -531,7 +533,7 @@ mod tests {
 
         let before_plan = build_test_plan(before_callback).await?;
         let before_batches = collect(before_plan, ctx.task_ctx()).await?;
-        let before_rows: usize = before_batches.iter().map(|b| b.num_rows()).sum();
+        let before_rows: usize = before_batches.iter().map(RecordBatch::num_rows).sum();
         let before_total: u64 = before_values
             .lock()
             .expect("before mutex should not be poisoned")
@@ -563,7 +565,7 @@ mod tests {
         );
 
         let after_batches = collect(optimized, ctx.task_ctx()).await?;
-        let after_rows: usize = after_batches.iter().map(|b| b.num_rows()).sum();
+        let after_rows: usize = after_batches.iter().map(RecordBatch::num_rows).sum();
         let after_total: u64 = after_values
             .lock()
             .expect("after mutex should not be poisoned")
