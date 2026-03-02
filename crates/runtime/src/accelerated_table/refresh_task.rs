@@ -1733,10 +1733,10 @@ fn schema_evolution_mismatch_refresh_message(
     table_name: &str,
     error: &super::Error,
 ) -> Option<String> {
-    let source = match error {
-        super::Error::FailedToWriteData { source }
-        | super::Error::FailedToRefreshDataset { source } => source,
-        _ => return None,
+    let (super::Error::FailedToWriteData { source }
+    | super::Error::FailedToRefreshDataset { source }) = error
+    else {
+        return None;
     };
 
     if !is_insert_schema_mismatch_error(&source.to_string()) {
