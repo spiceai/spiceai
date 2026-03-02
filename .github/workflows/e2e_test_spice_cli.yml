@@ -91,7 +91,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -99,7 +99,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |

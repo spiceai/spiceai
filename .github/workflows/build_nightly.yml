@@ -149,12 +149,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: spiced_linux_x86_64
           path: spiced_linux_x86_64.tar.gz
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: spice_linux_x86_64
           path: spice_linux_x86_64.tar.gz
@@ -222,12 +222,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: spiced_linux_aarch64
           path: spiced_linux_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: spice_linux_aarch64
           path: spice_linux_aarch64.tar.gz
@@ -294,12 +294,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: spiced_darwin_aarch64
           path: spiced_darwin_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: spice_darwin_aarch64
           path: spice_darwin_aarch64.tar.gz
@@ -366,7 +366,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-arm64,mode=max
 
       - name: Upload ARM64 Docker image
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: images-arm64
           path: /tmp/image-arm64-default.tar
@@ -411,7 +411,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-amd64,mode=max
 
       - name: Upload AMD64 Docker image
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: images-amd64
           path: /tmp/image-amd64-default.tar

@@ -140,7 +140,7 @@ jobs:
             RUST_PROFILE=${{ env.RUST_PROFILE }}
 
       - name: Upload ARM64 artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: image-arm64
           path: /tmp/image-arm64.tar
@@ -197,7 +197,7 @@ jobs:
             RUST_PROFILE=${{ env.RUST_PROFILE }}
 
       - name: Upload AMD64 artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v5
         with:
           name: image-amd64
           path: /tmp/image-amd64.tar
