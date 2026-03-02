@@ -796,9 +796,6 @@ impl Runtime {
     }
 
     /// Returns the partition manager for accelerated table partition metadata (scheduler only).
-    ///
-    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
-    /// a write lock (e.g., during initialization), this returns `None`.
     #[must_use]
     pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
         match self.distributed.as_ref() {
