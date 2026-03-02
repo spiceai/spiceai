@@ -74,13 +74,6 @@ impl DataAccelerator for ArrowAccelerator {
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        ensure!(
-            partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
-                msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
-            }
-        );
-
         // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
         // which overwrites the entire table. Primary key constraints cause uniqueness validation
         // errors during inserts because Arrow doesn't support upsert operations.

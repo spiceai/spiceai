@@ -43,6 +43,7 @@ use tokio::sync::RwLock;
 pub mod arrow;
 #[cfg(not(windows))]
 pub mod cayenne;
+pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "duckdb")]

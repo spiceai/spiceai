@@ -400,6 +400,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 name: engine_str.to_string(),
             }
         })? {
+            Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
             #[cfg(feature = "duckdb")]
             Engine::DuckDB if !acceleration.partition_by.is_empty() => {
                 match get_duckdb_partition_mode(&params) {
