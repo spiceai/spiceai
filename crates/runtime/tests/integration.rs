@@ -29,6 +29,8 @@ mod acceleration;
 mod cache;
 mod catalog;
 mod cayenne;
+#[cfg(not(windows))]
+mod cayenne_catalog_ddl;
 #[cfg(feature = "duckdb")]
 mod clickbench;
 mod cluster;
