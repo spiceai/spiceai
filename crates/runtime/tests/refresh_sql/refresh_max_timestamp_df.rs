@@ -135,16 +135,6 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 format!("refresh_max_timestamp_df_explain_plan"),
                 explain_plan
             );
-            let explain_plan = explain_plan.to_string();
-            assert!(
-                explain_plan
-                    .contains("SQLiteSqlExec sql=SELECT \"time_in_string\" FROM test_table"),
-                "Expected SQLite scan pushdown in refresh_sql explain plan"
-            );
-            assert!(
-                explain_plan.contains("SortExec") && explain_plan.contains("fetch=1"),
-                "Expected DataFusion TopK/sort+limit stage in refresh_sql explain plan"
-            );
 
             Ok(())
         })
