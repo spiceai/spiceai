@@ -1,5 +1,5 @@
 name: testoperator streaming dynamodb benchmark
-run-name: streaming - ${{ github.event.inputs.queryset }} - ${{ github.event.inputs.config_name }} - ${{ github.event.inputs.run_id }}
+run-name: streaming - ${{ github.event.inputs.queryset }}
 
 on:
   workflow_dispatch:
@@ -10,14 +10,6 @@ on:
         type: string
       spicepod_path:
         description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb/tpch-duckdb.yaml)'
-        required: true
-        type: string
-      config_name:
-        description: 'Configuration name (e.g., tpch-duckdb, tpch-cayenne)'
-        required: true
-        type: string
-      run_id:
-        description: 'Run ID from dispatch-dynamodb (identifies tables and snapshots)'
         required: true
         type: string
       queryset:
@@ -68,7 +60,7 @@ on:
 
 jobs:
   run-streaming-benchmark:
-    name: Run DynamoDB streaming benchmark - ${{ github.event.inputs.config_name }}
+    name: Run DynamoDB streaming benchmark
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
     permissions:
@@ -125,10 +117,6 @@ jobs:
 
       - name: Run DynamoDB streaming benchmark
         run: |
-          VERIFY_FLAG=""
-          if [ "${{ github.event.inputs.verify }}" = "true" ]; then
-            VERIFY_FLAG="--verify"
-          fi
 
           LIVENESS_FLAG=""
           if [ "${{ github.event.inputs.enable_liveness }}" = "true" ]; then
@@ -143,12 +131,10 @@ jobs:
           testoperator run streaming-dynamodb \
             -s /usr/local/bin/spiced \
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
-            --run-id ${{ github.event.inputs.run_id }} \
             --queryset ${{ github.event.inputs.queryset }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --metrics \
-            ${VERIFY_FLAG} \
             ${LIVENESS_FLAG} \
             ${QUERY_LIVENESS_FLAG}
         env:

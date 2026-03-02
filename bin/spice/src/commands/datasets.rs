@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::DatasetInfo;
 
@@ -30,14 +30,26 @@ use runtime_api_types::v1::DatasetInfo;
 
 Examples:
   spice datasets
+  spice datasets -o json
 
 See more at: https://spiceai.org/docs/"#
 )]
-pub struct DatasetsArgs {}
+pub struct DatasetsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
 
 impl TableRow for DatasetInfo {
     fn headers() -> Vec<&'static str> {
-        vec!["NAME", "FROM", "REPLICATION", "ACCELERATION", "STATUS"]
+        vec![
+            "NAME",
+            "FROM",
+            "REPLICATION",
+            "ACCELERATION",
+            "STATUS",
+            "ERROR",
+        ]
     }
 
     fn values(&self) -> Vec<String> {
@@ -49,12 +61,13 @@ impl TableRow for DatasetInfo {
             self.status
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
+            self.error_message.clone().unwrap_or_default(),
         ]
     }
 }
 
 /// Execute the datasets command.
-pub async fn execute(ctx: &RuntimeContext, _args: &DatasetsArgs) -> Result<()> {
+pub async fn execute(ctx: &RuntimeContext, args: &DatasetsArgs) -> Result<()> {
     if ctx.is_cloud() {
         tracing::error!("`spice datasets` does not support `--cloud`.");
         return Ok(());
@@ -81,7 +94,10 @@ pub async fn execute(ctx: &RuntimeContext, _args: &DatasetsArgs) -> Result<()> {
         .build()
     })?;
 
-    write_table(&datasets);
+    match args.output {
+        OutputFormat::Table => write_table(&datasets),
+        OutputFormat::Json => write_json(&datasets)?,
+    }
 
     Ok(())
 }

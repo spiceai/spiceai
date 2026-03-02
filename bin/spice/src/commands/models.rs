@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::{ModelInfo, ModelListResponse};
 
@@ -30,14 +30,19 @@ use runtime_api_types::v1::{ModelInfo, ModelListResponse};
 
 Examples:
   spice models
+  spice models -o json
 
 See more at: https://spiceai.org/docs/"#
 )]
-pub struct ModelsArgs {}
+pub struct ModelsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
 
 impl TableRow for ModelInfo {
     fn headers() -> Vec<&'static str> {
-        vec!["ID", "OWNED_BY", "STATUS"]
+        vec!["ID", "OWNED_BY", "STATUS", "ERROR"]
     }
 
     fn values(&self) -> Vec<String> {
@@ -47,12 +52,13 @@ impl TableRow for ModelInfo {
             self.status
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
+            self.error_message.clone().unwrap_or_default(),
         ]
     }
 }
 
 /// Execute the models command.
-pub async fn execute(ctx: &RuntimeContext, _args: &ModelsArgs) -> Result<()> {
+pub async fn execute(ctx: &RuntimeContext, args: &ModelsArgs) -> Result<()> {
     let response = ctx.get("/v1/models?status=true").await.map_err(|_| {
         RuntimeUnavailableSnafu {
             endpoint: ctx.http_endpoint().to_string(),
@@ -74,7 +80,10 @@ pub async fn execute(ctx: &RuntimeContext, _args: &ModelsArgs) -> Result<()> {
         .build()
     })?;
 
-    write_table(&model_response.data);
+    match args.output {
+        OutputFormat::Table => write_table(&model_response.data),
+        OutputFormat::Json => write_json(&model_response.data)?,
+    }
 
     Ok(())
 }

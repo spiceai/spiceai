@@ -33,6 +33,13 @@ use crate::metrics;
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeReadyState {
+    #[default]
+    OnLoad,
+    OnRegistration,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
     /// Stores the current status of all components.
@@ -41,6 +48,8 @@ pub struct RuntimeStatus {
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
+    /// Controls how runtime readiness is computed.
+    ready_state: Arc<RwLock<RuntimeReadyState>>,
     /// Per-component notifiers for status change subscriptions.
     notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
 }
@@ -52,8 +61,17 @@ impl RuntimeStatus {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
+            ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             notifiers: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn set_ready_state(&self, ready_state: RuntimeReadyState) {
+        let mut configured_ready_state = self
+            .ready_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured_ready_state = ready_state;
     }
 
     #[must_use]
@@ -62,7 +80,7 @@ impl RuntimeStatus {
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
-    fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
         let mut statuses = match self.statuses.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -199,11 +217,12 @@ impl RuntimeStatus {
             return false;
         }
 
+        let ready_state = *self
+            .ready_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let statuses = match self.statuses.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let ever_ready = match self.ever_ready_components.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -212,10 +231,25 @@ impl RuntimeStatus {
             return false; // No components registered yet
         }
 
-        // Check if all registered components have been ready at least once
-        statuses
-            .keys()
-            .all(|component| ever_ready.contains(component))
+        match ready_state {
+            RuntimeReadyState::OnLoad => {
+                let ever_ready = match self.ever_ready_components.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                // OnLoad readiness: a component counts as ready if it has been ready at least once.
+                // All registered components must appear in the ever-ready set before we report ready.
+                statuses
+                    .keys()
+                    .all(|component| ever_ready.contains(component))
+            }
+            // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
+            // Only components in ShuttingDown state block overall readiness.
+            RuntimeReadyState::OnRegistration => statuses
+                .values()
+                .all(|status| !matches!(status, ComponentStatus::ShuttingDown)),
+        }
     }
 
     /// Returns the status of all registered components.
@@ -428,6 +462,105 @@ mod tests {
             status.get_component_status("dataset:test_dataset"),
             Some(ComponentStatus::Ready)
         );
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_requires_registered_component() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        // Empty statuses are not ready.
+        assert!(!status.is_ready());
+
+        // Initializing still counts as registered.
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(status.is_ready());
+
+        // Refreshing stays ready.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
+
+        // Error still counts as registered for on_registration mode.
+        status.update_dataset(&dataset, ComponentStatus::error());
+        assert!(status.is_ready());
+
+        // Explicit shutting down state for a component is not ready.
+        status.update_dataset(&dataset, ComponentStatus::ShuttingDown);
+        assert!(!status.is_ready());
+
+        // Runtime-level shutdown always forces not ready.
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        status.mark_shutdown();
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_allows_mixed_component_states() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        status.update_dataset(&dataset, ComponentStatus::error());
+        status.update_model("test_model", ComponentStatus::Initializing);
+        status.update_tool("test_tool", ComponentStatus::Disabled);
+
+        assert!(status.is_ready());
+
+        status.update_tool("test_tool", ComponentStatus::ShuttingDown);
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_all_component_types() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("dataset_a");
+        let view = TableReference::bare("view_a");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        status.update_catalog("catalog_a", ComponentStatus::Initializing);
+        status.update_dataset(&dataset, ComponentStatus::error());
+        status.update_model("model_a", ComponentStatus::Disabled);
+        status.update_tool("tool_a", ComponentStatus::Refreshing);
+        status.update_tool_catalog("tool_catalog_a", ComponentStatus::Ready);
+        status.update_llm("llm_a", ComponentStatus::error());
+        status.update_embedding("embedding_a", ComponentStatus::Initializing);
+        status.update_view(&view, ComponentStatus::Ready);
+        status.update_worker("worker_a", ComponentStatus::Disabled);
+        status.update_cluster("cluster_node_a", ComponentStatus::error());
+
+        assert!(
+            status.is_ready(),
+            "on_registration should be ready when all components are registered and none are ShuttingDown"
+        );
+
+        status.update_embedding("embedding_a", ComponentStatus::ShuttingDown);
+        assert!(
+            !status.is_ready(),
+            "any component in ShuttingDown should make runtime not ready"
+        );
+    }
+
+    #[test]
+    fn test_is_ready_on_load_still_requires_ever_ready() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(!status.is_ready());
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        // Once ever-ready is achieved, transient non-ready states still satisfy OnLoad mode.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
     }
 
     #[tokio::test]

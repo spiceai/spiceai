@@ -315,7 +315,10 @@ async fn huggingface(
             path.display()
         );
     }
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token).await
+
+    let chat_template_literal = params.get("chat_template").expose().ok();
+
+    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token, chat_template_literal).await
 }
 
 async fn databricks(
