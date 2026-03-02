@@ -111,7 +111,7 @@ pub fn parse_refresh_sql(
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
 
-                let limit_value = parse_limit(&query.limit_clause, &expected_table)?;
+                let limit_value = parse_limit(query.limit_clause.as_ref(), &expected_table)?;
 
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
@@ -173,19 +173,14 @@ pub fn parse_refresh_sql(
                                     .map(ToString::to_string)
                                     .collect::<Vec<_>>()
                                     .join(".");
-                                ensure!(
-                                    TableReference::parse_str(&table_name_with_schema)
-                                        == expected_table,
-                                    InvalidSqlStatementSnafu {
-                                        expected_table: expected_table.clone()
-                                    }
-                                );
+                                if TableReference::parse_str(&table_name_with_schema)
+                                    != expected_table
+                                {
+                                    return InvalidSqlStatementSnafu { expected_table }.fail();
+                                }
                             }
                             _ => {
-                                InvalidSqlStatementSnafu {
-                                    expected_table: expected_table.clone(),
-                                }
-                                .fail()?;
+                                return InvalidSqlStatementSnafu { expected_table }.fail();
                             }
                         }
 
@@ -201,10 +196,7 @@ pub fn parse_refresh_sql(
 
                         Ok((refresh_sql, refresh_schema))
                     }
-                    _ => InvalidSqlStatementSnafu {
-                        expected_table: expected_table.clone(),
-                    }
-                    .fail()?,
+                    _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
                 }
             }
             _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
@@ -214,7 +206,7 @@ pub fn parse_refresh_sql(
 }
 
 /// Extract and validate the LIMIT clause, ensuring it is a simple non-negative integer literal if present, and that no unsupported features like OFFSET or LIMIT BY are used.
-fn parse_limit(limit: &Option<LimitClause>, tbl: &TableReference) -> Result<Option<usize>> {
+fn parse_limit(limit: Option<&LimitClause>, tbl: &TableReference) -> Result<Option<usize>> {
     let (limit, offset, limit_by) = match limit {
         Some(LimitClause::LimitOffset {
             limit,

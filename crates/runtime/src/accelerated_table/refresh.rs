@@ -63,7 +63,7 @@ pub enum RefreshSQLColumns {
 }
 
 /// Structured representation of refresh SQL, decomposed into validated parts.
-/// The user's `refresh_sql` config is parsed into columns + user_filters + limit.
+/// The user's `refresh_sql` config is parsed into columns + `user_filters` + limit.
 /// System-generated filters (partitions) are stored separately.
 #[derive(Clone, Debug)]
 pub struct RefreshSQL {
@@ -71,13 +71,13 @@ pub struct RefreshSQL {
     table: TableReference,
     /// Column projection (All or specific named columns).
     columns: RefreshSQLColumns,
-    /// User-provided WHERE predicates from refresh_sql, split on top-level AND.
-    /// Stored as sqlparser AST Exprs so they can be recombined with system filters.
+    /// User-provided WHERE predicates from `refresh_sql`, split on top-level `AND`.
+    /// Stored as sqlparser `AST` `Expr`s so they can be recombined with system filters.
     user_filters: Vec<sqlparser::ast::Expr>,
     /// LIMIT clause from user SQL, if any.
     limit: Option<usize>,
-    /// Cluster partition filter expressions (DataFusion Exprs).
-    /// Applied as DataFrame `.filter()` calls at query time.
+    /// Cluster partition filter expressions (`DataFusion` Exprs).
+    /// Applied as `DataFrame` `.filter()` calls at query time.
     partition_filters: Vec<datafusion_expr::Expr>,
 }
 
@@ -100,7 +100,7 @@ impl RefreshSQL {
     }
 
     /// Reconstruct the user SQL from parts: `SELECT {columns} FROM {table} WHERE {user_filters} LIMIT {limit}`.
-    /// This does NOT include partition filters — those are applied as DataFrame filters.
+    /// This does NOT include partition filters — those are applied as `DataFrame` filters.
     #[must_use]
     pub fn to_sql(&self) -> String {
         let columns_str = match &self.columns {
@@ -121,17 +121,19 @@ impl RefreshSQL {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            sql.push_str(&format!(" WHERE {where_clause}"));
+            use std::fmt::Write;
+            let _ = write!(sql, " WHERE {where_clause}");
         }
 
         if let Some(limit) = self.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
+            use std::fmt::Write;
+            let _ = write!(sql, " LIMIT {limit}");
         }
 
         sql
     }
 
-    /// Get the partition filter expressions for DataFrame filtering.
+    /// Get the partition filter expressions for `DataFrame` filtering.
     #[must_use]
     pub fn partition_filters(&self) -> &[datafusion_expr::Expr] {
         &self.partition_filters
@@ -303,7 +305,7 @@ impl Refresh {
     /// Get the display SQL string for logging/status purposes.
     #[must_use]
     pub fn display_sql(&self) -> Option<String> {
-        self.sql.as_ref().map(|s| s.display_sql())
+        self.sql.as_ref().map(RefreshSQL::display_sql)
     }
 
     #[must_use]

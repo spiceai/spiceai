@@ -227,7 +227,7 @@ pub(crate) struct MessageResponse {
 #[derive(Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AccelerationRequest {
-    /// SQL statement used for the refresh. Defaults to current `refresh_sql` configured (either from the spicepod or a previous refresh_sql update).
+    /// SQL statement used for the refresh. Defaults to current `refresh_sql` configured (either from the spicepod or a previous `refresh_sql` update).
     pub refresh_sql: Option<String>,
 }
 
