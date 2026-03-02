@@ -312,13 +312,15 @@ impl MistralLlama {
         arch: Option<&str>,
         hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
+        chat_template_literal: Option<&str>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
+        let chat_template = chat_template_literal.map(ToString::to_string);
 
         // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
         let loader: Result<Box<dyn Loader>> = if let Some(gguf) = gguf_filename {
             Ok(GGUFLoaderBuilder::new(
-                None,
+                chat_template.clone(),
                 None,
                 model_parts[0].to_string(),
                 vec![gguf.to_string_lossy().to_string()],
@@ -339,7 +341,7 @@ impl MistralLlama {
 
             let builder = NormalLoaderBuilder::new(
                 NormalSpecificConfig::default(),
-                None,
+                chat_template,
                 None,
                 Some(model_parts[0].to_string()),
                 false,

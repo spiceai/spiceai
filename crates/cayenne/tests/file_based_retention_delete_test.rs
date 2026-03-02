@@ -35,6 +35,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{
     CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, TimeRetentionFilterBuilder,
+    STAGING_DIR_NAME,
 };
 use common::TestFixture;
 use data_components::delete::DeletionTableProvider;
@@ -762,7 +763,7 @@ async fn execute_delete(
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table, &ctx.state(), &[filter]).await?;
     let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
@@ -834,7 +835,7 @@ fn count_vortex_files(table_dir: &std::path::Path) -> usize {
     let mut count = 0;
     for entry in entries.filter_map(std::result::Result::ok) {
         let path = entry.path();
-        if path.is_dir() {
+        if path.is_dir() && path.file_name().is_none_or(|n| n != STAGING_DIR_NAME) {
             if let Ok(snapshot_entries) = std::fs::read_dir(&path) {
                 for file_entry in snapshot_entries.filter_map(std::result::Result::ok) {
                     if file_entry
@@ -859,7 +860,7 @@ fn list_snapshot_dirs(table_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     entries
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && p.file_name().is_none_or(|n| n != STAGING_DIR_NAME))
         .collect()
 }
 

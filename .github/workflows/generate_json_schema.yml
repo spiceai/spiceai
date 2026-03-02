@@ -62,7 +62,7 @@ jobs:
 
       - name: Upload JSON schema artifact
         if: github.event_name != 'workflow_dispatch' || inputs.run_build
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json

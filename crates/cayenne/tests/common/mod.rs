@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 //! Common test utilities for Cayenne with multiple metastore backends
+#![allow(dead_code, clippy::allow_attributes)]
 
 use std::sync::Arc;
 
@@ -29,7 +30,6 @@ use tempfile::TempDir;
 
 /// Backend type for parameterized tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code)]
 pub enum BackendType {
     Sqlite,
     #[cfg(feature = "turso")]
@@ -37,8 +37,6 @@ pub enum BackendType {
 }
 
 impl BackendType {
-    #[expect(dead_code, clippy::allow_attributes)]
-    #[allow(unfulfilled_lint_expectations)]
     pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
@@ -49,17 +47,10 @@ impl BackendType {
 }
 
 /// Test fixture that sets up a temporary directory and catalog
-#[expect(dead_code)]
 pub struct TestFixture {
-    // this is only used in 1 of the tests, but is imported in all test files
-    // hence, it is dead everywhere else
-    #[expect(dead_code, clippy::allow_attributes)]
-    #[allow(unfulfilled_lint_expectations)]
     pub temp_dir: TempDir,
     pub catalog: Arc<CayenneCatalog>,
     pub data_path: std::path::PathBuf,
-    #[expect(dead_code, clippy::allow_attributes)]
-    #[allow(unfulfilled_lint_expectations)]
     pub backend_type: BackendType,
 }
 
@@ -94,8 +85,6 @@ impl TestFixture {
     }
 
     /// Get the database path for SQLite-specific verification
-    #[expect(dead_code, clippy::allow_attributes)]
-    #[allow(unfulfilled_lint_expectations)]
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")
     }
@@ -123,7 +112,6 @@ macro_rules! test_with_backends {
 }
 
 /// Helper to run a test function with a specific backend
-#[expect(dead_code)]
 pub async fn run_with_backend<F, Fut>(
     backend: BackendType,
     test_fn: F,
@@ -146,7 +134,6 @@ where
 /// Insert a single batch using `insert_into()` (append mode).
 ///
 /// Creates a temporary `SessionContext` internally.
-#[expect(dead_code)]
 pub async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) -> DFResult<u64> {
     insert_batches(provider, vec![batch]).await
 }
@@ -154,7 +141,6 @@ pub async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) -
 /// Insert record batches using `insert_into()` API (append mode).
 ///
 /// Creates a temporary `SessionContext` internally.
-#[expect(dead_code)]
 pub async fn insert_batches(
     provider: &CayenneTableProvider,
     batches: Vec<RecordBatch>,

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use datafusion_execution::config::SessionConfig;
 use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{VortexFormat, VortexOptions};
+use vortex_datafusion::{VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
 use crate::metadata::VortexConfig;
@@ -127,10 +127,32 @@ impl CayenneContext {
         let vortex_session = VortexSession::default();
 
         // Configure VortexFormat - it creates its own VortexFileCache internally
-        let vortex_opts = VortexOptions {
-            footer_cache_size_mb: config.footer_cache_mb,
-            segment_cache_size_mb: config.segment_cache_mb,
-            ..VortexOptions::default()
+        //
+        // target_file_size_mb is set to 0 so the Vortex sink delegates to DataFusion's
+        // file demuxer for output file naming. DataFusion's demuxer generates random
+        // write IDs (e.g., "aB3D5fG7hJ9K0mN1_0.vortex"), ensuring unique filenames
+        // across multiple append writes to the same snapshot directory. Without this,
+        // the Vortex sink's built-in file splitting uses sequential names (part-00000,
+        // part-00001, ...) that collide when multiple INSERT operations write to the
+        // same directory. Cayenne handles file splitting itself in
+        // `chunk_and_write_parallel`, so the Vortex-level splitting is not needed.
+        let default_config = VortexConfig::default();
+        if config.footer_cache_mb != default_config.footer_cache_mb {
+            tracing::warn!(
+                footer_cache_mb = config.footer_cache_mb,
+                "Vortex config `footer_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
+            );
+        }
+        if config.segment_cache_mb != default_config.segment_cache_mb {
+            tracing::warn!(
+                segment_cache_mb = config.segment_cache_mb,
+                "Vortex config `segment_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
+            );
+        }
+
+        let vortex_opts = VortexTableOptions {
+            target_file_size_mb: 0,
+            ..VortexTableOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))

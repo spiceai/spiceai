@@ -36,6 +36,8 @@ pub struct App {
     pub region: Option<String>,
     pub production_branch: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub config: Option<AppConfig>,
 }
 
 impl App {
@@ -50,6 +52,44 @@ pub struct AppsResponse {
     pub apps: Vec<App>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub spicepod: Option<serde_json::Value>,
+    pub registry: Option<String>,
+    pub image: Option<String>,
+    pub image_tag: Option<String>,
+    pub update_channel: Option<String>,
+    pub replicas: Option<i32>,
+    pub resources: Option<AppResources>,
+    pub region: Option<String>,
+    pub node_group: Option<String>,
+    pub storage_claim_size_gb: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppResources {
+    pub limits: AppResourceLimits,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests: Option<AppResourceRequests>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppResourceLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    pub memory: String,
+    #[serde(rename = "ephemeral-storage", skip_serializing_if = "Option::is_none")]
+    pub ephemeral_storage: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppResourceRequests {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CreateAppRequest {
     pub name: String,
@@ -60,6 +100,8 @@ pub struct CreateAppRequest {
     pub cname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<AppResources>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +118,8 @@ pub struct UpdateAppRequest {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spicepod: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<AppResources>,
 }
 
 // ============================================================================
@@ -165,7 +209,7 @@ pub struct ContainerImage {
     pub channel: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContainerImagesResponse {
     pub images: Vec<ContainerImage>,
     pub default: Option<String>,
@@ -207,7 +251,7 @@ pub struct LogEntry {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LogsResponse {
     pub logs: Vec<LogEntry>,
 }
@@ -216,13 +260,13 @@ pub struct LogsResponse {
 // API keys
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiKeysResponse {
     pub api_key: Option<String>,
     pub api_key_2: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegenerateApiKeyResponse {
     pub api_key: Option<String>,
     pub api_key_2: Option<String>,
@@ -243,18 +287,18 @@ pub struct PodMetrics {
     pub cpu_usage_percent: Option<f64>,
     pub memory_usage_bytes: Option<u64>,
     pub disk_read_bytes: Option<f64>,
-    pub disk_read_iops: Option<f64>,
+    pub disk_read_operations: Option<f64>,
     pub disk_write_bytes: Option<f64>,
-    pub disk_write_iops: Option<f64>,
+    pub disk_write_operations: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionMetrics {
     pub rows_ingested: Option<u64>,
     pub bytes_ingested: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MetricsResponse {
     pub metrics: BTreeMap<String, PodMetrics>,
     #[serde(default)]
@@ -280,7 +324,7 @@ pub struct AuthExchangeResponse {
     pub access_denied: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AuthContext {
     pub username: String,
     pub email: String,

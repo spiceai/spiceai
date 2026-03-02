@@ -20,20 +20,19 @@ limitations under the License.
 //!
 //! ## Commands
 //!
-//! - `streaming-dynamodb`: Run a single `DynamoDB` streaming benchmark
-//! - `dispatch-dynamodb`: Run multi-config `DynamoDB` benchmarks (ingest once, benchmark many)
+//! - `streaming-dynamodb`: Self-contained performance benchmark
+//! - `streaming-dynamodb-correctness`: Multi-round CDC data correctness test
 
+pub mod correctness;
 pub mod datasets;
-pub mod dynamodb_dispatch;
-pub mod dynamodb_runner;
 pub mod mutations;
 pub mod query_liveness;
 pub mod querysets;
+pub mod runner;
 pub mod sources;
-mod traits;
+pub(crate) mod traits;
 mod utils;
 pub mod verification;
 
-// Re-export the runner and dispatch entry points
-pub use dynamodb_dispatch::run_dispatch;
-pub use dynamodb_runner::run_dynamodb;
+pub use correctness::run_correctness;
+pub use runner::run_benchmark;

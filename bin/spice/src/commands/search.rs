@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
-use crate::output::TableOutput;
+use crate::output::{OutputFormat, TableOutput};
 use clap::Args;
 use repl::util::{Spinner, create_editor_with_history, save_history};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,10 @@ pub struct SearchArgs {
     /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     pub custom_headers: Vec<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Request body for the search endpoint.
@@ -66,7 +70,7 @@ struct SearchRequest {
 }
 
 /// A single search match result.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SearchMatch {
     matches: HashMap<String, StringOrSlice>,
     score: f64,
@@ -76,7 +80,7 @@ struct SearchMatch {
 }
 
 /// Response from the search endpoint.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SearchResponse {
     results: Vec<SearchMatch>,
     duration_ms: u64,
@@ -89,7 +93,7 @@ struct SearchResult {
 }
 
 /// A string or array of strings (for flexible JSON parsing).
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum StringOrSlice {
     Single(String),
@@ -111,8 +115,10 @@ impl StringOrSlice {
 ///
 /// Returns an error if the API requests fail or input/output fails.
 pub async fn execute(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
-    println!("Welcome to the Spice.ai search REPL! Enter your search queries.");
-    println!();
+    if args.output == OutputFormat::Table {
+        println!("Welcome to the Spice.ai search REPL! Enter your search queries.");
+        println!();
+    }
 
     run_repl(ctx, args).await
 }
@@ -165,15 +171,17 @@ async fn run_repl(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
         // Execute the search with spinner
         match send_search_request_with_spinner(ctx, query, args).await {
             Ok(result) => {
-                display_results(&result.response);
+                display_results(&result.response, args.output);
                 #[expect(clippy::cast_precision_loss)]
                 let duration_secs = result.response.duration_ms as f64 / 1000.0;
                 let cached_str = if result.from_cache { " (cached)" } else { "" };
-                println!(
-                    "\nTime: {duration_secs:.3} seconds. {} results{cached_str}.",
-                    result.response.results.len()
-                );
-                println!();
+                if args.output == OutputFormat::Table {
+                    println!(
+                        "\nTime: {duration_secs:.3} seconds. {} results{cached_str}.",
+                        result.response.results.len()
+                    );
+                    println!();
+                }
             }
             Err(e) => {
                 eprintln!("\x1b[31mError\x1b[0m {e}");
@@ -279,9 +287,17 @@ async fn send_search_request(
 }
 
 /// Display search results in a table.
-fn display_results(response: &SearchResponse) {
+fn display_results(response: &SearchResponse, output: OutputFormat) {
     if response.results.is_empty() {
         println!("No results.");
+        return;
+    }
+
+    if output == OutputFormat::Json {
+        match serde_json::to_string_pretty(response) {
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Failed to serialize search results: {e}"),
+        }
         return;
     }
 

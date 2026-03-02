@@ -628,11 +628,7 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        clippy::missing_panics_doc
-    )]
+    #[expect(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     #[must_use]
     pub fn default_value_array(dt: &DataType) -> ArrayRef {
         match dt {
@@ -676,7 +672,6 @@ mod tests {
     }
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
-    #[expect(clippy::missing_panics_doc)]
     #[must_use]
     pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema

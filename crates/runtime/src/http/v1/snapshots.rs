@@ -21,7 +21,7 @@ use std::sync::Arc;
 use app::App;
 use axum::{
     Extension, Json,
-    extract::Path,
+    extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -31,6 +31,13 @@ use spicepod::component::snapshot::Snapshots;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
+
+const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
+
+#[derive(Debug, Deserialize)]
+pub struct ListSnapshotsQuery {
+    pub limit: Option<usize>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageResponse {
@@ -44,6 +51,7 @@ pub async fn list_snapshots(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Path(dataset_name): Path<String>,
+    Query(query): Query<ListSnapshotsQuery>,
 ) -> Response {
     let app_lock = tokio::select! {
         lock = app.read() => lock,
@@ -112,7 +120,8 @@ pub async fn list_snapshots(
     // Need to drop the app lock before the async call
     drop(app_lock);
 
-    match snapshot_manager.get_snapshot_summary().await {
+    let limit = query.limit.unwrap_or(DEFAULT_SNAPSHOTS_LIMIT);
+    match snapshot_manager.get_snapshot_summary(limit).await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(e) => snapshot_api_error_to_response(&e),
     }

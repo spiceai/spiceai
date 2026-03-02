@@ -27,6 +27,7 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spi
 use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
+use crate::datafusion::refresh_sql;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::metrics::telemetry::track_bytes_processed;
@@ -396,8 +397,11 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
@@ -442,8 +446,11 @@ impl RefreshTask {
                         metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
                     }
 
-                    self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Ready)
-                        .await;
+                    self.set_refresh_status(
+                        refresh.display_sql().as_deref(),
+                        status::ComponentStatus::Ready,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Ok(_) => {
@@ -499,8 +506,11 @@ impl RefreshTask {
                 if self.runtime_status.is_shutdown() {
                     return Ok(());
                 }
-                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
-                    .await;
+                self.log_refresh_error(
+                    inner_err_from_retry_ref(&e),
+                    refresh.display_sql().as_deref(),
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -531,7 +541,7 @@ impl RefreshTask {
             .write_streaming_data_update(
                 Some(start_time),
                 streaming_data_update,
-                refresh.sql.as_deref(),
+                refresh.display_sql().as_deref(),
             )
             .await
         {
@@ -788,8 +798,11 @@ impl RefreshTask {
             tracing::info!("Loading data for {} {dataset_name}", self.component_type());
         }
 
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let refresh = refresh.clone();
         let mut filters = vec![];
@@ -923,7 +936,7 @@ impl RefreshTask {
 
     async fn get_data_update(
         &self,
-        filters: Vec<Expr>,
+        mut filters: Vec<Expr>,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
@@ -940,12 +953,42 @@ impl RefreshTask {
             RefreshMode::Caching => UpdateType::Overwrite,
         };
 
+        // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
+        // spicepod), parse and use it. Transfer partition filters from the base refresh SQL.
+        let effective_sql = match refresh.override_sql_raw.as_ref().map(|s| {
+            refresh_sql::parse_refresh_sql(dataset_name.clone(), s, federated_provider.schema())
+        }) {
+            Some(Ok((mut parsed, _schema))) => {
+                if let Some(base) = &refresh.sql {
+                    parsed.set_partition_filters(base.partition_filters().to_vec());
+                }
+                Some(parsed)
+            }
+            Some(Err(e)) => {
+                tracing::error!("Failed to parse override refresh_sql for {dataset_name}: {e}");
+                return Err(RetryError::permanent(
+                    super::Error::FailedToRefreshDataset {
+                        source: DataFusionError::Plan(format!("Invalid override refresh_sql: {e}")),
+                    },
+                ));
+            }
+            None => refresh.sql.clone(),
+        };
+
+        // Extract SQL string and partition filters from RefreshSQL
+        let sql_string = effective_sql
+            .as_ref()
+            .map(super::refresh::RefreshSQL::to_sql);
+        if let Some(ref s) = effective_sql {
+            filters.extend(s.partition_filters().iter().cloned());
+        }
+
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
             let dataset_name_for_runtime = dataset_name.clone();
             let filters_for_runtime = filters.clone();
             let update_type_for_runtime = update_type.clone();
             let provider_for_runtime = Arc::clone(&federated_provider);
-            let sql_for_runtime = refresh.sql.clone();
+            let sql_for_runtime = sql_string.clone();
             let request_context = RequestContext::current(AsyncMarker::new().await);
             let span = Span::current();
 
@@ -1010,7 +1053,7 @@ impl RefreshTask {
             &mut ctx,
             dataset_name,
             federated_provider,
-            refresh.sql.clone(),
+            sql_string,
             filters,
         )
         .await
@@ -1419,6 +1462,20 @@ impl RefreshTask {
             _ => (),
         }
 
+        if let Some(message) = schema_evolution_mismatch_refresh_message(
+            self.component_type(),
+            &include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            error,
+        ) {
+            tracing::warn!("{message}");
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(message),
+            )
+            .await;
+            return;
+        }
+
         tracing::warn!(
             "Failed to load data for {} {}: {error}",
             self.component_type(),
@@ -1691,6 +1748,31 @@ fn is_s3_express_upload_speed_error(error_message: &str) -> bool {
     error_message.contains("ClientUploadSpeedTooSlow")
 }
 
+fn is_insert_schema_mismatch_error(error_message: &str) -> bool {
+    error_message.contains("Inserting query must have the same schema length as the table")
+        || error_message.contains("Inserting query must have same schema length as the table")
+}
+
+fn schema_evolution_mismatch_refresh_message(
+    component_type: &str,
+    table_name: &str,
+    error: &super::Error,
+) -> Option<String> {
+    let (super::Error::FailedToWriteData { source }
+    | super::Error::FailedToRefreshDataset { source }) = error
+    else {
+        return None;
+    };
+
+    if !is_insert_schema_mismatch_error(&source.to_string()) {
+        return None;
+    }
+
+    Some(format!(
+        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; fully featured schema evolution is on the roadmap, and acceleration does not apply this schema evolution automatically today; delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,7 +1813,6 @@ mod tests {
         assert!(is_s3_express_upload_speed_error(
             "Error: ClientUploadSpeedTooSlow: Upload speed is below minimum threshold"
         ));
-
         // Should detect when error is part of a larger message
         assert!(is_s3_express_upload_speed_error(
             "Failed to upload: S3 returned ClientUploadSpeedTooSlow for bucket mybucket--usw2-az1--x-s3"
@@ -1745,5 +1826,39 @@ mod tests {
         // Should not match partial error names
         assert!(!is_s3_express_upload_speed_error("ClientUpload"));
         assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    #[test]
+    fn test_is_insert_schema_mismatch_error() {
+        assert!(is_insert_schema_mismatch_error(
+            "Error during planning: Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5"
+        ));
+        assert!(!is_insert_schema_mismatch_error(
+            "Error during planning: failed to parse expression"
+        ));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_for_write_error() {
+        let error = super::super::Error::FailedToWriteData {
+            source: DataFusionError::Execution(
+                "Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5".to_string(),
+            ),
+        };
+
+        let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
+            .expect("should detect schema mismatch");
+        assert!(message.contains("schema mismatch"));
+        assert!(message.contains("on the roadmap"));
+        assert!(message.contains("delete the existing acceleration data"));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_non_schema_error() {
+        let error = super::super::Error::FailedToRefreshDataset {
+            source: DataFusionError::Execution("other failure".to_string()),
+        };
+
+        assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
     }
 }

@@ -288,9 +288,9 @@ fn is_datetime_related_expr(expr: &Expr) -> bool {
                     | DataType::Timestamp(_, _)
             )
         }
-        Expr::ScalarVariable(data_type, _) => {
+        Expr::ScalarVariable(field, _) => {
             matches!(
-                data_type,
+                field.data_type(),
                 DataType::Time32(_)
                     | DataType::Time64(_)
                     | DataType::Date32

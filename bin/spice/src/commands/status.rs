@@ -18,33 +18,24 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::output::{OutputFormat, write_json};
 use clap::Args;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Arguments for the status command.
 #[derive(Args, Debug)]
 pub struct StatusArgs {
-    /// Output format (text or json)
-    #[arg(long, default_value = "text")]
-    format: OutputFormat,
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table", alias = "format")]
+    pub output: OutputFormat,
 }
 
-/// Output format for status command.
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
-pub enum OutputFormat {
-    #[default]
-    Text,
-    Json,
-}
-
-/// Status response from the runtime.
-#[derive(Debug, Deserialize)]
-struct StatusResponse {
+/// A single component status entry returned by /v1/status.
+#[derive(Debug, Serialize, Deserialize)]
+struct ComponentStatus {
+    name: String,
+    endpoint: String,
     status: String,
-    #[serde(default)]
-    application_name: Option<String>,
-    #[serde(default)]
-    version: Option<String>,
 }
 
 /// Execute the status command.
@@ -63,37 +54,21 @@ pub async fn execute(ctx: &RuntimeContext, args: &StatusArgs) -> Result<()> {
         .build());
     }
 
-    let status: StatusResponse = response.json().await.map_err(|e| {
+    let components: Vec<ComponentStatus> = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse status response: {e}"),
         }
         .build()
     })?;
 
-    match args.format {
-        OutputFormat::Text => {
-            println!("Status: {}", status.status);
-            if let Some(name) = &status.application_name {
-                println!("Application: {name}");
-            }
-            if let Some(version) = &status.version {
-                println!("Version: {version}");
+    match args.output {
+        OutputFormat::Table => {
+            for c in &components {
+                println!("{:<20} {:<30} {}", c.name, c.endpoint, c.status);
             }
         }
         OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&serde_json::json!({
-                "status": status.status,
-                "application_name": status.application_name,
-                "version": status.version,
-                "endpoint": ctx.http_endpoint(),
-            }))
-            .map_err(|e| {
-                InvalidResponseSnafu {
-                    message: format!("Failed to serialize status: {e}"),
-                }
-                .build()
-            })?;
-            println!("{json}");
+            write_json(&components)?;
         }
     }
 

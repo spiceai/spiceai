@@ -1894,7 +1894,7 @@ fn convert_timestamp_to_turso(
 /// - `Timestamp*(_, Some(_))` → ERROR
 ///
 /// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
-#[expect(clippy::too_many_lines, clippy::match_same_arms)]
+#[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
     timestamp_format: TimestampFormat,

@@ -163,7 +163,6 @@ fn calculate_batch_size(vector_dimensions: usize) -> usize {
     max_by_size.clamp(1, PUT_VECTORS_MAX_ITEMS)
 }
 
-#[expect(clippy::too_many_lines)]
 fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
     let name = S3_VECTOR_PRIMARY_KEY_NAME.to_string();
     let keys = record_batch

@@ -18,7 +18,8 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
-use crate::output::TableOutput;
+use crate::output::{OutputFormat, TableOutput, write_json};
+use arrow_json;
 use clap::{Args, Subcommand};
 use repl::pretty::format_batches_with_types;
 use rustyline::error::ReadlineError;
@@ -31,7 +32,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::mpsc;
-
 /// Default poll interval for checking query status.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -62,6 +62,10 @@ pub struct QueryArgs {
     #[arg(long)]
     timeout: Option<humantime::Duration>,
 
+    /// Output format (applies to query results when SQL is provided)
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+
     #[command(subcommand)]
     command: Option<QuerySubcommand>,
 }
@@ -77,18 +81,30 @@ pub enum QuerySubcommand {
         /// Maximum number of queries to return
         #[arg(long, default_value = "100")]
         limit: usize,
+
+        /// Output format
+        #[arg(long, short = 'o', default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Check the status of a query
     Status {
         /// Query ID to check
         query_id: String,
+
+        /// Output format
+        #[arg(long, short = 'o', default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Fetch and display results of a completed query
     Results {
         /// Query ID to get results for
         query_id: String,
+
+        /// Output format
+        #[arg(long, short = 'o', default_value = "table")]
+        output: OutputFormat,
     },
 
     /// Cancel a running query
@@ -145,7 +161,14 @@ pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
 
     // If SQL argument provided, submit directly
     if let Some(sql) = &args.sql {
-        return submit_and_wait(&client, sql, !args.no_wait, args.timeout.map(Into::into)).await;
+        return submit_and_wait(
+            &client,
+            sql,
+            !args.no_wait,
+            args.timeout.map(Into::into),
+            args.output,
+        )
+        .await;
     }
 
     // No argument, start REPL
@@ -154,7 +177,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
 
 async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Result<()> {
     match cmd {
-        QuerySubcommand::List { status, limit } => {
+        QuerySubcommand::List {
+            status,
+            limit,
+            output,
+        } => {
             let resp = client
                 .queries(status.as_deref(), Some(*limit))
                 .await
@@ -167,6 +194,22 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                 return Ok(());
             }
 
+            if *output == OutputFormat::Json {
+                let json_queries: Vec<serde_json::Value> = resp
+                    .queries
+                    .iter()
+                    .map(|q| {
+                        serde_json::json!({
+                            "query_id": q.query_id,
+                            "status": q.state.clone(),
+                            "created_at": q.created_at,
+                            "sql_preview": q.sql_preview,
+                        })
+                    })
+                    .collect();
+                return write_json(&json_queries);
+            }
+
             let mut table = TableOutput::new(vec!["QUERY ID", "STATE", "CREATED", "SQL PREVIEW"]);
             for q in &resp.queries {
                 let sql = if q.sql_preview.len() > 47 {
@@ -176,7 +219,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                 };
                 table.add_row(vec![
                     q.query_id.clone(),
-                    q.status.to_string(),
+                    q.state.clone(),
                     q.created_at.clone(),
                     sql,
                 ]);
@@ -184,7 +227,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
             table.print();
             println!("\nTotal: {} queries", resp.queries.len());
         }
-        QuerySubcommand::Status { query_id } => {
+        QuerySubcommand::Status { query_id, output } => {
             let job =
                 client
                     .get_query(query_id)
@@ -197,10 +240,21 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                 .map_err(|e| crate::error::Error::InvalidResponse {
                     message: e.to_string(),
                 })?;
+            if *output == OutputFormat::Json {
+                return write_json(&serde_json::json!({
+                    "query_id": info.query_id,
+                    "status": info.status.to_string(),
+                    "error": info.error.as_ref().map(|e| &e.message),
+                    "result": info.result.as_ref().map(|r| serde_json::json!({
+                        "total_rows": r.total_rows,
+                        "total_chunks": r.total_chunks,
+                    })),
+                }));
+            }
             display_query_info(&info);
         }
-        QuerySubcommand::Results { query_id } => {
-            display_results(client, query_id, Duration::ZERO).await?;
+        QuerySubcommand::Results { query_id, output } => {
+            display_results(client, query_id, Duration::ZERO, *output).await?;
         }
         QuerySubcommand::Cancel { query_id } => {
             let info = client.cancel_query(query_id).await.map_err(|e| {
@@ -222,6 +276,7 @@ async fn submit_and_wait(
     sql: &str,
     wait: bool,
     timeout: Option<Duration>,
+    output: OutputFormat,
 ) -> Result<()> {
     let job = client
         .query(sql)
@@ -260,7 +315,7 @@ async fn submit_and_wait(
 
     if let Some(status) = final_status {
         if status.is_success() {
-            display_results(client, &query_id, elapsed).await?;
+            display_results(client, &query_id, elapsed, output).await?;
         } else if status.is_failed() {
             let job =
                 client
@@ -398,7 +453,9 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
         // Handle final status
         if let Some(status) = final_status {
             if status.is_success() {
-                if let Err(e) = display_results(client, &query_id, elapsed).await {
+                if let Err(e) =
+                    display_results(client, &query_id, elapsed, OutputFormat::Table).await
+                {
                     println!("\x1b[31mError displaying results:\x1b[0m {e}");
                 }
             } else if status.is_failed() {
@@ -538,7 +595,9 @@ async fn handle_special_command(
             if query_id.is_empty() {
                 return true;
             }
-            if let Err(e) = display_results(client, &query_id, Duration::ZERO).await {
+            if let Err(e) =
+                display_results(client, &query_id, Duration::ZERO, OutputFormat::Table).await
+            {
                 println!("\x1b[31mError:\x1b[0m {e}");
             }
         }
@@ -644,7 +703,7 @@ async fn wait_for_query(
 
     if let Some(status) = final_status {
         if status.is_success() {
-            if let Err(e) = display_results(client, query_id, elapsed).await {
+            if let Err(e) = display_results(client, query_id, elapsed, OutputFormat::Table).await {
                 println!("\x1b[31mError displaying results:\x1b[0m {e}");
             }
         } else if status.is_failed() {
@@ -737,7 +796,12 @@ impl CtrlCGuard {
     }
 }
 
-async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration) -> Result<()> {
+async fn display_results(
+    client: &Arc<Client>,
+    query_id: &str,
+    elapsed: Duration,
+    output: OutputFormat,
+) -> Result<()> {
     // First get query info to check status
     let job = client
         .get_query(query_id)
@@ -780,6 +844,28 @@ async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration
         } else {
             println!("No results.");
         }
+        return Ok(());
+    }
+
+    if output == OutputFormat::Json {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+            writer
+                .write_batches(&batches.iter().collect::<Vec<_>>())
+                .map_err(|e| crate::error::Error::InvalidResponse {
+                    message: format!("serializing results to JSON: {e}"),
+                })?;
+            writer
+                .finish()
+                .map_err(|e| crate::error::Error::InvalidResponse {
+                    message: format!("finalizing JSON output: {e}"),
+                })?;
+        }
+        let json = String::from_utf8(buf).map_err(|e| crate::error::Error::InvalidResponse {
+            message: format!("encoding JSON as UTF-8: {e}"),
+        })?;
+        println!("{json}");
         return Ok(());
     }
 
