@@ -203,7 +203,7 @@ linkme = "0.3.35"
 logos = "0.16.0"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
-mongodb = { version = "3.3.0", features = ["openssl-tls"] }
+mongodb = { version = "3.5.1", features = ["openssl-tls"] }
 mysql_async = { version = "0.36.1", features = ["native-tls-tls", "chrono"] }
 nix = "0.30"
 num_cpus = "1.16"
