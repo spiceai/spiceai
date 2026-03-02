@@ -94,6 +94,7 @@ pub mod api {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub row_count: Option<u64>,
         pub is_current: bool,
+        pub status: String,
     }
 
     /// Request body for setting the current snapshot.
@@ -555,6 +556,16 @@ impl std::fmt::Display for AccelerationEngine {
             Self::Turso => write!(f, "turso"),
         }
     }
+}
+
+/// Result of checking a snapshot file in the object store.
+enum SnapshotFileStatus {
+    /// File exists and size matches metadata.
+    Verified,
+    /// File exists but size does not match metadata.
+    Unverified,
+    /// File not found in the object store.
+    NotFound,
 }
 
 /// Manages snapshots for a specific accelerated dataset.
@@ -2044,9 +2055,6 @@ impl SnapshotManager {
             dataset_entry.snapshots.push(snapshot_entry);
             dataset_entry.current_snapshot_id = Some(next_snapshot_id);
 
-            // Remove metadata entries whose snapshot files no longer exist.
-            self.compact_metadata(dataset_entry).await;
-
             let serialized = serde_json::to_vec_pretty(&metadata).map_err(|source| {
                 SnapshotUploadError::UploadSerializeMetadata {
                     path: metadata_path_display.clone(),
@@ -2109,14 +2117,16 @@ impl SnapshotManager {
         &self.dataset_name
     }
 
-    /// Retrieves the snapshot summary for this dataset, including all available snapshots.
-    ///
-    /// Only snapshots that actually exist in the object store are returned.
+    /// Retrieves the snapshot summary for this dataset, returning the most recent
+    /// `limit` snapshots.
     ///
     /// # Errors
     ///
     /// Returns an error if reading or parsing the metadata fails.
-    pub async fn get_snapshot_summary(&self) -> Result<api::SnapshotSummary, SnapshotApiError> {
+    pub async fn get_snapshot_summary(
+        &self,
+        limit: usize,
+    ) -> Result<api::SnapshotSummary, SnapshotApiError> {
         let handle = self.load_metadata().await.map_err(|e| match e {
             MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
                 path,
@@ -2147,55 +2157,53 @@ impl SnapshotManager {
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
         let dataset_engine = dataset_metadata.engine.clone();
 
+        // Take only the last `limit` entries (most recent) to avoid unnecessary
+        // HEAD requests for old snapshots we won't return.
+        let total = dataset_metadata.snapshots.len();
+        let start = total.saturating_sub(limit);
+        let windowed_entries = &dataset_metadata.snapshots[start..];
+
         // Check which snapshots actually exist in the object store (with bounded concurrency).
         // Eagerly collect futures into a Vec so the closure doesn't capture `&self` lazily,
         // which would cause higher-ranked lifetime issues with axum handlers.
-        let existence_futures: Vec<_> = dataset_metadata
-            .snapshots
+        let existence_futures: Vec<_> = windowed_entries
             .iter()
             .map(|entry| {
                 let snapshot_uri = entry.snapshot.clone();
                 let snapshot_id = entry.snapshot_id;
+                let snapshot_size = entry.snapshot_size;
                 async move {
-                    let exists = self.snapshot_exists(&snapshot_uri).await;
+                    let exists = self.snapshot_exists(&snapshot_uri, snapshot_size).await;
                     (snapshot_id, exists)
                 }
             })
             .collect();
 
-        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
-            .buffer_unordered(10)
-            .collect()
-            .await;
+        let existence_results: HashMap<u64, SnapshotFileStatus> =
+            futures::stream::iter(existence_futures)
+                .buffer_unordered(10)
+                .collect()
+                .await;
 
-        let snapshots: Vec<api::SnapshotInfo> = dataset_metadata
-            .snapshots
+        let snapshots: Vec<api::SnapshotInfo> = windowed_entries
             .iter()
-            .filter_map(|entry| {
-                let exists = existence_results
-                    .get(&entry.snapshot_id)
-                    .copied()
-                    .unwrap_or(false);
-                if exists {
-                    Some(api::SnapshotInfo {
-                        snapshot_id: entry.snapshot_id,
-                        timestamp_ms: entry.timestamp_ms,
-                        location: entry.snapshot.clone(),
-                        checksum: entry.snapshot_checksum.clone(),
-                        checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
-                        size_bytes: entry.snapshot_size,
-                        engine: entry.snapshot_engine.clone(),
-                        row_count: entry.snapshot_row_count,
-                        is_current: Some(entry.snapshot_id) == current_snapshot_id,
-                    })
-                } else {
-                    tracing::debug!(
-                        dataset = %self.dataset_name,
-                        snapshot_id = entry.snapshot_id,
-                        location = %entry.snapshot,
-                        "Snapshot referenced in metadata does not exist in object store"
-                    );
-                    None
+            .map(|entry| {
+                let status = match existence_results.get(&entry.snapshot_id) {
+                    Some(SnapshotFileStatus::Verified) => "verified".to_string(),
+                    Some(SnapshotFileStatus::Unverified) => "unverified".to_string(),
+                    _ => String::new(),
+                };
+                api::SnapshotInfo {
+                    snapshot_id: entry.snapshot_id,
+                    timestamp_ms: entry.timestamp_ms,
+                    location: entry.snapshot.clone(),
+                    checksum: entry.snapshot_checksum.clone(),
+                    checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+                    size_bytes: entry.snapshot_size,
+                    engine: entry.snapshot_engine.clone(),
+                    row_count: entry.snapshot_row_count,
+                    is_current: Some(entry.snapshot_id) == current_snapshot_id,
+                    status,
                 }
             })
             .collect();
@@ -2239,16 +2247,23 @@ impl SnapshotManager {
         .await
     }
 
-    /// Checks if a snapshot exists in the object store, with retry for transient errors.
-    async fn snapshot_exists(&self, snapshot_uri: &str) -> bool {
+    /// Checks if a snapshot exists in the object store and whether its size matches,
+    /// with retry for transient errors.
+    async fn snapshot_exists(&self, snapshot_uri: &str, expected_size: u64) -> SnapshotFileStatus {
         let Ok(object_path) = self.snapshot_uri_to_object_path(snapshot_uri) else {
-            return false;
+            return SnapshotFileStatus::NotFound;
         };
 
         retry(self.network_retry_strategy.clone(), || async {
             match self.object_store.head(&object_path).await {
-                Ok(_) => Ok(true),
-                Err(object_store::Error::NotFound { .. }) => Ok(false),
+                Ok(res) => {
+                    if res.size == expected_size {
+                        Ok(SnapshotFileStatus::Verified)
+                    } else {
+                        Ok(SnapshotFileStatus::Unverified)
+                    }
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(SnapshotFileStatus::NotFound),
                 Err(err) => {
                     tracing::warn!(
                         "Transient error checking snapshot existence, retrying. dataset={} path={object_path} error={err}",
@@ -2264,56 +2279,8 @@ impl SnapshotManager {
                 "Failed to check snapshot existence after retries. dataset={} path={object_path} error={err}",
                 self.dataset_name,
             );
-            false
+            SnapshotFileStatus::NotFound
         })
-    }
-
-    /// Compacts dataset metadata by removing entries whose snapshot files no longer
-    /// exist in the object store. The current snapshot entry is always preserved.
-    async fn compact_metadata(&self, dataset_entry: &mut DatasetMetadata) {
-        let current_id = dataset_entry.current_snapshot_id;
-
-        let entries_to_check: Vec<_> = dataset_entry
-            .snapshots
-            .iter()
-            .filter(|e| Some(e.snapshot_id) != current_id)
-            .map(|e| (e.snapshot_id, e.snapshot.clone()))
-            .collect();
-
-        if entries_to_check.is_empty() {
-            return;
-        }
-
-        let existence_futures: Vec<_> = entries_to_check
-            .into_iter()
-            .map(|(id, uri)| async move {
-                let exists = self.snapshot_exists(&uri).await;
-                (id, exists)
-            })
-            .collect();
-
-        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
-            .buffer_unordered(10)
-            .collect()
-            .await;
-
-        let before = dataset_entry.snapshots.len();
-        dataset_entry.snapshots.retain(|e| {
-            Some(e.snapshot_id) == current_id
-                || existence_results
-                    .get(&e.snapshot_id)
-                    .copied()
-                    .unwrap_or(true)
-        });
-        let removed = before - dataset_entry.snapshots.len();
-
-        if removed > 0 {
-            tracing::info!(
-                dataset = %dataset_entry.name,
-                removed_count = removed,
-                "Compacted snapshot metadata: removed entries for non-existent snapshots"
-            );
-        }
     }
 
     /// Retrieves information about a specific snapshot by ID.
@@ -2364,6 +2331,15 @@ impl SnapshotManager {
             });
         };
 
+        let status = match self
+            .snapshot_exists(&entry.snapshot, entry.snapshot_size)
+            .await
+        {
+            SnapshotFileStatus::Verified => "verified".to_string(),
+            SnapshotFileStatus::Unverified => "unverified".to_string(),
+            SnapshotFileStatus::NotFound => String::new(),
+        };
+
         Ok(api::SnapshotInfo {
             snapshot_id: entry.snapshot_id,
             timestamp_ms: entry.timestamp_ms,
@@ -2374,6 +2350,7 @@ impl SnapshotManager {
             engine: entry.snapshot_engine.clone(),
             row_count: entry.snapshot_row_count,
             is_current: Some(entry.snapshot_id) == dataset_metadata.current_snapshot_id,
+            status,
         })
     }
 
@@ -4305,7 +4282,7 @@ mod tests {
         let manager = build_manager_for_api_tests(Arc::clone(&store));
 
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -4328,7 +4305,7 @@ mod tests {
             snapshot: "snapshots/test_snapshot.db".to_string(),
             snapshot_checksum: "abc123".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 1024,
+            snapshot_size: 13,
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
@@ -4357,7 +4334,7 @@ mod tests {
 
         write_metadata(&store, &metadata_path, &metadata).await;
 
-        // Create the actual snapshot file so it passes the existence check
+        // Create the actual snapshot file so it passes the existence check (13 bytes)
         let snapshot_path = Path::from("snapshots/test_snapshot.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
@@ -4366,7 +4343,7 @@ mod tests {
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -4381,6 +4358,220 @@ mod tests {
         assert_eq!(snapshot_info.timestamp_ms, 1_704_153_600_000);
         assert_eq!(snapshot_info.checksum, "abc123");
         assert!(snapshot_info.is_current);
+        assert_eq!(snapshot_info.status, "verified");
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_summary_returns_missing_snapshot_with_empty_status() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        let existing_entry = SnapshotEntry {
+            snapshot_id: 1,
+            timestamp_ms: 1_000_000,
+            snapshot: "snapshots/existing.db".to_string(),
+            snapshot_checksum: "aaa".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 4,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+
+        let missing_entry = SnapshotEntry {
+            snapshot_id: 2,
+            timestamp_ms: 2_000_000,
+            snapshot: "snapshots/missing.db".to_string(),
+            snapshot_checksum: "bbb".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 200,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+
+        let mut datasets = HashMap::new();
+        datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                engine: None,
+                schemas: vec![],
+                current_schema_id: 0,
+                snapshots: vec![existing_entry, missing_entry],
+                current_snapshot_id: Some(2),
+                properties: HashMap::new(),
+            },
+        );
+
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 2_000_000,
+            datasets,
+        };
+
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        // Only create the file for the first snapshot
+        store
+            .put(
+                &Path::from("snapshots/existing.db"),
+                Bytes::from_static(b"data").into(),
+            )
+            .await
+            .expect("write snapshot file");
+
+        let manager = build_manager_for_api_tests(Arc::clone(&store));
+        let summary = manager
+            .get_snapshot_summary(100)
+            .await
+            .expect("get_snapshot_summary should succeed");
+
+        // Both snapshots should be returned regardless of file existence
+        assert_eq!(summary.snapshots.len(), 2);
+
+        let s1 = summary
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == 1)
+            .expect("snapshot 1 should be present");
+        let s2 = summary
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == 2)
+            .expect("snapshot 2 should be present");
+
+        assert_eq!(s1.status, "verified");
+        assert_eq!(s2.status, "", "missing file should have empty status");
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_summary_returns_unverified_when_size_mismatches() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        let entry = SnapshotEntry {
+            snapshot_id: 1,
+            timestamp_ms: 1_000_000,
+            snapshot: "snapshots/wrong_size.db".to_string(),
+            snapshot_checksum: "aaa".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 100,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+
+        let mut datasets = HashMap::new();
+        datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                engine: None,
+                schemas: vec![],
+                current_schema_id: 0,
+                snapshots: vec![entry],
+                current_snapshot_id: Some(1),
+                properties: HashMap::new(),
+            },
+        );
+
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 1_000_000,
+            datasets,
+        };
+
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        // Write a file with different size than metadata expects (100 vs 4 bytes)
+        store
+            .put(
+                &Path::from("snapshots/wrong_size.db"),
+                Bytes::from_static(b"data").into(),
+            )
+            .await
+            .expect("write snapshot file");
+
+        let manager = build_manager_for_api_tests(Arc::clone(&store));
+        let summary = manager
+            .get_snapshot_summary(100)
+            .await
+            .expect("get_snapshot_summary should succeed");
+
+        assert_eq!(summary.snapshots.len(), 1);
+        assert_eq!(
+            summary.snapshots[0].status, "unverified",
+            "file exists but size doesn't match, should be unverified"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_summary_respects_limit() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        let mut snapshots = Vec::new();
+        for i in 0..5u64 {
+            let filename = format!("snapshots/snap_{i}.db");
+            snapshots.push(SnapshotEntry {
+                snapshot_id: i,
+                #[expect(clippy::cast_possible_wrap)]
+                timestamp_ms: (i as i64) * 1_000_000,
+                snapshot: filename.clone(),
+                snapshot_checksum: format!("checksum_{i}"),
+                snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                snapshot_size: 4,
+                snapshot_engine: None,
+                snapshot_row_count: None,
+                snapshot_last_updated_at_ms: None,
+            });
+            store
+                .put(&Path::from(filename), Bytes::from_static(b"data").into())
+                .await
+                .expect("write snapshot file");
+        }
+
+        let mut datasets = HashMap::new();
+        datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                engine: None,
+                schemas: vec![],
+                current_schema_id: 0,
+                snapshots,
+                current_snapshot_id: Some(4),
+                properties: HashMap::new(),
+            },
+        );
+
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 4_000_000,
+            datasets,
+        };
+
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let manager = build_manager_for_api_tests(Arc::clone(&store));
+
+        // Request only 3 most recent
+        let summary = manager
+            .get_snapshot_summary(3)
+            .await
+            .expect("get_snapshot_summary should succeed");
+
+        assert_eq!(summary.snapshots.len(), 3, "should return only 3 snapshots");
+
+        let ids: Vec<u64> = summary.snapshots.iter().map(|s| s.snapshot_id).collect();
+        assert_eq!(ids, vec![2, 3, 4], "should return the last 3 snapshots");
     }
 
     #[tokio::test]
@@ -4564,7 +4755,7 @@ mod tests {
 
         // Verify the change by reading the summary
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -4669,7 +4860,7 @@ mod tests {
             .expect("write metadata");
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
-        let result = manager.get_snapshot_summary().await;
+        let result = manager.get_snapshot_summary(100).await;
 
         assert!(result.is_err());
         let err = result.expect_err("should return error");
@@ -4694,7 +4885,7 @@ mod tests {
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
         let summary = manager
-            .get_snapshot_summary()
+            .get_snapshot_summary(100)
             .await
             .expect("get_snapshot_summary should succeed");
 
@@ -5153,112 +5344,5 @@ mod tests {
             serde_json::json!(100),
             "snapshot-row-count should be serialized"
         );
-    }
-
-    #[tokio::test]
-    async fn compact_metadata_removes_stale_entries() {
-        let store = Arc::new(InMemory::new());
-
-        // Create a snapshot file for only one of the two entries
-        let existing_path = Path::from("snapshots/existing_snapshot.db");
-        store
-            .put(&existing_path, Bytes::from_static(b"snapshot data").into())
-            .await
-            .expect("write snapshot file");
-
-        let manager = build_manager_for_api_tests(Arc::clone(&store));
-
-        let existing_entry = SnapshotEntry {
-            snapshot_id: 1,
-            timestamp_ms: 1_000_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/existing_snapshot.db"),
-            snapshot_checksum: "aaa".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 100,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let stale_entry = SnapshotEntry {
-            snapshot_id: 0,
-            timestamp_ms: 900_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/deleted_snapshot.db"),
-            snapshot_checksum: "bbb".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 200,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let mut dataset_entry = DatasetMetadata {
-            name: DATASET_NAME.to_string(),
-            engine: None,
-            schemas: vec![],
-            current_schema_id: 0,
-            snapshots: vec![stale_entry, existing_entry],
-            current_snapshot_id: Some(1),
-            properties: HashMap::new(),
-        };
-
-        manager.compact_metadata(&mut dataset_entry).await;
-
-        assert_eq!(
-            dataset_entry.snapshots.len(),
-            1,
-            "Stale entry should be removed"
-        );
-        assert_eq!(dataset_entry.snapshots[0].snapshot_id, 1);
-    }
-
-    #[tokio::test]
-    async fn compact_metadata_preserves_current_snapshot_even_if_missing() {
-        let store = Arc::new(InMemory::new());
-        let manager = build_manager_for_api_tests(Arc::clone(&store));
-
-        // Both entries point to non-existent files, but the current one should be preserved
-        let current_entry = SnapshotEntry {
-            snapshot_id: 5,
-            timestamp_ms: 1_000_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/missing_current.db"),
-            snapshot_checksum: "aaa".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 100,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let old_entry = SnapshotEntry {
-            snapshot_id: 3,
-            timestamp_ms: 900_000,
-            snapshot: format!("{SNAPSHOT_URI_PREFIX}/missing_old.db"),
-            snapshot_checksum: "bbb".to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: 200,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-
-        let mut dataset_entry = DatasetMetadata {
-            name: DATASET_NAME.to_string(),
-            engine: None,
-            schemas: vec![],
-            current_schema_id: 0,
-            snapshots: vec![old_entry, current_entry],
-            current_snapshot_id: Some(5),
-            properties: HashMap::new(),
-        };
-
-        manager.compact_metadata(&mut dataset_entry).await;
-
-        assert_eq!(
-            dataset_entry.snapshots.len(),
-            1,
-            "Only the current snapshot should remain"
-        );
-        assert_eq!(dataset_entry.snapshots[0].snapshot_id, 5);
     }
 }

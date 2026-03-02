@@ -514,7 +514,9 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
 
             let ctx = rt.datafusion().ctx.state();
             let filter = col("id").eq(lit(3i64));
-            let delete_plan = deletion_provider.delete_from(&ctx, &[filter]).await?;
+            let delete_plan =
+                DeletionTableProvider::delete_from(deletion_provider.as_ref(), &ctx, &[filter])
+                    .await?;
             collect(delete_plan, rt.datafusion().ctx.task_ctx()).await?;
 
             // Verify deletion
@@ -1672,7 +1674,8 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
 
             // Delete row with id=2 using DeletionTableProvider
             let filter = col("id").eq(lit(2i64));
-            let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+            let delete_plan =
+                DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
             collect(delete_plan, ctx.task_ctx()).await?;
 
             // Verify deletion

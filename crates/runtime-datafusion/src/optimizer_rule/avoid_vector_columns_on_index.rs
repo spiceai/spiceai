@@ -120,7 +120,7 @@ impl AvoidDerivedVectorColumnOnIndexRule {
                     .index_of_column_by_name(None, d.as_str())
                     .map(|idx| {
                         let (tbl_ref, field) = table_scan.projected_schema.qualified_field(idx);
-                        (idx, (tbl_ref.cloned(), Arc::new(field.clone())))
+                        (idx, (tbl_ref.cloned(), Arc::clone(field)))
                     })
             })
             .collect();

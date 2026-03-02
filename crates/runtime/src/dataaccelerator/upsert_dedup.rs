@@ -176,7 +176,7 @@ impl DeletionTableProvider for UpsertDedupTableProvider {
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.deletion_provider.delete_from(state, filters).await
+        DeletionTableProvider::delete_from(self.deletion_provider.as_ref(), state, filters).await
     }
 }
 

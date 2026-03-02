@@ -1212,11 +1212,7 @@ mod tests {
         // 4. The parameterized query pattern (used by prepared statements) functions properly
     }
 
-    #[expect(
-        clippy::similar_names,
-        clippy::redundant_closure_for_method_calls,
-        clippy::too_many_lines
-    )]
+    #[expect(clippy::similar_names, clippy::redundant_closure_for_method_calls)]
     #[tokio::test]
     async fn test_prepare_execute_with_dataframe_api() {
         use arrow::array::{Int64Array, RecordBatch, StringArray};
