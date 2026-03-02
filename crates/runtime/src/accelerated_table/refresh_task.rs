@@ -396,8 +396,11 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
@@ -442,8 +445,11 @@ impl RefreshTask {
                         metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
                     }
 
-                    self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Ready)
-                        .await;
+                    self.set_refresh_status(
+                        refresh.display_sql().as_deref(),
+                        status::ComponentStatus::Ready,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Ok(_) => {
@@ -499,8 +505,11 @@ impl RefreshTask {
                 if self.runtime_status.is_shutdown() {
                     return Ok(());
                 }
-                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
-                    .await;
+                self.log_refresh_error(
+                    inner_err_from_retry_ref(&e),
+                    refresh.display_sql().as_deref(),
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -531,7 +540,7 @@ impl RefreshTask {
             .write_streaming_data_update(
                 Some(start_time),
                 streaming_data_update,
-                refresh.sql.as_deref(),
+                refresh.display_sql().as_deref(),
             )
             .await
         {
@@ -788,8 +797,11 @@ impl RefreshTask {
             tracing::info!("Loading data for {} {dataset_name}", self.component_type());
         }
 
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let refresh = refresh.clone();
         let mut filters = vec![];
@@ -923,7 +935,7 @@ impl RefreshTask {
 
     async fn get_data_update(
         &self,
-        filters: Vec<Expr>,
+        mut filters: Vec<Expr>,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
@@ -940,12 +952,18 @@ impl RefreshTask {
             RefreshMode::Caching => UpdateType::Overwrite,
         };
 
+        // Extract SQL string and partition filters from RefreshSQL
+        let sql_string = refresh.sql.as_ref().map(|s| s.to_sql());
+        if let Some(ref s) = refresh.sql {
+            filters.extend(s.partition_filters().iter().cloned());
+        }
+
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
             let dataset_name_for_runtime = dataset_name.clone();
             let filters_for_runtime = filters.clone();
             let update_type_for_runtime = update_type.clone();
             let provider_for_runtime = Arc::clone(&federated_provider);
-            let sql_for_runtime = refresh.sql.clone();
+            let sql_for_runtime = sql_string.clone();
             let request_context = RequestContext::current(AsyncMarker::new().await);
             let span = Span::current();
 
@@ -1010,7 +1028,7 @@ impl RefreshTask {
             &mut ctx,
             dataset_name,
             federated_provider,
-            refresh.sql.clone(),
+            sql_string,
             filters,
         )
         .await

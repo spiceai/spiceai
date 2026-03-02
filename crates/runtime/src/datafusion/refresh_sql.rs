@@ -29,6 +29,8 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
+use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -84,11 +86,13 @@ macro_rules! ensure_no_expr {
     };
 }
 
-pub fn validate_refresh_sql(
+/// Parse and validate a refresh SQL string, returning both a structured `RefreshSQL` and the
+/// validated schema. This replaces the old `validate_refresh_sql` which only returned a schema.
+pub fn parse_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,
     source_schema: Arc<Schema>,
-) -> Result<Arc<Schema>> {
+) -> Result<(RefreshSQL, Arc<Schema>)> {
     let mut statements = DFParser::parse_sql_with_dialect(refresh_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
     if statements.len() != 1 {
@@ -107,9 +111,9 @@ pub fn validate_refresh_sql(
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
 
-                if let Some(limit) = &query.limit_clause {
+                let limit_value = if let Some(limit) = &query.limit_clause {
                     let LimitClause::LimitOffset {
-                        limit: _,
+                        limit: limit_expr,
                         offset,
                         limit_by,
                     } = limit
@@ -123,14 +127,22 @@ pub fn validate_refresh_sql(
 
                     ensure_no_expr!(limit_by.is_empty(), "LIMIT BY", expected_table);
                     ensure_no_expr!(offset.is_none(), "OFFSET", expected_table);
-                }
+
+                    // Extract the numeric LIMIT value if present
+                    limit_expr.as_ref().and_then(|e| match e {
+                        Expr::Value(v) => v.to_string().parse::<usize>().ok(),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
 
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
 
                 match query.body.as_ref() {
                     SetExpr::Select(select) => {
-                        let refresh_schema = validate_select_columns(
+                        let (columns, refresh_schema) = validate_and_extract_columns(
                             &select.projection,
                             source_schema,
                             &expected_table,
@@ -188,17 +200,35 @@ pub fn validate_refresh_sql(
                                 ensure!(
                                     TableReference::parse_str(&table_name_with_schema)
                                         == expected_table,
-                                    InvalidSqlStatementSnafu { expected_table }
+                                    InvalidSqlStatementSnafu {
+                                        expected_table: expected_table.clone()
+                                    }
                                 );
                             }
                             _ => {
-                                InvalidSqlStatementSnafu { expected_table }.fail()?;
+                                InvalidSqlStatementSnafu {
+                                    expected_table: expected_table.clone(),
+                                }
+                                .fail()?;
                             }
                         }
 
-                        Ok(refresh_schema)
+                        // Extract user WHERE filters, split on top-level AND
+                        let user_filters = select
+                            .selection
+                            .as_ref()
+                            .map(|expr| split_conjunction(expr.clone()))
+                            .unwrap_or_default();
+
+                        let refresh_sql =
+                            RefreshSQL::new(expected_table, columns, user_filters, limit_value);
+
+                        Ok((refresh_sql, refresh_schema))
                     }
-                    _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+                    _ => InvalidSqlStatementSnafu {
+                        expected_table: expected_table.clone(),
+                    }
+                    .fail()?,
                 }
             }
             _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
@@ -207,17 +237,19 @@ pub fn validate_refresh_sql(
     }
 }
 
-fn validate_select_columns(
+/// Validate select columns and extract both the `RefreshSQLColumns` and the resulting schema.
+fn validate_and_extract_columns(
     select: &Vec<SelectItem>,
     source_schema: Arc<Schema>,
     expected_table: &TableReference,
-) -> Result<Arc<Schema>> {
+) -> Result<(RefreshSQLColumns, Arc<Schema>)> {
     // Wildcard will select all columns
     if select.len() == 1 && matches!(select[0], SelectItem::Wildcard(_)) {
-        return Ok(source_schema);
+        return Ok((RefreshSQLColumns::All, source_schema));
     }
 
     let mut fields = vec![];
+    let mut column_names = vec![];
     for select_item in select {
         match select_item {
             SelectItem::UnnamedExpr(expr) => match expr {
@@ -234,6 +266,7 @@ fn validate_select_columns(
                         .fail();
                     };
                     fields.push(field.clone());
+                    column_names.push(column_name.to_string());
                 }
                 _ => {
                     return OnlyColumnReferencesSnafu {
@@ -257,7 +290,26 @@ fn validate_select_columns(
     // are not included automatically. We verify their presence in the source schema and add them manually if needed.
     fields = include_computed_columns(&fields, &source_schema);
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok((
+        RefreshSQLColumns::Named(column_names),
+        Arc::new(Schema::new(fields)),
+    ))
+}
+
+/// Split a WHERE expression on top-level AND into individual predicates.
+fn split_conjunction(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = split_conjunction(*left);
+            parts.extend(split_conjunction(*right));
+            parts
+        }
+        other => vec![other],
+    }
 }
 
 /// Checks the source schema for associated computed columns (e.g., embeddings)
@@ -345,8 +397,10 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT * FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 3);
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 3);
+        assert!(matches!(refresh_sql.columns(), RefreshSQLColumns::All));
+        assert_eq!(refresh_sql.to_sql(), "SELECT * FROM test_table");
         Ok(())
     }
 
@@ -356,10 +410,12 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, name FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 2);
-        assert_eq!(result.field(0).name(), "id");
-        assert_eq!(result.field(1).name(), "name");
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 2);
+        assert_eq!(result_schema.field(0).name(), "id");
+        assert_eq!(result_schema.field(1).name(), "name");
+        assert!(matches!(refresh_sql.columns(), RefreshSQLColumns::Named(_)));
+        assert_eq!(refresh_sql.to_sql(), "SELECT id, name FROM test_table");
         Ok(())
     }
 
@@ -369,7 +425,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, invalid_column FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::ColumnNotFoundInSource { .. })));
     }
 
@@ -379,7 +435,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id FROM wrong_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::InvalidSqlStatement { .. })));
     }
 
@@ -389,7 +445,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id + 1 FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::OnlyColumnReferences { .. })));
     }
 
@@ -399,7 +455,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id as user_id FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::OnlyColumnReferences { .. })));
     }
 
@@ -409,7 +465,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id FROM test_table GROUP BY id";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::UnexpectedExpression { .. })));
     }
 
@@ -419,7 +475,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id FROM test_table; SELECT name FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(
             result,
             Err(Error::ExpectedSingleSqlStatement { .. })
@@ -432,12 +488,12 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, name FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 4);
-        assert_eq!(result.field(0).name(), "id");
-        assert_eq!(result.field(1).name(), "name");
-        assert_eq!(result.field(2).name(), "name_embedding");
-        assert_eq!(result.field(3).name(), "name_offset");
+        let (_, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 4);
+        assert_eq!(result_schema.field(0).name(), "id");
+        assert_eq!(result_schema.field(1).name(), "name");
+        assert_eq!(result_schema.field(2).name(), "name_embedding");
+        assert_eq!(result_schema.field(3).name(), "name_offset");
         Ok(())
     }
 
@@ -452,14 +508,68 @@ mod tests {
 
         // bucket() in a WHERE clause should be accepted by refresh SQL validation.
         let sql = "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0";
-        let result = validate_refresh_sql(table.clone(), sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 3);
+        let (refresh_sql, result_schema) =
+            parse_refresh_sql(table.clone(), sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 3);
+        assert_eq!(
+            refresh_sql.to_sql(),
+            "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0"
+        );
 
         // Multiple OR'd bucket() filters (as generated by partition assignment).
         let sql = "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0 OR bucket(50, organization_id) = 1";
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 3);
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 3);
+        // The OR expression stays as a single filter since OR is not top-level AND
+        assert_eq!(
+            refresh_sql.to_sql(),
+            "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0 OR bucket(50, organization_id) = 1"
+        );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_where_with_and() -> Result<()> {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT * FROM test_table WHERE id > 10 AND name = 'foo'";
+
+        let (refresh_sql, _) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        // Should split on top-level AND into 2 user_filters
+        let reconstructed = refresh_sql.to_sql();
+        assert!(reconstructed.contains("WHERE"));
+        assert!(reconstructed.contains("id > 10"));
+        assert!(reconstructed.contains("name = 'foo'"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_limit() -> Result<()> {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT * FROM test_table LIMIT 100";
+
+        let (refresh_sql, _) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert!(refresh_sql.to_sql().contains("LIMIT 100"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_conjunction() {
+        use sqlparser::ast::{BinaryOperator, Value};
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Value(Value::Number("1".to_string(), false))),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Value(Value::Number("2".to_string(), false))),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::Value(Value::Number("3".to_string(), false))),
+            }),
+        };
+
+        let parts = split_conjunction(expr);
+        assert_eq!(parts.len(), 3);
     }
 }

@@ -1566,16 +1566,17 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
-        let refresh_sql = dataset.refresh_sql();
-        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(
+        let refresh_sql_str = dataset.refresh_sql();
+        let (parsed_refresh_sql, refresh_schema) = if let Some(sql_str) = &refresh_sql_str {
+            let (parsed, schema) = refresh_sql::parse_refresh_sql(
                 dataset.name.clone(),
-                refresh_sql.as_str(),
+                sql_str.as_str(),
                 source_schema,
             )
-            .context(RefreshSqlSnafu)?
+            .context(RefreshSqlSnafu)?;
+            (Some(parsed), schema)
         } else {
-            source_schema
+            (None, source_schema)
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1598,7 +1599,7 @@ impl DataFusion {
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let use_constraints = refresh_sql.is_none();
+        let use_constraints = parsed_refresh_sql.is_none();
 
         let constraints = if use_constraints {
             match &*source_table_provider {
@@ -1656,8 +1657,8 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-        if let Some(sql) = &refresh_sql {
-            refresh = refresh.sql(sql.clone());
+        if let Some(sql) = parsed_refresh_sql {
+            refresh = refresh.refresh_sql(sql);
         }
         if let Some(format) = dataset.time_format {
             refresh = refresh.time_format(format);
@@ -2058,8 +2059,8 @@ impl DataFusion {
 
         let refresh_schema = table.schema();
 
-        if let Some(sql) = &refresh_sql {
-            let selected_schema = refresh_sql::validate_refresh_sql(
+        let parsed = if let Some(sql) = &refresh_sql {
+            let (parsed_sql, selected_schema) = refresh_sql::parse_refresh_sql(
                 dataset_name.clone(),
                 sql,
                 Arc::clone(&refresh_schema),
@@ -2077,11 +2078,35 @@ impl DataFusion {
                 }
                 .fail();
             }
+            Some(parsed_sql)
+        } else {
+            None
+        };
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table.update_refresh_sql(parsed).await.context(
+                UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                },
+            )?;
         }
+
+        Ok(())
+    }
+
+    /// Update only the partition filters on an accelerated table's refresh.
+    pub async fn update_partition_filters(
+        &self,
+        dataset_name: TableReference,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<()> {
+        let table = self
+            .get_accelerated_table_provider(&dataset_name.to_string())
+            .await?;
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
-                .update_refresh_sql(refresh_sql)
+                .update_partition_filters(filters)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
