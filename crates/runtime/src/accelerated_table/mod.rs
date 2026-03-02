@@ -251,6 +251,7 @@ pub struct AcceleratedTable {
     last_updated_at: Arc<AtomicI64>,
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
+    cluster_role: Option<ClusterRole>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -887,6 +888,7 @@ impl Builder {
             in_flight_revalidations,
             last_updated_at,
             batch_write_tx,
+            cluster_role: self.cluster_role,
         })
     }
 }
@@ -1135,6 +1137,14 @@ impl TableProvider for AcceleratedTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Check if we're in caching mode
         let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+
+        if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
+            let federated_provider = self.federated.table_provider().await;
+            return federated_provider
+                .scan(state, projection, filters, limit)
+                .await;
+        }
 
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
         if !self.refresher().initial_load_completed() && !is_caching_mode {
