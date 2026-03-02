@@ -17945,6 +17945,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "ansi_colors",
  "arrow",
+ "arrow-json",
  "assert_cmd",
  "chrono",
  "clap",
@@ -17956,6 +17957,7 @@ dependencies = [
  "fundu",
  "futures",
  "humantime",
+ "keyring",
  "nix 0.29.0",
  "open",
  "opentelemetry",
@@ -18182,6 +18184,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "clap",
+ "dirs",
  "reqwest 0.12.24",
  "runtime-secrets",
  "rustls 0.23.36",

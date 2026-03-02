@@ -720,10 +720,17 @@ pub async fn create_hf_model(
     model_type: Option<&str>,
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
+    chat_template_literal: Option<&str>,
 ) -> Result<Arc<dyn Chat>> {
-    mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal, from_gguf)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
+    mistral::MistralLlama::from_hf(
+        model_id,
+        model_type,
+        hf_token_literal,
+        from_gguf,
+        chat_template_literal,
+    )
+    .await
+    .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
 #[cfg(feature = "local_llm")]

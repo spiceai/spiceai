@@ -19,3 +19,29 @@ limitations under the License.
 mod table;
 
 pub use table::{TableOutput, TableRow, write_table};
+
+use crate::error::{InvalidResponseSnafu, Result};
+use serde::Serialize;
+
+/// Output format shared by all CLI commands that produce structured data.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Display results as a human-readable table (default)
+    #[default]
+    #[value(alias = "text")]
+    Table,
+    /// Output results as pretty-printed JSON
+    Json,
+}
+
+/// Serialize `data` to pretty-printed JSON and print to stdout.
+pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(data).map_err(|e| {
+        InvalidResponseSnafu {
+            message: format!("Failed to serialize to JSON: {e}"),
+        }
+        .build()
+    })?;
+    println!("{json}");
+    Ok(())
+}
