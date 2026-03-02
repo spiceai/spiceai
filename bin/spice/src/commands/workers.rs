@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::{WorkerInfo, WorkerListResponse};
 
@@ -30,10 +30,15 @@ use runtime_api_types::v1::{WorkerInfo, WorkerListResponse};
 
 Examples:
   spice workers
+  spice workers -o json
 
 See more at: https://spiceai.org/docs/"#
 )]
-pub struct WorkersArgs {}
+pub struct WorkersArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
 
 impl TableRow for WorkerInfo {
     fn headers() -> Vec<&'static str> {
@@ -50,7 +55,7 @@ impl TableRow for WorkerInfo {
 }
 
 /// Execute the workers command.
-pub async fn execute(ctx: &RuntimeContext, _args: &WorkersArgs) -> Result<()> {
+pub async fn execute(ctx: &RuntimeContext, args: &WorkersArgs) -> Result<()> {
     let response = ctx.get("/v1/workers").await.map_err(|_| {
         RuntimeUnavailableSnafu {
             endpoint: ctx.http_endpoint().to_string(),
@@ -72,7 +77,10 @@ pub async fn execute(ctx: &RuntimeContext, _args: &WorkersArgs) -> Result<()> {
         .build()
     })?;
 
-    write_table(&worker_response.data);
+    match args.output {
+        OutputFormat::Table => write_table(&worker_response.data),
+        OutputFormat::Json => write_json(&worker_response.data)?,
+    }
 
     Ok(())
 }

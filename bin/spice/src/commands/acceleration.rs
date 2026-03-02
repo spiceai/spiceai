@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,10 @@ pub enum AccelerationCommand {
 pub struct SnapshotsArgs {
     /// The dataset name
     pub dataset: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Arguments for the snapshot subcommand.
@@ -73,6 +77,10 @@ pub struct SnapshotArgs {
 
     /// The snapshot ID
     pub snapshot_id: u64,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Arguments for the set-snapshot subcommand.
@@ -86,7 +94,7 @@ pub struct SetSnapshotArgs {
 }
 
 /// Snapshot information from the API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotInfo {
     pub snapshot_id: u64,
     pub timestamp_ms: i64,
@@ -100,7 +108,7 @@ pub struct SnapshotInfo {
 }
 
 /// Snapshot summary from the API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotSummary {
     pub dataset_name: String,
     pub location: String,
@@ -188,6 +196,10 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
         .build()
     })?;
 
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&summary);
+    }
+
     if summary.snapshots.is_empty() {
         println!("No snapshots found for dataset {}", args.dataset);
         println!("Location: {}", summary.location);
@@ -256,6 +268,10 @@ async fn execute_snapshot(ctx: &RuntimeContext, args: &SnapshotArgs) -> Result<(
         }
         .build()
     })?;
+
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&snapshot);
+    }
 
     println!("Snapshot ID: {}", snapshot.snapshot_id);
     println!("Timestamp: {}", format_timestamp_ms(snapshot.timestamp_ms));
