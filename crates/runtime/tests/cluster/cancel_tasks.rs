@@ -200,6 +200,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
                     node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let scheduler_rt = Arc::new(
@@ -257,6 +258,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
                     node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor_rt = Arc::new(
