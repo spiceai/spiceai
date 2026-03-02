@@ -141,7 +141,7 @@ candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "a
 candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
 charset = "0.1.5"
-chrono = "0.4.42"
+chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
@@ -203,7 +203,7 @@ linkme = "0.3.35"
 logos = "0.16.0"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
-mongodb = { version = "3.3.0", features = ["openssl-tls"] }
+mongodb = { version = "3.5.1", features = ["openssl-tls"] }
 mysql_async = { version = "0.36.1", features = ["native-tls-tls", "chrono"] }
 nix = "0.30"
 num_cpus = "1.16"
