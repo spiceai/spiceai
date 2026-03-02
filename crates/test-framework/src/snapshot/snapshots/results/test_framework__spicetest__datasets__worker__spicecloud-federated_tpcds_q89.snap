@@ -14,5 +14,5 @@ description: "Query: tpcds_q89"
 | Children   | infants   | importoexporti #2  | ese          | Unknown        | 3     | 3152.45   | 6935.281667       |
 | Music      | classical | edu packscholar #2 | ese          | Unknown        | 3     | 3692.96   | 7471.503333       |
 | Music      | classical | edu packscholar #2 | eing         | Unknown        | 7     | 3778.65   | 7549.881667       |
-| Children   | infants   | importoexporti #2  | bar          | Unknown        | 2     | 2986.60   | 6742.470000       |
+| Children   | infants   | importoexporti #2  | bar          | Unknown        | 2     | 2986.60   | 6742.47           |
 +------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
