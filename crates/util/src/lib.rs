@@ -41,7 +41,7 @@ pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
 
-pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues.";
+pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues";
 
 #[must_use]
 pub fn sanitize_datafusion_error_message(message: &str) -> String {
@@ -415,9 +415,41 @@ mod tests {
 
     #[test]
     fn sanitize_datafusion_error_message_removes_bug_report_with_newline_separator() {
-        let input =
-            format!("Internal error: baz.\n\n{DATAFUSION_BUG_REPORT_MESSAGE}");
+        let input = format!("Internal error: baz.\n\n{DATAFUSION_BUG_REPORT_MESSAGE}");
         let sanitized = sanitize_datafusion_error_message(&input);
         assert_eq!(sanitized, "Internal error: baz.");
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_matches_actual_datafusion_internal_error() {
+        use datafusion::error::DataFusionError;
+
+        let error = DataFusionError::Internal("test internal error".to_string());
+        let displayed = error.to_string();
+
+        assert!(
+            displayed.contains(DATAFUSION_BUG_REPORT_MESSAGE),
+            "DataFusionError::Internal display output did not contain expected bug report suffix. Got: {displayed}"
+        );
+
+        let sanitized = sanitize_datafusion_error_message(&displayed);
+
+        // The sanitized message should no longer include the bug report suffix
+        assert!(
+            !sanitized.contains(DATAFUSION_BUG_REPORT_MESSAGE),
+            "Sanitized message still contains DataFusion bug report suffix: {sanitized}"
+        );
+
+        // The sanitized message should preserve the core internal error text
+        assert!(
+            sanitized.starts_with("Internal error: test internal error"),
+            "Sanitized message did not preserve expected internal error prefix. Got: {sanitized}"
+        );
+
+        // Ensure something was actually removed
+        assert!(
+            sanitized.len() < displayed.len(),
+            "Sanitized message was not shorter than original. Original: {displayed}, Sanitized: {sanitized}"
+        );
     }
 }

@@ -45,8 +45,10 @@ use std::{
     time::Duration,
 };
 use token_provider::TokenProvider;
-use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
-use util::format_datafusion_error;
+use util::{
+    fibonacci_backoff::{Backoff, FibonacciBackoffBuilder},
+    format_datafusion_error,
+};
 
 mod datatypes;
 

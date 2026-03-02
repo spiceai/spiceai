@@ -53,9 +53,8 @@ use std::{
 };
 use tokio::sync::RwLock;
 use url::Url;
-use util::format_datafusion_error;
 use util::{
-    RetryError, retry,
+    RetryError, format_datafusion_error, retry,
     retry_strategy::{BackoffMethod, RetryBackoff, RetryBackoffBuilder},
 };
 
