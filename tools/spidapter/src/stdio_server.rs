@@ -80,22 +80,6 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(ToString::to_string)
 }
 
-/// Average non-`None` `f64` values extracted from pods.
-#[expect(clippy::cast_precision_loss)]
-fn avg_opt(
-    pods: &[&spice_cloud_client::types::PodMetrics],
-    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
-) -> Option<f64> {
-    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
-        if let Some(v) = f(p) {
-            (s + v, c + 1)
-        } else {
-            (s, c)
-        }
-    });
-    (count > 0).then_some(sum / (count as f64))
-}
-
 /// Sum non-`None` `u64` values extracted from pods.
 fn sum_opt_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
@@ -223,12 +207,26 @@ impl Handler for SpidapterHandler {
             ResourceMetrics::default()
         } else {
             ResourceMetrics {
-                cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                // Sum cumulative CPU seconds across all pods
+                cpu_usage_percent: Some(
+                    pods.iter()
+                        .filter_map(|p| p.cpu_usage_percent)
+                        .sum::<f64>()
+                        .max(0.0),
+                ),
                 memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
-                disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
-                disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
-                disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_iops),
-                disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_iops),
+                disk_read_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes).unwrap_or_default(),
+                ),
+                disk_write_bytes: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes).unwrap_or_default(),
+                ),
+                disk_read_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations).unwrap_or_default(),
+                ),
+                disk_write_iops: Some(
+                    sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations).unwrap_or_default(),
+                ),
             }
         };
 
@@ -304,8 +302,6 @@ async fn post_setup_sink_action(
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
             loop {
-                attempts += 1;
-
                 let response = sql_client
                     .post(&sql_url)
                     .header("X-API-Key", api_key)
@@ -316,6 +312,8 @@ async fn post_setup_sink_action(
                 if response.status().is_success() {
                     break;
                 }
+
+                attempts += 1;
 
                 if attempts >= 3 {
                     let status = response.status();
@@ -384,7 +382,7 @@ fn generate_adbc_create_table_statement(
     }
 
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
         column_definitions.join(", ")
     ))
 }
