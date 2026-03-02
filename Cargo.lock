@@ -18166,6 +18166,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "clap",
+ "dirs",
  "reqwest 0.12.24",
  "runtime-secrets",
  "rustls 0.23.36",
