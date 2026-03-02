@@ -228,7 +228,7 @@ impl PartitionMetadata {
 }
 
 /// Which compression strategy to use for the Vortex layout.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionStrategy {
     /// Uses the default Vortex Btrblocks compression.
     #[default]

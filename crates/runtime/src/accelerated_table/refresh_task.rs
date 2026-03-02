@@ -27,6 +27,7 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spi
 use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
+use crate::datafusion::refresh_sql;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::metrics::telemetry::track_bytes_processed;
@@ -396,8 +397,11 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
@@ -442,8 +446,11 @@ impl RefreshTask {
                         metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
                     }
 
-                    self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Ready)
-                        .await;
+                    self.set_refresh_status(
+                        refresh.display_sql().as_deref(),
+                        status::ComponentStatus::Ready,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Ok(_) => {
@@ -499,8 +506,11 @@ impl RefreshTask {
                 if self.runtime_status.is_shutdown() {
                     return Ok(());
                 }
-                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
-                    .await;
+                self.log_refresh_error(
+                    inner_err_from_retry_ref(&e),
+                    refresh.display_sql().as_deref(),
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -531,7 +541,7 @@ impl RefreshTask {
             .write_streaming_data_update(
                 Some(start_time),
                 streaming_data_update,
-                refresh.sql.as_deref(),
+                refresh.display_sql().as_deref(),
             )
             .await
         {
@@ -788,8 +798,11 @@ impl RefreshTask {
             tracing::info!("Loading data for {} {dataset_name}", self.component_type());
         }
 
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let refresh = refresh.clone();
         let mut filters = vec![];
@@ -923,7 +936,7 @@ impl RefreshTask {
 
     async fn get_data_update(
         &self,
-        filters: Vec<Expr>,
+        mut filters: Vec<Expr>,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
@@ -940,12 +953,42 @@ impl RefreshTask {
             RefreshMode::Caching => UpdateType::Overwrite,
         };
 
+        // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
+        // spicepod), parse and use it. Transfer partition filters from the base refresh SQL.
+        let effective_sql = match refresh.override_sql_raw.as_ref().map(|s| {
+            refresh_sql::parse_refresh_sql(dataset_name.clone(), s, federated_provider.schema())
+        }) {
+            Some(Ok((mut parsed, _schema))) => {
+                if let Some(base) = &refresh.sql {
+                    parsed.set_partition_filters(base.partition_filters().to_vec());
+                }
+                Some(parsed)
+            }
+            Some(Err(e)) => {
+                tracing::error!("Failed to parse override refresh_sql for {dataset_name}: {e}");
+                return Err(RetryError::permanent(
+                    super::Error::FailedToRefreshDataset {
+                        source: DataFusionError::Plan(format!("Invalid override refresh_sql: {e}")),
+                    },
+                ));
+            }
+            None => refresh.sql.clone(),
+        };
+
+        // Extract SQL string and partition filters from RefreshSQL
+        let sql_string = effective_sql
+            .as_ref()
+            .map(super::refresh::RefreshSQL::to_sql);
+        if let Some(ref s) = effective_sql {
+            filters.extend(s.partition_filters().iter().cloned());
+        }
+
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
             let dataset_name_for_runtime = dataset_name.clone();
             let filters_for_runtime = filters.clone();
             let update_type_for_runtime = update_type.clone();
             let provider_for_runtime = Arc::clone(&federated_provider);
-            let sql_for_runtime = refresh.sql.clone();
+            let sql_for_runtime = sql_string.clone();
             let request_context = RequestContext::current(AsyncMarker::new().await);
             let span = Span::current();
 
@@ -1010,7 +1053,7 @@ impl RefreshTask {
             &mut ctx,
             dataset_name,
             federated_provider,
-            refresh.sql.clone(),
+            sql_string,
             filters,
         )
         .await
