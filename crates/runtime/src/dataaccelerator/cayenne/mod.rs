@@ -124,7 +124,7 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
 /// Transform schema according to `unsupported_type_action` policy
 /// Always converts Float16 to Float32 and normalizes timestamps to Microsecond (these are compatible transformations)
 /// Handles truly unsupported types according to the action: String (convert to Utf8) or Error (return error)
-pub(crate) fn transform_schema_for_vortex(
+fn transform_schema_for_vortex(
     schema: &arrow::datatypes::Schema,
     unsupported_type_action: UnsupportedTypeAction,
 ) -> Result<arrow::datatypes::Schema> {
