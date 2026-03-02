@@ -4017,6 +4017,25 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Invalidate the DF52 list-files cache to preserve DF51 behavior where every scan
+        // lists files fresh from the ObjectStore / filesystem.
+        //
+        // DataFusion v52 introduced `list_files_cache` (commit 1ac18a3af) which
+        // caches ObjectStore directory listings with infinite TTL by default. This causes stale
+        // results when Cayenne adds or removes files between scans (e.g. after an insert writes
+        // new Vortex files into a snapshot directory, subsequent scans would not discover them).
+        //
+        // Ideally this invalidation would happen on the write path (in `CayenneDataSink::write_all`)
+        // after files are committed. However, the write's `TaskContext` and the scan caller's
+        // `Session` hold *different* `RuntimeEnv` instances — each with its own `CacheManager`.
+        // Clearing the write-side cache has no effect on the scan-side cache. Until we unify the
+        // `RuntimeEnv` across read and write paths (or propagate invalidation signals), we
+        // clear the cache at scan time to ensure data correctness.
+        // https://github.com/spiceai/spiceai/issues/9553
+        if let Some(cache) = state.runtime_env().cache_manager.get_list_files_cache() {
+            cache.clear();
+        }
+
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
         if let Some(ref config) = self.object_store_config {
