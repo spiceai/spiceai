@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
-use crate::output::TableOutput;
+use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
@@ -33,6 +33,10 @@ pub struct EvalArgs {
     /// Model to evaluate
     #[arg(long, required = true)]
     pub model: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Request body for eval API.
@@ -42,7 +46,7 @@ struct EvalRequest {
 }
 
 /// Response from eval API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct EvalResponse {
     id: String,
     created_at: String,
@@ -100,6 +104,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &EvalArgs) -> Result<()> {
     if results.is_empty() {
         println!("No evaluation results.");
         return Ok(());
+    }
+
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&results);
     }
 
     // Display results in a table

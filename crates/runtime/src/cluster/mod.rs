@@ -31,6 +31,7 @@ use crate::{
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
 use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::TableReference;
 use app::App;
@@ -1544,13 +1545,25 @@ async fn create_scheduler_server(
                 cfg = cfg.with_ballista_shuffle_storage_url(storage_url);
             }
 
-            Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
-                    .with_config(cfg)
-                    .with_runtime_env(default_runtime_env(io_runtime.clone()))
-                    .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
-                    .build(),
-            )
+            // Filter out PartitionedTableScanRewrite from analyzer rules.
+            // That rule rewrites TableScans into UNION ALL of FlightSQL partitions
+            // for sync query distribution; Ballista handles distribution natively
+            // for async queries, and FlightSqlExec has no codec support.
+            let spice_state = current_context.as_ref().state();
+            let distributed_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = spice_state
+                .analyzer()
+                .rules
+                .iter()
+                .filter(|r| r.name() != "PartitionedTableScanRewrite")
+                .map(Arc::clone)
+                .collect();
+
+            Ok(SessionStateBuilder::new_from_existing(spice_state)
+                .with_config(cfg)
+                .with_runtime_env(default_runtime_env(io_runtime.clone()))
+                .with_analyzer_rules(distributed_analyzer_rules)
+                .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
+                .build())
         });
 
     // Create config_producer that dynamically sets target_partitions based on cluster capacity
