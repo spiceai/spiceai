@@ -41,6 +41,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
@@ -195,18 +196,10 @@ impl DeltaTable {
         };
 
         let engine = match table_object_store {
-            Some(object_store) => Arc::new(DefaultEngine::new(
-                object_store.into(),
-                Arc::new(TokioBackgroundExecutor::default()),
+            Some(object_store) => Arc::new(DefaultEngine::new(object_store.into())),
+            None => Arc::new(DefaultEngine::new(
+                store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
             )),
-            None => Arc::new(
-                DefaultEngine::try_new(
-                    &table_url,
-                    storage_options,
-                    Arc::new(TokioBackgroundExecutor::default()),
-                )
-                .map_err(handle_delta_error)?,
-            ),
         };
 
         let snapshot = Snapshot::builder_for(table_url.clone())

@@ -164,7 +164,8 @@ datafusion-proto = { version = "52.0.0", features = ["json"] }
 datafusion-pruning = "52.0.0"
 datafusion-spark = "52.0.0"
 datafusion-table-providers = "0.1.0"  # Placeholder version; actual crate is provided via [patch.crates-io] from spiceai fork with DF52 support
-delta_kernel = { version = "0.17.0", features = [
+
+delta_kernel = { version = "0.18.2", features = [
     "default-engine-rustls",
     "arrow-57",
     "internal-api",
@@ -391,7 +392,8 @@ datafusion-table-providers = { git = "https://github.com/datafusion-contrib/data
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c6871700b1433cdb460f791ce3bb6433bc9fcd9c" }      # spiceai-52
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c6871700b1433cdb460f791ce3bb6433bc9fcd9c" } # spiceai-52
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c6871700b1433cdb460f791ce3bb6433bc9fcd9c" } # spiceai-52
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
+
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "9d26fb3662d2edb8f382d4d0f7899c303549f0d0" } # spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
