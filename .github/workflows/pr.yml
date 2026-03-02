@@ -128,7 +128,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
-          BRANCH: spiceai-51
+          BRANCH: spiceai-52
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
@@ -162,7 +162,7 @@ jobs:
 
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version: ${{ env.GOVER }}
           cache: false

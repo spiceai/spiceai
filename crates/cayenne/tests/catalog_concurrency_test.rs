@@ -112,7 +112,6 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
 
     // Turso has a single-connection architecture that doesn't support concurrent writes
     // so we run sequentially for Turso and concurrently for SQLite
-    #[expect(clippy::collapsible_else_if)]
     if matches!(fixture.backend_type, BackendType::Sqlite) {
         // SQLite: Use true concurrency to test race conditions
         let mut handles = vec![];

@@ -42,7 +42,7 @@ use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::projection::ProjectionExpr;
+use datafusion::physical_plan::projection::ProjectionExprs;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::{
     catalog::{Session, memory::DataSourceExec},
@@ -281,8 +281,9 @@ impl FileFormat for SpiceJsonFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table_schema = conf.file_source().table_schema().clone();
         let source = Arc::new(
-            SpiceJsonSource::new()
+            SpiceJsonSource::new(table_schema)
                 .with_array_to_ndjson(matches!(self.options.format, Format::Array))
                 .with_unnest_struct(self.options.flatten_json.clone()),
         );
@@ -334,11 +335,12 @@ impl FileFormat for SpiceJsonFormat {
         not_impl_err!("Inserts are not implemented yet for Json")
     }
 
-    fn file_source(&self) -> Arc<dyn FileSource> {
+    fn file_source(&self, table_schema: datafusion_datasource::TableSchema) -> Arc<dyn FileSource> {
         Arc::new(
-            SpiceJsonSource::new()
+            SpiceJsonSource::new(table_schema.clone())
                 .with_array_to_ndjson(matches!(self.options.format, Format::Array))
-                .with_unnest_struct(self.options.flatten_json.clone()),
+                .with_unnest_struct(self.options.flatten_json.clone())
+                .with_table_schema(table_schema),
         )
     }
 }
@@ -481,7 +483,7 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
     fn try_swapping_with_projection(
         &self,
-        projection: &[ProjectionExpr],
+        projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
         self.inner.try_swapping_with_projection(projection)
     }

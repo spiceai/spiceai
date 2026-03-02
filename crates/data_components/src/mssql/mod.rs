@@ -250,9 +250,9 @@ fn is_time_related_expr(expr: &Expr) -> bool {
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }
-        Expr::ScalarVariable(dara_type, _) => {
+        Expr::ScalarVariable(field, _) => {
             matches!(
-                dara_type,
+                field.data_type(),
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }

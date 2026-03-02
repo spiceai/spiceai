@@ -74,7 +74,7 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
-use data_components::delete::get_deletion_provider;
+use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
@@ -1344,7 +1344,7 @@ async fn create_delete_physical_plan(
         ))
     })?;
 
-    deletion_provider.delete_from(session_state, &filters).await
+    DeletionTableProvider::delete_from(deletion_provider.as_ref(), session_state, &filters).await
 }
 
 /// Extract filter expressions from a DML source logical plan.
@@ -1532,9 +1532,12 @@ impl ExecutionPlan for UpdateExec {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(DataFusionError::from)?;
 
-            let delete_plan = deletion_provider
-                .delete_from(&session_state, &filters)
-                .await?;
+            let delete_plan = DeletionTableProvider::delete_from(
+                deletion_provider.as_ref(),
+                &session_state,
+                &filters,
+            )
+            .await?;
             let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
             let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
 

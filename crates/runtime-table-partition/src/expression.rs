@@ -95,7 +95,8 @@ pub fn validate_scalar_compatibility(
     scalar: &ScalarValue,
     schema: &DFSchema,
 ) -> ValidationResult {
-    let (expr_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+    let (_, expr_field) = expr.to_field(schema).context(DataTypeSnafu)?;
+    let expr_type = expr_field.data_type().clone();
     let scalar_type = scalar.data_type();
 
     ensure!(
@@ -158,7 +159,8 @@ impl Criterion for DataTypeCriterion {
     }
 
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
-        let (data_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+        let (_, field) = expr.to_field(schema).context(DataTypeSnafu)?;
+        let data_type = field.data_type().clone();
 
         ensure!(
             matches!(

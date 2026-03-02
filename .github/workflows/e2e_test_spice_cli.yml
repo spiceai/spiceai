@@ -91,7 +91,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -99,7 +99,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -126,7 +126,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -229,7 +229,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -310,7 +310,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -372,7 +372,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -462,7 +462,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -510,7 +510,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

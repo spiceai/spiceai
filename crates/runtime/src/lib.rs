@@ -35,10 +35,9 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
-use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::error::format_datafusion_error;
-use crate::datafusion::{DataFusion, resolved_equality};
+use crate::datafusion::DataFusion;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
@@ -734,58 +733,15 @@ impl Runtime {
         table: TableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
-        // Re-construct the refresh SQL with the new partitions
-        // 1. Get the dataset to find the base refresh SQL
-        let (dataset_component, app_arc) = {
-            let Some(app_arc) = self.read_app().await else {
-                tracing::debug!("App not initialized when updating partitions for {table}");
-                return Ok(());
-            };
+        let partition_filters =
+            crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
 
-            let Some(ds) = app_arc
-                .datasets
-                .iter()
-                .find(|ds| resolved_equality(ds.name.clone().into(), table.clone()))
-            else {
-                tracing::debug!("Dataset {table} not found in App when updating partitions");
-                return Ok(());
-            };
-            (ds.clone(), Arc::clone(&app_arc))
-        };
-
-        let Ok(dataset) =
-            crate::component::dataset::builder::DatasetBuilder::try_from(dataset_component)
-                .and_then(|mut b| {
-                    b = b.with_app(app_arc);
-                    b.with_runtime(Arc::new(self.clone())).build().context(
-                        UnableToBuildDatasetSnafu {
-                            dataset: table.to_string(),
-                        },
-                    )
-                })
-        else {
-            tracing::warn!("Failed to build dataset {table} when updating partitions");
-            return Ok(());
-        };
-
-        // 2. Construct the new SQL
-        let new_sql = update_partitioning_filter_in_refresh_sql(
-            dataset
-                .acceleration
-                .as_ref()
-                .and_then(|a| a.refresh_sql.as_deref()),
-            &table,
-            assignments,
-        )
-        .context(UnableToConvertPartitionExprSnafu)?;
-
-        // 3. Update the AcceleratedTable
         if let Err(e) = self
             .datafusion()
-            .update_refresh_sql(table.clone(), new_sql)
+            .update_partition_filters(table.clone(), partition_filters)
             .await
         {
-            tracing::error!("Failed to update refresh SQL for {table}: {e}");
+            tracing::error!("Failed to update partition filters for {table}: {e}");
         } else {
             tracing::info!("Updated partition assignments for {table}");
             // Trigger a refresh to load the data for the new partitions

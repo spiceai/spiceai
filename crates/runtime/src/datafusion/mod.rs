@@ -402,6 +402,10 @@ pub enum Table {
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        /// Initial partition filter expressions to apply before the refresher starts.
+        /// These are set on the `Refresh` during table registration to avoid a race
+        /// where the first refresh runs before partition filters are applied.
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -649,6 +653,7 @@ impl DataFusion {
                 accelerated_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -682,6 +687,7 @@ impl DataFusion {
                         federated_read_table,
                         secrets,
                         bootstrap_status,
+                        initial_partition_filters,
                     )
                     .await?
                 }
@@ -975,6 +981,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+            vec![],
         )
         .await?;
 
@@ -1543,6 +1550,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1582,16 +1590,17 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
-        let refresh_sql = dataset.refresh_sql();
-        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(
+        let refresh_sql_str = dataset.refresh_sql();
+        let (parsed_refresh_sql, refresh_schema) = if let Some(sql_str) = &refresh_sql_str {
+            let (parsed, schema) = refresh_sql::parse_refresh_sql(
                 dataset.name.clone(),
-                refresh_sql.as_str(),
+                sql_str.as_str(),
                 source_schema,
             )
-            .context(RefreshSqlSnafu)?
+            .context(RefreshSqlSnafu)?;
+            (Some(parsed), schema)
         } else {
-            source_schema
+            (None, source_schema)
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1614,7 +1623,7 @@ impl DataFusion {
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let use_constraints = refresh_sql.is_none();
+        let use_constraints = parsed_refresh_sql.is_none();
 
         let constraints = if use_constraints {
             match &*source_table_provider {
@@ -1672,8 +1681,8 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-        if let Some(sql) = &refresh_sql {
-            refresh = refresh.sql(sql.clone());
+        if let Some(sql) = parsed_refresh_sql {
+            refresh = refresh.refresh_sql(sql);
         }
         if let Some(format) = dataset.time_format {
             refresh = refresh.time_format(format);
@@ -1709,6 +1718,20 @@ impl DataFusion {
         refresh
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
+
+        // Apply initial partition filters before the refresher starts to avoid a race
+        // where the first refresh runs without partition filters.
+        if !initial_partition_filters.is_empty() {
+            use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+            if let Some(ref mut sql) = refresh.sql {
+                sql.set_partition_filters(initial_partition_filters);
+            } else {
+                let mut sql =
+                    RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
+                sql.set_partition_filters(initial_partition_filters);
+                refresh = refresh.refresh_sql(sql);
+            }
+        }
 
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -2003,6 +2026,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -2011,6 +2035,7 @@ impl DataFusion {
                 federated_read_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
@@ -2066,7 +2091,7 @@ impl DataFusion {
     pub async fn update_refresh_sql(
         &self,
         dataset_name: TableReference,
-        refresh_sql: Option<String>,
+        refresh_sql: String,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
@@ -2074,30 +2099,49 @@ impl DataFusion {
 
         let refresh_schema = table.schema();
 
-        if let Some(sql) = &refresh_sql {
-            let selected_schema = refresh_sql::validate_refresh_sql(
-                dataset_name.clone(),
-                sql,
-                Arc::clone(&refresh_schema),
-            )
-            .context(RefreshSqlSnafu)?;
-            if selected_schema != refresh_schema {
-                return RefreshSqlSchemaChangeDisallowedSnafu {
-                    dataset_name: Arc::from(dataset_name.to_string()),
-                    selected_columns: Arc::from(
-                        selected_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                    refresh_columns: Arc::from(
-                        refresh_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                }
-                .fail();
+        let (parsed, selected_schema) = refresh_sql::parse_refresh_sql(
+            dataset_name.clone(),
+            &refresh_sql,
+            Arc::clone(&refresh_schema),
+        )
+        .context(RefreshSqlSnafu)?;
+        if selected_schema != refresh_schema {
+            return RefreshSqlSchemaChangeDisallowedSnafu {
+                dataset_name: Arc::from(dataset_name.to_string()),
+                selected_columns: Arc::from(
+                    selected_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
+                refresh_columns: Arc::from(
+                    refresh_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
             }
+            .fail();
         }
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table.update_refresh_sql(parsed).await.context(
+                UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Update only the partition filters on an accelerated table's refresh.
+    pub async fn update_partition_filters(
+        &self,
+        dataset_name: TableReference,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<()> {
+        let table = self
+            .get_accelerated_table_provider(&dataset_name.to_string())
+            .await?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
-                .update_refresh_sql(refresh_sql)
+                .update_partition_filters(filters)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),

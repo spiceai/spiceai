@@ -1,5 +1,6 @@
 ---
 source: crates/runtime/tests/integration.rs
+assertion_line: 209
 description: "Query: SELECT * FROM test_graphql where id = '4' limit 1"
 ---
 +---------------+--------------------------------------------------------------------------+
@@ -9,7 +10,7 @@ description: "Query: SELECT * FROM test_graphql where id = '4' limit 1"
 |               |   Filter: test_graphql.id = Utf8("4")                                    |
 |               |     TableScan: test_graphql projection=[id, name, posts]                 |
 | physical_plan | CoalescePartitionsExec: fetch=1                                          |
-|               |   FilterExec: id@0 = 4                                                   |
+|               |   FilterExec: id@0 = 4, fetch=1                                          |
 |               |     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |
 |               |       CooperativeExec                                                    |
 |               |         BytesProcessedExec                                               |

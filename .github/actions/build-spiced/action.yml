@@ -265,14 +265,14 @@ runs:
 
     - name: Upload spiced artifact
       if: inputs.upload_artifact == 'true' && inputs.build_cli != 'true'
-      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
         name: ${{ inputs.artifact_name }}
         path: spiced${{ steps.detect-os.outputs.ext }}
 
     - name: Upload spiced and spice CLI artifacts
       if: inputs.upload_artifact == 'true' && inputs.build_cli == 'true'
-      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
         name: ${{ inputs.artifact_name }}
         path: |
