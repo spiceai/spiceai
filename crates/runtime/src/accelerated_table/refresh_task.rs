@@ -955,7 +955,7 @@ impl RefreshTask {
 
         // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
         // spicepod), parse and use it. Transfer partition filters from the base refresh SQL.
-        let effective_sql = match refresh.override_sql_raw.map(|s| {
+        let effective_sql = match refresh.override_sql_raw.as_ref().map(|s| {
             refresh_sql::parse_refresh_sql(dataset_name.clone(), &s, federated_provider.schema())
         }) {
             Some(Ok((mut parsed, _schema))) => {
