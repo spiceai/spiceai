@@ -1,21 +1,18 @@
 ---
 source: crates/runtime/tests/refresh_sql/refresh_max_timestamp_df.rs
-assertion_line: 134
 expression: explain_plan
 ---
-+---------------+---------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                  |
-+---------------+---------------------------------------------------------------------------------------+
-| logical_plan  | Sort: a DESC NULLS LAST, fetch=1                                                      |
-|               |   Projection: CAST(?table?.time_in_string AS Timestamp(ns)) AS a                      |
-|               |     TableScan: ?table? projection=[time_in_string]                                    |
-| physical_plan | SortPreservingMergeExec: [a@0 DESC NULLS LAST], fetch=1                               |
-|               |   SortExec: TopK(fetch=1), expr=[a@0 DESC NULLS LAST], preserve_partitioning=[true]   |
-|               |     ProjectionExec: expr=[CAST(time_in_string@0 AS Timestamp(Nanosecond, None)) as a] |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1           |
-|               |         SchemaCastScanExec                                                            |
-|               |           CooperativeExec                                                             |
-|               |             BytesProcessedExec                                                        |
-|               |               SQLiteSqlExec sql=SELECT "time_in_string" FROM test_table               |
-|               |                                                                                       |
-+---------------+---------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                                                                                                |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                                                                                                           |
+|               |  Limit: skip=0, fetch=1                                                                                                                                                                                                                                                                                             |
+|               |   Sort: a DESC NULLS LAST                                                                                                                                                                                                                                                                                           |
+|               |     Projection: CAST(?table?.time_in_string AS Timestamp(ns)) AS a                                                                                                                                                                                                                                                  |
+|               |       TableScan: ?table? projection=[time_in_string]                                                                                                                                                                                                                                                                |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                                                                                                                  |
+|               |   CooperativeExec                                                                                                                                                                                                                                                                                                   |
+|               |     BytesProcessedExec                                                                                                                                                                                                                                                                                              |
+|               |       VirtualExecutionPlan name=sqlite compute_context=memory initial_sql=SELECT CAST(`?table?`.`time_in_string` AS TEXT) AS `a` FROM `?table?` ORDER BY `a` DESC NULLS LAST LIMIT 1 rewritten_sql=SELECT CAST(`test_table`.`time_in_string` AS TEXT) AS `a` FROM `test_table` ORDER BY `a` DESC NULLS LAST LIMIT 1 |
+|               |                                                                                                                                                                                                                                                                                                                     |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
