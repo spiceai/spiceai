@@ -1,15 +1,17 @@
 ---
 source: crates/runtime/tests/duckdb/mod.rs
-assertion_line: 358
 expression: pretty
+snapshot_kind: text
 ---
-+---------------+------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                           |
-+---------------+------------------------------------------------------------------------------------------------+
-| logical_plan  | TableScan: csv_test projection=[region], full_filters=[csv_test.region LIKE Utf8("%america%")] |
-| physical_plan | SchemaCastScanExec                                                                             |
-|               |   CooperativeExec                                                                              |
-|               |     BytesProcessedExec                                                                         |
-|               |       DuckSqlExec sql= SELECT "region" FROM csv_test WHERE "region" LIKE '%america%'           |
-|               |                                                                                                |
-+---------------+------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                        |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                   |
+|               |  Projection: csv_test.region                                                                                                                                                |
+|               |   TableScan: csv_test projection=[region], full_filters=[regexp_like(csv_test.region, Utf8("america"))]                                                                     |
+| physical_plan | SchemaCastScanExec                                                                                                                                                          |
+|               |   CooperativeExec                                                                                                                                                           |
+|               |     BytesProcessedExec                                                                                                                                                      |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "csv_test"."region" FROM "csv_test" WHERE regexp_matches("csv_test"."region", 'america') |
+|               |                                                                                                                                                                             |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
