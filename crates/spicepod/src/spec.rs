@@ -39,7 +39,6 @@ use crate::extension::Extension;
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
-    V1Beta1,
     V1,
     #[default]
     V2,
