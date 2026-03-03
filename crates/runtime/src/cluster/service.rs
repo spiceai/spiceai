@@ -610,6 +610,15 @@ impl ClusterService for ClusterServiceImpl {
                 // Find accelerated datasets with partitioning
 
                 for table_ref in super::partition::accelerated_tables(app).keys() {
+                    if partition_manager
+                        .get_cached_table_metadata(table_ref)
+                        .is_none()
+                    {
+                        tracing::info!(
+                            "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
+                        );
+                        continue;
+                    }
                     match partition_manager
                         .allocate_partitions(table_ref, executor_id, 10)
                         .await
