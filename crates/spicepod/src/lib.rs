@@ -476,9 +476,7 @@ mod version_tests {
     use super::*;
     use crate::component::{
         access::AccessMode,
-        caching::{
-            CacheEngine, CacheKeyType, CachingPolicy, Encoding, HashingAlgorithm,
-        },
+        caching::{CacheEngine, CacheKeyType, CachingPolicy, Encoding, HashingAlgorithm},
         runtime::RuntimeReadyState,
     };
 
@@ -506,12 +504,10 @@ mod version_tests {
     /// Version strings serialize to the expected lowercase YAML values.
     #[test]
     fn test_version_enum_serialization() {
-        let v1_str =
-            yaml::to_string(&SpicepodVersion::V1).expect("Should serialize v1");
+        let v1_str = yaml::to_string(&SpicepodVersion::V1).expect("Should serialize v1");
         assert!(v1_str.trim().contains("v1"), "Expected 'v1', got: {v1_str}");
 
-        let v2_str =
-            yaml::to_string(&SpicepodVersion::V2).expect("Should serialize v2");
+        let v2_str = yaml::to_string(&SpicepodVersion::V2).expect("Should serialize v2");
         assert!(v2_str.trim().contains("v2"), "Expected 'v2', got: {v2_str}");
     }
 
@@ -538,10 +534,7 @@ mod version_tests {
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "Unknown version 'v3' should be rejected"
-        );
+        assert!(result.is_err(), "Unknown version 'v3' should be rejected");
     }
 
     // ========================================================================
@@ -587,8 +580,15 @@ mod version_tests {
         assert_eq!(query.temp_directory, Some("/tmp/spice_v1".to_string()));
 
         // Flight still works without v2-only fields
-        let flight = pod.runtime.flight.as_ref().expect("flight should be present");
-        assert!(flight.do_put_rate_limit_enabled, "should default to true for v1");
+        let flight = pod
+            .runtime
+            .flight
+            .as_ref()
+            .expect("flight should be present");
+        assert!(
+            flight.do_put_rate_limit_enabled,
+            "should default to true for v1"
+        );
 
         // Dataset loaded
         assert_eq!(pod.datasets.len(), 1);
@@ -640,8 +640,7 @@ mod version_tests {
                     enabled: true
                     item_ttl: 60s
         ";
-        let runtime: Runtime =
-            yaml::from_str(yaml).expect("Should parse runtime with both styles");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse runtime with both styles");
         let sql_results = runtime
             .caching
             .sql_results
@@ -733,7 +732,11 @@ mod version_tests {
         assert_eq!(pod.runtime.ready_state, RuntimeReadyState::OnRegistration);
 
         // Flight with do_put_rate_limit_enabled
-        let flight = pod.runtime.flight.as_ref().expect("flight should be present");
+        let flight = pod
+            .runtime
+            .flight
+            .as_ref()
+            .expect("flight should be present");
         assert_eq!(flight.max_message_size, Some("32MiB".to_string()));
         assert!(!flight.do_put_rate_limit_enabled);
 
@@ -866,8 +869,7 @@ mod version_tests {
         let yaml = r"
             max_message_size: 4MiB
         ";
-        let flight: component::runtime::Flight =
-            yaml::from_str(yaml).expect("Should parse Flight");
+        let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
         assert!(flight.do_put_rate_limit_enabled);
     }
 
@@ -877,8 +879,7 @@ mod version_tests {
         let yaml = r"
             do_put_rate_limit_enabled: false
         ";
-        let flight: component::runtime::Flight =
-            yaml::from_str(yaml).expect("Should parse Flight");
+        let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
         assert!(!flight.do_put_rate_limit_enabled);
     }
 
@@ -931,10 +932,7 @@ mod version_tests {
             yaml::from_str(yaml).expect("Should parse SQLResultsCacheConfig");
         assert!(config.enabled);
         assert_eq!(config.item_ttl, Some("30s".to_string()));
-        assert_eq!(
-            config.stale_while_revalidate_ttl,
-            Some("60s".to_string())
-        );
+        assert_eq!(config.stale_while_revalidate_ttl, Some("60s".to_string()));
         assert_eq!(config.encoding, Encoding::Zstd);
     }
 
@@ -945,8 +943,7 @@ mod version_tests {
             memory_limit: 512MiB
             spill_compression: lz4_frame
         ";
-        let query: component::runtime::Query =
-            yaml::from_str(yaml).expect("Should parse Query");
+        let query: component::runtime::Query = yaml::from_str(yaml).expect("Should parse Query");
         assert_eq!(query.memory_limit, Some("512MiB".to_string()));
         assert_eq!(
             query.spill_compression,
@@ -975,11 +972,7 @@ mod version_tests {
         assert_eq!(def.version, SpicepodVersion::V2);
 
         // The RuntimeDeserializer migrates results_cache → caching.sql_results
-        let sql = def
-            .runtime
-            .caching
-            .sql_results
-            .expect("should be migrated");
+        let sql = def.runtime.caching.sql_results.expect("should be migrated");
         assert!(sql.enabled);
         assert_eq!(sql.item_ttl, Some("5s".to_string()));
     }
@@ -1010,8 +1003,7 @@ mod version_tests {
     #[test]
     fn test_v1_version_roundtrip() {
         let original = SpicepodVersion::V1;
-        let yaml_str =
-            yaml::to_string(&original).expect("Should serialize SpicepodVersion::V1");
+        let yaml_str = yaml::to_string(&original).expect("Should serialize SpicepodVersion::V1");
         let roundtripped: SpicepodVersion =
             yaml::from_str(&yaml_str).expect("Should deserialize back to V1");
         assert_eq!(original, roundtripped);
@@ -1021,14 +1013,11 @@ mod version_tests {
     #[test]
     fn test_v2_version_roundtrip() {
         let original = SpicepodVersion::V2;
-        let yaml_str =
-            yaml::to_string(&original).expect("Should serialize SpicepodVersion::V2");
+        let yaml_str = yaml::to_string(&original).expect("Should serialize SpicepodVersion::V2");
         let roundtripped: SpicepodVersion =
             yaml::from_str(&yaml_str).expect("Should deserialize back to V2");
         assert_eq!(original, roundtripped);
     }
-
-
 
     // ========================================================================
     // All v1 test fixtures still load (regression guard)
@@ -1051,11 +1040,7 @@ mod version_tests {
             let pod = Spicepod::load_exact(&PathBuf::from(file))
                 .await
                 .unwrap_or_else(|e| panic!("Failed to load v1 fixture {file}: {e}"));
-            assert_eq!(
-                pod.version,
-                SpicepodVersion::V1,
-                "Expected V1 for {file}"
-            );
+            assert_eq!(pod.version, SpicepodVersion::V1, "Expected V1 for {file}");
         }
     }
 
@@ -1073,11 +1058,7 @@ mod version_tests {
             let pod = Spicepod::load_exact(&PathBuf::from(file))
                 .await
                 .unwrap_or_else(|e| panic!("Failed to load v2 fixture {file}: {e}"));
-            assert_eq!(
-                pod.version,
-                SpicepodVersion::V2,
-                "Expected V2 for {file}"
-            );
+            assert_eq!(pod.version, SpicepodVersion::V2, "Expected V2 for {file}");
         }
     }
 
@@ -1095,7 +1076,10 @@ mod version_tests {
                 cache_max_size: 128MiB
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
-        let sql = runtime.caching.sql_results.expect("sql_results must be migrated");
+        let sql = runtime
+            .caching
+            .sql_results
+            .expect("sql_results must be migrated");
         assert_eq!(
             sql.max_size,
             Some("128MiB".to_string()),
@@ -1114,7 +1098,10 @@ mod version_tests {
                 max_stale_while_revalidate: 120s
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
-        let sql = runtime.caching.sql_results.expect("sql_results must be migrated");
+        let sql = runtime
+            .caching
+            .sql_results
+            .expect("sql_results must be migrated");
         assert_eq!(
             sql.stale_while_revalidate_ttl, None,
             "v1 `max_stale_while_revalidate` should NOT migrate to `stale_while_revalidate_ttl`"
@@ -1131,7 +1118,10 @@ mod version_tests {
                 cache_max_size: 64MiB
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
-        let sql = runtime.caching.sql_results.expect("sql_results must be migrated");
+        let sql = runtime
+            .caching
+            .sql_results
+            .expect("sql_results must be migrated");
         assert_eq!(
             sql.encoding,
             Encoding::None,
@@ -1155,7 +1145,10 @@ mod version_tests {
                 max_stale_while_revalidate: 120s
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
-        let sql = runtime.caching.sql_results.expect("sql_results must be migrated");
+        let sql = runtime
+            .caching
+            .sql_results
+            .expect("sql_results must be migrated");
 
         // Field-by-field migration assertions
         assert!(sql.enabled, "enabled should be preserved");
@@ -1164,11 +1157,7 @@ mod version_tests {
             Some("256MiB".to_string()),
             "cache_max_size → max_size"
         );
-        assert_eq!(
-            sql.item_ttl,
-            Some("45s".to_string()),
-            "item_ttl preserved"
-        );
+        assert_eq!(sql.item_ttl, Some("45s".to_string()), "item_ttl preserved");
         assert_eq!(
             sql.caching_policy,
             CachingPolicy::TinyLfu,
@@ -1184,11 +1173,7 @@ mod version_tests {
             HashingAlgorithm::Blake3,
             "hashing_algorithm preserved"
         );
-        assert_eq!(
-            sql.engine,
-            CacheEngine::Pingora,
-            "engine preserved"
-        );
+        assert_eq!(sql.engine, CacheEngine::Pingora, "engine preserved");
         assert_eq!(
             sql.stale_while_revalidate_ttl, None,
             "max_stale_while_revalidate NOT migrated to stale_while_revalidate_ttl"
@@ -1308,8 +1293,7 @@ mod version_tests {
         let yaml = r"
             max_message_size: 16MiB
         ";
-        let flight: component::runtime::Flight =
-            yaml::from_str(yaml).expect("Should parse Flight");
+        let flight: component::runtime::Flight = yaml::from_str(yaml).expect("Should parse Flight");
         assert!(
             flight.do_put_rate_limit_enabled,
             "v1 Flight should default `do_put_rate_limit_enabled` to true"
@@ -1343,7 +1327,10 @@ mod version_tests {
                 max_stale_while_revalidate: 45s
         ";
         let runtime_v1: Runtime = yaml::from_str(yaml_v1).expect("Should parse Runtime");
-        let sql_v1 = runtime_v1.caching.sql_results.expect("sql_results migrated");
+        let sql_v1 = runtime_v1
+            .caching
+            .sql_results
+            .expect("sql_results migrated");
         assert_eq!(
             sql_v1.stale_while_revalidate_ttl, None,
             "v1 `max_stale_while_revalidate` does NOT map to `stale_while_revalidate_ttl`"
@@ -1362,7 +1349,11 @@ mod version_tests {
         ";
         let runtime_v2: Runtime = yaml::from_str(yaml_v2).expect("Should parse Runtime");
         let sql_v2 = runtime_v2.caching.sql_results.expect("sql_results present");
-        assert_eq!(sql_v2.encoding, Encoding::Zstd, "v2 supports encoding field");
+        assert_eq!(
+            sql_v2.encoding,
+            Encoding::Zstd,
+            "v2 supports encoding field"
+        );
 
         // v1 results_cache migration defaults encoding to None
         let yaml_v1 = r"
@@ -1370,7 +1361,10 @@ mod version_tests {
                 enabled: true
         ";
         let runtime_v1: Runtime = yaml::from_str(yaml_v1).expect("Should parse Runtime");
-        let sql_v1 = runtime_v1.caching.sql_results.expect("sql_results migrated");
+        let sql_v1 = runtime_v1
+            .caching
+            .sql_results
+            .expect("sql_results migrated");
         assert_eq!(
             sql_v1.encoding,
             Encoding::None,
