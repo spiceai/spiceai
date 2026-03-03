@@ -219,7 +219,7 @@ impl FileBasedDeletionSink {
         let mut deleted_count: u64 = 0;
 
         for (meta, num_rows) in eligible_files {
-            // Delete the file from the object store, but does not invalidate the listing table cache so we need to do this separatly.
+            // Delete the file from the object store. This does not invalidate the listing table cache; cache invalidation is handled separately.
             match object_store.delete(&meta.location).await {
                 Ok(()) => {
                     let row_count = num_rows.unwrap_or(0);

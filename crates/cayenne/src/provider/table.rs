@@ -3392,7 +3392,7 @@ impl CayenneTableProvider {
 
     /// Invalidate the `list_files_cache` entry for the given snapshot directory URL.
     ///
-    /// `DataFusion'`s `ListingTableUrl` caches directory listings in the `RuntimeEnv`'s
+    /// `DataFusion`'s `ListingTableUrl` caches directory listings in the `RuntimeEnv`'s
     /// `CacheManager` with infinite TTL. After files are added or removed from a
     /// snapshot directory, the stale cache entry must be evicted so the next scan
     /// lists files fresh from the filesystem / object store.

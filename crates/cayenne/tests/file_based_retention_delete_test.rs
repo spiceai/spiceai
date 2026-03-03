@@ -329,7 +329,7 @@ async fn test_cache_invalidated_after_append_impl(fixture: TestFixture) -> TestR
     };
     cache.put(&other_table_key, dummy_cache_value());
     assert_eq!(
-        entries.len(),
+        cache.len(),
         2,
         "Expected exactly two cache entries after adding unrelated entry"
     );
