@@ -38,6 +38,7 @@ use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 
 // ============================================================================
@@ -53,13 +54,14 @@ async fn create_sorted_table(
     table_name: &str,
     schema: Arc<Schema>,
     sort_columns: Vec<String>,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> Arc<CayenneTableProvider> {
     let vortex_config = VortexConfig {
         sort_columns,
         ..VortexConfig::default()
     };
 
-    let context = CayenneContext::new(&vortex_config);
+    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env));
 
     let options = CreateTableOptions {
         table_name: table_name.to_string(),
@@ -74,7 +76,7 @@ async fn create_sorted_table(
     let catalog_arc = Arc::clone(&fixture.catalog);
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
     Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc)
+        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
             .with_context(context)
             .create(options)
             .await
@@ -83,10 +85,13 @@ async fn create_sorted_table(
 }
 
 /// Read all data from a table via SQL, returning collected `RecordBatch`es.
-async fn query_all(provider: &Arc<CayenneTableProvider>, table_name: &str) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("table should be registered");
+async fn query_all(
+    ctx: &SessionContext,
+    provider: &Arc<CayenneTableProvider>,
+    table_name: &str,
+) -> Vec<RecordBatch> {
+    // Table may already be registered from a previous call; ignore "already exists" errors.
+    let _ = ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>);
     ctx.sql(&format!("SELECT * FROM {table_name}"))
         .await
         .expect("query should succeed")
@@ -97,13 +102,13 @@ async fn query_all(provider: &Arc<CayenneTableProvider>, table_name: &str) -> Ve
 
 /// Read all data ordered by a column.
 async fn query_ordered(
+    ctx: &SessionContext,
     provider: &Arc<CayenneTableProvider>,
     table_name: &str,
     order_col: &str,
 ) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("table should be registered");
+    // Table may already be registered from a previous call; ignore "already exists" errors.
+    let _ = ctx.register_table(table_name, Arc::clone(provider) as Arc<dyn TableProvider>);
     ctx.sql(&format!("SELECT * FROM {table_name} ORDER BY {order_col}"))
         .await
         .expect("query should succeed")
@@ -194,11 +199,13 @@ async fn test_sort_rewrite_basic_impl(
         Field::new("value", DataType::Int64, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_basic",
         Arc::clone(&schema),
         vec!["id".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -217,7 +224,7 @@ async fn test_sort_rewrite_basic_impl(
         .expect("sort_and_rewrite_data should succeed");
 
     // Verify data is sorted (query without ORDER BY to check physical sort order)
-    let results = query_all(&table, "sort_basic").await;
+    let results = query_all(&ctx, &table, "sort_basic").await;
     assert_eq!(total_rows(&results), 5, "should have 5 rows");
 
     let ids = collect_i64_column(&results, "id");
@@ -243,11 +250,13 @@ async fn test_sort_rewrite_multiple_inserts_impl(
         Field::new("label", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_multi",
         Arc::clone(&schema),
         vec!["ts".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -262,7 +271,7 @@ async fn test_sort_rewrite_multiple_inserts_impl(
         .await
         .expect("sort_and_rewrite_data should succeed");
 
-    let results = query_all(&table, "sort_multi").await;
+    let results = query_all(&ctx, &table, "sort_multi").await;
     assert_eq!(total_rows(&results), 6, "should have 6 rows");
 
     let timestamps = collect_i64_column(&results, "ts");
@@ -301,11 +310,13 @@ async fn test_sort_rewrite_with_nulls_impl(
         Field::new("name", DataType::Utf8, true), // nullable
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_nulls",
         Arc::clone(&schema),
         vec!["id".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -322,7 +333,7 @@ async fn test_sort_rewrite_with_nulls_impl(
         .await
         .expect("sort_and_rewrite_data should succeed");
 
-    let results = query_all(&table, "sort_nulls").await;
+    let results = query_all(&ctx, &table, "sort_nulls").await;
     assert_eq!(total_rows(&results), 5, "should have 5 rows");
 
     let ids = collect_i64_column(&results, "id");
@@ -349,11 +360,13 @@ async fn test_sort_rewrite_idempotent_impl(
         Field::new("data", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_idem",
         Arc::clone(&schema),
         vec!["id".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -370,7 +383,7 @@ async fn test_sort_rewrite_idempotent_impl(
         .await
         .expect("first sort should succeed");
 
-    let after_first = query_all(&table, "sort_idem").await;
+    let after_first = query_all(&ctx, &table, "sort_idem").await;
     let ids_first = collect_i64_column(&after_first, "id");
     let data_first = collect_string_column(&after_first, "data");
 
@@ -380,7 +393,7 @@ async fn test_sort_rewrite_idempotent_impl(
         .await
         .expect("second sort should succeed");
 
-    let after_second = query_all(&table, "sort_idem").await;
+    let after_second = query_all(&ctx, &table, "sort_idem").await;
     let ids_second = collect_i64_column(&after_second, "id");
     let data_second = collect_string_column(&after_second, "data");
 
@@ -405,11 +418,13 @@ async fn test_sort_rewrite_empty_table_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_empty",
         Arc::clone(&schema),
         vec!["x".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -418,7 +433,7 @@ async fn test_sort_rewrite_empty_table_impl(
         .await
         .expect("sort on empty table should succeed");
 
-    let results = query_all(&table, "sort_empty").await;
+    let results = query_all(&ctx, &table, "sort_empty").await;
     assert_eq!(total_rows(&results), 0, "empty table should stay empty");
 
     Ok(())
@@ -432,11 +447,13 @@ async fn test_sort_rewrite_snapshot_changes_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_snap",
         Arc::clone(&schema),
         vec!["id".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -463,7 +480,7 @@ async fn test_sort_rewrite_snapshot_changes_impl(
     );
 
     // Data should still be correct in the new snapshot
-    let results = query_all(&table, "sort_snap").await;
+    let results = query_all(&ctx, &table, "sort_snap").await;
     let ids = collect_i64_column(&results, "id");
     assert_eq!(ids, vec![1, 2, 3]);
 
@@ -481,11 +498,13 @@ async fn test_sort_rewrite_then_insert_impl(
         Field::new("val", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_then_ins",
         Arc::clone(&schema),
         vec!["id".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -502,7 +521,7 @@ async fn test_sort_rewrite_then_insert_impl(
     sql_insert(&table, "sort_then_ins", "(5, 'pre'), (25, 'mid')").await;
 
     // Query ordered to verify all data is present
-    let results = query_ordered(&table, "sort_then_ins", "id").await;
+    let results = query_ordered(&ctx, &table, "sort_then_ins", "id").await;
     assert_eq!(total_rows(&results), 5, "should have 5 rows total");
 
     let ids = collect_i64_column(&results, "id");
@@ -534,11 +553,13 @@ async fn test_sort_rewrite_large_dataset_impl(
         Field::new("payload", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_large",
         Arc::clone(&schema),
         vec!["id".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -559,7 +580,7 @@ async fn test_sort_rewrite_large_dataset_impl(
         .await
         .expect("sort should succeed");
 
-    let results = query_all(&table, "sort_large").await;
+    let results = query_all(&ctx, &table, "sort_large").await;
     assert_eq!(total_rows(&results), 500, "should have 500 rows");
 
     let ids = collect_i64_column(&results, "id");
@@ -598,11 +619,13 @@ async fn test_sort_rewrite_multi_column_sort_impl(
         Field::new("name", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_multi_col",
         Arc::clone(&schema),
         vec!["category".to_string(), "rank".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -620,7 +643,7 @@ async fn test_sort_rewrite_multi_column_sort_impl(
         .await
         .expect("multi-column sort should succeed");
 
-    let results = query_all(&table, "sort_multi_col").await;
+    let results = query_all(&ctx, &table, "sort_multi_col").await;
     assert_eq!(total_rows(&results), 6, "should have 6 rows");
 
     let categories = collect_i64_column(&results, "category");
@@ -656,12 +679,15 @@ async fn test_sort_rewrite_reopen_table_impl(
         Field::new("txt", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
+    let runtime_env = ctx.runtime_env();
+
     let vortex_config = VortexConfig {
         sort_columns: vec!["id".to_string()],
         ..VortexConfig::default()
     };
 
-    let context = CayenneContext::new(&vortex_config);
+    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env));
 
     let options = CreateTableOptions {
         table_name: "sort_reopen".to_string(),
@@ -677,7 +703,7 @@ async fn test_sort_rewrite_reopen_table_impl(
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
 
     let table = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc))
+        CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc), Arc::clone(&runtime_env))
             .with_context(Arc::clone(&context))
             .create(options)
             .await
@@ -697,7 +723,7 @@ async fn test_sort_rewrite_reopen_table_impl(
     drop(table);
 
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc))
+        CayenneTableProviderBuilder::new(Arc::clone(&catalog_arc), runtime_env)
             .with_context(context)
             .open("sort_reopen")
             .await
@@ -705,7 +731,7 @@ async fn test_sort_rewrite_reopen_table_impl(
     );
 
     // Verify data is still sorted in the re-opened table
-    let results = query_all(&reopened, "sort_reopen").await;
+    let results = query_all(&ctx, &reopened, "sort_reopen").await;
     assert_eq!(total_rows(&results), 3, "should have 3 rows");
 
     let ids = collect_i64_column(&results, "id");
@@ -739,11 +765,13 @@ async fn test_sort_rewrite_duplicate_values_impl(
         Field::new("item", DataType::Utf8, false),
     ]));
 
+    let ctx = SessionContext::new();
     let table = create_sorted_table(
         &fixture,
         "sort_dups",
         Arc::clone(&schema),
         vec!["priority".to_string()],
+        ctx.runtime_env(),
     )
     .await;
 
@@ -760,7 +788,7 @@ async fn test_sort_rewrite_duplicate_values_impl(
         .await
         .expect("sort with duplicates should succeed");
 
-    let results = query_all(&table, "sort_dups").await;
+    let results = query_all(&ctx, &table, "sort_dups").await;
     assert_eq!(total_rows(&results), 6, "all 6 rows should be preserved");
 
     let priorities = collect_i64_column(&results, "priority");

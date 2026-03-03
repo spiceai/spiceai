@@ -29,6 +29,7 @@ use datafusion::{
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
 };
 
+use ::util::format_datafusion_error;
 use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
@@ -84,7 +85,10 @@ pub enum Error {
     #[snafu(display("Failed to infer an Arrow schema from JSON format. Error: {source}"))]
     ArrowSchemaError { source: ArrowError },
 
-    #[snafu(display("Failed to convert JSON values to Arrow format. Error: {source}"))]
+    #[snafu(display(
+        "Failed to convert JSON values to Arrow format. Error: {}",
+        format_datafusion_error(source)
+    ))]
     ArrowConversionError { source: DataFusionError },
 
     #[snafu(display("Failed to convert underlying search data into JSON format. Error: {source}"))]
@@ -113,7 +117,10 @@ pub enum Error {
     #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
     FailedToRetrieveDataFromIndex { source: TantivyError },
 
-    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
+    #[snafu(display(
+        "Failed to retrieve the data from the underlying table: {}.",
+        format_datafusion_error(source)
+    ))]
     FailedToRetrieveDataFromSource { source: DataFusionError },
 
     #[snafu(display("Failed to insert data into the full text search index: {source}.",))]

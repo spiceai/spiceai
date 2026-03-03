@@ -64,11 +64,13 @@ async fn test_retention_filters_apply_on_insert_impl(
 
     let retention_expr = col("value").lt(lit(3i64));
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
     let table_provider = Arc::new(
         CayenneTableProvider::create_table_with_retention(
             catalog_arc,
             table_options,
             vec![retention_expr],
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -123,7 +125,6 @@ async fn test_retention_filters_apply_on_insert_impl(
     );
 
     // Query via DataFusion to ensure only rows >= 3 remain.
-    let ctx = SessionContext::new();
     ctx.register_table(
         "retention_apply",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,
@@ -171,10 +172,12 @@ async fn test_retention_filters_skip_when_no_matches_impl(
 
     let retention_expr = col("value").lt(lit(0i64));
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
     let table_provider = CayenneTableProvider::create_table_with_retention(
         catalog_arc,
         table_options,
         vec![retention_expr],
+        ctx.runtime_env(),
     )
     .await?;
 
@@ -245,8 +248,9 @@ async fn test_time_retention_filter_scan_expiry_impl(
         .expect("to create retention builder");
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc)
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
             .with_time_retention_filter_builder(retention_builder)
             .create(table_options)
             .await?,
@@ -270,23 +274,27 @@ async fn test_time_retention_filter_scan_expiry_impl(
     }
 
     // Helper: query visible row IDs
-    let query_ids = |provider: Arc<dyn TableProvider>| async move {
-        let ctx = SessionContext::new();
-        ctx.register_table("time_retention", provider)?;
-        let df = ctx.sql("SELECT id FROM time_retention ORDER BY id").await?;
-        let batches = df.collect().await?;
-        let mut ids = Vec::new();
-        for batch in &batches {
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("id column");
-            for i in 0..col.len() {
-                ids.push(col.value(i));
+    let runtime_env = ctx.runtime_env();
+    let query_ids = |provider: Arc<dyn TableProvider>| {
+        let runtime_env = Arc::clone(&runtime_env);
+        async move {
+            let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env);
+            ctx.register_table("time_retention", provider)?;
+            let df = ctx.sql("SELECT id FROM time_retention ORDER BY id").await?;
+            let batches = df.collect().await?;
+            let mut ids = Vec::new();
+            for batch in &batches {
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column");
+                for i in 0..col.len() {
+                    ids.push(col.value(i));
+                }
             }
+            Ok::<Vec<i64>, Box<dyn std::error::Error>>(ids)
         }
-        Ok::<Vec<i64>, Box<dyn std::error::Error>>(ids)
     };
 
     // 1. Immediately: id=1 (now) and id=2 (2s ago) are within 3s retention,
@@ -366,8 +374,9 @@ async fn test_time_retention_with_user_filter_impl(
         .expect("to create retention builder");
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc)
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
             .with_time_retention_filter_builder(retention_builder)
             .create(table_options)
             .await?,
@@ -396,10 +405,12 @@ async fn test_time_retention_with_user_filter_impl(
     }
 
     // Helper: query with an optional SQL WHERE clause, returns sorted ids.
+    let runtime_env = ctx.runtime_env();
     let query_ids = |provider: Arc<dyn TableProvider>, sql: &str| {
         let sql = sql.to_string();
+        let runtime_env = Arc::clone(&runtime_env);
         async move {
-            let ctx = SessionContext::new();
+            let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env);
             ctx.register_table("t", provider)?;
             let df = ctx.sql(&sql).await?;
             let batches = df.collect().await?;

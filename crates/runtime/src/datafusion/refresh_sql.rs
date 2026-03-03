@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
@@ -36,7 +37,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Refresh SQL could not be parsed. {source} Check the SQL for syntax errors."
+        "The provided Refresh SQL could not be parsed. {} Check the SQL for syntax errors.",
+        format_datafusion_error(source)
     ))]
     UnableToParseSql { source: DataFusionError },
 
@@ -45,8 +47,13 @@ pub enum Error {
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
-    #[snafu(display("Expected a SQL query starting with SELECT <columns> FROM {expected_table}"))]
-    InvalidSqlStatement { expected_table: TableReference },
+    #[snafu(display(
+        "Expected a SQL query starting with SELECT <columns> FROM {expected_table}. {issue}"
+    ))]
+    InvalidSqlStatement {
+        expected_table: TableReference,
+        issue: String,
+    },
 
     #[snafu(display(
         "Unexpected '{expr}' in the Refresh SQL statement. Rewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
@@ -125,7 +132,13 @@ pub fn parse_refresh_sql(
                         )?;
                         ensure!(
                             select.from.len() == 1,
-                            InvalidSqlStatementSnafu { expected_table }
+                            InvalidSqlStatementSnafu {
+                                expected_table,
+                                issue: format!(
+                                    "A single FROM clause with table reference is expected, found {}",
+                                    select.from.len()
+                                )
+                            }
                         );
 
                         ensure_no_expr!(select.cluster_by.is_empty(), "CLUSTER BY", expected_table);
@@ -176,11 +189,23 @@ pub fn parse_refresh_sql(
                                 if TableReference::parse_str(&table_name_with_schema)
                                     != expected_table
                                 {
-                                    return InvalidSqlStatementSnafu { expected_table }.fail();
+                                    return InvalidSqlStatementSnafu {
+                                        expected_table: expected_table.clone(),
+                                        issue: format!(
+                                            "Table name in refresh_sql should be {expected_table}, is {name}",
+                                        ),
+                                    }
+                                    .fail();
                                 }
                             }
                             _ => {
-                                return InvalidSqlStatementSnafu { expected_table }.fail();
+                                return InvalidSqlStatementSnafu {
+                                    expected_table,
+                                    issue:
+                                        "No FROM clause with table reference found in SQL statement"
+                                            .to_string(),
+                                }
+                                .fail();
                             }
                         }
 
@@ -196,12 +221,27 @@ pub fn parse_refresh_sql(
 
                         Ok((refresh_sql, refresh_schema))
                     }
-                    _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+                    _ => InvalidSqlStatementSnafu {
+                        expected_table,
+                        issue: format!(
+                            "Expected a basic Select SQL query statement, found {}",
+                            query.body
+                        ),
+                    }
+                    .fail()?,
                 }
             }
-            _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+            _ => InvalidSqlStatementSnafu {
+                expected_table,
+                issue: format!("Expected a Select SQL query statement, found {statement}"),
+            }
+            .fail()?,
         },
-        _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+        _ => InvalidSqlStatementSnafu {
+            expected_table,
+            issue: format!("Expected a SQL Statement, found {statement}"),
+        }
+        .fail()?,
     }
 }
 

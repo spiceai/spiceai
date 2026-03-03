@@ -22,7 +22,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
-use crate::datafusion::error::SpiceExternalError;
+use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
@@ -75,22 +75,26 @@ pub use snapshots::SnapshotCreationConfig;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to fetch data from the data connector: {source}. Ensure the dataset source path and connector configuration are valid, and try again."
+        "Failed to fetch data from the data connector: {}. Ensure the dataset source path and connector configuration are valid, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to refresh dataset from the data connector: {source}. Verify the dataset configuration and data connector status, and try again."
+        "Failed to refresh dataset from the data connector: {}. Verify the dataset configuration and data connector status, and try again.",
+        format_datafusion_error(source)
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to scan the dataset from the data connector: {source}. Ensure the dataset configuration is valid, and try again."
+        "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToScanTableProvider { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to apply data update to the accelerated dataset: {source}. Ensure the dataset schema is compatible, and try again."
+        "Failed to apply data update to the accelerated dataset: {}. Ensure the dataset schema is compatible, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
@@ -120,7 +124,8 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table: {source}. Is the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table: {}. Is the 'time_column' parameter correct?",
+        format_datafusion_error(source)
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
@@ -130,7 +135,10 @@ pub enum Error {
     #[snafu(display("Failed to filter update data for the accelerated dataset: {source}"))]
     FailedToFilterUpdates { source: ArrowError },
 
-    #[snafu(display("Failed to write data into the accelerated dataset: {source}"))]
+    #[snafu(display(
+        "Failed to write data into the accelerated dataset: {}",
+        format_datafusion_error(source)
+    ))]
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(

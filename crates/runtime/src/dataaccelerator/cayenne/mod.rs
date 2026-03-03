@@ -32,6 +32,7 @@ use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
@@ -97,6 +98,9 @@ pub enum Error {
 
     #[snafu(display("Cayenne S3 acceleration error: {source}"))]
     S3Error { source: s3::Error },
+
+    #[snafu(display("RuntimeEnv is required for Cayenne accelerator but was not provided"))]
+    RuntimeEnvRequired,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -634,6 +638,7 @@ impl CayenneAccelerator {
         time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
         primary_keys: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
@@ -686,9 +691,14 @@ impl CayenneAccelerator {
             vortex_config,
         };
 
+        // Create shared Cayenne context with the runtime's RuntimeEnv
+        let context =
+            cayenne::CayenneContext::new(&table_options.vortex_config, Arc::clone(&runtime_env));
+
         // Create CayenneTableProvider with object store for S3 Express One Zone
-        let mut builder =
-            CayenneTableProviderBuilder::new(catalog).with_retention_filters(retention_filters);
+        let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_context(context)
+            .with_retention_filters(retention_filters);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -973,7 +983,12 @@ impl DataAccelerator for CayenneAccelerator {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // Cayenne requires a RuntimeEnv to share caches (list_files_cache, object stores)
+        // with the main query engine. This must always be provided by the runtime.
+        let runtime_env = runtime_env.context(RuntimeEnvRequiredSnafu).boxed()?;
+
         // Cayenne requires a source for file mode with directory-based storage
         let source = source.ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from(Error::InvalidConfiguration {
@@ -1056,6 +1071,7 @@ impl DataAccelerator for CayenneAccelerator {
                 time_retention_filter_builder.clone(),
                 primary_keys.clone(),
                 on_conflict.clone(),
+                Arc::clone(&runtime_env),
             )
             .await
             .boxed()?;
@@ -1149,6 +1165,7 @@ impl DataAccelerator for CayenneAccelerator {
                 object_store_config,
                 primary_keys,
                 on_conflict,
+                runtime_env,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -1276,11 +1293,12 @@ impl CayennePartitionCreator {
         object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
         primary_key: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config);
+        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env);
 
         Self {
             table_name,
@@ -1426,9 +1444,12 @@ impl PartitionCreator for CayennePartitionCreator {
 
         // Create Cayenne table provider for this partition with S3 support.
         // Use the shared context to share footer/segment caches across partitions.
-        let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
-            .with_retention_filters(self.retention_filters.clone())
-            .with_context(Arc::clone(&self.context));
+        let mut builder = cayenne::CayenneTableProviderBuilder::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.runtime_env()),
+        )
+        .with_context(Arc::clone(&self.context))
+        .with_retention_filters(self.retention_filters.clone());
         if let Some(ref retention_builder) = self.time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder.clone());
         }
@@ -1496,9 +1517,12 @@ impl PartitionCreator for CayennePartitionCreator {
 
             // Use builder pattern to pass object store config for S3 support.
             // Use the shared context to share footer/segment caches across partitions.
-            let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
-                .with_retention_filters(self.retention_filters.clone())
-                .with_context(Arc::clone(&self.context));
+            let mut builder = cayenne::CayenneTableProviderBuilder::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(self.context.runtime_env()),
+            )
+            .with_context(Arc::clone(&self.context))
+            .with_retention_filters(self.retention_filters.clone());
             if let Some(ref retention_builder) = self.time_retention_filter_builder {
                 builder = builder.with_time_retention_filter_builder(retention_builder.clone());
             }

@@ -263,7 +263,8 @@ async fn test_wal_blocks_table_open_impl(
     let meta = table.metadata();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let open_result = cayenne::CayenneTableProviderBuilder::new(catalog)
+    let ctx = SessionContext::new();
+    let open_result = cayenne::CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
         .open(&meta.table_name)
         .await;
 
@@ -589,12 +590,12 @@ async fn setup_table(
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = CayenneTableProvider::create_table(catalog, table_options)
+    let ctx = SessionContext::new();
+    let table = CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env())
         .await
         .expect("create table");
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)
         .expect("register");
 

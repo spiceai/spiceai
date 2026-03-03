@@ -41,6 +41,21 @@ pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
 
+pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues";
+
+#[must_use]
+pub fn sanitize_datafusion_error_message(message: &str) -> String {
+    message
+        .replace(DATAFUSION_BUG_REPORT_MESSAGE, "")
+        .trim()
+        .to_string()
+}
+
+#[must_use]
+pub fn format_datafusion_error(e: &(impl std::fmt::Display + ?Sized)) -> String {
+    sanitize_datafusion_error_message(&e.to_string())
+}
+
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::cast_sign_loss)]
 #[expect(clippy::cast_possible_truncation)]
@@ -238,7 +253,10 @@ pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usi
 mod tests {
     // generate test for human_readable_bytes
 
-    use crate::distribute_nulls;
+    use crate::{
+        DATAFUSION_BUG_REPORT_MESSAGE, distribute_nulls, format_datafusion_error,
+        sanitize_datafusion_error_message,
+    };
 
     #[test]
     fn test_human_readable_bytes() {
@@ -364,6 +382,74 @@ mod tests {
         assert_eq!(
             distribute_nulls(vec![1, 2], vec![3, 0, 1]),
             vec![None, None, Some(1), None, Some(2)]
+        );
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_removes_bug_report_suffix() {
+        let input = format!("Internal error: foo. {DATAFUSION_BUG_REPORT_MESSAGE}");
+        let sanitized = sanitize_datafusion_error_message(&input);
+        assert_eq!(sanitized, "Internal error: foo.");
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_keeps_other_messages() {
+        let input = "Error during planning: table x not found";
+        let sanitized = sanitize_datafusion_error_message(input);
+        assert_eq!(sanitized, input);
+    }
+
+    #[test]
+    fn format_datafusion_error_removes_bug_report_suffix() {
+        let input = format!("Internal error: bar. {DATAFUSION_BUG_REPORT_MESSAGE}");
+        let formatted = format_datafusion_error(&input);
+        assert_eq!(formatted, "Internal error: bar.");
+    }
+
+    #[test]
+    fn format_datafusion_error_keeps_other_messages() {
+        let input = "Error during planning: column y not found";
+        let formatted = format_datafusion_error(input);
+        assert_eq!(formatted, input);
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_removes_bug_report_with_newline_separator() {
+        let input = format!("Internal error: baz.\n\n{DATAFUSION_BUG_REPORT_MESSAGE}");
+        let sanitized = sanitize_datafusion_error_message(&input);
+        assert_eq!(sanitized, "Internal error: baz.");
+    }
+
+    #[test]
+    fn sanitize_datafusion_error_message_matches_actual_datafusion_internal_error() {
+        use datafusion::error::DataFusionError;
+
+        let error = DataFusionError::Internal("test internal error".to_string());
+        let displayed = error.to_string();
+
+        assert!(
+            displayed.contains(DATAFUSION_BUG_REPORT_MESSAGE),
+            "DataFusionError::Internal display output did not contain expected bug report suffix. Got: {displayed}"
+        );
+
+        let sanitized = sanitize_datafusion_error_message(&displayed);
+
+        // The sanitized message should no longer include the bug report suffix
+        assert!(
+            !sanitized.contains(DATAFUSION_BUG_REPORT_MESSAGE),
+            "Sanitized message still contains DataFusion bug report suffix: {sanitized}"
+        );
+
+        // The sanitized message should preserve the core internal error text
+        assert!(
+            sanitized.starts_with("Internal error: test internal error"),
+            "Sanitized message did not preserve expected internal error prefix. Got: {sanitized}"
+        );
+
+        // Ensure something was actually removed
+        assert!(
+            sanitized.len() < displayed.len(),
+            "Sanitized message was not shorter than original. Original: {displayed}, Sanitized: {sanitized}"
         );
     }
 }

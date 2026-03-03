@@ -18,8 +18,8 @@ description: "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second')
 |               |             HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@1)], projection=[id@0, _score@1, answer@2]                                     |
 |               |               CoalescePartitionsExec                                                                                                                                                        |
 |               |                 CooperativeExec                                                                                                                                                             |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                      |
-|               |                     BytesProcessedExec                                                                                                                                                      |
+|               |                   BytesProcessedExec                                                                                                                                                        |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                    |
 |               |                       CooperativeExec                                                                                                                                                       |
 |               |                         FullTextSearchTableExec q=second                                                                                                                                    |
 |               |               SchemaCastScanExec                                                                                                                                                            |

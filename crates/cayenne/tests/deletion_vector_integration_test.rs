@@ -132,9 +132,11 @@ async fn test_deletion_with_projection_excluding_pk() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "pk_projection_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -223,7 +225,10 @@ async fn test_deletion_persists_after_reopen() -> TestResult<()> {
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
-        let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
+        let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        );
 
         // Insert data
         let batch = RecordBatch::try_new(
@@ -240,7 +245,6 @@ async fn test_deletion_persists_after_reopen() -> TestResult<()> {
         // Delete id=2 and id=4
         delete_records(&table, col("id").eq(lit(2i64)).or(col("id").eq(lit(4i64)))).await?;
 
-        let ctx = SessionContext::new();
         ctx.register_table("persist_test", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
         // Verify deletions work before close
@@ -255,13 +259,13 @@ async fn test_deletion_persists_after_reopen() -> TestResult<()> {
         catalog.init().await?;
 
         // Reopen the table using builder pattern
+        let ctx = SessionContext::new();
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog)
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
                 .open("persist_test")
                 .await?,
         );
 
-        let ctx = SessionContext::new();
         ctx.register_table("persist_test", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
         // Verify row count
@@ -335,9 +339,11 @@ async fn test_position_based_deletion_no_pk() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table("no_pk_test", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // Insert data with duplicates (valid since no PK)
@@ -401,9 +407,11 @@ async fn test_composite_primary_key_deletion() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "composite_pk_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -495,9 +503,11 @@ async fn test_delete_then_insert_different_key() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "delete_insert_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -590,9 +600,11 @@ async fn test_multiple_delete_operations() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "multi_delete_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -679,9 +691,11 @@ async fn test_large_scale_deletion() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "large_scale_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
