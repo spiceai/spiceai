@@ -327,7 +327,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9a
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "c536c9aedc8fdf8e3787a31c43c8e41318cf3956" } # spiceai-52
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7815fb062ba508636abeff85ade93f93edff5a7e" } # branch: trunk
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4c63970cf1d78c71eb69e2f4346d5d4795631b47" } # branch: trunk
 
 [profile.release-lto]
 inherits = "release"
