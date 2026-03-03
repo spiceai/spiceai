@@ -2099,8 +2099,10 @@ mod tests {
             .expect("Failed to create table");
 
         // Add sort columns — should return ChangedConfiguration error
-        let mut vortex_config = crate::metadata::VortexConfig::default();
-        vortex_config.sort_columns = vec!["ts".to_string()];
+        let vortex_config = crate::metadata::VortexConfig {
+            sort_columns: vec!["ts".to_string()],
+            ..Default::default()
+        };
         let options_sorted = CreateTableOptions {
             table_name: "sorted_table".to_string(),
             schema: Arc::clone(&schema),
