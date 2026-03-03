@@ -57,6 +57,7 @@ use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
+use util::format_datafusion_error;
 
 use crate::Read;
 
@@ -75,7 +76,8 @@ pub enum Error {
     DeltaCheckpointError { source: delta_kernel::Error },
 
     #[snafu(display(
-        "Failed to plan or execute a Delta Lake table due to the following error: {source}"
+        "Failed to plan or execute a Delta Lake table due to the following error: {}",
+        format_datafusion_error(source)
     ))]
     DeltaTableExecutionError { source: DataFusionError },
 

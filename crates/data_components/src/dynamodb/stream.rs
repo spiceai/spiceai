@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
+use util::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
@@ -55,7 +56,7 @@ pub enum StreamError {
     #[snafu(display("Failed to build ChangeBatch: {source}"))]
     FailedToCreateRecordBatch { source: ArrowError },
 
-    #[snafu(display("Failed to read RecordBatch: {source}"))]
+    #[snafu(display("Failed to read RecordBatch: {}", format_datafusion_error(source)))]
     FailedToReadRecordBatch { source: DataFusionError },
 }
 

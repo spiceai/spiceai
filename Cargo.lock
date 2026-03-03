@@ -16116,6 +16116,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "util",
 ]
 
 [[package]]
@@ -16254,6 +16255,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "util",
 ]
 
 [[package]]

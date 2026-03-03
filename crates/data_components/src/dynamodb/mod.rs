@@ -18,6 +18,7 @@ use datafusion::error::DataFusionError;
 use snafu::Snafu;
 use std::collections::HashMap;
 use std::sync::Arc;
+use util::format_datafusion_error;
 
 mod arrow;
 mod json_nest;
@@ -89,7 +90,10 @@ pub enum Error {
     #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
     FailedToInitializeStream { source: dynamodb_streams::Error },
 
-    #[snafu(display("Failed to Bootstrap DynamoDB Table: {source}"))]
+    #[snafu(display(
+        "Failed to Bootstrap DynamoDB Table: {}",
+        format_datafusion_error(source)
+    ))]
     FailedToBootstrapTable { source: DataFusionError },
 
     #[snafu(display("DynamoDB table {table_name} is empty"))]
