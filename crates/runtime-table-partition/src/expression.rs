@@ -28,17 +28,18 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use snafu::prelude::*;
+use util::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Failed to determine data type: {source}"))]
+    #[snafu(display("Failed to determine data type: {}", format_datafusion_error(source)))]
     DataTypeError { source: DataFusionError },
     #[snafu(display("Expression {expr} does not meet the criteria: {criterion} Expression Criteria: {}", PartitionCriteria.doc()))]
     CriterionFailed { expr: String, criterion: String },
     #[snafu(display("Invalid expression: {message}"))]
     InvalidExpression { message: String },
-    #[snafu(display("Parsing SQL expression failed: {source}"))]
+    #[snafu(display("Parsing SQL expression failed: {}", format_datafusion_error(source)))]
     ParsingExpression { source: DataFusionError },
     #[snafu(display(
         "Scalar value type {scalar_type} is incompatible with expression type {expr_type}"

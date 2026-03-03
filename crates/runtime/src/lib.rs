@@ -37,6 +37,7 @@ use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
+use crate::datafusion::error::format_datafusion_error;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
@@ -331,7 +332,7 @@ pub enum Error {
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
 
-    #[snafu(display("Unable to create metrics table: {source}"))]
+    #[snafu(display("Unable to create metrics table: {}", format_datafusion_error(source)))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to create eval runs table: {source}"))]
@@ -447,7 +448,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to convert partition expression to SQL: {source}"))]
+    #[snafu(display(
+        "Failed to convert partition expression to SQL: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToConvertPartitionExpr { source: DataFusionError },
 }
 

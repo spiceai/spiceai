@@ -13,6 +13,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use ::util::format_datafusion_error;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -31,7 +32,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to execute search query: {source}"))]
+    #[snafu(display("Failed to execute search query: {}", format_datafusion_error(source)))]
     QueryError { source: DataFusionError },
 
     #[cfg(feature = "text_search")]
