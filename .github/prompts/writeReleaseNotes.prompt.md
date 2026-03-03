@@ -18,8 +18,8 @@ Follow these steps:
    - Changelog format with PR links and author attribution
 
 2. **Gather changes** using `git log` between the two version tags:
-   - Get all non-merge commits with `git log <prev-tag>..HEAD --oneline --no-merges`
-   - Identify contributors with `git log <prev-tag>..HEAD --format="%an <%ae>" --no-merges | sort -u`
+   - Get all non-merge commits with `git log <prev-tag>..<new-tag> --oneline --no-merges` (or `git log <prev-tag>..HEAD` if the new tag does not exist yet)
+   - Identify contributors with `git log <prev-tag>..<new-tag> --format="%an <%ae>" --no-merges | sort -u` (or `git log <prev-tag>..HEAD` if the new tag does not exist yet)
    - Map contributor names to GitHub usernames by cross-referencing previous release notes and email addresses
    - Read commit messages for major PRs to understand feature scope and details
 
