@@ -80,14 +80,14 @@ async fn test_two_level_partition_basic_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    println!("✓ Created table with partition_column: year");
 
-    let ctx = SessionContext::new();
     ctx.register_table("two_level_partitioned", Arc::new(table))?;
 
     // Insert data spanning multiple year/month combinations
@@ -177,14 +177,14 @@ async fn test_three_level_partition_basic_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    println!("✓ Created table with three-level partitioning");
 
-    let ctx = SessionContext::new();
     ctx.register_table("three_level_partitioned", Arc::new(table))?;
 
     // Insert data spanning multiple year/month/day combinations
@@ -297,14 +297,15 @@ async fn test_mixed_type_partition_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Created table with mixed-type partitioning (region=string, year=int)");
 
-    let ctx = SessionContext::new();
     ctx.register_table("mixed_type_partitioned", Arc::new(table))?;
 
     // Insert data across different regions and years
@@ -405,12 +406,14 @@ async fn test_composite_partition_metadata_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    let ctx = SessionContext::new();
+
     ctx.register_table("metadata_test", Arc::new(table))?;
 
     // Insert data to create partitions
@@ -506,12 +509,14 @@ async fn test_partition_data_isolation_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    let ctx = SessionContext::new();
+
     ctx.register_table("isolation_test", Arc::new(table))?;
 
     // Insert initial data into multiple partitions
@@ -629,12 +634,14 @@ async fn test_multi_partition_stress_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    let ctx = SessionContext::new();
+
     ctx.register_table("stress_test", Arc::new(table))?;
 
     // Insert data across 10 partitions, with multiple rows per partition
@@ -753,12 +760,14 @@ async fn test_partition_value_edge_cases_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    let ctx = SessionContext::new();
+
     ctx.register_table("edge_cases", Arc::new(table))?;
 
     // Test various partition values
@@ -848,12 +857,14 @@ async fn test_aggregation_across_partitions_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
-    let ctx = SessionContext::new();
+
     ctx.register_table("sales_data", Arc::new(table))?;
 
     // Insert sales data across regions

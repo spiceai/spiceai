@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::TableProviderFactory, common::Constraints, datasource::TableProvider,
     execution::context::SessionContext, logical_expr::CreateExternalTable,
@@ -73,6 +74,7 @@ impl DataAccelerator for ArrowAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         _partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
         // which overwrites the entire table. Primary key constraints cause uniqueness validation

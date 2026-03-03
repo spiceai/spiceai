@@ -69,11 +69,13 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         vortex_config: VortexConfig::default(),
     };
 
-    let table = CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
+            .await?;
     println!("✓ Table created");
 
     // 3. Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("test_overwrite", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
@@ -214,11 +216,13 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
         vortex_config: VortexConfig::default(),
     };
 
-    let table = CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
+            .await?;
     println!("✓ Table created");
 
     // 3. Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("test_cleanup", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 

@@ -23,6 +23,7 @@ use datafusion::{
     common::Constraints,
     datasource::TableProvider,
     error::DataFusionError,
+    execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
     prelude::{Expr, SessionContext},
     scalar::ScalarValue,
@@ -150,6 +151,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             !partition_by.is_empty(),
