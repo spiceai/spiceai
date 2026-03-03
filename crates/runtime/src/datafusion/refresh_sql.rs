@@ -188,7 +188,7 @@ pub fn parse_refresh_sql(
                                     != expected_table
                                 {
                                     return InvalidSqlStatementSnafu {
-                                        expected_table,
+                                        expected_table: expected_table.clone(),
                                         issue: format!(
                                             "Table name in refresh_sql should be {expected_table}, is {name}",
                                         ),
