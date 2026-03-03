@@ -38,11 +38,8 @@ use worker::WorkerRegistry;
 use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::{DataFusion, resolved_equality};
-use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
-use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector, internal_table::Error as InternalTableError,
-};
+use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
