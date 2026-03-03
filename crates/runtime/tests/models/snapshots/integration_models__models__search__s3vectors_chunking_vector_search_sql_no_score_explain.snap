@@ -19,8 +19,8 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
 |               |               AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[_score]                                                                                       |
 |               |                 ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, 1 - distance@1 as _score]                                                   |
 |               |                   CooperativeExec                                                                                                                                |
-|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                         |
-|               |                       BytesProcessedExec                                                                                                                         |
+|               |                     BytesProcessedExec                                                                                                                           |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                       |
 |               |                         CooperativeExec                                                                                                                          |
 |               |                           S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                           |
 |               |         SchemaCastScanExec                                                                                                                                       |
