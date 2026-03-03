@@ -143,8 +143,8 @@ impl DataAccelerator for PartitionedArrowAccelerator {
 
     async fn create_external_table(
         &self,
-        cmd: CreateExternalTable,
-        _source: Option<&dyn AccelerationSource>,
+        mut cmd: CreateExternalTable,
+        source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
@@ -153,6 +153,20 @@ impl DataAccelerator for PartitionedArrowAccelerator {
                 msg: "PartitionedArrow accelerator requires non-empty `partition_by`".to_string()
             }
         );
+
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+        {
+            if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
+                cmd.options
+                    .insert("sort_columns".to_string(), sort_cols_str.clone());
+            }
+            if let Some(hash_index_str) = acceleration.params.get("hash_index") {
+                cmd.options
+                    .insert("hash_index".to_string(), hash_index_str.clone());
+            }
+        }
+
         let schema = Arc::new(cmd.schema.as_arrow().clone());
         let creator = Arc::new(ArrowPartitionCreator::new(cmd, partition_by.clone()));
         let table_provider =

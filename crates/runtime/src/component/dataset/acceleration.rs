@@ -418,12 +418,18 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"));
 
         // Indexes require hash_index to be enabled for Arrow engine
-        if engine == Engine::Arrow && !indexes.is_empty() && !hash_index_enabled {
+        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
+            && !indexes.is_empty()
+            && !hash_index_enabled
+        {
             tracing::warn!(
                 "Indexes specified but hash_index is not enabled for Arrow engine. Add 'hash_index: enabled' to use indexes for fast lookups."
             );
         }
-        if engine == Engine::Arrow && primary_key.is_some() && !hash_index_enabled {
+        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
+            && primary_key.is_some()
+            && !hash_index_enabled
+        {
             tracing::warn!(
                 "Primary key specified but hash_index is not enabled for Arrow engine. \
                  Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
@@ -431,7 +437,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
         // Note: The warning for hash_index being experimental is logged once
         // at dataset registration time in init/dataset.rs, not during parsing.
-        if engine == Engine::Arrow && !on_conflict.is_empty() {
+        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow) && !on_conflict.is_empty() {
             tracing::warn!(
                 "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
             );
