@@ -344,6 +344,14 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' or 'cayenne' instead."
+    ))]
+    UnsupportedDistributedAccelerationEngine {
+        dataset_name: String,
+        engine: String,
+    },
+
+    #[snafu(display(
         "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
         format_datafusion_error(source)
     ))]
@@ -1634,6 +1642,20 @@ impl DataFusion {
             None
         };
 
+        // Distributed acceleration is only supported with Arrow or Cayenne engines.
+        if self.cluster_config.effective_role().is_some()
+            && !matches!(
+                acceleration_settings.engine,
+                Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+            )
+        {
+            return UnsupportedDistributedAccelerationEngineSnafu {
+                dataset_name: dataset.name.to_string(),
+                engine: acceleration_settings.engine.to_string(),
+            }
+            .fail();
+        }
+
         let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
@@ -2393,6 +2415,20 @@ impl DataFusion {
                 })?;
 
         let schema = view_table.schema();
+
+        // Distributed acceleration is only supported with Arrow or Cayenne engines.
+        if self.cluster_config.effective_role().is_some()
+            && !matches!(
+                acceleration.engine,
+                Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+            )
+        {
+            return UnsupportedDistributedAccelerationEngineSnafu {
+                dataset_name: table.to_string(),
+                engine: acceleration.engine.to_string(),
+            }
+            .fail();
+        }
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()

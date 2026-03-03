@@ -185,9 +185,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
             let resp = client
                 .queries(status.as_deref(), Some(*limit))
                 .await
-                .map_err(|e| crate::error::Error::InvalidResponse {
-                    message: e.to_string(),
-                })?;
+                .map_err(to_query_error)?;
 
             if resp.queries.is_empty() {
                 println!("No queries found.");
@@ -271,6 +269,19 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
     Ok(())
 }
 
+/// Check if an error indicates that distributed mode (state_location) is required
+/// and return a user-friendly error message if so.
+fn to_query_error(e: impl std::fmt::Display) -> crate::error::Error {
+    let err_str = e.to_string();
+    if err_str.contains("state_location") || err_str.contains("distributed mode") {
+        crate::error::Error::InvalidResponse {
+            message: "Spice is required to be running in distributed mode with `scheduler.state_location` configured in the spicepod. See: https://spiceai.org/docs/features/distributed".to_string(),
+        }
+    } else {
+        crate::error::Error::InvalidResponse { message: err_str }
+    }
+}
+
 async fn submit_and_wait(
     client: &Arc<Client>,
     sql: &str,
@@ -281,9 +292,7 @@ async fn submit_and_wait(
     let job = client
         .query(sql)
         .await
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: e.to_string(),
-        })?;
+        .map_err(to_query_error)?;
 
     let query_id = job.id().to_string();
 
@@ -406,7 +415,8 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
         let job = match client.query(input).await {
             Ok(j) => j,
             Err(e) => {
-                println!("\x1b[31mError:\x1b[0m {e}");
+                let err = to_query_error(e);
+                println!("\x1b[31mError:\x1b[0m {err}");
                 continue;
             }
         };

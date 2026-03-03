@@ -50,7 +50,7 @@ fn require_cluster_mode(rt: &Arc<Runtime>) -> Result<(), Response> {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "Async queries API is only available when running as scheduler. Start with: spiced --role scheduler"
+                "error": "Async queries API requires distributed mode with `scheduler.state_location` configured. Start with: spiced --role scheduler"
             })),
         )
             .into_response());
