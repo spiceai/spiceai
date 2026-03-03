@@ -37,6 +37,7 @@ use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
+use crate::datafusion::error::format_datafusion_error;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
@@ -331,7 +332,7 @@ pub enum Error {
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
 
-    #[snafu(display("Unable to create metrics table: {source}"))]
+    #[snafu(display("Unable to create metrics table: {}", format_datafusion_error(source)))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to create eval runs table: {source}"))]
@@ -447,7 +448,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to convert partition expression to SQL: {source}"))]
+    #[snafu(display(
+        "Failed to convert partition expression to SQL: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToConvertPartitionExpr { source: DataFusionError },
 }
 
@@ -752,45 +756,13 @@ impl Runtime {
     }
 
     /// Returns the partition manager for accelerated table partition metadata (scheduler only).
-    ///
-    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
-    /// a write lock (e.g., during initialization), this returns `None`.
     #[must_use]
     pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
                 partition_manager, ..
-            }) => {
-                if let Ok(guard) = partition_manager.try_read() {
-                    guard.clone()
-                } else {
-                    tracing::debug!(
-                        "Partition manager is currently being initialized. Returning None."
-                    );
-                    None
-                }
-            }
+            }) => Some(Arc::clone(partition_manager)),
             _ => None,
-        }
-    }
-
-    /// Sets the partition manager for accelerated table partition metadata.
-    pub async fn set_partition_manager(&self, manager: Arc<PartitionManager>) {
-        match self.distributed.as_ref() {
-            Some(DistributedNode::Scheduler {
-                partition_manager, ..
-            }) => {
-                let mut guard = partition_manager.write().await;
-                *guard = Some(manager);
-            }
-            Some(DistributedNode::Executor { .. }) => {
-                tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
-            }
-            None => {
-                tracing::warn!(
-                    "Attempted to set partition manager on a non-cluster runtime. Ignoring."
-                );
-            }
         }
     }
 

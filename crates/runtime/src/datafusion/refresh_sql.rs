@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
@@ -36,7 +37,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Refresh SQL could not be parsed. {source} Check the SQL for syntax errors."
+        "The provided Refresh SQL could not be parsed. {} Check the SQL for syntax errors.",
+        format_datafusion_error(source)
     ))]
     UnableToParseSql { source: DataFusionError },
 

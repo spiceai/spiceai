@@ -32,6 +32,7 @@ use datafusion::{
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
+use util::format_datafusion_error;
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
@@ -48,7 +49,8 @@ pub enum Error {
     CandidateAggregationError { source: aggregation::Error },
 
     #[snafu(display(
-        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {source}"
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {}",
+        format_datafusion_error(source)
     ))]
     SearchRequestConstructionError { source: DataFusionError },
 
