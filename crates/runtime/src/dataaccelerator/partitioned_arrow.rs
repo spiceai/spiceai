@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
@@ -46,20 +45,14 @@ pub(crate) struct ArrowPartitionCreator {
     cmd: CreateExternalTable,
     arrow_factory: ArrowFactory,
     partition_by: Vec<PartitionedBy>,
-    schema: SchemaRef,
 }
 
 impl ArrowPartitionCreator {
-    pub(crate) fn new(
-        cmd: CreateExternalTable,
-        partition_by: Vec<PartitionedBy>,
-        schema: SchemaRef,
-    ) -> Self {
+    pub(crate) fn new(cmd: CreateExternalTable, partition_by: Vec<PartitionedBy>) -> Self {
         Self {
             cmd,
             arrow_factory: ArrowFactory::new(),
             partition_by,
-            schema,
         }
     }
 }
@@ -161,14 +154,14 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             }
         );
 
-        let schema = Arc::new(cmd.schema.as_arrow().clone());
-        let creator = Arc::new(ArrowPartitionCreator::new(
-            cmd,
-            partition_by.clone(),
-            Arc::clone(&schema),
-        ));
-        let table_provider =
-            Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
+        let table_provider = Arc::new(
+            PartitionTableProvider::new(
+                Arc::new(ArrowPartitionCreator::new(cmd, partition_by.clone())),
+                partition_by,
+                Arc::new(cmd.schema.as_arrow().clone()),
+            )
+            .await?,
+        );
 
         Ok(table_provider as Arc<dyn TableProvider>)
     }
