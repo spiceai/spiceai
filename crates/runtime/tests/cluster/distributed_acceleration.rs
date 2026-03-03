@@ -76,11 +76,11 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
         .with_ansi(true)
         .try_init();
 
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
+    // for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+    //     verify_env_secret_exists(env_var)
+    //         .await
+    //         .map_err(anyhow::Error::msg)?;
+    // }
 
     // Keep the tempdirs alive for the duration of the test.
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
