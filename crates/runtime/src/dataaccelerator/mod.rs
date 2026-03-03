@@ -45,6 +45,7 @@ pub mod arrow;
 pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
 #[cfg(feature = "postgres-accel")]
