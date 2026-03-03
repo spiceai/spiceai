@@ -41,6 +41,9 @@ pub enum Error {
     #[snafu(display("Partition {partition} not found in table {table}"))]
     PartitionNotFound { table: String, partition: String },
 
+    #[snafu(display("No partition metadata found for table {table}"))]
+    TableMetadataNotFound { table: String },
+
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
 }
@@ -152,13 +155,10 @@ impl PartitionManager {
 
         loop {
             let now_ms = now_ms()?;
-            let mut metadata =
-                self.get_table_metadata(table)
-                    .await?
-                    .ok_or_else(|| Error::PartitionNotFound {
-                        table: key.clone(),
-                        partition: "any".to_string(),
-                    })?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut allocated: Vec<_> = metadata
                 .partitions
@@ -219,13 +219,10 @@ impl PartitionManager {
 
         loop {
             let now_ms = now_ms()?;
-            let mut metadata =
-                self.get_table_metadata(table)
-                    .await?
-                    .ok_or_else(|| Error::PartitionNotFound {
-                        table: key.clone(),
-                        partition: "any".to_string(),
-                    })?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut updated = false;
             for partition in &mut metadata.partitions {
