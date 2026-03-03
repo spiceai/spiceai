@@ -261,6 +261,18 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
 
     let marker_insertion_time = Instant::now();
 
+    println!("\n!!! Total records written per table:");
+    for info in &dataset_infos {
+        let total = info.record_count + info.dataset.marker_count();
+        println!(
+            "  {}: {} (data: {}, markers: {})",
+            info.dataset.dataset_type(),
+            total,
+            info.record_count,
+            info.dataset.marker_count(),
+        );
+    }
+
     // Phase 11: Poll for markers
     println!("\nPhase 11: Polling for marker detection");
     let marker_queries: HashMap<DatasetType, String> = dataset_infos
