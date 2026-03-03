@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -37,6 +38,7 @@ use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::sqlparser;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
@@ -51,6 +53,122 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
+
+/// Columns selected in the refresh SQL.
+#[derive(Clone, Debug)]
+pub enum RefreshSQLColumns {
+    /// SELECT * — all columns from source.
+    All,
+    /// SELECT col1, col2, ... — specific columns preserving original quoting/case.
+    Named(Vec<sqlparser::ast::Ident>),
+}
+
+/// Structured representation of refresh SQL, decomposed into validated parts.
+/// The user's `refresh_sql` config is parsed into columns + `user_filters` + limit.
+/// System-generated filters (partitions) are stored separately.
+#[derive(Clone, Debug)]
+pub struct RefreshSQL {
+    /// The source table this refresh targets.
+    table: TableReference,
+    /// Column projection (All or specific named columns).
+    columns: RefreshSQLColumns,
+    /// User-provided WHERE predicates from `refresh_sql`, split on top-level `AND`.
+    /// Stored as sqlparser `AST` `Expr`s so they can be recombined with system filters.
+    user_filters: Vec<sqlparser::ast::Expr>,
+    /// LIMIT clause from user SQL, if any.
+    limit: Option<usize>,
+    /// Cluster partition filter expressions (`DataFusion` Exprs).
+    /// Applied as `DataFrame` `.filter()` calls at query time.
+    partition_filters: Vec<datafusion_expr::Expr>,
+}
+
+impl RefreshSQL {
+    /// Create a new `RefreshSQL` with the given parts.
+    #[must_use]
+    pub fn new(
+        table: TableReference,
+        columns: RefreshSQLColumns,
+        user_filters: Vec<sqlparser::ast::Expr>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self {
+            table,
+            columns,
+            user_filters,
+            limit,
+            partition_filters: vec![],
+        }
+    }
+
+    /// Reconstruct the user SQL from parts: `SELECT {columns} FROM {table} WHERE {user_filters} LIMIT {limit}`.
+    /// This does NOT include partition filters — those are applied as `DataFrame` filters.
+    #[must_use]
+    pub fn to_sql(&self) -> String {
+        let columns_str = match &self.columns {
+            RefreshSQLColumns::All => "*".to_string(),
+            RefreshSQLColumns::Named(idents) => idents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+
+        let mut sql = format!("SELECT {columns_str} FROM {}", self.table);
+
+        if !self.user_filters.is_empty() {
+            let where_clause = self
+                .user_filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let _ = write!(sql, " WHERE {where_clause}");
+        }
+
+        if let Some(limit) = self.limit {
+            let _ = write!(sql, " LIMIT {limit}");
+        }
+
+        sql
+    }
+
+    /// Get the partition filter expressions for `DataFrame` filtering.
+    #[must_use]
+    pub fn partition_filters(&self) -> &[datafusion_expr::Expr] {
+        &self.partition_filters
+    }
+
+    /// Set the partition filter expressions.
+    pub fn set_partition_filters(&mut self, filters: Vec<datafusion_expr::Expr>) {
+        self.partition_filters = filters;
+    }
+
+    /// For logging/status display. Shows the user SQL and annotates if partition filters are active.
+    #[must_use]
+    pub fn display_sql(&self) -> String {
+        let base = self.to_sql();
+        if self.partition_filters.is_empty() {
+            base
+        } else {
+            format!(
+                "{base} [+{} partition filter(s)]",
+                self.partition_filters.len()
+            )
+        }
+    }
+
+    /// Returns the table reference.
+    #[must_use]
+    pub fn table(&self) -> &TableReference {
+        &self.table
+    }
+
+    /// Returns the columns selection.
+    #[must_use]
+    pub fn columns(&self) -> &RefreshSQLColumns {
+        &self.columns
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,7 +197,10 @@ pub struct Refresh {
     pub(crate) time_partition_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
-    pub(crate) sql: Option<String>,
+    pub(crate) sql: Option<RefreshSQL>,
+    /// Raw SQL string from an override request, not yet parsed.
+    /// When set, this should be parsed into a `RefreshSQL` before use.
+    pub(crate) override_sql_raw: Option<String>,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
@@ -175,9 +296,15 @@ impl Refresh {
     }
 
     #[must_use]
-    pub fn sql(mut self, sql: String) -> Self {
+    pub fn refresh_sql(mut self, sql: RefreshSQL) -> Self {
         self.sql = Some(sql);
         self
+    }
+
+    /// Get the display SQL string for logging/status purposes.
+    #[must_use]
+    pub fn display_sql(&self) -> Option<String> {
+        self.sql.as_ref().map(RefreshSQL::display_sql)
     }
 
     #[must_use]
@@ -205,10 +332,16 @@ impl Refresh {
         self
     }
 
+    /// Apply overrides from a refresh request.
+    ///
+    /// Note: if the override includes a `sql` string, it is stored as the raw override.
+    /// The caller is responsible for parsing it into a `RefreshSQL` using
+    /// `crate::datafusion::refresh_sql::parse_refresh_sql` before use
+    /// (this requires table name and schema context).
     #[must_use]
     pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
-        if let Some(sql) = &overrides.sql {
-            self.sql = Some(sql.clone());
+        if let Some(sql_str) = &overrides.sql {
+            self.override_sql_raw = Some(sql_str.clone());
         }
         if let Some(mode) = overrides.mode {
             self.mode = mode;
@@ -435,6 +568,7 @@ impl Default for Refresh {
             check_interval: None,
             max_jitter: None,
             sql: None,
+            override_sql_raw: None,
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
@@ -1061,7 +1195,7 @@ async fn notify_refresh_done(
     let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
     let refresh_guard = refresh.read().await;
     if let Some(sql) = &refresh_guard.sql {
-        labels.push(KeyValue::new("sql", sql.clone()));
+        labels.push(KeyValue::new("sql", sql.display_sql()));
     }
 
     metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);

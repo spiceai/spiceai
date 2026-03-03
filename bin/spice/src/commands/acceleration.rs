@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,14 @@ pub enum AccelerationCommand {
 pub struct SnapshotsArgs {
     /// The dataset name
     pub dataset: String,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+
+    /// Maximum number of snapshots to return (most recent first)
+    #[arg(long, default_value = "10")]
+    pub limit: usize,
 }
 
 /// Arguments for the snapshot subcommand.
@@ -73,6 +81,10 @@ pub struct SnapshotArgs {
 
     /// The snapshot ID
     pub snapshot_id: u64,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Arguments for the set-snapshot subcommand.
@@ -86,7 +98,7 @@ pub struct SetSnapshotArgs {
 }
 
 /// Snapshot information from the API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotInfo {
     pub snapshot_id: u64,
     pub timestamp_ms: i64,
@@ -97,10 +109,11 @@ pub struct SnapshotInfo {
     pub engine: Option<String>,
     pub row_count: Option<u64>,
     pub is_current: bool,
+    pub status: String,
 }
 
 /// Snapshot summary from the API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotSummary {
     pub dataset_name: String,
     pub location: String,
@@ -130,11 +143,20 @@ struct SnapshotTableRow {
     rows: String,
     checksum: String,
     current: String,
+    status: String,
 }
 
 impl TableRow for SnapshotTableRow {
     fn headers() -> Vec<&'static str> {
-        vec!["ID", "TIMESTAMP", "SIZE", "ROWS", "CHECKSUM", "CURRENT"]
+        vec![
+            "ID",
+            "TIMESTAMP",
+            "SIZE",
+            "ROWS",
+            "CHECKSUM",
+            "CURRENT",
+            "STATUS",
+        ]
     }
 
     fn values(&self) -> Vec<String> {
@@ -145,6 +167,7 @@ impl TableRow for SnapshotTableRow {
             self.rows.clone(),
             self.checksum.clone(),
             self.current.clone(),
+            self.status.clone(),
         ]
     }
 }
@@ -165,7 +188,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &AccelerationArgs) -> Result<()
 
 /// Execute the snapshots subcommand.
 async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result<()> {
-    let url = format!("/v1/datasets/{}/acceleration/snapshots", args.dataset);
+    let url = format!(
+        "/v1/datasets/{}/acceleration/snapshots?limit={}",
+        args.dataset, args.limit
+    );
 
     let response = ctx.get(&url).await.map_err(|_| {
         RuntimeUnavailableSnafu {
@@ -187,6 +213,10 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
         }
         .build()
     })?;
+
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&summary);
+    }
 
     if summary.snapshots.is_empty() {
         println!("No snapshots found for dataset {}", args.dataset);
@@ -221,6 +251,7 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
             } else {
                 String::new()
             },
+            status: s.status.clone(),
         })
         .collect();
 
@@ -256,6 +287,10 @@ async fn execute_snapshot(ctx: &RuntimeContext, args: &SnapshotArgs) -> Result<(
         }
         .build()
     })?;
+
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&snapshot);
+    }
 
     println!("Snapshot ID: {}", snapshot.snapshot_id);
     println!("Timestamp: {}", format_timestamp_ms(snapshot.timestamp_ms));

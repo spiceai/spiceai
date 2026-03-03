@@ -104,9 +104,10 @@ impl CayenneDeletionSink {
             let partition_filters: &[Expr] = &[];
 
             // List files for this table with partition pruning applied (if partitioned)
-            let (file_groups, _stats) = table
+            let list_result = table
                 .list_files_for_scan(&ctx.state(), partition_filters, None)
                 .await?;
+            let file_groups = list_result.file_groups;
 
             // Get the object store URL for this table
             let object_store_url = table

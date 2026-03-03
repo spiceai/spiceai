@@ -112,7 +112,7 @@ fn determine_names(name_arg: &str) -> (String, String) {
 /// Create the spicepod.yaml content.
 fn create_spicepod_yaml(name: &str) -> String {
     format!(
-        r"version: v1
+        r"version: v2
 kind: Spicepod
 name: {name}
 "

@@ -28,13 +28,14 @@ use object_store::prefix::PrefixStore;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
+use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
+use tokio::{runtime::Handle, sync::RwLock};
 use tonic::transport::Channel;
 
 use super::{PartitionManager, Result};
 use crate::{
-    Runtime,
     cluster::partition::{
         ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
         PartitionExpressionDeserializationSnafu, PartitionMetadataInitSnafu, discovery,
@@ -44,13 +45,18 @@ use crate::{
 
 /// Builds an object store for partition metadata from scheduler configuration.
 pub async fn build_partition_metadata_store(
-    rt: &Runtime,
+    io_runtime: Handle,
+    secrets: Arc<RwLock<Secrets>>,
     config: &SchedulerConfig,
 ) -> Result<Arc<dyn ObjectStore>> {
-    let (store, prefix) =
-        crate::cluster::scheduler_registry::build_object_store(rt, &config.state_location, config)
-            .await
-            .context(ObjectStoreBuildSnafu)?;
+    let (store, prefix) = crate::cluster::scheduler_registry::build_object_store_internal(
+        secrets,
+        io_runtime,
+        &config.state_location,
+        config,
+    )
+    .await
+    .context(ObjectStoreBuildSnafu)?;
 
     if prefix.is_empty() {
         Ok(store)

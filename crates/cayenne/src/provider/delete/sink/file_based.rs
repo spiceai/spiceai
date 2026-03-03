@@ -34,11 +34,13 @@ limitations under the License.
 use crate::catalog::MetadataCatalog;
 use crate::provider::constants::LISTING_TABLE_LOCK_POISONED;
 use crate::provider::retention::extract_retention_column_and_threshold;
+use crate::provider::table::CayenneTableProvider;
 use crate::provider::Error;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
@@ -54,6 +56,9 @@ pub(crate) struct FileBasedDeletionResult {
     /// IDs of protected snapshots that were fully emptied
     /// (all files expired and deleted).
     pub emptied_snapshot_ids: Vec<String>,
+    /// Snapshot directory URLs where files were actually deleted.
+    /// Used for targeted list-files cache invalidation.
+    pub invalidated_snapshot_urls: Vec<String>,
 }
 
 /// Result of scanning a single listing table for retention-eligible files.
@@ -98,6 +103,8 @@ pub struct FileBasedDeletionSink {
     table_id: i64,
     /// Table base path for constructing snapshot directory paths.
     table_path: String,
+    /// Shared runtime environment for cache invalidation after file deletion.
+    runtime_env: Arc<RuntimeEnv>,
 }
 
 impl FileBasedDeletionSink {
@@ -114,6 +121,7 @@ impl FileBasedDeletionSink {
     /// * `protected_snapshots` - In-memory protected snapshots map.
     /// * `table_id` - Table ID for catalog operations.
     /// * `table_path` - Table base path for snapshot directory construction.
+    /// * `runtime_env` - Shared runtime environment for cache invalidation.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
@@ -124,6 +132,7 @@ impl FileBasedDeletionSink {
         protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
         table_id: i64,
         table_path: String,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
         Self {
             listing_table,
@@ -134,6 +143,7 @@ impl FileBasedDeletionSink {
             protected_snapshots,
             table_id,
             table_path,
+            runtime_env,
         }
     }
 
@@ -161,9 +171,10 @@ impl FileBasedDeletionSink {
     ) -> crate::provider::Result<DeletionCheckScanResult> {
         // Call list_files_for_scan — lists all files + collects per-file stats.
         // collect_stat is true by default via SessionConfig::default().
-        let (file_groups, _aggregate_stats) = listing_table
+        let list_result = listing_table
             .list_files_for_scan(&ctx.state(), &[], None)
             .await?;
+        let file_groups = list_result.file_groups;
 
         // Find the column index for the retention column
         let col_idx = listing_table.schema().index_of(retention_col)?;
@@ -208,6 +219,7 @@ impl FileBasedDeletionSink {
         let mut deleted_count: u64 = 0;
 
         for (meta, num_rows) in eligible_files {
+            // Delete the file from the object store. This does not invalidate the listing table cache; cache invalidation is handled separately.
             match object_store.delete(&meta.location).await {
                 Ok(()) => {
                     let row_count = num_rows.unwrap_or(0);
@@ -317,6 +329,7 @@ impl FileBasedDeletionSink {
             .get_store(object_store_url.as_ref())?;
 
         let mut total_deleted_rows: u64 = 0;
+        let mut invalidated_snapshot_urls = Vec::new();
 
         // 1. Discover and delete eligible files from the main listing table
         let main_scan = self
@@ -328,6 +341,10 @@ impl FileBasedDeletionSink {
                 .delete_eligible_files(&main_scan.files, object_store.as_ref(), "main")
                 .await?;
             total_deleted_rows = total_deleted_rows.saturating_add(rows);
+
+            if let Some(url) = listing_table.table_paths().first() {
+                invalidated_snapshot_urls.push(url.as_str().to_string());
+            }
         }
 
         // 2. Discover and delete eligible files from protected snapshot tables
@@ -350,6 +367,10 @@ impl FileBasedDeletionSink {
                 .await?;
             total_deleted_rows = total_deleted_rows.saturating_add(rows);
 
+            if let Some(url) = snapshot_table.table_paths().first() {
+                invalidated_snapshot_urls.push(url.as_str().to_string());
+            }
+
             if scan_result.all_matched {
                 tracing::debug!(
                     table = %self.table_name,
@@ -370,6 +391,7 @@ impl FileBasedDeletionSink {
         Ok(FileBasedDeletionResult {
             total_deleted_rows,
             emptied_snapshot_ids,
+            invalidated_snapshot_urls,
         })
     }
 }
@@ -378,6 +400,12 @@ impl FileBasedDeletionSink {
 impl DeletionSink for FileBasedDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let result = self.delete_from_internal().await?;
+
+        // Invalidate the list-files cache for snapshot directories where
+        // files were deleted, so the next scan sees the updated listing.
+        for url in &result.invalidated_snapshot_urls {
+            CayenneTableProvider::invalidate_list_files_cache(&self.runtime_env, url);
+        }
 
         // Clean up emptied protected snapshots: catalog, in-memory map, and directory.
         if !result.emptied_snapshot_ids.is_empty() {

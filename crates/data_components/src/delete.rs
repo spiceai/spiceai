@@ -247,4 +247,21 @@ impl TableProvider for DeletionTableProviderAdapter {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.source.insert_into(state, input, overwrite).await
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        TableProvider::delete_from(self.source.as_ref(), state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.source.update(state, assignments, filters).await
+    }
 }

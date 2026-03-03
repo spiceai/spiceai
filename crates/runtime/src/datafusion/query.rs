@@ -65,13 +65,16 @@ use datafusion::prelude::SessionContext;
 use async_stream::stream;
 use futures::StreamExt;
 
-use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
+use super::{
+    SPICE_RUNTIME_SCHEMA,
+    error::{find_datafusion_root, format_datafusion_error},
+};
 
 use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
-use data_components::delete::get_deletion_provider;
+use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
@@ -82,22 +85,31 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to execute query: {source}"))]
+    #[snafu(display("Failed to execute query: {}", format_datafusion_error(source)))]
     UnableToExecuteQuery { source: DataFusionError },
 
     #[snafu(display("Failed to access query results cache: {source}"))]
     FailedToAccessCache { source: ::cache::Error },
 
-    #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
+    #[snafu(display(
+        "Unable to convert cached result to a record batch stream: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCreateMemoryStream { source: DataFusionError },
 
-    #[snafu(display("Unable to collect results after query execution: {source}"))]
+    #[snafu(display(
+        "Unable to collect results after query execution: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCollectResults { source: DataFusionError },
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
 
-    #[snafu(display("Failed to set parameters in logical plan: {source}"))]
+    #[snafu(display(
+        "Failed to set parameters in logical plan: {}",
+        format_datafusion_error(source)
+    ))]
     BindingParameters { source: DataFusionError },
 
     // Error message matches DataFusion's own error for table not found (not exposing existance of un-authorized table to unauthorized user).
@@ -395,7 +407,7 @@ impl Query {
 
         // Submit the job to the Ballista scheduler
         let ballista_job_id = scheduler
-            .submit_job(job_id, session_ctx, &plan)
+            .submit_job(job_id, session_ctx, &plan, None)
             .await
             .map_err(|e| Error::JobSubmissionFailed {
                 message: e.to_string(),
@@ -1332,7 +1344,7 @@ async fn create_delete_physical_plan(
         ))
     })?;
 
-    deletion_provider.delete_from(session_state, &filters).await
+    DeletionTableProvider::delete_from(deletion_provider.as_ref(), session_state, &filters).await
 }
 
 /// Extract filter expressions from a DML source logical plan.
@@ -1520,9 +1532,12 @@ impl ExecutionPlan for UpdateExec {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(DataFusionError::from)?;
 
-            let delete_plan = deletion_provider
-                .delete_from(&session_state, &filters)
-                .await?;
+            let delete_plan = DeletionTableProvider::delete_from(
+                deletion_provider.as_ref(),
+                &session_state,
+                &filters,
+            )
+            .await?;
             let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
             let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
 

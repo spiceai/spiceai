@@ -29,6 +29,7 @@ use sqlparser::ast::Statement as SQLStatement;
 use tokio::runtime::Handle;
 
 use crate::datafusion::builder::get_df_default_config;
+use crate::datafusion::error::format_datafusion_error;
 use runtime_object_store::registry::default_runtime_env;
 
 #[derive(Clone, Debug)]
@@ -42,7 +43,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Retention SQL could not be parsed. {source} Check the SQL for syntax errors."
+        "The provided Retention SQL could not be parsed. {} Check the SQL for syntax errors.",
+        format_datafusion_error(source)
     ))]
     UnableToParseSql { source: DataFusionError },
 
@@ -75,10 +77,16 @@ pub enum Error {
     #[snafu(display("Missing expected SQL statement - this is a bug in Spice.ai"))]
     MissingStatement,
 
-    #[snafu(display("Failed to convert Arrow schema to DataFusion schema: {source}"))]
+    #[snafu(display(
+        "Failed to convert Arrow schema to DataFusion schema: {}",
+        format_datafusion_error(source)
+    ))]
     SchemaConversion { source: DataFusionError },
 
-    #[snafu(display("Failed to parse SQL expression '{expression}': {source}"))]
+    #[snafu(display(
+        "Failed to parse SQL expression '{expression}': {}",
+        format_datafusion_error(source)
+    ))]
     ExpressionParsing {
         expression: String,
         source: Box<DataFusionError>,

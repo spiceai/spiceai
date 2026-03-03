@@ -72,7 +72,9 @@ data/
 # Database files
 *.db
 *.db-wal
+*.db.wal
 *.db-shm
+*.db-log
 
 # Cluster logs
 cluster_logs/

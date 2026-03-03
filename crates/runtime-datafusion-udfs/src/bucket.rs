@@ -29,6 +29,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use snafu::{ResultExt as _, Snafu};
+use util::format_datafusion_error;
 
 /// Maximum number of buckets, chosen to support large-scale partitioning while preventing excessive memory usage.
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
@@ -56,7 +57,7 @@ pub enum BucketError {
     #[snafu(display("ScalarValue `{scalar:?}` is not supported"))]
     UnsupportedScalarValue { scalar: ScalarValue },
 
-    #[snafu(display("DataFusion error: {source}"))]
+    #[snafu(display("DataFusion error: {}", format_datafusion_error(source)))]
     DataFusion { source: DataFusionError },
 
     #[snafu(display(

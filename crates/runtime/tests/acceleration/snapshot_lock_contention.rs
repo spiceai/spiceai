@@ -358,7 +358,6 @@ async fn run_query_workload(
 }
 
 /// Run snapshot creation workload
-#[expect(clippy::too_many_arguments, reason = "test helper function")]
 async fn run_snapshot_workload(
     snapshot_manager: &Arc<SnapshotManager>,
     checkpointer: &Arc<dyn DatasetCheckpointer>,
@@ -735,7 +734,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
 
             let engine = DuckDBAccelerator::new();
             engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .map_err(|e| anyhow::anyhow!("DuckDB table creation failed: {e}"))?
         }
@@ -765,7 +764,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
 
             let engine = SqliteAccelerator::new();
             engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .map_err(|e| anyhow::anyhow!("SQLite table creation failed: {e}"))?
         }

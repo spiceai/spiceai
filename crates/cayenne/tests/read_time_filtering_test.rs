@@ -73,12 +73,11 @@ async fn setup_test_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    // Create table provider
-    let table_provider =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
-    // Create session context for queries
+    // Create session context and table provider
     let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "test_table",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,
@@ -115,7 +114,8 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table_provider.as_ref(), &ctx.state(), &[filter])
+        .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 

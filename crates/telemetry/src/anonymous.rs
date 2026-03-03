@@ -214,7 +214,6 @@ mod tests {
 
     #[test]
     fn test_u64_to_i64_telemetry_max_i64() {
-        #[expect(clippy::cast_sign_loss)]
         let max_i64_as_u64 = i64::MAX as u64;
         assert_eq!(u64_to_i64_telemetry(max_i64_as_u64, "test"), i64::MAX);
     }
@@ -223,7 +222,6 @@ mod tests {
     fn test_u64_to_i64_telemetry_overflow_clamps() {
         assert_eq!(u64_to_i64_telemetry(u64::MAX, "test"), i64::MAX);
 
-        #[expect(clippy::cast_sign_loss)]
         let just_over = (i64::MAX as u64) + 1;
         assert_eq!(u64_to_i64_telemetry(just_over, "test"), i64::MAX);
     }

@@ -185,7 +185,7 @@ runs:
 
     - name: Upload spidapter artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
         name: spidapter-${{ steps.detect-os.outputs.os }}
         path: target/release/spidapter${{ steps.detect-os.outputs.ext }}

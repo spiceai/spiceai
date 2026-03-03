@@ -12,8 +12,8 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(q
 |               |   SortExec: TopK(fetch=4), expr=[_score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                         |
 |               |     ProjectionExec: expr=[CAST(key@1 AS Int64) as id, answer@0 as answer, trunc(1 - distance@2, 3) as _score]                                                              |
 |               |       CooperativeExec                                                                                                                                                      |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                               |
-|               |           BytesProcessedExec                                                                                                                                               |
+|               |         BytesProcessedExec                                                                                                                                                 |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                             |
 |               |             CooperativeExec                                                                                                                                                |
 |               |               S3VectorsQueryExec (INDEX_NAME_1): filter={subject:{$ne:"math"}} limit=100                                                                                   |
 |               |                                                                                                                                                                            |

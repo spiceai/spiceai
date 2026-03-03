@@ -71,12 +71,13 @@ async fn test_delete_with_primary_key_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
     println!("✓ Table created with primary key on 'id'");
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_pk", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -108,7 +109,8 @@ async fn test_delete_with_primary_key_impl(
     let filter = id_col.eq(lit(3i64));
 
     // Call delete_from directly on the table provider
-    let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let delete_plan =
+        DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
 
     // Execute the deletion plan
     let delete_results = collect(delete_plan, ctx.task_ctx()).await?;
@@ -147,7 +149,8 @@ async fn test_delete_with_primary_key_impl(
     let id_col = col("id");
     let filter = id_col.clone().eq(lit(1i64)).or(id_col.eq(lit(5i64)));
 
-    let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let delete_plan =
+        DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let delete_results = collect(delete_plan, ctx.task_ctx()).await?;
     let delete_count = delete_results[0]
         .column(0)
@@ -211,12 +214,13 @@ async fn test_delete_without_primary_key_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
     println!("✓ Table created WITHOUT primary key");
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_no_pk", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -246,7 +250,8 @@ async fn test_delete_without_primary_key_impl(
     let category_col = col("category");
     let filter = category_col.eq(lit("A"));
 
-    let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let delete_plan =
+        DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let delete_results = collect(delete_plan, ctx.task_ctx()).await?;
     let delete_count = delete_results[0]
         .column(0)
@@ -312,11 +317,12 @@ async fn test_delete_all_rows_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_all", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -327,7 +333,7 @@ async fn test_delete_all_rows_impl(
     println!("✓ Inserted 3 rows");
 
     // 5. Delete all rows (empty filter means delete all)
-    let delete_plan = table.delete_from(&ctx.state(), &[]).await?;
+    let delete_plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[]).await?;
     let delete_results = collect(delete_plan, ctx.task_ctx()).await?;
     let delete_count = delete_results[0]
         .column(0)
@@ -389,11 +395,12 @@ async fn test_delete_then_insert_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_insert", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -407,7 +414,8 @@ async fn test_delete_then_insert_impl(
     let id_col = col("id");
     let filter = id_col.eq(lit(2i64));
 
-    let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let delete_plan =
+        DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let delete_results = collect(delete_plan, ctx.task_ctx()).await?;
     let delete_count = delete_results[0]
         .column(0)
@@ -495,11 +503,12 @@ async fn test_delete_with_complex_filter_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_complex", Arc::clone(&table) as _)?;
 
     // 4. Insert test data
@@ -527,7 +536,8 @@ async fn test_delete_with_complex_filter_impl(
         .and(value_col.gt(lit(100i64)))
         .and(active_col.eq(lit(false)));
 
-    let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let delete_plan =
+        DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let delete_results = collect(delete_plan, ctx.task_ctx()).await?;
     let delete_count = delete_results[0]
         .column(0)

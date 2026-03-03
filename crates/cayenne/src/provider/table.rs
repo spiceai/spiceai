@@ -21,7 +21,8 @@ limitations under the License.
 
 use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
-    PROTECTED_SNAPSHOTS_LOCK_POISONED, WRITE_SEMAPHORE_CLOSED,
+    PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, STAGING_WAL_FILENAME,
+    WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -44,11 +45,12 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::sink::DataSinkExec;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::{Constraints, DFSchema};
+use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
@@ -175,19 +177,20 @@ pub struct CayenneTableProvider {
 ///
 /// ```ignore
 /// // Open an existing table
-/// let provider = CayenneTableProviderBuilder::new(catalog)
+/// let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
 ///     .with_retention_filters(filters)
 ///     .with_object_store(config)
 ///     .open("my_table").await?;
 ///
 /// // Create a new table
-/// let provider = CayenneTableProviderBuilder::new(catalog)
+/// let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
 ///     .with_retention_filters(filters)
 ///     .create(options).await?;
 /// ```
 #[derive(Clone)]
 pub struct CayenneTableProviderBuilder {
     catalog: Arc<dyn MetadataCatalog>,
+    runtime_env: Arc<RuntimeEnv>,
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
@@ -195,11 +198,12 @@ pub struct CayenneTableProviderBuilder {
 }
 
 impl CayenneTableProviderBuilder {
-    /// Create a new builder with the required catalog.
+    /// Create a new builder with the required catalog and shared `RuntimeEnv`.
     #[must_use]
-    pub fn new(catalog: Arc<dyn MetadataCatalog>) -> Self {
+    pub fn new(catalog: Arc<dyn MetadataCatalog>, runtime_env: Arc<RuntimeEnv>) -> Self {
         Self {
             catalog,
+            runtime_env,
             retention_filters: Vec::new(),
             time_retention_filter_builder: None,
             object_store_config: None,
@@ -262,6 +266,7 @@ impl CayenneTableProviderBuilder {
             self.retention_filters,
             self.time_retention_filter_builder,
             self.object_store_config,
+            self.runtime_env,
             self.context,
         )
         .await
@@ -276,12 +281,14 @@ impl CayenneTableProviderBuilder {
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
         let _table_id = self.catalog.create_table(options).await?;
+
         CayenneTableProvider::new_internal(
             &table_name,
             self.catalog,
             self.retention_filters,
             self.time_retention_filter_builder,
             self.object_store_config,
+            self.runtime_env,
             self.context,
         )
         .await
@@ -465,7 +472,11 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_path(table_path: &str, table_id: i64, snapshot_id: &str) -> std::path::PathBuf {
+    pub(super) fn snapshot_dir_path(
+        table_path: &str,
+        table_id: i64,
+        snapshot_id: &str,
+    ) -> std::path::PathBuf {
         std::path::PathBuf::from(table_path)
             .join(table_id.to_string())
             .join(snapshot_id)
@@ -499,7 +510,7 @@ impl CayenneTableProvider {
         }
     }
 
-    fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
+    pub(super) fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
         self.object_store_config
             .as_ref()
             .ok_or_else(|| Error::Internal {
@@ -508,7 +519,10 @@ impl CayenneTableProvider {
             })
     }
 
-    fn snapshot_object_store_prefix(&self, snapshot_id: &str) -> Result<Option<ObjectStorePath>> {
+    pub(super) fn snapshot_object_store_prefix(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ObjectStorePath>> {
         if !self.table_metadata.path.starts_with("s3://") {
             return Ok(None);
         }
@@ -603,11 +617,14 @@ impl CayenneTableProvider {
         for common_prefix in list_result.common_prefixes {
             if let Some(snapshot_id) = common_prefix.parts().last() {
                 let snapshot_id_str = snapshot_id.as_ref();
-                // Skip current snapshot and protected snapshots
+                // Skip current snapshot, protected snapshots, and the staging directory
                 if snapshot_id_str == current_snapshot
                     || protected_snapshot_ids.contains(snapshot_id_str)
+                    || snapshot_id_str == STAGING_DIR_NAME
                 {
-                    tracing::debug!("Keeping snapshot: {snapshot_id_str} (current or protected)");
+                    tracing::debug!(
+                        "Keeping snapshot: {snapshot_id_str} (current, protected, or staging)"
+                    );
                     continue;
                 }
                 self.delete_prefix_with_object_store(&common_prefix).await?;
@@ -708,6 +725,200 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Clear the staging directory, removing any leftover files.
+    ///
+    /// Called at the start of each staged append to guarantee a clean slate.
+    /// If the directory does not exist it is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be cleaned or created.
+    pub(crate) async fn clear_staging_dir(&self) -> Result<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            // S3: delete all objects under the staging prefix
+            if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
+                self.delete_prefix_with_object_store(&prefix).await?;
+            }
+        } else {
+            // Local FS: remove and recreate the directory
+            let staging_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                STAGING_DIR_NAME,
+            );
+            match tokio::fs::remove_dir_all(&staging_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            tokio::fs::create_dir_all(&staging_dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Move all files from the staging directory into the current snapshot directory.
+    ///
+    /// On local filesystems `rename()` is used, which is atomic on the same filesystem
+    /// (staging and snapshot dirs share `{table_path}/{table_id}/`).
+    ///
+    /// On S3, files are copied to the current snapshot prefix first, then the staging
+    /// originals are deleted (copy-all-then-delete-all ordering to avoid data loss if
+    /// the operation is interrupted).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any file move/copy fails.
+    pub(crate) async fn move_files_to_current_snapshot(&self) -> Result<()> {
+        let current_snapshot = self.get_current_snapshot_id()?;
+
+        if self.table_metadata.path.starts_with("s3://") {
+            self.move_staging_files_s3(&current_snapshot).await
+        } else {
+            self.move_staging_files_local(&current_snapshot).await
+        }
+    }
+
+    /// Move staging files to the current snapshot on local filesystem.
+    async fn move_staging_files_local(&self, current_snapshot: &str) -> Result<()> {
+        let staging_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            STAGING_DIR_NAME,
+        );
+        let target_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            current_snapshot,
+        );
+
+        // Ensure target directory exists
+        Self::ensure_snapshot_dir_exists(&target_dir).await?;
+
+        let mut entries = tokio::fs::read_dir(&staging_dir).await?;
+        let mut moved_count = 0usize;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let file_name = entry.file_name();
+
+            // Skip the WAL file — it is managed separately (removed after
+            // all data files have been successfully moved).
+            if file_name == STAGING_WAL_FILENAME {
+                continue;
+            }
+
+            let src = staging_dir.join(&file_name);
+            let dst = target_dir.join(&file_name);
+
+            tokio::fs::rename(&src, &dst).await?;
+            moved_count += 1;
+        }
+
+        tracing::debug!(
+            "Moved {moved_count} file(s) from staging to snapshot {current_snapshot} for table {table_name}",
+            table_name = self.table_metadata.table_name,
+        );
+
+        Ok(())
+    }
+
+    /// Move staging files to the current snapshot on S3.
+    ///
+    /// Uses copy-all-then-delete-all ordering: all files are copied to the target
+    /// prefix first, then staging originals are deleted. If interrupted after copies
+    /// but before deletes, data exists in both locations (safe — deduplicated by PK
+    /// or idempotent for append-only tables).
+    async fn move_staging_files_s3(&self, current_snapshot: &str) -> Result<()> {
+        let config = self.require_object_store()?;
+
+        let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? else {
+            return Ok(());
+        };
+        let Some(target_prefix) = self.snapshot_object_store_prefix(current_snapshot)? else {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("Cannot compute S3 prefix for snapshot '{current_snapshot}'"),
+            });
+        };
+
+        // List all objects in staging
+        let objects: Vec<_> = config
+            .store
+            .list(Some(&staging_prefix))
+            .try_collect()
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "list staging objects for move",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?;
+
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: copy data objects to target prefix (skip WAL file)
+        let mut copied_locations = Vec::with_capacity(objects.len());
+        for meta in &objects {
+            let relative = meta
+                .location
+                .as_ref()
+                .strip_prefix(staging_prefix.as_ref())
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "Staging object '{}' does not have expected prefix '{}'",
+                        meta.location,
+                        staging_prefix.as_ref(),
+                    ),
+                })?;
+
+            // Skip the WAL file — it is managed separately (removed after
+            // all data files have been successfully copied/deleted).
+            if relative == STAGING_WAL_FILENAME {
+                continue;
+            }
+            let target_path =
+                ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+
+            config
+                .store
+                .copy(&meta.location, &target_path)
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "copy staging file to snapshot",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+            copied_locations.push(meta.location.clone());
+        }
+
+        // Phase 2: delete staging originals
+        for location in &copied_locations {
+            config
+                .store
+                .delete(location)
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "delete staging file after copy",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+        }
+
+        tracing::debug!(
+            "Moved {} file(s) from staging to snapshot {current_snapshot} (S3) for table {}",
+            copied_locations.len(),
+            self.table_metadata.table_name,
+        );
+
+        Ok(())
+    }
+
     /// Sync a directory to ensure all files are durably written to disk.
     ///
     /// This is critical for crash safety: we must ensure all data files are
@@ -804,9 +1015,15 @@ impl CayenneTableProvider {
                 continue;
             };
 
-            // Skip the current snapshot and protected snapshots
-            if snapshot_id == current_snapshot_id || protected_snapshot_ids.contains(snapshot_id) {
-                tracing::debug!("Keeping snapshot: {} (current or protected)", snapshot_id);
+            // Skip the current snapshot, protected snapshots, and the staging directory
+            if snapshot_id == current_snapshot_id
+                || protected_snapshot_ids.contains(snapshot_id)
+                || snapshot_id == STAGING_DIR_NAME
+            {
+                tracing::debug!(
+                    "Keeping snapshot: {} (current, protected, or staging)",
+                    snapshot_id
+                );
                 continue;
             }
 
@@ -843,8 +1060,12 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
-    pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+    pub async fn new(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Result<Self> {
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .open(table_name)
             .await
     }
@@ -861,8 +1082,9 @@ impl CayenneTableProvider {
         table_name: &str,
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_retention_filters(retention_filters)
             .open(table_name)
             .await
@@ -875,9 +1097,15 @@ impl CayenneTableProvider {
         retention_filters: Vec<Expr>,
         time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
         object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+        runtime_env: Arc<RuntimeEnv>,
         context: Option<Arc<CayenneContext>>,
     ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
+
+        // Use the provided context (for partition cache sharing) or build a
+        // fresh one from this table's VortexConfig and the shared RuntimeEnv.
+        let context = context
+            .unwrap_or_else(|| CayenneContext::new(&table_metadata.vortex_config, runtime_env));
 
         if table_metadata.path.starts_with("s3://") && object_store_config.is_none() {
             return Err(Error::Internal {
@@ -896,9 +1124,6 @@ impl CayenneTableProvider {
             table_metadata.table_id,
             &table_metadata.current_snapshot_id,
         );
-
-        // Use provided context or create a new one from table metadata config
-        let context = context.unwrap_or_else(|| CayenneContext::new(&table_metadata.vortex_config));
 
         // Determine if this table has a primary key for key-based deletion
         let has_primary_key = !table_metadata.primary_key.is_empty();
@@ -971,7 +1196,7 @@ impl CayenneTableProvider {
             Self::load_protected_snapshots(Arc::clone(&catalog), table_id, &pk_deletion_strategy)
                 .await?;
 
-        Ok(Self {
+        let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
@@ -985,7 +1210,13 @@ impl CayenneTableProvider {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
-        })
+        };
+
+        // Fail construction if a staging WAL exists — the table may contain
+        // partial data from an interrupted append and must be resolved first.
+        provider.ensure_no_incomplete_write().await?;
+
+        Ok(provider)
     }
 
     /// Create a new table in Cayenne.
@@ -998,8 +1229,9 @@ impl CayenneTableProvider {
     pub async fn create_table(
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .create(options)
             .await
             .map_err(Into::into)
@@ -1016,8 +1248,9 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
         retention_filters: Vec<Expr>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_retention_filters(retention_filters)
             .create(options)
             .await
@@ -1129,221 +1362,11 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Process stream in chunks and write them in parallel with bounded concurrency.
-    ///
-    /// This method optimizes throughput by:
-    /// - Streaming chunk formation (no buffering of all chunks)
-    /// - Parallel writes with bounded concurrency (configurable via `VortexConfig.upload_concurrency`)
-    /// - Zero-copy batch handling (Arc references)
-    ///
-    /// # Returns
-    ///
-    /// Returns a tuple of `(total_rows, chunk_count)` where:
-    /// - `total_rows` is the total number of rows written
-    /// - `chunk_count` is the number of Vortex files created
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any chunk write fails.
-    pub(crate) async fn chunk_and_write_parallel(
-        &self,
-        mut stream: SendableRecordBatchStream,
-        target_size_bytes: usize,
-    ) -> Result<(u64, usize)> {
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-        use std::time::Instant;
-
-        // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let semaphore = Arc::clone(self.context.upload_semaphore());
-
-        // Progress tracking for S3 Express uploads
-        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
-        let start_time = Instant::now();
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let total_bytes_written = Arc::new(AtomicUsize::new(0));
-        let files_written = Arc::new(AtomicUsize::new(0));
-        let mut write_tasks = tokio::task::JoinSet::new();
-
-        // Log when starting S3 upload process
-        if is_s3_storage {
-            tracing::info!(
-                "Starting S3 upload for table {} (target chunk size: {})",
-                self.table_metadata.table_name,
-                format_bytes(target_size_bytes)
-            );
-        }
-
-        // Pre-allocate chunk vector with estimated capacity
-        // Estimate: average batch ~8MB, so reserve for a few batches per chunk
-        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
-        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
-        let mut current_size = 0usize;
-        let mut total_rows = 0u64;
-        let mut chunk_count = 0usize;
-
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-
-            let batch_size = batch.get_array_memory_size();
-
-            // If adding this batch would exceed target size and we have data, write current chunk
-            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
-                // Acquire semaphore permit before spawning write task
-                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|_| {
-                    Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: WRITE_SEMAPHORE_CLOSED,
-                    }
-                })?;
-
-                // Move chunk to write task (zero-copy via mem::take)
-                let chunk_to_write = std::mem::replace(
-                    &mut current_chunk,
-                    Vec::with_capacity(estimated_batches_per_chunk),
-                );
-                let chunk_size = current_size;
-                current_size = 0;
-                chunk_count += 1;
-
-                // Clone self and progress trackers for the async task
-                let self_clone = self.clone_for_write();
-                let total_bytes = Arc::clone(&total_bytes_written);
-                let files_count = Arc::clone(&files_written);
-                let progress_time = Arc::clone(&last_progress_ms);
-                let is_s3 = is_s3_storage;
-                let table_name = self.table_metadata.table_name.clone();
-                let start = start_time;
-                let current_chunk_num = chunk_count;
-
-                // Log when starting a chunk upload (before the slow I/O operation)
-                if is_s3 {
-                    tracing::info!(
-                        "Starting S3 upload for {} chunk {} ({})...",
-                        table_name,
-                        current_chunk_num,
-                        format_bytes(chunk_size)
-                    );
-                }
-
-                write_tasks.spawn(async move {
-                    let result = self_clone.write_chunk(chunk_to_write).await;
-
-                    // Track progress for S3 uploads
-                    if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
-                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        // Log progress every 10 seconds or when a file completes
-                        let elapsed = start.elapsed();
-                        // Use saturating conversion since elapsed time in real usage won't exceed u64::MAX milliseconds
-                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = progress_time.load(Ordering::Relaxed);
-                        let should_log =
-                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
-                        if should_log {
-                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
-                            let throughput = if elapsed.as_secs_f64() > 0.0 {
-                                #[expect(clippy::cast_precision_loss)]
-                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
-                                format_bytes_per_sec(bytes_per_sec)
-                            } else {
-                                "calculating...".to_string()
-                            };
-                            tracing::info!(
-                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
-                                table_name,
-                                file_num,
-                                format_bytes(bytes_so_far),
-                                elapsed.as_secs_f64(),
-                                throughput
-                            );
-                            progress_time.store(elapsed_ms, Ordering::Relaxed);
-                        }
-                    }
-
-                    drop(permit); // Release permit after write completes
-                    result
-                });
-            }
-
-            current_size += batch_size;
-            current_chunk.push(batch);
-        }
-
-        // Write final chunk if non-empty
-        if !current_chunk.is_empty() {
-            let permit =
-                Arc::clone(&semaphore)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: WRITE_SEMAPHORE_CLOSED,
-                    })?;
-
-            chunk_count += 1;
-            let final_chunk_size = current_size;
-
-            let self_clone = self.clone_for_write();
-            let total_bytes = Arc::clone(&total_bytes_written);
-            let files_count = Arc::clone(&files_written);
-            let is_s3 = is_s3_storage;
-
-            write_tasks.spawn(async move {
-                let result = self_clone.write_chunk(current_chunk).await;
-
-                // Track final chunk for S3 uploads
-                if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
-                    files_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                drop(permit);
-                result
-            });
-        }
-
-        // Wait for all writes to complete and collect row counts
-        while let Some(result) = write_tasks.join_next().await {
-            let row_count = result.map_err(|e| Error::TaskPanicked {
-                table: self.table_metadata.table_name.clone(),
-                source: e,
-            })??;
-            total_rows += row_count;
-        }
-
-        // Log final summary for S3 Express uploads
-        if is_s3_storage {
-            let elapsed = start_time.elapsed();
-            let total_bytes = total_bytes_written.load(Ordering::Relaxed);
-            let files_count = files_written.load(Ordering::Relaxed);
-            let throughput = if elapsed.as_secs_f64() > 0.0 {
-                #[expect(clippy::cast_precision_loss)]
-                let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
-                format_bytes_per_sec(bytes_per_sec)
-            } else {
-                "N/A".to_string()
-            };
-            tracing::info!(
-                "Completed S3 upload for {}: {} rows in {} files ({}) in {:.1}s, {}",
-                self.table_metadata.table_name,
-                total_rows,
-                files_count,
-                format_bytes(total_bytes),
-                elapsed.as_secs_f64(),
-                throughput
-            );
-        }
-
-        Ok((total_rows, chunk_count))
-    }
-
     /// Write a stream of record batches to a specific snapshot directory, chunking into
     /// parallel writes for efficiency.
     ///
-    /// This is similar to `chunk_and_write_parallel` but writes to a specified snapshot
-    /// directory rather than the current listing table's location. This is used during
-    /// compaction operations where data needs to be written to a new snapshot.
+    /// This is used during compaction operations where data needs to be written to a
+    /// new snapshot.
     ///
     /// # Arguments
     ///
@@ -1381,6 +1404,10 @@ impl CayenneTableProvider {
             self.context.file_format(),
             &self.pk_deletion_strategy,
         )?;
+
+        // Create session context once with object store registered (if S3),
+        // then share the session state across all parallel write tasks.
+        let session_state = Arc::new(self.create_session_context().state());
 
         // Bounded parallelism: configurable concurrent writes to optimize I/O
         let semaphore = Arc::clone(self.context.upload_semaphore());
@@ -1442,6 +1469,7 @@ impl CayenneTableProvider {
                 let table_name = self.table_metadata.table_name.clone();
                 let start = start_time;
                 let current_chunk_num = chunk_count;
+                let state = Arc::clone(&session_state);
 
                 if is_s3 {
                     tracing::info!(
@@ -1453,9 +1481,12 @@ impl CayenneTableProvider {
                 }
 
                 write_tasks.spawn(async move {
-                    let result =
-                        Self::write_chunk_to_listing_table(&listing_table_clone, chunk_to_write)
-                            .await;
+                    let result = Self::write_chunk_to_listing_table(
+                        &listing_table_clone,
+                        chunk_to_write,
+                        &state,
+                    )
+                    .await;
 
                     if is_s3 {
                         total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
@@ -1514,10 +1545,12 @@ impl CayenneTableProvider {
             let total_bytes = Arc::clone(&total_bytes_written);
             let files_count = Arc::clone(&files_written);
             let is_s3 = is_s3_storage;
+            let state = Arc::clone(&session_state);
 
             write_tasks.spawn(async move {
                 let result =
-                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk).await;
+                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk, &state)
+                        .await;
 
                 if is_s3 {
                     total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
@@ -1568,9 +1601,16 @@ impl CayenneTableProvider {
     /// Write a chunk of record batches to a specific `ListingTable`.
     ///
     /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
+    ///
+    /// # Arguments
+    ///
+    /// * `listing_table` - The listing table to write to
+    /// * `chunk` - Record batches to write
+    /// * `state` - Shared session state (with object store already registered for S3)
     async fn write_chunk_to_listing_table(
         listing_table: &ListingTable,
         chunk: Vec<RecordBatch>,
+        state: &SessionState,
     ) -> Result<u64> {
         if chunk.is_empty() {
             return Ok(0);
@@ -1588,11 +1628,8 @@ impl CayenneTableProvider {
             Box::pin(chunk_stream),
         ));
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         let insert_plan = listing_table
-            .insert_into(&state, stream_exec, InsertOp::Append)
+            .insert_into(state, stream_exec, InsertOp::Append)
             .await?;
 
         collect(insert_plan, state.task_ctx()).await?;
@@ -2501,20 +2538,23 @@ impl CayenneTableProvider {
         Ok(sorted_stream)
     }
 
-    /// Sort and rewrite data on disk by reading from the listing table.
+    /// Sort and rewrite data by reading from the current listing table, writing
+    /// sorted data to a new snapshot, and atomically swapping.
     ///
     /// This method:
-    /// 1. Reads all data from the current listing table (includes retention filter results)
+    /// 1. Reads all data from the current listing table
     /// 2. Sorts the data using `DataFusion`'s `SortExec` (with disk spilling)
-    /// 3. Deletes the old unsorted files
-    /// 4. Writes the sorted data back in optimally-sized chunks
+    /// 3. Writes sorted data to a **new** snapshot directory (avoids deleting
+    ///    files that the lazy `SortExec` stream still needs to read)
+    /// 4. Atomically commits the new snapshot in the catalog
+    /// 5. Updates in-memory state and triggers old snapshot cleanup
     ///
     /// This ensures zone maps have non-overlapping min/max ranges for optimal pruning.
     ///
     /// # Errors
     ///
     /// Returns an error if reading, sorting, or rewriting fails.
-    pub(crate) async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> Result<()> {
+    pub async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> Result<()> {
         tracing::info!(
             "Sorting and rewriting data for table {} by columns {:?}",
             self.table_metadata.table_name,
@@ -2540,69 +2580,167 @@ impl CayenneTableProvider {
         // Sort the stream using our existing sort logic
         let sorted_stream = self.sort_stream(stream)?;
 
-        // Delete all existing Vortex files in the snapshot directory before rewriting
-        // Note: For S3 paths, we skip deletion and let new files coexist (may need future cleanup)
-        let is_s3_path = self.table_metadata.path.starts_with("s3://");
-        let current_snapshot = self.get_current_snapshot_id()?;
+        // Write sorted data to a new snapshot directory. Because SortExec lazily
+        // reads input files via DataSourceExec, writing to a separate directory
+        // avoids the need to either:
+        //  - delete old files first (which would break the lazy read), or
+        //  - collect all sorted data into memory before writing
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
 
-        if is_s3_path {
-            if let Some(prefix) = self.snapshot_object_store_prefix(&current_snapshot)? {
-                self.delete_prefix_with_object_store(&prefix).await?;
-            } else {
-                tracing::warn!(
-                    "S3 path detected but no object store prefix could be derived for sorted rewrite cleanup"
+        let cleanup_failed_snapshot = async {
+            if is_s3 {
+                let snapshot_url = Self::snapshot_dir_url(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &new_snapshot_id,
                 );
+
+                match url::Url::parse(&snapshot_url) {
+                    Ok(url) => {
+                        let Some(config) = self.object_store_config.as_ref() else {
+                            tracing::warn!(
+                                "Skipping failed sort-rewrite S3 cleanup for table {} because object_store_config is missing",
+                                self.table_metadata.table_name
+                            );
+                            return;
+                        };
+
+                        let snapshot_host = url.host_str().unwrap_or_default();
+                        let config_host = config.url.host_str().unwrap_or_default();
+                        if !snapshot_host.is_empty()
+                            && !config_host.is_empty()
+                            && snapshot_host != config_host
+                        {
+                            tracing::warn!(
+                                "Skipping failed sort-rewrite S3 cleanup for table {} because snapshot host {} does not match configured object store host {}",
+                                self.table_metadata.table_name,
+                                snapshot_host,
+                                config_host
+                            );
+                            return;
+                        }
+
+                        let path = url.path().trim_start_matches('/');
+                        let prefix = ObjectStorePath::from(path);
+                        if let Err(e) = self.delete_prefix_with_object_store(&prefix).await {
+                            tracing::warn!(
+                                "Failed to clean up failed sort-rewrite snapshot {} for table {}: {e}",
+                                new_snapshot_id,
+                                self.table_metadata.table_name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse snapshot URL for failed sort-rewrite cleanup {} on table {}: {e}",
+                            snapshot_url,
+                            self.table_metadata.table_name
+                        );
+                    }
+                }
+            } else {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
+                    tracing::warn!(
+                        "Failed to clean up failed sort-rewrite snapshot dir {} for table {}: {e}",
+                        snapshot_dir.display(),
+                        self.table_metadata.table_name
+                    );
+                }
             }
-        } else {
-            let snapshot_dir = Self::snapshot_dir_path(
-                &self.table_metadata.path,
-                self.table_metadata.table_id,
-                &current_snapshot,
-            );
-            self.delete_snapshot_files(&snapshot_dir).await?;
+        };
+
+        // For local paths, ensure the snapshot directory exists.
+        // S3 doesn't require directory creation (object storage creates paths on write).
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        // Write the sorted data back in chunks
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(sorted_stream, target_size_bytes)
+            .chunk_and_write_parallel_to_snapshot(
+                sorted_stream,
+                target_size_bytes,
+                &new_snapshot_id,
+            )
             .await?;
+
+        if total_rows == 0 {
+            tracing::debug!(
+                "No data to sort-rewrite for table {}",
+                self.table_metadata.table_name
+            );
+            // Clean up empty snapshot directory for local paths
+            if !is_s3 {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                let _ = tokio::fs::remove_dir(&snapshot_dir).await;
+            }
+            return Ok(());
+        }
+
+        // Sync the snapshot directory for durability before committing metadata.
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                cleanup_failed_snapshot.await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
+        // Pre-create the listing table before committing to catalog.
+        // This ensures that if listing table creation fails, we haven't committed
+        // the catalog yet, avoiding an inconsistent state.
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+        )?;
+
+        // Atomically update the catalog to point to the new sorted snapshot.
+        // commit_compaction clears delete files and insert records, which is
+        // correct here since the sort rewrites all live data into the new snapshot.
+        if let Err(e) = self.commit_overwrite(&new_snapshot_id).await {
+            cleanup_failed_snapshot.await;
+            return Err(Error::Catalog { source: e });
+        }
+
+        // Now that catalog is committed, update the in-memory listing table.
+        {
+            let mut listing_table_guard =
+                self.listing_table
+                    .write()
+                    .map_err(|_| Error::LockPoisoned {
+                        table: self.table_metadata.table_name.clone(),
+                        lock: LISTING_TABLE_LOCK_POISONED,
+                    })?;
+            *listing_table_guard = new_listing_table;
+        }
+
+        // Update in-memory state to match the new catalog
+        self.update_current_snapshot_id(&new_snapshot_id)?;
+
+        if let Err(e) = self.clear_all_deletion_caches() {
+            tracing::warn!(
+                "Failed to clear deletion caches after sort rewrite for table {}: {e}",
+                self.table_metadata.table_name
+            );
+        }
+
+        // Old snapshot directories are cleaned up in the background
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
         tracing::info!(
             "Rewrote {} rows in {} sorted chunk(s) for table {}",
             total_rows,
             chunk_count,
             self.table_metadata.table_name
-        );
-
-        Ok(())
-    }
-
-    /// Delete all Vortex files in a snapshot directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if files cannot be deleted.
-    async fn delete_snapshot_files(&self, snapshot_dir: &std::path::Path) -> Result<()> {
-        if !snapshot_dir.exists() {
-            return Ok(());
-        }
-
-        let mut read_dir = tokio::fs::read_dir(snapshot_dir).await?;
-
-        let mut deleted_count = 0;
-        while let Some(entry) = read_dir.next_entry().await? {
-            let path = entry.path();
-
-            // Only delete files (Vortex files), not subdirectories
-            if path.is_file() {
-                tokio::fs::remove_file(&path).await?;
-                deleted_count += 1;
-            }
-        }
-
-        tracing::debug!(
-            "Deleted {} Vortex file(s) from snapshot directory before rewriting sorted data",
-            deleted_count
         );
 
         Ok(())
@@ -2624,53 +2762,6 @@ impl CayenneTableProvider {
         }
 
         ctx
-    }
-
-    /// Write a single chunk of record batches as a Vortex file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the chunk cannot be written.
-    async fn write_chunk(&self, chunk: Vec<RecordBatch>) -> Result<u64> {
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let schema = chunk[0].schema();
-        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
-
-        // Create a stream from the chunk batches
-        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
-        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-        let stream_exec = Arc::new(StreamingExec::new(
-            Arc::clone(&schema),
-            Box::pin(chunk_stream),
-        ));
-
-        // Create a session context for executing the insert (with object store if needed)
-        let ctx = self.create_session_context();
-        let state = ctx.state();
-
-        // Delegate to ListingTable's insert_into to write Vortex files
-        // Clone the Arc and drop the lock before awaiting
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&guard)
-        };
-        let insert_plan = listing_table
-            .insert_into(&state, stream_exec, InsertOp::Append)
-            .await?;
-
-        // Execute the insert plan
-        collect(insert_plan, state.task_ctx()).await?;
-
-        tracing::debug!("Wrote chunk with {} rows to Vortex", row_count);
-
-        Ok(row_count)
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -3168,7 +3259,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the lock is poisoned.
-    fn get_current_snapshot_id(&self) -> Result<String> {
+    pub(super) fn get_current_snapshot_id(&self) -> Result<String> {
         let guard = self
             .current_snapshot_id
             .read()
@@ -3270,6 +3361,10 @@ impl CayenneTableProvider {
             &current_snapshot,
         );
 
+        // Invalidate the list-files cache for the snapshot directory so the next
+        // scan discovers newly written files
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
+
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
@@ -3293,6 +3388,39 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    /// Invalidate the `list_files_cache` entry for the given snapshot directory URL.
+    ///
+    /// `DataFusion`'s `ListingTableUrl` caches directory listings in the `RuntimeEnv`'s
+    /// `CacheManager` with infinite TTL. After files are added or removed from a
+    /// snapshot directory, the stale cache entry must be evicted so the next scan
+    /// lists files fresh from the filesystem / object store.
+    pub(crate) fn invalidate_list_files_cache(
+        runtime_env: &Arc<RuntimeEnv>,
+        snapshot_dir_url: &str,
+    ) {
+        let Some(cache) = runtime_env.cache_manager.get_list_files_cache() else {
+            return;
+        };
+
+        // Parse the URL the same way `ListingTableUrl::parse` does to derive
+        // the `object_store::path::Path` prefix used as the cache key.
+        let Ok(table_url) = ListingTableUrl::parse(snapshot_dir_url) else {
+            tracing::warn!(
+                "Failed to parse snapshot URL for cache invalidation: {snapshot_dir_url}"
+            );
+            return;
+        };
+
+        let key = TableScopedPath {
+            table: None,
+            path: table_url.prefix().clone(),
+        };
+
+        if cache.remove(&key).is_some() {
+            tracing::debug!("Invalidated list-files cache for {snapshot_dir_url}");
+        }
     }
 
     /// Load both position-based and key-based deletion vectors from the catalog.
@@ -4289,6 +4417,7 @@ impl CayenneTableProvider {
                 Arc::clone(&self.protected_snapshots),
                 self.table_metadata.table_id,
                 self.table_metadata.path.clone(),
+                Arc::clone(self.context.runtime_env()),
             )),
             &self.table_metadata.schema,
         )))
@@ -4465,7 +4594,7 @@ mod tests {
     impl TableProviderFactory for CayenneTableProviderFactory {
         async fn create(
             &self,
-            _state: &dyn Session,
+            state: &dyn Session,
             cmd: &CreateExternalTable,
         ) -> std::result::Result<Arc<dyn TableProvider>, DataFusionError> {
             let metastore_type = cmd
@@ -4534,6 +4663,7 @@ mod tests {
                 catalog,
                 table_options,
                 retention_filters,
+                Arc::clone(state.runtime_env()),
             )
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -4787,5 +4917,278 @@ mod tests {
 
         assert_eq!(keyset.len(), 3, "all rows should be in keyset");
         assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
+    }
+
+    /// Helper to create a `CayenneTableProvider` with sort columns configured.
+    ///
+    /// Returns the provider and the temp dir (must be kept alive for the test duration).
+    async fn create_sorted_cayenne_table(
+        table_name: &str,
+        schema: SchemaRef,
+        sort_columns: Vec<String>,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let vortex_config = VortexConfig {
+            sort_columns,
+            ..VortexConfig::default()
+        };
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+
+        (provider, temp_dir)
+    }
+
+    /// Helper to insert a `RecordBatch` into a `CayenneTableProvider`.
+    async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let schema = batch.schema();
+
+        let mem_exec = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("memory exec created");
+
+        let insert_plan = provider
+            .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
+            .await
+            .expect("insert plan created");
+
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert done");
+    }
+
+    /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
+    async fn read_all(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+    ) -> Vec<RecordBatch> {
+        ctx.deregister_table(table_name).ok();
+        ctx.register_table(table_name, Arc::new(provider.clone_for_write()))
+            .expect("table registered");
+        let df = ctx
+            .sql(&format!("SELECT * FROM {table_name}"))
+            .await
+            .expect("query created");
+        df.collect().await.expect("collect succeeded")
+    }
+
+    #[tokio::test]
+    async fn test_sort_and_rewrite_data_sorts_by_column() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "sort_rewrite_test",
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Insert data in deliberately unsorted order across multiple batches
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![30, 10, 50])),
+                Arc::new(Int64Array::from(vec![300, 100, 500])),
+            ],
+        )
+        .expect("valid batch");
+        insert_batch(&provider, batch1).await;
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![20, 40])),
+                Arc::new(Int64Array::from(vec![200, 400])),
+            ],
+        )
+        .expect("valid batch");
+        insert_batch(&provider, batch2).await;
+
+        // Verify data is present but unsorted before rewrite
+        let before = read_all(&ctx, &provider, "sort_rewrite_test").await;
+        let total_rows_before: usize = before.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows_before, 5, "should have 5 rows before sort");
+
+        // Sort and rewrite
+        provider
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("sort_and_rewrite_data should succeed");
+
+        // Read back and verify data is sorted by "id" ascending
+        let after = read_all(&ctx, &provider, "sort_rewrite_test").await;
+        let total_rows_after: usize = after.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows_after, 5, "should still have 5 rows after sort");
+
+        // Collect all id values in order
+        let mut all_ids: Vec<i64> = Vec::new();
+        let mut all_values: Vec<i64> = Vec::new();
+        for batch in &after {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column should be Int64");
+            let val_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column should be Int64");
+            for i in 0..batch.num_rows() {
+                all_ids.push(id_col.value(i));
+                all_values.push(val_col.value(i));
+            }
+        }
+
+        assert_eq!(
+            all_ids,
+            vec![10, 20, 30, 40, 50],
+            "ids should be sorted ascending"
+        );
+        assert_eq!(
+            all_values,
+            vec![100, 200, 300, 400, 500],
+            "values should follow their corresponding ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_and_rewrite_data_empty_table() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "sort_empty_test",
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Sort and rewrite on empty table should succeed without error
+        provider
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("sort_and_rewrite_data on empty table should succeed");
+
+        let after = read_all(&ctx, &provider, "sort_empty_test").await;
+        let total_rows: usize = after.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 0, "empty table should remain empty after sort");
+    }
+
+    #[tokio::test]
+    async fn test_sort_and_rewrite_data_preserves_all_rows() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "sort_preserve_test",
+            Arc::clone(&schema),
+            vec!["ts".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Insert multiple batches with overlapping timestamp ranges
+        for i in (0..5).rev() {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![i * 10 + 5, i * 10])),
+                    Arc::new(StringArray::from(vec![
+                        format!("row_{}", i * 10 + 5),
+                        format!("row_{}", i * 10),
+                    ])),
+                ],
+            )
+            .expect("valid batch");
+            insert_batch(&provider, batch).await;
+        }
+
+        // Sort and rewrite
+        provider
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("sort_and_rewrite_data should succeed");
+
+        // Read back and verify all 10 rows are present and sorted
+        let after = read_all(&ctx, &provider, "sort_preserve_test").await;
+        let total_rows: usize = after.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 10, "all 10 rows should be preserved");
+
+        let mut all_ts: Vec<i64> = Vec::new();
+        let mut all_names: Vec<String> = Vec::new();
+        for batch in &after {
+            let ts_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ts column should be Int64");
+            let name_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column should be Utf8");
+            for i in 0..batch.num_rows() {
+                all_ts.push(ts_col.value(i));
+                all_names.push(name_col.value(i).to_string());
+            }
+        }
+
+        // Verify sorted by ts ascending
+        let expected_ts: Vec<i64> = (0..10).map(|i| i * 5).collect();
+        assert_eq!(all_ts, expected_ts, "timestamps should be sorted ascending");
+
+        // Verify each name corresponds to its timestamp
+        for (ts, name) in all_ts.iter().zip(all_names.iter()) {
+            assert_eq!(
+                name,
+                &format!("row_{ts}"),
+                "name should match its timestamp"
+            );
+        }
     }
 }

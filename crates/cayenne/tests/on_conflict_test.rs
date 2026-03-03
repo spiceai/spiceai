@@ -59,10 +59,11 @@ async fn test_on_conflict_upsert_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "conflict_upsert",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
