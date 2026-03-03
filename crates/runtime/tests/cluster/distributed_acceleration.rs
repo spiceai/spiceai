@@ -59,7 +59,7 @@ const TEST_DATA_CSV: &str = r"id,name,age,city,score
 /// Test that distributed acceleration with `bucket()` partitioning works end to end
 /// with an executor.
 ///
-/// Sets up a cluster with 1 scheduler + 1 executor accelerating data
+/// Sets up a cluster with 1 scheduler + 2 executors accelerating data
 /// with `partition_by: bucket(3, id)` using the Cayenne engine. Verifies:
 /// - `bucket()` UDF can be used in the dataset definition for partitioning
 /// - Queries return correct, complete results across all executors
