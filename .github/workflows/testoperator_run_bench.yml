@@ -289,6 +289,8 @@ jobs:
       - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
+          [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
+
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
@@ -355,6 +357,8 @@ jobs:
       - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
+          [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
+          
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \

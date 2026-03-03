@@ -100,15 +100,16 @@ async fn test_cayenne_partition_pruning_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Partitioned table created with partition_by: region");
 
     // Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("partitioned_table", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
@@ -401,15 +402,16 @@ async fn test_cayenne_bucket_partitioning_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Table created with partition column: id");
 
     // Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("bucket_table", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 

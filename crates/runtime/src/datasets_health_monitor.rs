@@ -32,7 +32,10 @@ use tracing_futures::Instrument;
 
 use crate::{
     component::dataset::{CheckAvailability, Dataset},
-    datafusion::{DataFusion, error::find_datafusion_root},
+    datafusion::{
+        DataFusion,
+        error::{find_datafusion_root, format_datafusion_error},
+    },
     metrics,
     search::util::find_concrete_table_provider,
 };
@@ -45,7 +48,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read the dataset table for health check: {source}"))]
+    #[snafu(display(
+        "Failed to read the dataset table for health check: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("Failed to query dataset health status: {source}"))]
@@ -53,7 +59,10 @@ pub enum Error {
         source: crate::datafusion::query::Error,
     },
 
-    #[snafu(display("Failed to get recently access datasets. {source}"))]
+    #[snafu(display(
+        "Failed to get recently accessed datasets. {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
     #[snafu(display(

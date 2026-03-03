@@ -1990,7 +1990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_detects_config_change() {
+    async fn test_create_table_returns_error_on_config_change() {
         let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -2023,7 +2023,7 @@ mod tests {
         assert!(metadata.primary_key.is_empty());
         assert_eq!(metadata.table_id, table_id_1);
 
-        // Now recreate with a primary key change — should detect changed configuration
+        // Now try to create with a primary key change — should get ChangedConfiguration error
         let options_changed = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema: Arc::clone(&schema),
@@ -2033,53 +2033,37 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        let err = catalog
-            .create_table(options_changed.clone())
-            .await
-            .expect_err("Expected ChangedConfiguration error");
+        let result = catalog.create_table(options_changed).await;
         assert!(
-            matches!(err, CatalogError::ChangedConfiguration { .. }),
-            "Expected ChangedConfiguration, got: {err:?}"
+            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
+            "Expected ChangedConfiguration error, got: {result:?}"
         );
 
-        // Drop and recreate with new config
-        catalog
-            .drop_table("test_table")
-            .await
-            .expect("Failed to drop table");
-        let table_id_2 = catalog
-            .create_table(options_changed)
-            .await
-            .expect("Failed to create table after drop and recreate");
-
-        // Should have gotten a new table_id (old one was dropped)
-        assert_ne!(table_id_1, table_id_2);
-
-        // Verify new config is stored
+        // Original table should still be intact with original config
         let metadata = catalog
             .get_table("test_table")
             .await
             .expect("Failed to get table");
-        assert_eq!(metadata.primary_key, vec!["id".to_string()]);
-        assert_eq!(metadata.table_id, table_id_2);
+        assert!(metadata.primary_key.is_empty());
+        assert_eq!(metadata.table_id, table_id_1);
 
         // Recreate with the SAME config — should return the same table_id
         let options_same = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema: Arc::clone(&schema),
-            primary_key: vec!["id".to_string()],
+            primary_key: vec![],
             on_conflict: None,
             base_path: "/tmp/cayenne_config_test".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        let table_id_3 = catalog
+        let table_id_2 = catalog
             .create_table(options_same)
             .await
             .expect("Failed to create table with same config");
 
         // Should reuse the existing table
-        assert_eq!(table_id_2, table_id_3);
+        assert_eq!(table_id_1, table_id_2);
 
         // Cleanup
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
@@ -2089,7 +2073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_detects_sort_columns_change() {
+    async fn test_create_table_returns_error_on_sort_columns_change() {
         let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -2100,7 +2084,6 @@ mod tests {
         ]));
 
         // Create table with no sort columns
-        let mut vortex_config = crate::metadata::VortexConfig::default();
         let options = CreateTableOptions {
             table_name: "sorted_table".to_string(),
             schema: Arc::clone(&schema),
@@ -2108,15 +2091,18 @@ mod tests {
             on_conflict: None,
             base_path: "/tmp/cayenne_sort_test".to_string(),
             partition_column: None,
-            vortex_config: vortex_config.clone(),
+            vortex_config: crate::metadata::VortexConfig::default(),
         };
-        let table_id_1 = catalog
+        catalog
             .create_table(options)
             .await
             .expect("Failed to create table");
 
-        // Add sort columns — should detect changed configuration
-        vortex_config.sort_columns = vec!["ts".to_string()];
+        // Add sort columns — should return ChangedConfiguration error
+        let vortex_config = crate::metadata::VortexConfig {
+            sort_columns: vec!["ts".to_string()],
+            ..Default::default()
+        };
         let options_sorted = CreateTableOptions {
             table_name: "sorted_table".to_string(),
             schema: Arc::clone(&schema),
@@ -2126,33 +2112,11 @@ mod tests {
             partition_column: None,
             vortex_config,
         };
-        let err = catalog
-            .create_table(options_sorted.clone())
-            .await
-            .expect_err("Expected ChangedConfiguration error");
+        let result = catalog.create_table(options_sorted).await;
         assert!(
-            matches!(err, CatalogError::ChangedConfiguration { .. }),
-            "Expected ChangedConfiguration, got: {err:?}"
+            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
+            "Expected ChangedConfiguration error, got: {result:?}"
         );
-
-        // Drop and recreate with new sort config
-        catalog
-            .drop_table("sorted_table")
-            .await
-            .expect("Failed to drop table");
-        let table_id_2 = catalog
-            .create_table(options_sorted)
-            .await
-            .expect("Failed to create table after drop and recreate");
-
-        assert_ne!(table_id_1, table_id_2);
-
-        // Verify new config
-        let metadata = catalog
-            .get_table("sorted_table")
-            .await
-            .expect("Failed to get table");
-        assert_eq!(metadata.vortex_config.sort_columns, vec!["ts".to_string()]);
 
         // Cleanup
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);

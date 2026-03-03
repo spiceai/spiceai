@@ -162,6 +162,7 @@ async fn test_shared_metastore_concurrent_inserts(backend: BackendType) -> TestR
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
     // Create first table
+    let ctx = SessionContext::new();
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
             Arc::clone(&catalog_arc),
@@ -174,6 +175,7 @@ async fn test_shared_metastore_concurrent_inserts(backend: BackendType) -> TestR
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -191,12 +193,12 @@ async fn test_shared_metastore_concurrent_inserts(backend: BackendType) -> TestR
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
 
     // Create a shared session context with both tables
-    let ctx = SessionContext::new();
     ctx.register_table("customer1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
     ctx.register_table("customer2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
@@ -265,6 +267,7 @@ async fn test_multiple_concurrent_inserts(backend: BackendType) -> TestResult<()
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
     // Create tables
+    let ctx = SessionContext::new();
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
             Arc::clone(&catalog_arc),
@@ -277,6 +280,7 @@ async fn test_multiple_concurrent_inserts(backend: BackendType) -> TestResult<()
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -293,11 +297,11 @@ async fn test_multiple_concurrent_inserts(backend: BackendType) -> TestResult<()
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
 
-    let ctx = SessionContext::new();
     ctx.register_table("orders1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
     ctx.register_table("orders2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
@@ -390,6 +394,10 @@ async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
     let schema = create_test_schema();
     let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
+    // Use SEPARATE session contexts (simulating separate accelerations)
+    let ctx1 = Arc::new(SessionContext::new());
+    let ctx2 = Arc::new(SessionContext::new());
+
     // Create two tables sharing the same catalog
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
@@ -403,6 +411,7 @@ async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx1.runtime_env(),
         )
         .await?,
     );
@@ -419,32 +428,34 @@ async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx2.runtime_env(),
         )
         .await?,
     );
 
-    // Use SEPARATE session contexts (simulating separate accelerations)
-    let ctx1 = SessionContext::new();
     ctx1.register_table("products1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
 
-    let ctx2 = SessionContext::new();
     ctx2.register_table("products2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
     let barrier = Arc::new(Barrier::new(2));
 
     let barrier1 = Arc::clone(&barrier);
+    let ctx1_clone = Arc::clone(&ctx1);
     let insert1 = tokio::spawn(async move {
         barrier1.wait().await;
-        ctx1.sql("INSERT INTO products1 VALUES (1, 'Widget', 1000), (2, 'Gadget', 2000)")
+        ctx1_clone
+            .sql("INSERT INTO products1 VALUES (1, 'Widget', 1000), (2, 'Gadget', 2000)")
             .await?
             .collect()
             .await
     });
 
     let barrier2 = Arc::clone(&barrier);
+    let ctx2_clone = Arc::clone(&ctx2);
     let insert2 = tokio::spawn(async move {
         barrier2.wait().await;
-        ctx2.sql("INSERT INTO products2 VALUES (1, 'Sprocket', 3000), (2, 'Flange', 4000)")
+        ctx2_clone
+            .sql("INSERT INTO products2 VALUES (1, 'Sprocket', 3000), (2, 'Flange', 4000)")
             .await?
             .collect()
             .await
@@ -459,19 +470,15 @@ async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
         .expect("insert2 task panicked")
         .expect("insert2 failed - 'Database is busy' error should no longer occur");
 
-    // Verify data
-    let verify_ctx = SessionContext::new();
-    verify_ctx.register_table("products1", table1 as Arc<dyn TableProvider>)?;
-    verify_ctx.register_table("products2", table2 as Arc<dyn TableProvider>)?;
-
-    let batches1 = verify_ctx
+    // Verify data — reuse the same contexts (and RuntimeEnv) that created each table
+    let batches1 = ctx1
         .sql("SELECT * FROM products1 ORDER BY id")
         .await?
         .collect()
         .await?;
     assert_eq!(batches1[0].num_rows(), 2);
 
-    let batches2 = verify_ctx
+    let batches2 = ctx2
         .sql("SELECT * FROM products2 ORDER BY id")
         .await?
         .collect()
@@ -494,6 +501,9 @@ async fn test_separate_catalog_instances_same_db(backend: BackendType) -> TestRe
     let (_temp_dir, catalog1, catalog2, data_path) = create_separate_catalogs(backend).await?;
     let schema = create_test_schema();
 
+    let ctx1 = Arc::new(SessionContext::new());
+    let ctx2 = Arc::new(SessionContext::new());
+
     // Create table1 using catalog1
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
@@ -507,6 +517,7 @@ async fn test_separate_catalog_instances_same_db(backend: BackendType) -> TestRe
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx1.runtime_env(),
         )
         .await?,
     );
@@ -524,31 +535,34 @@ async fn test_separate_catalog_instances_same_db(backend: BackendType) -> TestRe
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx2.runtime_env(),
         )
         .await?,
     );
 
-    let ctx1 = SessionContext::new();
     ctx1.register_table("dataset1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
 
-    let ctx2 = SessionContext::new();
     ctx2.register_table("dataset2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
     let barrier = Arc::new(Barrier::new(2));
 
     let barrier1 = Arc::clone(&barrier);
+    let ctx1_clone = Arc::clone(&ctx1);
     let insert1 = tokio::spawn(async move {
         barrier1.wait().await;
-        ctx1.sql("INSERT INTO dataset1 VALUES (1, 'Row1', 100), (2, 'Row2', 200)")
+        ctx1_clone
+            .sql("INSERT INTO dataset1 VALUES (1, 'Row1', 100), (2, 'Row2', 200)")
             .await?
             .collect()
             .await
     });
 
     let barrier2 = Arc::clone(&barrier);
+    let ctx2_clone = Arc::clone(&ctx2);
     let insert2 = tokio::spawn(async move {
         barrier2.wait().await;
-        ctx2.sql("INSERT INTO dataset2 VALUES (1, 'Row1', 300), (2, 'Row2', 400)")
+        ctx2_clone
+            .sql("INSERT INTO dataset2 VALUES (1, 'Row1', 300), (2, 'Row2', 400)")
             .await?
             .collect()
             .await
@@ -563,19 +577,15 @@ async fn test_separate_catalog_instances_same_db(backend: BackendType) -> TestRe
         "insert2 failed - concurrent write to shared metastore should succeed without SQLITE_BUSY",
     );
 
-    // Verify data
-    let verify_ctx = SessionContext::new();
-    verify_ctx.register_table("dataset1", table1 as Arc<dyn TableProvider>)?;
-    verify_ctx.register_table("dataset2", table2 as Arc<dyn TableProvider>)?;
-
-    let batches1 = verify_ctx
+    // Verify data — reuse the same contexts (and RuntimeEnv) that created each table
+    let batches1 = ctx1
         .sql("SELECT * FROM dataset1 ORDER BY id")
         .await?
         .collect()
         .await?;
     assert_eq!(batches1[0].num_rows(), 2);
 
-    let batches2 = verify_ctx
+    let batches2 = ctx2
         .sql("SELECT * FROM dataset2 ORDER BY id")
         .await?
         .collect()
@@ -597,6 +607,7 @@ async fn test_separate_catalogs_stress(backend: BackendType) -> TestResult<()> {
     let schema = create_test_schema();
 
     // Create tables with separate catalogs
+    let ctx = SessionContext::new();
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
             Arc::clone(&catalog1) as Arc<dyn MetadataCatalog>,
@@ -609,6 +620,7 @@ async fn test_separate_catalogs_stress(backend: BackendType) -> TestResult<()> {
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -625,11 +637,11 @@ async fn test_separate_catalogs_stress(backend: BackendType) -> TestResult<()> {
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
 
-    let ctx = SessionContext::new();
     ctx.register_table("stress1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
     ctx.register_table("stress2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
@@ -724,6 +736,7 @@ async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> 
     let schema = create_test_schema();
 
     // Create tables
+    let ctx = SessionContext::new();
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
             Arc::clone(&catalog1) as Arc<dyn MetadataCatalog>,
@@ -736,6 +749,7 @@ async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> 
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -752,11 +766,11 @@ async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> 
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
 
-    let ctx = SessionContext::new();
     ctx.register_table("highconc1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
     ctx.register_table("highconc2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
@@ -875,6 +889,7 @@ async fn test_concurrent_overwrite_operations(backend: BackendType) -> TestResul
     let schema = create_test_schema();
 
     // Create tables
+    let ctx = SessionContext::new();
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
             Arc::clone(&catalog1) as Arc<dyn MetadataCatalog>,
@@ -887,6 +902,7 @@ async fn test_concurrent_overwrite_operations(backend: BackendType) -> TestResul
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -903,12 +919,12 @@ async fn test_concurrent_overwrite_operations(backend: BackendType) -> TestResul
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
 
     // Insert initial data
-    let ctx = SessionContext::new();
     ctx.register_table("overwrite1", Arc::clone(&table1) as Arc<dyn TableProvider>)?;
     ctx.register_table("overwrite2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
@@ -999,6 +1015,7 @@ async fn test_multiple_concurrent_overwrites(backend: BackendType) -> TestResult
     let schema = create_test_schema();
 
     // Create tables
+    let ctx = SessionContext::new();
     let table1 = Arc::new(
         CayenneTableProvider::create_table(
             Arc::clone(&catalog1) as Arc<dyn MetadataCatalog>,
@@ -1011,6 +1028,7 @@ async fn test_multiple_concurrent_overwrites(backend: BackendType) -> TestResult
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -1027,11 +1045,11 @@ async fn test_multiple_concurrent_overwrites(backend: BackendType) -> TestResult
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "multi_overwrite1",
         Arc::clone(&table1) as Arc<dyn TableProvider>,

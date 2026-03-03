@@ -39,7 +39,7 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
     fn get_partitions(
         &self,
         table: &TableReference,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)>;
 
     /// Whether partitioning should be applied to the given table.
@@ -104,7 +104,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 
             let providers = self
                 .partition_provider
-                .get_partitions(&scan.table_name, scan.source.schema());
+                .get_partitions(&scan.table_name, &scan.source.schema());
 
             tracing::debug!(
                 "PartitionedTableScanRewrite: {} partitions for '{}' table.",

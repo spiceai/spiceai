@@ -100,7 +100,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Spice.ai Cloud Platform](https://github.com/spiceai/cookbook/blob/trunk/spiceai/README.md)
      - [ ] [Debezium CDC (plain & SASL/SCRAM)](https://github.com/spiceai/cookbook/blob/trunk/cdc-debezium/README.md)
      - [ ] [IMAP](https://github.com/spiceai/cookbook/blob/trunk/imap/README.md)
-     - [ ] Update connector status per [Connector RC Criteria](/docs/criteria/connectors/rc.md).
+     - [ ] Update connector status per [Connector RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/connectors/rc.md).
 
    - **Data Accelerators**
      - [ ] [DuckDB Accelerator](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
@@ -108,7 +108,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
      - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
-     - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
+     - [ ] Update accelerator status per [Accelerator RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
      - [ ] [Databricks Unity Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/databricks/README.md)

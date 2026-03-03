@@ -26,7 +26,6 @@ use crate::cluster::partition::metadata::PartitionValue;
 
 use super::metadata::{PartitionMetadata, TablePartitionMetadata};
 
-#[expect(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
@@ -36,10 +35,13 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to get current time: {source}"))]
-    TimeError { source: std::time::SystemTimeError },
+    SystemTime { source: std::time::SystemTimeError },
 
     #[snafu(display("Partition {partition} not found in table {table}"))]
     PartitionNotFound { table: String, partition: String },
+
+    #[snafu(display("No partition metadata found for table {table}"))]
+    TableMetadataNotFound { table: String },
 
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
@@ -53,6 +55,7 @@ static PARTITION_PREFIX: &str = "accelerations/partitions/";
 ///
 /// Uses optimistic concurrency control to safely coordinate partition assignments
 /// across multiple schedulers without locks.
+#[derive(Debug)]
 pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
 }
@@ -152,13 +155,10 @@ impl PartitionManager {
 
         loop {
             let now_ms = now_ms()?;
-            let mut metadata =
-                self.get_table_metadata(table)
-                    .await?
-                    .ok_or_else(|| Error::PartitionNotFound {
-                        table: key.clone(),
-                        partition: "any".to_string(),
-                    })?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut allocated: Vec<_> = metadata
                 .partitions
@@ -219,13 +219,10 @@ impl PartitionManager {
 
         loop {
             let now_ms = now_ms()?;
-            let mut metadata =
-                self.get_table_metadata(table)
-                    .await?
-                    .ok_or_else(|| Error::PartitionNotFound {
-                        table: key.clone(),
-                        partition: "any".to_string(),
-                    })?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut updated = false;
             for partition in &mut metadata.partitions {
@@ -299,5 +296,5 @@ fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
-        .map_err(|source| Error::TimeError { source })
+        .context(SystemTimeSnafu)
 }

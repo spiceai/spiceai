@@ -48,6 +48,7 @@ use datafusion::{
 use pruning::prune_partition;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use util::format_datafusion_error;
 
 use crate::{
     Partition,
@@ -67,7 +68,10 @@ pub enum Error {
     CreatingPartition { source: super::creator::Error },
     #[snafu(display("Validating expressions failed: {source}"))]
     ValidatingExpressions { source: super::expression::Error },
-    #[snafu(display("Failed to convert schema to DFSchema: {source}"))]
+    #[snafu(display(
+        "Failed to convert schema to DFSchema: {}",
+        format_datafusion_error(source)
+    ))]
     SchemaConversion { source: DataFusionError },
     #[snafu(display("Expected array from partition expression, got scalar"))]
     InvalidPartitionExpression,
@@ -185,6 +189,19 @@ impl PartitionTableProvider {
     pub fn with_insert_strategy(mut self, insert_strategy: Arc<dyn InsertStrategy>) -> Self {
         self.insert_strategy = insert_strategy;
         self
+    }
+
+    /// Returns the table providers for all current partitions.
+    ///
+    /// Callers can use this to apply per-partition operations (e.g., index maintenance)
+    /// that are not part of the standard `TableProvider` interface.
+    pub async fn partition_table_providers(&self) -> Vec<Arc<dyn TableProvider>> {
+        self.partitions
+            .read()
+            .await
+            .values()
+            .map(|p| Arc::clone(&p.table_provider))
+            .collect()
     }
 
     /// Collects all partition column references from all partition expressions.
