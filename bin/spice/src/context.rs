@@ -284,16 +284,19 @@ impl RuntimeContext {
         cmd.args(args);
 
         // Add HTTP endpoint (use override if provided, otherwise use context default)
-        cmd.arg("--http");
-        let http_addr = http_endpoint_override.map_or_else(
-            || self.http_socket_address(),
-            |ep| {
-                ep.trim_start_matches("http://")
-                    .trim_start_matches("https://")
-                    .to_string()
-            },
-        );
-        cmd.arg(http_addr);
+        // Skip if --http is already present in the trailing args
+        if !args.iter().any(|a| a == "--http") {
+            cmd.arg("--http");
+            let http_addr = http_endpoint_override.map_or_else(
+                || self.http_socket_address(),
+                |ep| {
+                    ep.trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .to_string()
+                },
+            );
+            cmd.arg(http_addr);
+        }
 
         // Add API key if present
         if let Some(api_key) = &self.api_key {
