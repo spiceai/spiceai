@@ -433,9 +433,10 @@ async fn post_setup_sink_action(
 
                 if attempts >= 3 {
                     let status = response.status();
-                    let body = response.text().await.unwrap_or_else(|e| {
-                        format!("<failed to read error response body: {e}>")
-                    });
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read error response body: {e}>"));
                     return Err(anyhow::anyhow!(
                         "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
                     ));
