@@ -489,15 +489,18 @@ mod version_tests {
     /// All supported version strings parse to the correct enum variant.
     #[test]
     fn test_version_enum_deserialization() {
-        let v1beta1: SpicepodVersion =
-            yaml::from_str("v1beta1").expect("Should parse v1beta1");
-        assert_eq!(v1beta1, SpicepodVersion::V1Beta1);
-
         let v1: SpicepodVersion = yaml::from_str("v1").expect("Should parse v1");
         assert_eq!(v1, SpicepodVersion::V1);
 
         let v2: SpicepodVersion = yaml::from_str("v2").expect("Should parse v2");
         assert_eq!(v2, SpicepodVersion::V2);
+    }
+
+    /// v1beta1 is no longer a valid version.
+    #[test]
+    fn test_v1beta1_rejected() {
+        let result: Result<SpicepodVersion, _> = yaml::from_str("v1beta1");
+        assert!(result.is_err(), "v1beta1 should no longer be accepted");
     }
 
     /// Version strings serialize to the expected lowercase YAML values.
@@ -1025,16 +1028,7 @@ mod version_tests {
         assert_eq!(original, roundtripped);
     }
 
-    /// A v1beta1 `SpicepodVersion` roundtrips through YAML.
-    #[test]
-    fn test_v1beta1_version_roundtrip() {
-        let original = SpicepodVersion::V1Beta1;
-        let yaml_str = yaml::to_string(&original)
-            .expect("Should serialize SpicepodVersion::V1Beta1");
-        let roundtripped: SpicepodVersion =
-            yaml::from_str(&yaml_str).expect("Should deserialize back to V1Beta1");
-        assert_eq!(original, roundtripped);
-    }
+
 
     // ========================================================================
     // All v1 test fixtures still load (regression guard)

@@ -468,7 +468,6 @@
     "SpicepodVersion": {
       "type": "string",
       "enum": [
-        "v1beta1",
         "v1",
         "v2"
       ]
