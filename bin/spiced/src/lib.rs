@@ -415,7 +415,7 @@ pub async fn run(args: Args) -> Result<()> {
                     return Err(Error::InvalidClusterConfig {
                         source: std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            "Scheduler mode requires `runtime.scheduler.state_location` to be configured in the spicepod. See: https://spiceai.org/docs/features/distributed",
+                            "Scheduler mode requires `runtime.scheduler.state_location` to be configured in the spicepod. See: https://spiceai.org/docs/features/distributed-query",
                         ),
                     });
                 }
