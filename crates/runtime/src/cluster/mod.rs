@@ -44,7 +44,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -119,8 +119,9 @@ impl DistributedNode {
     }
 }
 
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+type SchedulerEndpointOverride = Arc<
+    dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+>;
 
 struct SchedulerPollHandle {
     cancel: CancellationToken,
@@ -183,8 +184,10 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint = match create_grpc_client_endpoint(endpoint_url.clone())
-                    {
+                    let scheduler_endpoint = match create_grpc_client_endpoint(
+                        endpoint_url.clone(),
+                        Some(&GrpcClientConfig::default()),
+                    ) {
                         Ok(endpoint) => endpoint,
                         Err(err) => {
                             tracing::warn!(
@@ -1396,9 +1399,13 @@ async fn create_scheduler_server(
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
-    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
-        .clone()
-        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
+        client_tls_config.clone().map(|tls_config| {
+            Arc::new(move |ep: Endpoint| {
+                ep.tls_config(tls_config.clone())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }) as _
+        });
 
     // Convert shuffle_format param to ballista ShuffleFormat
     #[cfg(feature = "vortex")]
@@ -1617,6 +1624,10 @@ async fn create_scheduler_server(
 
         // Faster failure detection: 30s timeout with 10s heartbeat interval
         executor_timeout_seconds: 30,
+
+        // The Spice executor uses pull-based polling (execution_loop::poll_loop),
+        // so the scheduler must use PullStaged to register executors via PollWork RPCs.
+        scheduling_policy: ballista_core::config::TaskSchedulingPolicy::PullStaged,
         ..Default::default()
     };
 
