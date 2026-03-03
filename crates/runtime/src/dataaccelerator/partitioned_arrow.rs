@@ -153,15 +153,10 @@ impl DataAccelerator for PartitionedArrowAccelerator {
                 msg: "PartitionedArrow accelerator requires non-empty `partition_by`".to_string()
             }
         );
-
-        let table_provider = Arc::new(
-            PartitionTableProvider::new(
-                Arc::new(ArrowPartitionCreator::new(cmd, partition_by.clone())),
-                partition_by,
-                Arc::new(cmd.schema.as_arrow().clone()),
-            )
-            .await?,
-        );
+        let schema = Arc::new(cmd.schema.as_arrow().clone());
+        let creator = Arc::new(ArrowPartitionCreator::new(cmd, partition_by.clone()));
+        let table_provider =
+            Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
         Ok(table_provider as Arc<dyn TableProvider>)
     }
