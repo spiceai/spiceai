@@ -1,0 +1,566 @@
+In `crates/runtime/tests/cluster/distributed_acceleration.rs`, extend `test_distributed_acceleration_with_bucket_partitioning` to multiple executors. Also, snapshot both the SQL result, but also the explain plan `EXPLAIN <sql>`. To fix the concurrency issue on filesystems, you can use 
+
+ParameterSpec::component("cayenne_data_dir")
+        .description("Local directory for table data files. Defaults to spice data directory."),
+    ParameterSpec::component("cayenne_metadata_dir").description(
+        "Local directory for Cayenne SQLite metadata. Defaults to spice data directory.",
+    )
+
+---
+
+[Request interrupted by user]
+
+---
+
+okay, keep going i cleaned up disk
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+<task-notification>
+<task-id>bnlatzdpp</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-jeadie-Github-spiceai/tasks/bnlatzdpp.output</output-file>
+<status>killed</status>
+<summary>Background command "cargo check -p runtime --features "duckdb,sqlite,vortex,postgres,flightsql,kafka,dynamodb" 2>&1 | grep -E "^error|warning\[" | head -20" was stopped</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-jeadie-Github-spiceai/tasks/bnlatzdpp.output
+
+---
+
+[Request interrupted by user]
+
+---
+
+Okay, will i compile check it, start contemplating how we can simplify the logic of setting up and connecting executor and scheduler nodes. We want to add more tests, but make it easy and an exceptional DX for engineers
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically to capture all technical details.
+
+1. **Initial Request**: User asked to extend `test_distributed_acceleration_with_bucket_partitioning` in `crates/runtime/tests/cluster/distributed_acceleration.rs` to:
+   - Use multiple executors
+   - Snapshot both SQL results AND explain plans (`EXPLAIN <sql>`)
+   - Fix filesystem concurrency issues using `cayenne_data_dir` and `cayenne_metadata_dir` ParameterSpecs
+
+2. **Code Investigation**: I read several files to understand the architecture:
+   - The existing test file (`distributed_acceleration.rs`)
+   - The `simple.rs` cluster test (for EXPLAIN snapshot pattern)
+   - The Cayenne accelerator (`crates/runtime/src/dataaccelerator/cayenne/mod.rs`)
+   - The catalog connector (`crates/runtime/src/catalogconnector/cayenne/mod.rs`) - showed `cayenne_data_dir` and `cayenne_metadata_dir` ParameterSpecs
+   - `spice_data_base_path()` function in `lib.rs`
+   - `cluster/mod.rs` for executor bind flow
+   - SQLite concurrency test (`shared_metastore_concurrency_test.rs`) - confirmed WAL + busy timeout fix
+
+3. **Key Technical Finding**: 
+   - `cayenne_data_dir` exists in catalog connector but NOT in the accelerator PARAMETERS
+   - The accelerator uses `cayenne_file_path` for custom paths (with `/{dataset_name}/` appended)
+   - SQLite WAL mode + busy timeout was already fixed for concurrent access
+   - Each executor receives the same dataset definition from the scheduler
+
+4. **Changes to `crates/runtime/src/dataaccelerator/cayenne/mod.rs`**:
+   - Added `cayenne_data_dir` to PARAMETERS (count changed from 11 to 12)
+   - In `cayenne_data_dir()` method: added check for `cayenne_data_dir` param BEFORE `cayenne_file_path`
+   - In `resolve_metadata_dir()`: added fallback from `cayenne_data_dir` when `cayenne_metadata_dir` is not set
+
+5. **First version of distributed_acceleration.rs**: Added executor2, EXPLAIN snapshots, used `cayenne_data_dir` instead of `cayenne_file_path`
+
+6. **Disk space issue**: User ran out of disk space, cleaned it up
+
+7. **Second request from user**: "Okay, keep going I cleaned up disk" - ALSO "start contemplating how we can simplify the logic of setting up and connecting executor and scheduler nodes. We want to add more tests, but make it easy and an exceptional DX for engineers"
+
+8. **Harness Design and Implementation**: 
+   - Created `crates/runtime/tests/cluster/harness.rs` - a `ClusterHarness` builder
+   - Key features: dynamic port allocation (bind to port 0), single PKI setup, automatic cert creation per node, background server thread management, `wait_for_executors()`, `query()`, `explain()`, `executor_data_dir()`, `shutdown()` 
+   - Added `pub mod harness;` to `cluster/mod.rs`
+   - Rewrote `distributed_acceleration.rs` to use the harness
+
+9. **Current state**: The harness is implemented and distributed_acceleration.rs is rewritten to use it. The test body is much simpler. However, there's an architectural issue noted in the code comments: executor apps come from the scheduler (`get_app_definition`), so per-executor `cayenne_data_dir` overrides need to be in the executor app - but the harness currently uses empty executor apps. The comment in the test acknowledges this and relies on SQLite WAL mode for concurrency safety.
+
+10. **Compile check interrupted**: User interrupted the cargo check command.
+
+Let me be thorough about what files were changed and their current state.
+
+Summary:
+1. Primary Request and Intent:
+   - **Primary task**: Extend `test_distributed_acceleration_with_bucket_partitioning` in `crates/runtime/tests/cluster/distributed_acceleration.rs` to use multiple executors (not just 1), snapshot both SQL query results AND `EXPLAIN <sql>` plans, and fix the filesystem concurrency issue using `ParameterSpec::component("cayenne_data_dir")` / `ParameterSpec::component("cayenne_metadata_dir")` as the fix mechanism.
+   - **Secondary task** (added mid-conversation): Design and implement a `ClusterHarness` test helper to dramatically reduce boilerplate when writing cluster integration tests, providing exceptional DX for engineers adding new tests.
+
+2. Key Technical Concepts:
+   - **Spice distributed cluster architecture**: Scheduler (coordinator) + N Executor (worker) nodes connected via mTLS gRPC
+   - **Cayenne accelerator**: File-mode columnar storage (Vortex files + SQLite metadata catalog). Parameters `cayenne_file_path` (existing), `cayenne_data_dir` (new), `cayenne_metadata_dir`
+   - **SQLite WAL mode + busy timeout**: Already implemented fix for concurrent catalog initialization — allows multiple executors to safely share the same metadata dir
+   - **`executor_bind_app`**: Executors receive their dataset definition from the scheduler via `get_app_definition` gRPC — the executor's local app is replaced by the scheduler's app
+   - **`spice_data_base_path()`**: Global function using `std::env::current_dir()` — not per-runtime configurable
+   - **Insta snapshots**: Used for SQL result and EXPLAIN plan verification
+   - **Dynamic port allocation**: `TcpListener::bind("127.0.0.1:0")` to get OS-assigned free ports, avoiding inter-test collisions
+   - **ParameterSpec**: Framework for documenting/validating accelerator/connector parameters
+
+3. Files and Code Sections:
+
+   - **`crates/runtime/src/dataaccelerator/cayenne/mod.rs`** — Added `cayenne_data_dir` as a recognized accelerator parameter
+     - Changed PARAMETERS count from 11 to 12, added `ParameterSpec::component("data_dir")`
+     - In `cayenne_data_dir()`: check `cayenne_data_dir` param BEFORE `cayenne_file_path`
+     - In `resolve_metadata_dir()`: added fallback from `cayenne_data_dir` base when `cayenne_metadata_dir` not set
+     ```rust
+     // PARAMETERS const — changed from 11 to 12:
+     const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+         ParameterSpec,
+         S3_PARAMS_LEN,
+         12,
+         { S3_PARAMS_LEN + 12 },
+     >(
+         S3_PARAMETERS,
+         [
+             ParameterSpec::component("file_path")...,
+             ParameterSpec::component("data_dir")
+                 .description("Local directory for table data files. Defaults to spice data directory. Takes precedence over 'cayenne_file_path' when both are specified."),
+             ParameterSpec::component("metadata_dir")...,
+             // ...11 more entries
+         ],
+     );
+
+     // cayenne_data_dir() — new check added FIRST:
+     if let Some(data_dir) = acceleration_params.get("cayenne_data_dir") {
+         return Self::resolve_custom_data_path(&dataset_name, data_dir);
+     }
+     if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
+         return Self::resolve_custom_data_path(&dataset_name, custom_path);
+     }
+
+     // resolve_metadata_dir() — new priority level added:
+     if let Some(data_dir) = accel.params.get("cayenne_data_dir")
+         && is_local_path(data_dir)
+     {
+         let base = data_dir.trim_end_matches('/');
+         return format!("{base}/metadata");
+     }
+     ```
+
+   - **`crates/runtime/tests/cluster/harness.rs`** (NEW FILE) — `ClusterHarness` test infrastructure
+     - `NodePorts::allocate()`: binds 3 ports to port 0, reads assigned ports, drops listeners
+     - `ClusterHarnessBuilder`: fluent API — `.scheduler(app)`, `.executor()`, `.executor_with_app(app)`, `.executors(n)`, `.start().await`
+     - `ClusterHarness`: holds scheduler + executor runtimes, handles, executor_manager
+     - Methods: `wait_for_executors(timeout)`, `wait_for_no_executors(timeout)`, `query(sql)`, `explain(sql)`, `executor_data_dir(i)`, `shutdown().await`
+     - `Drop` impl aborts all server handles automatically
+     ```rust
+     pub struct ClusterHarness {
+         pub tempdir: Arc<TempDir>,
+         pub scheduler: Arc<Runtime>,
+         pub executors: Vec<Arc<Runtime>>,
+         handles: Vec<JoinHandle<RuntimeResult<()>>>,
+         executor_manager: ExecutorManager,
+     }
+     impl ClusterHarnessBuilder {
+         pub fn scheduler(mut self, app: App) -> Self { ... }
+         pub fn executor(mut self) -> Self { ... }
+         pub fn executor_with_app(mut self, app: App) -> Self { ... }
+         pub fn executors(mut self, n: usize) -> Self { ... }
+         pub async fn start(self) -> Result<ClusterHarness, anyhow::Error> { ... }
+     }
+     impl ClusterHarness {
+         pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error>
+         pub async fn explain(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error>
+         pub fn executor_data_dir(&self, i: usize) -> PathBuf
+         pub async fn wait_for_executors(&self, timeout: Duration) -> Result<()>
+         pub async fn shutdown(mut self)
+     }
+     ```
+
+   - **`crates/runtime/tests/cluster/mod.rs`** — Added `pub mod harness;`
+     ```rust
+     pub mod harness;
+     mod cancel_tasks;
+     mod distributed_acceleration;
+     mod in_memory_shuffle;
+     mod job_store;
+     mod simple;
+     ```
+
+   - **`crates/runtime/tests/cluster/distributed_acceleration.rs`** (REWRITTEN) — Now uses `ClusterHarness`
+     - Test body uses `ClusterHarness::builder().scheduler(app).executors(2).start().await`
+     - Adds EXPLAIN snapshots for both queries: `distributed_accel_explain_select_all`, `distributed_accel_explain_aggregation`
+     - Uses `cayenne_data_dir` and `cayenne_metadata_dir` instead of `cayenne_file_path`
+     - `make_accelerated_dataset` updated to use `cayenne_data_dir`/`cayenne_metadata_dir`
+     - Key note: executor apps are currently empty (receive dataset from scheduler); comments explain WAL-mode concurrency safety
+     ```rust
+     fn make_accelerated_dataset(..., data_dir: &std::path::Path) -> Dataset {
+         params: Some(spicepod::param::Params::from_string_map(
+             std::collections::HashMap::from([
+                 ("cayenne_data_dir".to_string(), data_dir.join("data").to_string_lossy().to_string()),
+                 ("cayenne_metadata_dir".to_string(), data_dir.join("metadata").to_string_lossy().to_string()),
+             ]),
+         )),
+     }
+     // Test body:
+     let harness = ClusterHarness::builder()
+         .scheduler(scheduler_app)
+         .executors(2)
+         .start().await?;
+     harness.wait_for_executors(Duration::from_secs(15)).await?;
+     sleep(Duration::from_secs(5)).await;
+     let plan = harness.explain(select_all_sql).await?;
+     insta::assert_snapshot!("distributed_accel_explain_select_all", ...);
+     let rows = harness.query(select_all_sql).await?;
+     insta::assert_snapshot!("distributed_accel_select_all", ...);
+     harness.shutdown().await;
+     ```
+
+4. Errors and fixes:
+   - **ENOSPC (no space left on device)**: First `Edit` attempt on `cayenne/mod.rs` failed with disk full error. User cleared disk space. Continued afterward.
+   - **Background cargo check killed**: `cargo check` was spawned as background task, then user interrupted and killed it before results were read. No compile errors were confirmed.
+   - **Architectural tension — per-executor data dirs**: Long analysis of how to give each executor its own data/metadata dir when all executors receive the same dataset definition from the scheduler. Resolution: rely on SQLite WAL mode (already fixed via `shared_metastore_concurrency_test.rs` busy-timeout fix) rather than per-executor paths, since partitions go to separate subdirectories.
+
+5. Problem Solving:
+   - **`cayenne_data_dir` not recognized by accelerator**: Fixed by adding it to PARAMETERS and checking it in `cayenne_data_dir()` method before `cayenne_file_path`.
+   - **Multi-executor filesystem concurrency**: Analyzed `CayenneCatalog::create_table` — it reads existing table before inserting, and SQLite WAL serializes concurrent writes. Decided shared dirs are safe given the busy-timeout fix already in place.
+   - **Per-executor data dir injection**: Architecturally, executors receive the scheduler's app definition via `executor_bind_app` which replaces the local app. There is no merge mechanism. For the test, the harness uses empty executor apps and relies on WAL-mode SQLite safety.
+   - **Port collision in tests**: Solved in harness by allocating ports via `TcpListener::bind("127.0.0.1:0")` instead of hardcoded port numbers.
+   - **Duplicated boilerplate**: `wait_for_executor_count`, PKI setup, Config construction, Runtime builder, server spawning — all extracted into `ClusterHarness`.
+
+6. All user messages:
+   - "In `crates/runtime/tests/cluster/distributed_acceleration.rs`, extend `test_distributed_acceleration_with_bucket_partitioning` to multiple executors. Also, snapshot both the SQL result, but also the explain plan `EXPLAIN <sql>`. To fix the concurrency issue on filesystems, you can use `ParameterSpec::component("cayenne_data_dir").description("Local directory for table data files. Defaults to spice data directory."), ParameterSpec::component("cayenne_metadata_dir").description("Local directory for Cayenne SQLite metadata. Defaults to spice data directory.")`"
+   - "[Request interrupted by user] okay, keep going i cleaned up disk"
+   - "[Request interrupted by user for tool use] Okay, will i compile check it, start contemplating how we can simplify the logic of setting up and connecting executor and scheduler nodes. We want to add more tests, but make it easy and an exceptional DX for engineers"
+
+7. Pending Tasks:
+   - **Compile verification**: The `cargo check` was killed before completing. The changes to `cayenne/mod.rs` (PARAMETERS count change from 11→12, new `cayenne_data_dir` logic) and the new `harness.rs` need to be verified to compile cleanly.
+   - **Insta snapshot files**: The new snapshot names (`distributed_accel_explain_select_all`, `distributed_accel_explain_aggregation`) need to be generated by running the test with `INSTA_UPDATE=new` or `cargo insta review`.
+   - **Remaining cluster tests migration**: `simple.rs`, `in_memory_shuffle.rs`, `cancel_tasks.rs` could be migrated to use the new `ClusterHarness` for consistency.
+   - **Test correctness**: The `distributed_acceleration.rs` rewrite has a logical issue: `make_accelerated_dataset` is called with a placeholder path (`/tmp/scheduler_placeholder`) for the scheduler app, but the executors receive this definition and will try to use that path. This needs to be resolved — either pass real paths or remove the path params so executors use defaults.
+
+8. Current Work:
+   Immediately before the summary request, I had just written two files:
+   1. `crates/runtime/tests/cluster/harness.rs` — the full `ClusterHarness` implementation with dynamic port allocation, PKI setup, builder pattern, query/explain helpers
+   2. Rewrote `crates/runtime/tests/cluster/distributed_acceleration.rs` to use the harness
+
+   The user's last message was: "Okay, will i compile check it, start contemplating how we can simplify the logic of setting up and connecting executor and scheduler nodes. We want to add more tests, but make it easy and an exceptional DX for engineers" — indicating approval of compile checking and requesting the harness design/implementation, which I delivered.
+
+9. Optional Next Step:
+   The next step directly in line with the most recent work is to verify compilation. The user said "will i compile check it" and a `cargo check` was spawned but killed. Now that the harness and test are written, we should run:
+   ```
+   cargo check -p runtime
+   ```
+   to confirm the new `harness.rs` and updated `distributed_acceleration.rs` compile cleanly, fix any type errors (e.g., imports, missing `use` statements in `harness.rs`), and address the placeholder path issue in `distributed_acceleration.rs` where `/tmp/scheduler_placeholder` is passed to `make_accelerated_dataset` for the scheduler app that gets propagated to executors.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/jeadie/.claude/projects/-Users-jeadie-Github-spiceai/ffaebec9-a81e-468e-8f98-fcf757a45e60.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Run `make lint-rust-fix PACKAGES="runtime" FEATURES="aws-secrets-manager,keyring-secret-store,models,odbc,mcp"`
+
+---
+
+WHy the changes to `crates/runtime/src/dataaccelerator/cayenne/mod.rs`
+
+---
+
+Can't i just use `cayenne_file_path` and `cayenne_metadata_dir`. Then run each executor at a different base path. Then they will be constructed at <executor_base_path>/cayenne_file_path and equivalent
+
+---
+
+[Request interrupted by user]
+
+---
+
+No they can all share the same cayenne_metadata_dir and cayenne_file_path as long as `executor_base_path` make them unique
+
+---
+
+hmmm i see base_dir is going to be shared for each executor, because we start the server in the same integration test. in practice, we can start executor nodes in different $cwd
+
+---
+
+yeah okay, we could add the implementation of `cayenne_data_dir`, its already there. But we can't change Config from crates/runtime/src/config.rs. Although cayenne_data_dir doesn't really solve our problem?
+
+---
+
+It's not possible to have a thread think its in a different directory
+
+---
+
+Why might the tests, as they are now, return no rows? Here are some logs
+
+2026-03-03T22:14:59.898275Z  INFO runtime::cluster: Cluster mTLS configured with CA CN=Spice.ai Test CA - DO NOT USE IN PRODUCTION, OU=test-framework and node certificate CN scheduler
+2026-03-03T22:14:59.913697Z  INFO runtime::init::caching: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+2026-03-03T22:14:59.914793Z  INFO runtime::init::caching: Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-03-03T22:14:59.915116Z  INFO runtime::init::caching: Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-03-03T22:14:59.915375Z DEBUG runtime::resource_monitor: Using system memory limit: 68719476736 bytes
+2026-03-03T22:14:59.917494Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_region
+2026-03-03T22:14:59.917510Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_endpoint
+2026-03-03T22:14:59.917519Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_key
+2026-03-03T22:14:59.917526Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_secret
+2026-03-03T22:14:59.917532Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_session_token
+2026-03-03T22:14:59.917539Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_auth
+2026-03-03T22:15:00.217112Z DEBUG runtime::datafusion::builder: No memory limit specified, defaulting to 70% of total memory: 44.80 GiB
+2026-03-03T22:15:00.222743Z  INFO runtime::cluster: Starting Ballista scheduler on 127.0.0.1:55913 (shuffle_format=arrow_ipc, shuffle_location=disk (temp_directory))
+2026-03-03T22:15:00.222850Z  INFO ballista_scheduler::scheduler_process: Starting Scheduler grpc server with task scheduling policy of PullStaged
+2026-03-03T22:15:00.223251Z  INFO ballista_scheduler::scheduler_server::query_stage_scheduler: Starting QueryStageScheduler
+2026-03-03T22:15:00.224489Z  INFO runtime::init::task_history: Task history enabled: retention_period=28800s, retention_check_interval=900s
+2026-03-03T22:15:00.224783Z DEBUG runtime::task_history: Task history retention period: 28800 seconds
+2026-03-03T22:15:00.224798Z DEBUG runtime::task_history: Task history retention check interval: 900 seconds
+2026-03-03T22:15:00.225542Z  INFO ballista_core::event_loop: Starting the event loop query_stage
+2026-03-03T22:15:00.227648Z  INFO runtime::cluster::partition::startup: Initializing partition metadata for accelerated tables table_count=1
+2026-03-03T22:15:00.232289Z  INFO runtime::cluster::servers: Cluster mTLS enabled for internal cluster server
+2026-03-03T22:15:00.232514Z DEBUG runtime::dataaccelerator: Adding on_conflict to options: upsert:span_id
+2026-03-03T22:15:00.233192Z  INFO runtime::init::dataset: Dataset test_data initializing...
+2026-03-03T22:15:00.233807Z  INFO runtime::cluster::servers: Spice Runtime internal cluster server listening on 127.0.0.1:55913
+2026-03-03T22:15:00.236999Z DEBUG runtime::dataconnector::listing::connector: Detecting the most recently modified object for the path: file:REDACTED.tmpBDyG8z/test_data.csv
+2026-03-03T22:15:00.237188Z DEBUG runtime::accelerated_table::refresh: startup_next_refresh called with mode: Full, check_interval: None
+2026-03-03T22:15:00.238066Z DEBUG runtime::init::task_history: Registering federated task_history table with scheduler_id=127.0.0.1:55913
+2026-03-03T22:15:00.238124Z DEBUG runtime::dataconnector::listing::connector: Dataset 'test_data' schema will be resolved based on file:REDACTED.tmpBDyG8z/test_data.csv
+2026-03-03T22:15:00.239482Z DEBUG runtime::accelerated_table::refresh: Starting scheduled refresh
+2026-03-03T22:15:00.240300Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::refresh_task: Loading data for dataset runtime.task_history
+2026-03-03T22:15:00.243285Z DEBUG runtime::accelerated_table::retention: [retention] Expr: BinaryExpr(BinaryExpr { left: Column(Column { relation: None, name: "start_time" }), op: Lt, right: Literal(TimestampNanosecond(1772547300239882000, Some("UTC")), None) })
+2026-03-03T22:15:00.254226Z  INFO acceleration_refresh{input=runtime.task_history}: task_history: labels sql=SELECT trace_id, span_id, parent_span_id, "task", "input", captured_output, start_time, end_time, execution_duration_ms, error_message, labels, scheduler_id FROM runtime.task_history
+2026-03-03T22:15:00.257113Z DEBUG runtime_parameters: Attempting to autoload secret for accelerator cayenne: cayenne_s3_key
+2026-03-03T22:15:00.257148Z DEBUG runtime_parameters: Attempting to autoload secret for accelerator cayenne: cayenne_s3_secret
+2026-03-03T22:15:00.257157Z DEBUG runtime_parameters: Attempting to autoload secret for accelerator cayenne: cayenne_s3_session_token
+2026-03-03T22:15:00.258885Z DEBUG runtime::dataaccelerator::cayenne: create_cayenne_table_provider: starting for table test_data
+2026-03-03T22:15:00.264413Z DEBUG runtime::dataaccelerator::cayenne: Cayenne Vortex config: footer_cache=128MB, segment_cache=256MB, target_file_size=128MB, upload_concurrency=4, sort_columns=[], compression_strategy=Btrblocks
+2026-03-03T22:15:00.264490Z DEBUG runtime::dataaccelerator::cayenne: create_cayenne_table_provider: calling builder.create for test_data
+2026-03-03T22:15:00.265263Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink::insert_into starting (overwrite: Overwrite)
+2026-03-03T22:15:00.265952Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink: calling table_provider.insert_into to create execution plan
+2026-03-03T22:15:00.266330Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink: insert_into returned execution plan in 0.00s
+2026-03-03T22:15:00.266385Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink: executing insertion plan with collect() - this will read source and write to accelerator
+2026-03-03T22:15:00.267235Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink::insert_into completed in 0.00s (collect phase: 0.00s)
+2026-03-03T22:15:00.267496Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::refresh_task: Loaded 0 rows for dataset runtime.task_history in 27ms.
+2026-03-03T22:15:00.267593Z DEBUG runtime::accelerated_table::refresh_task_runner: Dataset runtime.task_history refreshed successfully
+2026-03-03T22:15:00.267630Z DEBUG runtime::accelerated_table::refresh: Received refresh task completion callback: Ok(())
+2026-03-03T22:15:00.269522Z DEBUG runtime::dataaccelerator::cayenne: create_cayenne_table_provider: table test_data created successfully
+2026-03-03T22:15:00.270377Z DEBUG runtime::dataaccelerator::cayenne: Cayenne Vortex config: footer_cache=128MB, segment_cache=256MB, target_file_size=128MB, upload_concurrency=4, sort_columns=[], compression_strategy=Btrblocks
+2026-03-03T22:15:00.271045Z DEBUG runtime::dataconnector::file: File watcher disabled for dataset test_data
+2026-03-03T22:15:00.271158Z  INFO runtime::init::dataset: Dataset test_data registered (file:REDACTED.tmpBDyG8z/test_data.csv), acceleration (cayenne:file), results cache enabled.
+2026-03-03T22:15:00.273103Z  INFO runtime::cluster: Cluster mTLS configured with CA CN=Spice.ai Test CA - DO NOT USE IN PRODUCTION, OU=test-framework and node certificate CN executor0
+2026-03-03T22:15:00.273282Z  WARN runtime::builder: Failed to initialize DataFusion tracer: Failed to set DataFusion JoinSet tracer: The global JoinSetTracer is already set. Span context may not propagate correctly across async boundaries.
+2026-03-03T22:15:00.276826Z  INFO runtime::init::caching: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+2026-03-03T22:15:00.277010Z  INFO runtime::init::caching: Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-03-03T22:15:00.277139Z  INFO runtime::init::caching: Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, engine: Moka
+2026-03-03T22:15:00.277192Z DEBUG runtime::resource_monitor: Using system memory limit: 68719476736 bytes
+2026-03-03T22:15:00.277715Z DEBUG runtime::datafusion::builder: No memory limit specified, defaulting to 70% of total memory: 44.80 GiB
+2026-03-03T22:15:00.278402Z  INFO runtime::init::task_history: Task history enabled: retention_period=28800s, retention_check_interval=900s
+2026-03-03T22:15:00.278439Z DEBUG runtime::task_history: Task history retention period: 28800 seconds
+2026-03-03T22:15:00.278446Z DEBUG runtime::task_history: Task history retention check interval: 900 seconds
+2026-03-03T22:15:00.278669Z DEBUG runtime::dataaccelerator: Adding on_conflict to options: upsert:span_id
+2026-03-03T22:15:00.279384Z DEBUG runtime::accelerated_table::refresh: startup_next_refresh called with mode: Full, check_interval: None
+2026-03-03T22:15:00.280645Z DEBUG runtime::accelerated_table::refresh: Starting scheduled refresh
+2026-03-03T22:15:00.280745Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::refresh_task: Loading data for dataset runtime.task_history
+2026-03-03T22:15:00.280785Z DEBUG runtime::accelerated_table::retention: [retention] Expr: BinaryExpr(BinaryExpr { left: Column(Column { relation: None, name: "start_time" }), op: Lt, right: Literal(TimestampNanosecond(1772547300280645000, Some("UTC")), None) })
+2026-03-03T22:15:00.288945Z  INFO acceleration_refresh{input=runtime.task_history}: task_history: labels sql=SELECT trace_id, span_id, parent_span_id, "task", "input", captured_output, start_time, end_time, execution_duration_ms, error_message, labels, scheduler_id FROM runtime.task_history
+2026-03-03T22:15:00.290259Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink::insert_into starting (overwrite: Overwrite)
+2026-03-03T22:15:00.290899Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink: calling table_provider.insert_into to create execution plan
+2026-03-03T22:15:00.290975Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink: insert_into returned execution plan in 0.00s
+2026-03-03T22:15:00.291005Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink: executing insertion plan with collect() - this will read source and write to accelerator
+2026-03-03T22:15:00.291142Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::sink::table: TableSink::insert_into completed in 0.00s (collect phase: 0.00s)
+2026-03-03T22:15:00.291201Z DEBUG acceleration_refresh{input=runtime.task_history}: runtime::accelerated_table::refresh_task: Loaded 0 rows for dataset runtime.task_history in 10ms.
+2026-03-03T22:15:00.291268Z DEBUG runtime::accelerated_table::refresh_task_runner: Dataset runtime.task_history refreshed successfully
+2026-03-03T22:15:00.291308Z DEBUG runtime::accelerated_table::refresh: Received refresh task completion callback: Ok(())
+2026-03-03T22:15:00.307829Z DEBUG runtime::cluster::service: ClusterService::get_schedulers request
+2026-03-03T22:15:00.307896Z DEBUG runtime::cluster::service: ClusterService::get_schedulers response schedulers=[https://127.0.0.1:55913]
+2026-03-03T22:15:00.308722Z  INFO runtime::cluster: Scheduler membership: ["https://127.0.0.1:55913"]
+2026-03-03T22:15:00.310758Z  INFO runtime::cluster: Executor shuffle configuration: shuffle_format=arrow_ipc, shuffle_location=disk (temp_directory), REDACTED
+2026-03-03T22:15:00.311512Z  INFO runtime::http: Spice Runtime HTTP health endpoint listening on 127.0.0.1:55916
+2026-03-03T22:15:00.311534Z  INFO runtime::cluster::servers: Cluster mTLS enabled for executor flight server
+2026-03-03T22:15:00.311545Z  WARN runtime::cluster::servers: Executor Flight API key auth is disabled; accepting scheduler-trusted DoPut requires cluster mTLS
+2026-03-03T22:15:00.311864Z DEBUG runtime::cluster::control_stream_client: Control stream membership updated; added=1, removed=0
+2026-03-03T22:15:00.311943Z DEBUG runtime::cluster: Scheduler membership updated; added=[https://127.0.0.1:55913], removed=[]
+2026-03-03T22:15:00.313707Z  INFO runtime::cluster::servers: Spice Runtime executor Flight listening on 127.0.0.1:55918
+2026-03-03T22:15:00.315371Z DEBUG runtime::cluster::service: ClusterService::get_schedulers request
+2026-03-03T22:15:00.315395Z DEBUG runtime::cluster::service: ClusterService::get_schedulers response schedulers=[https://127.0.0.1:55913]
+2026-03-03T22:15:00.373221Z  INFO runtime: All components are loaded. Spice runtime is ready!
+2026-03-03T22:15:00.381261Z  INFO runtime: No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+2026-03-03T22:15:00.381293Z  INFO runtime: All components are loaded. Spice runtime is ready!
+2026-03-03T22:15:00.452055Z  INFO ballista_executor::execution_loop: Starting poll work loop with scheduler
+2026-03-03T22:15:00.513003Z DEBUG runtime::cluster::service: Executor control stream connected: 127.0.0.1:55918
+2026-03-03T22:15:00.513051Z DEBUG runtime::cluster::executor_registry: Executor 127.0.0.1:55918 connected
+2026-03-03T22:15:00.513066Z DEBUG runtime::cluster::control_stream_client: Control stream established to scheduler https://127.0.0.1:55913
+2026-03-03T22:15:00.513100Z DEBUG runtime::cluster::service: Registered executor stream: 127.0.0.1:55918 (total: 1)
+2026-03-03T22:15:01.220426Z DEBUG runtime::cluster::partition::startup: Partition metadata already exists, skipping initialization table=test_data
+2026-03-03T22:15:01.222839Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task in background
+2026-03-03T22:15:01.223012Z  INFO runtime::cluster::partition::startup: Initializing partition metadata for accelerated tables table_count=1
+2026-03-03T22:15:01.223571Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_region
+2026-03-03T22:15:01.223626Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_endpoint
+2026-03-03T22:15:01.223645Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_key
+2026-03-03T22:15:01.223653Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_secret
+2026-03-03T22:15:01.223660Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_session_token
+2026-03-03T22:15:01.223667Z DEBUG runtime_parameters: Attempting to autoload secret for scheduler: s3_auth
+2026-03-03T22:15:01.223712Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:55912
+2026-03-03T22:15:01.224655Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:55911
+2026-03-03T22:15:01.225163Z  INFO runtime::cluster::scheduler_registry: Initialized async SQL jobs API with state location: s3://spiceai-integration-tests/cluster-state/test_distributed_acceleration_with_bucket_partitioning/
+2026-03-03T22:15:01.227003Z  INFO runtime::cluster: Cluster executor slots updated executor_count=1 total_slots=10
+2026-03-03T22:15:01.409350Z DEBUG runtime::cluster: For executor="https://127.0.0.1:55918", initial accelerated table partitions={}
+2026-03-03T22:15:01.413707Z  INFO runtime::init::dataset: Dataset test_data initializing...
+2026-03-03T22:15:01.414965Z DEBUG runtime::dataconnector::listing::connector: Detecting the most recently modified object for the path: file:REDACTED.tmpBDyG8z/test_data.csv
+2026-03-03T22:15:01.415293Z DEBUG runtime::dataconnector::listing::connector: Dataset 'test_data' schema will be resolved based on file:REDACTED.tmpBDyG8z/test_data.csv
+2026-03-03T22:15:01.416639Z DEBUG runtime_parameters: Attempting to autoload secret for accelerator cayenne: cayenne_s3_key
+2026-03-03T22:15:01.417303Z DEBUG cluster::expand_secret{executor_id=127.0.0.1:55918 key=cayenne_s3_key}: runtime::cluster::service: ExpandSecret: expanding secret cayenne_s3_key for executor 127.0.0.1:55918
+2026-03-03T22:15:01.417338Z ERROR cluster::expand_secret{executor_id=127.0.0.1:55918 key=cayenne_s3_key}: task_history: Secret not found
+2026-03-03T22:15:01.417633Z DEBUG runtime_parameters: Attempting to autoload secret for accelerator cayenne: cayenne_s3_secret
+2026-03-03T22:15:01.417949Z DEBUG cluster::expand_secret{executor_id=127.0.0.1:55918 key=cayenne_s3_secret}: runtime::cluster::service: ExpandSecret: expanding secret cayenne_s3_secret for executor 127.0.0.1:55918
+2026-03-03T22:15:01.417967Z ERROR cluster::expand_secret{executor_id=127.0.0.1:55918 key=cayenne_s3_secret}: task_history: Secret not found
+2026-03-03T22:15:01.418173Z DEBUG runtime_parameters: Attempting to autoload secret for accelerator cayenne: cayenne_s3_session_token
+2026-03-03T22:15:01.418437Z DEBUG cluster::expand_secret{executor_id=127.0.0.1:55918 key=cayenne_s3_session_token}: runtime::cluster::service: ExpandSecret: expanding secret cayenne_s3_session_token for executor 127.0.0.1:55918
+2026-03-03T22:15:01.418454Z ERROR cluster::expand_secret{executor_id=127.0.0.1:55918 key=cayenne_s3_session_token}: task_history: Secret not found
+2026-03-03T22:15:01.419123Z DEBUG runtime::dataaccelerator::cayenne: create_cayenne_table_provider: starting for table test_data
+2026-03-03T22:15:01.420041Z DEBUG runtime::dataaccelerator::cayenne: Cayenne Vortex config: footer_cache=128MB, segment_cache=256MB, target_file_size=128MB, upload_concurrency=4, sort_columns=[], compression_strategy=Btrblocks
+2026-03-03T22:15:01.420072Z DEBUG runtime::dataaccelerator::cayenne: create_cayenne_table_provider: calling builder.create for test_data
+2026-03-03T22:15:01.420728Z DEBUG runtime::dataaccelerator::cayenne: create_cayenne_table_provider: table test_data created successfully
+2026-03-03T22:15:01.421664Z DEBUG runtime::dataaccelerator::cayenne: Cayenne Vortex config: footer_cache=128MB, segment_cache=256MB, target_file_size=128MB, upload_concurrency=4, sort_columns=[], compression_strategy=Btrblocks
+2026-03-03T22:15:01.421990Z DEBUG runtime::accelerated_table::refresh: startup_next_refresh called with mode: Full, check_interval: None
+2026-03-03T22:15:01.422054Z DEBUG runtime::dataconnector::file: File watcher disabled for dataset test_data
+2026-03-03T22:15:01.422142Z  INFO runtime::init::dataset: Dataset test_data registered (file:REDACTED.tmpBDyG8z/test_data.csv), acceleration (cayenne:file), results cache enabled.
+2026-03-03T22:15:01.422344Z  WARN runtime::cluster: Unable to configure Dataset URL REDACTED.tmpBDyG8z/test_data.csv
+2026-03-03T22:15:01.423416Z DEBUG runtime::accelerated_table::refresh: Starting scheduled refresh
+2026-03-03T22:15:01.423533Z  INFO acceleration_refresh{input=test_data}: runtime::accelerated_table::refresh_task: Loading data for dataset test_data
+2026-03-03T22:15:01.428642Z  INFO acceleration_refresh{input=test_data}: task_history: labels sql=SELECT test_data.id, test_data."name", test_data.age, test_data.city, test_data.score FROM test_data
+2026-03-03T22:15:01.430795Z DEBUG acceleration_refresh{input=test_data}: runtime::accelerated_table::sink::table: TableSink::insert_into starting (overwrite: Overwrite)
+2026-03-03T22:15:01.431369Z DEBUG acceleration_refresh{input=test_data}: runtime::accelerated_table::sink::table: TableSink: calling table_provider.insert_into to create execution plan
+2026-03-03T22:15:01.431457Z DEBUG acceleration_refresh{input=test_data}: runtime::accelerated_table::sink::table: TableSink: insert_into returned execution plan in 0.00s
+2026-03-03T22:15:01.431487Z DEBUG acceleration_refresh{input=test_data}: runtime::accelerated_table::sink::table: TableSink: executing insertion plan with collect() - this will read source and write to accelerator
+2026-03-03T22:15:01.436687Z DEBUG acceleration_refresh{input=test_data}: runtime::dataaccelerator::cayenne: creating Cayenne partition at REDACTED.tmp2VgxJj/data/test_data/expr0=2
+2026-03-03T22:15:01.438371Z DEBUG acceleration_refresh{input=test_data}: runtime::dataaccelerator::cayenne: creating Cayenne partition at REDACTED.tmp2VgxJj/data/test_data/expr0=1
+2026-03-03T22:15:01.439600Z DEBUG acceleration_refresh{input=test_data}: runtime::dataaccelerator::cayenne: creating Cayenne partition at REDACTED.tmp2VgxJj/data/test_data/expr0=0
+2026-03-03T22:15:01.471860Z DEBUG runtime::cluster::partition::startup: Partition metadata already exists, skipping initialization table=test_data
+2026-03-03T22:15:01.471935Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:01.472882Z  INFO vortex_datafusion::persistent::sink: Successfully written file REDACTED.REDACTED.vortex
+2026-03-03T22:15:01.473154Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:01.473921Z  INFO vortex_datafusion::persistent::sink: Successfully written file REDACTED.REDACTED.vortex
+2026-03-03T22:15:01.474035Z  INFO vortex_datafusion::persistent::sink: Successfully written file REDACTED.REDACTED.vortex
+2026-03-03T22:15:01.480313Z  INFO cayenne::provider::table: Deleting old snapshot directory for table 3: 019cb5c4-d43e-7f03-a19d-02f10739f358
+2026-03-03T22:15:01.483742Z  INFO cayenne::provider::table: Cleaned up 1 old snapshot(s) for table 3
+2026-03-03T22:15:01.484140Z  INFO cayenne::provider::table: Deleting old snapshot directory for table 2: 019cb5c4-d43d-7033-8831-2074c413d01e
+2026-03-03T22:15:01.484153Z  INFO cayenne::provider::table: Deleting old snapshot directory for table 4: 019cb5c4-d440-7d32-ac4d-e3dbbaea4b28
+2026-03-03T22:15:01.484232Z DEBUG acceleration_refresh{input=test_data}: runtime::accelerated_table::sink::table: TableSink::insert_into completed in 0.05s (collect phase: 0.05s)
+2026-03-03T22:15:01.484298Z  INFO cayenne::provider::table: Cleaned up 1 old snapshot(s) for table 2
+2026-03-03T22:15:01.484317Z  INFO cayenne::provider::table: Cleaned up 1 old snapshot(s) for table 4
+2026-03-03T22:15:01.484314Z  INFO acceleration_refresh{input=test_data}: runtime::accelerated_table::refresh_task: Loaded 10 rows (2.98 kiB) for dataset test_data in 60ms.
+2026-03-03T22:15:01.484404Z DEBUG runtime::accelerated_table::refresh_task_runner: Dataset test_data refreshed successfully
+2026-03-03T22:15:01.484435Z DEBUG runtime::accelerated_table::refresh: Received refresh task completion callback: Ok(())
+2026-03-03T22:15:01.485120Z DEBUG runtime::init::scheduler: dataset 'test_data' has no refresh cron specified, skipping schedule creation
+2026-03-03T22:15:02.223799Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:02.224822Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:02.224951Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:02.225011Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:02.225081Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:02.473357Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:03.265826Z  INFO runtime::cluster::scheduler_registry: Scheduler membership updated; added=1, removed=0
+2026-03-03T22:15:03.266039Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:03.266308Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:03.266462Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:03.266808Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:03.266877Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:03.475181Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:04.394611Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:04.395357Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:04.395519Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:04.395596Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:04.395717Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:04.473737Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:05.313730Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:05.314000Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:05.314085Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:05.314138Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:05.314187Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:05.475382Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:06.343878Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:06.344253Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:06.344353Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:06.344401Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:06.344470Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:06.474928Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:07.364425Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:07.365164Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:07.365428Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:07.365677Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:07.365753Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:07.474897Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:08.283663Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:08.283898Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:08.283975Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:08.284026Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:08.284075Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:08.474786Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:09.227198Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:09.227519Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:09.227605Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:09.227648Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:09.227712Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:09.474862Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:10.322903Z DEBUG runtime::cluster::service: ClusterService::get_schedulers request
+2026-03-03T22:15:10.323050Z DEBUG runtime::cluster::service: ClusterService::get_schedulers response schedulers=[127.0.0.1:55913]
+2026-03-03T22:15:10.323537Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:10.323853Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:10.323896Z DEBUG runtime::cluster::control_stream_client: Control stream membership updated; added=1, removed=1
+2026-03-03T22:15:10.323962Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:10.324033Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:10.324099Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:10.324165Z DEBUG runtime::cluster: Scheduler membership updated; added=[127.0.0.1:55913], removed=[https://127.0.0.1:55913]
+2026-03-03T22:15:10.324515Z DEBUG runtime::cluster: Stopping scheduler poll loop for https://127.0.0.1:55913 (cancelled)
+2026-03-03T22:15:10.325060Z DEBUG runtime::cluster::service: Executor control stream closed by executor 127.0.0.1:55918
+2026-03-03T22:15:10.325103Z DEBUG runtime::cluster::executor_registry: Executor 127.0.0.1:55918 disconnected
+2026-03-03T22:15:10.325122Z DEBUG runtime::cluster::service: Unregistered executor stream: 127.0.0.1:55918 (remaining: 0)
+2026-03-03T22:15:10.325134Z DEBUG runtime::cluster::service: Executor control stream ended: 127.0.0.1:55918
+2026-03-03T22:15:10.474212Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:10.487932Z DEBUG runtime::cluster::service: Executor control stream connected: 127.0.0.1:55918
+2026-03-03T22:15:10.487964Z DEBUG runtime::cluster::executor_registry: Executor 127.0.0.1:55918 connected
+2026-03-03T22:15:10.487983Z DEBUG runtime::cluster::service: Registered executor stream: 127.0.0.1:55918 (total: 1)
+2026-03-03T22:15:10.488033Z DEBUG runtime::cluster::control_stream_client: Control stream established to scheduler 127.0.0.1:55913
+2026-03-03T22:15:10.545310Z  INFO ballista_executor::execution_loop: Starting poll work loop with scheduler
+2026-03-03T22:15:11.254161Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:11.255455Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:11.255650Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:11.255738Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:11.255865Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:11.473796Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:12.279306Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:12.279638Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:12.279757Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:12.279825Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:12.279898Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:12.474052Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:13.247006Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:13.247252Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:13.247323Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:13.247356Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:13.247405Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:13.474789Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:14.366283Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:14.366918Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:14.367066Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:14.367161Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:14.367403Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:14.475065Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:15.289177Z DEBUG runtime::cluster::partition::discovery: Starting partition value discovery table=test_data partitioning=[PartitionedBy { name: "expr0", expression: "bucket(3, id)" }]
+2026-03-03T22:15:15.289917Z DEBUG runtime::cluster::partition::discovery: Partition values resolved statically (skipping source query) table=test_data partition_count=3
+2026-03-03T22:15:15.290072Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 new, 0 removed partitions
+2026-03-03T22:15:15.290147Z DEBUG runtime::cluster::partition::scheduler_task: [cluster_partition_management_task][task]: 0 Unassigned partitions
+2026-03-03T22:15:15.290312Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task loop
+2026-03-03T22:15:15.475005Z DEBUG runtime::cluster::partition::scheduler_task: Starting cluster_partition_management_task task run
+2026-03-03T22:15:15.490073Z DEBUG sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime::cluster::partition::executor_selection: Selected executor '127.0.0.1:50354' covering 3 partition(s), 0 remaining
+2026-03-03T22:15:15.490182Z DEBUG sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime::cluster::partition::executor_selection: Selected 1 executor(s) to cover 3 partition(s)
+2026-03-03T22:15:15.490200Z DEBUG sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime::cluster::executor_registry: Selected 1 executor(s) from 1 available for table test_data (covering 3 partition(s))
+2026-03-03T22:15:15.490381Z DEBUG sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime_datafusion::analyzer_rule::partitioned_table_scan_rewrite: PartitionedTableScanRewrite: 0 partitions for 'test_data' table.
+2026-03-03T22:15:15.493337Z  INFO sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels query_execution_duration_ms=4.019167
+2026-03-03T22:15:15.493373Z  INFO sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels rows_produced=2
+2026-03-03T22:15:15.493397Z  INFO sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels accelerated=true
+2026-03-03T22:15:15.493411Z  INFO sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels protocol=Internal datasets="test_data"
+2026-03-03T22:15:15.493424Z  INFO sql_query{input=EXPLAIN SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: captured_output=[{"plan_type":"logical_plan","plan":"EmptyRelation: rows=0"},{"plan_type":"physical_plan","plan":"BytesProcessedExec\n  EmptyExec\n"}]
+2026-03-03T22:15:15.671504Z DEBUG sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime::cluster::partition::executor_selection: Selected executor '127.0.0.1:50354' covering 3 partition(s), 0 remaining
+2026-03-03T22:15:15.671534Z DEBUG sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime::cluster::partition::executor_selection: Selected 1 executor(s) to cover 3 partition(s)
+2026-03-03T22:15:15.671545Z DEBUG sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime::cluster::executor_registry: Selected 1 executor(s) from 1 available for table test_data (covering 3 partition(s))
+2026-03-03T22:15:15.671570Z DEBUG sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: runtime_datafusion::analyzer_rule::partitioned_table_scan_rewrite: PartitionedTableScanRewrite: 0 partitions for 'test_data' table.
+2026-03-03T22:15:15.672760Z  INFO sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels query_execution_duration_ms=1.4552499
+2026-03-03T22:15:15.672783Z  INFO sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels rows_produced=0
+2026-03-03T22:15:15.672792Z  INFO sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels accelerated=true
+2026-03-03T22:15:15.672802Z  INFO sql_query{input=SELECT id, name, age, city, score FROM test_data ORDER BY id runtime_query=false}: task_history: labels protocol=Internal datasets="test_data"
