@@ -44,7 +44,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -184,22 +184,24 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint =
-                        match create_grpc_client_endpoint(endpoint_url.clone(), None) {
-                            Ok(endpoint) => endpoint,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "Failed to create scheduler endpoint {endpoint_url}: {err}"
-                                );
-                                if let Some(delay) = backoff.next_duration() {
-                                    tokio::select! {
-                                        () = token.cancelled() => break,
-                                        () = tokio::time::sleep(delay) => {}
-                                    }
+                    let scheduler_endpoint = match create_grpc_client_endpoint(
+                        endpoint_url.clone(),
+                        Some(&GrpcClientConfig::default()),
+                    ) {
+                        Ok(endpoint) => endpoint,
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to create scheduler endpoint {endpoint_url}: {err}"
+                            );
+                            if let Some(delay) = backoff.next_duration() {
+                                tokio::select! {
+                                    () = token.cancelled() => break,
+                                    () = tokio::time::sleep(delay) => {}
                                 }
-                                continue;
                             }
-                        };
+                            continue;
+                        }
+                    };
 
                     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
                         match scheduler_endpoint.tls_config(tls_config) {
@@ -1621,6 +1623,10 @@ async fn create_scheduler_server(
 
         // Faster failure detection: 30s timeout with 10s heartbeat interval
         executor_timeout_seconds: 30,
+
+        // The Spice executor uses pull-based polling (execution_loop::poll_loop),
+        // so the scheduler must use PullStaged to register executors via PollWork RPCs.
+        scheduling_policy: ballista_core::config::TaskSchedulingPolicy::PullStaged,
         ..Default::default()
     };
 

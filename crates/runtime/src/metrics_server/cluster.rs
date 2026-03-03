@@ -25,7 +25,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{AnyValue, KeyValue, any_value::Value},
@@ -257,7 +257,8 @@ async fn fetch_metrics_from_scheduler(
     let endpoint_url = normalize_endpoint(address, tls_enabled);
 
     let endpoint =
-        create_grpc_client_endpoint(endpoint_url.clone(), None).map_err(|e| e.to_string())?;
+        create_grpc_client_endpoint(endpoint_url.clone(), Some(&GrpcClientConfig::default()))
+            .map_err(|e| e.to_string())?;
 
     let endpoint = if let Some(tls_config) = tls_config {
         endpoint.tls_config(tls_config).map_err(|e| e.to_string())?
