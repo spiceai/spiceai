@@ -9,7 +9,7 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 | Accelerator | RC Quality | DRI Sign-off |
 | ----------- | ---------- | ------------ |
 | Arrow       | ✅          | @sgrebnov    |
-| Cayenne     | 🔄          | @lukekim     |
+| Cayenne     | ✅          | @lukekim     |
 | DuckDB      | ✅          | @peasee      |
 | SQLite      | ✅          | @peasee      |
 | PostgreSQL  | ✅          | @peasee      |
@@ -18,7 +18,7 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 
 The RC release criteria expand on and require that all [Beta release criteria](./beta.md) continue to pass for the accelerator.
 
-- [ ] All [Beta release criteria](./beta.md) pass for this accelerator.
+- [x] All [Beta release criteria](./beta.md) pass for this accelerator.
 
 ### Test Coverage
 
@@ -32,26 +32,26 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 #### TPC-H
 
-- [ ] The accelerator can load TPC-H SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
-- [ ] The accelerator can load TPC-H SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
+- [x] The accelerator can load TPC-H SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
+- [x] The accelerator can load TPC-H SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
 
 #### TPC-DS
 
-- [ ] The accelerator can load TPC-DS SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
-- [ ] The accelerator can load TPC-DS SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
+- [x] The accelerator can load TPC-DS SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
+- [x] The accelerator can load TPC-DS SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major or Minor Bugs](../definitions.md).
 
 #### ClickBench
 
-- [ ] A test script exists that can load ClickBench data into this accelerator in all [Access Modes](../definitions.md).
-- [ ] The accelerator can load ClickBench in all [Access Modes](../definitions.md), and all queries run with no [Major Bugs](../definitions.md).
+- [x] A test script exists that can load ClickBench data into this accelerator in all [Access Modes](../definitions.md).
+- [x] The accelerator can load ClickBench in all [Access Modes](../definitions.md), and all queries run with no [Major Bugs](../definitions.md).
 
 #### Data correctness
 
-- [ ] TPC-H SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
-- [ ] ClickBench loaded all [Access Modes](../definitions.md), returned results are identical across source and accelerated queries for all ClickBench queries.
+- [x] TPC-H SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
+- [x] ClickBench loaded all [Access Modes](../definitions.md), returned results are identical across source and accelerated queries for all ClickBench queries.
 
 ### Documentation
 
-- [ ] Documentation includes all known issues/limitations for the accelerator.
-- [ ] Documentation includes any exceptions made to allow this accelerator to reach RC quality (e.g. if a particular data type cannot be supported by the accelerator).
-- [ ] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).
+- [x] Documentation includes all known issues/limitations for the accelerator.
+- [x] Documentation includes any exceptions made to allow this accelerator to reach RC quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [x] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).
