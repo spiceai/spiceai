@@ -69,6 +69,14 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to initialize local filesystem for scheduler state at {location}: {source}"
+    ))]
+    LocalFileSystemInit {
+        location: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
         "Scheduler registration record already exists for {scheduler_id} and is still active"
     ))]
     SchedulerIdConflict { scheduler_id: String },
@@ -421,6 +429,41 @@ pub(super) async fn build_object_store_internal(
     let url = Url::parse(state_location).context(InvalidStateLocationSnafu {
         location: state_location,
     })?;
+
+    if url.scheme() == "file" {
+        // For file:// URLs, reconstruct the local filesystem path.
+        // `file://.data/scheduler-state` → host=".data", path="/scheduler-state" → ".data/scheduler-state"
+        // `file:///absolute/path`        → host=None,    path="/absolute/path"   → "/absolute/path"
+        let local_path = match url.host_str() {
+            Some(host) => {
+                let path_suffix = url.path().trim_start_matches('/');
+                if path_suffix.is_empty() {
+                    std::path::PathBuf::from(host)
+                } else {
+                    std::path::PathBuf::from(format!("{host}/{path_suffix}"))
+                }
+            }
+            None => std::path::PathBuf::from(url.path()),
+        };
+
+        std::fs::create_dir_all(&local_path).map_err(|e| Error::LocalFileSystemInit {
+            location: local_path.display().to_string(),
+            source: Box::new(e),
+        })?;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(&local_path).map_err(|e| {
+                Error::LocalFileSystemInit {
+                    location: local_path.display().to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+        );
+
+        // The store is rooted at `local_path`, so the base prefix is empty.
+        return Ok((store, String::new()));
+    }
+
     let base_prefix = url.path().trim_matches('/').to_string();
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
