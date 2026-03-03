@@ -29,6 +29,7 @@ use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -402,18 +403,32 @@ pub(super) async fn build_object_store(
     state_location: &str,
     config: &SchedulerConfig,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
+    build_object_store_internal(
+        Arc::clone(&rt.secrets()),
+        rt.tokio_io_runtime().clone(),
+        state_location,
+        config,
+    )
+    .await
+}
+
+pub(super) async fn build_object_store_internal(
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+    state_location: &str,
+    config: &SchedulerConfig,
+) -> Result<(Arc<dyn ObjectStore>, String)> {
     let url = Url::parse(state_location).context(InvalidStateLocationSnafu {
         location: state_location,
     })?;
     let base_prefix = url.path().trim_matches('/').to_string();
-    let io_runtime = rt.tokio_io_runtime();
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
         let params = config
             .params
             .as_ref()
             .map(spicepod::param::Params::as_string_map);
-        let s3_params = build_s3_parameters(rt.secrets(), params.as_ref()).await;
+        let s3_params = build_s3_parameters(secrets, params.as_ref()).await;
 
         S3ObjectStoreBuilder::from_url(&url, io_runtime)
             .context(S3ObjectStoreInitSnafu {

@@ -73,9 +73,10 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
-use crate::cluster::executor_registry::{ExecutorRegistry, TablePartitions};
-use crate::cluster::partition::PartitionManager;
-use crate::cluster::{SchedulerPeers, partition::partition_value_to_bytes};
+use crate::cluster::{
+    executor_registry::{ExecutorRegistry, TablePartitions},
+    {SchedulerPeers, partition::partition_value_to_bytes},
+};
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
@@ -180,8 +181,6 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
-    /// Manager for partition metadata (scheduler only).
-    partition_manager: Option<Arc<PartitionManager>>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
@@ -189,7 +188,6 @@ pub struct ClusterServiceImpl {
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -198,7 +196,6 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
-        partition_manager: Option<Arc<PartitionManager>>,
     ) -> Self {
         Self {
             app,
@@ -208,7 +205,6 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-            partition_manager,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -227,7 +223,6 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
-        partition_manager: Option<Arc<PartitionManager>>,
         executor_streams: ExecutorControlStreamRegistry,
     ) -> Self {
         Self {
@@ -238,7 +233,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-            partition_manager,
+
             executor_streams,
         }
     }
@@ -604,47 +599,39 @@ impl ClusterService for ClusterServiceImpl {
 
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
-        if let Some(partition_manager) = &self.partition_manager {
-            let app_guard = self.app.read().await;
-            if let Some(app) = app_guard.as_ref() {
-                // Find accelerated datasets with partitioning
+        let partition_manager = self.executor_registry().partition_manager();
+        let app_guard = self.app.read().await;
+        if let Some(app) = app_guard.as_ref() {
+            // Find accelerated datasets with partitioning
 
-                for table_ref in super::partition::accelerated_tables(app).keys() {
-                    match partition_manager
-                        .allocate_partitions(table_ref, executor_id, 10)
-                        .await
-                    {
-                        Ok(partitions) => {
-                            if partitions.is_empty() {
-                                continue;
-                            }
-                            let mut items = Vec::with_capacity(partitions.len());
-                            for partition in partitions {
-                                match partition_value_to_bytes(
-                                    partition,
-                                    table_ref,
-                                    &self.datafusion,
-                                )
+            for table_ref in super::partition::accelerated_tables(app).keys() {
+                match partition_manager
+                    .allocate_partitions(table_ref, executor_id, 10)
+                    .await
+                {
+                    Ok(partitions) => {
+                        if partitions.is_empty() {
+                            continue;
+                        }
+                        let mut items = Vec::with_capacity(partitions.len());
+                        for partition in partitions {
+                            match partition_value_to_bytes(partition, table_ref, &self.datafusion)
                                 .await
-                                {
-                                    Ok(bytes) => items.push(bytes.to_vec()),
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to serialize partition expression for table {table_ref}: {e}"
-                                        );
-                                    }
+                            {
+                                Ok(bytes) => items.push(bytes.to_vec()),
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to serialize partition expression for table {table_ref}: {e}"
+                                    );
                                 }
                             }
-                            table_partitions.insert(table_ref.to_string(), BytesArray { items });
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to allocate partitions for table {} to executor {}: {}",
-                                table_ref.to_string(),
-                                executor_id,
-                                e
-                            );
-                        }
+                        table_partitions.insert(table_ref.to_string(), BytesArray { items });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to allocate partitions for table {table_ref} to executor {executor_id}: {e}",
+                        );
                     }
                 }
             }
