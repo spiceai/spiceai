@@ -197,6 +197,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::context::SessionContext;
+    use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion_catalog::TableProvider;
     use datafusion_expr::dml::InsertOp;
     use datafusion_physical_plan::collect;
@@ -224,6 +225,7 @@ mod tests {
     /// Helper to create a test catalog with a table containing sample data
     async fn setup_test_table(
         connection_string: &str,
+        ctx: &SessionContext,
     ) -> (Arc<CayenneCatalog>, crate::metadata::TableMetadata, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory for test");
         let catalog = Arc::new(
@@ -262,10 +264,9 @@ mod tests {
         tracing::info!("Created table '{}' with ID {}", table_name, table_id);
 
         // Create provider and insert test data
-        let ctx = SessionContext::new();
         let catalog_trait: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
-        let provider = CayenneTableProvider::new(table_name, catalog_trait)
+        let provider = CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
             .await
             .expect("Failed to create CayenneTableProvider instance");
 
@@ -327,7 +328,8 @@ mod tests {
 
     /// Core concurrent read test implementation
     async fn test_concurrent_reads_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         // Create multiple concurrent readers
         let num_readers = 20;
@@ -342,9 +344,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider in concurrent reader task");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider in concurrent reader task");
 
                 let mut total_rows = 0;
                 for query_num in 0..num_queries_per_reader {
@@ -421,7 +424,8 @@ mod tests {
 
     /// Test concurrent reads with various filter conditions
     async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         let num_readers = 10;
 
@@ -434,9 +438,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider for filter test reader");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for filter test reader");
 
                 // Register the table with DataFusion so we can run SQL queries
                 ctx.register_table("test_table", Arc::new(provider))
@@ -511,7 +516,8 @@ mod tests {
 
     /// Test concurrent reads with different column projections
     async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         let num_readers = 15;
 
@@ -524,9 +530,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider for projection test reader");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for projection test reader");
 
                 ctx.register_table("test_table", Arc::new(provider))
                     .expect("Failed to register table for projection test");
@@ -596,7 +603,8 @@ mod tests {
 
     /// Stress test with high concurrency (50 readers, 50 queries each)
     async fn test_high_concurrency_stress_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         let num_readers = 50;
         let queries_per_reader = 50;
@@ -611,9 +619,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider for stress test reader");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for stress test reader");
 
                 for _ in 0..queries_per_reader {
                     let plan = provider
@@ -694,7 +703,8 @@ mod tests {
             vortex_config,
         };
 
-        let table = CayenneTableProvider::create_table(catalog, table_options)
+        let ctx = SessionContext::new();
+        let table = CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env())
             .await
             .expect("Failed to create table");
 
@@ -830,10 +840,13 @@ mod tests {
             vortex_config: crate::metadata::VortexConfig::default(),
         };
 
-        let provider =
-            CayenneTableProvider::create_table(Arc::clone(&catalog_trait), table_options)
-                .await
-                .expect("Failed to create table for multi-upsert restart test");
+        let provider = CayenneTableProvider::create_table(
+            Arc::clone(&catalog_trait),
+            table_options,
+            Arc::new(RuntimeEnv::default()),
+        )
+        .await
+        .expect("Failed to create table for multi-upsert restart test");
         let provider = Arc::new(provider);
 
         // ---- Round 1: Initial insert of all 3 users ----
@@ -909,13 +922,13 @@ mod tests {
         let catalog_trait2: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
-        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2)
+        let ctx2 = SessionContext::new();
+        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
             .open("users")
             .await
             .expect("Failed to reopen table after restart");
         let provider2 = Arc::new(provider2);
 
-        let ctx2 = SessionContext::new();
         ctx2.register_table("users", Arc::clone(&provider2) as Arc<dyn TableProvider>)
             .expect("Failed to register table post-restart");
 

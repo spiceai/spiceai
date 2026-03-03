@@ -191,6 +191,19 @@ impl PartitionTableProvider {
         self
     }
 
+    /// Returns the table providers for all current partitions.
+    ///
+    /// Callers can use this to apply per-partition operations (e.g., index maintenance)
+    /// that are not part of the standard `TableProvider` interface.
+    pub async fn partition_table_providers(&self) -> Vec<Arc<dyn TableProvider>> {
+        self.partitions
+            .read()
+            .await
+            .values()
+            .map(|p| Arc::clone(&p.table_provider))
+            .collect()
+    }
+
     /// Collects all partition column references from all partition expressions.
     fn all_partition_columns(&self) -> std::collections::HashSet<&datafusion::common::Column> {
         self.partition_by

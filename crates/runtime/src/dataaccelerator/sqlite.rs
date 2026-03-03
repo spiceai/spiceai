@@ -26,6 +26,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -294,6 +295,7 @@ impl DataAccelerator for SqliteAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
@@ -433,7 +435,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 

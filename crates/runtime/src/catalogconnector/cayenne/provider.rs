@@ -32,6 +32,7 @@ use cayenne::metadata::VortexConfig;
 use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use snafu::prelude::*;
 
 use crate::component::catalog::Catalog;
@@ -78,6 +79,8 @@ pub struct CayenneCatalogProvider {
     data_base_path: String,
     /// Local metadata directory.
     metadata_dir: String,
+    /// Shared `RuntimeEnv` from the main Spice runtime for cache coherence.
+    runtime_env: Arc<RuntimeEnv>,
     /// Schema providers keyed by namespace name, created dynamically via DDL.
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
@@ -96,7 +99,11 @@ impl CayenneCatalogProvider {
     ///
     /// Initializes the `SQLite` metadata catalog and local file storage.
     /// The `catalog_id` field is ignored; Cayenne always uses a fixed default name.
-    pub async fn try_new(params: Parameters, _catalog_config: &Catalog) -> Result<Self> {
+    pub async fn try_new(
+        params: Parameters,
+        _catalog_config: &Catalog,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Result<Self> {
         let catalog_name = DEFAULT_CATALOG_NAME;
 
         // Resolve metadata directory
@@ -149,6 +156,7 @@ impl CayenneCatalogProvider {
             vortex_config,
             data_base_path,
             metadata_dir,
+            runtime_env,
             schemas: RwLock::new(HashMap::new()),
         };
 
@@ -171,6 +179,12 @@ impl CayenneCatalogProvider {
     #[must_use]
     pub fn vortex_config(&self) -> &VortexConfig {
         &self.vortex_config
+    }
+
+    /// Returns the shared `RuntimeEnv`.
+    #[must_use]
+    pub fn runtime_env(&self) -> &Arc<RuntimeEnv> {
+        &self.runtime_env
     }
 
     /// Returns the metadata directory path.
@@ -285,8 +299,13 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
 
         let mut new_schemas: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
         for (ns, full_names) in &grouped {
-            let schema_provider =
-                CayenneSchemaProvider::try_new(Arc::clone(&self.catalog), ns, full_names).await?;
+            let schema_provider = CayenneSchemaProvider::try_new(
+                Arc::clone(&self.catalog),
+                ns,
+                full_names,
+                Arc::clone(&self.runtime_env),
+            )
+            .await?;
             new_schemas.insert(ns.clone(), Arc::new(schema_provider));
         }
 
@@ -319,6 +338,8 @@ pub struct CayenneSchemaProvider {
     catalog: Arc<dyn MetadataCatalog>,
     /// The namespace this schema provider represents.
     namespace: String,
+    /// Shared `RuntimeEnv` for cache coherence with the main runtime.
+    runtime_env: Arc<RuntimeEnv>,
     /// Table providers keyed by short (unqualified) table name.
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
@@ -338,12 +359,13 @@ impl CayenneSchemaProvider {
         catalog: Arc<dyn MetadataCatalog>,
         namespace: &str,
         full_table_names: &[String],
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
         let ns_prefix = format!("{namespace}/");
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
         for full_name in full_table_names {
             let short_name = full_name.strip_prefix(&ns_prefix).unwrap_or(full_name);
-            match Self::load_table(&catalog, full_name).await {
+            match Self::load_table(&catalog, full_name, &runtime_env).await {
                 Ok(Some(provider)) => {
                     tables.insert(short_name.to_string(), provider);
                 }
@@ -361,16 +383,22 @@ impl CayenneSchemaProvider {
         Ok(Self {
             catalog,
             namespace: namespace.to_string(),
+            runtime_env,
             tables: RwLock::new(tables),
         })
     }
 
     /// Create an empty schema provider for a namespace (used by DDL).
     #[must_use]
-    pub fn new_empty(catalog: Arc<dyn MetadataCatalog>, namespace: String) -> Self {
+    pub fn new_empty(
+        catalog: Arc<dyn MetadataCatalog>,
+        namespace: String,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Self {
         Self {
             catalog,
             namespace,
+            runtime_env,
             tables: RwLock::new(HashMap::new()),
         }
     }
@@ -396,11 +424,13 @@ impl CayenneSchemaProvider {
     async fn load_table(
         catalog: &Arc<dyn MetadataCatalog>,
         table_name: &str,
+        runtime_env: &Arc<RuntimeEnv>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Check if the table exists in the catalog
         match catalog.get_table(table_name).await {
             Ok(_metadata) => {
-                let builder = CayenneTableProviderBuilder::new(Arc::clone(catalog));
+                let builder =
+                    CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env));
 
                 match builder.open(table_name).await {
                     Ok(provider) => {
@@ -452,7 +482,7 @@ impl SchemaProvider for CayenneSchemaProvider {
 
         // Try to load from catalog (lazy loading) using namespace-prefixed name
         let full_name = self.full_table_name(name);
-        match Self::load_table(&self.catalog, &full_name).await {
+        match Self::load_table(&self.catalog, &full_name, &self.runtime_env).await {
             Ok(Some(provider)) => {
                 if let Ok(mut tables) = self.tables.write() {
                     tables.insert(name.to_string(), Arc::clone(&provider));
