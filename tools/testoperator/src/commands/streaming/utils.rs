@@ -243,8 +243,21 @@ pub async fn wait_for_all_marker_deletions(
 pub struct DynamoDbMetrics {
     /// Total records consumed across all datasets.
     pub records_consumed_total: u64,
+    /// Records consumed per dataset (keyed by dataset name from the `dataset` label).
+    pub records_consumed_per_table: HashMap<String, u64>,
     /// Total transient errors across all datasets.
     pub errors_transient_total: u64,
+}
+
+/// Extract a label value from a Prometheus metric line.
+///
+/// E.g., for `metric{dataset="lineitem",foo="bar"} 123` and key `"dataset"`, returns `Some("lineitem")`.
+fn extract_label(line: &str, key: &str) -> Option<String> {
+    let labels = line.split('{').nth(1)?.split('}').next()?;
+    let prefix = format!("{key}=\"");
+    let start = labels.find(&prefix)? + prefix.len();
+    let end = start + labels[start..].find('"')?;
+    Some(labels[start..end].to_string())
 }
 
 /// Fetch `DynamoDB` metrics from Spice's Prometheus metrics endpoint.
@@ -284,7 +297,15 @@ pub async fn get_dynamodb_metrics() -> Result<DynamoDbMetrics> {
 
         // Match lines like: dataset_dynamodb_records_consumed_total{dataset="lineitem",...} 12345
         if line.starts_with("dataset_dynamodb_records_consumed_total") {
-            metrics.records_consumed_total += parse_value(line);
+            let value = parse_value(line);
+            metrics.records_consumed_total += value;
+            println!("!!! Metric line: {}, label: {:?}", line, extract_label(line, "dataset"));
+            if let Some(dataset) = extract_label(line, "name") {
+                *metrics
+                    .records_consumed_per_table
+                    .entry(dataset)
+                    .or_default() += value;
+            }
         } else if line.starts_with("dataset_dynamodb_errors_transient_total") {
             metrics.errors_transient_total += parse_value(line);
         }

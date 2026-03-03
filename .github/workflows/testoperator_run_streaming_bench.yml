@@ -139,7 +139,7 @@ jobs:
             ${QUERY_LIVENESS_FLAG}
         env:
           # DynamoDB credentials
-          DYNAMODB_AWS_REGION: us-east-1
+          DYNAMODB_AWS_REGION: us-east-2
           DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
           DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           # Snapshot storage

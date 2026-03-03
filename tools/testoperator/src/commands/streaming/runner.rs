@@ -387,6 +387,11 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
         0.0
     };
 
+    println!("!!!!!!!!!! ingestion_duration: {}", ingestion_duration.as_millis());
+    println!("!!!!!!!!!! stream_lag: {}", stream_lag.as_millis());
+    println!("!!!!!!!!!! record_count: {}", record_count);
+    println!("!!!!!!!!!! throughput: {}", throughput);
+
     crate::metrics::STREAM_LAG.record(stream_lag.as_millis().try_into().unwrap_or(u64::MAX), &[]);
     crate::metrics::INGESTION_DURATION.record(
         ingestion_duration
@@ -395,8 +400,19 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
             .unwrap_or(u64::MAX),
         &[],
     );
+
+
+    println!("!!!!!!!!!! records_consumed_per_table: {:?}", dynamodb_metrics.records_consumed_per_table);
+
     crate::metrics::RECORDS_PER_SECOND.record(throughput, &[]);
     crate::metrics::RECORD_COUNT.record(record_count, &[]);
+    for (dataset_name, count) in &dynamodb_metrics.records_consumed_per_table {
+        println!("!!!!!!!!!! records_consumed_per_table: table={}, records={}", dataset_name, count);
+        crate::metrics::RECORD_COUNT.record(
+            *count,
+            &[KeyValue::new("dataset", dataset_name.clone())],
+        );
+    }
     crate::metrics::DYNAMODB_TRANSIENT_ERRORS.record(dynamodb_metrics.errors_transient_total, &[]);
 
     // Phase 16: Emit telemetry
