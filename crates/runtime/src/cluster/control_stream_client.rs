@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_executor::executor::Executor;
 use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
@@ -106,7 +106,10 @@ fn spawn_control_stream(
 
             // Build endpoint
             let endpoint_url = normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-            let endpoint = match create_grpc_client_endpoint(endpoint_url.clone()) {
+            let endpoint = match create_grpc_client_endpoint(
+                endpoint_url.clone(),
+                Some(&GrpcClientConfig::default()),
+            ) {
                 Ok(ep) => ep,
                 Err(e) => {
                     tracing::warn!(

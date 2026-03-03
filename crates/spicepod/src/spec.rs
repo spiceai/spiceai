@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -39,9 +39,9 @@ use crate::extension::Extension;
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
-    #[default]
-    V1Beta1,
     V1,
+    #[default]
+    V2,
 }
 
 impl Display for SpicepodVersion {
@@ -146,7 +146,7 @@ impl SpicepodDefinition {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            version: SpicepodVersion::V1,
+            version: SpicepodVersion::V2,
             kind: SpicepodKind::Spicepod,
             ..Default::default()
         }

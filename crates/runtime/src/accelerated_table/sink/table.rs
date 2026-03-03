@@ -22,6 +22,7 @@ use datafusion::{
     physical_plan::collect, prelude::SessionContext,
 };
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
 use crate::{
@@ -94,19 +95,33 @@ impl TableSink {
             return Err(retry_from_df_error(e));
         }
 
-        // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it
-        match perform_index_maintenance(self.table_provider.as_ref()).await {
-            Ok(true) => {
-                tracing::debug!("TableSink: index maintenance completed successfully");
-            }
-            Ok(false) => {
-                // Table doesn't support index maintenance - this is expected for most tables
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "TableSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
-                );
-                // Don't fail the write - data was successfully written, index rebuild is best-effort
+        // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it.
+        // For partitioned tables each partition holds its own IndexedMemTable, so we iterate over
+        // all partition providers and trigger maintenance on each one individually.
+        let providers_to_maintain: Vec<Arc<dyn TableProvider>> = if let Some(p) = self
+            .table_provider
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+        {
+            p.partition_table_providers().await
+        } else {
+            vec![Arc::clone(&self.table_provider)]
+        };
+
+        for provider in providers_to_maintain {
+            match perform_index_maintenance(provider.as_ref()).await {
+                Ok(true) => {
+                    tracing::debug!("TableSink: index maintenance completed successfully");
+                }
+                Ok(false) => {
+                    // Table doesn't support index maintenance - this is expected for most tables
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "TableSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
+                    );
+                    // Don't fail the write - data was successfully written, index rebuild is best-effort
+                }
             }
         }
 

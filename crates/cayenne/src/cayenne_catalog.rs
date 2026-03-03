@@ -2023,7 +2023,7 @@ mod tests {
         assert!(metadata.primary_key.is_empty());
         assert_eq!(metadata.table_id, table_id_1);
 
-        // Try to recreate with a primary key change — should return ChangedConfiguration error
+        // Now try to create with a primary key change — should get ChangedConfiguration error
         let options_changed = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema: Arc::clone(&schema),

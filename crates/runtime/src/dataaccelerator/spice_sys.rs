@@ -439,7 +439,7 @@ async fn acceleration_connection(
             engine: Engine::Cayenne,
         }
         .fail(),
-        Engine::Arrow => UnsupportedEngineSnafu {
+        Engine::Arrow | Engine::PartitionedArrow => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),

@@ -77,6 +77,16 @@ pub struct ObjectState<T> {
     _marker: PhantomData<T>,
 }
 
+impl<T> std::fmt::Debug for ObjectState<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectState")
+            .field("prefix", &self.prefix)
+            .field("store", &"Arc<dyn ObjectStore>")
+            .field("cache_size", &self.cache.read().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> ObjectState<T>
 where
     T: Serialize + DeserializeOwned + Clone + Send + Sync,

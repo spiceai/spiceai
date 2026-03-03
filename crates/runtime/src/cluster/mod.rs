@@ -44,7 +44,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -96,7 +96,7 @@ pub enum DistributedNode {
         executor_registry: Arc<ExecutorRegistry>,
 
         /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<RwLock<Option<Arc<PartitionManager>>>>,
+        partition_manager: Arc<PartitionManager>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -119,8 +119,9 @@ impl DistributedNode {
     }
 }
 
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+type SchedulerEndpointOverride = Arc<
+    dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+>;
 
 struct SchedulerPollHandle {
     cancel: CancellationToken,
@@ -183,8 +184,10 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint = match create_grpc_client_endpoint(endpoint_url.clone())
-                    {
+                    let scheduler_endpoint = match create_grpc_client_endpoint(
+                        endpoint_url.clone(),
+                        Some(&GrpcClientConfig::default()),
+                    ) {
                         Ok(endpoint) => endpoint,
                         Err(err) => {
                             tracing::warn!(
@@ -813,65 +816,66 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        // Initialize partition manager with the configured object store
-        match partition::build_partition_metadata_store(rt, &config).await {
-            Ok(store) => {
-                let partition_manager = Arc::new(PartitionManager::new(store));
-                rt.set_partition_manager(Arc::clone(&partition_manager))
-                    .await;
-
-                // Start partition management task (which also seeds initial partition
-                // metadata as its first step, before entering the periodic loop).
-                let pm_shutdown = CancellationToken::new();
-                let pm_config = match config
-                    .partition_management
-                    .clone()
-                    .map(PartitionManagementConfig::try_from)
-                {
-                    Some(Ok(cfg)) => cfg,
-                    None => PartitionManagementConfig::default(),
-                    Some(Err(err)) => {
-                        tracing::warn!(
-                            "Failed to parse partition management config, partition management task will not be started: {err
-                        }");
-                        return Ok(None);
-                    }
-                };
-
-                // Register partition_metadata as Initializing so `/v1/ready`
-                // waits for metadata seeding to complete before reporting ready.
-                rt.status
-                    .update_component_status("partition_metadata", ComponentStatus::Initializing);
-
-                let pm_task = PartitionManagementTask::new(
-                    rt.app(),
-                    rt.datafusion(),
-                    Arc::clone(&partition_manager),
-                    Arc::clone(&scheduler_executor_registry),
-                    Arc::clone(&rt.status),
-                    pm_config,
-                    pm_shutdown.clone(),
+        if let Some(partition_manager) = rt.partition_manager() {
+            // Initialize partition metadata for all accelerated tables
+            if let Err(err) = partition::initialize_partition_metadata(
+                rt.datafusion(),
+                Arc::clone(&app),
+                &partition_manager,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to initialize partition metadata during scheduler startup: {err}"
                 );
+            }
 
-                futures.push(Box::pin(
-                    self_for_task
-                        .start_runtime_task(
-                            CLUSTER_PARTITION_MANAGEMENT_TASK,
-                            Some(pm_shutdown),
-                            async move {
-                                pm_task
-                                    .run()
-                                    .await
-                                    .boxed()
-                                    .context(FailedToRegisterSchedulerSnafu)
-                            },
-                        )
-                        .await,
-                ));
-            }
-            Err(err) => {
-                tracing::error!("Failed to build partition metadata store: {err}");
-            }
+            // Start partition management task
+            let pm_shutdown = CancellationToken::new();
+            let pm_config = match config
+                .partition_management
+                .clone()
+                .map(PartitionManagementConfig::try_from)
+            {
+                Some(Ok(cfg)) => cfg,
+                None => PartitionManagementConfig::default(),
+                Some(Err(err)) => {
+                    tracing::warn!(
+                        "Failed to parse partition management config, partition management task will not be started: {err}"
+                    );
+                    return Ok(None);
+                }
+            };
+            // Register partition_metadata as Initializing so `/v1/ready`
+            // waits for metadata seeding to complete before reporting ready.
+            rt.status
+                .update_component_status("partition_metadata", ComponentStatus::Initializing);
+
+            let pm_task = PartitionManagementTask::new(
+                rt.app(),
+                rt.datafusion(),
+                Arc::clone(&partition_manager),
+                Arc::clone(&scheduler_executor_registry),
+                Arc::clone(&rt.status),
+                pm_config,
+                pm_shutdown.clone(),
+            );
+
+            futures.push(Box::pin(
+                self_for_task
+                    .start_runtime_task(
+                        CLUSTER_PARTITION_MANAGEMENT_TASK,
+                        Some(pm_shutdown),
+                        async move {
+                            pm_task
+                                .run()
+                                .await
+                                .boxed()
+                                .context(FailedToRegisterSchedulerSnafu)
+                        },
+                    )
+                    .await,
+            ));
         }
 
         let registry_shutdown = CancellationToken::new();
@@ -1395,9 +1399,13 @@ async fn create_scheduler_server(
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
-    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
-        .clone()
-        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
+        client_tls_config.clone().map(|tls_config| {
+            Arc::new(move |ep: Endpoint| {
+                ep.tls_config(tls_config.clone())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }) as _
+        });
 
     // Convert shuffle_format param to ballista ShuffleFormat
     #[cfg(feature = "vortex")]
@@ -1616,6 +1624,10 @@ async fn create_scheduler_server(
 
         // Faster failure detection: 30s timeout with 10s heartbeat interval
         executor_timeout_seconds: 30,
+
+        // The Spice executor uses pull-based polling (execution_loop::poll_loop),
+        // so the scheduler must use PullStaged to register executors via PollWork RPCs.
+        scheduling_policy: ballista_core::config::TaskSchedulingPolicy::PullStaged,
         ..Default::default()
     };
 
