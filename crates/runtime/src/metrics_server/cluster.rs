@@ -256,7 +256,8 @@ async fn fetch_metrics_from_scheduler(
 ) -> std::result::Result<Vec<u8>, String> {
     let endpoint_url = normalize_endpoint(address, tls_enabled);
 
-    let endpoint = create_grpc_client_endpoint(endpoint_url.clone()).map_err(|e| e.to_string())?;
+    let endpoint =
+        create_grpc_client_endpoint(endpoint_url.clone(), None).map_err(|e| e.to_string())?;
 
     let endpoint = if let Some(tls_config) = tls_config {
         endpoint.tls_config(tls_config).map_err(|e| e.to_string())?

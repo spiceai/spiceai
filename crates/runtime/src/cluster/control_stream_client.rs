@@ -106,7 +106,7 @@ fn spawn_control_stream(
 
             // Build endpoint
             let endpoint_url = normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-            let endpoint = match create_grpc_client_endpoint(endpoint_url.clone()) {
+            let endpoint = match create_grpc_client_endpoint(endpoint_url.clone(), None) {
                 Ok(ep) => ep,
                 Err(e) => {
                     tracing::warn!(

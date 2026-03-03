@@ -119,8 +119,9 @@ impl DistributedNode {
     }
 }
 
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+type SchedulerEndpointOverride = Arc<
+    dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+>;
 
 struct SchedulerPollHandle {
     cancel: CancellationToken,
@@ -183,22 +184,22 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint = match create_grpc_client_endpoint(endpoint_url.clone())
-                    {
-                        Ok(endpoint) => endpoint,
-                        Err(err) => {
-                            tracing::warn!(
-                                "Failed to create scheduler endpoint {endpoint_url}: {err}"
-                            );
-                            if let Some(delay) = backoff.next_duration() {
-                                tokio::select! {
-                                    () = token.cancelled() => break,
-                                    () = tokio::time::sleep(delay) => {}
+                    let scheduler_endpoint =
+                        match create_grpc_client_endpoint(endpoint_url.clone(), None) {
+                            Ok(endpoint) => endpoint,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to create scheduler endpoint {endpoint_url}: {err}"
+                                );
+                                if let Some(delay) = backoff.next_duration() {
+                                    tokio::select! {
+                                        () = token.cancelled() => break,
+                                        () = tokio::time::sleep(delay) => {}
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
-                        }
-                    };
+                        };
 
                     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
                         match scheduler_endpoint.tls_config(tls_config) {
@@ -1395,9 +1396,13 @@ async fn create_scheduler_server(
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
-    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
-        .clone()
-        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
+        client_tls_config.clone().map(|tls_config| {
+            Arc::new(move |ep: Endpoint| {
+                ep.tls_config(tls_config.clone())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }) as _
+        });
 
     // Convert shuffle_format param to ballista ShuffleFormat
     #[cfg(feature = "vortex")]
