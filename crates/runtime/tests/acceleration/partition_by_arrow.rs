@@ -169,13 +169,16 @@ async fn test_arrow_partition_by_bucket() -> Result<(), anyhow::Error> {
 /// Test that `hash_index: enabled` is correctly propagated to every Arrow partition.
 ///
 /// Prior to the fix, `_source` was ignored in `PartitionedArrowAccelerator::create_external_table`,
-/// so `hash_index` was silently dropped and the table was created without it.  With the fix the
-/// option is injected into `cmd.options` before the creator is built, meaning each partition's
-/// `ArrowFactory::create` receives it.
+/// so `hash_index` was silently dropped and each partition's `IndexedMemTable` was created without
+/// it.  With the propagation fix the option flows into every partition.  A second fix ensures the
+/// per-partition index is rebuilt after data is inserted (the `TableSink` previously only called
+/// `perform_index_maintenance` on the top-level provider, which returned `false` for
+/// `PartitionTableProvider` — missing all the inner `IndexedMemTable`s).
 ///
 /// We verify correctness by confirming:
-/// 1. The dataset loads successfully (would fail/warn if option caused a build error).
-/// 2. Primary-key point lookups return the correct single row (exercises hash index code path).
+/// 1. The dataset loads successfully with `hash_index: enabled` + `primary_key` set.
+/// 2. Primary-key point lookups on the partition table return the correct single row (exercises
+///    the rebuilt per-partition hash index).
 /// 3. A lookup for a non-existent key returns zero rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_arrow_partition_hash_index() -> Result<(), anyhow::Error> {
