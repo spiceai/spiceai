@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
     catalog::TableProviderFactory,
+    common::Constraints,
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
@@ -28,14 +29,16 @@ use datafusion::{
 };
 use runtime_table_partition::{
     Partition,
-    creator::{Error as CreatorError, PartitionCreator},
+    creator::{CreatePartitionSnafu, Error as CreatorError, PartitionCreator},
     expression::PartitionedBy,
     provider::PartitionTableProvider,
 };
 use snafu::prelude::*;
 
 use crate::{
-    component::dataset::acceleration::Engine, parameters::ParameterSpec, register_data_accelerator,
+    component::dataset::acceleration::{Engine, RefreshMode},
+    parameters::ParameterSpec,
+    register_data_accelerator,
 };
 
 use super::{AccelerationSource, DataAccelerator};
@@ -84,7 +87,8 @@ impl PartitionCreator for ArrowPartitionCreator {
         let table_provider =
             TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &self.cmd)
                 .await
-                .map_err(|e| CreatorError::CreatePartition { source: e.into() })?;
+                .boxed()
+                .context(CreatePartitionSnafu)?;
 
         Ok(Partition {
             partition_values,
@@ -154,9 +158,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             }
         );
 
-        if let Some(source) = source
-            && let Some(acceleration) = source.acceleration()
-        {
+        if let Some(acceleration) = source.as_ref().and_then(|s| s.acceleration()) {
             if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
                 cmd.options
                     .insert("sort_columns".to_string(), sort_cols_str.clone());
@@ -164,6 +166,12 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             if let Some(hash_index_str) = acceleration.params.get("hash_index") {
                 cmd.options
                     .insert("hash_index".to_string(), hash_index_str.clone());
+            }
+            // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
+            // which overwrites the entire table. Primary key constraints cause uniqueness validation
+            // errors during inserts because Arrow doesn't support upsert operations.
+            if matches!(acceleration.refresh_mode, Some(RefreshMode::Caching)) {
+                cmd.constraints = Constraints::new_unverified(vec![]);
             }
         }
 
