@@ -199,9 +199,9 @@ pub fn parse_refresh_sql(
                             _ => {
                                 return InvalidSqlStatementSnafu {
                                     expected_table,
-                                    issue: format!(
+                                    issue:
                                         "No FROM clause with table reference found in SQL statement"
-                                    ),
+                                            .to_string(),
                                 }
                                 .fail();
                             }
