@@ -132,7 +132,7 @@ jobs:
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - &build-arm64-image
         name: Build ARM64 ${{ env.IMAGE_TAG }} image
@@ -152,25 +152,25 @@ jobs:
       - name: data
         run: |
           echo "IMAGE_TAG=data" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb,pingora,scylladb,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=true" >> $GITHUB_ENV
       - *build-arm64-image
       - name: jemalloc
         run: |
           echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-arm64-image
       - name: mimalloc
         run: |
           echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-arm64-image
       - name: sysalloc
         run: |
           echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-arm64-image
       - name: Upload ARM64 artifacts
@@ -213,7 +213,7 @@ jobs:
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - &build-amd64-image
         name: Build AMD64 ${{ env.IMAGE_TAG }} image
@@ -234,25 +234,25 @@ jobs:
       - name: data
         run: |
           echo "IMAGE_TAG=data" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb,pingora,scylladb,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=true" >> $GITHUB_ENV
       - *build-amd64-image
       - name: jemalloc
         run: |
           echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-amd64-image
       - name: mimalloc
         run: |
           echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-amd64-image
       - name: sysalloc
         run: |
           echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system,nfs,odbc,vortex" >> $GITHUB_ENV
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-amd64-image
       - name: Upload AMD64 artifacts

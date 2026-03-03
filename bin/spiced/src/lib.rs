@@ -694,6 +694,7 @@ fn create_otel_reader(
 async fn start_anonymous_telemetry(
     telemetry_enabled: Option<bool>,
     spicepod_telemetry_config: Option<&TelemetryConfig>,
+    #[cfg_attr(not(feature = "anonymous_telemetry"), expect(unused_variables))]
     spicepod_name: Option<&String>,
 ) {
     // Always log hardware info at debug level regardless of telemetry settings
@@ -706,6 +707,7 @@ async fn start_anonymous_telemetry(
     let explicitly_disabled =
         telemetry_enabled == Some(false) || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
+    #[cfg_attr(not(feature = "anonymous_telemetry"), expect(unused_variables))]
     let telemetry_properties = match spicepod_telemetry_config {
         Some(config) => config
             .properties

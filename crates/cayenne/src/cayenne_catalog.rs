@@ -2023,7 +2023,7 @@ mod tests {
         assert!(metadata.primary_key.is_empty());
         assert_eq!(metadata.table_id, table_id_1);
 
-        // Now recreate with a primary key change — should get a new table_id
+        // Now recreate with a primary key change — should detect changed configuration
         let options_changed = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema: Arc::clone(&schema),
@@ -2033,10 +2033,24 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
+        let err = catalog
+            .create_table(options_changed.clone())
+            .await
+            .expect_err("Expected ChangedConfiguration error");
+        assert!(
+            matches!(err, CatalogError::ChangedConfiguration { .. }),
+            "Expected ChangedConfiguration, got: {err:?}"
+        );
+
+        // Drop and recreate with new config
+        catalog
+            .drop_table("test_table")
+            .await
+            .expect("Failed to drop table");
         let table_id_2 = catalog
             .create_table(options_changed)
             .await
-            .expect("Failed to create table after config change");
+            .expect("Failed to create table after drop and recreate");
 
         // Should have gotten a new table_id (old one was dropped)
         assert_ne!(table_id_1, table_id_2);
@@ -2101,7 +2115,7 @@ mod tests {
             .await
             .expect("Failed to create table");
 
-        // Add sort columns — should trigger recreation
+        // Add sort columns — should detect changed configuration
         vortex_config.sort_columns = vec!["ts".to_string()];
         let options_sorted = CreateTableOptions {
             table_name: "sorted_table".to_string(),
@@ -2112,10 +2126,24 @@ mod tests {
             partition_column: None,
             vortex_config,
         };
+        let err = catalog
+            .create_table(options_sorted.clone())
+            .await
+            .expect_err("Expected ChangedConfiguration error");
+        assert!(
+            matches!(err, CatalogError::ChangedConfiguration { .. }),
+            "Expected ChangedConfiguration, got: {err:?}"
+        );
+
+        // Drop and recreate with new sort config
+        catalog
+            .drop_table("sorted_table")
+            .await
+            .expect("Failed to drop table");
         let table_id_2 = catalog
             .create_table(options_sorted)
             .await
-            .expect("Failed to create table after sort_columns change");
+            .expect("Failed to create table after drop and recreate");
 
         assert_ne!(table_id_1, table_id_2);
 

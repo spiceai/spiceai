@@ -124,7 +124,7 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
 /// Transform schema according to `unsupported_type_action` policy
 /// Always converts Float16 to Float32 and normalizes timestamps to Microsecond (these are compatible transformations)
 /// Handles truly unsupported types according to the action: String (convert to Utf8) or Error (return error)
-fn transform_schema_for_vortex(
+pub(crate) fn transform_schema_for_vortex(
     schema: &arrow::datatypes::Schema,
     unsupported_type_action: UnsupportedTypeAction,
 ) -> Result<arrow::datatypes::Schema> {
@@ -976,9 +976,9 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         // Cayenne requires a source for file mode with directory-based storage
         let source = source.ok_or_else(|| {
-            Box::new(Error::InvalidConfiguration {
+            Box::<dyn std::error::Error + Send + Sync>::from(Error::InvalidConfiguration {
                 detail: Arc::from("Source required for Cayenne accelerator"),
-            }) as Box<dyn std::error::Error + Send + Sync>
+            })
         })?;
 
         let dir_path = self.resolve_storage_config(source).boxed()?;
@@ -1136,7 +1136,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             let creator = Arc::new(CayennePartitionCreator::new(
-                table_name,
+                table_name.clone(),
                 PathBuf::from(&dir_path),
                 partition_by.clone(),
                 Arc::clone(&arrow_schema),
@@ -1331,7 +1331,6 @@ impl CayennePartitionCreator {
         let partition_dir = to_hive_partition_dir(&pairings)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
         Ok(self.base_path.join(partition_dir))
     }
 }

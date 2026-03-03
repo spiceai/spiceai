@@ -8,13 +8,13 @@ The Spice open source project provides multiple distribution variants to support
 
 ## Default Distribution
 
-The default distribution includes all features including AI/ML model support. This is the recommended distribution for most users.
+The default distribution includes all standard data connectors and accelerators with ODBC support. This is the base distribution for data federation and acceleration.
 
 **Included Features:**
 
 - All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, etc.)
 - Embedded data accelerators (Spice Cayenne, DuckDB, SQLite)
-- AI/ML model inference (LLMs, embeddings)
+- ODBC connectivity
 - Search capabilities (Vector and BM-25 Full-Text-Search)
 - Default memory allocator (snmalloc)
 
@@ -33,6 +33,31 @@ docker pull ghcr.io/spiceai/spiceai:latest
 # or
 docker pull spiceai/spiceai:latest
 ```
+
+## Models Distribution
+
+The models distribution extends the default distribution with AI/ML model support. This is the recommended distribution for most users who need AI capabilities.
+
+**Included Features:**
+
+- All default distribution features
+- AI/ML model inference (LLMs, embeddings)
+
+**Installation:**
+
+```bash
+curl https://install.spiceai.org | /bin/bash
+```
+
+## NAS Distribution
+
+The NAS (Network Attached Storage) distribution extends the models distribution with NFS and SMB support for network file system connectivity. Available for Linux x86_64 only.
+
+**Included Features:**
+
+- All models distribution features
+- NFS (Network File System) connector
+- SMB (Server Message Block) connector
 
 ## Data Distribution
 
@@ -154,37 +179,36 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 ## Platform Support
 
-| Platform                      | Default | Data            | Metal | CUDA            |
-| ----------------------------- | ------- | --------------- | ----- | --------------- |
-| Linux x86_64                  | ✅       | Nightly         | ❌     | Nightly         |
-| Linux aarch64                 | ✅       | Nightly         | ❌     | ❌               |
-| macOS aarch64 (Apple Silicon) | ✅       | Nightly         | ✅     | ❌               |
-| Windows (WSL)                 | ✅       | Nightly         | ❌     | Nightly         |
-| Windows (Native)              | ❌       | Enterprise only | ❌     | Enterprise only |
+| Platform                      | Default | Models | NAS | Metal | CUDA    |
+| ----------------------------- | ------- | ------ | --- | ----- | ------- |
+| Linux x86_64                  | ✅       | ✅      | ✅   | ❌     | Nightly |
+| Linux aarch64                 | ✅       | ✅      | ❌   | ❌     | ❌       |
+| macOS aarch64 (Apple Silicon) | ✅       | ✅      | ❌   | ✅     | ❌       |
+| Windows (CLI only)            | ✅       | ❌      | ❌   | ❌     | ❌       |
 
-> **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing). Open source users on Windows should use Windows Subsystem for Linux (WSL).
+> **Note:** Windows support is limited to the Spice CLI. The Spice runtime is not supported on Windows. Windows users who need the runtime should use Windows Subsystem for Linux (WSL).
 
 ## Choosing a Distribution
 
 | Use Case                                | Recommended Distribution     |
 | --------------------------------------- | ---------------------------- |
-| General purpose with AI capabilities    | Default                      |
-| Data federation only, minimal footprint | Data (nightly)               |
+| Data federation only, minimal footprint | Default                      |
+| General purpose with AI capabilities    | Models                       |
+| Network file system connectivity        | NAS                          |
 | macOS with GPU acceleration             | Metal                        |
 | Linux with NVIDIA GPU                   | CUDA (nightly)               |
 | Memory allocation benchmarking          | Allocator variants (nightly) |
 
 ## Additional Connectors
 
-Some connectors require additional dependencies and are available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing):
+Some connectors require additional system dependencies:
 
-- **ODBC** - Connect to any ODBC-compatible data source
-- **NFS** - Network File System support
+- **NFS** - Network File System support (requires `libnfs`; included in the NAS distribution)
+- **SMB** - Server Message Block support (included in the NAS distribution)
 
 These can be built locally for development and testing:
 
 ```bash
-make install-odbc
 make install-nfs
 ```
 
@@ -197,7 +221,7 @@ You can build custom distributions with specific feature combinations:
 SPICED_CUSTOM_FEATURES="duckdb,postgres,sqlite,models" make build-runtime
 
 # Build with non-default features added to defaults
-SPICED_NON_DEFAULT_FEATURES="odbc" make install
+SPICED_NON_DEFAULT_FEATURES="nfs" make install
 ```
 
 See the [Makefile](../Makefile) for all available build targets and options.

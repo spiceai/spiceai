@@ -68,9 +68,19 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   lint-rust:
-    name: Rust Lint
-    runs-on: spicehq-dev-runners
+    name: ${{ matrix.variant.name }}
+    runs-on: spiceai-macos
     needs: check_changes
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: Rust Lint
+            command: lint-rust
+          - name: Rust Lint (Models)
+            command: lint-rust-models
+          - name: Rust Lint (NAS)
+            command: lint-rust-nas
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -114,9 +124,9 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      - name: Run Rust lint
+      - name: Run ${{ matrix.variant.name }}
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make lint-rust
+        run: make ${{ matrix.variant.command }}
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -124,7 +134,7 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Validate datafusion-table-providers commit
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.variant.command == 'lint-rust'
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
           BRANCH: spiceai-52
@@ -133,11 +143,11 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  # Build and test after linting passes
+  # Build and test runs concurrently with linting
   build-test:
     name: Build and Test
     runs-on: spicehq-dev-runners
-    needs: [check_changes, lint-rust]
+    needs: [check_changes]
     env:
       GOVER: 1.25.5
 

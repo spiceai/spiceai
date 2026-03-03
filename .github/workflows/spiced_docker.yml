@@ -177,7 +177,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,nfs,odbc,vortex" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
@@ -246,7 +246,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,nfs,odbc,vortex" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
@@ -296,7 +296,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=cuda" >> $GITHUB_ENV
           echo "BINARY_VARIANT=cuda" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,cuda,nfs,odbc,vortex" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA image

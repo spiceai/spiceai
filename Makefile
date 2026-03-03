@@ -94,7 +94,42 @@ lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	## Default variant: no models, no nfs
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
+.PHONY: lint-rust-models
+lint-rust-models:
+	## Models variant lint
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
@@ -111,6 +146,41 @@ lint-rust:
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
 	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
+.PHONY: lint-rust-nas
+lint-rust-nas:
+	## NAS variant lint (requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -152,7 +222,7 @@ endif
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
-	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	## All except metal, cuda, nfs (nfs requires system libnfs library, use lint-rust-fix with FEATURES=...nfs)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --all-targets --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \

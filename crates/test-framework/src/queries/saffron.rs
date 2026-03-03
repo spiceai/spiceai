@@ -191,7 +191,6 @@ fn generate_queries_with_dynamic_parameters(
 }
 
 /// Build a parameter set dynamically from a record and return the complete query.
-#[expect(clippy::too_many_lines)]
 fn create_query_with_parameter_set(mut query: Query, record: &NumberWithSenderInfoRecord) -> Query {
     let qtype = query.name.strip_prefix("saffron_").unwrap_or(&query.name);
 
