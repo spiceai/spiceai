@@ -1120,7 +1120,7 @@ impl PartitionManagementTask {
             }
         }
 
-        if !success_count.is_empty() || !failure_count.is_empty() {
+        if success_count + failure_count > 0 {
             tracing::info!(
                 success_count,
                 failure_count,
