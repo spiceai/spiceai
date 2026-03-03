@@ -74,10 +74,11 @@ async fn setup_test_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table_provider =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "test_table",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,

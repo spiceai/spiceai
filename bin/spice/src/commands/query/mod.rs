@@ -201,7 +201,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                     .map(|q| {
                         serde_json::json!({
                             "query_id": q.query_id,
-                            "status": q.state.clone(),
+                            "status": q.status.to_string(),
                             "created_at": q.created_at,
                             "sql_preview": q.sql_preview,
                         })
@@ -219,7 +219,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                 };
                 table.add_row(vec![
                     q.query_id.clone(),
-                    q.state.clone(),
+                    q.status.to_string(),
                     q.created_at.clone(),
                     sql,
                 ]);

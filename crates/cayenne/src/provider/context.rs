@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion_execution::config::SessionConfig;
+use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexTableOptions};
@@ -47,6 +47,12 @@ pub struct CayenneContext {
     session_config: SessionConfig,
     /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
     upload_semaphore: Arc<Semaphore>,
+    /// Shared `RuntimeEnv` from the main Spice runtime.
+    ///
+    /// Cayenne uses this `RuntimeEnv` for all internal `SessionContext`
+    /// creation, ensuring that the `list_files_cache` (and other caches/object stores)
+    /// are shared with the main query engine.
+    runtime_env: Arc<RuntimeEnv>,
 }
 
 impl CayenneContext {
@@ -56,13 +62,14 @@ impl CayenneContext {
     /// The returned `Arc` should be shared across all table providers that should
     /// use the same caches.
     #[must_use]
-    pub fn new(config: &VortexConfig) -> Arc<Self> {
+    pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>) -> Arc<Self> {
         let vortex_format = Self::create_vortex_format(config);
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency)),
+            runtime_env,
         })
     }
 
@@ -102,6 +109,12 @@ impl CayenneContext {
     #[must_use]
     pub fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
+    }
+
+    /// Get the shared `RuntimeEnv`.
+    #[must_use]
+    pub fn runtime_env(&self) -> &Arc<RuntimeEnv> {
+        &self.runtime_env
     }
 
     /// Get the maximum number of concurrent file uploads.

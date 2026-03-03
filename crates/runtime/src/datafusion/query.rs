@@ -407,7 +407,7 @@ impl Query {
 
         // Submit the job to the Ballista scheduler
         let ballista_job_id = scheduler
-            .submit_job(job_id, session_ctx, &plan)
+            .submit_job(job_id, session_ctx, &plan, None)
             .await
             .map_err(|e| Error::JobSubmissionFailed {
                 message: e.to_string(),

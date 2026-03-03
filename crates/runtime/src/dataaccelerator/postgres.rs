@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -113,6 +114,7 @@ impl DataAccelerator for PostgresAccelerator {
         mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),

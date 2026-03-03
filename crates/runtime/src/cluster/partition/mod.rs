@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod discovery;
+pub mod executor_selection;
 mod manager;
 mod metadata;
 pub mod scheduler_task;

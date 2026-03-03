@@ -81,8 +81,11 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -95,7 +98,6 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
     insert_batch(&table, batch).await?;
 
     // Delete and verify it works correctly (Int64Pk strategy)
-    let ctx = SessionContext::new();
     let filter = col("id").eq(lit(2i64));
     let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
@@ -157,8 +159,11 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -171,7 +176,6 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
     insert_batch(&table, batch).await?;
 
     // Delete and verify
-    let ctx = SessionContext::new();
     let filter = col("code").eq(lit("B"));
     let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
@@ -233,8 +237,11 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -248,7 +255,6 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
     insert_batch(&table, batch).await?;
 
     // Delete with composite key
-    let ctx = SessionContext::new();
     let filter = col("region").eq(lit("US")).and(col("id").eq(lit(1i64)));
     let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
@@ -307,8 +313,11 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -321,7 +330,6 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
     insert_batch(&table, batch).await?;
 
     // Delete by value (not PK)
-    let ctx = SessionContext::new();
     let filter = col("value").eq(lit(3i64));
     let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
@@ -375,8 +383,11 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -389,7 +400,6 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
     insert_batch(&table, batch).await?;
 
     // Delete and verify
-    let ctx = SessionContext::new();
     let filter = col("id").eq(lit(2i32));
     let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
@@ -452,8 +462,11 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -465,20 +478,19 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
     insert_batch(&table, batch).await?;
 
     // Delete a row
-    let ctx = SessionContext::new();
     let filter = col("id").eq(lit(3i64));
     let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 
     // Reopen table
+    let ctx2 = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(get_catalog(&fixture))
+        CayenneTableProviderBuilder::new(get_catalog(&fixture), ctx2.runtime_env())
             .open("persist_int64pk")
             .await?,
     );
 
     // Delete another row with reopened table
-    let ctx2 = SessionContext::new();
     let filter2 = col("id").eq(lit(5i64));
     let plan2 =
         DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
@@ -526,8 +538,11 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(get_catalog(&fixture), table_options, ctx.runtime_env())
+            .await?,
+    );
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -545,13 +560,12 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 
     // Reopen and delete more
+    let ctx2 = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(get_catalog(&fixture))
+        CayenneTableProviderBuilder::new(get_catalog(&fixture), ctx2.runtime_env())
             .open("persist_position")
             .await?,
     );
-
-    let ctx2 = SessionContext::new();
     let filter2 = col("value").eq(lit(1i64));
     let plan2 =
         DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
@@ -604,6 +618,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -633,6 +648,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );
@@ -662,6 +678,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
             },
+            ctx.runtime_env(),
         )
         .await?,
     );

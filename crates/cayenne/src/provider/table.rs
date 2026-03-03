@@ -50,6 +50,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::{Constraints, DFSchema};
+use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
@@ -176,19 +177,20 @@ pub struct CayenneTableProvider {
 ///
 /// ```ignore
 /// // Open an existing table
-/// let provider = CayenneTableProviderBuilder::new(catalog)
+/// let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
 ///     .with_retention_filters(filters)
 ///     .with_object_store(config)
 ///     .open("my_table").await?;
 ///
 /// // Create a new table
-/// let provider = CayenneTableProviderBuilder::new(catalog)
+/// let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
 ///     .with_retention_filters(filters)
 ///     .create(options).await?;
 /// ```
 #[derive(Clone)]
 pub struct CayenneTableProviderBuilder {
     catalog: Arc<dyn MetadataCatalog>,
+    runtime_env: Arc<RuntimeEnv>,
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
@@ -196,11 +198,12 @@ pub struct CayenneTableProviderBuilder {
 }
 
 impl CayenneTableProviderBuilder {
-    /// Create a new builder with the required catalog.
+    /// Create a new builder with the required catalog and shared `RuntimeEnv`.
     #[must_use]
-    pub fn new(catalog: Arc<dyn MetadataCatalog>) -> Self {
+    pub fn new(catalog: Arc<dyn MetadataCatalog>, runtime_env: Arc<RuntimeEnv>) -> Self {
         Self {
             catalog,
+            runtime_env,
             retention_filters: Vec::new(),
             time_retention_filter_builder: None,
             object_store_config: None,
@@ -263,6 +266,7 @@ impl CayenneTableProviderBuilder {
             self.retention_filters,
             self.time_retention_filter_builder,
             self.object_store_config,
+            self.runtime_env,
             self.context,
         )
         .await
@@ -277,12 +281,14 @@ impl CayenneTableProviderBuilder {
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
         let _table_id = self.catalog.create_table(options).await?;
+
         CayenneTableProvider::new_internal(
             &table_name,
             self.catalog,
             self.retention_filters,
             self.time_retention_filter_builder,
             self.object_store_config,
+            self.runtime_env,
             self.context,
         )
         .await
@@ -1054,8 +1060,12 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
-    pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+    pub async fn new(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Result<Self> {
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .open(table_name)
             .await
     }
@@ -1072,8 +1082,9 @@ impl CayenneTableProvider {
         table_name: &str,
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_retention_filters(retention_filters)
             .open(table_name)
             .await
@@ -1086,9 +1097,15 @@ impl CayenneTableProvider {
         retention_filters: Vec<Expr>,
         time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
         object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+        runtime_env: Arc<RuntimeEnv>,
         context: Option<Arc<CayenneContext>>,
     ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
+
+        // Use the provided context (for partition cache sharing) or build a
+        // fresh one from this table's VortexConfig and the shared RuntimeEnv.
+        let context = context
+            .unwrap_or_else(|| CayenneContext::new(&table_metadata.vortex_config, runtime_env));
 
         if table_metadata.path.starts_with("s3://") && object_store_config.is_none() {
             return Err(Error::Internal {
@@ -1107,9 +1124,6 @@ impl CayenneTableProvider {
             table_metadata.table_id,
             &table_metadata.current_snapshot_id,
         );
-
-        // Use provided context or create a new one from table metadata config
-        let context = context.unwrap_or_else(|| CayenneContext::new(&table_metadata.vortex_config));
 
         // Determine if this table has a primary key for key-based deletion
         let has_primary_key = !table_metadata.primary_key.is_empty();
@@ -1215,8 +1229,9 @@ impl CayenneTableProvider {
     pub async fn create_table(
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .create(options)
             .await
             .map_err(Into::into)
@@ -1233,8 +1248,9 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
         retention_filters: Vec<Expr>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Self> {
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_retention_filters(retention_filters)
             .create(options)
             .await
@@ -3345,6 +3361,10 @@ impl CayenneTableProvider {
             &current_snapshot,
         );
 
+        // Invalidate the list-files cache for the snapshot directory so the next
+        // scan discovers newly written files
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
+
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
@@ -3368,6 +3388,39 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    /// Invalidate the `list_files_cache` entry for the given snapshot directory URL.
+    ///
+    /// `DataFusion`'s `ListingTableUrl` caches directory listings in the `RuntimeEnv`'s
+    /// `CacheManager` with infinite TTL. After files are added or removed from a
+    /// snapshot directory, the stale cache entry must be evicted so the next scan
+    /// lists files fresh from the filesystem / object store.
+    pub(crate) fn invalidate_list_files_cache(
+        runtime_env: &Arc<RuntimeEnv>,
+        snapshot_dir_url: &str,
+    ) {
+        let Some(cache) = runtime_env.cache_manager.get_list_files_cache() else {
+            return;
+        };
+
+        // Parse the URL the same way `ListingTableUrl::parse` does to derive
+        // the `object_store::path::Path` prefix used as the cache key.
+        let Ok(table_url) = ListingTableUrl::parse(snapshot_dir_url) else {
+            tracing::warn!(
+                "Failed to parse snapshot URL for cache invalidation: {snapshot_dir_url}"
+            );
+            return;
+        };
+
+        let key = TableScopedPath {
+            table: None,
+            path: table_url.prefix().clone(),
+        };
+
+        if cache.remove(&key).is_some() {
+            tracing::debug!("Invalidated list-files cache for {snapshot_dir_url}");
+        }
     }
 
     /// Load both position-based and key-based deletion vectors from the catalog.
@@ -4017,25 +4070,6 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Invalidate the DF52 list-files cache to preserve DF51 behavior where every scan
-        // lists files fresh from the ObjectStore / filesystem.
-        //
-        // DataFusion v52 introduced `list_files_cache` (commit 1ac18a3af) which
-        // caches ObjectStore directory listings with infinite TTL by default. This causes stale
-        // results when Cayenne adds or removes files between scans (e.g. after an insert writes
-        // new Vortex files into a snapshot directory, subsequent scans would not discover them).
-        //
-        // Ideally this invalidation would happen on the write path (in `CayenneDataSink::write_all`)
-        // after files are committed. However, the write's `TaskContext` and the scan caller's
-        // `Session` hold *different* `RuntimeEnv` instances — each with its own `CacheManager`.
-        // Clearing the write-side cache has no effect on the scan-side cache. Until we unify the
-        // `RuntimeEnv` across read and write paths (or propagate invalidation signals), we
-        // clear the cache at scan time to ensure data correctness.
-        // https://github.com/spiceai/spiceai/issues/9553
-        if let Some(cache) = state.runtime_env().cache_manager.get_list_files_cache() {
-            cache.clear();
-        }
-
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
         if let Some(ref config) = self.object_store_config {
@@ -4383,6 +4417,7 @@ impl CayenneTableProvider {
                 Arc::clone(&self.protected_snapshots),
                 self.table_metadata.table_id,
                 self.table_metadata.path.clone(),
+                Arc::clone(self.context.runtime_env()),
             )),
             &self.table_metadata.schema,
         )))
@@ -4559,7 +4594,7 @@ mod tests {
     impl TableProviderFactory for CayenneTableProviderFactory {
         async fn create(
             &self,
-            _state: &dyn Session,
+            state: &dyn Session,
             cmd: &CreateExternalTable,
         ) -> std::result::Result<Arc<dyn TableProvider>, DataFusionError> {
             let metastore_type = cmd
@@ -4628,6 +4663,7 @@ mod tests {
                 catalog,
                 table_options,
                 retention_filters,
+                Arc::clone(state.runtime_env()),
             )
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -4890,6 +4926,7 @@ mod tests {
         table_name: &str,
         schema: SchemaRef,
         sort_columns: Vec<String>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let metadata_dir = format!(
@@ -4910,8 +4947,6 @@ mod tests {
             ..VortexConfig::default()
         };
 
-        let context = CayenneContext::new(&vortex_config);
-
         let options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema,
@@ -4922,8 +4957,7 @@ mod tests {
             vortex_config,
         };
 
-        let provider = CayenneTableProviderBuilder::new(catalog)
-            .with_context(context)
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .create(options)
             .await
             .expect("table created");
@@ -4950,8 +4984,12 @@ mod tests {
     }
 
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
-    async fn read_all(provider: &CayenneTableProvider, table_name: &str) -> Vec<RecordBatch> {
-        let ctx = SessionContext::new();
+    async fn read_all(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+    ) -> Vec<RecordBatch> {
+        ctx.deregister_table(table_name).ok();
         ctx.register_table(table_name, Arc::new(provider.clone_for_write()))
             .expect("table registered");
         let df = ctx
@@ -4971,10 +5009,12 @@ mod tests {
             Field::new("value", DataType::Int64, false),
         ]));
 
+        let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
             "sort_rewrite_test",
             Arc::clone(&schema),
             vec!["id".to_string()],
+            ctx.runtime_env(),
         )
         .await;
 
@@ -5000,7 +5040,7 @@ mod tests {
         insert_batch(&provider, batch2).await;
 
         // Verify data is present but unsorted before rewrite
-        let before = read_all(&provider, "sort_rewrite_test").await;
+        let before = read_all(&ctx, &provider, "sort_rewrite_test").await;
         let total_rows_before: usize = before.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows_before, 5, "should have 5 rows before sort");
 
@@ -5011,7 +5051,7 @@ mod tests {
             .expect("sort_and_rewrite_data should succeed");
 
         // Read back and verify data is sorted by "id" ascending
-        let after = read_all(&provider, "sort_rewrite_test").await;
+        let after = read_all(&ctx, &provider, "sort_rewrite_test").await;
         let total_rows_after: usize = after.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows_after, 5, "should still have 5 rows after sort");
 
@@ -5053,10 +5093,12 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
+        let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
             "sort_empty_test",
             Arc::clone(&schema),
             vec!["id".to_string()],
+            ctx.runtime_env(),
         )
         .await;
 
@@ -5066,7 +5108,7 @@ mod tests {
             .await
             .expect("sort_and_rewrite_data on empty table should succeed");
 
-        let after = read_all(&provider, "sort_empty_test").await;
+        let after = read_all(&ctx, &provider, "sort_empty_test").await;
         let total_rows: usize = after.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 0, "empty table should remain empty after sort");
     }
@@ -5081,10 +5123,12 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
         ]));
 
+        let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
             "sort_preserve_test",
             Arc::clone(&schema),
             vec!["ts".to_string()],
+            ctx.runtime_env(),
         )
         .await;
 
@@ -5111,7 +5155,7 @@ mod tests {
             .expect("sort_and_rewrite_data should succeed");
 
         // Read back and verify all 10 rows are present and sorted
-        let after = read_all(&provider, "sort_preserve_test").await;
+        let after = read_all(&ctx, &provider, "sort_preserve_test").await;
         let total_rows: usize = after.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 10, "all 10 rows should be preserved");
 

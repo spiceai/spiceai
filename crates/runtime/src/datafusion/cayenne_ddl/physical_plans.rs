@@ -253,7 +253,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
         let table_name = self.table_name.clone();
         let arrow_schema = Arc::clone(&self.arrow_schema);
@@ -263,6 +263,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let catalog_list = Arc::clone(&self.catalog_list);
         let executor_registry = self.executor_registry.clone();
         let result_schema = ddl_result_schema();
+        let runtime_env = context.runtime_env();
 
         let stream = futures::stream::once(async move {
             // Get the Cayenne catalog provider
@@ -302,6 +303,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
                                 Arc::clone(&metadata_catalog),
                                 df_schema_name.clone(),
+                                Arc::clone(&runtime_env),
                             ));
                             cayenne_provider.register_schema_provider(
                                 &df_schema_name,
@@ -312,8 +314,10 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
                     // Open and register the existing table provider if not already present.
                     if !schema_provider.table_exist(&table_name) {
-                        let builder =
-                            CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
+                        let builder = CayenneTableProviderBuilder::new(
+                            Arc::clone(&metadata_catalog),
+                            Arc::clone(&runtime_env),
+                        );
                         if let Ok(provider) = builder.open(&metadata_table_name).await {
                             let provider = Arc::new(provider);
                             let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
@@ -366,7 +370,10 @@ impl ExecutionPlan for CayenneCreateTableExec {
             };
 
             // Create the table via Cayenne
-            let builder = CayenneTableProviderBuilder::new(Arc::clone(&metadata_catalog));
+            let builder = CayenneTableProviderBuilder::new(
+                Arc::clone(&metadata_catalog),
+                Arc::clone(&runtime_env),
+            );
 
             let provider = builder.create(create_options).await.map_err(|e| {
                 DataFusionError::Execution(format!(
@@ -387,6 +394,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 let new_schema = Arc::new(CayenneSchemaProvider::new_empty(
                     Arc::clone(&metadata_catalog),
                     df_schema_name.clone(),
+                    Arc::clone(&runtime_env),
                 ));
                 cayenne_provider.register_schema_provider(
                     &df_schema_name,
@@ -512,13 +520,14 @@ impl ExecutionPlan for CayenneCreateSchemaExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
         let schema_name = self.schema_name.clone();
         let if_not_exists = self.if_not_exists;
         let df_catalog_name = self.df_catalog_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let result_schema = ddl_result_schema();
+        let runtime_env = context.runtime_env();
 
         let stream = futures::stream::once(async move {
             let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
@@ -550,6 +559,7 @@ impl ExecutionPlan for CayenneCreateSchemaExec {
             let schema_provider = Arc::new(CayenneSchemaProvider::new_empty(
                 Arc::clone(cayenne_provider.metadata_catalog()),
                 schema_name.clone(),
+                runtime_env,
             ));
 
             cayenne_provider

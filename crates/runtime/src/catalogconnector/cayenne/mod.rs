@@ -87,11 +87,12 @@ impl CatalogConnector for CayenneCatalogConnector {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        _runtime: Arc<Runtime>,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn data_components::RefreshableCatalogProvider>> {
+        let runtime_env = runtime.datafusion().ctx.runtime_env();
         let refreshable_provider = Arc::new(
-            CayenneCatalogProvider::try_new(self.params.clone(), catalog)
+            CayenneCatalogProvider::try_new(self.params.clone(), catalog, runtime_env)
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),
