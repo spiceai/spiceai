@@ -62,7 +62,6 @@ The `args` are appended to the mapped CLI command.
 - `run.load`
 - `run.bench`
 - `run.data_consistency`
-- `run.evals`
 - `run.search`
 - `run.query`
 - `run.text_to_sql`
@@ -72,7 +71,6 @@ The `args` are appended to the mapped CLI command.
 - `export.load`
 - `export.bench`
 - `export.data_consistency`
-- `export.evals`
 - `export.search`
 - `export.text_to_sql`
 - `run.append` / `export.append` (only when built with `append` feature)
@@ -412,15 +410,6 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 1024,"messages": [{"role": "user", "content": "Hello, world"}]}
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
-
-### Running Evaluation tests
-
-Run model evaluations (evals) test. In addition to the common options, supports specifying:
-
-- `--model <MODEL NAME>`: The language model (as named in Spicepod) to test against. If not specified, the first model from the Spicepod definition will be used.
-- `--eval <EVAL NAME>`: The eval name (as named in Spicepod) to test against. If not specified, the first eval from the Spicepod definition will be used.
-
-`spidapter run evals [OPTIONS]`
 
 ### Running Vector Search Tests
 
