@@ -398,6 +398,9 @@ impl ClusterHarnessBuilder {
             let executor_app =
                 maybe_app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
 
+            tracing::warn!(
+                "Executor {i}: Ports: {executor_ports:?}. Scheduler: {scheduler_cluster_addr}",
+            );
             let executor_config = Config {
                 http_bind_address: executor_ports.http_addr(),
                 flight_bind_address: executor_ports.flight_addr(),
