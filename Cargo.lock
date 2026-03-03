@@ -300,7 +300,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -311,7 +311,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2255,7 +2255,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=8cc29518e40bbff67b6ad8873e4fd8e8407c88f9#8cc29518e40bbff67b6ad8873e4fd8e8407c88f9"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=b4a797c54bc9b04e61581cd36793166f31ebdbb8#b4a797c54bc9b04e61581cd36793166f31ebdbb8"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2296,7 +2296,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=8cc29518e40bbff67b6ad8873e4fd8e8407c88f9#8cc29518e40bbff67b6ad8873e4fd8e8407c88f9"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=b4a797c54bc9b04e61581cd36793166f31ebdbb8#b4a797c54bc9b04e61581cd36793166f31ebdbb8"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2329,7 +2329,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=8cc29518e40bbff67b6ad8873e4fd8e8407c88f9#8cc29518e40bbff67b6ad8873e4fd8e8407c88f9"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=b4a797c54bc9b04e61581cd36793166f31ebdbb8#b4a797c54bc9b04e61581cd36793166f31ebdbb8"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4905,16 +4905,6 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa12038120eb13347a6ae2ffab1d34efe78150125108627fd85044dd4d6ff1e"
-dependencies = [
- "half",
- "libloading",
-]
-
-[[package]]
-name = "cudarc"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d5be1e9776a20360ca270df637b391c85d48ea57508140f30a4e8f6da91884a"
@@ -6500,7 +6490,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7062,7 +7052,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9324,7 +9314,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -9916,7 +9906,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9989,7 +9979,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12074,7 +12064,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14365,7 +14355,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.10.5",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "petgraph",
@@ -14399,7 +14389,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -16435,7 +16425,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16536,7 +16526,7 @@ dependencies = [
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -19097,7 +19087,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -21204,7 +21194,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "arcref",
  "arrow-arith",
@@ -21216,14 +21206,18 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "arrow-string",
+ "async-lock",
+ "bytes",
  "cfg-if",
  "enum-iterator",
  "flatbuffers",
  "futures",
  "getrandom 0.3.4",
+ "half",
  "humansize",
  "inventory",
  "itertools 0.14.0",
+ "jiff",
  "multiversion",
  "num-traits",
  "num_enum",
@@ -21234,19 +21228,16 @@ dependencies = [
  "rand 0.9.2",
  "rustc-hash 2.1.1",
  "simdutf8",
+ "static_assertions",
  "termtree",
  "tracing",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-compute",
- "vortex-dtype",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-scalar",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-vector",
 ]
 
 [[package]]
@@ -21332,12 +21323,11 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "arrow-buffer",
  "bitvec",
  "bytes",
- "cudarc 0.18.2",
  "itertools 0.14.0",
  "simdutf8",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
@@ -21366,27 +21356,6 @@ dependencies = [
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
-]
-
-[[package]]
-name = "vortex-compute"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
- "half",
- "itertools 0.14.0",
- "multiversion",
- "num-traits",
- "paste",
- "tracing",
- "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-dtype",
- "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-vector",
 ]
 
 [[package]]
@@ -21448,39 +21417,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "vortex-dtype"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
-dependencies = [
- "arrow-buffer",
- "arrow-schema",
- "flatbuffers",
- "half",
- "itertools 0.14.0",
- "jiff",
- "num-traits",
- "num_enum",
- "paste",
- "prost 0.14.3",
- "serde",
- "static_assertions",
- "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
-]
-
-[[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
  "jiff",
  "prost 0.14.3",
- "url",
 ]
 
 [[package]]
@@ -21563,10 +21507,11 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "flatbuffers",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
 ]
 
 [[package]]
@@ -21627,7 +21572,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -21636,9 +21581,9 @@ dependencies = [
  "pin-project-lite",
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-dtype",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
 ]
 
 [[package]]
@@ -21698,9 +21643,8 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
- "arrow-buffer",
  "itertools 0.14.0",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
@@ -21743,7 +21687,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "prost 0.14.3",
  "prost-types",
@@ -21772,26 +21716,6 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
-]
-
-[[package]]
-name = "vortex-scalar"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
-dependencies = [
- "arrow-array",
- "bytes",
- "itertools 0.14.0",
- "num-traits",
- "paste",
- "prost 0.14.3",
- "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-dtype",
- "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-vector",
 ]
 
 [[package]]
@@ -21837,9 +21761,11 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
+ "arcref",
  "dashmap",
+ "parking_lot 0.12.5",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
 ]
@@ -21874,7 +21800,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#c536c9aedc8fdf8e3787a31c43c8e41318cf3956"
 dependencies = [
  "dashmap",
  "hashbrown 0.16.1",
@@ -21889,20 +21815,6 @@ dependencies = [
  "dashmap",
  "hashbrown 0.16.1",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=c536c9aedc8fdf8e3787a31c43c8e41318cf3956)",
-]
-
-[[package]]
-name = "vortex-vector"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
-dependencies = [
- "num-traits",
- "paste",
- "static_assertions",
- "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-dtype",
- "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
- "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
 ]
 
 [[package]]
