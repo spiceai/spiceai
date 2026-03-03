@@ -246,10 +246,11 @@ impl MetadataCatalog for CayenneCatalog {
                         return Ok(table_id);
                     }
 
-                    // Configuration changed - return error to prevent accidental reuse of existing table with incompatible schema or settings
-                    return Err(CatalogError::ChangedConfiguration {
-                        table_name: table_name.clone(),
-                    });
+                    // Configuration changed - drop the old table and recreate with new config
+                    tracing::info!(
+                        "Table '{table_name}' configuration changed, dropping and recreating"
+                    );
+                    self.drop_table(&table_name).await?;
                 }
                 Err(e) => {
                     return Err(CatalogError::InvalidMetadata {
