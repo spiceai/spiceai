@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "75e43e2ecd16",
+  "session_id": "6b697097-8b1f-45a0-ad9a-d754e139b15e",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-03T01:58:23.151707Z",
+  "branch": "jeadie/26-03-03/partition-acceleration",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/runtime/src/dataaccelerator/partitioned_arrow.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "1e02dc2ae3dd",
+  "token_usage": {
+    "input_tokens": 8,
+    "cache_creation_tokens": 6692,
+    "cache_read_tokens": 137353,
+    "output_tokens": 1438,
+    "api_call_count": 6
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-03T01:58:23.112385Z",
+    "agent_lines": 16,
+    "human_added": 9,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 25,
+    "agent_percentage": 64
+  }
+}
