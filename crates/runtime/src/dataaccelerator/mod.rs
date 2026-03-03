@@ -22,6 +22,7 @@ use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
@@ -345,7 +346,12 @@ impl AcceleratorEngineRegistry {
         };
 
         let table_provider = accelerator
-            .create_external_table(external_table, source, partition_by)
+            .create_external_table(
+                external_table,
+                source,
+                partition_by,
+                Some(ctx.runtime_env()),
+            )
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -366,6 +372,7 @@ pub trait DataAccelerator: Send + Sync {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
@@ -1037,7 +1044,7 @@ mod accelerator_compat_tests {
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1051,7 +1058,7 @@ mod accelerator_compat_tests {
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
                     match TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1065,7 +1072,7 @@ mod accelerator_compat_tests {
                 Engine::DuckDB => {
                     use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1078,7 +1085,7 @@ mod accelerator_compat_tests {
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1184,6 +1191,7 @@ mod accelerator_compat_tests {
                         external_table,
                         Some(&dataset),
                         Vec::new(),
+                        None,
                     ))
                     .catch_unwind();
 
@@ -2291,7 +2299,7 @@ mod accelerator_compat_tests {
                     Engine::Sqlite => {
                         use crate::dataaccelerator::sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("SQLite table should be created")
                     }
@@ -2299,7 +2307,7 @@ mod accelerator_compat_tests {
                     Engine::Turso => {
                         use crate::dataaccelerator::turso::TursoAccelerator;
                         TursoAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("Turso table should be created")
                     }
@@ -2307,14 +2315,14 @@ mod accelerator_compat_tests {
                     Engine::DuckDB => {
                         use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                         DuckDBAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("DuckDB table should be created")
                     }
                     Engine::Arrow => {
                         use crate::dataaccelerator::arrow::ArrowAccelerator;
                         ArrowAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("Arrow table should be created")
                     }
@@ -2391,7 +2399,7 @@ mod accelerator_compat_tests {
                         });
 
                         CayenneAccelerator::new()
-                            .create_external_table(external_table, Some(&dataset), Vec::new())
+                            .create_external_table(external_table, Some(&dataset), Vec::new(), None)
                             .await
                             .expect("Vortex table should be created")
                     }

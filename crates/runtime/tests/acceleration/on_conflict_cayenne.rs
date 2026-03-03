@@ -95,11 +95,12 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "events",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -221,11 +222,12 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "events_drop",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -715,11 +717,10 @@ async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Err
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "partitioned_upsert_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -838,11 +839,10 @@ async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "composite_pk_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -974,11 +974,12 @@ async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> 
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "pk_no_conflict_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1198,10 +1199,12 @@ async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "large_batch_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1304,10 +1307,9 @@ async fn test_cayenne_special_characters() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
-            let table = Arc::new(table);
-
             let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+            let table = Arc::new(table);
             ctx.register_table(
                 "special_chars_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1406,10 +1408,9 @@ async fn test_cayenne_null_handling() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
-            let table = Arc::new(table);
-
             let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+            let table = Arc::new(table);
             ctx.register_table(
                 "null_handling_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1521,10 +1522,11 @@ async fn test_cayenne_upsert_batch_update() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
-            let table = Arc::new(table);
-
             let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
+            let table = Arc::new(table);
             ctx.register_table(
                 "batch_upsert_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1643,10 +1645,12 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "delete_insert_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1769,10 +1773,12 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "boundary_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,

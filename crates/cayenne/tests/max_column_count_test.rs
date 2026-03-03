@@ -89,9 +89,11 @@ async fn test_max_column_count_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Created Cayenne table with {MAX_COLUMN_COUNT} columns");
@@ -119,7 +121,6 @@ async fn test_max_column_count_impl(
     println!("✓ Inserted {rows_inserted} rows");
 
     // 5. Register with DataFusion and run queries
-    let ctx = SessionContext::new();
     ctx.register_table("wide_table", Arc::new(table))?;
 
     // 5a. Count query
@@ -337,9 +338,11 @@ mod additional_tests {
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
+        let ctx = SessionContext::new();
         let table = CayenneTableProvider::create_table(
             Arc::<cayenne::CayenneCatalog>::clone(catalog),
             table_options,
+            ctx.runtime_env(),
         )
         .await?;
 
@@ -360,7 +363,6 @@ mod additional_tests {
         insert_batch(&table, batch).await?;
 
         // Verify
-        let ctx = SessionContext::new();
         ctx.register_table("moderate_wide_table", Arc::new(table))?;
 
         let df = ctx

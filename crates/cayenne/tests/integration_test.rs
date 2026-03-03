@@ -65,9 +65,11 @@ async fn test_cayenne_basic_workflow_impl(
     };
 
     // 3. Create Cayenne table provider
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Table created");
@@ -79,7 +81,6 @@ async fn test_cayenne_basic_workflow_impl(
     println!("✓ Schema verified");
 
     // 5. Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("test_table", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
@@ -382,10 +383,11 @@ async fn test_cayenne_basic_workflow_impl(
     // This simulates what happens when spiced restarts or a new client connects
     let catalog_arc: Arc<dyn cayenne::MetadataCatalog> =
         Arc::<cayenne::CayenneCatalog>::clone(catalog);
-    let fresh_table = CayenneTableProvider::new("test_table", catalog_arc).await?;
+    let fresh_ctx = SessionContext::new();
+    let fresh_table =
+        CayenneTableProvider::new("test_table", catalog_arc, fresh_ctx.runtime_env()).await?;
 
     // Create a fresh context and register the fresh table
-    let fresh_ctx = SessionContext::new();
     fresh_ctx.register_table("test_table", Arc::new(fresh_table))?;
     println!("✓ Fresh table provider created from catalog");
 
@@ -589,9 +591,11 @@ async fn test_cayenne_statistics_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(&catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Table created");
@@ -604,7 +608,6 @@ async fn test_cayenne_statistics_impl(
     );
 
     // 4. Register table and insert data
-    let ctx = SessionContext::new();
     ctx.register_table(TableReference::bare("stats_table"), Arc::new(table))?;
 
     ctx.sql("INSERT INTO stats_table VALUES (1, 'test1'), (2, 'test2'), (3, 'test3')")
@@ -703,14 +706,14 @@ async fn test_cayenne_core_data_types_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(&catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     tracing::info!("✓ Table created with {} columns", schema.fields().len());
-
-    let ctx = SessionContext::new();
     ctx.register_table("types_test", Arc::new(table))?;
 
     // Insert test data with various types
@@ -947,15 +950,16 @@ async fn test_cayenne_sorted_insert_impl(
     };
 
     // Create table with sort configuration
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Table created with sort_columns=['timestamp']");
 
     // Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("sorted_table", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 

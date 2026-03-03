@@ -69,8 +69,10 @@ async fn setup_table(
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     Ok((table, ctx, schema))

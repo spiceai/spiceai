@@ -137,8 +137,10 @@ async fn setup_no_pk_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     Ok((table, ctx, schema))
@@ -581,8 +583,10 @@ async fn test_position_based_persistence_after_full_delete() -> TestResult<()> {
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
-        let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
         let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        );
         ctx.register_table(
             "full_delete_persist",
             Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -609,13 +613,16 @@ async fn test_position_based_persistence_after_full_delete() -> TestResult<()> {
         let catalog = Arc::new(CayenneCatalog::new(&db_path)?);
         catalog.init().await?;
 
+        let ctx = SessionContext::new();
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(Arc::clone(&catalog) as Arc<dyn MetadataCatalog>)
-                .open("full_delete_persist")
-                .await?,
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+            )
+            .open("full_delete_persist")
+            .await?,
         );
 
-        let ctx = SessionContext::new();
         ctx.register_table(
             "full_delete_persist",
             Arc::clone(&table) as Arc<dyn TableProvider>,

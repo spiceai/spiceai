@@ -25,6 +25,7 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     common::DFSchema,
     datasource::TableProvider,
@@ -284,6 +285,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 

@@ -71,12 +71,13 @@ async fn test_delete_with_primary_key_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
     println!("✓ Table created with primary key on 'id'");
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_pk", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -213,12 +214,13 @@ async fn test_delete_without_primary_key_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
     println!("✓ Table created WITHOUT primary key");
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_no_pk", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -315,11 +317,12 @@ async fn test_delete_all_rows_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_all", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -392,11 +395,12 @@ async fn test_delete_then_insert_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_insert", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
@@ -499,11 +503,12 @@ async fn test_delete_with_complex_filter_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("test_delete_complex", Arc::clone(&table) as _)?;
 
     // 4. Insert test data

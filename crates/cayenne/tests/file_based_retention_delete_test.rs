@@ -40,11 +40,14 @@ use cayenne::{
 use common::TestFixture;
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
 use datafusion_common::ScalarValue;
+use datafusion_execution::cache::TableScopedPath;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use object_store::ObjectMeta;
 use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -62,6 +65,10 @@ test_with_backends!(test_pk_file_based_retention_fresh_snapshot_preserved_impl);
 test_with_backends!(test_pk_file_based_retention_upsert_after_delete_impl);
 test_with_backends!(test_pk_file_based_retention_multiple_protected_snapshots_impl);
 
+// Cache invalidation tests
+test_with_backends!(test_cache_invalidated_after_append_impl);
+test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
+
 /// Test: File-based retention physically deletes files that are fully expired.
 ///
 /// Setup (3-second retention, position-based / no PK):
@@ -78,7 +85,9 @@ test_with_backends!(test_pk_file_based_retention_multiple_protected_snapshots_im
 async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 3;
     let table_name = "file_ret_delete";
-    let table = create_retention_table(&fixture, table_name, retention_seconds).await?;
+    let ctx = SessionContext::new();
+    let table =
+        create_retention_table(&fixture, table_name, retention_seconds, ctx.runtime_env()).await?;
 
     // Insert each row as a separate batch → separate Vortex file.
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -104,7 +113,14 @@ async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixtu
     );
 
     // Verify count(*) and individual rows
-    assert_table_contents(&table, table_name, &[1, 2], "After deleting expired file").await?;
+    assert_table_contents(
+        &ctx,
+        &table,
+        table_name,
+        &[1, 2],
+        "After deleting expired file",
+    )
+    .await?;
 
     Ok(())
 }
@@ -120,7 +136,9 @@ async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixtu
 async fn test_file_based_retention_no_eligible_files_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 60;
     let table_name = "file_ret_no_delete";
-    let table = create_retention_table(&fixture, table_name, retention_seconds).await?;
+    let ctx = SessionContext::new();
+    let table =
+        create_retention_table(&fixture, table_name, retention_seconds, ctx.runtime_env()).await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?;
@@ -138,7 +156,14 @@ async fn test_file_based_retention_no_eligible_files_impl(fixture: TestFixture) 
         "All Vortex files should still exist"
     );
 
-    assert_table_contents(&table, table_name, &[1, 2], "No rows should be removed").await?;
+    assert_table_contents(
+        &ctx,
+        &table,
+        table_name,
+        &[1, 2],
+        "No rows should be removed",
+    )
+    .await?;
 
     Ok(())
 }
@@ -155,7 +180,9 @@ async fn test_file_based_retention_no_eligible_files_impl(fixture: TestFixture) 
 async fn test_file_based_retention_deletes_all_files_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 1;
     let table_name = "file_ret_all_delete";
-    let table = create_retention_table(&fixture, table_name, retention_seconds).await?;
+    let ctx = SessionContext::new();
+    let table =
+        create_retention_table(&fixture, table_name, retention_seconds, ctx.runtime_env()).await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us - 10_000_000).await?; // 10s ago — expired
@@ -173,7 +200,7 @@ async fn test_file_based_retention_deletes_all_files_impl(fixture: TestFixture) 
         "All Vortex files should be deleted"
     );
 
-    assert_table_contents(&table, table_name, &[], "No rows should remain").await?;
+    assert_table_contents(&ctx, &table, table_name, &[], "No rows should remain").await?;
 
     Ok(())
 }
@@ -192,7 +219,9 @@ async fn test_file_based_retention_deletes_all_files_impl(fixture: TestFixture) 
 async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 3;
     let table_name = "file_ret_mixed";
-    let table = create_retention_table(&fixture, table_name, retention_seconds).await?;
+    let ctx = SessionContext::new();
+    let table =
+        create_retention_table(&fixture, table_name, retention_seconds, ctx.runtime_env()).await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
 
@@ -230,12 +259,253 @@ async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixt
     // Scan-time retention filter hides the expired row (id=2) inside the mixed file,
     // so only the fresh row (id=1) is visible.
     assert_table_contents(
+        &ctx,
         &table,
         table_name,
         &[1],
         "Only fresh row visible after deletion",
     )
     .await?;
+
+    Ok(())
+}
+
+/// `refresh_listing_table` invalidates the cache for its snapshot URL
+/// but preserves unrelated cache entries.
+///
+/// Steps:
+/// 1. Create a table, insert a row, then query to populate the list-files cache.
+/// 2. Capture the table's specific cache key and verify it exists.
+/// 3. Add a cache entry for a separate, unrelated table path.
+/// 4. Insert another row → triggers `refresh_listing_table` → invalidates table's cache entry.
+/// 5. Assert: the table's cache key is gone (targeted invalidation).
+/// 6. Assert: the unrelated table's cache entry is still present.
+/// 7. Query still returns correct data (fresh listing from disk).
+async fn test_cache_invalidated_after_append_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "cache_inv_append";
+    let ctx = SessionContext::new();
+    let runtime_env = ctx.runtime_env();
+    let table = create_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        Arc::clone(&runtime_env),
+    )
+    .await?;
+
+    // 1. Insert first row
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us).await?;
+
+    // 2. Query to populate the list-files cache (scan → list_with_cache → cache miss → populate)
+    assert_table_contents(&ctx, &table, table_name, &[1], "After first insert").await?;
+
+    // 3. Capture the table's specific cache key from the populated cache
+    let cache = runtime_env
+        .cache_manager
+        .get_list_files_cache()
+        .expect("list files cache should be enabled");
+    let entries = cache.list_entries();
+    assert_eq!(
+        entries.len(),
+        1,
+        "Expected exactly one cache entry after first query"
+    );
+    let table_cache_key = entries
+        .keys()
+        .next()
+        .expect("cache should have one entry")
+        .clone();
+    assert!(
+        cache.contains_key(&table_cache_key),
+        "Table's cache entry should exist after query"
+    );
+
+    // 4. Add a cache entry for a separate, unrelated table path
+    let other_table_key = TableScopedPath {
+        table: None,
+        path: object_store::path::Path::from("unrelated/table/path"),
+    };
+    cache.put(&other_table_key, dummy_cache_value());
+    assert_eq!(
+        entries.len(),
+        2,
+        "Expected exactly two cache entries after adding unrelated entry"
+    );
+    assert!(
+        cache.contains_key(&other_table_key),
+        "Unrelated table entry should be in cache"
+    );
+
+    // 5. Insert another row → triggers refresh_listing_table → invalidates this table's cache
+    insert_row(&table, 2, now_us - 1_000_000).await?;
+
+    // 6. Verify the table's specific cache entry was invalidated
+    assert!(
+        !cache.contains_key(&table_cache_key),
+        "Table's cache entry must be invalidated after refresh_listing_table"
+    );
+
+    // 7. Verify unrelated entry is still there (targeted invalidation, not cache.clear())
+    assert!(
+        cache.contains_key(&other_table_key),
+        "Unrelated table entry must survive targeted invalidation"
+    );
+
+    // 8. Query returns correct data — proves the stale cache entry was evicted and
+    //    fresh listing picked up the new file.
+    assert_table_contents(&ctx, &table, table_name, &[1, 2], "After second insert").await?;
+
+    Ok(())
+}
+
+/// File-based retention `delete_from` invalidates only snapshot URLs
+/// where files were actually deleted, preserving unrelated cache entries.
+///
+/// Steps:
+/// 1. Create a table with retention, insert 3 rows (1 fresh, 1 within retention, 1 expired).
+/// 2. Query to populate the cache, capture the table's specific cache key.
+/// 3. Add a cache entry for a separate, unrelated table path.
+/// 4. Execute file-based retention delete (physically removes the expired file).
+/// 5. Assert: the table's cache key is gone (targeted invalidation after delete).
+/// 6. Assert: the unrelated table entry survives (not cleared by `cache.clear()`).
+/// 7. Query returns correct 2 rows — proves fresh listing was used after invalidation.
+/// 8. Verify the query repopulated the table's cache entry (both entries present).
+/// 9. Execute a no-op delete (all remaining files within retention, 0 rows deleted).
+/// 10. Assert: both cache entries survive — no invalidation when nothing is deleted.
+async fn test_file_based_retention_targeted_cache_invalidation_impl(
+    fixture: TestFixture,
+) -> TestResult {
+    let retention_seconds = 3;
+    let table_name = "cache_inv_delete";
+    let ctx = SessionContext::new();
+    let runtime_env = ctx.runtime_env();
+    let table = create_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        Arc::clone(&runtime_env),
+    )
+    .await?;
+
+    // Insert 3 rows as separate files
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us).await?; // fresh
+    insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention
+    insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
+
+    // Query to populate the list-files cache.
+    // Retention filter applied at read time → returns only 2 non-expired rows.
+    assert_table_contents(&ctx, &table, table_name, &[1, 2], "Before delete").await?;
+
+    // Capture the table's specific cache key
+    let cache = runtime_env
+        .cache_manager
+        .get_list_files_cache()
+        .expect("list files cache should be enabled");
+    let entries = cache.list_entries();
+    assert_eq!(
+        entries.len(),
+        1,
+        "Expected exactly one cache entry after query"
+    );
+    let table_cache_key = entries
+        .keys()
+        .next()
+        .expect("cache should have one entry")
+        .clone();
+    assert!(
+        cache.contains_key(&table_cache_key),
+        "Table's cache entry should exist after query"
+    );
+
+    // Add a cache entry for a separate, unrelated table path
+    let other_table_key = TableScopedPath {
+        table: None,
+        path: object_store::path::Path::from("other/table/snapshot"),
+    };
+    cache.put(&other_table_key, dummy_cache_value());
+    assert!(
+        cache.contains_key(&other_table_key),
+        "Unrelated table entry must be in cache before delete"
+    );
+    assert_eq!(cache.len(), 2, "Expected 2 cache entries before delete");
+
+    // Verify 3 vortex files on disk (including the expired one)
+    let dir = table_id_dir(&fixture, &table, table_name);
+    assert_eq!(
+        count_vortex_files(&dir),
+        3,
+        "Expected 3 Vortex files before file-based delete"
+    );
+
+    // Execute file-based retention delete — physically removes the expired file
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(deleted, 1, "Should delete 1 expired row");
+
+    // Verify the expired file was physically removed
+    assert_eq!(
+        count_vortex_files(&dir),
+        2,
+        "Expected 2 Vortex files after deletion"
+    );
+
+    // Verify targeted invalidation:
+    // a) The table's specific cache entry was invalidated by delete_from
+    assert!(
+        !cache.contains_key(&table_cache_key),
+        "Table's cache entry must be invalidated after file-based delete"
+    );
+
+    // b) The unrelated table entry must still exist — not cleared by a blanket cache.clear()
+    assert!(
+        cache.contains_key(&other_table_key),
+        "Unrelated table entry must survive targeted cache invalidation after file-based delete"
+    );
+    assert_eq!(
+        cache.len(),
+        1,
+        "Only the unrelated entry should remain in cache"
+    );
+
+    // c) Query returns correct data — fresh listing was used (stale entry was evicted)
+    assert_table_contents(
+        &ctx,
+        &table,
+        table_name,
+        &[1, 2],
+        "After file-based retention delete with cache invalidation",
+    )
+    .await?;
+
+    // d) The query in (c) repopulated the table's cache entry; verify both entries are back.
+    assert!(
+        cache.contains_key(&table_cache_key),
+        "Table's cache entry should be repopulated after query"
+    );
+
+    assert_eq!(
+        cache.len(),
+        2,
+        "Expected 2 cache entries after query repopulated the table's entry"
+    );
+
+    // e) No-op delete: all remaining files are within retention, so nothing is removed.
+    //    Cache entries must survive because no files were actually deleted.
+    let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
+    assert_eq!(
+        deleted, 0,
+        "No rows should be deleted — all files are within retention"
+    );
+    assert!(
+        cache.contains_key(&table_cache_key),
+        "Table's cache entry must survive a no-op delete"
+    );
+    assert!(
+        cache.contains_key(&other_table_key),
+        "Unrelated table entry must survive a no-op delete"
+    );
 
     Ok(())
 }
@@ -259,7 +529,15 @@ async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixt
 async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 3;
     let table_name = "pk_file_ret_main";
-    let table = create_pk_retention_table(&fixture, table_name, retention_seconds, false).await?;
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        false,
+        ctx.runtime_env(),
+    )
+    .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
@@ -282,7 +560,14 @@ async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture)
         "Expected 2 Vortex files after deletion"
     );
 
-    assert_table_contents(&table, table_name, &[1, 2], "After deleting expired file").await?;
+    assert_table_contents(
+        &ctx,
+        &table,
+        table_name,
+        &[1, 2],
+        "After deleting expired file",
+    )
+    .await?;
 
     Ok(())
 }
@@ -310,7 +595,15 @@ async fn test_pk_file_based_retention_with_protected_snapshots_impl(
 ) -> TestResult {
     let retention_seconds = 3;
     let table_name = "pk_file_ret_snap";
-    let table = create_pk_retention_table(&fixture, table_name, retention_seconds, true).await?;
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        ctx.runtime_env(),
+    )
+    .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
@@ -361,6 +654,7 @@ async fn test_pk_file_based_retention_with_protected_snapshots_impl(
     );
 
     assert_table_contents(
+        &ctx,
         &table,
         table_name,
         &[1, 2],
@@ -388,7 +682,15 @@ async fn test_pk_file_based_retention_empties_main_snapshot_impl(
 ) -> TestResult {
     let retention_seconds = 3;
     let table_name = "pk_file_ret_empty_snap";
-    let table = create_pk_retention_table(&fixture, table_name, retention_seconds, true).await?;
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        ctx.runtime_env(),
+    )
+    .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     // Insert one expired row
@@ -438,7 +740,14 @@ async fn test_pk_file_based_retention_empties_main_snapshot_impl(
         "Main snapshot directory should be empty (no vortex files)"
     );
 
-    assert_table_contents(&table, table_name, &[1], "Only fresh upserted row visible").await?;
+    assert_table_contents(
+        &ctx,
+        &table,
+        table_name,
+        &[1],
+        "Only fresh upserted row visible",
+    )
+    .await?;
 
     Ok(())
 }
@@ -457,7 +766,15 @@ async fn test_pk_file_based_retention_fresh_snapshot_preserved_impl(
 ) -> TestResult {
     let retention_seconds = 3;
     let table_name = "pk_file_ret_fresh_snap";
-    let table = create_pk_retention_table(&fixture, table_name, retention_seconds, true).await?;
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        ctx.runtime_env(),
+    )
+    .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
@@ -478,7 +795,7 @@ async fn test_pk_file_based_retention_fresh_snapshot_preserved_impl(
     assert_eq!(deleted, 0, "No files should be deleted (all fresh)");
 
     assert_eq!(count_vortex_files(&dir), 2, "Both files still exist");
-    assert_table_contents(&table, table_name, &[1], "Only id=1 visible").await?;
+    assert_table_contents(&ctx, &table, table_name, &[1], "Only id=1 visible").await?;
 
     Ok(())
 }
@@ -494,7 +811,15 @@ async fn test_pk_file_based_retention_fresh_snapshot_preserved_impl(
 async fn test_pk_file_based_retention_upsert_after_delete_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 3;
     let table_name = "pk_file_ret_upsert_after";
-    let table = create_pk_retention_table(&fixture, table_name, retention_seconds, true).await?;
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        ctx.runtime_env(),
+    )
+    .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us).await?; // fresh
@@ -507,7 +832,7 @@ async fn test_pk_file_based_retention_upsert_after_delete_impl(fixture: TestFixt
     let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
     assert_eq!(deleted, 1, "Should delete 1 expired file");
     assert_eq!(count_vortex_files(&dir), 1, "1 file after delete");
-    assert_table_contents(&table, table_name, &[1], "Only id=1 after delete").await?;
+    assert_table_contents(&ctx, &table, table_name, &[1], "Only id=1 after delete").await?;
 
     // Upsert id=1 → new snapshot (updated row) added to protected_snapshots,
     // main listing table stays as-is.
@@ -518,7 +843,14 @@ async fn test_pk_file_based_retention_upsert_after_delete_impl(fixture: TestFixt
         2,
         "2 snapshots after upsert"
     );
-    assert_table_contents(&table, table_name, &[1], "Still only id=1, no ghost id=2").await?;
+    assert_table_contents(
+        &ctx,
+        &table,
+        table_name,
+        &[1],
+        "Still only id=1, no ghost id=2",
+    )
+    .await?;
 
     Ok(())
 }
@@ -540,7 +872,15 @@ async fn test_pk_file_based_retention_multiple_protected_snapshots_impl(
 ) -> TestResult {
     let retention_seconds = 3;
     let table_name = "pk_file_ret_multi_snap";
-    let table = create_pk_retention_table(&fixture, table_name, retention_seconds, true).await?;
+    let ctx = SessionContext::new();
+    let table = create_pk_retention_table(
+        &fixture,
+        table_name,
+        retention_seconds,
+        true,
+        ctx.runtime_env(),
+    )
+    .await?;
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us - 10_000_000).await?; // expired
@@ -585,6 +925,7 @@ async fn test_pk_file_based_retention_multiple_protected_snapshots_impl(
     );
 
     assert_table_contents(
+        &ctx,
         &table,
         table_name,
         &[1, 3],
@@ -616,6 +957,7 @@ async fn create_retention_table(
     fixture: &TestFixture,
     table_name: &str,
     retention_seconds: u64,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
     let table_dir = fixture.data_path.join(table_name);
     std::fs::create_dir_all(&table_dir)?;
@@ -638,7 +980,7 @@ async fn create_retention_table(
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc)
+        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
             .with_time_retention_filter_builder(retention_builder)
             .create(table_options)
             .await?,
@@ -654,6 +996,7 @@ async fn create_pk_retention_table(
     table_name: &str,
     retention_seconds: u64,
     with_upsert: bool,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
     let table_dir = fixture.data_path.join(table_name);
     std::fs::create_dir_all(&table_dir)?;
@@ -684,7 +1027,7 @@ async fn create_pk_retention_table(
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc)
+        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
             .with_time_retention_filter_builder(retention_builder)
             .create(table_options)
             .await?,
@@ -774,11 +1117,11 @@ async fn execute_delete(
 
 /// Query `SELECT count(*) FROM <table>` and return the count.
 async fn query_count(
+    ctx: &SessionContext,
     table: &Arc<CayenneTableProvider>,
     table_name: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::clone(table) as Arc<dyn TableProvider>)?;
+    let _ = ctx.register_table(table_name, Arc::clone(table) as Arc<dyn TableProvider>);
     let df = ctx
         .sql(&format!("SELECT count(*) AS cnt FROM {table_name}"))
         .await?;
@@ -792,20 +1135,20 @@ async fn query_count(
 
 /// Query ids and count, assert both match expectations.
 async fn assert_table_contents(
+    ctx: &SessionContext,
     table: &Arc<CayenneTableProvider>,
     table_name: &str,
     expected_ids: &[i64],
     msg: &str,
 ) -> TestResult {
-    let count = query_count(table, table_name).await?;
+    let count = query_count(ctx, table, table_name).await?;
     assert_eq!(
         count,
         i64::try_from(expected_ids.len()).expect("len fits i64"),
         "{msg}: count(*) mismatch"
     );
 
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::clone(table) as Arc<dyn TableProvider>)?;
+    let _ = ctx.register_table(table_name, Arc::clone(table) as Arc<dyn TableProvider>);
     let df = ctx
         .sql(&format!("SELECT id FROM {table_name} ORDER BY id"))
         .await?;
@@ -885,4 +1228,15 @@ fn table_id_dir(
         .data_path
         .join(table_name)
         .join(table.metadata().table_id.to_string())
+}
+
+/// Creates a dummy non-empty cache value. The cache rejects empty vecs internally.
+fn dummy_cache_value() -> std::sync::Arc<Vec<ObjectMeta>> {
+    std::sync::Arc::new(vec![ObjectMeta {
+        location: object_store::path::Path::from("dummy/file.parquet"),
+        last_modified: chrono::Utc::now(),
+        size: 42,
+        e_tag: None,
+        version: None,
+    }])
 }
