@@ -25,6 +25,7 @@ use serde::{Serialize, Serializer};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 enum IcebergErrorType {
     NoSuchNamespaceException,
+    BadRequestException,
     InternalServerError,
 }
 
@@ -32,6 +33,7 @@ impl IcebergErrorType {
     fn code(&self) -> u16 {
         match self {
             IcebergErrorType::NoSuchNamespaceException => 404,
+            IcebergErrorType::BadRequestException => 400,
             IcebergErrorType::InternalServerError => 500,
         }
     }
@@ -45,6 +47,9 @@ impl Serialize for IcebergErrorType {
         match self {
             IcebergErrorType::NoSuchNamespaceException => {
                 serializer.serialize_str("NoSuchNamespaceException")
+            }
+            IcebergErrorType::BadRequestException => {
+                serializer.serialize_str("BadRequestException")
             }
             IcebergErrorType::InternalServerError => {
                 serializer.serialize_str("InternalServerError")
@@ -91,6 +96,16 @@ impl IcebergResponseError {
         }
     }
 
+    pub fn bad_request(message: String) -> Self {
+        Self {
+            error: IcebergError {
+                message,
+                r#type: IcebergErrorType::BadRequestException,
+                code: IcebergErrorType::BadRequestException.code(),
+            },
+        }
+    }
+
     pub fn internal(code: InternalServerErrorCode) -> Self {
         Self {
             error: IcebergError {
@@ -106,6 +121,7 @@ impl IntoResponse for IcebergResponseError {
     fn into_response(self) -> Response {
         match self.error.code {
             404 => (status::StatusCode::NOT_FOUND, Json(self)).into_response(),
+            400 => (status::StatusCode::BAD_REQUEST, Json(self)).into_response(),
             _ => (status::StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response(),
         }
     }
