@@ -54,6 +54,18 @@ runs:
         Write-Host "Spice binaries installed successfully into $spiceInstallDir"
         Get-ChildItem -Path "$spiceInstallDir" -Force
 
+    - name: Install runtime dependencies (macOS)
+      shell: bash
+      if: runner.os == 'macOS'
+      run: |
+        brew install unixodbc
+
+    - name: Install runtime dependencies (Linux)
+      shell: bash
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update && sudo apt-get install -y unixodbc
+
     - name: Verify Spice installation
       shell: bash
       if: runner.os != 'Windows'
