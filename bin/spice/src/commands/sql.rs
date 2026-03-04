@@ -38,7 +38,7 @@ pub struct SqlArgs {
     /// Specifies the remote Spice instance endpoint.
     /// Supports http://, https://, grpc://, or grpc+tls:// schemes.
     /// If not provided, uses local spiced runtime.
-    #[arg(long, short = 'e')]
+    #[arg(long)]
     endpoint: Option<String>,
 
     /// (Deprecated) Specifies the remote Spice instance Flight endpoint (treated as gRPC endpoint)
