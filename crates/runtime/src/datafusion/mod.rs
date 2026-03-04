@@ -406,7 +406,7 @@ pub enum Error {
 /// Returns an error if a distributed role is active and the engine is unsupported.
 fn validate_distributed_engine(
     cluster_config: &ResolvedClusterConfig,
-    engine: &Engine,
+    engine: Engine,
     dataset_name: &str,
 ) -> Result<()> {
     if cluster_config.effective_role().is_some()
@@ -1669,7 +1669,7 @@ impl DataFusion {
         // Distributed acceleration is only supported with Arrow or Cayenne engines.
         validate_distributed_engine(
             &self.cluster_config,
-            &acceleration_settings.engine,
+            acceleration_settings.engine,
             &dataset.name.to_string(),
         )?;
 
@@ -2436,7 +2436,7 @@ impl DataFusion {
         // Distributed acceleration is only supported with Arrow or Cayenne engines.
         validate_distributed_engine(
             &self.cluster_config,
-            &acceleration.engine,
+            acceleration.engine,
             &table.to_string(),
         )?;
 
@@ -3464,9 +3464,7 @@ mod tests {
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(
-                validate_distributed_engine(&config, &Engine::PartitionedArrow, "ds").is_ok()
-            );
+            assert!(validate_distributed_engine(&config, Engine::PartitionedArrow, "ds").is_ok());
         }
 
         #[test]
@@ -3478,7 +3476,7 @@ mod tests {
         #[test]
         fn duckdb_rejected_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(&config, &Engine::DuckDB, "my_dataset");
+            let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
             assert!(
                 matches!(
                     result,
@@ -3491,7 +3489,7 @@ mod tests {
         #[test]
         fn sqlite_rejected_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Executor);
-            let result = validate_distributed_engine(&config, &Engine::Sqlite, "my_dataset");
+            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
             assert!(
                 matches!(
                     result,
@@ -3504,8 +3502,7 @@ mod tests {
         #[test]
         fn postgresql_rejected_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            let result =
-                validate_distributed_engine(&config, &Engine::PostgreSQL, "my_dataset");
+            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
             assert!(
                 matches!(
                     result,
@@ -3518,11 +3515,11 @@ mod tests {
         #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
-            assert!(validate_distributed_engine(&config, &Engine::DuckDB, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, &Engine::Sqlite, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, &Engine::PostgreSQL, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, &Engine::Arrow, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, &Engine::Cayenne, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::DuckDB, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::Sqlite, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::PostgreSQL, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::Arrow, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::Cayenne, "ds").is_ok());
         }
     }
 }
