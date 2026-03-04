@@ -1,0 +1,27 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ea1b793e1ea6",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-03-03/testing",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/runtime/tests/cluster/distributed_acceleration.rs",
+    "crates/runtime/tests/cluster/harness.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ea/1b793e1ea6/0/metadata.json",
+      "transcript": "/ea/1b793e1ea6/0/full.jsonl",
+      "context": "/ea/1b793e1ea6/0/context.md",
+      "content_hash": "/ea/1b793e1ea6/0/content_hash.txt",
+      "prompt": "/ea/1b793e1ea6/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 142,
+    "cache_creation_tokens": 313810,
+    "cache_read_tokens": 9617910,
+    "output_tokens": 79227,
+    "api_call_count": 118
+  }
+}
