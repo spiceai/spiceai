@@ -3458,7 +3458,7 @@ mod tests {
         #[test]
         fn arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(validate_distributed_engine(&config, &Engine::Arrow, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::Arrow, "ds").is_ok());
         }
 
         #[test]
@@ -3470,7 +3470,7 @@ mod tests {
         #[test]
         fn cayenne_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(validate_distributed_engine(&config, &Engine::Cayenne, "ds").is_ok());
+            assert!(validate_distributed_engine(&config, Engine::Cayenne, "ds").is_ok());
         }
 
         #[test]
