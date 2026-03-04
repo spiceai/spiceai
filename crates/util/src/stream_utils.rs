@@ -108,7 +108,7 @@ pub fn sort_stream(
     );
 
     // Create a streaming execution plan that yields the input stream
-    let stream_exec = Arc::new(StreamingExec::new(Arc::clone(&schema), stream));
+    let stream_exec = Arc::new(StreamingExec::new(&schema, stream));
 
     // Wrap with SortExec for external sorting with disk spilling
     let sort_exec = Arc::new(SortExec::new(lex_ordering, stream_exec));
@@ -129,9 +129,9 @@ struct StreamingExec {
 }
 
 impl StreamingExec {
-    fn new(schema: SchemaRef, stream: SendableRecordBatchStream) -> Self {
+    fn new(schema: &SchemaRef, stream: SendableRecordBatchStream) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
+            EquivalenceProperties::new(Arc::clone(schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,

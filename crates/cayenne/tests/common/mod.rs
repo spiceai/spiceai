@@ -29,7 +29,7 @@ use tempfile::TempDir;
 
 /// Backend type for parameterized tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
+#[expect(
     dead_code,
     reason = "Shared test helper enum; variants are consumed by backend-matrix macro expansion in subset test modules"
 )]
@@ -40,7 +40,7 @@ pub enum BackendType {
 }
 
 impl BackendType {
-    #[allow(
+    #[expect(
         dead_code,
         reason = "Debug helper for backend-specific test output; not every test module uses it"
     )]
@@ -54,19 +54,19 @@ impl BackendType {
 }
 
 /// Test fixture that sets up a temporary directory and catalog
-#[allow(
+#[expect(
     dead_code,
     reason = "Shared fixture type compiled into each integration test crate; only some tests construct it"
 )]
 pub struct TestFixture {
-    #[allow(
+    #[expect(
         dead_code,
         reason = "Some tests keep TempDir only for lifetime management without direct field reads"
     )]
     pub temp_dir: TempDir,
     pub catalog: Arc<CayenneCatalog>,
     pub data_path: std::path::PathBuf,
-    #[allow(
+    #[expect(
         dead_code,
         reason = "Backend marker is used by backend-parameterized tests only"
     )]
@@ -75,7 +75,7 @@ pub struct TestFixture {
 
 impl TestFixture {
     /// Create a new test fixture with the specified backend
-    #[allow(
+    #[expect(
         dead_code,
         reason = "Fixture constructor is called from backend harness helpers used by a subset of tests"
     )]
@@ -108,7 +108,7 @@ impl TestFixture {
     }
 
     /// Get the database path for SQLite-specific verification
-    #[allow(
+    #[expect(
         dead_code,
         reason = "SQLite-specific diagnostics helper used only by targeted tests"
     )]
@@ -139,7 +139,7 @@ macro_rules! test_with_backends {
 }
 
 /// Helper to run a test function with a specific backend
-#[allow(
+#[expect(
     dead_code,
     reason = "Backend harness helper used only by tests that invoke test_with_backends!"
 )]
@@ -165,7 +165,7 @@ where
 /// Insert a single batch using `insert_into()` (append mode).
 ///
 /// Creates a temporary `SessionContext` internally.
-#[allow(
+#[expect(
     dead_code,
     reason = "Convenience wrapper used by select tests; others call insert_batches directly"
 )]
@@ -176,7 +176,7 @@ pub async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) -
 /// Insert record batches using `insert_into()` API (append mode).
 ///
 /// Creates a temporary `SessionContext` internally.
-#[allow(
+#[expect(
     dead_code,
     reason = "Shared insert helper compiled into all test crates but only referenced by some tests"
 )]
@@ -204,7 +204,7 @@ pub async fn insert_batches(
 }
 
 /// Extract the row count from insert result batches.
-#[allow(
+#[expect(
     dead_code,
     reason = "Internal helper used only by insert helpers that are not referenced in every test crate"
 )]
