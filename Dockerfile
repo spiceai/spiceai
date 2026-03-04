@@ -5,14 +5,15 @@ FROM rust:${RUST_VERSION}-slim-bookworm as build
 # cache mounts below may already exist and owned by root
 USER root
 
+ARG CARGO_FEATURES=default
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev libclang-dev \
+    && if echo "$CARGO_FEATURES" | grep -q "nfs"; then apt install --yes libnfs-dev --no-install-recommends; fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build
 WORKDIR /build
 
-ARG CARGO_FEATURES=default
 ARG CARGO_NO_DEFAULT_FEATURES=false
 ARG RUST_PROFILE=release
 ARG CARGO_INCREMENTAL=yes
@@ -53,6 +54,9 @@ RUN apt update \
     && apt install --yes ca-certificates libssl3 findutils tzdata --no-install-recommends \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
+    fi \
+    && if echo "$CARGO_FEATURES" | grep -q "nfs"; then \
+    apt install --yes libnfs-dev --no-install-recommends; \
     fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
