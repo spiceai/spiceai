@@ -50,7 +50,7 @@ fn require_cluster_mode(rt: &Arc<Runtime>) -> Result<(), Response> {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "Async queries API requires distributed mode with `scheduler.state_location` configured. Start with: spiced --role scheduler"
+                "error": "Async queries API requires distributed mode with `runtime.scheduler.state_location` configured. Start with: spiced --role scheduler"
             })),
         )
             .into_response());
@@ -418,10 +418,11 @@ pub(crate) async fn get_status(
     params(
         ("query_id" = String, Path, description = "Query ID"),
         ("partition" = Option<usize>, Query, description = "Partition/chunk index (default 0)"),
-        ("format" = Option<String>, Query, description = "Result format: json (default), csv, arrow")
+        ("format" = Option<String>, Query, description = "Result format: json (default)")
     ),
     responses(
         (status = 200, description = "Query results", body = ChunkResponse),
+        (status = 400, description = "Invalid request format"),
         (status = 404, description = "Query not found"),
         (status = 409, description = "Query not yet complete"),
         (status = 410, description = "Query results expired"),
@@ -438,6 +439,18 @@ pub(crate) async fn get_results(
         Err(resp) => return resp,
     };
     let partition = params.partition.unwrap_or(0);
+    if let Some(format) = params.format.as_deref() {
+        let normalized = format.to_ascii_lowercase();
+        if normalized != "json" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Unsupported result format '{format}'. Supported format: json")
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // First check the job state
     let state = match executor.get_status(&query_id).await {
@@ -507,9 +520,8 @@ pub struct ResultsQueryParams {
     /// Partition/chunk index.
     #[serde(default)]
     pub partition: Option<usize>,
-    /// Result format (json, csv, arrow).
+    /// Result format (json).
     #[serde(default)]
-    #[expect(dead_code)]
     pub format: Option<String>,
 }
 

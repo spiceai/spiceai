@@ -344,7 +344,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow', 'partitioned_arrow', or 'cayenne' instead."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -3459,21 +3459,21 @@ mod tests {
         fn arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
             validate_distributed_engine(&config, Engine::Arrow, "ds")
-                .expect("Arrow engine should be allowed in distributed mode");
+                .expect("arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
             validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
-                .expect("PartitionedArrow engine should be allowed in distributed mode");
+                .expect("partitioned_arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn cayenne_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
-                .expect("Cayenne engine should be allowed in distributed mode");
+                .expect("cayenne engine should be allowed in distributed mode");
         }
 
         #[test]
@@ -3519,15 +3519,15 @@ mod tests {
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::DuckDB, "ds")
-                .expect("DuckDB should be allowed in non-distributed mode");
+                .expect("duckdb should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
-                .expect("Sqlite should be allowed in non-distributed mode");
+                .expect("sqlite should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
-                .expect("PostgreSQL should be allowed in non-distributed mode");
+                .expect("postgresql should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Arrow, "ds")
-                .expect("Arrow should be allowed in non-distributed mode");
+                .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
-                .expect("Cayenne should be allowed in non-distributed mode");
+                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 }
