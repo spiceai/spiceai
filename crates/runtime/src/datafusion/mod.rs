@@ -344,7 +344,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow', 'partitioned_arrow', or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -1666,7 +1666,7 @@ impl DataFusion {
             None
         };
 
-        // Distributed acceleration is only supported with Arrow or Cayenne engines.
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
         validate_distributed_engine(
             &self.cluster_config,
             acceleration_settings.engine,
@@ -2433,7 +2433,7 @@ impl DataFusion {
 
         let schema = view_table.schema();
 
-        // Distributed acceleration is only supported with Arrow or Cayenne engines.
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
         validate_distributed_engine(
             &self.cluster_config,
             acceleration.engine,
