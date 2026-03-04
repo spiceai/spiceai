@@ -38,6 +38,9 @@ pub use search::SearchTestArgs;
 mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
 
+mod schema;
+pub use schema::SchemaTestArgs;
+
 mod streaming;
 pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
 
@@ -76,6 +79,8 @@ pub enum TestCommands {
     StreamingDynamodb(StreamingDynamodbArgs),
     /// Run a streaming `DynamoDB` data correctness test (multi-round CDC verification)
     StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
+    /// Validate catalog connector schema discovery via `information_schema`
+    Schema(SchemaTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

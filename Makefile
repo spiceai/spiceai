@@ -79,11 +79,11 @@ test-integration-without-spiceai-dataset:
 
 .PHONY: test-integration-models
 test-integration-models:
-	@cargo test -p runtime --test integration_models --features models -- --nocapture
+	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture
 
 .PHONY: test-integration-models-without-openai
 test-integration-models-without-openai:
-	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
+	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture --skip openai_test
 
 .PHONY: test-bench
 test-bench:

@@ -62,6 +62,7 @@ pub enum Workflow {
     TextToSql,
     StreamingBench,
     StreamingCorrectness,
+    Schema,
 }
 
 impl From<Workflow> for TestType {
@@ -75,6 +76,7 @@ impl From<Workflow> for TestType {
             Workflow::TextToSql => TestType::TextToSql,
             Workflow::StreamingBench => TestType::Streaming,
             Workflow::StreamingCorrectness => TestType::StreamingCorrectness,
+            Workflow::Schema => TestType::Schema,
         }
     }
 }
@@ -105,6 +107,8 @@ pub struct DispatchTests {
     pub streaming_bench: Vec<StreamingBenchDispatchArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub streaming_correctness: Vec<StreamingCorrectnessDispatchArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub schema: Vec<SchemaArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -225,6 +229,16 @@ pub struct AppendArgs {
     pub with_conflict_data: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_retention_data: Option<bool>,
+}
+
+/// Schema test workflow arguments, defined in the test files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    /// Minimum number of tables expected in the catalog
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_tables: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for LoadArgs {

@@ -145,6 +145,17 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
+            TestType::Schema => {
+                for schema in &test_file.tests.schema {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: schema.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
             _ => {
                 println!("Test type {test_type} not supported for dispatching");
             }

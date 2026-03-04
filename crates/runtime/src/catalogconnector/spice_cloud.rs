@@ -276,6 +276,10 @@ impl CatalogConnector for SpiceCloudPlatformCatalog {
 fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = catalog_slug.split('/').collect();
 
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(Error::InvalidPath);
+    }
+
     match parts.len() {
         2 | 3 => {
             let org = parts[0].to_string();
@@ -285,5 +289,62 @@ fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
             Ok((org, app, catalog))
         }
         _ => Err(Error::InvalidPath),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_catalog_slug_org_and_app() {
+        let (org, app, catalog) = parse_catalog_slug("myorg/myapp").expect("valid two-part slug");
+        assert_eq!(org, "myorg");
+        assert_eq!(app, "myapp");
+        assert_eq!(catalog, "spice");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_org_app_and_catalog() {
+        let (org, app, catalog) =
+            parse_catalog_slug("myorg/myapp/mycatalog").expect("valid three-part slug");
+        assert_eq!(org, "myorg");
+        assert_eq!(app, "myapp");
+        assert_eq!(catalog, "mycatalog");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_default_catalog_name() {
+        let (_, _, catalog) = parse_catalog_slug("org/app").expect("valid two-part slug");
+        assert_eq!(catalog, "spice", "default catalog should be 'spice'");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_single_part_fails() {
+        parse_catalog_slug("justorg").expect_err("single-part slug should be invalid");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_four_parts_fails() {
+        parse_catalog_slug("a/b/c/d").expect_err("four-part slug should be invalid");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_empty_fails() {
+        parse_catalog_slug("").expect_err("empty slug should be invalid");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_trailing_slash() {
+        parse_catalog_slug("org/app/").expect_err("trailing slash should produce invalid slug");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_preserves_case() {
+        let (org, app, catalog) =
+            parse_catalog_slug("MyOrg/MyApp/MyCatalog").expect("valid three-part slug");
+        assert_eq!(org, "MyOrg");
+        assert_eq!(app, "MyApp");
+        assert_eq!(catalog, "MyCatalog");
     }
 }

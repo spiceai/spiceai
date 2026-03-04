@@ -1,0 +1,8 @@
+version: v1
+kind: Spicepod
+name: ducklake[catalog]-federated
+catalogs:
+  - from: ducklake
+    name: ducklake
+    params:
+      ducklake_connection_string: ${secrets:DUCKLAKE_CONNECTION_STRING}
