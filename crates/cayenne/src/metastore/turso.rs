@@ -25,8 +25,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
-use turso_shared::WAL_JOURNAL_MODE_VALUE;
 use turso::{Builder, Connection, Database, Value as TursoValue};
+use turso_shared::WAL_JOURNAL_MODE_VALUE;
 
 /// Turso-based metastore backend.
 pub struct TursoMetastore {

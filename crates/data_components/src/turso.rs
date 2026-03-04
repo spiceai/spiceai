@@ -148,8 +148,8 @@ use datafusion_federation::{
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
-use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, WAL_JOURNAL_MODE_VALUE};
 use turso::{Builder, Connection, Database, Value as TursoValue};
+use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, WAL_JOURNAL_MODE_VALUE};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
