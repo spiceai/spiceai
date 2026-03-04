@@ -9,9 +9,43 @@ on:
       rel_version:
         description: 'The version to build CLI / download released CLI'
         required: false
-        default: '1.0.2'
+        default: '2.0.0'
+      upgrade_from_version:
+        description: 'Released version of spiced to test upgrading from (empty = latest release)'
+        required: false
+        default: ''
 
 jobs:
+  resolve-upgrade-version:
+    name: Resolve upgrade-from version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT="${{ github.event.inputs.upgrade_from_version }}"
+          BUILD_CLI="${{ github.event.inputs.build_cli }}"
+
+          if [ -n "$INPUT" ]; then
+            VERSION="$INPUT"
+            echo "Using provided version: $VERSION"
+          elif [ "$BUILD_CLI" = "false" ]; then
+            # When testing a released CLI, upgrade from the previous release
+            VERSION=$(gh release list --repo ${{ github.repository }} --exclude-pre-releases --limit 20 --json tagName -q '.[].tagName' \
+              | grep -v '-' | sed 's/^v//' | sed -n '2p')
+            echo "Auto-detected N-1 release: $VERSION"
+          else
+            # When building from source, upgrade from the latest release
+            VERSION=$(gh release list --repo ${{ github.repository }} --exclude-pre-releases --limit 20 --json tagName -q '.[].tagName' \
+              | grep -v '-' | sed 's/^v//' | head -1)
+            echo "Auto-detected latest release: $VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spicehq-dev-runners
@@ -52,7 +86,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -110,11 +144,13 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
+      UPGRADE_FROM_VERSION: ${{ needs.resolve-upgrade-version.outputs.version }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
       - setup-matrix
+      - resolve-upgrade-version
     timeout-minutes: 5
 
     strategy:
@@ -136,7 +172,7 @@ jobs:
         run: |
           mkdir -p ./build
           cd ./build
-          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
           output="spice.tar.gz"
           curl -L -o "$output" "$url"
           tar -xzf "$output"
@@ -148,7 +184,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "./build" > $null
           Set-Location "./build"
-          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice.exe_windows_x86_64.tar.gz"
+          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spice.exe_windows_x86_64.tar.gz"
           $output = "spice.exe_windows_x86_64.tar.gz"
           Invoke-WebRequest -Uri $url -OutFile $output
           tar -xzf $output
@@ -159,7 +195,7 @@ jobs:
         if: matrix.target.target_os == 'windows'
         run: |
           Set-Location "./build"
-          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced.exe_windows_x86_64.tar.gz"
+          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spiced.exe_windows_x86_64.tar.gz"
           $output = "spiced.exe_windows_x86_64.tar.gz"
           Invoke-WebRequest -Uri $url -OutFile $output
           tar -xzf $output
@@ -169,7 +205,7 @@ jobs:
         if: matrix.target.target_os != 'windows'
         run: |
           cd ./build
-          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
           output="spiced.tar.gz"
           curl -L -o "$output" "$url"
           tar -xzf "$output"
@@ -180,6 +216,21 @@ jobs:
         uses: ./.github/actions/install-spice
         with:
           build-path: ./build
+
+      - name: Check pre-upgrade version
+        shell: bash
+        run: |
+          spice version
+          RUNTIME_VERSION=$(spice version 2>&1 | grep 'Runtime version:' | awk '{print $3}')
+          EXPECTED="v${{ env.UPGRADE_FROM_VERSION }}"
+          echo "Pre-upgrade Runtime version: $RUNTIME_VERSION (expected: $EXPECTED)"
+          # v1.11.x on Windows doesn't detect spiced.exe (looks for 'spiced' without extension)
+          if [[ "$RUNTIME_VERSION" == "not" ]]; then
+            echo "::warning::Runtime reported as 'not installed' (known v1.11.x Windows issue)"
+          elif [[ "$RUNTIME_VERSION" != "$EXPECTED"* ]]; then
+            echo "::error::Expected pre-upgrade Runtime version starting with $EXPECTED, got $RUNTIME_VERSION"
+            exit 1
+          fi
 
       - name: Run spice upgrade
         run: |
@@ -208,12 +259,35 @@ jobs:
               Select-Object FullName, Length, LastWriteTime |
               Format-Table -AutoSize
 
+      - name: Run spice version
+        shell: bash
+        run: |
+          spice version
+          CLI_VERSION=$(spice version 2>&1 | grep 'CLI version:' | awk '{print $3}')
+          RUNTIME_VERSION=$(spice version 2>&1 | grep 'Runtime version:' | awk '{print $3}')
+          EXPECTED="v${{ env.REL_VERSION }}"
+          # v1.11.x CLI doesn't self-upgrade (fix landed in v2.0.0)
+          if [[ "$CLI_VERSION" != v1.11.* ]]; then
+            if [[ "$CLI_VERSION" != "$EXPECTED"* ]]; then
+              echo "::error::Expected CLI version starting with $EXPECTED, got $CLI_VERSION"
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
+          fi
+          if [[ "$RUNTIME_VERSION" == "not" ]]; then
+            echo "::warning::Runtime reported as 'not installed' (known v1.11.x Windows issue)"
+          elif [[ "$RUNTIME_VERSION" != "$EXPECTED"* ]]; then
+            echo "::error::Expected Runtime version starting with $EXPECTED, got $RUNTIME_VERSION"
+            exit 1
+          fi
+
   test_spice_upgrade_without_runtime:
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -289,12 +363,28 @@ jobs:
               Select-Object FullName, Length, LastWriteTime |
               Format-Table -AutoSize
 
+      - name: Run spice version
+        shell: bash
+        run: |
+          spice version
+          CLI_VERSION=$(spice version 2>&1 | grep 'CLI version:' | awk '{print $3}')
+          EXPECTED="v${{ env.REL_VERSION }}"
+          # v1.11.x CLI doesn't self-upgrade (fix landed in v2.0.0)
+          if [[ "$CLI_VERSION" != v1.11.* ]]; then
+            if [[ "$CLI_VERSION" != "$EXPECTED"* ]]; then
+              echo "::error::Expected CLI version starting with $EXPECTED, got $CLI_VERSION"
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
+          fi
+
   test_spice_install_without_runtime:
     name: 'Test spice install without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -356,7 +446,7 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -442,7 +532,7 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -490,7 +580,7 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
