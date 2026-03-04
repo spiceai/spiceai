@@ -344,7 +344,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow', 'partitioned_arrow', or 'cayenne' instead."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,

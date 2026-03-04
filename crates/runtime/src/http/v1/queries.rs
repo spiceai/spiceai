@@ -418,10 +418,11 @@ pub(crate) async fn get_status(
     params(
         ("query_id" = String, Path, description = "Query ID"),
         ("partition" = Option<usize>, Query, description = "Partition/chunk index (default 0)"),
-        ("format" = Option<String>, Query, description = "Result format: json (default), csv, arrow")
+        ("format" = Option<String>, Query, description = "Result format: json (default)")
     ),
     responses(
         (status = 200, description = "Query results", body = ChunkResponse),
+        (status = 400, description = "Invalid request format"),
         (status = 404, description = "Query not found"),
         (status = 409, description = "Query not yet complete"),
         (status = 410, description = "Query results expired"),
@@ -519,7 +520,7 @@ pub struct ResultsQueryParams {
     /// Partition/chunk index.
     #[serde(default)]
     pub partition: Option<usize>,
-    /// Result format (json, csv, arrow).
+    /// Result format (json).
     #[serde(default)]
     pub format: Option<String>,
 }
