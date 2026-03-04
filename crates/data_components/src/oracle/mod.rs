@@ -38,6 +38,7 @@ use crate::oracle::{
 pub mod connection;
 mod convert;
 mod execution_plan;
+pub mod provider;
 
 // Re-export the native Oracle connector for use in dependent crates (e.g., integration tests)
 pub use oracle::Connector as oracle_connector;

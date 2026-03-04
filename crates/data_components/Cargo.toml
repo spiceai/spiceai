@@ -65,6 +65,7 @@ iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
+mysql_async = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
@@ -138,6 +139,7 @@ kafka = ["dep:rdkafka"]
 mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
+    "dep:mysql_async",
     "datafusion-table-providers/mysql",
     "datafusion-table-providers/mysql-federation",
 ]
