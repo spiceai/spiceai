@@ -14,10 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
+use futures::future::join_all;
 use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    path::Path,
     ClientOptions, RetryConfig, aws::AmazonS3Builder, client::SpawnedReqwestConnector,
 };
 use runtime_parameters::ParameterSpec;
@@ -88,6 +95,452 @@ pub enum Error {
     InvalidConfiguration { detail: Arc<str> },
 }
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+const MULTI_ZONE_STORE_NAME: &str = "S3ExpressMultiZone";
+
+#[derive(Debug, Clone)]
+struct ZoneStore {
+    zone_id: String,
+    store: Arc<dyn ObjectStore>,
+}
+
+#[derive(Debug)]
+struct MultiZoneS3ExpressStore {
+    zones: Vec<ZoneStore>,
+}
+
+impl MultiZoneS3ExpressStore {
+    fn new(zones: Vec<ZoneStore>) -> Self {
+        Self { zones }
+    }
+
+    fn stores_len(&self) -> usize {
+        self.zones.len()
+    }
+
+    fn striped_read_order(&self, location: &Path) -> Vec<usize> {
+        if self.zones.is_empty() {
+            return Vec::new();
+        }
+
+        let mut hasher = DefaultHasher::new();
+        location.as_ref().hash(&mut hasher);
+        let primary_idx = (hasher.finish() as usize) % self.zones.len();
+
+        let mut order = Vec::with_capacity(self.zones.len());
+        order.push(primary_idx);
+        for idx in 0..self.zones.len() {
+            if idx != primary_idx {
+                order.push(idx);
+            }
+        }
+        order
+    }
+
+    fn multi_zone_write_error(&self, failed_zone_ids: &[String]) -> object_store::Error {
+        object_store::Error::Generic {
+            store: MULTI_ZONE_STORE_NAME,
+            source: Box::new(Error::MultiZoneWriteFailed {
+                failed_count: failed_zone_ids.len(),
+                total_zones: self.stores_len(),
+                failed_zones: failed_zone_ids.join(", "),
+            }),
+        }
+    }
+
+    async fn rollback_put(&self, location: &Path, successful_zone_ids: &[String]) {
+        let successful_set: HashSet<&str> = successful_zone_ids
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+
+        for zone in &self.zones {
+            if !successful_set.contains(zone.zone_id.as_str()) {
+                continue;
+            }
+            if let Err(e) = zone.store.delete(location).await {
+                tracing::warn!(
+                    "{}",
+                    Error::MultiZoneRollbackFailed {
+                        zone: zone.zone_id.clone(),
+                        reason: e.to_string(),
+                    }
+                );
+            }
+        }
+    }
+
+    async fn rollback_copy(&self, to: &Path, successful_zone_ids: &[String]) {
+        let successful_set: HashSet<&str> = successful_zone_ids
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+
+        for zone in &self.zones {
+            if !successful_set.contains(zone.zone_id.as_str()) {
+                continue;
+            }
+            if let Err(e) = zone.store.delete(to).await {
+                tracing::warn!(
+                    "{}",
+                    Error::MultiZoneRollbackFailed {
+                        zone: zone.zone_id.clone(),
+                        reason: e.to_string(),
+                    }
+                );
+            }
+        }
+    }
+}
+
+impl Display for MultiZoneS3ExpressStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{MULTI_ZONE_STORE_NAME}")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for MultiZoneS3ExpressStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let mut put_futures = Vec::with_capacity(self.zones.len());
+        for zone in &self.zones {
+            put_futures.push(async {
+                let result = zone
+                    .store
+                    .put_opts(location, payload.clone(), opts.clone())
+                    .await;
+                (zone.zone_id.clone(), result)
+            });
+        }
+
+        let results = join_all(put_futures).await;
+
+        let mut first_success: Option<PutResult> = None;
+        let mut successful_zone_ids = Vec::new();
+        let mut failed_zone_ids = Vec::new();
+
+        for (zone_id, result) in results {
+            match result {
+                Ok(put_result) => {
+                    if first_success.is_none() {
+                        first_success = Some(put_result);
+                    }
+                    successful_zone_ids.push(zone_id);
+                }
+                Err(_) => failed_zone_ids.push(zone_id),
+            }
+        }
+
+        if failed_zone_ids.is_empty() {
+            return first_success.ok_or_else(|| object_store::Error::Generic {
+                store: MULTI_ZONE_STORE_NAME,
+                source: "No successful multi-zone write result".into(),
+            });
+        }
+
+        self.rollback_put(location, &successful_zone_ids).await;
+        Err(self.multi_zone_write_error(&failed_zone_ids))
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        let mut uploads: Vec<ZoneMultipartUpload> = Vec::with_capacity(self.zones.len());
+        for zone in &self.zones {
+            let upload = zone
+                .store
+                .put_multipart_opts(location, opts.clone())
+                .await?;
+            uploads.push(ZoneMultipartUpload {
+                zone_id: zone.zone_id.clone(),
+                store: Arc::clone(&zone.store),
+                upload,
+            });
+        }
+
+        Ok(Box::new(MultiZoneMultipartUpload {
+            location: location.clone(),
+            total_zones: self.stores_len(),
+            uploads,
+        }))
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        let read_order = self.striped_read_order(location);
+        let mut last_err: Option<object_store::Error> = None;
+
+        for idx in read_order {
+            let zone = &self.zones[idx];
+            match zone.store.get_opts(location, options.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    tracing::debug!(
+                        "S3 Express read failed for zone '{}' and object '{}': {err}",
+                        zone.zone_id,
+                        location
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| object_store::Error::NotFound {
+            path: location.to_string(),
+            source: "No configured S3 zones".into(),
+        }))
+    }
+
+    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        let read_order = self.striped_read_order(location);
+        let mut last_err: Option<object_store::Error> = None;
+
+        for idx in read_order {
+            let zone = &self.zones[idx];
+            match zone.store.head(location).await {
+                Ok(meta) => return Ok(meta),
+                Err(err) => {
+                    tracing::debug!(
+                        "S3 Express head failed for zone '{}' and object '{}': {err}",
+                        zone.zone_id,
+                        location
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| object_store::Error::NotFound {
+            path: location.to_string(),
+            source: "No configured S3 zones".into(),
+        }))
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        let mut failed_zone_ids = Vec::new();
+        for zone in &self.zones {
+            if let Err(err) = zone.store.delete(location).await {
+                tracing::warn!(
+                    "Failed to delete object '{}' from zone '{}': {err}",
+                    location,
+                    zone.zone_id
+                );
+                failed_zone_ids.push(zone.zone_id.clone());
+            }
+        }
+
+        if failed_zone_ids.is_empty() {
+            Ok(())
+        } else {
+            Err(self.multi_zone_write_error(&failed_zone_ids))
+        }
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        // Listing from the first zone is sufficient because writes are replicated atomically.
+        // If replication ever diverges due to external mutation, list consistency degrades
+        // predictably to the primary zone.
+        self.zones[0].store.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.zones[0].store.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.zones[0].store.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        let mut successful_zone_ids = Vec::new();
+        let mut failed_zone_ids = Vec::new();
+
+        for zone in &self.zones {
+            match zone.store.copy(from, to).await {
+                Ok(()) => successful_zone_ids.push(zone.zone_id.clone()),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to copy object '{}' -> '{}' in zone '{}': {err}",
+                        from,
+                        to,
+                        zone.zone_id
+                    );
+                    failed_zone_ids.push(zone.zone_id.clone());
+                }
+            }
+        }
+
+        if failed_zone_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.rollback_copy(to, &successful_zone_ids).await;
+        Err(self.multi_zone_write_error(&failed_zone_ids))
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        let mut successful_zone_ids = Vec::new();
+        let mut failed_zone_ids = Vec::new();
+
+        for zone in &self.zones {
+            match zone.store.copy_if_not_exists(from, to).await {
+                Ok(()) => successful_zone_ids.push(zone.zone_id.clone()),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to copy_if_not_exists '{}' -> '{}' in zone '{}': {err}",
+                        from,
+                        to,
+                        zone.zone_id
+                    );
+                    failed_zone_ids.push(zone.zone_id.clone());
+                }
+            }
+        }
+
+        if failed_zone_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.rollback_copy(to, &successful_zone_ids).await;
+        Err(self.multi_zone_write_error(&failed_zone_ids))
+    }
+}
+
+#[derive(Debug)]
+struct ZoneMultipartUpload {
+    zone_id: String,
+    store: Arc<dyn ObjectStore>,
+    upload: Box<dyn MultipartUpload>,
+}
+
+#[derive(Debug)]
+struct MultiZoneMultipartUpload {
+    location: Path,
+    total_zones: usize,
+    uploads: Vec<ZoneMultipartUpload>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for MultiZoneMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        let mut part_futures = Vec::with_capacity(self.uploads.len());
+        for zone_upload in &mut self.uploads {
+            part_futures.push((zone_upload.zone_id.clone(), zone_upload.upload.put_part(data.clone())));
+        }
+
+        Box::pin(async move {
+            let results = join_all(part_futures.into_iter().map(|(zone_id, fut)| async move {
+                (zone_id, fut.await)
+            }))
+            .await;
+
+            for (zone_id, result) in results {
+                if let Err(err) = result {
+                    tracing::warn!("Failed multipart part upload in zone '{zone_id}': {err}");
+                    return Err(err);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let mut first_success: Option<PutResult> = None;
+        let mut successful_zone_ids = Vec::new();
+        let mut failed_zone_ids = Vec::new();
+
+        for zone_upload in &mut self.uploads {
+            match zone_upload.upload.complete().await {
+                Ok(put_result) => {
+                    if first_success.is_none() {
+                        first_success = Some(put_result);
+                    }
+                    successful_zone_ids.push(zone_upload.zone_id.clone());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed multipart completion in zone '{}': {err}",
+                        zone_upload.zone_id
+                    );
+                    failed_zone_ids.push(zone_upload.zone_id.clone());
+                    let _ = zone_upload.upload.abort().await;
+                }
+            }
+        }
+
+        if failed_zone_ids.is_empty() {
+            return first_success.ok_or_else(|| object_store::Error::Generic {
+                store: MULTI_ZONE_STORE_NAME,
+                source: "No successful multi-zone multipart completion result".into(),
+            });
+        }
+
+        let successful_set: HashSet<&str> = successful_zone_ids
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        let rollback_targets: Vec<(String, Arc<dyn ObjectStore>)> = self
+            .uploads
+            .iter()
+            .filter(|zone_upload| successful_set.contains(zone_upload.zone_id.as_str()))
+            .map(|zone_upload| (zone_upload.zone_id.clone(), Arc::clone(&zone_upload.store)))
+            .collect();
+
+        for (zone_id, store) in rollback_targets {
+            if let Err(err) = store.delete(&self.location).await {
+                tracing::warn!(
+                    "{}",
+                    Error::MultiZoneRollbackFailed {
+                        zone: zone_id,
+                        reason: err.to_string(),
+                    }
+                );
+            }
+        }
+
+        Err(object_store::Error::Generic {
+            store: MULTI_ZONE_STORE_NAME,
+            source: Box::new(Error::MultiZoneWriteFailed {
+                failed_count: failed_zone_ids.len(),
+                total_zones: self.total_zones,
+                failed_zones: failed_zone_ids.join(", "),
+            }),
+        })
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        let mut first_error: Option<object_store::Error> = None;
+        for zone_upload in &mut self.uploads {
+            if let Err(err) = zone_upload.upload.abort().await {
+                tracing::warn!(
+                    "Failed multipart abort in zone '{}': {err}",
+                    zone_upload.zone_id
+                );
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(())
+    }
+}
 
 pub(crate) const S3_PARAMS_LEN: usize = 10;
 pub(crate) const S3_PARAMETERS: [ParameterSpec; S3_PARAMS_LEN] = [
@@ -729,38 +1182,20 @@ pub fn derive_region_from_zone(zone_id: &str) -> Option<String> {
     Some(region.to_string())
 }
 
-/// Build an S3 object store for S3 Express One Zone storage.
-///
-/// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
-pub async fn build_s3_object_store(
-    source: &dyn AccelerationSource,
-    data_path: String,
-) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
-    // Check if this is S3 Express One Zone storage
-    if !is_s3_express_data_path(source) {
-        return Ok(None);
-    }
+#[derive(Debug, Clone)]
+struct ResolvedS3Params {
+    s3_region: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_key: Option<String>,
+    s3_secret: Option<String>,
+    s3_session_token: Option<String>,
+    s3_auth: String,
+    s3_client_timeout: Option<String>,
+    s3_allow_http: bool,
+    s3_unsigned_payload: bool,
+}
 
-    if !is_s3_express_path(&data_path) {
-        return Ok(None);
-    }
-
-    tracing::debug!(
-        "Building S3 Express One Zone object store for path: {}",
-        data_path
-    );
-
-    // Parse the S3 URL
-    let url = Url::parse(&data_path).boxed().context(InvalidS3UrlSnafu {
-        url: data_path.clone(),
-    })?;
-
-    // Get bucket name from URL
-    let bucket_name = get_bucket_name(&url).boxed().context(InvalidS3UrlSnafu {
-        url: data_path.clone(),
-    })?;
-
-    // Get params with secrets resolved
+async fn resolve_s3_params(source: &dyn AccelerationSource) -> ResolvedS3Params {
     let raw_params = source
         .acceleration()
         .map(|a| a.params.clone())
@@ -768,7 +1203,6 @@ pub async fn build_s3_object_store(
     let secrets = source.runtime().secrets();
     let params = get_params_with_secrets(secrets, &raw_params).await;
 
-    // Helper to get param value with secret exposed
     let get_param =
         |key: &str| -> Option<String> { params.get(key).map(|v| v.expose_secret().to_string()) };
 
@@ -781,87 +1215,88 @@ pub async fn build_s3_object_store(
     let s3_client_timeout = get_param("cayenne_s3_client_timeout");
     let s3_allow_http =
         get_param("cayenne_s3_allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    // Default to unsigned payload (true) for better performance; can be disabled if needed
     let s3_unsigned_payload =
         get_param("cayenne_s3_unsigned_payload").is_none_or(|v| !v.eq_ignore_ascii_case("false"));
 
-    // Extract zone ID from bucket name for S3 Express One Zone endpoint
-    let zone_id = extract_zone_id_from_bucket(bucket_name);
+    ResolvedS3Params {
+        s3_region,
+        s3_endpoint,
+        s3_key,
+        s3_secret,
+        s3_session_token,
+        s3_auth,
+        s3_client_timeout,
+        s3_allow_http,
+        s3_unsigned_payload,
+    }
+}
 
-    // Derive region from zone_id if not explicitly provided
-    let derived_region = zone_id.and_then(derive_region_from_zone);
+async fn build_single_s3_store_for_path(
+    data_path: &str,
+    params: &ResolvedS3Params,
+) -> Result<(Url, Arc<dyn ObjectStore>, String)> {
+    let url = Url::parse(data_path).boxed().context(InvalidS3UrlSnafu {
+        url: data_path.to_string(),
+    })?;
 
-    // Use explicit region if provided, otherwise use derived region. If neither is available, fail fast.
-    let effective_region = s3_region
-        .or(derived_region)
+    let bucket_name = get_bucket_name(&url).boxed().context(InvalidS3UrlSnafu {
+        url: data_path.to_string(),
+    })?;
+
+    let zone_id = extract_zone_id_from_bucket(bucket_name)
+        .ok_or_else(|| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "S3 Express bucket name '{bucket_name}' does not contain a valid zone ID"
+            )),
+        })?
+        .to_string();
+
+    let effective_region = params
+        .s3_region
+        .clone()
+        .or_else(|| derive_region_from_zone(&zone_id))
         .ok_or_else(|| Error::InvalidConfiguration {
             detail: Arc::from(
                 "Cannot determine AWS region for S3 Express One Zone. Specify 'cayenne_s3_region' or use an S3 Express bucket name that encodes the zone (bucket--<zone>--x-s3).",
             ),
         })?;
 
-    // Build the S3 object store
     let io_runtime = tokio::runtime::Handle::current();
     let mut s3_builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
-        .with_allow_http(s3_allow_http)
+        .with_allow_http(params.s3_allow_http)
         .with_region(effective_region.clone());
 
-    // Configure longer retry timeout for S3 Express uploads from outside AWS
-    // S3 Express One Zone is optimized for same-AZ access; from outside AWS,
-    // uploads can be slow and need more time to complete.
     let retry_config = RetryConfig {
         max_retries: 3,
-        retry_timeout: std::time::Duration::from_secs(600), // 10 minutes
+        retry_timeout: std::time::Duration::from_secs(600),
         ..Default::default()
     };
     s3_builder = s3_builder.with_retry(retry_config);
 
-    let mut client_options = ClientOptions::default();
+    let mut client_options = ClientOptions::default()
+        .with_timeout(std::time::Duration::from_secs(120));
 
-    // Set default timeout for S3 Express One Zone requests.
-    // Can be overridden via cayenne_s3_client_timeout parameter.
-    let default_timeout = std::time::Duration::from_secs(120); // 2 minutes per request
-    client_options = client_options.with_timeout(default_timeout);
+    s3_builder = s3_builder
+        .with_s3_express(true)
+        .with_virtual_hosted_style_request(true)
+        .with_unsigned_payload(params.s3_unsigned_payload);
 
-    // For S3 Express One Zone buckets, enable special handling:
-    // - with_s3_express(true) enables CreateSession API for session tokens
-    // - with_virtual_hosted_style_request(true) uses {bucket}.endpoint format
-    // - with_unsigned_payload(s3_unsigned_payload) optionally skips SHA-256 computation for request body
-    //   (S3 Express One Zone uses session-based auth, making payload signing unnecessary)
-    // - Endpoint format with virtual-hosted-style: https://{bucket}.s3express-{zone-id}.{region}.amazonaws.com
-    if let Some(zid) = zone_id {
-        tracing::debug!(
-            "Detected S3 Express One Zone bucket (zone: {}), enabling S3 Express mode (unsigned_payload: {})",
-            zid,
-            s3_unsigned_payload
-        );
-        s3_builder = s3_builder
-            .with_s3_express(true)
-            .with_virtual_hosted_style_request(true)
-            .with_unsigned_payload(s3_unsigned_payload);
-
-        // For S3 Express with virtual-hosted-style, the endpoint should include the bucket name
-        // Format: https://{bucket}.s3express-{zone-id}.{region}.amazonaws.com
-        if s3_endpoint.is_none() {
-            let express_endpoint =
-                format!("https://{bucket_name}.s3express-{zid}.{effective_region}.amazonaws.com");
-            tracing::debug!("Using S3 Express One Zone endpoint: {express_endpoint}");
-            s3_builder = s3_builder.with_endpoint(&express_endpoint);
-        }
+    if params.s3_endpoint.is_none() {
+        let express_endpoint =
+            format!("https://{bucket_name}.s3express-{zone_id}.{effective_region}.amazonaws.com");
+        s3_builder = s3_builder.with_endpoint(&express_endpoint);
     }
 
-    // Apply explicit endpoint if provided (overrides auto-generated)
-    if let Some(ref endpoint) = s3_endpoint {
-        tracing::debug!("Using explicit S3 endpoint: {}", endpoint);
+    if let Some(endpoint) = &params.s3_endpoint {
         s3_builder = s3_builder.with_endpoint(endpoint);
         if endpoint.starts_with("http://") {
             client_options = client_options.with_allow_http(true);
         }
     }
 
-    if let Some(ref timeout) = s3_client_timeout {
+    if let Some(timeout) = &params.s3_client_timeout {
         client_options = client_options.with_timeout(
             fundu::parse_duration(timeout)
                 .boxed()
@@ -870,13 +1305,11 @@ pub async fn build_s3_object_store(
     }
 
     let mut load_credentials_from_environment = true;
-
-    // Handle explicit key/secret credentials
-    if s3_auth == "key" {
-        if let (Some(key), Some(secret)) = (s3_key, s3_secret) {
+    if params.s3_auth == "key" {
+        if let (Some(key), Some(secret)) = (params.s3_key.clone(), params.s3_secret.clone()) {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
-            if let Some(token) = s3_session_token {
+            if let Some(token) = params.s3_session_token.clone() {
                 s3_builder = s3_builder.with_token(token);
             }
             load_credentials_from_environment = false;
@@ -891,13 +1324,10 @@ pub async fn build_s3_object_store(
 
     s3_builder = s3_builder.with_client_options(client_options);
 
-    // Load credentials from environment if not using explicit keys
     if load_credentials_from_environment {
-        tracing::debug!("Loading S3 credentials from environment for Cayenne");
         match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
             Ok(Some(sdk_config)) => {
                 if sdk_config.credentials_provider().is_some() {
-                    tracing::debug!("Using S3 credentials provider from SDK config");
                     s3_builder = s3_builder.with_credentials(Arc::new(
                         S3CredentialProvider::from_config(sdk_config.as_ref())
                             .boxed()
@@ -921,15 +1351,79 @@ pub async fn build_s3_object_store(
         .boxed()
         .context(ObjectStoreCreationSnafu)?;
 
+    Ok((url, Arc::new(store), zone_id))
+}
+
+/// Build an S3 object store for S3 Express One Zone storage.
+///
+/// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
+pub async fn build_s3_object_store(
+    source: &dyn AccelerationSource,
+    data_path: String,
+) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
+    // Check if this is S3 Express One Zone storage
+    if !is_s3_express_data_path(source) {
+        return Ok(None);
+    }
+
+    if !is_s3_express_path(&data_path) {
+        return Ok(None);
+    }
+
+    tracing::debug!(
+        "Building S3 Express One Zone object store for path: {}",
+        data_path
+    );
+
+    let resolved = resolve_s3_params(source).await;
+
+    let zone_ids = get_s3_zone_ids(source);
+    if zone_ids.len() > 1 {
+        let dataset_name = source.name().to_string().replace(['.', '/'], "_");
+        let app_name = source.app().name.clone();
+
+        let mut zone_stores = Vec::with_capacity(zone_ids.len());
+        let mut primary_url: Option<Url> = None;
+
+        for zone_id in &zone_ids {
+            let bucket_name = generate_bucket_name(&app_name, &dataset_name, zone_id)?;
+            let zone_data_path = format!("s3://{bucket_name}/{dataset_name}/");
+            let (url, store, resolved_zone_id) =
+                build_single_s3_store_for_path(&zone_data_path, &resolved).await?;
+
+            if primary_url.is_none() {
+                primary_url = Some(url.clone());
+            }
+
+            zone_stores.push(ZoneStore {
+                zone_id: resolved_zone_id,
+                store,
+            });
+        }
+
+        let primary_url = primary_url.ok_or_else(|| Error::InvalidConfiguration {
+            detail: Arc::from("Failed to determine primary S3 Express URL for multi-zone setup"),
+        })?;
+
+        tracing::info!(
+            "Configured multi-zone S3 Express object store with {} zone(s)",
+            zone_stores.len()
+        );
+
+        return Ok(Some(cayenne::metadata::ObjectStoreConfig {
+            url: primary_url,
+            store: Arc::new(MultiZoneS3ExpressStore::new(zone_stores)),
+        }));
+    }
+
+    let (url, store, _) = build_single_s3_store_for_path(&data_path, &resolved).await?;
+
     tracing::info!(
         "S3 Express One Zone object store configured for data path: {}",
         data_path
     );
 
-    Ok(Some(cayenne::metadata::ObjectStoreConfig {
-        url,
-        store: Arc::new(store),
-    }))
+    Ok(Some(cayenne::metadata::ObjectStoreConfig { url, store }))
 }
 
 /// Returns true if the provided error or any of its sources indicates an authentication failure.
@@ -968,6 +1462,83 @@ pub fn is_auth_error(error: &(dyn std::error::Error + 'static)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::{Error as ObjectStoreError, ListResult};
+    use object_store::{PutMultipartOptions, PutOptions, PutPayload, PutResult};
+    use object_store::{memory::InMemory, path::Path};
+
+    #[derive(Debug)]
+    struct FailingPutStore {
+        inner: Arc<InMemory>,
+    }
+
+    impl Display for FailingPutStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            _payload: PutPayload,
+            _opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            Err(ObjectStoreError::Generic {
+                store: "FailingPutStore",
+                source: format!("forced put failure for {location}").into(),
+            })
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            Err(ObjectStoreError::NotSupported {
+                source: "multipart not supported in FailingPutStore test double".into(),
+            })
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 
     #[test]
     fn test_is_s3_express_path() {
@@ -1152,5 +1723,82 @@ mod tests {
         // Unknown zone format
         assert_eq!(derive_region_from_zone("unknown-az1"), None);
         assert_eq!(derive_region_from_zone("invalid"), None);
+    }
+
+    #[tokio::test]
+    async fn test_multi_zone_put_rolls_back_on_partial_failure() {
+        let healthy_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let failing_store = Arc::new(FailingPutStore {
+            inner: Arc::new(InMemory::new()),
+        }) as Arc<dyn ObjectStore>;
+
+        let multi_zone_store = MultiZoneS3ExpressStore::new(vec![
+            ZoneStore {
+                zone_id: "use1-az1".to_string(),
+                store: Arc::clone(&healthy_store),
+            },
+            ZoneStore {
+                zone_id: "use1-az2".to_string(),
+                store: failing_store,
+            },
+        ]);
+
+        let location = Path::from("table/snapshot/data.vtx");
+        let write_result = multi_zone_store
+            .put_opts(&location, PutPayload::from("test-data".to_string()), PutOptions::default())
+            .await;
+        assert!(write_result.is_err(), "multi-zone write should fail");
+
+        let head_result = healthy_store.head(&location).await;
+        assert!(
+            matches!(head_result, Err(ObjectStoreError::NotFound { .. })),
+            "successful zone should be rolled back when any replica write fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_striped_read_with_cross_zone_fallback() {
+        let zone_a = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let zone_b = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let multi_zone_store = MultiZoneS3ExpressStore::new(vec![
+            ZoneStore {
+                zone_id: "usw2-az1".to_string(),
+                store: Arc::clone(&zone_a),
+            },
+            ZoneStore {
+                zone_id: "usw2-az2".to_string(),
+                store: Arc::clone(&zone_b),
+            },
+        ]);
+
+        let location = Path::from("table/snapshot/striped-key.vtx");
+        let preferred_idx = multi_zone_store.striped_read_order(&location)[0];
+        let fallback_idx = if preferred_idx == 0 { 1 } else { 0 };
+
+        let fallback_store = if fallback_idx == 0 {
+            Arc::clone(&zone_a)
+        } else {
+            Arc::clone(&zone_b)
+        };
+
+        fallback_store
+            .put_opts(
+                &location,
+                PutPayload::from("fallback-zone-data".to_string()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("fallback zone write should succeed");
+
+        let bytes: Bytes = multi_zone_store
+            .get_opts(&location, GetOptions::default())
+            .await
+            .expect("read should succeed via cross-zone fallback")
+            .bytes()
+            .await
+            .expect("read bytes should succeed");
+
+        assert_eq!(bytes.as_ref(), b"fallback-zone-data");
     }
 }

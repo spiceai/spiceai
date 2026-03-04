@@ -412,14 +412,6 @@ impl CayenneAccelerator {
             .boxed()
             .context(AccelerationCreationFailedSnafu)?;
 
-        if paths.len() > 1 {
-            return Err(Error::InvalidConfiguration {
-                detail: Arc::from(
-                    "Cayenne multi-zone S3 Express writes are not implemented yet. Configure a single zone in 'cayenne_s3_zone_ids' or use a single-zone 'cayenne_file_path'.",
-                ),
-            });
-        }
-
         paths
             .first()
             .cloned()
@@ -882,14 +874,6 @@ impl DataAccelerator for CayenneAccelerator {
                 }));
             }
 
-            if s3::is_multi_zone_s3_express(source) {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne multi-zone S3 Express writes are not implemented yet. Configure a single zone in 'cayenne_s3_zone_ids' or use a single-zone 'cayenne_file_path'.",
-                    ),
-                }));
-            }
-
             // Validate that refresh_append_overlap is not specified
             if acceleration.refresh_append_overlap.is_some() {
                 return Err(Box::new(Error::InvalidConfiguration {
@@ -905,23 +889,99 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Handle S3 Express One Zone configuration
         if is_s3_express {
-            // Automatically create the bucket if it doesn't exist and we have the required info
-            let (bucket_name, zone_id, region, access_key, secret_key, session_token) =
-                s3::get_s3_bucket_info(source, &dir_path).boxed()?;
-            if s3::create_s3_express_bucket_if_needed(
-                &bucket_name,
-                &zone_id,
-                &region,
-                access_key,
-                secret_key,
-                session_token,
-            )
-            .await
-            .boxed()?
-            {
-                tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket created)");
+            if s3::is_multi_zone_s3_express(source) {
+                let zone_ids = s3::get_s3_zone_ids(source);
+                let dataset_name = source.name().to_string().replace(['.', '/'], "_");
+                let app_name = source.app().name.clone();
+
+                let acceleration = source.acceleration().ok_or_else(|| {
+                    Box::new(Error::InvalidConfiguration {
+                        detail: Arc::from(
+                            "Acceleration settings are required for multi-zone S3 Express initialization",
+                        ),
+                    }) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+
+                let s3_auth = acceleration
+                    .params
+                    .get("cayenne_s3_auth")
+                    .map_or("iam_role", String::as_str);
+                let (access_key, secret_key, session_token) = if s3_auth == "key" {
+                    (
+                        acceleration.params.get("cayenne_s3_key").cloned(),
+                        acceleration.params.get("cayenne_s3_secret").cloned(),
+                        acceleration.params.get("cayenne_s3_session_token").cloned(),
+                    )
+                } else {
+                    (None, None, None)
+                };
+
+                for zone_id in &zone_ids {
+                    let bucket_name = s3::generate_bucket_name(&app_name, &dataset_name, zone_id)
+                        .map_err(|source| {
+                            Box::new(Error::S3Error { source })
+                                as Box<dyn std::error::Error + Send + Sync>
+                        })?;
+
+                    let region = acceleration
+                        .params
+                        .get("cayenne_s3_region")
+                        .cloned()
+                        .or_else(|| s3::derive_region_from_zone(zone_id))
+                        .ok_or_else(|| Error::InvalidConfiguration {
+                            detail: Arc::from(format!(
+                                "Could not determine region for S3 Express zone '{zone_id}'. Specify 'cayenne_s3_region' parameter"
+                            )),
+                        })?;
+
+                    let created = s3::create_s3_express_bucket_if_needed(
+                        &bucket_name,
+                        zone_id,
+                        &region,
+                        access_key.clone(),
+                        secret_key.clone(),
+                        session_token.clone(),
+                    )
+                    .await
+                    .map_err(|source| {
+                        Box::new(Error::S3Error { source })
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+
+                    if created {
+                        tracing::info!(
+                            "Using S3 Express One Zone storage replica: s3://{bucket_name}/{dataset_name}/ (bucket created)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "Using S3 Express One Zone storage replica: s3://{bucket_name}/{dataset_name}/ (bucket exists)"
+                        );
+                    }
+                }
+
+                tracing::info!(
+                    "Using multi-zone S3 Express One Zone storage: {} zone(s), primary path {dir_path}",
+                    zone_ids.len()
+                );
             } else {
-                tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket exists)");
+                // Automatically create the bucket if it doesn't exist and we have the required info
+                let (bucket_name, zone_id, region, access_key, secret_key, session_token) =
+                    s3::get_s3_bucket_info(source, &dir_path).boxed()?;
+                if s3::create_s3_express_bucket_if_needed(
+                    &bucket_name,
+                    &zone_id,
+                    &region,
+                    access_key,
+                    secret_key,
+                    session_token,
+                )
+                .await
+                .boxed()?
+                {
+                    tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket created)");
+                } else {
+                    tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket exists)");
+                }
             }
             tracing::debug!(
                 "S3 Express One Zone is optimized for low-latency access within the same AWS Availability Zone. Access from outside AWS may experience higher latency."
@@ -1657,6 +1717,45 @@ mod tests {
         };
         assert!(dir_path.contains("cayenne_data_accelerator_test"));
         assert!(dir_path.ends_with('/'));
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_multi_zone_primary_path_generation() {
+        let app = AppBuilder::new("test-app").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new(
+            "orders.dataset".to_string(),
+            "orders.dataset",
+        )
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [(
+                "cayenne_s3_zone_ids".to_string(),
+                "usw2-az1,usw2-az2".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let accelerator = CayenneAccelerator::new();
+        let primary_data_dir = accelerator
+            .resolve_storage_config(&dataset)
+            .expect("Expected primary multi-zone path");
+
+        assert!(
+            primary_data_dir.starts_with("s3://spice-test-app-orders-dataset--usw2-az1--x-s3/"),
+            "Expected first zone to be primary path, got: {primary_data_dir}"
+        );
+        assert!(primary_data_dir.ends_with("/orders_dataset/"));
     }
 
     #[test]
