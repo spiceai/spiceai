@@ -299,7 +299,6 @@ pub async fn get_dynamodb_metrics() -> Result<DynamoDbMetrics> {
         if line.starts_with("dataset_dynamodb_records_consumed_total") {
             let value = parse_value(line);
             metrics.records_consumed_total += value;
-            println!("!!! Metric line: {}, label: {:?}", line, extract_label(line, "dataset"));
             if let Some(dataset) = extract_label(line, "name") {
                 *metrics
                     .records_consumed_per_table

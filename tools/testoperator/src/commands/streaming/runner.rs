@@ -250,6 +250,21 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
         }
     }
 
+
+    let dynamodb_metrics = match utils::get_dynamodb_metrics().await {
+        Ok(metrics) => {
+            metrics
+        }
+        Err(e) => {
+            println!("Warning: Failed to fetch DynamoDB metrics: {e}");
+            utils::DynamoDbMetrics::default()
+        }
+    };
+    println!("!!!!!!!!!! AFTER INGESTION - records_consumed_per_table: {:?}", dynamodb_metrics.records_consumed_per_table);
+
+
+
+
     // Phase 10: Insert markers for each dataset
     println!("\nPhase 10: Inserting marker records");
     for info in &dataset_infos {
@@ -260,18 +275,6 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
     }
 
     let marker_insertion_time = Instant::now();
-
-    println!("\n!!! Total records written per table:");
-    for info in &dataset_infos {
-        let total = info.record_count + info.dataset.marker_count();
-        println!(
-            "  {}: {} (data: {}, markers: {})",
-            info.dataset.dataset_type(),
-            total,
-            info.record_count,
-            info.dataset.marker_count(),
-        );
-    }
 
     // Phase 11: Poll for markers
     println!("\nPhase 11: Polling for marker detection");
@@ -419,7 +422,6 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
     crate::metrics::RECORDS_PER_SECOND.record(throughput, &[]);
     crate::metrics::RECORD_COUNT.record(record_count, &[]);
     for (dataset_name, count) in &dynamodb_metrics.records_consumed_per_table {
-        println!("!!!!!!!!!! records_consumed_per_table: table={}, records={}", dataset_name, count);
         crate::metrics::RECORD_COUNT.record(
             *count,
             &[KeyValue::new("dataset", dataset_name.clone())],
