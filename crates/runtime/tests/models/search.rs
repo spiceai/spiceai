@@ -934,6 +934,57 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
     ).await
 }
 
+/// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
+///
+/// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
+    let mut ds = get_mega_science_dataset(
+        Some("qs"),
+        Some(
+            Column::new("question")
+                .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+        ),
+        Some(
+            Column::new("answer")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+        ),
+    );
+    ds.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        ..Default::default()
+    });
+
+    run_search(
+        AppBuilder::new("search_app")
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "hf_minilm",
+            ))
+            .with_dataset(ds)
+            .build(),
+        vec![
+            // Basic hybrid search — the query pattern from the cookbook's bluesky search example
+            // (https://github.com/spiceai/cookbook/blob/trunk/search/README.md).
+            SearchTestCase::new(
+                "hybrid_rrf_duckdb_basic",
+                SearchTestType::from_sql(
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second')) order by fused_score desc, id asc LIMIT 4",
+                ),
+            ),
+            // Explicit join key with DuckDB acceleration
+            SearchTestCase::new(
+                "hybrid_rrf_duckdb_explicit_join",
+                SearchTestType::from_sql(
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second'), join_key => 'id') order by fused_score desc, id asc LIMIT 4",
+                ),
+            ),
+        ],
+    ).await
+}
+
 #[tokio::test]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     run_search(
