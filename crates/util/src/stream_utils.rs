@@ -185,14 +185,13 @@ impl ExecutionPlan for StreamingExec {
     }
 
     fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
-        vec![datafusion::physical_plan::Distribution::UnspecifiedDistribution; self
-            .children()
-            .len()]
+        vec![
+            datafusion::physical_plan::Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ]
     }
 
-    fn required_input_ordering(
-        &self,
-    ) -> Vec<Option<OrderingRequirements>> {
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
 
@@ -204,7 +203,10 @@ impl ExecutionPlan for StreamingExec {
         self.required_input_distribution()
             .into_iter()
             .map(|dist| {
-                !matches!(dist, datafusion::physical_plan::Distribution::SinglePartition)
+                !matches!(
+                    dist,
+                    datafusion::physical_plan::Distribution::SinglePartition
+                )
             })
             .collect()
     }
@@ -314,8 +316,11 @@ impl ExecutionPlan for StreamingExec {
         _phase: datafusion::physical_plan::filter_pushdown::FilterPushdownPhase,
         child_pushdown_result: datafusion::physical_plan::filter_pushdown::ChildPushdownResult,
         _config: &datafusion::config::ConfigOptions,
-    ) -> Result<datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation<Arc<dyn ExecutionPlan>>>
-    {
+    ) -> Result<
+        datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation<
+            Arc<dyn ExecutionPlan>,
+        >,
+    > {
         Ok(
             datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation::if_all(
                 child_pushdown_result,
@@ -323,18 +328,16 @@ impl ExecutionPlan for StreamingExec {
         )
     }
 
-    fn with_new_state(
-        &self,
-        _state: Arc<dyn Any + Send + Sync>,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
 
     fn try_pushdown_sort(
         &self,
         _order: &[PhysicalSortExpr],
-    ) -> Result<datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult<Arc<dyn ExecutionPlan>>>
-    {
+    ) -> Result<
+        datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult<Arc<dyn ExecutionPlan>>,
+    > {
         Ok(datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult::Unsupported)
     }
 }

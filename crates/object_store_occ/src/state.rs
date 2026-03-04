@@ -335,13 +335,9 @@ where
     }
 
     fn update_cache(&self, key: &str, value: T, version: UpdateVersion) {
-        self.cache.write().insert(
-            key.to_string(),
-            CachedEntry {
-                value,
-                version,
-            },
-        );
+        self.cache
+            .write()
+            .insert(key.to_string(), CachedEntry { value, version });
     }
 
     fn remove_from_cache(&self, key: &str) {

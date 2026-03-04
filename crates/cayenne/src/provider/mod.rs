@@ -978,7 +978,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["email".to_string()],
             on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "email".to_string(),
+                "email".to_string()
             ]))),
             base_path: data_dir.to_string_lossy().to_string(),
             partition_column: None,

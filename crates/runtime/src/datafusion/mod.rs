@@ -3464,9 +3464,7 @@ mod tests {
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(
-                validate_distributed_engine(&config, &Engine::PartitionedArrow, "ds").is_ok()
-            );
+            assert!(validate_distributed_engine(&config, &Engine::PartitionedArrow, "ds").is_ok());
         }
 
         #[test]
@@ -3504,8 +3502,7 @@ mod tests {
         #[test]
         fn postgresql_rejected_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            let result =
-                validate_distributed_engine(&config, &Engine::PostgreSQL, "my_dataset");
+            let result = validate_distributed_engine(&config, &Engine::PostgreSQL, "my_dataset");
             assert!(
                 matches!(
                     result,
