@@ -96,7 +96,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka"
+          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
@@ -457,7 +457,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          FEATURES="flightsql,models,s3_vectors,kafka"
+          FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
