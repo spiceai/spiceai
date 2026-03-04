@@ -3458,19 +3458,22 @@ mod tests {
         #[test]
         fn arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(validate_distributed_engine(&config, Engine::Arrow, "ds").is_ok());
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("Arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(validate_distributed_engine(&config, Engine::PartitionedArrow, "ds").is_ok());
+            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
+                .expect("PartitionedArrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn cayenne_allowed_in_distributed_mode() {
             let config = make_cluster_config(ClusterRole::Scheduler);
-            assert!(validate_distributed_engine(&config, Engine::Cayenne, "ds").is_ok());
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("Cayenne engine should be allowed in distributed mode");
         }
 
         #[test]
@@ -3515,11 +3518,16 @@ mod tests {
         #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
-            assert!(validate_distributed_engine(&config, Engine::DuckDB, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, Engine::Sqlite, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, Engine::PostgreSQL, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, Engine::Arrow, "ds").is_ok());
-            assert!(validate_distributed_engine(&config, Engine::Cayenne, "ds").is_ok());
+            validate_distributed_engine(&config, Engine::DuckDB, "ds")
+                .expect("DuckDB should be allowed in non-distributed mode");
+            validate_distributed_engine(&config, Engine::Sqlite, "ds")
+                .expect("Sqlite should be allowed in non-distributed mode");
+            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
+                .expect("PostgreSQL should be allowed in non-distributed mode");
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("Arrow should be allowed in non-distributed mode");
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("Cayenne should be allowed in non-distributed mode");
         }
     }
 }
