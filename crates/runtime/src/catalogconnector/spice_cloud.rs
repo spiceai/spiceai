@@ -448,7 +448,10 @@ mod tests {
             "test",
             vec![
                 ("spiceai_api_key".to_string(), "api-key".to_string().into()),
-                ("spiceai_token".to_string(), "legacy-token".to_string().into()),
+                (
+                    "spiceai_token".to_string(),
+                    "legacy-token".to_string().into(),
+                ),
             ],
             "spiceai",
             Arc::new(RwLock::new(Secrets::new())),
@@ -466,7 +469,10 @@ mod tests {
     async fn test_api_key_uses_legacy_token_parameter() {
         let params = Parameters::try_new(
             "test",
-            vec![("spiceai_token".to_string(), "legacy-token".to_string().into())],
+            vec![(
+                "spiceai_token".to_string(),
+                "legacy-token".to_string().into(),
+            )],
             "spiceai",
             Arc::new(RwLock::new(Secrets::new())),
             PARAMETERS,
