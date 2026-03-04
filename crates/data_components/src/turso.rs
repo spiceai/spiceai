@@ -148,6 +148,7 @@ use datafusion_federation::{
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
+use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, WAL_JOURNAL_MODE_VALUE};
 use turso::{Builder, Connection, Database, Value as TursoValue};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
@@ -391,7 +392,7 @@ fn is_now_function(func: &Function) -> bool {
 /// let conn = pool.connect().await?;
 /// ```
 ///
-/// Note: MVCC is enabled via PRAGMA journal_mode = 'experimental_mvcc' during pool creation.
+/// Note: Concurrent transactions are enabled via WAL journal mode during pool creation.
 /// This enables BEGIN CONCURRENT transactions for better concurrency.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
@@ -418,7 +419,7 @@ impl TursoConnectionPool {
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
     /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
     ///
-    /// Note: MVCC is enabled via PRAGMA journal_mode = 'experimental_mvcc' in turso 0.4.x.
+    /// Note: BEGIN CONCURRENT requires WAL mode, which is configured during pool creation.
     pub async fn new_with_timestamp_format(
         path: &str,
         timestamp_format: TimestampFormat,
@@ -428,11 +429,9 @@ impl TursoConnectionPool {
             .await
             .context(TursoDatabaseSnafu)?;
 
-        // Enable MVCC mode via PRAGMA - this is required for BEGIN CONCURRENT transactions
-        // In turso 0.4.x, the Builder.with_mvcc() method was removed, so we must enable
-        // MVCC via this pragma after database creation
+        // BEGIN CONCURRENT requires WAL journal mode for concurrent writers.
         let conn = database.connect().context(TursoDatabaseSnafu)?;
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        conn.pragma_update("journal_mode", WAL_JOURNAL_MODE_VALUE)
             .await
             .context(TursoDatabaseSnafu)?;
 
@@ -1718,8 +1717,8 @@ impl TursoDataSink {
         );
 
         // Use a transaction to batch all inserts
-        // MVCC is always enabled in turso 0.4.x, so use BEGIN CONCURRENT for better concurrency
-        conn.execute("BEGIN CONCURRENT", ()).await?;
+        // BEGIN CONCURRENT improves write concurrency on Turso in WAL mode.
+        conn.execute(BEGIN_CONCURRENT_SQL, ()).await?;
 
         // Prepare the statement once
         let mut stmt = conn.prepare(&insert_sql).await?;
@@ -1741,7 +1740,7 @@ impl TursoDataSink {
         }
 
         // Commit the transaction
-        conn.execute("COMMIT", ()).await?;
+        conn.execute(COMMIT_SQL, ()).await?;
 
         Ok(())
     }

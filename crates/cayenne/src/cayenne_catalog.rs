@@ -28,6 +28,10 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use turso_shared::{
+    BEGIN_CONCURRENT_SQL, BEGIN_TRANSACTION_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
+    is_retryable_write_conflict_message, retry_backoff_delay,
+};
 
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
@@ -38,6 +42,18 @@ pub(crate) enum MetastoreImpl {
 }
 
 impl MetastoreImpl {
+    #[must_use]
+    pub(crate) fn is_turso(&self) -> bool {
+        #[cfg(feature = "turso")]
+        {
+            matches!(self, Self::Turso(_))
+        }
+        #[cfg(not(feature = "turso"))]
+        {
+            false
+        }
+    }
+
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -889,8 +905,14 @@ impl MetadataCatalog for CayenneCatalog {
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
         // but data is not corrupted).
+        let begin_transaction = if self.metastore.is_turso() {
+            BEGIN_CONCURRENT_SQL
+        } else {
+            BEGIN_TRANSACTION_SQL
+        };
+
         let batch_sql = format!(
-            "BEGIN TRANSACTION; \
+            "{begin_transaction}; \
              DELETE FROM cayenne_delete_file WHERE table_id = {table_id}; \
              DELETE FROM cayenne_insert_record WHERE table_id = {table_id}; \
              DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id}; \
@@ -898,12 +920,37 @@ impl MetadataCatalog for CayenneCatalog {
              COMMIT;"
         );
 
-        self.metastore
-            .execute_batch_helper(&batch_sql)
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
-                source: Box::new(e),
-            })?;
+        // BEGIN CONCURRENT may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at commit time.
+        // Retry a few times with backoff to improve throughput under concurrent writers.
+        let max_attempts = if self.metastore.is_turso() {
+            DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS
+        } else {
+            1
+        };
+        for attempt in 1..=max_attempts {
+            match self.metastore.execute_batch_helper(&batch_sql).await {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if self.metastore.is_turso()
+                        && attempt < max_attempts
+                        && is_retryable_turso_write_conflict(&e) =>
+                {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying Turso BEGIN CONCURRENT compaction transaction after conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    return Err(CatalogError::FailedToSetCurrentSnapshot {
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1142,6 +1189,13 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
         Ok(true)
+    }
+}
+
+fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
+    match error {
+        CatalogError::Database { message } => is_retryable_write_conflict_message(message),
+        _ => false,
     }
 }
 

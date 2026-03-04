@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
+use turso_shared::WAL_JOURNAL_MODE_VALUE;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 
 /// Turso-based metastore backend.
@@ -292,7 +293,7 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
 /// Convert Turso errors to `CatalogError`, distinguishing constraint violations.
 fn convert_turso_error(e: turso::Error) -> CatalogError {
     match e {
-        // turso 0.4.x uses dedicated Constraint variant for constraint violations
+        // turso exposes a dedicated Constraint variant for constraint violations
         turso::Error::Constraint(ref msg) => CatalogError::ConstraintViolation {
             message: msg.clone(),
         },
@@ -306,6 +307,13 @@ fn convert_turso_error(e: turso::Error) -> CatalogError {
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
+
+        // BEGIN CONCURRENT requires WAL mode for concurrent writers.
+        conn.pragma_update("journal_mode", WAL_JOURNAL_MODE_VALUE)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set journal mode: {e}"),
+            })?;
 
         // NORMAL synchronous mode: safe with WAL, more performant than FULL
         // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
