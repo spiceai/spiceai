@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use turso_shared::{
-    BEGIN_CONCURRENT_SQL, BEGIN_TRANSACTION_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
-    is_retryable_write_conflict_message, retry_backoff_delay,
+    is_retryable_write_conflict_message, retry_backoff_delay, BEGIN_CONCURRENT_SQL,
+    BEGIN_TRANSACTION_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
 };
 
 /// Metastore backend enum to support different implementations.
