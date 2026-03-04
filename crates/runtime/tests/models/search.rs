@@ -934,9 +934,9 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
     ).await
 }
 
-/// Regression test for https://github.com/spiceai/spiceai/issues/9621
+/// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
 ///
-/// This test ensures that RRF queries work correctly with DuckDB acceleration.
+/// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
