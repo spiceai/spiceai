@@ -39,6 +39,7 @@ use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
 use search::provider::{SearchQueryProvider, UdtfSource};
 use search::telemetry_node::SearchTelemetryNode;
+use snafu::ResultExt;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
