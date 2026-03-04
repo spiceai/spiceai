@@ -99,7 +99,7 @@ tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
-turso-shared = { workspace = true }
+turso-shared = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
@@ -161,7 +161,7 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso"]
+turso = ["dep:turso", "dep:turso-shared"]
 
 test_hadoop_catalog_docker = []
 

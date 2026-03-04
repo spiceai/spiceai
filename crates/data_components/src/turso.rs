@@ -370,7 +370,7 @@ fn is_now_function(func: &Function) -> bool {
 /// Connection pool for Turso databases
 ///
 /// Manages connections to a Turso database (file-based or in-memory).
-/// Supports MVCC (Multi-Version Concurrency Control) for concurrent transactions.
+/// Supports concurrent transactions using WAL mode with `BEGIN CONCURRENT`.
 ///
 /// # Architecture
 ///
