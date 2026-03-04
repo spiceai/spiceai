@@ -25,8 +25,10 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_expr::{LexOrdering, OrderingRequirements, PhysicalSortExpr};
+use datafusion::physical_plan::execution_plan::{
+    Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
+};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -121,9 +123,7 @@ pub fn sort_stream(
 ///
 /// This is a simple wrapper that allows integrating an existing stream
 /// into `DataFusion`'s `ExecutionPlan` framework for operations like sorting.
-#[expect(dead_code)] // schema is used indirectly via PlanProperties
 struct StreamingExec {
-    schema: SchemaRef,
     stream: Mutex<Option<SendableRecordBatchStream>>,
     properties: PlanProperties,
 }
@@ -137,7 +137,6 @@ impl StreamingExec {
             Boundedness::Bounded,
         );
         Self {
-            schema,
             stream: Mutex::new(Some(stream)),
             properties,
         }
@@ -156,8 +155,16 @@ impl DisplayAs for StreamingExec {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for StreamingExec {
     fn name(&self) -> &'static str {
+        "StreamingExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
         "StreamingExec"
     }
 
@@ -165,8 +172,41 @@ impl ExecutionPlan for StreamingExec {
         self
     }
 
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(self.properties().eq_properties.schema())
+    }
+
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
+        check_default_invariants(self, check)
+    }
+
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![datafusion::physical_plan::Distribution::UnspecifiedDistribution; self
+            .children()
+            .len()]
+    }
+
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<OrderingRequirements>> {
+        vec![None; self.children().len()]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        self.required_input_distribution()
+            .into_iter()
+            .map(|dist| {
+                !matches!(dist, datafusion::physical_plan::Distribution::SinglePartition)
+            })
+            .collect()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -178,6 +218,19 @@ impl ExecutionPlan for StreamingExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
     }
 
     fn execute(
@@ -194,6 +247,95 @@ impl ExecutionPlan for StreamingExec {
             .ok_or_else(|| DataFusionError::Execution("Stream already consumed".to_string()))?;
 
         Ok(stream)
+    }
+
+    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+        None
+    }
+
+    fn statistics(&self) -> Result<datafusion::common::Statistics> {
+        Ok(datafusion::common::Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<datafusion::common::Statistics> {
+        if let Some(idx) = partition {
+            let partition_count = self.properties.output_partitioning().partition_count();
+            if idx >= partition_count {
+                return Err(DataFusionError::Internal(format!(
+                    "Invalid partition index: {idx}, the partition count is {partition_count}"
+                )));
+            }
+        }
+        Ok(datafusion::common::Statistics::new_unknown(&self.schema()))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Unknown
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &datafusion::physical_plan::projection::ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: datafusion::physical_plan::filter_pushdown::FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> Result<datafusion::physical_plan::filter_pushdown::FilterDescription> {
+        Ok(
+            datafusion::physical_plan::filter_pushdown::FilterDescription::all_unsupported(
+                &parent_filters,
+                &self.children(),
+            ),
+        )
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: datafusion::physical_plan::filter_pushdown::FilterPushdownPhase,
+        child_pushdown_result: datafusion::physical_plan::filter_pushdown::ChildPushdownResult,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> Result<datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation<Arc<dyn ExecutionPlan>>>
+    {
+        Ok(
+            datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation::if_all(
+                child_pushdown_result,
+            ),
+        )
+    }
+
+    fn with_new_state(
+        &self,
+        _state: Arc<dyn Any + Send + Sync>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult<Arc<dyn ExecutionPlan>>>
+    {
+        Ok(datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult::Unsupported)
     }
 }
 

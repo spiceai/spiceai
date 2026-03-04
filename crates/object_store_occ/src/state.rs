@@ -17,7 +17,6 @@ limitations under the License.
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Instant;
 
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
@@ -62,8 +61,6 @@ pub enum WriteResult<T> {
 struct CachedEntry<T> {
     value: T,
     version: UpdateVersion,
-    #[expect(dead_code)]
-    cached_at: Instant,
 }
 
 /// Manages typed objects in an object store with optimistic concurrency control.
@@ -343,7 +340,6 @@ where
             CachedEntry {
                 value,
                 version,
-                cached_at: Instant::now(),
             },
         );
     }

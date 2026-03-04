@@ -96,17 +96,6 @@ impl IcebergResponseError {
         }
     }
 
-    #[expect(dead_code)]
-    pub fn bad_request(message: String) -> Self {
-        Self {
-            error: IcebergError {
-                message,
-                r#type: IcebergErrorType::BadRequestException,
-                code: IcebergErrorType::BadRequestException.code(),
-            },
-        }
-    }
-
     pub fn internal(code: InternalServerErrorCode) -> Self {
         Self {
             error: IcebergError {

@@ -438,6 +438,18 @@ pub(crate) async fn get_results(
         Err(resp) => return resp,
     };
     let partition = params.partition.unwrap_or(0);
+    if let Some(format) = params.format.as_deref() {
+        let normalized = format.to_ascii_lowercase();
+        if normalized != "json" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Unsupported result format '{format}'. Supported format: json")
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // First check the job state
     let state = match executor.get_status(&query_id).await {
@@ -509,7 +521,6 @@ pub struct ResultsQueryParams {
     pub partition: Option<usize>,
     /// Result format (json, csv, arrow).
     #[serde(default)]
-    #[expect(dead_code)]
     pub format: Option<String>,
 }
 
