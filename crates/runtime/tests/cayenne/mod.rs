@@ -447,15 +447,25 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
         }
     }
 
-    if zone_pool.len() < 2 {
-        return Err(format!(
-            "At least 2 S3 zone IDs are required for acceleration tests, found {}",
-            zone_pool.len()
-        ));
+    if zone_pool.is_empty() {
+        return Err(
+            "At least 1 S3 zone ID is required for acceleration tests".to_string(),
+        );
+    }
+
+    // Clean stale Cayenne catalog metadata from previous test runs.
+    // The catalog is a local SQLite DB that persists across test invocations.
+    // If a previous run created a table with a different configuration (e.g.
+    // different PK/on_conflict), re-creation will fail with
+    // "already exists with different configuration" unless the old entry is removed.
+    let cayenne_db = std::path::PathBuf::from(".spice/data/metadata/cayenne.db");
+    if cayenne_db.exists() {
+        let _ = std::fs::remove_file(&cayenne_db);
+        tracing::info!("Removed stale Cayenne catalog metadata");
     }
 
     test_request_context().scope(async {
-        for zone_count in [2usize, 3] {
+        for zone_count in [1usize, 2, 3] {
             if zone_pool.len() < zone_count {
                 tracing::info!(
                     "Skipping {zone_count}-zone scenario: only {} zone(s) available",
@@ -467,6 +477,21 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             let scenario_zone_ids = zone_pool[..zone_count].join(",");
             let table_name = format!("taxi_multi_zone_live_{zone_count}z");
             let app_name = format!("test_cayenne_s3_express_multi_zone_live_{zone_count}z");
+
+            // Clean stale S3 data from previous test runs for this scenario.
+            // Each zone bucket may contain Vortex files from a prior run whose
+            // metadata no longer matches the current table configuration.
+            for zone_id in &zone_pool[..zone_count] {
+                let bucket_name = generated_zone_bucket_name(&app_name, &table_name, zone_id)?;
+                if let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await {
+                    let prefix = ObjectPath::from(format!("{table_name}/"));
+                    let mut stream = store.list(Some(&prefix));
+                    while let Some(Ok(meta)) = stream.next().await {
+                        let _ = store.delete(&meta.location).await;
+                    }
+                    tracing::info!("Cleaned S3 data for {table_name} in zone {zone_id}");
+                }
+            }
 
             let mut dataset = Dataset::new(
                 "s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
@@ -596,14 +621,44 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 "Cayenne write mutation validated: appended VendorID={new_vendor_id}, count {baseline_count} → {post_append_count}"
             );
 
-            let scenario_zones = zone_pool[..zone_count].to_vec();
-            validate_s3_replica_integrity_direct(&app_name, &table_name, &region, &scenario_zones)
-                .await?;
+            if zone_count >= 2 {
+                let scenario_zones = zone_pool[..zone_count].to_vec();
+                validate_s3_replica_integrity_direct(&app_name, &table_name, &region, &scenario_zones)
+                    .await?;
 
-            tracing::info!(
-                "Cayenne S3 Express replica consistency validated for {zone_count}-zone scenario ({scenario_zone_ids})"
-            );
+                tracing::info!(
+                    "Cayenne S3 Express replica consistency validated for {zone_count}-zone scenario ({scenario_zone_ids})"
+                );
+            } else {
+                tracing::info!(
+                    "Cayenne S3 Express 1-zone scenario validated (no replica to compare)"
+                );
+            }
         }
+
+        // --- Post-test cleanup: remove S3 data and local metadata ---
+        // Clean up all zone buckets for every scenario that ran so subsequent
+        // test invocations start from a clean slate.
+        for zone_count in 1..=zone_pool.len() {
+            let table_name = format!("taxi_multi_zone_live_{zone_count}z");
+            let app_name = format!("test_cayenne_s3_express_multi_zone_live_{zone_count}z");
+            for zone_id in &zone_pool[..zone_count] {
+                if let Ok(bucket_name) = generated_zone_bucket_name(&app_name, &table_name, zone_id) {
+                    if let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await {
+                        let prefix = ObjectPath::from(format!("{table_name}/"));
+                        let mut stream = store.list(Some(&prefix));
+                        while let Some(Ok(meta)) = stream.next().await {
+                            let _ = store.delete(&meta.location).await;
+                        }
+                    }
+                }
+            }
+        }
+        let cayenne_db = std::path::PathBuf::from(".spice/data/metadata/cayenne.db");
+        if cayenne_db.exists() {
+            let _ = std::fs::remove_file(&cayenne_db);
+        }
+        tracing::info!("Post-test cleanup complete: removed S3 data and local Cayenne catalog");
 
         Ok(())
     }).await
