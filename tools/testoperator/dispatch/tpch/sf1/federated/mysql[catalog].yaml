@@ -1,11 +1,11 @@
 tests:
   bench:
-    spicepod_path: federated/spicecloud[catalog].yaml
+    spicepod_path: federated/mysql[catalog].yaml
     query_set: tpch
+    query_overrides: mysql
     runner_type: spiceai-dev-runners
-    query_overrides: spicecloud-catalog
     validate_results: true
   schema:
-    spicepod_path: federated/spicecloud[catalog].yaml
+    spicepod_path: federated/mysql[catalog].yaml
     runner_type: spiceai-dev-runners
     min_tables: 1

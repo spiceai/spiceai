@@ -381,3 +381,161 @@ async fn create_token_provider_for_catalog(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_uc_table(storage_location: Option<&str>) -> UCTable {
+        UCTable {
+            name: "my_table".to_string(),
+            catalog_name: "my_catalog".to_string(),
+            schema_name: "my_schema".to_string(),
+            table_type: "MANAGED".to_string(),
+            data_source_format: "DELTA".to_string(),
+            columns: vec![],
+            storage_location: storage_location.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_spark_returns_full_reference() {
+        let table = make_uc_table(Some("s3://bucket/path"));
+        let reference =
+            table_reference_creator_spark(&table).expect("spark creator should always return Some");
+        assert!(
+            matches!(reference, TableReference::Full { .. }),
+            "Expected Full table reference"
+        );
+        match reference {
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                assert_eq!(catalog.as_ref(), "my_catalog");
+                assert_eq!(schema.as_ref(), "my_schema");
+                assert_eq!(table.as_ref(), "my_table");
+            }
+            _ => unreachable!("already asserted to be Full table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_spark_ignores_storage_location() {
+        let table = make_uc_table(None);
+        let reference = table_reference_creator_spark(&table)
+            .expect("spark creator should return Some regardless of storage_location");
+        assert!(
+            matches!(reference, TableReference::Full { .. }),
+            "Expected Full table reference"
+        );
+        match reference {
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                assert_eq!(catalog.as_ref(), "my_catalog");
+                assert_eq!(schema.as_ref(), "my_schema");
+                assert_eq!(table.as_ref(), "my_table");
+            }
+            _ => unreachable!("already asserted to be Full table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_delta_lake_with_storage() {
+        let table = make_uc_table(Some("s3://bucket/path"));
+        let reference = table_reference_creator_delta_lake(&table)
+            .expect("should return Some when storage_location is present");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "s3://bucket/path/");
+            }
+            _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_delta_lake_without_storage() {
+        let table = make_uc_table(None);
+        assert!(
+            table_reference_creator_delta_lake(&table).is_none(),
+            "should return None when storage_location is None"
+        );
+    }
+
+    #[test]
+    fn test_table_reference_creator_delta_lake_appends_trailing_slash() {
+        let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/path"));
+        let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
+        match reference {
+            TableReference::Bare { table } => {
+                assert!(
+                    table.as_ref().ends_with('/'),
+                    "delta lake reference should end with trailing slash"
+                );
+            }
+            _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_spark_uses_all_name_fields() {
+        let table = UCTable {
+            name: "orders".to_string(),
+            catalog_name: "prod_catalog".to_string(),
+            schema_name: "sales".to_string(),
+            table_type: "EXTERNAL".to_string(),
+            data_source_format: "PARQUET".to_string(),
+            columns: vec![],
+            storage_location: Some("s3://bucket/orders".to_string()),
+        };
+        let reference =
+            table_reference_creator_spark(&table).expect("spark creator should always return Some");
+        assert!(
+            matches!(reference, TableReference::Full { .. }),
+            "Expected Full table reference"
+        );
+        match reference {
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                assert_eq!(catalog.as_ref(), "prod_catalog");
+                assert_eq!(schema.as_ref(), "sales");
+                assert_eq!(table.as_ref(), "orders");
+            }
+            _ => unreachable!("already asserted to be Full table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_delta_lake_preserves_full_storage_uri() {
+        let table = make_uc_table(Some("s3://my-bucket/warehouse/catalog/schema/table"));
+        let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(
+                    table.as_ref(),
+                    "s3://my-bucket/warehouse/catalog/schema/table/"
+                );
+            }
+            _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+}
