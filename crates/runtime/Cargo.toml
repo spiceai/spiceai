@@ -349,3 +349,7 @@ vortex-datafusion.workspace = true
 [[bench]]
 harness = false
 name = "prepared_statement"
+
+[[bench]]
+harness = false
+name = "streaming_ingestion"
