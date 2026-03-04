@@ -162,6 +162,21 @@ const PARAMETERS: &[ParameterSpec] = &[
 const HEADER_ORG: &str = "spiceai-org";
 const HEADER_APP: &str = "spiceai-app";
 
+fn get_api_key(params: &ConnectorParams) -> Result<secrecy::SecretString> {
+    if let Some(api_key) = params.parameters.get("api_key").ok() {
+        return Ok(api_key.clone());
+    }
+
+    if let Some(token) = params.parameters.get("token").ok() {
+        return Ok(token.clone());
+    }
+
+    MissingRequiredParameterSnafu {
+        parameter: "api_key or token".to_string(),
+    }
+    .fail()
+}
+
 impl DataConnectorFactory for SpiceAIFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -187,10 +202,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 }
             })?;
 
-            let api_key = params
-                .parameters
-                .get("api_key")
-                .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
+            let api_key = get_api_key(&params)?;
             let credentials = Credentials::new("", api_key.clone());
 
             let mut flight_client = FlightClient::try_new(url, credentials, None, None)
