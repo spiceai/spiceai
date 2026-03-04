@@ -72,6 +72,7 @@ use runtime_datafusion::{
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
+use search;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -444,6 +445,10 @@ impl DataFusionBuilder {
                 &ddl_enabled_catalogs,
             ),
         ));
+
+        // Expand SearchQueryProvider table scans into their full logical plan equivalents so
+        // DataFusion's optimizer can act on the search plan structure.
+        ctx.add_analyzer_rule(Arc::new(search::analyzer_rule::SearchQueryAnalyzerRule));
 
         DataFusion {
             runtime_status: self.status,

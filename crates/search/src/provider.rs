@@ -428,81 +428,19 @@ impl SearchQueryProvider {
         // Ensure filters do not reference column not in search index.
         Ok(columns_missing_from(filters, search_index_schema).is_empty())
     }
-}
 
-#[async_trait]
-impl TableProvider for SearchQueryProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.constraints.as_ref()
-    }
-
-    fn schema(&self) -> SchemaRef {
-        let mut fields_map = self
-            .search_index_query
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), Arc::clone(f)))
-            .collect::<HashMap<String, FieldRef>>();
-
-        // Only add if key not in search index (we chose search index columns in `scan` afterall).
-        for f in self.table_provider.schema().fields() {
-            if !fields_map.contains_key(f.name()) {
-                fields_map.insert(f.name().clone(), Arc::clone(f));
-            }
-        }
-
-        // Add `match` only if its a chunked search field (chunking offsets must be from this search index).
-        if self
-            .search_index_query
-            .schema()
-            .has_column_with_unqualified_name(&ChunkedSearchIndex::chunking_offset_col(
-                self.search_column.as_str(),
-            ))
-            && fields_map.contains_key(&self.search_column)
-        {
-            fields_map.insert(
-                SEARCH_MATCH_COLUMN_NAME.to_string(),
-                Arc::new(Field::new(
-                    SEARCH_MATCH_COLUMN_NAME.to_string(),
-                    arrow_schema::DataType::Utf8,
-                    false,
-                )),
-            );
-        }
-
-        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
-        fields.sort_unstable();
-        Arc::new(Schema::new(fields))
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    fn supports_filters_pushdown(
+    /// Builds the [`LogicalPlan`] that represents this search query.
+    ///
+    /// This is the core transformation logic: search index scan → optional join with the base
+    /// table → sort by score → project. The resulting plan can be optimized by DataFusion's
+    /// optimizer rules (predicate pushdown, projection pruning, join ordering, etc.) before
+    /// physical planning.
+    pub fn to_logical_plan(
         &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Like `ViewTable`, a filter is added on `scan` when needed
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if let Some(ref callback) = self.scan_callback {
-            callback().await;
-        }
-
+    ) -> datafusion::error::Result<LogicalPlan> {
         // Final schema to match requested projection
         let schema_proj: SchemaRef = match projection {
             None => self.schema(),
@@ -572,17 +510,94 @@ impl TableProvider for SearchQueryProvider {
             limit,
         )?;
 
-        // Add final
-        let final_plan = self
-            .add_match_column(inner_proj.as_ref(), search_lp)?
+        self.add_match_column(inner_proj.as_ref(), search_lp)?
             .project(
                 schema_proj
                     .fields()
                     .into_iter()
                     .map(|f| ident(f.name().clone())),
             )?
-            .build()?;
-        state.create_physical_plan(&final_plan).await
+            .build()
+    }
+}
+
+#[async_trait]
+impl TableProvider for SearchQueryProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints.as_ref()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        let mut fields_map = self
+            .search_index_query
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), Arc::clone(f)))
+            .collect::<HashMap<String, FieldRef>>();
+
+        // Only add if key not in search index (we chose search index columns in `scan` afterall).
+        for f in self.table_provider.schema().fields() {
+            if !fields_map.contains_key(f.name()) {
+                fields_map.insert(f.name().clone(), Arc::clone(f));
+            }
+        }
+
+        // Add `match` only if its a chunked search field (chunking offsets must be from this search index).
+        if self
+            .search_index_query
+            .schema()
+            .has_column_with_unqualified_name(&ChunkedSearchIndex::chunking_offset_col(
+                self.search_column.as_str(),
+            ))
+            && fields_map.contains_key(&self.search_column)
+        {
+            fields_map.insert(
+                SEARCH_MATCH_COLUMN_NAME.to_string(),
+                Arc::new(Field::new(
+                    SEARCH_MATCH_COLUMN_NAME.to_string(),
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )),
+            );
+        }
+
+        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
+        fields.sort_unstable();
+        Arc::new(Schema::new(fields))
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        // Like `ViewTable`, a filter is added on `scan` when needed
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // SearchQueryProvider nodes are expanded into their full logical plan by
+        // SearchQueryAnalyzerRule during the analysis phase; scan() should never be reached.
+        Err(DataFusionError::Internal(
+            "SearchQueryProvider::scan() was called, but SearchQueryAnalyzerRule should have \
+             expanded this node before physical planning. Ensure SearchQueryAnalyzerRule is \
+             registered in the DataFusion session."
+                .to_string(),
+        ))
     }
 }
 
