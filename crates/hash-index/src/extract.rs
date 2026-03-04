@@ -620,11 +620,8 @@ pub trait KeyExtractorDyn: Send + Sync {
     /// Returns the number of rows.
     fn len(&self) -> usize;
 
-    /// Returns true if empty.
-    #[expect(dead_code, reason = "trait method for completeness")]
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    /// Returns true if there are no rows.
+    fn is_empty(&self) -> bool;
 
     /// Computes the hash for the key at the given row.
     fn hash_key(&self, row: usize) -> Option<u64>;
@@ -639,6 +636,10 @@ pub trait KeyExtractorDyn: Send + Sync {
 impl<E: KeyExtractor> KeyExtractorDyn for E {
     fn len(&self) -> usize {
         KeyExtractor::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        KeyExtractor::is_empty(self)
     }
 
     fn hash_key(&self, row: usize) -> Option<u64> {

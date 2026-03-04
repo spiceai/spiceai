@@ -323,10 +323,6 @@ impl CayenneAccelerator {
     ///
     /// Returns a vector of S3 paths, one for each zone. The first zone is the primary zone
     /// used for reads; all zones are used for writes (ACID replication).
-    #[expect(
-        dead_code,
-        reason = "Will be used when multi-zone write support is implemented"
-    )]
     fn cayenne_data_dirs_multi_zone(&self, source: &dyn AccelerationSource) -> Result<Vec<String>> {
         let zone_ids = s3::get_s3_zone_ids(source);
         if zone_ids.is_empty() {
@@ -411,15 +407,34 @@ impl CayenneAccelerator {
     }
 
     fn resolve_storage_config(&self, source: &dyn AccelerationSource) -> Result<String> {
-        self.file_path(source)
+        let paths = self
+            .cayenne_data_dirs_multi_zone(source)
             .boxed()
-            .context(AccelerationCreationFailedSnafu)
+            .context(AccelerationCreationFailedSnafu)?;
+
+        if paths.len() > 1 {
+            return Err(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Cayenne multi-zone S3 Express writes are not implemented yet. Configure a single zone in 'cayenne_s3_zone_ids' or use a single-zone 'cayenne_file_path'.",
+                ),
+            });
+        }
+
+        paths
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::InvalidConfiguration {
+                detail: Arc::from("Unable to resolve Cayenne storage path"),
+            })
     }
 
     fn get_unsupported_type_action(source: &dyn AccelerationSource) -> UnsupportedTypeAction {
         // Check if unsupported_type_action is specified in acceleration params
         if let Some(acceleration) = source.acceleration()
-            && let Some(action_str) = acceleration.params.get("unsupported_type_action")
+            && let Some(action_str) = acceleration
+                .params
+                .get("cayenne_unsupported_type_action")
+                .or_else(|| acceleration.params.get("unsupported_type_action"))
         {
             match action_str.to_lowercase().as_str() {
                 "error" => return UnsupportedTypeAction::Error,
@@ -487,7 +502,11 @@ impl CayenneAccelerator {
             }
 
             // Parse sort columns
-            if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
+            if let Some(sort_cols_str) = acceleration
+                .params
+                .get("cayenne_sort_columns")
+                .or_else(|| acceleration.params.get("sort_columns"))
+            {
                 config.sort_columns = sort_cols_str
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -755,7 +774,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("segment_cache_mb")
             .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
             .default("256"),
-        ParameterSpec::component("cayenne_target_file_size_mb")
+        ParameterSpec::component("target_file_size_mb")
             .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
             .default("256"),
         ParameterSpec::component("sort_columns")
@@ -764,7 +783,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
-        ParameterSpec::component("cayenne_upload_concurrency")
+        ParameterSpec::component("upload_concurrency")
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Default: 4.")
             .default("4"),
     ],
@@ -859,6 +878,14 @@ impl DataAccelerator for CayenneAccelerator {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(
                         "Cannot specify both 'cayenne_s3_zone_ids' and 'cayenne_file_path' with an S3 Express path. Use either 'cayenne_s3_zone_ids' for auto-generated bucket names, or 'cayenne_file_path' for explicit bucket paths.",
+                    ),
+                }));
+            }
+
+            if s3::is_multi_zone_s3_express(source) {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Cayenne multi-zone S3 Express writes are not implemented yet. Configure a single zone in 'cayenne_s3_zone_ids' or use a single-zone 'cayenne_file_path'.",
                     ),
                 }));
             }

@@ -300,6 +300,12 @@ impl PartitionManagementTask {
                                 error = %e,
                                 "Partition management cycle failed"
                             );
+                            self.status.update_component_status(
+                                "partition_metadata",
+                                ComponentStatus::error_with_message(format!(
+                                    "Management cycle failed: {e}"
+                                )),
+                            );
                         }
                     }
 

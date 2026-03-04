@@ -91,34 +91,34 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) const S3_PARAMS_LEN: usize = 10;
 pub(crate) const S3_PARAMETERS: [ParameterSpec; S3_PARAMS_LEN] = [
-    ParameterSpec::component("cayenne_s3_region")
+    ParameterSpec::component("s3_region")
         .description("AWS region for S3 Express One Zone storage. If not specified, derived from cayenne_s3_zone_ids."),
-    ParameterSpec::component("cayenne_s3_endpoint")
+    ParameterSpec::component("s3_endpoint")
         .description("Custom S3 endpoint URL for S3 Express One Zone."),
-    ParameterSpec::component("cayenne_s3_key")
+    ParameterSpec::component("s3_key")
         .description("AWS access key ID for S3 authentication.")
         .secret(),
-    ParameterSpec::component("cayenne_s3_secret")
+    ParameterSpec::component("s3_secret")
         .description("AWS secret access key for S3 authentication.")
         .secret(),
-    ParameterSpec::component("cayenne_s3_session_token")
+    ParameterSpec::component("s3_session_token")
         .description("AWS session token for temporary credentials (optional).")
         .secret(),
-    ParameterSpec::component("cayenne_s3_auth")
+    ParameterSpec::component("s3_auth")
         .description("Authentication method for S3 Express One Zone. Options: 'iam_role' (default, uses environment credentials), 'key' (uses explicit cayenne_s3_key/cayenne_s3_secret).")
         .default("iam_role")
         .one_of(&["iam_role", "key"]),
-    ParameterSpec::component("cayenne_s3_client_timeout")
+    ParameterSpec::component("s3_client_timeout")
         .description("Timeout for S3 client operations (e.g., '30s', '5m'). Default: 120s.")
         .default("120s"),
-    ParameterSpec::component("cayenne_s3_allow_http")
+    ParameterSpec::component("s3_allow_http")
         .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
         .default("false"),
-    ParameterSpec::component("cayenne_s3_unsigned_payload")
+    ParameterSpec::component("s3_unsigned_payload")
         .description("Use unsigned payload for S3 Express One Zone requests. Only applies when S3 Express mode is enabled (via cayenne_s3_zone_ids or directory bucket path). Skips SHA-256 computation for request body, improving upload performance. S3 Express One Zone uses session-based auth, making payload signing unnecessary. Default: true.")
         .default("true"),
     // S3 Express One Zone auto-generation parameter
-    ParameterSpec::component("cayenne_s3_zone_ids")
+    ParameterSpec::component("s3_zone_ids")
         .description("Comma-separated list of Availability Zone IDs for S3 Express One Zone storage (e.g., 'usw2-az1' or 'usw2-az1,usw2-az2'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, specify multiple zones. Data is written to all zones with ACID guarantees - writes succeed only if all zones succeed. Reads are served from the primary (first) zone with fallback to replicas."),
 ];
 
@@ -164,10 +164,6 @@ pub fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
 /// Returns true if multi-zone S3 Express One Zone storage is configured.
 ///
 /// Multi-zone is enabled when `cayenne_s3_zone_ids` contains multiple zone IDs.
-#[expect(
-    dead_code,
-    reason = "Will be used when multi-zone write support is implemented"
-)]
 pub fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
     source.acceleration().is_some_and(|a| {
         a.params
