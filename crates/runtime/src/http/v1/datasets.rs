@@ -60,15 +60,6 @@ pub struct DatasetQueryParams {
 // Re-export the shared type for backwards compatibility
 pub use runtime_api_types::v1::DatasetInfo as DatasetResponseItem;
 
-#[expect(dead_code)]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub(crate) struct Property {
-    pub key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
-}
-
 /// List Datasets
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,

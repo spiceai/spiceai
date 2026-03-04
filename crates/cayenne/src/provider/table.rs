@@ -34,7 +34,6 @@ use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
-use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
@@ -2319,6 +2318,11 @@ impl CayenneTableProvider {
             }
         };
 
+        let pk_bytes_list_for_insert_records: Vec<Vec<u8>> = row_keys_for_deletion
+            .iter()
+            .map(|key| key.as_ref().to_vec())
+            .collect();
+
         let specs = if row_keys_for_deletion.is_empty() {
             vec![]
         } else {
@@ -2350,6 +2354,22 @@ impl CayenneTableProvider {
                     }
                 }
             }
+        }
+
+        // Persist insert records for reinserted PKs so sequence-based visibility survives restart.
+        // Without this, caches may allow reinserted rows in-process, but after restart the
+        // catalog reload would miss insert sequences and incorrectly hide rows as deleted.
+        if !pk_bytes_list_for_insert_records.is_empty() {
+            self.catalog
+                .add_insert_records_batch(
+                    self.table_metadata.table_id,
+                    pk_bytes_list_for_insert_records,
+                    insert_sequence,
+                )
+                .await
+                .map_err(|err| CatalogError::InvalidOperationNoSource {
+                    message: format!("Failed to persist insert records for upserted PKs: {err}"),
+                })?;
         }
 
         // For PK-based strategies, keep old delete files to preserve deletion history.
@@ -2859,250 +2879,6 @@ impl CayenneTableProvider {
             self.table_metadata.table_name,
             self.pk_deletion_strategy.strategy(),
         );
-
-        Ok(())
-    }
-
-    /// Process incoming batches and add insert records for PKs that are being re-inserted.
-    ///
-    /// This method implements upsert semantics using sequence-based ordering:
-    /// 1. Collects all incoming batches
-    /// 2. Gets a new sequence number from the catalog
-    /// 3. Extracts PKs from the data
-    /// 4. For PKs that are in the deletion set, adds insert records with the new sequence
-    /// 5. Returns a stream of the batches for normal insert processing
-    ///
-    /// Insert records are stored in the catalog and cached in memory. During scan,
-    /// a row is deleted only if its PK is in the deletion set AND (not in `insert_records`
-    /// OR `insert_seq` < `delete_seq`).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if processing fails.
-    ///
-    /// NOTE: Currently unused because we use compaction for all strategies when there
-    /// are pending deletions. Kept for potential future optimization with per-file
-    /// sequence tracking.
-    #[expect(dead_code)]
-    async fn add_insert_records_for_incoming_pks(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> CatalogResult<SendableRecordBatchStream> {
-        use futures::TryStreamExt;
-
-        // Collect all batches from the stream
-        let batches: Vec<RecordBatch> =
-            stream
-                .try_collect()
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to collect batches for insert record processing".to_string(),
-                    source: Box::new(e),
-                })?;
-
-        if batches.is_empty() {
-            let schema = Arc::clone(&self.table_metadata.schema);
-            let empty_stream: futures::stream::Iter<
-                std::vec::IntoIter<datafusion_common::Result<RecordBatch>>,
-            > = futures::stream::iter(Vec::new());
-            return Ok(Box::pin(
-                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                    schema,
-                    empty_stream,
-                ),
-            ));
-        }
-
-        // Get a new sequence number for this insert operation
-        let insert_sequence = self
-            .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
-            .await?;
-
-        // Extract PKs and add insert records based on strategy
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                self.add_insert_records_int64(&batches, insert_sequence)
-                    .await?;
-            }
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                self.add_insert_records_row_converter(&batches, insert_sequence)
-                    .await?;
-            }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // Position-based uses per-file deletion vectors and doesn't need insert records
-                unreachable!("Position-based strategy doesn't track insert records");
-            }
-        }
-
-        // Return the batches as a stream for normal insert processing
-        let schema = Arc::clone(&self.table_metadata.schema);
-        let batch_results: Vec<datafusion_common::Result<RecordBatch>> =
-            batches.into_iter().map(Ok).collect();
-        let batch_stream = futures::stream::iter(batch_results);
-        Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batch_stream),
-        ))
-    }
-
-    /// Add insert records for Int64 PK strategy.
-    ///
-    /// Extracts ALL Int64 PKs from incoming batches and adds insert records with the current
-    /// sequence number. This is required for sequence-based ordering where we need to know
-    /// when each PK was inserted to compare against deletion sequences.
-    async fn add_insert_records_int64(
-        &self,
-        batches: &[RecordBatch],
-        insert_sequence: i64,
-    ) -> CatalogResult<()> {
-        use arrow::array::Int64Array;
-
-        let pk_column_index =
-            *self
-                .pk_column_indices
-                .first()
-                .ok_or_else(|| CatalogError::InvalidOperation {
-                    message: "Int64 PK strategy requires exactly one PK column index".to_string(),
-                    source: Box::new(std::io::Error::other("missing pk column")),
-                })?;
-
-        // Extract ALL PKs from incoming batches
-        let mut pks_to_record: Vec<i64> = Vec::new();
-
-        for batch in batches {
-            let pk_column = batch.column(pk_column_index);
-            let pk_array = pk_column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| CatalogError::InvalidOperation {
-                    message: "Failed to downcast PK column to Int64Array".to_string(),
-                    source: Box::new(std::io::Error::other("invalid pk type")),
-                })?;
-
-            for value in pk_array.values() {
-                pks_to_record.push(*value);
-            }
-        }
-
-        if pks_to_record.is_empty() {
-            tracing::debug!(
-                "No PKs in incoming data for table {}",
-                self.table_metadata.table_name
-            );
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Adding {} insert records (seq={}) for table {} (Int64 PK strategy)",
-            pks_to_record.len(),
-            insert_sequence,
-            self.table_metadata.table_name
-        );
-
-        // Convert to bytes for catalog storage
-        let pk_bytes_list: Vec<Vec<u8>> = pks_to_record
-            .iter()
-            .map(|pk| pk.to_be_bytes().to_vec())
-            .collect();
-
-        // Add to catalog with sequence number
-        self.catalog
-            .add_insert_records_batch(self.table_metadata.table_id, pk_bytes_list, insert_sequence)
-            .await?;
-
-        // Update in-memory cache
-        if let Some(cache) = self.pk_deletion_strategy.int64_insert_records_cache() {
-            let mut guard = cache.write().map_err(|_| CatalogError::LockPoisoned {
-                operation: "update Int64 insert records cache".to_string(),
-            })?;
-            let mut new_map = (**guard).clone();
-            for pk in pks_to_record {
-                new_map.insert(pk, insert_sequence);
-            }
-            *guard = Arc::new(new_map);
-        }
-
-        Ok(())
-    }
-
-    /// Add insert records for `RowConverter`-based PK strategy.
-    ///
-    /// Converts ALL PK columns to byte representation and adds insert records with the current
-    /// sequence number. This is required for sequence-based ordering where we need to know
-    /// when each PK was inserted to compare against deletion sequences.
-    async fn add_insert_records_row_converter(
-        &self,
-        batches: &[RecordBatch],
-        insert_sequence: i64,
-    ) -> CatalogResult<()> {
-        let row_converter =
-            self.pk_row_converter
-                .as_ref()
-                .ok_or_else(|| CatalogError::InvalidOperation {
-                    message: "RowConverter not available for RowConverterBased strategy"
-                        .to_string(),
-                    source: Box::new(std::io::Error::other("missing row converter")),
-                })?;
-
-        // Extract ALL PKs from incoming batches
-        let mut keys_to_record: Vec<Box<[u8]>> = Vec::new();
-
-        for batch in batches {
-            // Extract PK columns
-            let pk_columns: Vec<ArrayRef> = self
-                .pk_column_indices
-                .iter()
-                .map(|&idx| Arc::clone(batch.column(idx)))
-                .collect();
-
-            // Convert to row format
-            let rows = row_converter.convert_columns(&pk_columns).map_err(|e| {
-                CatalogError::InvalidOperation {
-                    message: "Failed to convert PK columns to row format".to_string(),
-                    source: Box::new(e),
-                }
-            })?;
-
-            for row in &rows {
-                let key: Box<[u8]> = row.as_ref().into();
-                keys_to_record.push(key);
-            }
-        }
-
-        if keys_to_record.is_empty() {
-            tracing::debug!(
-                "No PKs in incoming data for table {}",
-                self.table_metadata.table_name
-            );
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Adding {} insert records (seq={}) for table {} (RowConverter strategy)",
-            keys_to_record.len(),
-            insert_sequence,
-            self.table_metadata.table_name
-        );
-
-        // Convert to Vec<Vec<u8>> for catalog storage
-        let pk_bytes_list: Vec<Vec<u8>> = keys_to_record.iter().map(|k| k.to_vec()).collect();
-
-        // Add to catalog with sequence number
-        self.catalog
-            .add_insert_records_batch(self.table_metadata.table_id, pk_bytes_list, insert_sequence)
-            .await?;
-
-        // Update in-memory cache
-        if let Some(cache) = self.pk_deletion_strategy.row_keys_insert_records_cache() {
-            let mut guard = cache.write().map_err(|_| CatalogError::LockPoisoned {
-                operation: "update key-based insert records cache".to_string(),
-            })?;
-            let mut new_map = (**guard).clone();
-            for key in keys_to_record {
-                new_map.insert(key, insert_sequence);
-            }
-            *guard = Arc::new(new_map);
-        }
 
         Ok(())
     }

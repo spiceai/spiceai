@@ -41,13 +41,22 @@ enum ActionType {
 
 impl ActionType {
     fn from_str(s: &str) -> Self {
+        if let Some(async_action) = async_actions::AsyncActionType::from_str(s) {
+            return match async_action {
+                async_actions::AsyncActionType::SubmitAsyncQuery => ActionType::SubmitAsyncQuery,
+                async_actions::AsyncActionType::GetAsyncQueryStatus => {
+                    ActionType::GetAsyncQueryStatus
+                }
+                async_actions::AsyncActionType::GetAsyncQueryResult => {
+                    ActionType::GetAsyncQueryResult
+                }
+                async_actions::AsyncActionType::CancelAsyncQuery => ActionType::CancelAsyncQuery,
+            };
+        }
+
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
-            async_actions::action_types::SUBMIT_ASYNC_QUERY => ActionType::SubmitAsyncQuery,
-            async_actions::action_types::GET_ASYNC_QUERY_STATUS => ActionType::GetAsyncQueryStatus,
-            async_actions::action_types::GET_ASYNC_QUERY_RESULT => ActionType::GetAsyncQueryResult,
-            async_actions::action_types::CANCEL_ASYNC_QUERY => ActionType::CancelAsyncQuery,
             _ => ActionType::Unknown,
         }
     }
