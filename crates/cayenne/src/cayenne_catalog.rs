@@ -892,8 +892,8 @@ impl MetadataCatalog for CayenneCatalog {
 
     async fn commit_compaction(&self, table_id: i64, new_snapshot_id: &str) -> CatalogResult<()> {
         // Execute all operations atomically using a transaction batch.
-        // SQLite's execute_batch runs all statements in a single transaction,
-        // ensuring atomicity: either all succeed or none takes effect.
+        // Atomicity is provided by explicit BEGIN ... COMMIT statements in `batch_sql`,
+        // ensuring either all statements succeed or none takes effect.
         //
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
