@@ -72,8 +72,8 @@ use runtime_datafusion::{
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
-use search;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use search;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
 use std::sync::LazyLock;
@@ -618,6 +618,7 @@ pub(crate) fn default_extension_planners(
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        Arc::new(search::telemetry_node::SearchTelemetryPlanner),
         Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
         #[cfg(not(windows))]
         Arc::new(super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(executor_registry)),

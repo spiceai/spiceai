@@ -21,6 +21,7 @@ use crate::cluster::datafusion::codec::udtf_args::{
 use crate::embeddings::udtf::{
     VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
 };
+use crate::search::DataFusionSnafu;
 use crate::search::full_text::udtf::{TextSearchTableFunc, TextSearchTableFuncArgs};
 use crate::search::rrf::ReciprocalRankFusion;
 use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
@@ -37,6 +38,7 @@ use prost::Message;
 use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
 use search::provider::{SearchQueryProvider, UdtfSource};
+use search::telemetry_node::SearchTelemetryNode;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -259,6 +261,18 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         let name = serde_json::from_slice::<String>(buf)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        // Reconstruct SearchTelemetryNode with a no-op callback (callback is not serializable).
+        // Telemetry fires on whichever side created the plan; the remote side is a passthrough.
+        if name == "SearchTelemetry" {
+            if let Some(input) = inputs.first() {
+                let no_op: search::telemetry_node::TelemetryCallback =
+                    Arc::new(|| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>);
+                return Ok(Extension {
+                    node: Arc::new(SearchTelemetryNode::new(input.clone(), no_op)),
+                });
+            }
+        }
+
         exec_err!(
             "SpiceLogicalCodec does not support {}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
             name.as_str()
@@ -270,8 +284,23 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
             return Ok(());
         }
 
+        // SearchTelemetryNode: encode a marker; the callback is not serializable.
+        if node
+            .node
+            .as_any()
+            .downcast_ref::<SearchTelemetryNode>()
+            .is_some()
+        {
+            let marker = serde_json::to_vec("SearchTelemetry")
+                .boxed()
+                .context(DataFusionSnafu)?;
+            buf.extend_from_slice(&marker);
+            return Ok(());
+        }
+
         let node_name = serde_json::to_vec(node.node.name())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .boxed()
+            .context(DataFusionSnafu)?;
         buf.extend_from_slice(&node_name[..]);
         Ok(())
     }

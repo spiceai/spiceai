@@ -21,16 +21,18 @@ limitations under the License.
 //! pruning, join ordering, etc.) can act on the full search plan rather than on an opaque
 //! [`TableProvider`] whose structure is only revealed during physical planning.
 
+use std::sync::Arc;
+
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     datasource::DefaultTableSource,
     error::Result as DFResult,
-    logical_expr::LogicalPlan,
+    logical_expr::{Extension, LogicalPlan},
     optimizer::AnalyzerRule,
 };
 
-use crate::provider::SearchQueryProvider;
+use crate::{provider::SearchQueryProvider, telemetry_node::SearchTelemetryNode};
 
 /// Analyzer rule that replaces `TableScan(SearchQueryProvider)` nodes with the expanded
 /// logical plan produced by [`SearchQueryProvider::to_logical_plan`].
@@ -69,7 +71,15 @@ impl AnalyzerRule for SearchQueryAnalyzerRule {
             let expanded =
                 provider.to_logical_plan(scan.projection.as_ref(), &scan.filters, scan.fetch)?;
 
-            Ok(Transformed::yes(expanded))
+            let plan = if let Some(callback) = &provider.scan_callback {
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(SearchTelemetryNode::new(expanded, Arc::clone(callback))),
+                })
+            } else {
+                expanded
+            };
+
+            Ok(Transformed::yes(plan))
         })
         .map(|t| t.data)
     }

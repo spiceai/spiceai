@@ -26,6 +26,7 @@ pub mod index;
 pub mod metadata;
 pub mod pipeline;
 pub mod provider;
+pub mod telemetry_node;
 
 pub static SEARCH_SCORE_COLUMN_NAME: &str = "_score";
 pub static SEARCH_VALUE_COLUMN_NAME: &str = "_value";
