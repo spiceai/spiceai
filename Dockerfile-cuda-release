@@ -18,7 +18,7 @@ ENV REL_VERSION=${REL_VERSION}
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 RUN set -eux; \
-    asset="spiced_models_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
+    asset="spiced_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
     base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
     curl -fSLo /tmp/spiced.tar.gz "${base_url}"; \
     tar -C /root -xzf /tmp/spiced.tar.gz; \
