@@ -856,9 +856,8 @@ mod tests {
     #[test]
     fn test_parse_s3_url_style_invalid_value() {
         let params = HashMap::from([("url_style".to_string(), "invalid".to_string())]);
-        let result = SpiceObjectStoreRegistry::parse_s3_url_style(&params);
-
-        assert!(result.is_err());
+        let _ = SpiceObjectStoreRegistry::parse_s3_url_style(&params)
+            .expect_err("invalid url_style should error");
     }
 
     #[test]
@@ -911,14 +910,16 @@ mod tests {
 
     #[test]
     fn test_endpoint_for_s3_url_style_virtual_with_ip_returns_error() {
-        let result = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
-            "http://192.168.1.100:9000",
-            "bucket",
-            true,
+        let message = format!(
+            "{:#}",
+            SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+                "http://192.168.1.100:9000",
+                "bucket",
+                true,
+            )
+            .expect_err("IP endpoint should error")
         );
 
-        assert!(result.is_err());
-        let message = format!("{:#}", result.expect_err("IP endpoint should error"));
         assert!(message.contains("s3_url_style=path"));
     }
 }
