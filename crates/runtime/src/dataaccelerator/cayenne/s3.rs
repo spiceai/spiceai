@@ -21,6 +21,7 @@ use std::sync::Arc;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use futures::StreamExt;
 use futures::future::join_all;
+use futures::stream::BoxStream;
 use object_store::{
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RetryConfig, aws::AmazonS3Builder,
@@ -118,6 +119,20 @@ struct MultiZoneS3ExpressStore {
     zones: Vec<ZoneStore>,
 }
 
+#[derive(Clone)]
+enum ListMode {
+    Prefix(Option<Path>),
+    Offset { prefix: Option<Path>, offset: Path },
+}
+
+struct ListFallbackState {
+    zones: Vec<ZoneStore>,
+    mode: ListMode,
+    current_zone_idx: usize,
+    current_stream: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
+    emitted_from_current: bool,
+}
+
 impl MultiZoneS3ExpressStore {
     fn new(zones: Vec<ZoneStore>) -> Self {
         Self { zones }
@@ -210,6 +225,87 @@ impl MultiZoneS3ExpressStore {
                 );
             }
         }
+    }
+
+    fn build_list_stream_for_zone(
+        zone: &ZoneStore,
+        mode: &ListMode,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        match mode {
+            ListMode::Prefix(prefix) => zone.store.list(prefix.as_ref()),
+            ListMode::Offset { prefix, offset } => {
+                zone.store.list_with_offset(prefix.as_ref(), offset)
+            }
+        }
+    }
+
+    fn list_with_fallback(
+        &self,
+        mode: ListMode,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if self.zones.is_empty() {
+            let path = match &mode {
+                ListMode::Prefix(prefix) => prefix
+                    .as_ref()
+                    .map_or_else(String::new, std::string::ToString::to_string),
+                ListMode::Offset { offset, .. } => offset.to_string(),
+            };
+            return futures::stream::once(async {
+                Err(object_store::Error::NotFound {
+                    path,
+                    source: "No configured S3 zones".into(),
+                })
+            })
+            .boxed();
+        }
+
+        let initial_state = ListFallbackState {
+            zones: self.zones.clone(),
+            mode,
+            current_zone_idx: 0,
+            current_stream: None,
+            emitted_from_current: false,
+        };
+
+        futures::stream::unfold(initial_state, |mut state| async move {
+            loop {
+                if state.current_stream.is_none() {
+                    if state.current_zone_idx >= state.zones.len() {
+                        return None;
+                    }
+
+                    let zone = state.zones[state.current_zone_idx].clone();
+                    state.current_stream = Some(Self::build_list_stream_for_zone(&zone, &state.mode));
+                    state.emitted_from_current = false;
+                }
+
+                let next_item = {
+                    let Some(stream) = state.current_stream.as_mut() else {
+                        unreachable!("current_stream should be initialized before polling");
+                    };
+                    stream.next().await
+                };
+
+                match next_item {
+                    Some(Ok(meta)) => {
+                        state.emitted_from_current = true;
+                        return Some((Ok(meta), state));
+                    }
+                    Some(Err(err)) if !state.emitted_from_current => {
+                        let zone_id = state.zones[state.current_zone_idx].zone_id.clone();
+                        tracing::debug!(
+                            "S3 Express list stream failed for zone '{}' before yielding rows: {err}",
+                            zone_id
+                        );
+                        state.current_zone_idx += 1;
+                        state.current_stream = None;
+                    }
+                    Some(Err(err)) => return Some((Err(err), state)),
+                    None => return None,
+                }
+            }
+        })
+        .boxed()
     }
 }
 
@@ -386,18 +482,7 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         &self,
         prefix: Option<&Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        if self.zones.is_empty() {
-            let path = prefix.map_or_else(String::new, std::string::ToString::to_string);
-            return futures::stream::once(async {
-                Err(object_store::Error::NotFound {
-                    path,
-                    source: "No configured S3 zones".into(),
-                })
-            })
-            .boxed();
-        }
-
-        self.zones[0].store.list(prefix)
+        self.list_with_fallback(ListMode::Prefix(prefix.cloned()))
     }
 
     fn list_with_offset(
@@ -405,18 +490,10 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        if self.zones.is_empty() {
-            let path = offset.to_string();
-            return futures::stream::once(async {
-                Err(object_store::Error::NotFound {
-                    path,
-                    source: "No configured S3 zones".into(),
-                })
-            })
-            .boxed();
-        }
-
-        self.zones[0].store.list_with_offset(prefix, offset)
+        self.list_with_fallback(ListMode::Offset {
+            prefix: prefix.cloned(),
+            offset: offset.clone(),
+        })
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
