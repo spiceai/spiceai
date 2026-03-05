@@ -113,17 +113,17 @@ impl RefreshTask {
 
                             if had_change
                                 && let Some(cache_provider_ref) = caching.as_ref()
-                                    && let Some(cache_provider) = cache_provider_ref.upgrade()
-                                    && let Err(e) =
-                                        cache_provider.invalidate_for_table(dataset_name.clone())
-                                    && !self.runtime_status.is_shutdown()
-                                {
-                                    // No cache provider means runtime is shutting down and cache is already cleaned up
-                                    tracing::error!(
-                                        "Failed to invalidate cached results for dataset {}: {e}",
-                                        &dataset_name.to_string()
-                                    );
-                                }
+                                && let Some(cache_provider) = cache_provider_ref.upgrade()
+                                && let Err(e) =
+                                    cache_provider.invalidate_for_table(dataset_name.clone())
+                                && !self.runtime_status.is_shutdown()
+                            {
+                                // No cache provider means runtime is shutting down and cache is already cleaned up
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name.to_string()
+                                );
+                            }
                         }
                         Err(e) => {
                             let error_message = format_datafusion_error(&e);
