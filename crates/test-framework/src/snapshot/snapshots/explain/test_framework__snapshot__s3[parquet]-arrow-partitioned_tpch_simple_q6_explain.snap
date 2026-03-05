@@ -1,0 +1,28 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q6"
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                        |
++---------------+-----------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                                                            |
+|               |   Projection: orders.o_orderkey + Int64(1) AS key                                                                           |
+|               |     Limit: skip=0, fetch=10                                                                                                 |
+|               |       TableScan: orders projection=[o_orderkey], fetch=10                                                                   |
+| physical_plan | ProjectionExec: expr=[o_orderkey@0 + 1 as key]                                                                              |
+|               |   GlobalLimitExec: skip=0, fetch=10                                                                                         |
+|               |     SchemaCastScanExec                                                                                                      |
+|               |       CoalescePartitionsExec                                                                                                |
+|               |         PartitionedUnionExec                                                                                                |
+|               |           BytesProcessedExec                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[11, 12, 12, 12, 12, 12, 11, 12, 11, 11, 12, 11, 11, 11, 11, 12] |
+|               |           BytesProcessedExec                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[11, 12, 12, 12, 12, 12, 12, 11, 11, 11, 12, 11, 11, 11, 11, 12] |
+|               |           BytesProcessedExec                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[11, 12, 12, 12, 12, 12, 12, 11, 11, 12, 11, 11, 11, 11, 11, 12] |
+|               |           BytesProcessedExec                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[11, 12, 12, 12, 12, 12, 12, 11, 11, 12, 11, 11, 11, 11, 11, 12] |
+|               |           BytesProcessedExec                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[11, 12, 12, 12, 12, 12, 12, 11, 11, 12, 11, 11, 11, 11, 11, 12] |
+|               |                                                                                                                             |
++---------------+-----------------------------------------------------------------------------------------------------------------------------+
