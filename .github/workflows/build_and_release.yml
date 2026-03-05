@@ -392,10 +392,34 @@ jobs:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
+      # Windows CLI
+      - name: download artifacts - spice.exe_windows_x86_64
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: spice.exe_windows_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # Default (non-models) runtime
+      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # Models runtime
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # NAS variant (Linux x64 only)
+      - name: download artifacts - spiced_nas_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: spiced_nas_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       # macOS metal variant
