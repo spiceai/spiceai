@@ -323,6 +323,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration: [{}, { engine: arrow, mode: memory }]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -415,6 +416,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration:
           [
