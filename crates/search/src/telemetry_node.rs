@@ -35,7 +35,6 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     common::{DFSchemaRef, Result as DFResult},
-    error::DataFusionError,
     execution::TaskContext,
     logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     physical_plan::{
@@ -110,7 +109,7 @@ impl Ord for SearchTelemetryNode {
 }
 
 impl UserDefinedLogicalNodeCore for SearchTelemetryNode {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SearchTelemetry"
     }
 
@@ -176,7 +175,7 @@ impl DisplayAs for SearchTelemetryExec {
 }
 
 impl ExecutionPlan for SearchTelemetryExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SearchTelemetryExec"
     }
 
@@ -241,12 +240,12 @@ impl Unpin for TelemetryStream {}
 impl Stream for TelemetryStream {
     type Item = DFResult<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if let Some(ref mut fut) = this.pending {
             match fut.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(_) => {}
+                Poll::Ready(()) => {}
             }
         }
         this.pending = None;
