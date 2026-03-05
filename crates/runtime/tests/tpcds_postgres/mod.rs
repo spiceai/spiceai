@@ -206,6 +206,7 @@ datasets:
       allow_http: true
       s3_auth: key
       s3_endpoint: {minio_endpoint}
+      s3_url_style: path
       s3_key: {minio_access_key}
       s3_secret: {minio_secret_key}
     acceleration:
