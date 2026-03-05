@@ -118,6 +118,15 @@ impl MultiZoneS3ExpressStore {
         self.zones.len()
     }
 
+    /// Returns a deterministic read order for the given object path, distributing
+    /// primary reads across zones by hashing the path.
+    ///
+    /// **Design tradeoff**: `list()` always reads from zone 0 while `get()`/`head()`
+    /// stripe across zones via this method. This is acceptable because writes are
+    /// replicated atomically to all zones, so every zone holds the same object set.
+    /// If a primary zone is temporarily unavailable, get/head falls back to the next
+    /// zone in the order. An inconsistency would only arise from external out-of-band
+    /// mutations, which are outside the supported contract.
     fn striped_read_order(&self, location: &Path) -> Vec<usize> {
         if self.zones.is_empty() {
             return Vec::new();
@@ -232,7 +241,10 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                     }
                     successful_zone_ids.push(zone_id);
                 }
-                Err(_) => failed_zone_ids.push(zone_id),
+                Err(err) => {
+                    tracing::warn!("Multi-zone put failed for zone '{zone_id}': {err}");
+                    failed_zone_ids.push(zone_id);
+                }
             }
         }
 
@@ -254,15 +266,28 @@ impl ObjectStore for MultiZoneS3ExpressStore {
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let mut uploads: Vec<ZoneMultipartUpload> = Vec::with_capacity(self.zones.len());
         for zone in &self.zones {
-            let upload = zone
-                .store
-                .put_multipart_opts(location, opts.clone())
-                .await?;
-            uploads.push(ZoneMultipartUpload {
-                zone_id: zone.zone_id.clone(),
-                store: Arc::clone(&zone.store),
-                upload,
-            });
+            match zone.store.put_multipart_opts(location, opts.clone()).await {
+                Ok(upload) => {
+                    uploads.push(ZoneMultipartUpload {
+                        zone_id: zone.zone_id.clone(),
+                        store: Arc::clone(&zone.store),
+                        upload,
+                    });
+                }
+                Err(err) => {
+                    // Abort any already-started uploads to avoid leaked multipart state.
+                    for mut started in uploads {
+                        if let Err(abort_err) = started.upload.abort().await {
+                            tracing::warn!(
+                                "Failed to abort multipart upload for zone '{}' after zone '{}' init failure: {abort_err}",
+                                started.zone_id,
+                                zone.zone_id,
+                            );
+                        }
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         Ok(Box::new(MultiZoneMultipartUpload {
@@ -628,16 +653,18 @@ pub fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
 /// Returns the list of zone IDs for S3 Express One Zone storage.
 ///
 /// Parses the `cayenne_s3_zone_ids` parameter as a comma-separated list of zone IDs.
+/// Normalizes entries (trim + lowercase) and deduplicates, preserving first-seen order.
 /// Returns an empty vector if the parameter is not set.
 pub fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Vec<String> {
     source
         .acceleration()
         .and_then(|a| a.params.get("cayenne_s3_zone_ids"))
         .map(|zone_ids| {
+            let mut seen = HashSet::new();
             zone_ids
                 .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty() && seen.insert(s.clone()))
                 .collect()
         })
         .unwrap_or_default()

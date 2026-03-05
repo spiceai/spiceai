@@ -31,6 +31,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::Dataset;
@@ -52,7 +53,6 @@ async fn append_one_row_via_cayenne_accelerator(
     vendor_id: i64,
 ) -> Result<(), String> {
     use arrow::array::{ArrayRef, Int64Array, new_null_array};
-    use arrow::datatypes::DataType;
 
     let table_ref = TableReference::bare(table_name);
 
@@ -83,13 +83,19 @@ async fn append_one_row_via_cayenne_accelerator(
         .zip(schema.fields())
         .map(|(col, field)| {
             if col.data_type() != field.data_type() {
-                arrow::compute::cast(&col, field.data_type())
-                    .unwrap_or_else(|_| new_null_array(field.data_type(), 1))
+                arrow::compute::cast(&col, field.data_type()).map_err(|e| {
+                    format!(
+                        "failed to cast column '{}' from {:?} to {:?}: {e}",
+                        field.name(),
+                        col.data_type(),
+                        field.data_type()
+                    )
+                })
             } else {
-                col
+                Ok(col)
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
         .map_err(|e| format!("failed to build RecordBatch for append: {e}"))?;
@@ -142,52 +148,6 @@ fn first_i64_cell(batches: &[RecordBatch]) -> Result<i64, String> {
         .downcast_ref::<arrow::array::Int64Array>()
         .ok_or_else(|| "unexpected result column type, expected Int64".to_string())?;
     Ok(col.value(0))
-}
-
-fn s3_sanitize_component(input: &str) -> String {
-    input
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-fn generated_zone_bucket_name(
-    app_name: &str,
-    dataset_name: &str,
-    zone_id: &str,
-) -> Result<String, String> {
-    let sanitized_app = s3_sanitize_component(app_name);
-    let sanitized_dataset = s3_sanitize_component(dataset_name);
-    if sanitized_app.is_empty() || sanitized_dataset.is_empty() {
-        return Err("app or dataset name is empty after S3 sanitization".to_string());
-    }
-
-    let suffix_len = 2_usize.saturating_add(zone_id.len()).saturating_add(6);
-    let required_fixed_len = 6_usize.saturating_add(1).saturating_add(suffix_len);
-    if required_fixed_len >= 63 {
-        return Err(format!(
-            "zone ID '{zone_id}' is too long for S3 directory bucket naming"
-        ));
-    }
-
-    let max_name_len = 63_usize.saturating_sub(required_fixed_len);
-    let base_name = format!("{sanitized_app}-{sanitized_dataset}");
-    let truncated_name = if base_name.len() > max_name_len {
-        base_name[..max_name_len].trim_end_matches('-').to_string()
-    } else {
-        base_name
-    };
-
-    if truncated_name.is_empty() {
-        return Err("bucket name became empty after truncation".to_string());
-    }
-
-    Ok(format!("spice-{truncated_name}--{zone_id}--x-s3"))
 }
 
 async fn build_zone_store(
@@ -267,7 +227,8 @@ async fn validate_s3_replica_integrity_direct(
 
     let mut zone_stores = Vec::with_capacity(zone_ids.len());
     for zone_id in zone_ids {
-        let bucket_name = generated_zone_bucket_name(app_name, table_name, zone_id)?;
+        let bucket_name = generate_bucket_name(app_name, table_name, zone_id)
+            .map_err(|e| format!("failed to generate bucket name: {e}"))?;
         let store = build_zone_store(&bucket_name, zone_id, region).await?;
         zone_stores.push((zone_id.clone(), bucket_name, store));
     }
@@ -482,7 +443,8 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             // Each zone bucket may contain Vortex files from a prior run whose
             // metadata no longer matches the current table configuration.
             for zone_id in &zone_pool[..zone_count] {
-                let bucket_name = generated_zone_bucket_name(&app_name, &table_name, zone_id)?;
+                let bucket_name = generate_bucket_name(&app_name, &table_name, zone_id)
+                    .map_err(|e| format!("failed to generate bucket name: {e}"))?;
                 if let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await {
                     let prefix = ObjectPath::from(format!("{table_name}/"));
                     let mut stream = store.list(Some(&prefix));
@@ -643,7 +605,7 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             let table_name = format!("taxi_multi_zone_live_{zone_count}z");
             let app_name = format!("test_cayenne_s3_express_multi_zone_live_{zone_count}z");
             for zone_id in &zone_pool[..zone_count] {
-                if let Ok(bucket_name) = generated_zone_bucket_name(&app_name, &table_name, zone_id) {
+                if let Ok(bucket_name) = generate_bucket_name(&app_name, &table_name, zone_id) {
                     if let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await {
                         let prefix = ObjectPath::from(format!("{table_name}/"));
                         let mut stream = store.list(Some(&prefix));

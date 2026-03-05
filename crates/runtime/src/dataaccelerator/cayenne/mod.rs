@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub(crate) mod s3;
+pub mod s3;
 
 use std::any::Any;
 use std::collections::HashMap;
