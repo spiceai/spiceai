@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use super::composite_flight_service::CompositeFlightService;
+use super::partition::scheduler_task::PartitionManagementConfig;
 use crate::auth::EndpointAuth;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
@@ -111,6 +112,19 @@ pub async fn start_internal_cluster_server(
         })
         .unwrap_or_else(|| bind_address.to_string());
 
+    // Resolve max_partitions_per_executor from the app config, falling back to the default.
+    let max_partitions_per_executor = rt
+        .read_app()
+        .await
+        .and_then(|app| {
+            app.runtime
+                .scheduler
+                .as_ref()
+                .and_then(|s| s.partition_management.as_ref())
+                .map(|pm| pm.max_partitions_per_executor)
+        })
+        .unwrap_or_else(|| PartitionManagementConfig::default().max_partitions_per_executor);
+
     // Use the shared executor stream registry if available (created during scheduler init).
     // This allows the scheduler callback to broadcast PollNow to connected executors.
     let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {
@@ -123,6 +137,7 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
             executor_streams,
+            max_partitions_per_executor,
         )
     } else {
         ClusterServiceImpl::new(
@@ -133,6 +148,7 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
+            max_partitions_per_executor,
         )
     };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);

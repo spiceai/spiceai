@@ -183,11 +183,14 @@ pub struct ClusterServiceImpl {
     metrics_reader: Option<MetricsReader>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
+    /// Maximum number of partitions that can be assigned to a single executor.
+    max_partitions_per_executor: usize,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -196,6 +199,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        max_partitions_per_executor: usize,
     ) -> Self {
         Self {
             app,
@@ -206,6 +210,7 @@ impl ClusterServiceImpl {
             executor_registry,
             metrics_reader,
             executor_streams: ExecutorControlStreamRegistry::new(),
+            max_partitions_per_executor,
         }
     }
 
@@ -224,6 +229,7 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
+        max_partitions_per_executor: usize,
     ) -> Self {
         Self {
             app,
@@ -235,6 +241,7 @@ impl ClusterServiceImpl {
             metrics_reader,
 
             executor_streams,
+            max_partitions_per_executor,
         }
     }
 
@@ -601,9 +608,21 @@ impl ClusterService for ClusterServiceImpl {
 
         let partition_manager = self.executor_registry().partition_manager();
         let app_guard = self.app.read().await;
+        let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
             // Find accelerated datasets with partitioning
             for table_ref in super::partition::accelerated_tables(app).keys() {
+                if total_assigned >= self.max_partitions_per_executor {
+                    tracing::debug!(
+                        "Executor {executor_id} reached max_partitions_per_executor ({}) during initial allocation, skipping remaining tables",
+                        self.max_partitions_per_executor
+                    );
+                    break;
+                }
+                let remaining = self
+                    .max_partitions_per_executor
+                    .saturating_sub(total_assigned);
+
                 if partition_manager
                     .get_cached_table_metadata(table_ref)
                     .is_none()
@@ -614,7 +633,7 @@ impl ClusterService for ClusterServiceImpl {
                     continue;
                 }
                 match partition_manager
-                    .allocate_partitions(table_ref, executor_id, 10)
+                    .allocate_partitions(table_ref, executor_id, remaining)
                     .await
                 {
                     Ok(partitions) => {
@@ -622,9 +641,13 @@ impl ClusterService for ClusterServiceImpl {
                             continue;
                         }
                         let mut items = Vec::with_capacity(partitions.len());
-                        for partition in partitions {
-                            match partition_value_to_bytes(partition, table_ref, &self.datafusion)
-                                .await
+                        for partition in &partitions {
+                            match partition_value_to_bytes(
+                                partition.clone(),
+                                table_ref,
+                                &self.datafusion,
+                            )
+                            .await
                             {
                                 Ok(bytes) => items.push(bytes.to_vec()),
                                 Err(e) => {
@@ -634,6 +657,7 @@ impl ClusterService for ClusterServiceImpl {
                                 }
                             }
                         }
+                        total_assigned += partitions.len();
                         table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
                     Err(e) => {
