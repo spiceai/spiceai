@@ -9,6 +9,7 @@ datasets:
       allow_http: true
       s3_auth: key
       s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_url_style: path
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet

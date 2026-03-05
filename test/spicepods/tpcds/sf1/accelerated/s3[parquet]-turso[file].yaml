@@ -6,6 +6,7 @@ datasets:
     name: catalog_sales
     params: &s3_params
       s3_endpoint: http://minio:9000
+      s3_url_style: path
       s3_region: us-east-1
       s3_bucket: tpcds-sf1
       s3_key: data

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use datafusion::{
@@ -85,6 +85,12 @@ impl SpiceObjectStoreRegistry {
                 "No host found in endpoint URL: {endpoint}"
             )));
         };
+
+        if host.parse::<IpAddr>().is_ok() {
+            return Err(DataFusionError::Configuration(format!(
+                "Endpoint '{endpoint}' uses an IP address and is incompatible with virtual-hosted style. Use s3_url_style=path."
+            )));
+        }
 
         let expected_prefix = format!("{bucket_name}.");
         if !host.starts_with(&expected_prefix) {
@@ -889,5 +895,30 @@ mod tests {
         .expect("virtual-hosted endpoint should parse");
 
         assert_eq!(endpoint, "https://spiceai-public-datasets.t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_virtual_with_port_preserves_port() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "http://minio:9000",
+            "bucket",
+            true,
+        )
+        .expect("virtual-hosted endpoint with port should parse");
+
+        assert_eq!(endpoint, "http://bucket.minio:9000");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_virtual_with_ip_returns_error() {
+        let result = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "http://192.168.1.100:9000",
+            "bucket",
+            true,
+        );
+
+        assert!(result.is_err());
+        let message = format!("{:#}", result.expect_err("IP endpoint should error"));
+        assert!(message.contains("s3_url_style=path"));
     }
 }
