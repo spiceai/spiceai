@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
-use turso_shared::WAL_JOURNAL_MODE_VALUE;
+use turso_shared::MVCC_JOURNAL_MODE_VALUE;
 
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
@@ -331,15 +331,15 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
 
-        // BEGIN CONCURRENT requires WAL mode for concurrent writers.
-        conn.pragma_update("journal_mode", WAL_JOURNAL_MODE_VALUE)
+        // BEGIN CONCURRENT requires MVCC mode for concurrent writers.
+        conn.pragma_update("journal_mode", MVCC_JOURNAL_MODE_VALUE)
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to set journal mode: {e}"),
             })?;
 
-        // NORMAL synchronous mode: safe with WAL, more performant than FULL
-        // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
+        // NORMAL synchronous mode: safe with MVCC, more performant than FULL
+        // With MVCC mode, NORMAL only syncs at checkpoints, not on every commit
         conn.execute("PRAGMA synchronous = NORMAL", ())
             .await
             .map_err(|e| CatalogError::Database {

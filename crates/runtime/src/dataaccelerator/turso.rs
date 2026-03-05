@@ -742,6 +742,7 @@ mod tests {
 
         // cleanup
         std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{path}-log")).ok();
     }
 
     #[tokio::test]
@@ -1263,6 +1264,7 @@ mod tests {
 
         // Clean up
         std::fs::remove_file(&file_path).ok();
+        std::fs::remove_file(format!("{file_path}-log")).ok();
     }
 
     #[tokio::test]
