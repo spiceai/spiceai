@@ -440,7 +440,9 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
     // "already exists with different configuration" unless the old entry is removed.
     let cayenne_db = std::path::PathBuf::from(".spice/data/metadata/cayenne.db");
     if cayenne_db.exists() {
-        let _ = std::fs::remove_file(&cayenne_db);
+        tokio::fs::remove_file(&cayenne_db)
+            .await
+            .map_err(|e| format!("failed to remove stale Cayenne catalog metadata: {e}"))?;
         tracing::info!("Removed stale Cayenne catalog metadata");
     }
 
@@ -639,7 +641,9 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
         }
         let cayenne_db = std::path::PathBuf::from(".spice/data/metadata/cayenne.db");
         if cayenne_db.exists() {
-            let _ = std::fs::remove_file(&cayenne_db);
+            tokio::fs::remove_file(&cayenne_db)
+                .await
+                .map_err(|e| format!("failed to remove Cayenne catalog metadata: {e}"))?;
         }
         tracing::info!("Post-test cleanup complete: removed S3 data and local Cayenne catalog");
 

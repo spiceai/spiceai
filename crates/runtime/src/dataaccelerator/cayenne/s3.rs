@@ -74,7 +74,7 @@ pub enum Error {
 
     #[snafu(display(
         "Multi-zone S3 Express One Zone write failed: {failed_count} of {total_zones} zone(s) failed. \
-        Failure details: {failed_zones}. Successful writes have been rolled back for ACID consistency."
+        Failure details: {failed_zones}. Rollback was attempted for successful zones."
     ))]
     MultiZoneWriteFailed {
         failed_count: usize,
@@ -183,17 +183,20 @@ impl MultiZoneS3ExpressStore {
         }
     }
 
-    async fn rollback_put(&self, location: &Path, successful_zone_ids: &[String]) {
+    async fn rollback_put(&self, location: &Path, successful_zone_ids: &[String]) -> Vec<String> {
         let successful_set: HashSet<&str> = successful_zone_ids
             .iter()
             .map(std::string::String::as_str)
             .collect();
+
+        let mut rollback_failures = Vec::new();
 
         for zone in &self.zones {
             if !successful_set.contains(zone.zone_id.as_str()) {
                 continue;
             }
             if let Err(e) = zone.store.delete(location).await {
+                rollback_failures.push(format!("rollback {}: {e}", zone.zone_id));
                 tracing::warn!(
                     "{}",
                     Error::MultiZoneRollbackFailed {
@@ -203,19 +206,24 @@ impl MultiZoneS3ExpressStore {
                 );
             }
         }
+
+        rollback_failures
     }
 
-    async fn rollback_copy(&self, to: &Path, successful_zone_ids: &[String]) {
+    async fn rollback_copy(&self, to: &Path, successful_zone_ids: &[String]) -> Vec<String> {
         let successful_set: HashSet<&str> = successful_zone_ids
             .iter()
             .map(std::string::String::as_str)
             .collect();
+
+        let mut rollback_failures = Vec::new();
 
         for zone in &self.zones {
             if !successful_set.contains(zone.zone_id.as_str()) {
                 continue;
             }
             if let Err(e) = zone.store.delete(to).await {
+                rollback_failures.push(format!("rollback {}: {e}", zone.zone_id));
                 tracing::warn!(
                     "{}",
                     Error::MultiZoneRollbackFailed {
@@ -225,6 +233,8 @@ impl MultiZoneS3ExpressStore {
                 );
             }
         }
+
+        rollback_failures
     }
 
     fn build_list_stream_for_zone(
@@ -362,7 +372,8 @@ impl ObjectStore for MultiZoneS3ExpressStore {
             });
         }
 
-        self.rollback_put(location, &successful_zone_ids).await;
+        let rollback_failures = self.rollback_put(location, &successful_zone_ids).await;
+        failed_zone_details.extend(rollback_failures);
         Err(self.multi_zone_write_error(&failed_zone_details))
     }
 
@@ -540,7 +551,8 @@ impl ObjectStore for MultiZoneS3ExpressStore {
             return Ok(());
         }
 
-        self.rollback_copy(to, &successful_zone_ids).await;
+        let rollback_failures = self.rollback_copy(to, &successful_zone_ids).await;
+        failed_zone_details.extend(rollback_failures);
         Err(self.multi_zone_write_error(&failed_zone_details))
     }
 
@@ -567,7 +579,8 @@ impl ObjectStore for MultiZoneS3ExpressStore {
             return Ok(());
         }
 
-        self.rollback_copy(to, &successful_zone_ids).await;
+        let rollback_failures = self.rollback_copy(to, &successful_zone_ids).await;
+        failed_zone_details.extend(rollback_failures);
         Err(self.multi_zone_write_error(&failed_zone_details))
     }
 }
