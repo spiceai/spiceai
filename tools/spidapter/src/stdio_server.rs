@@ -1177,7 +1177,6 @@ fn generate_hive_spicepod(
             engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
-            refresh_check_interval: Some("1s".to_string()),
             ..Acceleration::default()
         });
 
@@ -1305,7 +1304,6 @@ mod tests {
         assert!(spicepod.contains("engine: cayenne"));
         assert!(spicepod.contains("mode: file"));
         assert!(spicepod.contains("refresh_mode: full"));
-        assert!(spicepod.contains("refresh_check_interval: 1s"));
         assert!(spicepod.contains("telemetry:"));
         assert!(spicepod.contains("enabled: false"));
     }

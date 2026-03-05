@@ -1,0 +1,6 @@
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-arrow-partitioned.yaml
+    query_set: clickbench
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1800
