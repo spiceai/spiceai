@@ -185,15 +185,46 @@ impl JobStore {
     }
 
     /// Marks a job as cancelled.
+    ///
+    /// Retries with fibonacci backoff on concurrent modification errors (e.g.,
+    /// background task updated the state between our read and write). On retry,
+    /// re-reads the state and returns early if the job already reached a terminal
+    /// state.
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobState> {
-        let mut state = self.get_job(job_id).await?;
-        if state.is_terminal() {
-            // Already in terminal state, return as-is
-            return Ok(state);
+        use util::fibonacci_backoff::FibonacciBackoffBuilder;
+
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
+
+        loop {
+            let mut state = self.get_job(job_id).await?;
+            if state.is_terminal() {
+                return Ok(state);
+            }
+            state.set_cancelled();
+            match self.write_job_state(&mut state).await {
+                Ok(()) => return Ok(state),
+                Err(super::error::Error::ConcurrentModification { .. }) => {
+                    if let Some(duration) = backoff.next_duration() {
+                        tracing::debug!(
+                            job_id = %job_id,
+                            "Concurrent modification on cancel, retrying"
+                        );
+                        tokio::time::sleep(duration).await;
+                    } else {
+                        // Max retries exhausted — re-read state in case another
+                        // writer already cancelled the job.
+                        let state = self.get_job(job_id).await?;
+                        if state.is_terminal() {
+                            return Ok(state);
+                        }
+                        return Err(super::error::Error::ConcurrentModification {
+                            job_id: job_id.to_string(),
+                        });
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-        state.set_cancelled();
-        self.write_job_state(&mut state).await?;
-        Ok(state)
     }
 
     /// Writes result chunks for a completed job from a stream of record batches.
