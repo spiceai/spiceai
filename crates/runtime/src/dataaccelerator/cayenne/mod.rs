@@ -324,7 +324,7 @@ impl CayenneAccelerator {
     /// Returns a vector of S3 paths, one for each zone. The first zone is the primary zone
     /// used for reads; all zones are used for writes (ACID replication).
     fn cayenne_data_dirs_multi_zone(&self, source: &dyn AccelerationSource) -> Result<Vec<String>> {
-        let zone_ids = s3::get_s3_zone_ids(source);
+        let zone_ids = s3::get_s3_zone_ids(source).context(S3Snafu)?;
         if zone_ids.is_empty() {
             // No multi-zone config, return single path
             return Ok(vec![self.cayenne_data_dir(source)?]);
@@ -890,7 +890,9 @@ impl DataAccelerator for CayenneAccelerator {
         // Handle S3 Express One Zone configuration
         if is_s3_express {
             if s3::is_multi_zone_s3_express(source) {
-                let zone_ids = s3::get_s3_zone_ids(source);
+                let zone_ids = s3::get_s3_zone_ids(source).map_err(|source| {
+                    Box::new(Error::S3Error { source }) as Box<dyn std::error::Error + Send + Sync>
+                })?;
                 let dataset_name = source.name().to_string().replace(['.', '/'], "_");
                 let app_name = source.app().name.clone();
 
@@ -919,9 +921,9 @@ impl DataAccelerator for CayenneAccelerator {
                 for zone_id in &zone_ids {
                     let bucket_name = s3::generate_bucket_name(&app_name, &dataset_name, zone_id)
                         .map_err(|source| {
-                            Box::new(Error::S3Error { source })
-                                as Box<dyn std::error::Error + Send + Sync>
-                        })?;
+                        Box::new(Error::S3Error { source })
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
 
                     let region = acceleration
                         .params
@@ -978,7 +980,9 @@ impl DataAccelerator for CayenneAccelerator {
                 .await
                 .boxed()?
                 {
-                    tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket created)");
+                    tracing::info!(
+                        "Using S3 Express One Zone storage: {dir_path} (bucket created)"
+                    );
                 } else {
                     tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket exists)");
                 }
@@ -1724,15 +1728,12 @@ mod tests {
         let app = AppBuilder::new("test-app").build();
         let rt = crate::Runtime::builder().build().await;
 
-        let mut dataset = DatasetBuilder::try_new(
-            "orders.dataset".to_string(),
-            "orders.dataset",
-        )
-        .expect("Failed to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("Failed to build dataset");
+        let mut dataset = DatasetBuilder::try_new("orders.dataset".to_string(), "orders.dataset")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Cayenne,

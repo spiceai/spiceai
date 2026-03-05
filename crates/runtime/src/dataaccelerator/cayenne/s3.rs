@@ -14,18 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
+use futures::StreamExt;
 use futures::future::join_all;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    path::Path,
-    ClientOptions, RetryConfig, aws::AmazonS3Builder, client::SpawnedReqwestConnector,
+    ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RetryConfig, aws::AmazonS3Builder,
+    client::SpawnedReqwestConnector, path::Path,
 };
 use runtime_parameters::ParameterSpec;
 use runtime_secrets::get_params_with_secrets;
@@ -74,9 +73,19 @@ pub enum Error {
 
     #[snafu(display(
         "Multi-zone S3 Express One Zone write failed: {failed_count} of {total_zones} zone(s) failed. \
-        Failed zones: {failed_zones}. Successful writes have been rolled back for ACID consistency."
+        Failure details: {failed_zones}. Successful writes have been rolled back for ACID consistency."
     ))]
     MultiZoneWriteFailed {
+        failed_count: usize,
+        total_zones: usize,
+        failed_zones: String,
+    },
+
+    #[snafu(display(
+        "Multi-zone S3 Express One Zone delete failed for {failed_count} of {total_zones} zone(s). \
+        Failure details: {failed_zones}. Some replicas may still retain the object."
+    ))]
+    MultiZoneDeleteFailed {
         failed_count: usize,
         total_zones: usize,
         failed_zones: String,
@@ -118,41 +127,43 @@ impl MultiZoneS3ExpressStore {
         self.zones.len()
     }
 
-    /// Returns a deterministic read order for the given object path, distributing
-    /// primary reads across zones by hashing the path.
+    /// Returns a deterministic read order for all read operations.
     ///
-    /// **Design tradeoff**: `list()` always reads from zone 0 while `get()`/`head()`
-    /// stripe across zones via this method. This is acceptable because writes are
-    /// replicated atomically to all zones, so every zone holds the same object set.
-    /// If a primary zone is temporarily unavailable, get/head falls back to the next
-    /// zone in the order. An inconsistency would only arise from external out-of-band
-    /// mutations, which are outside the supported contract.
-    fn striped_read_order(&self, location: &Path) -> Vec<usize> {
+    /// Always prefers zone 0 (the listing primary) and falls back to other zones on
+    /// read failures. Keeping list/get/head aligned to the same primary zone avoids
+    /// potential metadata/content mismatches if replicas drift.
+    fn read_order(&self) -> Vec<usize> {
         if self.zones.is_empty() {
             return Vec::new();
         }
-
-        let mut hasher = DefaultHasher::new();
-        location.as_ref().hash(&mut hasher);
-        let primary_idx = (hasher.finish() as usize) % self.zones.len();
-
         let mut order = Vec::with_capacity(self.zones.len());
-        order.push(primary_idx);
+        order.push(0);
         for idx in 0..self.zones.len() {
-            if idx != primary_idx {
+            if idx != 0 {
                 order.push(idx);
             }
         }
         order
     }
 
-    fn multi_zone_write_error(&self, failed_zone_ids: &[String]) -> object_store::Error {
+    fn multi_zone_write_error(&self, failed_zone_details: &[String]) -> object_store::Error {
         object_store::Error::Generic {
             store: MULTI_ZONE_STORE_NAME,
             source: Box::new(Error::MultiZoneWriteFailed {
-                failed_count: failed_zone_ids.len(),
+                failed_count: failed_zone_details.len(),
                 total_zones: self.stores_len(),
-                failed_zones: failed_zone_ids.join(", "),
+                failed_zones: failed_zone_details.join(", "),
+            }),
+        }
+    }
+
+    fn multi_zone_delete_error(&self, failed_zone_details: &[String]) -> object_store::Error {
+        object_store::Error::Generic {
+            store: MULTI_ZONE_STORE_NAME,
+            source: Box::new(Error::MultiZoneDeleteFailed {
+                failed_count: failed_zone_details.len(),
+                total_zones: self.stores_len(),
+                failed_zones: failed_zone_details.join(", "),
             }),
         }
     }
@@ -231,7 +242,7 @@ impl ObjectStore for MultiZoneS3ExpressStore {
 
         let mut first_success: Option<PutResult> = None;
         let mut successful_zone_ids = Vec::new();
-        let mut failed_zone_ids = Vec::new();
+        let mut failed_zone_details = Vec::new();
 
         for (zone_id, result) in results {
             match result {
@@ -243,12 +254,12 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                 }
                 Err(err) => {
                     tracing::warn!("Multi-zone put failed for zone '{zone_id}': {err}");
-                    failed_zone_ids.push(zone_id);
+                    failed_zone_details.push(format!("{zone_id}: {err}"));
                 }
             }
         }
 
-        if failed_zone_ids.is_empty() {
+        if failed_zone_details.is_empty() {
             return first_success.ok_or_else(|| object_store::Error::Generic {
                 store: MULTI_ZONE_STORE_NAME,
                 source: "No successful multi-zone write result".into(),
@@ -256,7 +267,7 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         }
 
         self.rollback_put(location, &successful_zone_ids).await;
-        Err(self.multi_zone_write_error(&failed_zone_ids))
+        Err(self.multi_zone_write_error(&failed_zone_details))
     }
 
     async fn put_multipart_opts(
@@ -297,8 +308,12 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         }))
     }
 
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
-        let read_order = self.striped_read_order(location);
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let read_order = self.read_order();
         let mut last_err: Option<object_store::Error> = None;
 
         for idx in read_order {
@@ -323,7 +338,7 @@ impl ObjectStore for MultiZoneS3ExpressStore {
     }
 
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let read_order = self.striped_read_order(location);
+        let read_order = self.read_order();
         let mut last_err: Option<object_store::Error> = None;
 
         for idx in read_order {
@@ -348,7 +363,7 @@ impl ObjectStore for MultiZoneS3ExpressStore {
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        let mut failed_zone_ids = Vec::new();
+        let mut failed_zone_details = Vec::new();
         for zone in &self.zones {
             if let Err(err) = zone.store.delete(location).await {
                 tracing::warn!(
@@ -356,14 +371,14 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                     location,
                     zone.zone_id
                 );
-                failed_zone_ids.push(zone.zone_id.clone());
+                failed_zone_details.push(format!("{}: {err}", zone.zone_id));
             }
         }
 
-        if failed_zone_ids.is_empty() {
+        if failed_zone_details.is_empty() {
             Ok(())
         } else {
-            Err(self.multi_zone_write_error(&failed_zone_ids))
+            Err(self.multi_zone_delete_error(&failed_zone_details))
         }
     }
 
@@ -371,9 +386,17 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         &self,
         prefix: Option<&Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        // Listing from the first zone is sufficient because writes are replicated atomically.
-        // If replication ever diverges due to external mutation, list consistency degrades
-        // predictably to the primary zone.
+        if self.zones.is_empty() {
+            let path = prefix.map_or_else(String::new, std::string::ToString::to_string);
+            return futures::stream::once(async {
+                Err(object_store::Error::NotFound {
+                    path,
+                    source: "No configured S3 zones".into(),
+                })
+            })
+            .boxed();
+        }
+
         self.zones[0].store.list(prefix)
     }
 
@@ -382,16 +405,44 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if self.zones.is_empty() {
+            let path = offset.to_string();
+            return futures::stream::once(async {
+                Err(object_store::Error::NotFound {
+                    path,
+                    source: "No configured S3 zones".into(),
+                })
+            })
+            .boxed();
+        }
+
         self.zones[0].store.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.zones[0].store.list_with_delimiter(prefix).await
+        let mut last_err: Option<object_store::Error> = None;
+        for zone in &self.zones {
+            match zone.store.list_with_delimiter(prefix).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    tracing::debug!(
+                        "S3 Express list_with_delimiter failed for zone '{}': {err}",
+                        zone.zone_id
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| object_store::Error::NotFound {
+            path: prefix.map_or_else(String::new, std::string::ToString::to_string),
+            source: "No configured S3 zones".into(),
+        }))
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         let mut successful_zone_ids = Vec::new();
-        let mut failed_zone_ids = Vec::new();
+        let mut failed_zone_details = Vec::new();
 
         for zone in &self.zones {
             match zone.store.copy(from, to).await {
@@ -403,22 +454,22 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                         to,
                         zone.zone_id
                     );
-                    failed_zone_ids.push(zone.zone_id.clone());
+                    failed_zone_details.push(format!("{}: {err}", zone.zone_id));
                 }
             }
         }
 
-        if failed_zone_ids.is_empty() {
+        if failed_zone_details.is_empty() {
             return Ok(());
         }
 
         self.rollback_copy(to, &successful_zone_ids).await;
-        Err(self.multi_zone_write_error(&failed_zone_ids))
+        Err(self.multi_zone_write_error(&failed_zone_details))
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         let mut successful_zone_ids = Vec::new();
-        let mut failed_zone_ids = Vec::new();
+        let mut failed_zone_details = Vec::new();
 
         for zone in &self.zones {
             match zone.store.copy_if_not_exists(from, to).await {
@@ -430,17 +481,17 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                         to,
                         zone.zone_id
                     );
-                    failed_zone_ids.push(zone.zone_id.clone());
+                    failed_zone_details.push(format!("{}: {err}", zone.zone_id));
                 }
             }
         }
 
-        if failed_zone_ids.is_empty() {
+        if failed_zone_details.is_empty() {
             return Ok(());
         }
 
         self.rollback_copy(to, &successful_zone_ids).await;
-        Err(self.multi_zone_write_error(&failed_zone_ids))
+        Err(self.multi_zone_write_error(&failed_zone_details))
     }
 }
 
@@ -463,13 +514,18 @@ impl MultipartUpload for MultiZoneMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         let mut part_futures = Vec::with_capacity(self.uploads.len());
         for zone_upload in &mut self.uploads {
-            part_futures.push((zone_upload.zone_id.clone(), zone_upload.upload.put_part(data.clone())));
+            part_futures.push((
+                zone_upload.zone_id.clone(),
+                zone_upload.upload.put_part(data.clone()),
+            ));
         }
 
         Box::pin(async move {
-            let results = join_all(part_futures.into_iter().map(|(zone_id, fut)| async move {
-                (zone_id, fut.await)
-            }))
+            let results = join_all(
+                part_futures
+                    .into_iter()
+                    .map(|(zone_id, fut)| async move { (zone_id, fut.await) }),
+            )
             .await;
 
             for (zone_id, result) in results {
@@ -655,25 +711,47 @@ pub fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
 /// Parses the `cayenne_s3_zone_ids` parameter as a comma-separated list of zone IDs.
 /// Normalizes entries (trim + lowercase) and deduplicates, preserving first-seen order.
 /// Returns an empty vector if the parameter is not set.
-pub fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Vec<String> {
+pub fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Result<Vec<String>> {
     source
         .acceleration()
         .and_then(|a| a.params.get("cayenne_s3_zone_ids"))
-        .map(|zone_ids| {
+        .map_or_else(
+            || Ok(Vec::new()),
+            |zone_ids| {
             let mut seen = HashSet::new();
+            let mut ordered = Vec::new();
+            let mut duplicates = Vec::new();
             zone_ids
                 .split(',')
                 .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
+                .filter(|s| !s.is_empty())
+                .for_each(|zone_id| {
+                    if seen.insert(zone_id.clone()) {
+                        ordered.push(zone_id);
+                    } else {
+                        duplicates.push(zone_id);
+                    }
+                });
+
+            if !duplicates.is_empty() {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Duplicate values found in 'cayenne_s3_zone_ids': {}. Use a unique, comma-separated zone list.",
+                        duplicates.join(", ")
+                    )),
+                });
+            }
+
+                Ok(ordered)
+            },
+        )
 }
 
 /// Extracts the zone ID from an S3 Express One Zone bucket name.
 ///
 /// S3 Express One Zone bucket names have the format: `{base-name}--{zone-id}--x-s3`
 /// Example: `mybucket--usw2-az1--x-s3` returns `Some("usw2-az1")`
+#[must_use]
 pub fn extract_zone_id_from_bucket(bucket_name: &str) -> Option<&str> {
     // Find the last occurrence of "--x-s3"
     let suffix_start = bucket_name.rfind("--x-s3")?;
@@ -1163,6 +1241,7 @@ pub fn get_s3_bucket_info(
 ///
 /// Zone IDs follow the pattern: `{region-code}-az{n}` (e.g., `usw2-az1`, `use1-az4`)
 /// We need to map the abbreviated region code to the full AWS region name.
+#[must_use]
 pub fn derive_region_from_zone(zone_id: &str) -> Option<String> {
     // Extract the region prefix from zone ID (e.g., "usw2" from "usw2-az1")
     let region_prefix = zone_id.split("-az").next()?;
@@ -1211,15 +1290,15 @@ pub fn derive_region_from_zone(zone_id: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 struct ResolvedS3Params {
-    s3_region: Option<String>,
-    s3_endpoint: Option<String>,
-    s3_key: Option<String>,
-    s3_secret: Option<String>,
-    s3_session_token: Option<String>,
-    s3_auth: String,
-    s3_client_timeout: Option<String>,
-    s3_allow_http: bool,
-    s3_unsigned_payload: bool,
+    region: Option<String>,
+    endpoint: Option<String>,
+    key: Option<String>,
+    secret: Option<String>,
+    session_token: Option<String>,
+    auth: String,
+    client_timeout: Option<String>,
+    allow_http: bool,
+    unsigned_payload: bool,
 }
 
 async fn resolve_s3_params(source: &dyn AccelerationSource) -> ResolvedS3Params {
@@ -1246,15 +1325,15 @@ async fn resolve_s3_params(source: &dyn AccelerationSource) -> ResolvedS3Params 
         get_param("cayenne_s3_unsigned_payload").is_none_or(|v| !v.eq_ignore_ascii_case("false"));
 
     ResolvedS3Params {
-        s3_region,
-        s3_endpoint,
-        s3_key,
-        s3_secret,
-        s3_session_token,
-        s3_auth,
-        s3_client_timeout,
-        s3_allow_http,
-        s3_unsigned_payload,
+        region: s3_region,
+        endpoint: s3_endpoint,
+        key: s3_key,
+        secret: s3_secret,
+        session_token: s3_session_token,
+        auth: s3_auth,
+        client_timeout: s3_client_timeout,
+        allow_http: s3_allow_http,
+        unsigned_payload: s3_unsigned_payload,
     }
 }
 
@@ -1279,7 +1358,7 @@ async fn build_single_s3_store_for_path(
         .to_string();
 
     let effective_region = params
-        .s3_region
+        .region
         .clone()
         .or_else(|| derive_region_from_zone(&zone_id))
         .ok_or_else(|| Error::InvalidConfiguration {
@@ -1292,7 +1371,7 @@ async fn build_single_s3_store_for_path(
     let mut s3_builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
-        .with_allow_http(params.s3_allow_http)
+        .with_allow_http(params.allow_http)
         .with_region(effective_region.clone());
 
     let retry_config = RetryConfig {
@@ -1302,28 +1381,28 @@ async fn build_single_s3_store_for_path(
     };
     s3_builder = s3_builder.with_retry(retry_config);
 
-    let mut client_options = ClientOptions::default()
-        .with_timeout(std::time::Duration::from_secs(120));
+    let mut client_options =
+        ClientOptions::default().with_timeout(std::time::Duration::from_secs(120));
 
     s3_builder = s3_builder
         .with_s3_express(true)
         .with_virtual_hosted_style_request(true)
-        .with_unsigned_payload(params.s3_unsigned_payload);
+        .with_unsigned_payload(params.unsigned_payload);
 
-    if params.s3_endpoint.is_none() {
+    if params.endpoint.is_none() {
         let express_endpoint =
             format!("https://{bucket_name}.s3express-{zone_id}.{effective_region}.amazonaws.com");
         s3_builder = s3_builder.with_endpoint(&express_endpoint);
     }
 
-    if let Some(endpoint) = &params.s3_endpoint {
+    if let Some(endpoint) = &params.endpoint {
         s3_builder = s3_builder.with_endpoint(endpoint);
         if endpoint.starts_with("http://") {
             client_options = client_options.with_allow_http(true);
         }
     }
 
-    if let Some(timeout) = &params.s3_client_timeout {
+    if let Some(timeout) = &params.client_timeout {
         client_options = client_options.with_timeout(
             fundu::parse_duration(timeout)
                 .boxed()
@@ -1332,11 +1411,11 @@ async fn build_single_s3_store_for_path(
     }
 
     let mut load_credentials_from_environment = true;
-    if params.s3_auth == "key" {
-        if let (Some(key), Some(secret)) = (params.s3_key.clone(), params.s3_secret.clone()) {
+    if params.auth == "key" {
+        if let (Some(key), Some(secret)) = (params.key.clone(), params.secret.clone()) {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
-            if let Some(token) = params.s3_session_token.clone() {
+            if let Some(token) = params.session_token.clone() {
                 s3_builder = s3_builder.with_token(token);
             }
             load_credentials_from_environment = false;
@@ -1404,7 +1483,7 @@ pub async fn build_s3_object_store(
 
     let resolved = resolve_s3_params(source).await;
 
-    let zone_ids = get_s3_zone_ids(source);
+    let zone_ids = get_s3_zone_ids(source)?;
     if zone_ids.len() > 1 {
         let dataset_name = source.name().to_string().replace(['.', '/'], "_");
         let app_name = source.app().name.clone();
@@ -1538,11 +1617,18 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
         async fn delete(&self, location: &Path) -> object_store::Result<()> {
             self.inner.delete(location).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -1554,7 +1640,10 @@ mod tests {
             self.inner.list_with_offset(prefix, offset)
         }
 
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -1772,7 +1861,11 @@ mod tests {
 
         let location = Path::from("table/snapshot/data.vtx");
         let write_result = multi_zone_store
-            .put_opts(&location, PutPayload::from("test-data".to_string()), PutOptions::default())
+            .put_opts(
+                &location,
+                PutPayload::from("test-data".to_string()),
+                PutOptions::default(),
+            )
             .await;
         assert!(write_result.is_err(), "multi-zone write should fail");
 
@@ -1799,17 +1892,9 @@ mod tests {
             },
         ]);
 
-        let location = Path::from("table/snapshot/striped-key.vtx");
-        let preferred_idx = multi_zone_store.striped_read_order(&location)[0];
-        let fallback_idx = if preferred_idx == 0 { 1 } else { 0 };
+        let location = Path::from("table/snapshot/primary-fallback-key.vtx");
 
-        let fallback_store = if fallback_idx == 0 {
-            Arc::clone(&zone_a)
-        } else {
-            Arc::clone(&zone_b)
-        };
-
-        fallback_store
+        zone_b
             .put_opts(
                 &location,
                 PutPayload::from("fallback-zone-data".to_string()),

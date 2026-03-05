@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check_with_timeout;
 use crate::{
@@ -26,12 +25,13 @@ use crate::{
     utils::{register_test_connectors, test_request_context},
 };
 use app::AppBuilder;
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
+use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
-use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::Dataset;
@@ -64,25 +64,20 @@ async fn append_one_row_via_cayenne_accelerator(
         .ok_or_else(|| format!("table {table_name} not found in catalog"))?;
     let schema = table_provider.schema();
 
-    // Build column arrays: VendorID gets the provided value, everything else is NULL.
+    // Build column arrays and cast to the exact schema type when needed.
     let columns: Vec<ArrayRef> = schema
         .fields()
         .iter()
         .map(|field| {
-            if field.name() == "VendorID" {
+            let col = if field.name() == "VendorID" {
                 Arc::new(Int64Array::from(vec![vendor_id])) as ArrayRef
             } else {
                 new_null_array(field.data_type(), 1)
-            }
-        })
-        .collect();
+            };
 
-    // Cast VendorID to match exact schema type (source may use non-Int64)
-    let columns: Vec<ArrayRef> = columns
-        .into_iter()
-        .zip(schema.fields())
-        .map(|(col, field)| {
-            if col.data_type() != field.data_type() {
+            if col.data_type() == field.data_type() {
+                Ok(col)
+            } else {
                 arrow::compute::cast(&col, field.data_type()).map_err(|e| {
                     format!(
                         "failed to cast column '{}' from {:?} to {:?}: {e}",
@@ -91,8 +86,6 @@ async fn append_one_row_via_cayenne_accelerator(
                         field.data_type()
                     )
                 })
-            } else {
-                Ok(col)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -155,9 +148,7 @@ async fn build_zone_store(
     zone_id: &str,
     region: &str,
 ) -> Result<Arc<dyn ObjectStore>, String> {
-    let endpoint = format!(
-        "https://{bucket_name}.s3express-{zone_id}.{region}.amazonaws.com"
-    );
+    let endpoint = format!("https://{bucket_name}.s3express-{zone_id}.{region}.amazonaws.com");
 
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
@@ -172,7 +163,9 @@ async fn build_zone_store(
         std::env::var("AWS_ACCESS_KEY_ID"),
         std::env::var("AWS_SECRET_ACCESS_KEY"),
     ) {
-        builder = builder.with_access_key_id(key).with_secret_access_key(secret);
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
         if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
             builder = builder.with_token(token);
         }
@@ -210,6 +203,39 @@ async fn list_objects_under_prefix(
     }
 
     Ok(objects)
+}
+
+fn normalize_zone_ids(raw_zone_ids: &str) -> Vec<String> {
+    let mut zone_pool: Vec<String> = Vec::new();
+    for raw_zone in raw_zone_ids.split(',') {
+        let normalized = raw_zone.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && !zone_pool.iter().any(|z| z == &normalized) {
+            zone_pool.push(normalized);
+        }
+    }
+    zone_pool
+}
+
+async fn cleanup_s3_table_data(
+    app_name: &str,
+    table_name: &str,
+    region: &str,
+    zone_ids: &[String],
+) {
+    for zone_id in zone_ids {
+        let Ok(bucket_name) = generate_bucket_name(app_name, table_name, zone_id) else {
+            continue;
+        };
+        let Ok(store) = build_zone_store(&bucket_name, zone_id, region).await else {
+            continue;
+        };
+
+        let prefix = ObjectPath::from(format!("{table_name}/"));
+        let mut stream = store.list(Some(&prefix));
+        while let Some(Ok(meta)) = stream.next().await {
+            let _ = store.delete(&meta.location).await;
+        }
+    }
 }
 
 // Validation-only helper:
@@ -390,28 +416,21 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
 
     // Keep test input minimal: hardcoded defaults with optional env overrides.
     // Defaults include two known-good zones. A third zone can be provided via env.
-    let zone_ids = std::env::var("CAYENNE_S3_ZONE_IDS")
-        .unwrap_or_else(|_| "usw2-az1,usw2-az4".to_string());
+    let zone_ids =
+        std::env::var("CAYENNE_S3_ZONE_IDS").unwrap_or_else(|_| "usw2-az1,usw2-az4".to_string());
     let region = std::env::var("CAYENNE_S3_REGION").unwrap_or_else(|_| "us-west-2".to_string());
 
-    let mut zone_pool: Vec<String> = zone_ids
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect();
+    let mut zone_pool = normalize_zone_ids(&zone_ids);
 
     if let Ok(third_zone) = std::env::var("CAYENNE_S3_ZONE_ID_3") {
-        let third_zone = third_zone.trim();
-        if !third_zone.is_empty() && !zone_pool.iter().any(|z| z == third_zone) {
-            zone_pool.push(third_zone.to_string());
+        let normalized = third_zone.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && !zone_pool.iter().any(|z| z == &normalized) {
+            zone_pool.push(normalized);
         }
     }
 
     if zone_pool.is_empty() {
-        return Err(
-            "At least 1 S3 zone ID is required for acceleration tests".to_string(),
-        );
+        return Err("At least 1 S3 zone ID is required for acceleration tests".to_string());
     }
 
     // Clean stale Cayenne catalog metadata from previous test runs.
@@ -439,22 +458,12 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             let table_name = format!("taxi_multi_zone_live_{zone_count}z");
             let app_name = format!("test_cayenne_s3_express_multi_zone_live_{zone_count}z");
 
-            // Clean stale S3 data from previous test runs for this scenario.
-            // Each zone bucket may contain Vortex files from a prior run whose
-            // metadata no longer matches the current table configuration.
-            for zone_id in &zone_pool[..zone_count] {
-                let bucket_name = generate_bucket_name(&app_name, &table_name, zone_id)
-                    .map_err(|e| format!("failed to generate bucket name: {e}"))?;
-                if let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await {
-                    let prefix = ObjectPath::from(format!("{table_name}/"));
-                    let mut stream = store.list(Some(&prefix));
-                    while let Some(Ok(meta)) = stream.next().await {
-                        let _ = store.delete(&meta.location).await;
-                    }
-                    tracing::info!("Cleaned S3 data for {table_name} in zone {zone_id}");
-                }
-            }
+            let scenario_zones = zone_pool[..zone_count].to_vec();
 
+            // Clean stale S3 data from previous test runs for this scenario.
+            cleanup_s3_table_data(&app_name, &table_name, &region, &scenario_zones).await;
+
+            let scenario_result: Result<(), String> = async {
             let mut dataset = Dataset::new(
                 "s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
                 table_name.clone(),
@@ -546,9 +555,15 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             }
 
             // --- Cayenne write mutation: append one row through Cayenne accelerator ---
-            // Uses a VendorID that does NOT exist to avoid upsert deduplication.
+            // Derive a guaranteed-unique VendorID to avoid upsert deduplication.
             // The row is written through Runtime/DataFusion → AcceleratedTable → CayenneTableProvider.
-            let new_vendor_id: i64 = 999_999;
+            let new_vendor_id: i64 = first_i64_cell(
+                &run_sql(
+                    &rt,
+                    &format!(r#"SELECT COALESCE(MAX("VendorID"), 0) + 1 AS c FROM {table_name}"#),
+                )
+                .await?,
+            )?;
             append_one_row_via_cayenne_accelerator(&rt, &table_name, new_vendor_id).await?;
 
             // Wait for the SQL results cache to expire (TTL=1s) so the next query
@@ -584,7 +599,6 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             );
 
             if zone_count >= 2 {
-                let scenario_zones = zone_pool[..zone_count].to_vec();
                 validate_s3_replica_integrity_direct(&app_name, &table_name, &region, &scenario_zones)
                     .await?;
 
@@ -596,6 +610,13 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                     "Cayenne S3 Express 1-zone scenario validated (no replica to compare)"
                 );
             }
+
+            Ok(())
+            }
+            .await;
+
+            cleanup_s3_table_data(&app_name, &table_name, &region, &scenario_zones).await;
+            scenario_result?;
         }
 
         // --- Post-test cleanup: remove S3 data and local metadata ---
@@ -605,13 +626,13 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             let table_name = format!("taxi_multi_zone_live_{zone_count}z");
             let app_name = format!("test_cayenne_s3_express_multi_zone_live_{zone_count}z");
             for zone_id in &zone_pool[..zone_count] {
-                if let Ok(bucket_name) = generate_bucket_name(&app_name, &table_name, zone_id) {
-                    if let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await {
-                        let prefix = ObjectPath::from(format!("{table_name}/"));
-                        let mut stream = store.list(Some(&prefix));
-                        while let Some(Ok(meta)) = stream.next().await {
-                            let _ = store.delete(&meta.location).await;
-                        }
+                if let Ok(bucket_name) = generate_bucket_name(&app_name, &table_name, zone_id)
+                    && let Ok(store) = build_zone_store(&bucket_name, zone_id, &region).await
+                {
+                    let prefix = ObjectPath::from(format!("{table_name}/"));
+                    let mut stream = store.list(Some(&prefix));
+                    while let Some(Ok(meta)) = stream.next().await {
+                        let _ = store.delete(&meta.location).await;
                     }
                 }
             }
