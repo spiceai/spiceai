@@ -19,7 +19,7 @@ use std::time::Duration;
 pub const BEGIN_CONCURRENT_SQL: &str = "BEGIN CONCURRENT";
 pub const BEGIN_TRANSACTION_SQL: &str = "BEGIN TRANSACTION";
 pub const COMMIT_SQL: &str = "COMMIT";
-pub const WAL_JOURNAL_MODE_VALUE: &str = "'WAL'";
+pub const MVCC_JOURNAL_MODE_VALUE: &str = "'mvcc'";
 
 pub const DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS: u32 = 4;
 pub const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;

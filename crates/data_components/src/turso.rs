@@ -149,7 +149,7 @@ use datafusion_federation::{
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
-use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, WAL_JOURNAL_MODE_VALUE};
+use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, MVCC_JOURNAL_MODE_VALUE};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
@@ -370,7 +370,7 @@ fn is_now_function(func: &Function) -> bool {
 /// Connection pool for Turso databases
 ///
 /// Manages connections to a Turso database (file-based or in-memory).
-/// Supports concurrent transactions using WAL mode with `BEGIN CONCURRENT`.
+/// Supports concurrent transactions using MVCC mode with `BEGIN CONCURRENT`.
 ///
 /// # Architecture
 ///
@@ -392,7 +392,7 @@ fn is_now_function(func: &Function) -> bool {
 /// let conn = pool.connect().await?;
 /// ```
 ///
-/// Note: Concurrent transactions are enabled via WAL journal mode during pool creation.
+/// Note: Concurrent transactions are enabled via MVCC journal mode during pool creation.
 /// This enables BEGIN CONCURRENT transactions for better concurrency.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
@@ -419,7 +419,7 @@ impl TursoConnectionPool {
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
     /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
     ///
-    /// Note: BEGIN CONCURRENT requires WAL mode, which is configured during pool creation.
+    /// Note: BEGIN CONCURRENT requires MVCC mode, which is configured during pool creation.
     pub async fn new_with_timestamp_format(
         path: &str,
         timestamp_format: TimestampFormat,
@@ -429,9 +429,9 @@ impl TursoConnectionPool {
             .await
             .context(TursoDatabaseSnafu)?;
 
-        // BEGIN CONCURRENT requires WAL journal mode for concurrent writers.
+        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
         let conn = database.connect().context(TursoDatabaseSnafu)?;
-        conn.pragma_update("journal_mode", WAL_JOURNAL_MODE_VALUE)
+        conn.pragma_update("journal_mode", MVCC_JOURNAL_MODE_VALUE)
             .await
             .context(TursoDatabaseSnafu)?;
 
@@ -1717,7 +1717,7 @@ impl TursoDataSink {
         );
 
         // Use a transaction to batch all inserts
-        // BEGIN CONCURRENT improves write concurrency on Turso in WAL mode.
+        // BEGIN CONCURRENT improves write concurrency on Turso in MVCC mode.
         conn.execute(BEGIN_CONCURRENT_SQL, ()).await?;
 
         // Prepare the statement once
