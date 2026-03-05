@@ -42,7 +42,7 @@ RUN set -eux; \
         curl -fSL -H "Accept: application/octet-stream" "${asset_api_url}" -o /tmp/spiced.tar.gz; \
       fi; \
     }; \
-    asset="spiced_models_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
+    asset="spiced_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
     release_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/v${REL_VERSION}"; \
     asset_downloaded=false; \
     if fetch_release_json "${release_url}"; then \
