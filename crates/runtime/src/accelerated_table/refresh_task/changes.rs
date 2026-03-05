@@ -94,7 +94,7 @@ impl RefreshTask {
                         .write_change(change_envelope.change_batch.clone())
                         .await
                     {
-                        Ok(()) => {
+                        Ok(had_change) => {
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
                                 initial_load_completed.store(true, Ordering::Relaxed);
@@ -111,18 +111,19 @@ impl RefreshTask {
                                 tracing::error!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if let Some(cache_provider_ref) = caching.as_ref()
-                                && let Some(cache_provider) = cache_provider_ref.upgrade()
-                                && let Err(e) =
-                                    cache_provider.invalidate_for_table(dataset_name.clone())
-                                && !self.runtime_status.is_shutdown()
-                            {
-                                // No cache provider means runtime is shutting down and cache is already cleaned up
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name.to_string()
-                                );
-                            }
+                            if had_change
+                                && let Some(cache_provider_ref) = caching.as_ref()
+                                    && let Some(cache_provider) = cache_provider_ref.upgrade()
+                                    && let Err(e) =
+                                        cache_provider.invalidate_for_table(dataset_name.clone())
+                                    && !self.runtime_status.is_shutdown()
+                                {
+                                    // No cache provider means runtime is shutting down and cache is already cleaned up
+                                    tracing::error!(
+                                        "Failed to invalidate cached results for dataset {}: {e}",
+                                        &dataset_name.to_string()
+                                    );
+                                }
                         }
                         Err(e) => {
                             let error_message = format_datafusion_error(&e);
@@ -160,13 +161,12 @@ impl RefreshTask {
         Ok(())
     }
 
+    /// Returns `true` if any actual data change (upsert or delete) was written.
     async fn write_change(
         &self,
         change_batch: ChangeBatch,
-    ) -> crate::accelerated_table::Result<()> {
+    ) -> crate::accelerated_table::Result<bool> {
         let dataset_name = self.dataset_name.clone();
-        let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
-            .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
@@ -177,15 +177,22 @@ impl RefreshTask {
             sub_batches.len()
         );
 
+        let mut had_change = false;
         for (op_type, row_indices) in sub_batches {
             match op_type {
                 ChangeOperationType::Delete => {
+                    let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
+                        .context(
+                            crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu,
+                        )?;
                     self.process_delete_batch(&change_batch, &row_indices, &deletion_provider)
                         .await?;
+                    had_change = true;
                 }
                 ChangeOperationType::Upsert => {
                     self.process_upsert_batch(&change_batch, &row_indices)
                         .await?;
+                    had_change = true;
                 }
                 ChangeOperationType::Truncate => {
                     tracing::warn!("Truncate operation not yet implemented for {dataset_name}");
@@ -202,7 +209,7 @@ impl RefreshTask {
             future.await;
         }
 
-        Ok(())
+        Ok(had_change)
     }
 
     async fn process_upsert_batch(
@@ -521,7 +528,10 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
+    use data_components::delete::DeletionTableProviderAdapter;
+    use datafusion::datasource::TableProvider;
 
     use std::sync::Arc;
 
@@ -819,5 +829,54 @@ mod tests {
 
         assert_eq!(result[3].0, ChangeOperationType::Delete);
         assert_eq!(result[3].1, vec![3]);
+    }
+
+    fn make_mem_table() -> Arc<MemTable> {
+        let schema = Arc::new(create_test_data_schema());
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
+    }
+
+    fn make_refresh_task(accelerator: Arc<dyn TableProvider>) -> RefreshTask {
+        use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
+        use crate::federated_table::FederatedTable;
+        use tokio::runtime::Handle;
+        use tokio::sync::Mutex;
+
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            datafusion::sql::TableReference::bare("test"),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build()
+    }
+
+    #[tokio::test]
+    async fn test_write_change_upsert_returns_true() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let change_batch =
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+        assert!(task.write_change(change_batch).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_write_change_delete_returns_true() {
+        let adapter = Arc::new(DeletionTableProviderAdapter::new(make_mem_table()));
+        let task = make_refresh_task(adapter as Arc<dyn TableProvider>);
+        let change_batch =
+            create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+        assert!(task.write_change(change_batch).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_empty_returns_false() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        // Any unrecognized op string maps to ChangeOperation::Unknown
+        let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
+        assert!(!task.write_change(change_batch).await.unwrap());
     }
 }
