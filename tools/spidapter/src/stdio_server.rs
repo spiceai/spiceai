@@ -1201,10 +1201,7 @@ fn generate_hive_spicepod(
     Ok(spicepod)
 }
 
-fn generate_adbc_spicepod(
-    run_id: &Uuid,
-    flight_api_key: Option<&str>,
-) -> anyhow::Result<SpicepodDefinition> {
+fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -1233,7 +1230,7 @@ fn generate_adbc_spicepod(
         Catalog::new("cayenne".to_string(), "spicebench".to_string())
             .with_access(AccessMode::ReadWriteCreate),
     ));
-    Ok(spicepod)
+    spicepod
 }
 
 /// Generate the initial [`SpicepodDefinition`] for the benchmark run.
@@ -1244,7 +1241,7 @@ fn generate_initial_spicepod(
     flight_api_key: Option<&str>,
 ) -> anyhow::Result<SpicepodDefinition> {
     let mut spicepod = match setup_config.sink_type {
-        Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id, flight_api_key),
+        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key)),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
     }?;
 
