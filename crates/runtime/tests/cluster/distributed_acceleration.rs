@@ -23,6 +23,7 @@ limitations under the License.
 //! 4. The `bucket()` UDF is available in the refresh context for partition filtering
 
 use app::AppBuilder;
+use ballista_scheduler::state::executor_manager::ExecutorManager;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
     PartitionManagement, Runtime as SpicepodRuntime, Scheduler as SchedulerConfig,
@@ -32,7 +33,7 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -139,8 +140,20 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
             insta::assert_snapshot!( rows_fmt, @r"
-            ++
-            ++
+            +----+--------------+-----+--------------+-------+
+            | id | name         | age | city         | score |
+            +----+--------------+-----+--------------+-------+
+            | 1  | John Doe     | 28  | New York     | 85    |
+            | 2  | Jane Smith   | 34  | Los Angeles  | 92    |
+            | 3  | Mike Johnson | 45  | Chicago      | 78    |
+            | 4  | Emily Brown  | 31  | Houston      | 89    |
+            | 5  | David Lee    | 39  | Phoenix      | 76    |
+            | 6  | Sarah Wilson | 26  | Philadelphia | 94    |
+            | 7  | Tom Anderson | 52  | San Antonio  | 81    |
+            | 8  | Lisa Taylor  | 29  | San Diego    | 88    |
+            | 9  | Chris Martin | 37  | Dallas       | 79    |
+            | 10 | Anna Garcia  | 41  | San Jose     | 90    |
+            +----+--------------+-----+--------------+-------+
             ");
 
             // --- Test 2: Aggregation ---
@@ -157,11 +170,15 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
             | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                    |
             |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                            |
-            |               |     EmptyRelation: rows=0                                                                                                                                     |
+            |               |     TableScan: test_data projection=[age, score]                                                                                                              |
             | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age] |
-            |               |   AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                    |
-            |               |     BytesProcessedExec                                                                                                                                        |
-            |               |       EmptyExec                                                                                                                                               |
+            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                     |
+            |               |     CoalescePartitionsExec                                                                                                                                    |
+            |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                               |
+            |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                  |
+            |               |           CooperativeExec                                                                                                                                     |
+            |               |             BytesProcessedExec                                                                                                                                |
+            |               |               FlightSqlExec sql=SELECT age, score FROM test_data                                                                                              |
             |               |                                                                                                                                                               |
             +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
             ");
@@ -172,7 +189,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             +------------+-----------+---------+---------+
             | total_rows | avg_score | min_age | max_age |
             +------------+-----------+---------+---------+
-            | 0          |           |         |         |
+            | 10         | 85.2      | 26      | 52      |
             +------------+-----------+---------+---------+
             ");
 
