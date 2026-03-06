@@ -36,7 +36,10 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tracing_subscriber::EnvFilter;
 
-use crate::{configure_test_datafusion, utils::test_request_context};
+use crate::{
+    configure_test_datafusion,
+    utils::{test_request_context, verify_env_secret_exists},
+};
 
 use super::harness::ClusterHarness;
 
@@ -57,7 +60,7 @@ const TEST_DATA_CSV: &str = r"id,name,age,city,score
 /// Test that distributed acceleration with `bucket()` partitioning works end to end
 /// with multiple executors.
 ///
-/// Sets up a cluster with 1 scheduler + 2 executors accelerating data
+/// Sets up a cluster with 1 scheduler + 1 executors accelerating data
 /// with `partition_by: bucket(3, id)` using the Cayenne engine. Verifies:
 /// - `bucket()` UDF can be used in the dataset definition for partitioning
 /// - Queries return correct, complete results across all executors
@@ -73,11 +76,11 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
         .with_ansi(true)
         .try_init();
 
-    // for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-    //     verify_env_secret_exists(env_var)
-    //         .await
-    //         .map_err(anyhow::Error::msg)?;
-    // }
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
 
     // Keep the tempdirs alive for the duration of the test.
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
@@ -255,11 +258,14 @@ fn make_scheduler_config() -> SchedulerConfig {
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),
-                // ("s3_key".to_string(), "${env:AWS_S3_VECTORS_KEY}".to_string()),
-                // (
-                //     "s3_secret".to_string(),
-                //     "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                // ),
+                (
+                    "s3_key".to_string(),
+                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
+                ),
+                (
+                    "s3_secret".to_string(),
+                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                ),
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
