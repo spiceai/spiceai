@@ -16,6 +16,7 @@ on:
           - 'macOS aarch64 (GPU M4)'
           - 'Linux aarch64'
           - 'macOS aarch64'
+          - 'Windows x64 (native CLI)'
           - 'Windows x64 (WSL)'
         default: 'all'
   pull_request:
@@ -211,6 +212,75 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+
+
+  test-install-windows-native-cli:
+    name: Windows x64 (native CLI)
+    runs-on: windows-latest
+    needs: setup-matrix
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform_option == 'all' || inputs.platform_option == 'Windows x64 (native CLI)' }}
+    steps:
+      - name: checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: install Spice (https://install.spiceai.org)
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1
+          PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+        shell: pwsh
+
+      - name: install Spice (from branch)
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $branch = "${{ inputs.install_script_branch }}"
+          if ([string]::IsNullOrEmpty($branch)) {
+            $branch = "${{ github.head_ref }}"
+            if ([string]::IsNullOrEmpty($branch)) {
+              $branch = "${{ github.ref_name }}"
+            }
+          }
+          $url = "https://raw.githubusercontent.com/spiceai/spiceai/$branch/install/Install.ps1"
+          curl -L $url -o Install.ps1
+          PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+        shell: pwsh
+
+      - name: add Spice bin to PATH
+        run: |
+          Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
+        shell: pwsh
+
+      - name: check installation
+        run: |
+          spice version
+        shell: pwsh
+
+      - name: Validate native Windows WSL guidance
+        run: |
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+
+          $installOutput = (& spice install 2>&1 | Out-String)
+          Write-Host $installOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice install unexpectedly succeeded on native Windows"
+          }
+          if (-not $installOutput.Contains($expected)) {
+            throw "spice install did not print the expected WSL guidance"
+          }
+
+          $runOutput = (& spice run 2>&1 | Out-String)
+          Write-Host $runOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice run unexpectedly succeeded on native Windows"
+          }
+          if (-not $runOutput.Contains($expected)) {
+            throw "spice run did not print the expected WSL guidance"
+          }
+        shell: pwsh
 
 
   test-install-windows-wsl:
