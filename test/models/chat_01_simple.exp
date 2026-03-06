@@ -1,42 +1,39 @@
-#!/usr/bin/expect -f
+#!/usr/bin/env python3
 
-# Runtime response timeout
-set timeout 30
+import re
+import sys
+from pathlib import Path
 
-spawn spice chat
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-proc chat {message}  {
-    global timeout
+from interactive_cli import InteractionError, PtyProcess
 
-     send "$message\r"
 
-    expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
-        }
-        "chat> " {
-            # end of model response
-        }
-        timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
-        }
-    }
+PROMPT = re.compile(r"chat>")
+ERROR = re.compile(r" ERROR ")
 
-    send_user "Model returned expected response\n"
-}
 
-expect "chat>"
+def chat(process: PtyProcess, message: str) -> None:
+    process.send_line(message)
+    process.read_until_prompt(PROMPT, timeout=35, error=ERROR)
+    print("Model returned expected response")
 
-chat "What datasets you have access to?"
-sleep 1
 
-chat "How many issues stored in database?"
+def main() -> int:
+    process = PtyProcess(["spice", "chat"])
 
-# Signal to exit (Ctrl+C)
-send \x03
+    try:
+        process.read_until_prompt(PROMPT, timeout=35)
+        chat(process, "What datasets you have access to?")
+        chat(process, "How many issues stored in database?")
+        process.send_ctrl_c()
+        return 0
+    except InteractionError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    finally:
+        process.close()
 
-exit 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

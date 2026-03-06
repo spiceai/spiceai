@@ -165,17 +165,6 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Install expect (linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
-
-      - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
-        run: |
-          brew install expect
-
       - name: Test vector search
         run: |
           ./test/models/search_01.exp
@@ -241,17 +230,6 @@ jobs:
         timeout-minutes: 5
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
-
-      - name: Install expect (linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
-
-      - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
-        run: |
-          brew install expect
 
       - name: Test vector search
         run: |

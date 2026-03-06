@@ -1,114 +1,57 @@
-#!/usr/bin/expect -f
+#!/usr/bin/env python3
 
-# Runtime response timeout
-set timeout 30
+import re
+import sys
+from pathlib import Path
 
-spawn spice chat
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-proc verify_datasets_access {} {
-    global timeout
+from interactive_cli import InteractionError, PtyProcess
 
-    set taxi_trips_available 0
-    set gh_issues_available 0
-    set catalog_page_available 0
 
-    send "What datasets you have access to\r"
+PROMPT = re.compile(r"chat>")
+ERROR = re.compile(r" ERROR ")
 
-    expect {
-        -re "(?i)taxi_trips|taxi trips" {
-            set taxi_trips_available 1
-            exp_continue
-        }
-        -re "(?i)github_issues|github issues" {
-            set gh_issues_available 1
-            exp_continue
-        }
-        -re "(?i)catalog_page|catalog page" {
-            set catalog_page_available 1
-            exp_continue
-        }
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
-        }
-        "chat> " {
-            # end of model response
-        }
-        timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
-        }
-    }
 
-    if { $taxi_trips_available == 1 && $gh_issues_available == 1 && $catalog_page_available == 1 } {
-        send_user "Model confirmed access to all datasets\n"
-    } else {
-        send_user "Model did not return expected response\n"
-        exit 1
-    }
-}
+def verify_datasets_access(process: PtyProcess) -> None:
+    process.send_line("What datasets you have access to")
+    result = process.read_until_prompt(PROMPT, timeout=35, error=ERROR)
+    output = result.output
 
-proc verify_num_issues {} {
-    global timeout
+    expected = [
+        re.compile(r"(?i)taxi_trips|taxi trips"),
+        re.compile(r"(?i)github_issues|github issues"),
+        re.compile(r"(?i)catalog_page|catalog page"),
+    ]
 
-    send "How many issues stored in database?\r"
+    if not all(pattern.search(output) for pattern in expected):
+        raise InteractionError(f"Model did not return expected datasets. Output:\n{output}")
 
-    expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
-        }
-        "chat> " {
-            # end of model response
-        }
-        timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
-        }
-    }
+    print("Model confirmed access to all datasets")
 
-    send_user "Model returned expected response\n"
-}
 
-proc verify_catalog_page {} {
-    global timeout
+def verify_round_trip(process: PtyProcess, message: str) -> None:
+    process.send_line(message)
+    process.read_until_prompt(PROMPT, timeout=35, error=ERROR)
+    print("Model returned expected response")
 
-    send "find top 3 exclusive deals in catalog pages\r"
 
-    expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
-        }
-        "chat> " {
-            # end of model response
-        }
-        timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
-        }
-    }
+def main() -> int:
+    process = PtyProcess(["spice", "chat"])
 
-    send_user "Model returned expected response\n"
-}
+    try:
+        process.read_until_prompt(PROMPT, timeout=35)
+        verify_datasets_access(process)
+        verify_round_trip(process, "How many issues stored in database?")
+        verify_round_trip(process, "find top 3 exclusive deals in catalog pages")
+        process.send_ctrl_c()
+        return 0
+    except InteractionError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    finally:
+        process.close()
 
-expect "chat>"
 
-verify_datasets_access
-sleep 1
-
-verify_num_issues
-sleep 1
-
-verify_catalog_page
-
-# Signal to exit (Ctrl+C)
-send \x03
-
-exit 0
+if __name__ == "__main__":
+    raise SystemExit(main())

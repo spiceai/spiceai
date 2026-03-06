@@ -1,41 +1,52 @@
-#!/usr/bin/expect -f
+#!/usr/bin/env python3
 
-# spiced runtime response timeout
-set timeout 5
+import re
+import sys
+from pathlib import Path
 
-spawn spice search
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-proc perform_search {search_term expected_term} {
-    global timeout
+from interactive_cli import InteractionError, PtyProcess
 
-    send "$search_term\r"
 
-    expect {
-        -re $expected_term {
-            # allow stream to complete
-            sleep 2
-            send_user "Search returned expected result\n"
-        }
-        # if there is ERROR message before the expected term, then search failed
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
-        }
-        timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
-        }
-    }
-}
-expect "search>"
-perform_search "Spice runtime error" {1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.issues}
+PROMPT = re.compile(r"search>")
+ERROR = re.compile(r" ERROR ")
 
-expect "search>"
-perform_search "friends" {1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.catalog_page}
 
-# Signal to exit (Ctrl+C)
-send \x03
+def perform_search(process: PtyProcess, search_term: str, expected_term: str) -> None:
+    process.send_line(search_term)
+    process.read_until_prompt(
+        PROMPT,
+        timeout=10,
+        expected=re.compile(expected_term),
+        error=ERROR,
+    )
+    print("Search returned expected result")
 
-exit 0
+
+def main() -> int:
+    process = PtyProcess(["spice", "search"])
+
+    try:
+        process.read_until_prompt(PROMPT, timeout=10)
+        perform_search(
+            process,
+            "Spice runtime error",
+            r"1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.issues",
+        )
+        perform_search(
+            process,
+            "friends",
+            r"1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.catalog_page",
+        )
+        process.send_ctrl_c()
+        return 0
+    except InteractionError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    finally:
+        process.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

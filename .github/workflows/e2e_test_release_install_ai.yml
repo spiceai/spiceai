@@ -262,17 +262,6 @@ jobs:
         shell: pwsh
         timeout-minutes: 3
 
-      - name: Install expect (linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
-
-      - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          brew install expect
-
       - name: Test vector search
         if: matrix.target.target_os != 'windows'
         run: |

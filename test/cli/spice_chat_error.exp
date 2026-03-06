@@ -1,104 +1,86 @@
-#!/usr/bin/expect -f
+#!/usr/bin/env python3
 
-# Test invalid --model error case
-proc test_invalid_model {} {
-    set command "spice chat --model not_exist"
+import re
+import sys
+from pathlib import Path
 
-    catch {exec sh -c "$command 2>&1"} output
-    puts "Command output: $output"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-    # Check for expected error messages in the output
-    if {[regexp {ERROR.*model not_exist does not exist} $output]} {
-        puts "✓ Error message about unavailable model detected"
-    } else {
-        puts "✗ Missing error about unavailable model"
-        exit 1
-    }
+from interactive_cli import InteractionError, run_command
 
-    # Check that available models are listed
-    if {[regexp {ERROR.*configured models} $output]} {
-        puts "✓ Available models list is shown"
-    } else {
-        puts "✗ Available models list not shown"
-        exit 1
-    }
 
-    # Check that expected models are in the list
-    if {[regexp {model1} $output]} {
-        puts "✓ Found expected model 'model1' in the list"
-    } else {
-        puts "✗ Expected model 'model1' not found in the list"
-        exit 1
-    }
+def assert_matches(output: str, pattern: str, message: str) -> None:
+    if not re.search(pattern, output, re.DOTALL):
+        raise InteractionError(f"{message}\nOutput:\n{output}")
 
-    puts "✓ Invalid model test passed"
-}
 
-# Test invalid --http-endpoint error case
-proc test_invalid_http_endpoint {} {
-    set command "spice chat --http-endpoint https://data.spicea"
+def test_invalid_model() -> None:
+    result = run_command(["spice", "chat", "--model", "not_exist"])
+    output = result.stdout
+    print(f"Command output: {output}")
 
-    catch {exec sh -c "$command 2>&1"} output
-    puts "Command output: $output"
+    assert_matches(output, r"ERROR.*model not_exist does not exist", "Missing error about unavailable model")
+    assert_matches(output, r"ERROR.*configured models", "Available models list not shown")
+    assert_matches(output, r"model1", "Expected model 'model1' not found in the list")
+    print("Invalid model test passed")
 
-    # Check for expected error messages in the output
-    if {[regexp {ERROR.*could not list models.*no such host} $output]} {
-        puts "✓ Error message about invalid host detected"
-    } else {
-        puts "✗ Missing error about invalid host"
-        exit 1
-    }
 
-    # Check for the specific host name in the error
-    if {[regexp {lookup data.spicea: no such host} $output]} {
-        puts "✓ Invalid hostname correctly reported in error"
-    } else {
-        puts "✗ Invalid hostname not correctly reported"
-        exit 1
-    }
+def test_invalid_http_endpoint() -> None:
+    result = run_command(["spice", "chat", "--http-endpoint", "https://data.spicea"])
+    output = result.stdout
+    print(f"Command output: {output}")
 
-    puts "✓ Invalid host test passed"
-}
+    assert_matches(output, r"ERROR.*could not list models.*no such host", "Missing error about invalid host")
+    assert_matches(output, r"lookup data.spicea: no such host", "Invalid hostname not correctly reported")
+    print("Invalid host test passed")
 
-# Test invalid --temperature error case
-proc test_invalid_temperature {} {
-    set command "spice chat --temperature -1"
 
-    catch {exec sh -c "$command 2>&1"} output
-    puts "Command output: $output"
+def test_invalid_temperature() -> None:
+    result = run_command(["spice", "chat", "--temperature", "-1"])
+    output = result.stdout
+    print(f"Command output: {output}")
 
-    # Check for expected error messages in the output
-    if {[regexp {ERROR.*temperature must be greater than or equal to 0} $output]} {
-        puts "✓ Error message about invalid temperature detected"
-    } else {
-        puts "✗ Missing error about invalid temperature"
-        exit 1
-    }
+    assert_matches(
+        output,
+        r"ERROR.*temperature must be greater than or equal to 0",
+        "Missing error about invalid temperature",
+    )
+    print("Invalid temperature test passed")
 
-    puts "✓ Invalid temperature test passed"
-}
 
-# Test invalid --api-key error case
-proc test_invalid_api_key {} {
-    set command "spice chat --http-endpoint https://data.spiceai.io --api-key \"wrong_key\""
+def test_invalid_api_key() -> None:
+    result = run_command(
+        [
+            "spice",
+            "chat",
+            "--http-endpoint",
+            "https://data.spiceai.io",
+            "--api-key",
+            "wrong_key",
+        ]
+    )
+    output = result.stdout
+    print(f"Command output: {output}")
 
-    catch {exec sh -c "$command 2>&1"} output
-    puts "Command output: $output"
+    assert_matches(
+        output,
+        r"ERROR.*could not list models.*unauthorized: invalid or missing Spice API key",
+        "Missing error about invalid API key",
+    )
+    print("Invalid API key test passed")
 
-    # Check for expected error messages in the output
-    if {[regexp {ERROR.*could not list models.*unauthorized: invalid or missing Spice API key} $output]} {
-        puts "✓ Error message about invalid API key detected"
-    } else {
-        puts "✗ Missing error about invalid API key"
-        exit 1
-    }
 
-    puts "✓ Invalid API key test passed"
-}
+def main() -> int:
+    try:
+        test_invalid_model()
+        test_invalid_http_endpoint()
+        test_invalid_temperature()
+        test_invalid_api_key()
+        return 0
+    except InteractionError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
-# Run the test
-test_invalid_model
-test_invalid_http_endpoint
-test_invalid_temperature
-test_invalid_api_key
-exit 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
