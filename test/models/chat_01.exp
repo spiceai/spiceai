@@ -1,57 +1,114 @@
-#!/usr/bin/env python3
+#!/usr/bin/expect -f
 
-import re
-import sys
-from pathlib import Path
+# Runtime response timeout
+set timeout 30
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+spawn spice chat
 
-from interactive_cli import InteractionError, PtyProcess
+proc verify_datasets_access {} {
+    global timeout
 
+    set taxi_trips_available 0
+    set gh_issues_available 0
+    set catalog_page_available 0
 
-PROMPT = re.compile(r"chat>")
-ERROR = re.compile(r" ERROR ")
+    send "What datasets you have access to\r"
 
+    expect {
+        -re "(?i)taxi_trips|taxi trips" {
+            set taxi_trips_available 1
+            exp_continue
+        }
+        -re "(?i)github_issues|github issues" {
+            set gh_issues_available 1
+            exp_continue
+        }
+        -re "(?i)catalog_page|catalog page" {
+            set catalog_page_available 1
+            exp_continue
+        }
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
 
-def verify_datasets_access(process: PtyProcess) -> None:
-    process.send_line("What datasets you have access to")
-    result = process.read_until_prompt(PROMPT, timeout=35, error=ERROR)
-    output = result.output
+    if { $taxi_trips_available == 1 && $gh_issues_available == 1 && $catalog_page_available == 1 } {
+        send_user "Model confirmed access to all datasets\n"
+    } else {
+        send_user "Model did not return expected response\n"
+        exit 1
+    }
+}
 
-    expected = [
-        re.compile(r"(?i)taxi_trips|taxi trips"),
-        re.compile(r"(?i)github_issues|github issues"),
-        re.compile(r"(?i)catalog_page|catalog page"),
-    ]
+proc verify_num_issues {} {
+    global timeout
 
-    if not all(pattern.search(output) for pattern in expected):
-        raise InteractionError(f"Model did not return expected datasets. Output:\n{output}")
+    send "How many issues stored in database?\r"
 
-    print("Model confirmed access to all datasets")
+    expect {
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
 
+    send_user "Model returned expected response\n"
+}
 
-def verify_round_trip(process: PtyProcess, message: str) -> None:
-    process.send_line(message)
-    process.read_until_prompt(PROMPT, timeout=35, error=ERROR)
-    print("Model returned expected response")
+proc verify_catalog_page {} {
+    global timeout
 
+    send "find top 3 exclusive deals in catalog pages\r"
 
-def main() -> int:
-    process = PtyProcess(["spice", "chat"])
+    expect {
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
 
-    try:
-        process.read_until_prompt(PROMPT, timeout=35)
-        verify_datasets_access(process)
-        verify_round_trip(process, "How many issues stored in database?")
-        verify_round_trip(process, "find top 3 exclusive deals in catalog pages")
-        process.send_ctrl_c()
-        return 0
-    except InteractionError as error:
-        print(str(error), file=sys.stderr)
-        return 1
-    finally:
-        process.close()
+    send_user "Model returned expected response\n"
+}
 
+expect "chat>"
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+verify_datasets_access
+sleep 1
+
+verify_num_issues
+sleep 1
+
+verify_catalog_page
+
+# Signal to exit (Ctrl+C)
+send \x03
+
+exit 0

@@ -627,17 +627,22 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Make chat test scripts executable
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install expect
+
+      - name: Make expect scripts executable
         run: |
           chmod +x ./test/cli/*.exp
 
       - name: Test `spice chat` error
         run: |
-          ./test/cli/spice_chat_error.exp
+          expect ./test/cli/spice_chat_error.exp
 
       - name: Test `spice chat <message>`
         run: |
-          ./test/cli/spice_chat_message.exp
+          expect ./test/cli/spice_chat_message.exp
 
       - name: Stop spice and check logs
         if: always()

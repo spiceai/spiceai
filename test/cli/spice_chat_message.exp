@@ -1,76 +1,111 @@
-#!/usr/bin/env python3
+# Test single message mode (non-interactive)
+proc test_spice_chat_message {} {
+    set command "spice chat \"hello\" --model model1"
 
-import re
-import sys
-from pathlib import Path
+    puts "Testing single message mode..."
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    # Use spawn instead of exec to observe process behavior
+    spawn {*}[split $command]
 
-from interactive_cli import InteractionError, PtyProcess, run_command
+    set timeout 30
 
+    # Look for either completion or chat prompt
+    expect {
+        "Spice.ai OSS CLI" {
+            exp_continue
+        }
+        "chat>" {
+            puts "✗ Command entered interactive mode when it shouldn't have"
+            exit 1
+        }
+        eof {
+            # Command terminated, this is the expected behavior of `spice chat <message>`
+            puts "✓ Command completed without entering interactive mode"
+        }
+    }
 
-def test_spice_chat_message() -> None:
-    print("Testing single message mode...")
-    result = run_command(["spice", "chat", "hello", "--model", "model1"], timeout=30)
-    output = result.stdout
+    set output $expect_out(buffer)
 
-    if "chat>" in output:
-        raise InteractionError("Command entered interactive mode when it should not have")
+    if {[string length $output] > 1} {
+        puts "✓ Command produced output of reasonable length"
+    } else {
+        puts "✗ Command produced insufficient output"
+        exit 1
+    }
 
-    if len(output.strip()) <= 1:
-        raise InteractionError("Command produced insufficient output")
+    puts "✓ spice chat <message> test passed"
+}
 
-    print("Command completed without entering interactive mode")
-    print("spice chat <message> test passed")
+# Test selection of model when running spice chat with a message
+proc test_spice_chat_model_select {} {
+    set command "spice chat \"hello\""
+    puts "Testing spice chat <message> with model selection..."
 
+    spawn {*}[split $command]
 
-def test_spice_chat_model_select() -> None:
-    print("Testing spice chat <message> with model selection...")
-    process = PtyProcess(["spice", "chat", "hello"])
+    set full_output ""
 
-    try:
-        prompt = process.read_until_match_or_eof(
-            re.compile(r"Use the arrow keys to navigate:"),
-            timeout=30,
-        )
-        print("Model selection prompt appeared")
+    # Wait for the model selection prompt
+    expect {
+        "Spice.ai OSS CLI" {
+            append full_output $expect_out(buffer)
+            exp_continue
+        }
+        "Use the arrow keys to navigate:" {
+            puts "✓ Model selection prompt appeared"
+            append full_output $expect_out(buffer)
+        }
+        timeout {
+            puts "✗ Model selection prompt did not appear"
+            exit 1
+        }
+    }
 
-        process.send_line("")
+    # Press Enter to select the first model
+    send "\r"
 
-        confirmation = process.read_until_match_or_eof(
-            re.compile(r"Using model:"),
-            timeout=30,
-        )
-        print("Model selection confirmed")
+    # Check model confirmation
+    expect {
+        "Using model:" {
+            puts "✓ Model selection confirmed"
+            append full_output $expect_out(buffer)
+        }
+        timeout {
+            puts "✗ Model selection confirmation not shown"
+            exit 1
+        }
+    }
 
-        response = process.read_until_match_or_eof(
-            re.compile(r"Time:.*Tokens:", re.DOTALL),
-            timeout=30,
-        )
-        print("Complete response with usage statistics received")
+    set timeout 30
+    expect {
+        -re {Time:.*Tokens:.*\n} {
+            puts "✓ Complete response with usage statistics received"
+            append full_output $expect_out(buffer)
+        }
+        timeout {
+            puts "✗ Usage statistics not shown within timeout"
+            exit 1
+        }
+        eof {
+            puts "✗ Command terminated unexpectedly"
+            exit 1
+        }
+    }
 
-        full_output = prompt + confirmation + response
-        print(f"Full output captured:\n{full_output}")
+    puts "Full output captured:\n$full_output"
 
-        if not re.search(r"Using model:", full_output) or not re.search(
-            r"Time:.*Tokens:", full_output, re.DOTALL
-        ):
-            raise InteractionError("Incomplete response cycle")
+    if {[regexp {Using model:} $full_output] &&
+        [regexp {Time:.*Tokens:} $full_output] &&
+        [string length $full_output] > 1} {
+        puts "✓ Complete response cycle verified"
+    } else {
+        puts "✗ Incomplete response cycle"
+        exit 1
+    }
 
-        print("Model selection test passed")
-    finally:
-        process.close()
+    puts "✓ Model selection test passed"
+}
 
-
-def main() -> int:
-    try:
-        test_spice_chat_message()
-        test_spice_chat_model_select()
-        return 0
-    except InteractionError as error:
-        print(str(error), file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+test_spice_chat_message
+test_spice_chat_model_select
+exit 0
