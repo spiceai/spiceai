@@ -94,7 +94,7 @@ impl RefreshTask {
                         .write_change(change_envelope.change_batch.clone())
                         .await
                     {
-                        Ok(had_change) => {
+                        Ok(write_result) => {
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
                                 initial_load_completed.store(true, Ordering::Relaxed);
@@ -111,7 +111,7 @@ impl RefreshTask {
                                 tracing::error!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if had_change
+                            if write_result == WriteChangeResult::DataWritten
                                 && let Some(cache_provider_ref) = caching.as_ref()
                                 && let Some(cache_provider) = cache_provider_ref.upgrade()
                                 && let Err(e) =
@@ -161,11 +161,10 @@ impl RefreshTask {
         Ok(())
     }
 
-    /// Returns `true` if any actual data change (upsert or delete) was written.
     async fn write_change(
         &self,
         change_batch: ChangeBatch,
-    ) -> crate::accelerated_table::Result<bool> {
+    ) -> crate::accelerated_table::Result<WriteChangeResult> {
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
@@ -209,7 +208,11 @@ impl RefreshTask {
             future.await;
         }
 
-        Ok(had_change)
+        if had_change {
+            Ok(WriteChangeResult::DataWritten)
+        } else {
+            Ok(WriteChangeResult::NoChange)
+        }
     }
 
     async fn process_upsert_batch(
@@ -425,6 +428,12 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     }
 
     sub_batches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteChangeResult {
+    DataWritten,
+    NoChange,
 }
 
 // Used to group batch changes into sub-batches
@@ -856,40 +865,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_change_upsert_returns_true() {
+    async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
-        assert!(
+        assert_eq!(
             task.write_change(change_batch)
                 .await
-                .expect("write_change should succeed")
+                .expect("write_change should succeed"),
+            WriteChangeResult::DataWritten
         );
     }
 
     #[tokio::test]
-    async fn test_write_change_delete_returns_true() {
+    async fn test_write_change_delete_returns_data_written() {
         let adapter = Arc::new(DeletionTableProviderAdapter::new(make_mem_table()));
         let task = make_refresh_task(adapter as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
-        assert!(
+        assert_eq!(
             task.write_change(change_batch)
                 .await
-                .expect("write_change should succeed")
+                .expect("write_change should succeed"),
+            WriteChangeResult::DataWritten
         );
     }
 
     #[tokio::test]
-    async fn test_empty_returns_false() {
+    async fn test_empty_returns_no_change() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         // Any unrecognized op string maps to ChangeOperation::Unknown
         let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
-        assert!(
-            !task
-                .write_change(change_batch)
+        assert_eq!(
+            task.write_change(change_batch)
                 .await
-                .expect("write_change should succeed")
+                .expect("write_change should succeed"),
+            WriteChangeResult::NoChange
         );
     }
 }
