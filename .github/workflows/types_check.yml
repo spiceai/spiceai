@@ -33,7 +33,7 @@ jobs:
           go-version: ${{ env.GOVER }}
           cache: false
 
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.1 --profile minimal
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:

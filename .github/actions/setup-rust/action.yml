@@ -28,16 +28,16 @@ runs:
           echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         }
 
-    - name: Install latest Rust stable toolchain (Linux/macOS)
+    - name: Install Rust 1.93.1 toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        rustup toolchain install 1.91
-        rustup default 1.91
+        rustup toolchain install 1.93.1
+        rustup default 1.93.1
 
-    - name: Install latest Rust stable toolchain (Windows)
+    - name: Install Rust 1.93.1 toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        rustup toolchain install 1.91
-        rustup default 1.91
+        rustup toolchain install 1.93.1
+        rustup default 1.93.1
