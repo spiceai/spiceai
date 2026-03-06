@@ -706,6 +706,13 @@ mod tests {
     use datafusion_table_providers::util::test::MockExec;
     use std::collections::HashMap;
 
+    fn cleanup_turso_test_files(path: &str) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(format!("{path}-wal")).ok();
+        std::fs::remove_file(format!("{path}-shm")).ok();
+        std::fs::remove_file(format!("{path}-log")).ok();
+    }
+
     #[tokio::test]
     async fn test_turso_file_initialization() {
         let app = app::AppBuilder::new("test").build();
@@ -728,6 +735,9 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
+        let path = accelerator.file_path(&dataset).expect("path should be derivable");
+        cleanup_turso_test_files(&path);
+
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
@@ -737,12 +747,10 @@ mod tests {
 
         assert!(accelerator.is_initialized(&dataset));
 
-        let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
 
         // cleanup
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(format!("{path}-log")).ok();
+        cleanup_turso_test_files(&path);
     }
 
     #[tokio::test]
@@ -1169,6 +1177,10 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
+        let file_path = accelerator
+            .file_path(&dataset)
+            .expect("should derive default file path");
+        cleanup_turso_test_files(&file_path);
 
         // Initialize the accelerator
         accelerator
@@ -1183,10 +1195,6 @@ mod tests {
         );
 
         // Get the file path
-        let file_path = accelerator
-            .file_path(&dataset)
-            .expect("should have file path");
-
         // Verify the file was created at the default location
         assert!(
             std::path::Path::new(&file_path).exists(),
@@ -1263,8 +1271,7 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3, "should have 3 rows");
 
         // Clean up
-        std::fs::remove_file(&file_path).ok();
-        std::fs::remove_file(format!("{file_path}-log")).ok();
+        cleanup_turso_test_files(&file_path);
     }
 
     #[tokio::test]
