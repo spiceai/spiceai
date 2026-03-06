@@ -200,7 +200,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     crate::metrics::STATUS.record(metrics.status.to_u64(), &attributes);
     crate::metrics::SCORE.record(metrics.score, &attributes);
     crate::metrics::TEST_DURATION.record(
-        u64::try_from((finished_at - started_at).as_millis())?,
+        duration_millis_between(finished_at, started_at)?,
         &attributes,
     );
 
@@ -226,6 +226,13 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
+}
+
+fn duration_millis_between(end: Duration, start: Duration) -> anyhow::Result<u64> {
+    let duration = end
+        .checked_sub(start)
+        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
+    Ok(u64::try_from(duration.as_millis())?)
 }
 
 async fn execute_sql(

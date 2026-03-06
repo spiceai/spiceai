@@ -146,14 +146,11 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
 
     // Record benchmark results
-    crate::metrics::TEST_DURATION
-        .record(u64::try_from((finished_at - started_at).as_millis())?, &[]);
-    crate::metrics::VECTOR_INDEX_CREATION_DURATION.record(
-        u64::try_from((index_finished_at - started_at).as_millis())?,
-        &[],
-    );
+    crate::metrics::TEST_DURATION.record(duration_millis_between(finished_at, started_at)?, &[]);
+    crate::metrics::VECTOR_INDEX_CREATION_DURATION
+        .record(duration_millis_between(index_finished_at, started_at)?, &[]);
     crate::metrics::SEARCH_DURATION.record(
-        u64::try_from((finished_at - search_started_at).as_millis())?,
+        duration_millis_between(finished_at, search_started_at)?,
         &[],
     );
 
@@ -176,6 +173,13 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
+}
+
+fn duration_millis_between(end: Duration, start: Duration) -> anyhow::Result<u64> {
+    let duration = end
+        .checked_sub(start)
+        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
+    Ok(u64::try_from(duration.as_millis())?)
 }
 
 fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
