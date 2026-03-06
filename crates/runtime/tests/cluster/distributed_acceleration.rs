@@ -23,6 +23,7 @@ limitations under the License.
 //! 4. The `bucket()` UDF is available in the refresh context for partition filtering
 
 use app::AppBuilder;
+use ballista_scheduler::state::executor_manager::ExecutorManager;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
     PartitionManagement, Runtime as SpicepodRuntime, Scheduler as SchedulerConfig,
@@ -32,13 +33,10 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    configure_test_datafusion,
-    utils::test_request_context,
-};
+use crate::{configure_test_datafusion, utils::test_request_context};
 
 use super::harness::ClusterHarness;
 
