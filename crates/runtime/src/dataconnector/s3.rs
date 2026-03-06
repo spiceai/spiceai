@@ -134,8 +134,7 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("region").secret(),
             ParameterSpec::component("endpoint").secret(),
             ParameterSpec::component("url_style")
-                .description("Controls S3 URL addressing style. Supported values: 'vhost' (default) and 'path'.")
-                .default("vhost")
+                .description("Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.")
                 .one_of(&["vhost", "path"]),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
@@ -372,8 +371,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_url_style_defaults_to_vhost() {
+    async fn test_url_style_not_set_omits_fragment() {
         let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        // When url_style is not set, it should not appear in fragments (auto-detect at runtime)
+        let fragment = object_store_url.fragment().unwrap_or("");
+        assert!(
+            !fragment.contains("url_style"),
+            "url_style should not be in fragment when not set, got: {fragment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_url_style_vhost_is_included_in_fragments() {
+        let params = create_test_parameters(vec![(
+            "s3_url_style".to_string(),
+            "vhost".to_string().into(),
+        )])
+        .await;
         let connector = create_test_connector(params);
         let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
 
