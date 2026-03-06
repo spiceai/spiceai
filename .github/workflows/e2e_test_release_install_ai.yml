@@ -270,6 +270,8 @@ jobs:
           if (-not $runOutput.Contains($expected)) {
             throw "spice run did not print the expected WSL guidance"
           }
+
+          exit 0
         shell: pwsh
 
 
@@ -351,13 +353,13 @@ jobs:
         shell: wsl-bash {0}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
-          ./test/models/search_01.exp
+          expect ./test/models/search_01.exp
 
       - name: Test chat
         shell: wsl-bash {0}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
-          ./test/models/chat_01_simple.exp
+          expect ./test/models/chat_01_simple.exp
 
       - name: Stop spice and check logs
         if: always()
