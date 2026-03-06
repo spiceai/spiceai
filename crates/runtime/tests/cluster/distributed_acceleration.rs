@@ -33,13 +33,10 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    configure_test_datafusion,
-    utils::test_request_context,
-};
+use crate::{configure_test_datafusion, utils::test_request_context};
 
 use super::harness::ClusterHarness;
 
