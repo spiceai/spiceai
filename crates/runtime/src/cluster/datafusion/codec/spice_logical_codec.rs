@@ -21,7 +21,6 @@ use crate::cluster::datafusion::codec::udtf_args::{
 use crate::embeddings::udtf::{
     VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
 };
-use crate::search::DataFusionSnafu;
 use crate::search::full_text::udtf::{TextSearchTableFunc, TextSearchTableFuncArgs};
 use crate::search::rrf::ReciprocalRankFusion;
 use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
@@ -39,7 +38,6 @@ use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
 use search::provider::{SearchQueryProvider, UdtfSource};
 use search::telemetry_node::SearchTelemetryNode;
-use snafu::ResultExt;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -264,14 +262,14 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
 
         // Reconstruct SearchTelemetryNode with a no-op callback (callback is not serializable).
         // Telemetry fires on whichever side created the plan; the remote side is a passthrough.
-        if name == "SearchTelemetry" {
-            if let Some(input) = inputs.first() {
-                let no_op: search::telemetry_node::TelemetryCallback =
-                    Arc::new(|| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>);
-                return Ok(Extension {
-                    node: Arc::new(SearchTelemetryNode::new(input.clone(), no_op)),
-                });
-            }
+        if name == "SearchTelemetry"
+            && let Some(input) = inputs.first()
+        {
+            let no_op: search::telemetry_node::TelemetryCallback =
+                Arc::new(|| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>);
+            return Ok(Extension {
+                node: Arc::new(SearchTelemetryNode::new(input.clone(), no_op)),
+            });
         }
 
         exec_err!(
@@ -293,15 +291,13 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
             .is_some()
         {
             let marker = serde_json::to_vec("SearchTelemetry")
-                .boxed()
-                .context(DataFusionSnafu)?;
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
             buf.extend_from_slice(&marker);
             return Ok(());
         }
 
         let node_name = serde_json::to_vec(node.node.name())
-            .boxed()
-            .context(DataFusionSnafu)?;
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         buf.extend_from_slice(&node_name[..]);
         Ok(())
     }
