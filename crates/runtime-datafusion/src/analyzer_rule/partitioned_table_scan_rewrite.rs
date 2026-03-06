@@ -173,7 +173,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 }
 
 /// When `Limit -> Sort -> Union(sub_scans)`, push `Sort(fetch = skip + fetch)` into each union
-/// leg. This enables per-executor TopK, reducing data transfer from executors to the scheduler.
+/// leg. This enables per-executor `TopK`, reducing data transfer from executors to the scheduler.
 ///
 /// The outer `Limit -> Sort` is preserved for correct final merge-sort and limiting.
 fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, DataFusionError> {
@@ -184,9 +184,8 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
 
-    let fetch = match limit.get_fetch_type()? {
-        FetchType::Literal(Some(f)) => f,
-        _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
+    let FetchType::Literal(Some(fetch)) = limit.get_fetch_type()? else {
+        return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
     let skip = match limit.get_skip_type()? {
         SkipType::Literal(s) => s,
