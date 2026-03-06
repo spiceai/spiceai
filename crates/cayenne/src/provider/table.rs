@@ -1195,6 +1195,14 @@ impl CayenneTableProvider {
             Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
 
+        // Register the S3 object store in the shared RuntimeEnv once during
+        // construction. Every code path that creates a SessionContext from
+        // `self.context.runtime_env()` (e.g. `create_session_context`, keyset
+        // loading, deletion sinks) will automatically inherit the store.
+        if let Some(ref config) = object_store_config {
+            Self::register_object_store_if_needed(context.runtime_env(), config);
+        }
+
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
@@ -1741,7 +1749,7 @@ impl CayenneTableProvider {
             guard.clone()
         };
 
-        let ctx = SessionContext::new();
+        let ctx = self.create_session_context();
         // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
 
@@ -2766,22 +2774,17 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Create a `SessionContext` for data operations, registering object store if configured.
+    /// Create a `SessionContext` for data operations using the shared `RuntimeEnv`.
+    ///
+    /// The shared `RuntimeEnv` (from [`CayenneContext`]) already has the S3 object
+    /// store registered during construction, so all sessions created here inherit
+    /// it automatically. This also shares the `list_files` cache and other
+    /// runtime-level caches with the main Spice query engine.
     fn create_session_context(&self) -> SessionContext {
-        let ctx = SessionContext::new();
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
-
-        // Register object store if configured for remote storage (e.g., S3 Express One Zone)
-        if let Some(ref config) = self.object_store_config {
-            Self::register_object_store_if_needed(&ctx.runtime_env(), config);
-        } else if is_s3 {
-            tracing::warn!(
-                "Creating SessionContext for S3 table {} but no object_store_config!",
-                self.table_metadata.table_name
-            );
-        }
-
-        ctx
+        SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(self.context.runtime_env()),
+        )
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -2835,6 +2838,7 @@ impl CayenneTableProvider {
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
+            Arc::clone(self.context.runtime_env()),
         );
 
         let deleted_count =
@@ -4221,6 +4225,7 @@ impl CayenneTableProvider {
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
                 snapshot_tables,
+                Arc::clone(self.context.runtime_env()),
             )),
             &self.table_metadata.schema,
         )))

@@ -39,6 +39,7 @@ use crate::provider::Error;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
@@ -307,11 +308,13 @@ impl FileBasedDeletionSink {
                 .clone()
         };
 
-        // A single throwaway SessionContext for the entire operation. It only
-        // provides the object-store registry.
+        // Use the shared RuntimeEnv which has S3 object stores pre-registered.
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
         // shared ListingTable and are unaffected by this SessionContext.
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(&self.runtime_env),
+        );
 
         // Get the object store for file deletion
         let object_store_url = listing_table

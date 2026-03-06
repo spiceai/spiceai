@@ -314,6 +314,10 @@ impl CayenneDataSink {
             rows
         };
 
+        // Refresh the listing table before retention/sort so newly written files are visible.
+        // Without this, sort rewrite can read stale data and drop fresh append rows.
+        self.table.refresh_listing_table()?;
+
         // Apply retention filters, sort, and refresh listing table.
         self.apply_retention_if_configured().await?;
 
