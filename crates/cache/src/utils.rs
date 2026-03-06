@@ -16,7 +16,8 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, UInt16Array};
+use arrow::compute::filter_record_batch;
 use datafusion::{
     execution::SendableRecordBatchStream, logical_expr::LogicalPlan,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
@@ -27,6 +28,71 @@ use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey};
 use async_stream::stream;
 
 use futures::StreamExt;
+
+pub const RESPONSE_STATUS_COLUMN: &str = "response_status";
+
+/// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
+/// from record batches before caching.
+///
+/// If the batches don't contain a `response_status` column (i.e., not from an HTTP connector),
+/// returns the batches unchanged.
+#[must_use]
+pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBatch> {
+    if batches.is_empty() {
+        return Vec::new();
+    }
+
+    // If schema doesn't have response_status column, this isn't an HTTP result — return as-is
+    if batches[0]
+        .schema()
+        .column_with_name(RESPONSE_STATUS_COLUMN)
+        .is_none()
+    {
+        return batches.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        let Some(col_idx) = batch
+            .schema()
+            .column_with_name(RESPONSE_STATUS_COLUMN)
+            .map(|(idx, _)| idx)
+        else {
+            result.push(batch.clone());
+            continue;
+        };
+
+        let Some(status_array) = batch.column(col_idx).as_any().downcast_ref::<UInt16Array>()
+        else {
+            tracing::warn!(
+                "'{RESPONSE_STATUS_COLUMN}' column is not UInt16Array, skipping transient error filtering"
+            );
+            result.push(batch.clone());
+            continue;
+        };
+
+        // Create boolean mask: true for status codes that should be cached
+        // (exclude 5xx server errors and 429 Too Many Requests)
+        let mask: arrow::array::BooleanArray = status_array
+            .iter()
+            .map(|status| status.map(|s| !(500..600).contains(&s) && s != 429))
+            .collect();
+
+        match filter_record_batch(batch, &mask) {
+            Ok(filtered) if filtered.num_rows() > 0 => {
+                result.push(filtered);
+            }
+            Ok(_) => {} // Empty after filtering, skip
+            Err(e) => {
+                tracing::warn!("Failed to filter transient error responses: {e}");
+                result.push(batch.clone());
+            }
+        }
+    }
+
+    result
+}
 
 #[must_use]
 #[expect(clippy::implicit_hasher)]
@@ -60,25 +126,32 @@ pub fn to_cached_record_batch_stream(
         }
 
         if records_size < cache_max_size {
-            let cached_at = std::time::Instant::now();
-            let encoder = cache_provider.encoder();
+            // Filter out transient HTTP error responses (5xx/429) before caching.
+            // Non-HTTP results pass through unchanged.
+            let records_to_cache = filter_transient_error_responses(&records);
+            if records_to_cache.is_empty() && !records.is_empty() {
+                tracing::debug!("All query results were transient errors, skipping cache storage");
+            } else if !records_to_cache.is_empty() {
+                let cached_at = std::time::Instant::now();
+                let encoder = cache_provider.encoder();
 
-            match CachedQueryResult::from_batches(
-                &records,
-                cache_schema,
-                input_tables,
-                cached_at,
-                encoder,
-            )
-            .await
-            {
-                Ok(cached_result) => {
-                    if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                        tracing::error!("Failed to cache query results: {e}");
+                match CachedQueryResult::from_batches(
+                    &records_to_cache,
+                    cache_schema,
+                    input_tables,
+                    cached_at,
+                    encoder,
+                )
+                .await
+                {
+                    Ok(cached_result) => {
+                        if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                            tracing::error!("Failed to cache query results: {e}");
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to encode query results for caching: {e}");
+                    Err(e) => {
+                        tracing::error!("Failed to encode query results for caching: {e}");
+                    }
                 }
             }
         }
@@ -298,5 +371,215 @@ pub(crate) mod tests {
             MemTable::try_new(orders_schema, vec![orders_data]).expect("Should create table");
         ctx.register_table("orders", Arc::new(orders_table))
             .expect("Should register table");
+    }
+
+    // --- filter_transient_error_responses tests ---
+
+    use arrow::array::{StringArray, UInt16Array};
+
+    fn create_http_response_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("content", DataType::Utf8, false),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]))
+    }
+
+    #[test]
+    fn test_filter_no_response_status_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch.clone()]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].num_rows(),
+            2,
+            "Non-HTTP batches pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_filter_keeps_2xx() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["ok1", "ok2", "ok3"])),
+                Arc::new(UInt16Array::from(vec![200, 201, 204])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 3, "All 2xx rows should be kept");
+    }
+
+    #[test]
+    fn test_filter_keeps_4xx() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "not found",
+                    "bad request",
+                    "forbidden",
+                ])),
+                Arc::new(UInt16Array::from(vec![404, 400, 403])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 3, "All 4xx rows should be kept");
+    }
+
+    #[test]
+    fn test_filter_removes_5xx() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["error1", "error2", "error3"])),
+                Arc::new(UInt16Array::from(vec![500, 502, 503])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert!(result.is_empty(), "All 5xx rows should be filtered out");
+    }
+
+    #[test]
+    fn test_filter_removes_429() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["rate limited"])),
+                Arc::new(UInt16Array::from(vec![429])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert!(
+            result.is_empty(),
+            "429 Too Many Requests should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_filter_mixed_status_codes() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ok",
+                    "rate limited",
+                    "server error",
+                    "not found",
+                ])),
+                Arc::new(UInt16Array::from(vec![200, 429, 500, 404])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2, "Should keep only 200 and 404");
+
+        let status = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(status.value(0), 200);
+        assert_eq!(status.value(1), 404);
+    }
+
+    #[test]
+    fn test_filter_empty_batches() {
+        let result = filter_transient_error_responses(&[]);
+        assert!(result.is_empty(), "Empty input should return empty output");
+    }
+
+    #[test]
+    fn test_filter_multiple_batches() {
+        let schema = create_http_response_schema();
+
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["ok"])),
+                Arc::new(UInt16Array::from(vec![200])),
+            ],
+        )
+        .expect("to create batch1");
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["error"])),
+                Arc::new(UInt16Array::from(vec![500])),
+            ],
+        )
+        .expect("to create batch2");
+
+        let batch3 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["not found"])),
+                Arc::new(UInt16Array::from(vec![404])),
+            ],
+        )
+        .expect("to create batch3");
+
+        let result = filter_transient_error_responses(&[batch1, batch2, batch3]);
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have 2 batches (batch2 filtered out entirely)"
+        );
+        assert_eq!(result[0].num_rows(), 1);
+        assert_eq!(result[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn test_filter_boundary_status_codes() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["499", "500", "599", "600"])),
+                Arc::new(UInt16Array::from(vec![499, 500, 599, 600])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = filter_transient_error_responses(&[batch]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2, "Should keep 499 and 600");
+
+        let status = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(status.value(0), 499);
+        assert_eq!(status.value(1), 600);
     }
 }

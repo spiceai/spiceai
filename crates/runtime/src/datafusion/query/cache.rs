@@ -455,11 +455,25 @@ impl Query {
         input_tables: Arc<HashSet<TableReference>>,
     ) {
         if let Some(cache_provider) = df.results_cache_provider() {
+            // Filter out transient HTTP error responses (5xx/429) before caching.
+            // If all results are errors, skip caching to preserve existing stale entry.
+            // NOTE: this logic is http-connector specific because this is the only connector
+            // that can return record batch representing transient error - which we
+            // don't want to cache while we do want client to see it.
+            let batches_to_cache = cache::filter_transient_error_responses(&batches);
+            if batches_to_cache.is_empty() && !batches.is_empty() {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation returned only transient errors, preserving stale cache"
+                );
+                return;
+            }
+
             let cached_at = std::time::Instant::now();
             let encoder = cache_provider.encoder();
 
             match cache::result::query::CachedQueryResult::from_batches(
-                &batches,
+                &batches_to_cache,
                 schema,
                 input_tables,
                 cached_at,
