@@ -30,6 +30,7 @@ use turso::{Builder, Connection, Database, Value as TursoValue};
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
     db: Arc<Mutex<Option<Database>>>,
+    conn: Arc<Mutex<Option<Connection>>>,
     connection_string: String,
 }
 
@@ -46,6 +47,7 @@ impl TursoMetastore {
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
             db: Arc::new(Mutex::new(None)),
+            conn: Arc::new(Mutex::new(None)),
             connection_string: connection_string.into(),
         }
     }
@@ -91,8 +93,14 @@ impl TursoMetastore {
         Ok(db)
     }
 
-    /// Get a connection from the database.
+    /// Get or create a cached connection from the database.
     async fn get_conn(&self) -> CatalogResult<Connection> {
+        let mut conn_guard = self.conn.lock().await;
+
+        if let Some(conn) = conn_guard.as_ref() {
+            return Ok(conn.clone());
+        }
+
         let db = self.get_db().await?;
         let conn = db.connect().map_err(|e| CatalogError::Database {
             message: format!("Failed to connect to Turso database: {e}"),
@@ -105,6 +113,21 @@ impl TursoMetastore {
                 message: format!("Failed to set busy timeout: {e}"),
             })?;
 
+        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set synchronous mode: {e}"),
+            })?;
+
+        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set cache size: {e}"),
+            })?;
+
+        *conn_guard = Some(conn.clone());
         Ok(conn)
     }
 
@@ -306,22 +329,6 @@ fn convert_turso_error(e: turso::Error) -> CatalogError {
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
-
-        // NORMAL synchronous mode: safe with WAL, more performant than FULL
-        // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
-        conn.execute("PRAGMA synchronous = NORMAL", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set synchronous mode: {e}"),
-            })?;
-
-        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
-        // Larger cache reduces disk I/O for frequently accessed metadata
-        conn.execute("PRAGMA cache_size = -32768", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set cache size: {e}"),
-            })?;
 
         // Create tables
         let schema_sql = format!(
