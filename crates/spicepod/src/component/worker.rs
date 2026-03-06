@@ -108,10 +108,7 @@ impl WithDependsOn<Worker> for Worker {
 impl Worker {
     pub fn validate(&self) -> std::result::Result<(), String> {
         let Some(routing) = &self.routing else {
-            return Err(format!(
-                "Worker '{}' must set 'routing'",
-                self.name
-            ));
+            return Err(format!("Worker '{}' must set 'routing'", self.name));
         };
 
         let configured_modes = usize::from(routing.prompt.is_some())
@@ -125,7 +122,10 @@ impl Worker {
             ));
         }
 
-        let cron = self.triggers.as_ref().and_then(|triggers| triggers.cron.as_ref());
+        let cron = self
+            .triggers
+            .as_ref()
+            .and_then(|triggers| triggers.cron.as_ref());
         let events = self
             .triggers
             .as_ref()
@@ -376,9 +376,10 @@ routing:
 "#;
 
         let err = yaml::from_str::<Worker>(yaml).expect_err("worker should fail to parse");
-        assert!(err
-            .to_string()
-            .contains("exactly one of 'routing.prompt', 'routing.sql', or 'routing.webhook'"));
+        assert!(
+            err.to_string()
+                .contains("exactly one of 'routing.prompt', 'routing.sql', or 'routing.webhook'")
+        );
     }
 
     #[test]
@@ -393,9 +394,10 @@ triggers:
 "#;
 
         let err = yaml::from_str::<Worker>(yaml).expect_err("worker should fail to parse");
-        assert!(err
-            .to_string()
-                        .contains("cannot set 'triggers.event' for a SQL worker"));
+        assert!(
+            err.to_string()
+                .contains("cannot set 'triggers.event' for a SQL worker")
+        );
     }
 
     #[test]
@@ -407,9 +409,10 @@ routing:
 "#;
 
         let err = yaml::from_str::<Worker>(yaml).expect_err("worker should fail to parse");
-        assert!(err
-            .to_string()
-            .contains("must set 'routing.models' when 'routing.prompt' is configured"));
+        assert!(
+            err.to_string()
+                .contains("must set 'routing.models' when 'routing.prompt' is configured")
+        );
     }
 
     #[test]
@@ -439,8 +442,9 @@ triggers: {}
 "#;
 
         let err = yaml::from_str::<Worker>(yaml).expect_err("worker should fail to parse");
-        assert!(err
-            .to_string()
-            .contains("must set at least one of 'triggers.cron' or 'triggers.event'"));
+        assert!(
+            err.to_string()
+                .contains("must set at least one of 'triggers.cron' or 'triggers.event'")
+        );
     }
 }

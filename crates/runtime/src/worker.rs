@@ -104,12 +104,10 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
                     .cloned(),
                 routing.prompt.as_ref(),
             ) {
-                (Some(cron), Some(prompt)) => {
-                    Some(WorkerScheduleParameters::Prompt {
-                        cron,
-                        prompt: prompt.clone(),
-                    })
-                }
+                (Some(cron), Some(prompt)) => Some(WorkerScheduleParameters::Prompt {
+                    cron,
+                    prompt: prompt.clone(),
+                }),
                 (Some(_), None) => {
                     tracing::warn!(
                         "Worker '{}' has a 'cron' but no prompt is specified.\nThe worker will not be scheduled to run.\nSpecify a 'prompt' parameter and try again.",
