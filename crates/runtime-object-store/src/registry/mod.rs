@@ -91,15 +91,12 @@ impl SpiceObjectStoreRegistry {
             )));
         };
 
-        let expected_prefix = format!("{bucket_name}.");
-        if !host.starts_with(&expected_prefix) {
-            let virtual_hosted = format!("{bucket_name}.{host}");
-            endpoint_url.set_host(Some(&virtual_hosted)).map_err(|e| {
-                DataFusionError::Configuration(format!(
-                    "Unable to set virtual-hosted endpoint host to {virtual_hosted}: {e}"
-                ))
-            })?;
-        }
+        let virtual_hosted = format!("{bucket_name}.{host}");
+        endpoint_url.set_host(Some(&virtual_hosted)).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to set virtual-hosted endpoint host to {virtual_hosted}: {e}"
+            ))
+        })?;
 
         Ok(endpoint_url.to_string().trim_end_matches('/').to_string())
     }
@@ -972,7 +969,8 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_for_s3_url_style_vhost_preserves_prefixed_endpoint() {
+    fn test_endpoint_for_s3_url_style_vhost_always_prepends_bucket() {
+        // Even when bucket name matches the start of the host, always prepend.
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://spiceai-public-datasets.t3.storage.dev",
             "spiceai-public-datasets",
@@ -980,7 +978,10 @@ mod tests {
         )
         .expect("virtual-hosted endpoint should parse");
 
-        assert_eq!(endpoint, "https://spiceai-public-datasets.t3.storage.dev");
+        assert_eq!(
+            endpoint,
+            "https://spiceai-public-datasets.spiceai-public-datasets.t3.storage.dev"
+        );
     }
 
     #[test]
@@ -993,6 +994,19 @@ mod tests {
         .expect("virtual-hosted endpoint with port should parse");
 
         assert_eq!(endpoint, "http://bucket.minio:9000");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_bucket_matches_host_prefix() {
+        // Bucket "t3" with endpoint "t3.storage.dev" — must still prepend.
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "t3",
+            true,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(endpoint, "https://t3.t3.storage.dev");
     }
 
     #[test]
