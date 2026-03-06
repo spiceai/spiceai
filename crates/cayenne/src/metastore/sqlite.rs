@@ -406,7 +406,7 @@ impl MetastoreBackend for SqliteMetastore {
                 .iter()
                 .map(|v| v as &dyn rusqlite::ToSql)
                 .collect();
-            conn.execute(&sql, params_refs.as_slice())?;
+            conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
             Ok::<_, rusqlite::Error>(())
         })
         .await
@@ -493,7 +493,7 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let rows = stmt.query_map(params_refs.as_slice(), |row| {
                     let column_count = row.as_ref().column_count();
                     let mut values = Vec::with_capacity(column_count);
