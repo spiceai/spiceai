@@ -1,0 +1,46 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "eab8208e0c5a",
+  "session_id": "54c8b261-017b-4bbf-8674-cb5e9df71346",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-06T01:32:07.948899Z",
+  "branch": "new_b/fix-initial-partitions-max-limit",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/runtime/src/cluster/servers.rs",
+    "crates/runtime/src/cluster/service.rs",
+    "data",
+    "logs.temp",
+    ".distributed/scheduler/pid",
+    ".entire/.gitignore",
+    ".zed/settings.json",
+    "parse_dont_validate.md",
+    "spiced_local",
+    ".distributed/executor1/pid",
+    "description.md",
+    "qs2.json",
+    ".claude/settings.json",
+    ".entire/settings.json",
+    "ME.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "120fa72cbc7f",
+  "checkpoint_transcript_start": 164,
+  "transcript_lines_at_start": 164,
+  "token_usage": {
+    "input_tokens": 12,
+    "cache_creation_tokens": 22824,
+    "cache_read_tokens": 329924,
+    "output_tokens": 2260,
+    "api_call_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-06T01:32:07.863897Z",
+    "agent_lines": 3549,
+    "human_added": 181887,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 185436,
+    "agent_percentage": 1.913867857373973
+  }
+}

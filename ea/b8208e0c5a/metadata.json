@@ -8,7 +8,12 @@
     ".claude/settings.json",
     ".distributed/executor1/pid",
     ".distributed/scheduler/pid",
+    ".entire/.gitignore",
+    ".entire/settings.json",
     ".zed/settings.json",
+    "ME.md",
+    "crates/runtime/src/cluster/servers.rs",
+    "crates/runtime/src/cluster/service.rs",
     "data",
     "description.md",
     "logs.temp",
@@ -23,13 +28,20 @@
       "context": "/ea/b8208e0c5a/0/context.md",
       "content_hash": "/ea/b8208e0c5a/0/content_hash.txt",
       "prompt": "/ea/b8208e0c5a/0/prompt.txt"
+    },
+    {
+      "metadata": "/ea/b8208e0c5a/1/metadata.json",
+      "transcript": "/ea/b8208e0c5a/1/full.jsonl",
+      "context": "/ea/b8208e0c5a/1/context.md",
+      "content_hash": "/ea/b8208e0c5a/1/content_hash.txt",
+      "prompt": "/ea/b8208e0c5a/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 35,
-    "cache_creation_tokens": 23678,
-    "cache_read_tokens": 1073933,
-    "output_tokens": 7873,
-    "api_call_count": 29
+    "input_tokens": 47,
+    "cache_creation_tokens": 46502,
+    "cache_read_tokens": 1403857,
+    "output_tokens": 10133,
+    "api_call_count": 39
   }
 }
