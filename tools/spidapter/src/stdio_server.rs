@@ -156,6 +156,22 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(ToString::to_string)
 }
 
+/// Average non-`None` `f64` values extracted from pods.
+#[expect(clippy::cast_precision_loss)]
+fn avg_opt(
+    pods: &[&spice_cloud_client::types::PodMetrics],
+    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
+) -> Option<f64> {
+    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
+        if let Some(v) = f(p) {
+            (s + v, c + 1)
+        } else {
+            (s, c)
+        }
+    });
+    (count > 0).then_some(sum / (count as f64))
+}
+
 /// Sum non-`None` `u64` values extracted from pods.
 fn sum_opt_u64(
     pods: &[&spice_cloud_client::types::PodMetrics],
@@ -309,30 +325,12 @@ impl Handler for SpidapterHandler {
                     ResourceMetrics::default()
                 } else {
                     ResourceMetrics {
-                        // Sum cumulative CPU seconds across all pods
-                        cpu_usage_percent: Some(
-                            pods.iter()
-                                .filter_map(|pod| pod.cpu_usage_percent)
-                                .sum::<f64>()
-                                .max(0.0),
-                        ),
-                        memory_usage_bytes: sum_opt_u64(&pods, |pod| pod.memory_usage_bytes),
-                        disk_read_bytes: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_read_bytes)
-                                .unwrap_or_default(),
-                        ),
-                        disk_write_bytes: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_write_bytes)
-                                .unwrap_or_default(),
-                        ),
-                        disk_read_iops: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_read_operations)
-                                .unwrap_or_default(),
-                        ),
-                        disk_write_iops: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_write_operations)
-                                .unwrap_or_default(),
-                        ),
+                        cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                        memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
+                        disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
+                        disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
+                        disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations),
+                        disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations),
                     }
                 };
 
@@ -415,9 +413,10 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
-        let mut attempts = 0; // global attempt counter, not per-table, to avoid compounding retries
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
+
+            let mut attempts = 0;
 
             loop {
                 let mut request = sql_client.post(sql_url).body(statement.clone());
@@ -434,7 +433,10 @@ async fn post_setup_sink_action(
 
                 if attempts >= 3 {
                     let status = response.status();
-                    let body = response.text().await?;
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read error response body: {e}>"));
                     return Err(anyhow::anyhow!(
                         "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
                     ));
@@ -1175,7 +1177,6 @@ fn generate_hive_spicepod(
             engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
-            refresh_check_interval: Some("1s".to_string()),
             ..Acceleration::default()
         });
 
@@ -1303,7 +1304,6 @@ mod tests {
         assert!(spicepod.contains("engine: cayenne"));
         assert!(spicepod.contains("mode: file"));
         assert!(spicepod.contains("refresh_mode: full"));
-        assert!(spicepod.contains("refresh_check_interval: 1s"));
         assert!(spicepod.contains("telemetry:"));
         assert!(spicepod.contains("enabled: false"));
     }

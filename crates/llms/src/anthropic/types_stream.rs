@@ -27,7 +27,7 @@ use futures::{Stream, StreamExt};
 use reqwest_eventsource::Error as SseError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use tokio::sync::Mutex;
 
@@ -197,61 +197,6 @@ impl Delta {
     }
 }
 
-#[expect(dead_code)]
-#[derive(Debug, Deserialize, Serialize)]
-pub struct AnthropicStreamError {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub error: ErrorPayload,
-}
-
-impl fmt::Display for AnthropicStreamError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "AnthropicStreamError: {:?}", self.error)
-    }
-}
-
-impl From<reqwest_eventsource::Error> for AnthropicStreamError {
-    fn from(e: reqwest_eventsource::Error) -> Self {
-        let message = if let reqwest_eventsource::Error::InvalidStatusCode(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            _,
-        ) = &e
-        {
-            "Anthropic API limit exceeded. Check limits: https://console.anthropic.com/settings/limits.".to_string()
-        } else {
-            e.to_string()
-        };
-
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "reqwest_eventsource_error".to_string(),
-                message,
-            },
-        }
-    }
-}
-
-impl From<serde_json::Error> for AnthropicStreamError {
-    fn from(e: serde_json::Error) -> Self {
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "serde_json_error".to_string(),
-                message: e.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorPayload {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
@@ -414,8 +359,12 @@ pub fn transform_stream(
                         | MessageCreateStreamResponse::MessageStop,
                     ) => None,
                     Err(e) => {
-                        tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(e))
+                        let formatted_error = format_anthropic_stream_error(e);
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
                     }
                 }
             }
@@ -427,6 +376,44 @@ pub fn transform_stream(
         });
 
     Box::pin(transformed_stream)
+}
+
+fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::ApiError(api_error) = error else {
+        return error;
+    };
+
+    let lowered = api_error.message.to_lowercase();
+
+    if lowered.contains("too many requests") || lowered.contains("429") {
+        return OpenAIError::ApiError(ApiError {
+            message: "Anthropic API rate limit exceeded. Check your limits at https://console.anthropic.com/settings/limits and retry shortly.".to_string(),
+            r#type: Some("AnthropicRateLimitError".to_string()),
+            param: api_error.param,
+            code: api_error.code,
+        });
+    }
+
+    if lowered.contains("401")
+        || lowered.contains("403")
+        || lowered.contains("authentication")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+    {
+        return OpenAIError::ApiError(ApiError {
+            message: "Anthropic authentication failed. Verify your Anthropic API key and workspace permissions.".to_string(),
+            r#type: Some("AnthropicAuthenticationError".to_string()),
+            param: api_error.param,
+            code: api_error.code,
+        });
+    }
+
+    OpenAIError::ApiError(ApiError {
+        message: format!("Anthropic streaming error: {}", api_error.message),
+        r#type: Some("AnthropicStreamError".to_string()),
+        param: api_error.param,
+        code: api_error.code,
+    })
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.

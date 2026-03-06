@@ -344,6 +344,14 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+    ))]
+    UnsupportedDistributedAccelerationEngine {
+        dataset_name: String,
+        engine: String,
+    },
+
+    #[snafu(display(
         "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
         format_datafusion_error(source)
     ))]
@@ -390,6 +398,30 @@ pub enum Error {
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
     ))]
     UnsupportedAccelerationEngineForSnapshots,
+}
+
+/// Validates that the acceleration engine is supported in distributed mode.
+///
+/// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
+/// Returns an error if a distributed role is active and the engine is unsupported.
+fn validate_distributed_engine(
+    cluster_config: &ResolvedClusterConfig,
+    engine: Engine,
+    dataset_name: &str,
+) -> Result<()> {
+    if cluster_config.effective_role().is_some()
+        && !matches!(
+            engine,
+            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+        )
+    {
+        return UnsupportedDistributedAccelerationEngineSnafu {
+            dataset_name: dataset_name.to_string(),
+            engine: engine.to_string(),
+        }
+        .fail();
+    }
+    Ok(())
 }
 
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
@@ -1634,6 +1666,13 @@ impl DataFusion {
             None
         };
 
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration_settings.engine,
+            &dataset.name.to_string(),
+        )?;
+
         let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
@@ -2393,6 +2432,13 @@ impl DataFusion {
                 })?;
 
         let schema = view_table.schema();
+
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration.engine,
+            &table.to_string(),
+        )?;
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()
@@ -3387,6 +3433,152 @@ mod tests {
                 ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
+        }
+    }
+
+    mod validate_distributed_engine_tests {
+        use super::super::*;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+            let config = ClusterConfig {
+                role: Some(role),
+                allow_insecure_connections: true,
+                node_advertise_address: Some("127.0.0.1".to_string()),
+                ..ClusterConfig::default()
+            };
+            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
+        }
+
+        fn make_non_distributed_config() -> ResolvedClusterConfig {
+            ResolvedClusterConfig::try_new(ClusterConfig::default())
+                .expect("valid default cluster config")
+        }
+
+        #[test]
+        fn arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn partitioned_arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
+                .expect("partitioned_arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn cayenne_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn sqlite_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Executor);
+            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn postgresql_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn turso_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result =
+                validate_distributed_engine(&config, Engine::PartitionedDuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn table_mode_partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(
+                &config,
+                Engine::TableModePartitionedDuckDB,
+                "my_dataset",
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn any_engine_allowed_in_non_distributed_mode() {
+            let config = make_non_distributed_config();
+            validate_distributed_engine(&config, Engine::DuckDB, "ds")
+                .expect("duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Sqlite, "ds")
+                .expect("sqlite should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
+                .expect("postgresql should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Turso, "ds")
+                .expect("turso should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PartitionedDuckDB, "ds")
+                .expect("partitioned_duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::TableModePartitionedDuckDB, "ds").expect(
+                "table_mode_partitioned_duckdb should be allowed when not in distributed mode",
+            );
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 }

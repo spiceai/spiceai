@@ -186,6 +186,44 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 // Helpers
 // ---------------------------------------------------------------------------
 
+async fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), anyhow::Error> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow::Error::msg(format!(
+        "Timed out waiting for port {addr} to become reachable"
+    )))
+}
+
+async fn wait_for_executor_count(
+    executor_manager: &ExecutorManager,
+    expected: usize,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let start = Instant::now();
+    loop {
+        let count = executor_manager
+            .get_executor_state()
+            .await
+            .map_err(|err| anyhow::Error::msg(err.to_string()))?
+            .len();
+        if count == expected {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Err(anyhow::Error::msg(format!(
+                "Timed out waiting for {expected} executors; found {count}"
+            )));
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Return a `SchedulerConfig` pointing at an S3 bucket for partition state.
 ///
 /// `PartitionManager` uses OCC (optimistic concurrency control) which needs

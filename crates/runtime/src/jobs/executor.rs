@@ -179,7 +179,8 @@ impl JobExecutor {
 
         // Check for early cancellation
         if cancel.is_cancelled() {
-            job_store.cancel_job(job_id).await?;
+            // Don't call cancel_job here - executor.cancel() already updates the
+            // job state via its own cancel_job call.
             return Ok(());
         }
 
@@ -243,7 +244,9 @@ impl JobExecutor {
                 if let Err(e) = query_handle.cancel().await {
                     tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
                 }
-                job_store.cancel_job(job_id).await?;
+                // Don't call cancel_job here - executor.cancel() already updates the
+                // job state. Doing it here would race with the OCC write and cause
+                // ConcurrentModification errors.
                 Ok(())
             },
             () = timeout_fut => {

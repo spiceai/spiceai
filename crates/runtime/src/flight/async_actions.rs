@@ -62,7 +62,6 @@ impl AsyncActionType {
 
     /// Parses an action type string from the Flight protocol.
     #[must_use]
-    #[expect(dead_code, reason = "API for external consumers")]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "SubmitAsyncQuery" => Some(Self::SubmitAsyncQuery),

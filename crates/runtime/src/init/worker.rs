@@ -18,11 +18,6 @@ use std::sync::Arc;
 
 use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::try_construct_worker};
 use opentelemetry::KeyValue;
-use snafu::prelude::*;
-
-#[derive(Debug, Snafu)]
-#[expect(dead_code)]
-pub enum Error {}
 
 impl Runtime {
     #[cfg(feature = "models")]
