@@ -463,7 +463,15 @@ fn verify_sqlite_metadata(
     ) = conn.query_row(
         "SELECT table_id, table_name, path, path_is_relative, schema_json FROM cayenne_table",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
     )?;
 
     assert_eq!(
@@ -481,9 +489,7 @@ fn verify_sqlite_metadata(
         !schema_json.is_empty(),
         "Expected schema_json to be non-empty"
     );
-    println!(
-        "  • Table metadata verified: table_id={table_id}, name={table_name}"
-    );
+    println!("  • Table metadata verified: table_id={table_id}, name={table_name}");
 
     // 3. Verify schema_json is base64 encoded (it's stored in Arrow IPC format)
     // We don't fully deserialize it here to avoid complex IPC parsing issues,

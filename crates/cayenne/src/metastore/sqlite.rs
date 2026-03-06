@@ -169,6 +169,11 @@ impl SqliteMetastore {
         )
     ";
 
+    const TABLE_NAME_UNIQUE_INDEX_DDL: &'static str = r"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_table_name_unique
+        ON cayenne_table(table_name)
+    ";
+
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
@@ -342,8 +347,9 @@ impl MetastoreBackend for SqliteMetastore {
         conn.call(|conn| {
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {};",
+                "{}; {}; {}; {}; {}; {};",
                 Self::TABLE_TABLE_DDL,
+                Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
                 Self::PARTITION_TABLE_DDL,
                 Self::INSERT_RECORD_TABLE_DDL,
@@ -448,17 +454,18 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                conn.prepare_cached(&sql)?.query_row(params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+                conn.prepare_cached(&sql)?
+                    .query_row(params_refs.as_slice(), |row| {
+                        let column_count = row.as_ref().column_count();
+                        let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
+                        for i in 0..column_count {
+                            let value = row.get_ref(i)?;
+                            values.push(convert_sqlite_value(value));
+                        }
 
-                    Ok(values)
-                })
+                        Ok(values)
+                    })
             })
             .await
             .map_err(

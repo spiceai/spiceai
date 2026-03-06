@@ -325,7 +325,8 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// This is used when a protected snapshot is superseded by a newer one.
     /// The old sequence record becomes orphaned and can be cleaned up.
-    async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
+    async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str)
+        -> CatalogResult<()>;
 
     /// Atomically update snapshot and clear delete files in a single transaction.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;

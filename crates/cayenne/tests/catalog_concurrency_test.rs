@@ -118,11 +118,12 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
 
         for i in 0..num_calls {
             let catalog_clone = Arc::clone(&fixture.catalog);
+            let table_id = table_id.clone();
             let path = table_dir.join(format!("partition_20240101_{i}"));
 
             let handle = tokio::spawn(async move {
                 let mut partition = PartitionMetadata::new_single(
-                    table_id.clone(),
+                    table_id,
                     "partition_date".to_string(),
                     "2024-01-01".to_string(), // Same value for all
                     path.to_string_lossy().to_string(),
