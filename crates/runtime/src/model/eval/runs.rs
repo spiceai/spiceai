@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,12 +33,14 @@ use futures::TryStreamExt;
 use snafu::ResultExt;
 
 use super::Result;
+use datafusion::prelude::{col, lit};
 use datafusion::sql::TableReference;
 
 use spicepod::component::eval::Eval;
 use std::{
     collections::HashMap,
     fmt::Display,
+    io,
     sync::{Arc, LazyLock},
 };
 
@@ -242,19 +244,27 @@ async fn get_eval_run(
     df: Arc<DataFusion>,
     id: &EvalRunId,
 ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(provider) = df.get_table(&EVAL_RUNS_TABLE_REFERENCE).await else {
+        return Err(io::Error::other(format!(
+            "Eval runs table not found: {EVAL_RUNS_TABLE_REFERENCE}"
+        ))
+        .into());
+    };
+
     let rb = df
-        .query_builder(sql_query_for(id).as_str())
-        .build()
-        .run()
-        .await
+        .ctx
+        .read_table(provider)
         .boxed()?
-        .data
-        .try_collect::<Vec<RecordBatch>>()
+        .filter(col(EVAL_RUNS_TABLE_PRIMARY_KEY).eq(lit(id.clone())))
+        .boxed()?
+        .limit(0, Some(1))
+        .boxed()?
+        .collect()
         .await
         .boxed()?
         .into_iter()
         .next()
-        .ok_or(format!("No eval run found with id: {id}"))?;
+        .ok_or_else(|| io::Error::other(format!("No eval run found with id: {id}")))?;
 
     Ok(rb)
 }

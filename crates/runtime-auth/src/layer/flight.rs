@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ pub fn validate_basic_auth_handshake(
         return Err(Status::unauthenticated("Invalid handshake request"));
     };
 
-    let [username, password] = decoded_auth_str.splitn(2, ':').collect::<Vec<&str>>()[..2] else {
+    let Some((username, password)) = decoded_auth_str.split_once(':') else {
         return Err(Status::unauthenticated("Invalid credentials"));
     };
     match basic_auth.validate(username, password) {

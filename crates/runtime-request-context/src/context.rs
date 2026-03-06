@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -244,6 +244,14 @@ impl RequestContext {
         self.authorization_header.as_deref()
     }
 
+    #[must_use]
+    pub fn scoped_client_supplied_cache_key(&self) -> Option<String> {
+        self.client_supplied_cache_key.as_deref().map(|cache_key| {
+            let auth_scope = self.authorization_header.as_deref().unwrap_or("anonymous");
+            format!("{auth_scope}:{cache_key}")
+        })
+    }
+
     pub fn extension<T>(&self) -> Option<T>
     where
         T: Extension + Clone,
@@ -413,6 +421,12 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
+    pub fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
+        self.authorization_header = authorization_header;
+        self
+    }
+
+    #[must_use]
     pub fn baggage_mut(&mut self) -> &mut Vec<KeyValue> {
         &mut self.baggage
     }
@@ -559,5 +573,32 @@ mod tests {
             CacheControl::Cache(CacheKeyType::Default)
         );
         assert_eq!(ctx_bad_user_key.client_supplied_cache_key, None);
+    }
+
+    #[test]
+    fn test_scoped_client_supplied_cache_key_uses_authorization_header() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .with_authorization_header(Some("Bearer alice".to_string()))
+            .build();
+
+        assert_eq!(
+            ctx.scoped_client_supplied_cache_key().as_deref(),
+            Some("Bearer alice:shared-key")
+        );
+    }
+
+    #[test]
+    fn test_scoped_client_supplied_cache_key_defaults_to_anonymous() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .build();
+
+        assert_eq!(
+            ctx.scoped_client_supplied_cache_key().as_deref(),
+            Some("anonymous:shared-key")
+        );
     }
 }

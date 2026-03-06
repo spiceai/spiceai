@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -197,7 +197,8 @@ impl SearchEngine {
             let search_key = SearchKey::from(req.clone());
             let cache_control = request_context.cache_control();
 
-            let cache_key = match request_context.client_supplied_cache_key() {
+            let scoped_user_cache_key = request_context.scoped_client_supplied_cache_key();
+            let cache_key = match scoped_user_cache_key.as_deref() {
                 Some(cache_key)
                     if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
                 {
