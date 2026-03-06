@@ -707,24 +707,20 @@ mod tests {
     use std::collections::HashMap;
 
     fn cleanup_turso_test_files(path: &str) {
-        let path = std::path::Path::new(path);
+        let db_path = std::path::Path::new(path);
+        let mut candidates = vec![db_path.to_path_buf()];
 
-        if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str()))
-            && let Ok(entries) = std::fs::read_dir(parent)
-        {
-            for entry in entries.flatten() {
-                let entry_path = entry.path();
-                let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-
-                if file_name.starts_with(stem) {
-                    std::fs::remove_file(&entry_path).ok();
-                }
+        if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name()) {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut sidecar = file_name.to_os_string();
+                sidecar.push(suffix);
+                candidates.push(parent.join(sidecar));
             }
         }
 
-        std::fs::remove_file(path).ok();
+        for candidate in candidates {
+            std::fs::remove_file(candidate).ok();
+        }
     }
 
     #[tokio::test]
@@ -749,7 +745,9 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
-        let path = accelerator.file_path(&dataset).expect("path should be derivable");
+        let path = accelerator
+            .file_path(&dataset)
+            .expect("path should be derivable");
         cleanup_turso_test_files(&path);
 
         assert!(!accelerator.is_initialized(&dataset));

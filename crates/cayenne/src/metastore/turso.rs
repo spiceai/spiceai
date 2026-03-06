@@ -28,6 +28,8 @@ use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::JOURNAL_MODE_SQL_LITERAL;
 
+const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
+
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
     db: Arc<Mutex<Option<Database>>>,
@@ -114,7 +116,14 @@ impl TursoMetastore {
                 message: format!("Failed to set busy timeout: {e}"),
             })?;
 
-        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set journal mode: {e}"),
+            })?;
+
+        // NORMAL synchronous mode: safe with MVCC, more performant than FULL
         conn.execute("PRAGMA synchronous = NORMAL", ())
             .await
             .map_err(|e| CatalogError::Database {
@@ -330,29 +339,6 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
 
-        // BEGIN CONCURRENT requires MVCC mode for concurrent writers.
-        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set journal mode: {e}"),
-            })?;
-
-        // NORMAL synchronous mode: safe with MVCC, more performant than FULL
-        // With MVCC mode, NORMAL only syncs at checkpoints, not on every commit
-        conn.execute("PRAGMA synchronous = NORMAL", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set synchronous mode: {e}"),
-            })?;
-
-        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
-        // Larger cache reduces disk I/O for frequently accessed metadata
-        conn.execute("PRAGMA cache_size = -32768", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set cache size: {e}"),
-            })?;
-
         // Create tables
         let schema_sql = format!(
             "{}; {}; {}; {}; {};",
@@ -367,6 +353,12 @@ impl MetastoreBackend for TursoMetastore {
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
+            })?;
+
+        conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to enforce unique delete-file paths for cayenne_delete_file; existing metadata may contain duplicate (table_id, path) rows: {e}"),
             })?;
 
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored

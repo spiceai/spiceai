@@ -21,14 +21,14 @@ use std::time::Duration;
 /// This should be used when issuing write transactions that may contend with
 /// other writers and are expected to be retried on conflict. It relies on
 /// libsql's MVCC support and is only valid when the database is configured
-/// with MVCC journal mode (see [`JOURNAL_MODE_SQL_LITERAL`]).
+/// with `PRAGMA journal_mode = 'mvcc'` (see [`JOURNAL_MODE_SQL_LITERAL`]).
 pub const BEGIN_CONCURRENT_SQL: &str = "BEGIN CONCURRENT";
 
 /// SQL used to begin a standard transaction.
 ///
 /// Use this for transactions that do not require `BEGIN CONCURRENT` semantics
-/// (for example, when MVCC is not enabled, or when the client handles
-/// concurrency differently).
+/// (for example, when MVCC journal mode is not enabled, or when the client
+/// handles concurrency differently).
 pub const BEGIN_TRANSACTION_SQL: &str = "BEGIN TRANSACTION";
 
 /// SQL used to commit either a concurrent or standard transaction.

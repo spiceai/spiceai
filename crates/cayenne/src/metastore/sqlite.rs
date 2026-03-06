@@ -28,6 +28,8 @@ use async_trait::async_trait;
 use std::path::Path;
 use tokio::sync::OnceCell;
 
+const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
+
 /// `SQLite`-based metastore backend with a persistent connection.
 ///
 /// Uses `tokio-rusqlite` to maintain a long-lived connection to the database,
@@ -363,6 +365,17 @@ impl MetastoreBackend for SqliteMetastore {
         .map_err(
             |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
+            },
+        )?;
+
+        conn.call(|conn| {
+            conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to enforce unique delete-file paths for cayenne_delete_file; existing metadata may contain duplicate (table_id, path) rows: {e}"),
             },
         )?;
 

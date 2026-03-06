@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 use turso_shared::{
     is_retryable_write_conflict_message, retry_backoff_delay, BEGIN_CONCURRENT_SQL,
-    BEGIN_TRANSACTION_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
+    BEGIN_TRANSACTION_SQL, COMMIT_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
 };
 
 /// Metastore backend enum to support different implementations.
@@ -80,10 +80,10 @@ impl MetastoreImpl {
         }
     }
 
-    /// Helper to execute a batch of SQL statements atomically.
+    /// Helper to execute a batch of SQL statements.
     ///
-    /// For `SQLite`, this runs all statements in a single transaction.
-    /// The entire batch succeeds or fails as a unit.
+    /// Callers that require atomicity must include explicit `BEGIN ... COMMIT`
+    /// statements in the SQL they pass to this helper.
     pub(crate) async fn execute_batch_helper(&self, sql: &str) -> CatalogResult<()> {
         match self {
             MetastoreImpl::Sqlite(m) => m.execute_batch(sql).await,
@@ -939,13 +939,15 @@ impl MetadataCatalog for CayenneCatalog {
             BEGIN_TRANSACTION_SQL
         };
 
+        let table_id_literal = sql_text_literal(table_id);
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         let batch_sql = format!(
             "{begin_transaction}; \
-             DELETE FROM cayenne_delete_file WHERE table_id = '{table_id}'; \
-             DELETE FROM cayenne_insert_record WHERE table_id = '{table_id}'; \
-             DELETE FROM cayenne_snapshot_sequence WHERE table_id = '{table_id}'; \
-             UPDATE cayenne_table SET current_snapshot_id = '{new_snapshot_id}' WHERE table_id = '{table_id}'; \
-             COMMIT;"
+             DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal}; \
+             {COMMIT_SQL};"
         );
 
         // BEGIN CONCURRENT may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at commit time.
@@ -963,6 +965,7 @@ impl MetadataCatalog for CayenneCatalog {
                         && attempt < max_attempts
                         && is_retryable_turso_write_conflict(&e) =>
                 {
+                    rollback_failed_compaction_transaction(&self.metastore).await;
                     let delay = retry_backoff_delay(attempt);
                     tracing::debug!(
                         attempt,
@@ -973,6 +976,7 @@ impl MetadataCatalog for CayenneCatalog {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
+                    rollback_failed_compaction_transaction(&self.metastore).await;
                     return Err(CatalogError::FailedToSetCurrentSnapshot {
                         source: Box::new(e),
                     });
@@ -1228,6 +1232,29 @@ fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
         _ => false,
+    }
+}
+
+fn sql_text_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
+    if !metastore.is_turso() {
+        return;
+    }
+
+    if let Err(error) = metastore
+        .execute_helper(ExecuteParams {
+            sql: "ROLLBACK",
+            params: vec![],
+        })
+        .await
+    {
+        tracing::debug!(
+            ?error,
+            "Failed to rollback Turso compaction transaction after batch error"
+        );
     }
 }
 
@@ -1542,6 +1569,91 @@ mod tests {
         assert_eq!(delete_files.len(), 10);
 
         // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_delete_file_creation_is_idempotent_for_same_path() {
+        let test_db = format!(
+            "sqlite://./.test_concurrent_delete_file_same_path_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_same_path".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_id = table_id.clone();
+
+            let handle = tokio::spawn(async move {
+                let delete_file = DeleteFile {
+                    delete_file_id: String::new(),
+                    table_id,
+                    source_data_file_path: None,
+                    path: "/tmp/delete_file_same_path.parquet".to_string(),
+                    path_is_relative: false,
+                    format: "parquet".to_string(),
+                    delete_count: 10,
+                    file_size_bytes: 512,
+                    deletion_type: DeletionType::default(),
+                    sequence_number: 1,
+                };
+
+                catalog_clone.add_delete_file(delete_file).await
+            });
+
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        let mut delete_file_ids = vec![];
+        for result in results {
+            let delete_file_id = result
+                .expect("Task panicked")
+                .expect("add_delete_file failed");
+            delete_file_ids.push(delete_file_id);
+        }
+
+        let unique_ids: std::collections::HashSet<_> = delete_file_ids.iter().collect();
+        assert_eq!(
+            unique_ids.len(),
+            1,
+            "All concurrent add_delete_file calls for the same path should return the same delete_file_id"
+        );
+
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+
+        assert_eq!(delete_files.len(), 1);
+        assert_eq!(delete_files[0].path, "/tmp/delete_file_same_path.parquet");
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

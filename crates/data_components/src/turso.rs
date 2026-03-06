@@ -392,7 +392,8 @@ fn is_now_function(func: &Function) -> bool {
 /// let conn = pool.connect().await?;
 /// ```
 ///
-/// Note: Concurrent transactions are enabled via MVCC journal mode during pool creation.
+/// Note: Concurrent transactions are enabled by configuring
+/// `PRAGMA journal_mode = 'mvcc'` during pool creation.
 /// This enables BEGIN CONCURRENT transactions for better concurrency.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
@@ -419,7 +420,7 @@ impl TursoConnectionPool {
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
     /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
     ///
-    /// Note: BEGIN CONCURRENT requires MVCC mode, which is configured during pool creation.
+    /// Note: BEGIN CONCURRENT requires MVCC journal mode, which is configured during pool creation.
     pub async fn new_with_timestamp_format(
         path: &str,
         timestamp_format: TimestampFormat,
