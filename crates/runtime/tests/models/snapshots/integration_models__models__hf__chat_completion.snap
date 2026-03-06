@@ -5,11 +5,20 @@ expression: "normalize_chat_completion_response(response, true)"
 {
   "choices": [
     {
-      "finish_reason": "stop",
+      "finish_reason": "tool_calls",
       "index": 0,
       "message": {
-        "content": "content_val",
-        "role": "assistant"
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{}",
+              "name": "python_string"
+            },
+            "id": "call-ed7dd99b-5ad0-4852-a991-7b43a0841e61",
+            "type": "function"
+          }
+        ]
       }
     }
   ],
