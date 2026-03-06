@@ -470,22 +470,46 @@ impl ObjectStore for MultiZoneS3ExpressStore {
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        let mut all_not_found = true;
+        let mut last_not_found: Option<object_store::Error> = None;
         let mut failed_zone_details = Vec::new();
         for zone in &self.zones {
-            if let Err(err) = zone.store.delete(location).await {
-                tracing::warn!(
-                    "Failed to delete object '{}' from zone '{}': {err}",
-                    location,
-                    zone.zone_id
-                );
-                failed_zone_details.push(format!("{}: {err}", zone.zone_id));
+            match zone.store.delete(location).await {
+                Ok(()) => {
+                    // At least one zone confirmed the delete.
+                    all_not_found = false;
+                }
+                Err(err) => match err {
+                    object_store::Error::NotFound { .. } => {
+                        tracing::debug!(
+                            "Object '{}' not found in zone '{}' during delete: {err}",
+                            location,
+                            zone.zone_id
+                        );
+                        last_not_found = Some(err);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Failed to delete object '{}' from zone '{}': {err}",
+                            location,
+                            zone.zone_id
+                        );
+                        failed_zone_details.push(format!("{}: {err}", zone.zone_id));
+                        all_not_found = false;
+                    }
+                },
             }
         }
 
-        if failed_zone_details.is_empty() {
-            Ok(())
-        } else {
+        if !failed_zone_details.is_empty() {
             Err(self.multi_zone_delete_error(&failed_zone_details))
+        } else if all_not_found {
+            Err(last_not_found.unwrap_or_else(|| object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "No configured S3 zones".into(),
+            }))
+        } else {
+            Ok(())
         }
     }
 
@@ -631,7 +655,7 @@ impl MultipartUpload for MultiZoneMultipartUpload {
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let mut first_success: Option<PutResult> = None;
         let mut successful_zone_ids = Vec::new();
-        let mut failed_zone_ids = Vec::new();
+        let mut failed_zone_details = Vec::new();
 
         for zone_upload in &mut self.uploads {
             match zone_upload.upload.complete().await {
@@ -646,13 +670,13 @@ impl MultipartUpload for MultiZoneMultipartUpload {
                         "Failed multipart completion in zone '{}': {err}",
                         zone_upload.zone_id
                     );
-                    failed_zone_ids.push(zone_upload.zone_id.clone());
+                    failed_zone_details.push(format!("{}: {err}", zone_upload.zone_id));
                     let _ = zone_upload.upload.abort().await;
                 }
             }
         }
 
-        if failed_zone_ids.is_empty() {
+        if failed_zone_details.is_empty() {
             return first_success.ok_or_else(|| object_store::Error::Generic {
                 store: MULTI_ZONE_STORE_NAME,
                 source: "No successful multi-zone multipart completion result".into(),
@@ -685,9 +709,9 @@ impl MultipartUpload for MultiZoneMultipartUpload {
         Err(object_store::Error::Generic {
             store: MULTI_ZONE_STORE_NAME,
             source: Box::new(Error::MultiZoneWriteFailed {
-                failed_count: failed_zone_ids.len(),
+                failed_count: failed_zone_details.len(),
                 total_zones: self.total_zones,
-                failed_zones: failed_zone_ids.join(", "),
+                failed_zones: failed_zone_details.join(", "),
             }),
         })
     }
