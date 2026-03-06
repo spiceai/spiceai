@@ -273,8 +273,15 @@ jobs:
       - name: Stop spice and check logs
         if: always()
         run: |
-          killall spice || true
-          cat spice.log
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
 
   test_hf_model:
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -282,6 +289,8 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
+      - setup-model-matrix
+    if: ${{ github.event_name != 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:
@@ -350,8 +359,15 @@ jobs:
       - name: Stop spice and check logs
         if: always()
         run: |
-          killall spice || true
-          cat spice.log
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
