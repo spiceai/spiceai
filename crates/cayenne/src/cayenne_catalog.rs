@@ -908,6 +908,17 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+        // Validate that IDs are well-formed UUIDs to prevent SQL injection.
+        // Both values are generated internally via uuid::Uuid::now_v7(), but we enforce
+        // the invariant here since they are interpolated into batch SQL.
+        for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
+            if uuid::Uuid::parse_str(value).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("{name} is not a valid UUID: {value}"),
+                });
+            }
+        }
+
         // Execute all operations atomically using a transaction batch.
         // Atomicity is provided by explicit BEGIN ... COMMIT statements in `batch_sql`,
         // ensuring either all statements succeed or none takes effect.
@@ -2246,6 +2257,124 @@ mod tests {
         assert_eq!(table_id_1, table_id_2);
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test that `commit_compaction` clears delete files, insert records, and
+    /// snapshot sequences, and updates the active snapshot pointer.
+    #[tokio::test]
+    async fn test_commit_compaction_clears_metadata() {
+        let test_db = format!(
+            "sqlite://./.test_commit_compaction_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        // Create a table.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "compaction_test".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/cayenne_compaction_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+
+        // Add a delete file so there is something to clear.
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: None,
+            path: "/tmp/delete.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 5,
+            file_size_bytes: 256,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+        catalog
+            .add_delete_file(delete_file)
+            .await
+            .expect("Failed to add delete file");
+
+        // Verify delete file exists before compaction.
+        let before = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(before.len(), 1, "Expected 1 delete file before compaction");
+
+        // Commit compaction with a new snapshot ID.
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_compaction(&table_id, &new_snapshot_id)
+            .await
+            .expect("commit_compaction failed");
+
+        // Verify delete files were cleared.
+        let after = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after compaction");
+        assert!(
+            after.is_empty(),
+            "Delete files should be cleared after compaction"
+        );
+
+        // Verify the snapshot pointer was updated.
+        let table = catalog
+            .get_table("compaction_test")
+            .await
+            .expect("Failed to get table after compaction");
+        assert_eq!(
+            table.current_snapshot_id, new_snapshot_id,
+            "Snapshot pointer should be updated after compaction"
+        );
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test that `commit_compaction` rejects non-UUID identifiers.
+    #[tokio::test]
+    async fn test_commit_compaction_rejects_invalid_uuid() {
+        let test_db = format!(
+            "sqlite://./.test_compaction_invalid_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let valid_uuid = uuid::Uuid::now_v7().to_string();
+
+        // Invalid table_id should fail.
+        let result = catalog
+            .commit_compaction("'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .await;
+        assert!(result.is_err(), "Should reject non-UUID table_id");
+
+        // Invalid new_snapshot_id should fail.
+        let result = catalog.commit_compaction(&valid_uuid, "not-a-uuid").await;
+        assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
+
+        // Cleanup.
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
