@@ -37,7 +37,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     configure_test_datafusion,
-    utils::{test_request_context, verify_env_secret_exists},
+    utils::test_request_context,
 };
 
 use super::harness::ClusterHarness;
