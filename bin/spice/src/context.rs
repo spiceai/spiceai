@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::error::{
     CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, Result, RuntimeExecutionSnafu,
-    RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
+    RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ use std::time::Duration;
 const DOT_SPICE: &str = ".spice";
 const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
+const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
 
 /// Runtime context holding paths and configuration for CLI operations.
 #[derive(Debug, Clone)]
@@ -234,6 +235,36 @@ impl RuntimeContext {
     #[must_use]
     pub fn is_runtime_installed(&self) -> bool {
         self.spiced_path().exists()
+    }
+
+    fn is_wsl_environment<F>(mut get_env: F) -> bool
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        WSL_ENV_KEYS.iter().any(|key| {
+            get_env(key).is_some_and(|value| !value.trim().is_empty())
+        })
+    }
+
+    fn local_runtime_supported_on_platform<F>(is_windows: bool, get_env: F) -> bool
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        !is_windows || Self::is_wsl_environment(get_env)
+    }
+
+    /// Ensure the local Spice runtime can be managed from this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Windows CLI is running natively instead of under WSL.
+    pub fn ensure_local_runtime_supported(&self) -> Result<()> {
+        if !Self::local_runtime_supported_on_platform(cfg!(windows), |key| std::env::var(key).ok())
+        {
+            return Err(WindowsNativeRuntimeUnsupportedSnafu.build());
+        }
+
+        Ok(())
     }
 
     /// Get the installed runtime version.
@@ -760,6 +791,35 @@ mod tests {
         let result = ctx.get_run_cmd(&[], None);
 
         assert!(result.is_err(), "Should fail when runtime not installed");
+    }
+
+    #[test]
+    fn test_local_runtime_supported_on_non_windows() {
+        assert!(RuntimeContext::local_runtime_supported_on_platform(false, |_| None));
+    }
+
+    #[test]
+    fn test_local_runtime_supported_in_wsl_on_windows() {
+        assert!(RuntimeContext::local_runtime_supported_on_platform(true, |key| {
+            if key == "WSL_DISTRO_NAME" {
+                Some("Ubuntu".to_string())
+            } else {
+                None
+            }
+        }));
+
+        assert!(RuntimeContext::local_runtime_supported_on_platform(true, |key| {
+            if key == "WSL_INTEROP" {
+                Some("/run/WSL/123_interop".to_string())
+            } else {
+                None
+            }
+        }));
+    }
+
+    #[test]
+    fn test_local_runtime_not_supported_on_native_windows() {
+        assert!(!RuntimeContext::local_runtime_supported_on_platform(true, |_| None));
     }
 
     #[test]
