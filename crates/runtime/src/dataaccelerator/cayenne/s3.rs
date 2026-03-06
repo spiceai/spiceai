@@ -479,16 +479,15 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                     // At least one zone confirmed the delete.
                     all_not_found = false;
                 }
-                Err(err) => match err {
-                    object_store::Error::NotFound { .. } => {
+                Err(err) => {
+                    if let object_store::Error::NotFound { .. } = err {
                         tracing::debug!(
                             "Object '{}' not found in zone '{}' during delete: {err}",
                             location,
                             zone.zone_id
                         );
                         last_not_found = Some(err);
-                    }
-                    _ => {
+                    } else {
                         tracing::warn!(
                             "Failed to delete object '{}' from zone '{}': {err}",
                             location,
@@ -497,17 +496,19 @@ impl ObjectStore for MultiZoneS3ExpressStore {
                         failed_zone_details.push(format!("{}: {err}", zone.zone_id));
                         all_not_found = false;
                     }
-                },
+                }
             }
         }
 
         if !failed_zone_details.is_empty() {
             Err(self.multi_zone_delete_error(&failed_zone_details))
         } else if all_not_found {
-            Err(last_not_found.unwrap_or_else(|| object_store::Error::NotFound {
-                path: location.to_string(),
-                source: "No configured S3 zones".into(),
-            }))
+            Err(
+                last_not_found.unwrap_or_else(|| object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: "No configured S3 zones".into(),
+                }),
+            )
         } else {
             Ok(())
         }
