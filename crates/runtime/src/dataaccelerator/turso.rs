@@ -707,10 +707,24 @@ mod tests {
     use std::collections::HashMap;
 
     fn cleanup_turso_test_files(path: &str) {
+        let path = std::path::Path::new(path);
+
+        if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str()))
+            && let Ok(entries) = std::fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+
+                if file_name.starts_with(stem) {
+                    std::fs::remove_file(&entry_path).ok();
+                }
+            }
+        }
+
         std::fs::remove_file(path).ok();
-        std::fs::remove_file(format!("{path}-wal")).ok();
-        std::fs::remove_file(format!("{path}-shm")).ok();
-        std::fs::remove_file(format!("{path}-log")).ok();
     }
 
     #[tokio::test]
