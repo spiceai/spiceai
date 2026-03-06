@@ -264,7 +264,12 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
+          export GITHUB_TOKEN='${{ secrets.GITHUB_TOKEN }}'
           export SPICE_OPENAI_API_KEY='${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}'
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "GITHUB_TOKEN is not available in WSL"
+            exit 1
+          fi
           if [ -z "$SPICE_OPENAI_API_KEY" ]; then
             echo "SPICE_OPENAI_API_KEY is not available in WSL"
             exit 1
