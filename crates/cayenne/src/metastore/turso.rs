@@ -135,8 +135,7 @@ impl TursoMetastore {
     /// Schema for the `cayenne_table` table.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_uuid TEXT NOT NULL,
+            table_id TEXT PRIMARY KEY,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
@@ -153,8 +152,8 @@ impl TursoMetastore {
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            delete_file_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -173,8 +172,8 @@ impl TursoMetastore {
     /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            partition_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             partition_columns_json TEXT NOT NULL,
             partition_values_json TEXT NOT NULL,
             partition_key TEXT NOT NULL,
@@ -196,8 +195,8 @@ impl TursoMetastore {
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            insert_record_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -212,7 +211,7 @@ impl TursoMetastore {
     /// <= the delete file's `sequence_number`.
     const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
-            table_id INTEGER NOT NULL,
+            table_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -417,7 +416,11 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        conn.execute(params.sql, turso_params)
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(convert_turso_error)?;
+        stmt.execute(turso_params)
             .await
             .map_err(convert_turso_error)?;
 
@@ -445,12 +448,18 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut rows =
-            conn.query(params.sql, turso_params)
-                .await
-                .map_err(|e| CatalogError::Database {
-                    message: format!("Failed to query row: {e}"),
-                })?;
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to query row: {e}"),
+            })?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to query row: {e}"),
+            })?;
 
         let row = rows.next().await.map_err(|e| CatalogError::Database {
             message: format!("Failed to fetch row: {e}"),
@@ -482,12 +491,18 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut rows =
-            conn.query(params.sql, turso_params)
-                .await
-                .map_err(|e| CatalogError::Database {
-                    message: format!("Failed to query rows: {e}"),
-                })?;
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to query rows: {e}"),
+            })?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to query rows: {e}"),
+            })?;
 
         let mut results = Vec::new();
 

@@ -470,7 +470,7 @@ impl CayenneDeletionSink {
         } else {
             let sequence = self
                 .catalog
-                .increment_sequence_number(self.table_metadata.table_id)
+                .increment_sequence_number(&self.table_metadata.table_id)
                 .await?;
             *delete_sequence = Some(sequence);
             sequence
@@ -494,7 +494,7 @@ impl CayenneDeletionSink {
         } else {
             let sequence = self
                 .catalog
-                .increment_sequence_number(self.table_metadata.table_id)
+                .increment_sequence_number(&self.table_metadata.table_id)
                 .await?;
             *delete_sequence = Some(sequence);
             sequence
@@ -516,7 +516,7 @@ impl CayenneDeletionSink {
 
         let delete_sequence = self
             .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await?;
 
         self.persist_key_based_deletions_with_sequence(filtered_row_keys, delete_sequence)
@@ -634,7 +634,7 @@ impl CayenneDeletionSink {
 
         let delete_sequence = self
             .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await?;
 
         self.persist_int64_pk_deletions_with_sequence(filtered_pk_values, delete_sequence)
