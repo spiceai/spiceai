@@ -860,7 +860,11 @@ mod tests {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
-        assert!(task.write_change(change_batch).await.unwrap());
+        assert!(
+            task.write_change(change_batch)
+                .await
+                .expect("write_change should succeed")
+        );
     }
 
     #[tokio::test]
@@ -869,7 +873,11 @@ mod tests {
         let task = make_refresh_task(adapter as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
-        assert!(task.write_change(change_batch).await.unwrap());
+        assert!(
+            task.write_change(change_batch)
+                .await
+                .expect("write_change should succeed")
+        );
     }
 
     #[tokio::test]
@@ -877,6 +885,11 @@ mod tests {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         // Any unrecognized op string maps to ChangeOperation::Unknown
         let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
-        assert!(!task.write_change(change_batch).await.unwrap());
+        assert!(
+            !task
+                .write_change(change_batch)
+                .await
+                .expect("write_change should succeed")
+        );
     }
 }
