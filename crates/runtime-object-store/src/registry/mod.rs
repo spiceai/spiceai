@@ -58,7 +58,7 @@ impl SpiceObjectStoreRegistry {
     fn parse_s3_url_style(params: &HashMap<String, String>) -> datafusion::error::Result<bool> {
         match params.get("url_style").map(String::as_str) {
             Some("path") => Ok(false),
-            Some("virtual") | None => Ok(true),
+            Some("vhost") | None => Ok(true),
             Some(value) => Err(DataFusionError::Configuration(format!(
                 "{value} is not a valid value for url_style"
             ))),
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_s3_url_style_defaults_to_virtual() {
+    fn test_parse_s3_url_style_defaults_to_vhost() {
         let params = HashMap::new();
         assert_eq!(
             SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
@@ -845,8 +845,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_s3_url_style_virtual() {
-        let params = HashMap::from([("url_style".to_string(), "virtual".to_string())]);
+    fn test_parse_s3_url_style_vhost() {
+        let params = HashMap::from([("url_style".to_string(), "vhost".to_string())]);
         assert_eq!(
             SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
             Some(true)
@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_for_s3_url_style_virtual_adds_bucket_prefix() {
+    fn test_endpoint_for_s3_url_style_vhost_adds_bucket_prefix() {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://t3.storage.dev",
             "spiceai-public-datasets",
@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_for_s3_url_style_virtual_preserves_prefixed_endpoint() {
+    fn test_endpoint_for_s3_url_style_vhost_preserves_prefixed_endpoint() {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://spiceai-public-datasets.t3.storage.dev",
             "spiceai-public-datasets",
@@ -897,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_for_s3_url_style_virtual_with_port_preserves_port() {
+    fn test_endpoint_for_s3_url_style_vhost_with_port_preserves_port() {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "http://minio:9000",
             "bucket",
@@ -909,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_for_s3_url_style_virtual_with_ip_returns_error() {
+    fn test_endpoint_for_s3_url_style_vhost_with_ip_returns_error() {
         let message = format!(
             "{:#}",
             SpiceObjectStoreRegistry::endpoint_for_s3_url_style(

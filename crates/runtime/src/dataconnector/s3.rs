@@ -134,9 +134,9 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("region").secret(),
             ParameterSpec::component("endpoint").secret(),
             ParameterSpec::component("url_style")
-                .description("Controls S3 URL addressing style. Supported values: 'virtual' (default) and 'path'.")
-                .default("virtual")
-                .one_of(&["virtual", "path"]),
+                .description("Controls S3 URL addressing style. Supported values: 'vhost' (default) and 'path'.")
+                .default("vhost")
+                .one_of(&["vhost", "path"]),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
             ParameterSpec::component("session_token").secret(),
@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_url_style_defaults_to_virtual() {
+    async fn test_url_style_defaults_to_vhost() {
         let params = create_test_parameters(vec![]).await;
         let connector = create_test_connector(params);
         let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
@@ -381,7 +381,7 @@ mod tests {
             .get_object_store_url(&dataset, None)
             .expect("object store URL should be constructed");
 
-        assert_eq!(object_store_url.fragment(), Some("url_style=virtual"));
+        assert_eq!(object_store_url.fragment(), Some("url_style=vhost"));
     }
 
     #[tokio::test]
