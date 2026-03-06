@@ -58,7 +58,9 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::{collect, execute_stream};
 use datafusion_catalog::TableProvider;
@@ -98,6 +100,8 @@ pub struct CayenneDeletionSink {
     pk_column_indices: Vec<usize>,
     /// Additional listing tables from protected snapshots that should also be scanned for deletions.
     protected_snapshot_tables: Vec<Arc<ListingTable>>,
+    /// Shared `RuntimeEnv` for S3 object store access.
+    runtime_env: Arc<RuntimeEnv>,
 }
 
 impl CayenneDeletionSink {
@@ -113,6 +117,7 @@ impl CayenneDeletionSink {
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
         Self {
             table_metadata,
@@ -124,6 +129,7 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             protected_snapshot_tables,
+            runtime_env,
         }
     }
 
@@ -764,7 +770,10 @@ impl CayenneDeletionSink {
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(&self.runtime_env),
+        );
 
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
