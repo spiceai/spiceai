@@ -448,12 +448,12 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut stmt = conn
-            .prepare_cached(params.sql)
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to query row: {e}"),
-            })?;
+        let mut stmt =
+            conn.prepare_cached(params.sql)
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to query row: {e}"),
+                })?;
         let mut rows = stmt
             .query(turso_params)
             .await
@@ -491,12 +491,12 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut stmt = conn
-            .prepare_cached(params.sql)
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to query rows: {e}"),
-            })?;
+        let mut stmt =
+            conn.prepare_cached(params.sql)
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to query rows: {e}"),
+                })?;
         let mut rows = stmt
             .query(turso_params)
             .await
