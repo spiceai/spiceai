@@ -434,8 +434,25 @@ jobs:
           build-path: ./build
 
       - name: Run spice install
+        if: matrix.target.target_os != 'windows'
         run: |
           spice install
+
+      - name: Validate native Windows spice install guidance
+        if: matrix.target.target_os == 'windows'
+        shell: pwsh
+        run: |
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $installOutput = (& spice install 2>&1 | Out-String)
+          Write-Host $installOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice install unexpectedly succeeded on native Windows"
+          }
+          if (-not $installOutput.Contains($expected)) {
+            throw "spice install did not print the expected WSL guidance"
+          }
+
+          exit 0
 
       - name: Run spice version
         run: |
@@ -502,25 +519,27 @@ jobs:
           # time to download runtime
           sleep 60
 
-      - name: Start spice runtime
+      - name: Validate native Windows spice run guidance
         if: matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
-          Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.stdout.log" -RedirectStandardError "spice.stderr.log"
-          # time to download runtime
-          Start-Sleep -Seconds 60
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $runOutput = (& spice run 2>&1 | Out-String)
+          Write-Host $runOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice run unexpectedly succeeded on native Windows"
+          }
+          if (-not $runOutput.Contains($expected)) {
+            throw "spice run did not print the expected WSL guidance"
+          }
+
+          exit 0
 
       - name: Stop spice and check logs
         if: always() && matrix.target.target_os != 'windows'
         run: |
           killall spice || true
           cat spice.log
-
-      - name: Stop spice and check logs
-        if: always() && matrix.target.target_os == 'windows'
-        shell: pwsh
-        run: |
-          Get-Process -Name spice -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Get-Content spice.stdout.log, spice.stderr.log
 
       - name: Run spice version
         run: |
