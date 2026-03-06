@@ -30,7 +30,6 @@ fn get_rustfs_hive_dataset_with_location(name: &str, endpoint: &str) -> Dataset 
             ("client_timeout".to_string(), "120s".to_string()),
             ("hive_partitioning_enabled".to_string(), "true".to_string()),
             ("s3_endpoint".to_string(), endpoint.to_string()),
-            ("s3_url_style".to_string(), "path".to_string()),
             ("s3_region".to_string(), "us-west-2".to_string()),
             ("s3_key".to_string(), "rustfsadmin".to_string()),
             ("s3_secret".to_string(), "rustfsadmin".to_string()),
