@@ -20,26 +20,26 @@ use std::time::Duration;
 ///
 /// This should be used when issuing write transactions that may contend with
 /// other writers and are expected to be retried on conflict. It relies on
-/// libsql's WAL support and is only valid when the database is configured
-/// with WAL journal mode (see [`JOURNAL_MODE_SQL_LITERAL`]).
+/// libsql's MVCC support and is only valid when the database is configured
+/// with MVCC journal mode (see [`JOURNAL_MODE_SQL_LITERAL`]).
 pub const BEGIN_CONCURRENT_SQL: &str = "BEGIN CONCURRENT";
 
 /// SQL used to begin a standard transaction.
 ///
 /// Use this for transactions that do not require `BEGIN CONCURRENT` semantics
-/// (for example, when WAL is not enabled, or when the client handles
+/// (for example, when MVCC is not enabled, or when the client handles
 /// concurrency differently).
 pub const BEGIN_TRANSACTION_SQL: &str = "BEGIN TRANSACTION";
 
 /// SQL used to commit either a concurrent or standard transaction.
 pub const COMMIT_SQL: &str = "COMMIT";
 
-/// SQL literal for configuring libsql/Turso to use WAL journal mode.
+/// SQL literal for configuring libsql/Turso to use MVCC journal mode.
 ///
 /// This is typically passed to `PRAGMA journal_mode` before using
 /// [`BEGIN_CONCURRENT_SQL`] so that concurrent write transactions can rely on
-/// WAL semantics. The value includes SQL single-quoting.
-pub const JOURNAL_MODE_SQL_LITERAL: &str = "'wal'";
+/// MVCC semantics. The value includes SQL single-quoting.
+pub const JOURNAL_MODE_SQL_LITERAL: &str = "'mvcc'";
 
 /// Default maximum number of attempts for retrying a concurrent write
 /// transaction after retryable conflicts.
