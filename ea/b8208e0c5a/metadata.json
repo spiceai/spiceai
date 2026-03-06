@@ -1,0 +1,35 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "eab8208e0c5a",
+  "strategy": "manual-commit",
+  "branch": "new_b/fix-initial-partitions-max-limit",
+  "checkpoints_count": 1,
+  "files_touched": [
+    ".claude/settings.json",
+    ".distributed/executor1/pid",
+    ".distributed/scheduler/pid",
+    ".zed/settings.json",
+    "data",
+    "description.md",
+    "logs.temp",
+    "parse_dont_validate.md",
+    "qs2.json",
+    "spiced_local"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ea/b8208e0c5a/0/metadata.json",
+      "transcript": "/ea/b8208e0c5a/0/full.jsonl",
+      "context": "/ea/b8208e0c5a/0/context.md",
+      "content_hash": "/ea/b8208e0c5a/0/content_hash.txt",
+      "prompt": "/ea/b8208e0c5a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 35,
+    "cache_creation_tokens": 23678,
+    "cache_read_tokens": 1073933,
+    "output_tokens": 7873,
+    "api_call_count": 29
+  }
+}
