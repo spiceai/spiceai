@@ -150,12 +150,6 @@ jobs:
         run: |
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
-      - name: install AI runtime version
-        run: |
-          spice install ai
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: check installation
         run: |
           spice version
@@ -250,14 +244,6 @@ jobs:
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
           curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
-
-      - name: install AI runtime version
-        shell: wsl-bash {0}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          export PATH="$HOME/.spice/bin:$PATH"
-          spice install ai
 
       - name: check installation
         shell: wsl-bash {0}
