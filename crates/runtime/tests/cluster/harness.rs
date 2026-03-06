@@ -134,8 +134,6 @@ impl NodePorts {
 /// Drop aborts background server handles. Call [`shutdown`](ClusterHarness::shutdown)
 /// for an orderly teardown that waits for runtimes to stop.
 pub struct ClusterHarness {
-    /// Temporary directory shared by all nodes.  Kept alive for the harness lifetime.
-    pub tempdir: Arc<TempDir>,
     /// The scheduler runtime.
     pub scheduler: Arc<Runtime>,
     /// All executor runtimes, in the order they were added.
@@ -159,22 +157,6 @@ impl ClusterHarness {
         ClusterHarnessBuilder::new()
     }
 
-    /// The scheduler runtime.
-    pub fn scheduler(&self) -> &Arc<Runtime> {
-        &self.scheduler
-    }
-
-    /// The `i`-th executor runtime (0-indexed).
-    pub fn executor(&self, i: usize) -> &Arc<Runtime> {
-        &self.executors[i]
-    }
-
-    /// The per-executor data directory that tests can use to isolate Cayenne
-    /// file-mode acceleration between in-process executors.
-    pub fn executor_data_dir(&self, i: usize) -> PathBuf {
-        self.tempdir.path().join(format!("executor{i}_data"))
-    }
-
     /// Block until exactly `n` executors have registered with the scheduler,
     /// or return an error after `timeout`.
     pub async fn wait_for_executors(&self, timeout: Duration) -> Result<(), anyhow::Error> {
@@ -193,28 +175,6 @@ impl ClusterHarness {
             if start.elapsed() > timeout {
                 return Err(anyhow::Error::msg(format!(
                     "Timed out waiting for {n} executors; found {count}"
-                )));
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    }
-
-    /// Wait until the executor count drops to zero (useful after shutdown).
-    pub async fn wait_for_no_executors(&self, timeout: Duration) -> Result<(), anyhow::Error> {
-        let start = Instant::now();
-        loop {
-            let count = self
-                .executor_manager
-                .get_executor_state()
-                .await
-                .map_err(|e| anyhow::Error::msg(e.to_string()))?
-                .len();
-            if count == 0 {
-                return Ok(());
-            }
-            if start.elapsed() > timeout {
-                return Err(anyhow::Error::msg(format!(
-                    "Timed out waiting for executors to deregister; found {count}"
                 )));
             }
             sleep(Duration::from_millis(200)).await;
@@ -273,23 +233,6 @@ impl ClusterHarnessBuilder {
     /// Set the scheduler's `App` (datasets, runtime config, etc.).
     pub fn scheduler(mut self, app: App) -> Self {
         self.scheduler_app = Some(app);
-        self
-    }
-
-    /// Add one executor with an empty `App`.
-    ///
-    /// In cluster mode the executor receives its dataset definitions from the
-    /// scheduler via `get_app_definition`; the local app is only used for
-    /// executor-local overrides (e.g. `shuffle_location`, per-executor dirs).
-    pub fn executor(mut self) -> Self {
-        self.executor_apps.push(None);
-        self
-    }
-
-    /// Add one executor with a custom `App` (e.g. with per-executor acceleration
-    /// params for Cayenne `cayenne_data_dir` / `cayenne_metadata_dir`).
-    pub fn executor_with_app(mut self, app: App) -> Self {
-        self.executor_apps.push(Some(app));
         self
     }
 
@@ -473,7 +416,6 @@ impl ClusterHarnessBuilder {
             .clone();
 
         Ok(ClusterHarness {
-            tempdir,
             scheduler: scheduler_rt,
             executors: executor_rts,
             handles,
