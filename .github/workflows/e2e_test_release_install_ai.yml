@@ -223,35 +223,25 @@ jobs:
       - name: checkout code
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: install Spice (https://install.spiceai.org)
-        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1
-          PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
-        shell: pwsh
+      - name: Install Visual Studio Build Tools
+        uses: ./.github/actions/install-vs-buildtools
 
-      - name: install Spice (from branch)
-        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $branch = "${{ inputs.install_script_branch }}"
-          if ([string]::IsNullOrEmpty($branch)) {
-            $branch = "${{ github.head_ref }}"
-            if ([string]::IsNullOrEmpty($branch)) {
-              $branch = "${{ github.ref_name }}"
-            }
-          }
-          $url = "https://raw.githubusercontent.com/spiceai/spiceai/$branch/install/Install.ps1"
-          curl -L $url -o Install.ps1
-          PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
-        shell: pwsh
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
-      - name: add Spice bin to PATH
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Spice CLI
+        working-directory: bin/spiced
         run: |
-          Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
+          cargo build -p spice --bin spice --target-dir ../../target
+
+      - name: add built Spice bin to PATH
+        run: |
+          Add-Content $env:GITHUB_PATH (Join-Path $PWD "target\debug")
         shell: pwsh
 
       - name: check installation
