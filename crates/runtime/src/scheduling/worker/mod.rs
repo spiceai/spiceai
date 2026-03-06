@@ -26,6 +26,7 @@ use tracing_futures::Instrument;
 
 use crate::Runtime;
 use crate::http::v1::run_sql;
+use crate::lifecycle_events::{LifecycleEvent, LifecycleEventLevel, LifecycleEventTopic};
 
 pub struct WorkerPromptTask {
     runtime: Arc<Runtime>,
@@ -52,6 +53,16 @@ impl ScheduledTask for WorkerPromptTask {
             let worker_name = Arc::clone(&self.worker_name);
             let prompt = Arc::clone(&self.prompt);
             let runtime = Arc::clone(&self.runtime);
+            let component = format!("worker:{worker_name}");
+
+            runtime.emit_lifecycle_event(LifecycleEvent::new(
+                LifecycleEventLevel::Info,
+                LifecycleEventTopic::Crons,
+                component.clone(),
+                "worker_cron",
+                Some("started".to_string()),
+                Some("Started scheduled prompt worker execution".to_string()),
+            ));
 
             let workers_lock = Arc::clone(&runtime.workers);
             let workers = workers_lock.read().await;
@@ -96,6 +107,23 @@ impl ScheduledTask for WorkerPromptTask {
                 tracing::error!(
                     "Failed to execute worker prompt task for worker '{worker_name}': {e}",
                 );
+                runtime.emit_lifecycle_event(LifecycleEvent::new(
+                    LifecycleEventLevel::Error,
+                    LifecycleEventTopic::Crons,
+                    component,
+                    "worker_cron",
+                    Some("error".to_string()),
+                    Some(e.to_string()),
+                ));
+            } else {
+                runtime.emit_lifecycle_event(LifecycleEvent::new(
+                    LifecycleEventLevel::Success,
+                    LifecycleEventTopic::Crons,
+                    component,
+                    "worker_cron",
+                    Some("completed".to_string()),
+                    Some("Completed scheduled prompt worker execution".to_string()),
+                ));
             }
 
             Ok(())
@@ -130,6 +158,17 @@ impl ScheduledTask for WorkerSqlTask {
             let worker_name = Arc::clone(&self.worker_name);
             let sql = Arc::clone(&self.sql);
             let runtime = Arc::clone(&self.runtime);
+            let component = format!("worker:{worker_name}");
+
+            runtime
+                .emit_lifecycle_event(LifecycleEvent::new(
+                    LifecycleEventLevel::Info,
+                    LifecycleEventTopic::Crons,
+                    component.clone(),
+                    "worker_cron",
+                    Some("started".to_string()),
+                    Some("Started scheduled SQL worker execution".to_string()),
+                ));
 
             if !runtime.status.is_ready() {
                 tracing::debug!("Runtime is not ready, skipping worker SQL task execution for worker: {worker_name}");
@@ -151,6 +190,25 @@ impl ScheduledTask for WorkerSqlTask {
                 tracing::error!(
                     "Failed to execute worker SQL task for worker '{worker_name}': {e}",
                 );
+                runtime
+                    .emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Error,
+                        LifecycleEventTopic::Crons,
+                        component,
+                        "worker_cron",
+                        Some("error".to_string()),
+                        Some(e.to_string()),
+                    ));
+            } else {
+                runtime
+                    .emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Success,
+                        LifecycleEventTopic::Crons,
+                        component,
+                        "worker_cron",
+                        Some("completed".to_string()),
+                        Some("Completed scheduled SQL worker execution".to_string()),
+                        ));
             }
 
             Ok(())

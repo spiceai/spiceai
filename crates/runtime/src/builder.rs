@@ -377,6 +377,8 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle_events: Arc::new(crate::lifecycle_events::LifecycleEventDispatcher::new()),
+            lifecycle_events_listener_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),

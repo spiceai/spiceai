@@ -27,7 +27,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Weak;
 use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicBool},
+};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
@@ -108,6 +111,7 @@ pub mod http_types {
 mod init;
 pub mod internal_table;
 pub mod jobs;
+mod lifecycle_events;
 mod management;
 mod metrics;
 pub mod metrics_reader;
@@ -424,9 +428,9 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to infer the worker type for the worker '{name}'. Ensure the worker has a valid configuration, and try again. For details, visit: https://spiceai.org/docs/components/workers"
+        "Failed to configure worker '{name}': {details}. Ensure the worker has a valid configuration, and try again. For details, visit: https://spiceai.org/docs/components/workers"
     ))]
-    FailedToInferWorkerType { name: String },
+    FailedToInferWorkerType { name: String, details: String },
 
     #[snafu(display(
         "Dataset {dataset_name}: acceleration is required for full text search. Ensure the dataset has an acceleration configuration, and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
@@ -509,6 +513,8 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    lifecycle_events: Arc<lifecycle_events::LifecycleEventDispatcher>,
+    lifecycle_events_listener_started: Arc<AtomicBool>,
 
     /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
     distributed: Option<DistributedNode>,
@@ -558,6 +564,51 @@ impl Runtime {
     #[must_use]
     pub fn status(&self) -> Arc<status::RuntimeStatus> {
         Arc::clone(&self.status)
+    }
+
+    pub async fn register_lifecycle_events_worker_from_component(
+        &self,
+        cfg: &spicepod::component::worker::Worker,
+    ) {
+        let Some(url) = cfg
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.webhook.as_ref())
+        else {
+            return;
+        };
+
+        if reqwest::Url::parse(url).is_err() {
+            tracing::warn!(
+                "Ignoring webhook worker '{}': invalid URL '{}'.",
+                cfg.name,
+                url
+            );
+            return;
+        }
+
+        let filters = lifecycle_events::LifecycleEventFilters::from_event_filters(
+            cfg.triggers
+                .as_ref()
+                .and_then(|triggers| triggers.event.as_ref()),
+        );
+        self.lifecycle_events
+            .register_webhook_worker(lifecycle_events::WebhookWorkerConfig {
+                name: cfg.name.clone(),
+                url: url.clone(),
+                filters,
+            })
+            .await;
+    }
+
+    pub async fn unregister_lifecycle_events_worker(&self, worker_name: &str) {
+        self.lifecycle_events
+            .unregister_webhook_worker(worker_name)
+            .await;
+    }
+
+    pub fn emit_lifecycle_event(&self, event: lifecycle_events::LifecycleEvent) {
+        self.lifecycle_events.dispatch_event(event);
     }
 
     #[must_use]
@@ -1211,6 +1262,26 @@ impl Runtime {
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(self: Arc<Self>) {
+        if self
+            .lifecycle_events_listener_started
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            Arc::clone(&self.lifecycle_events).spawn_status_update_listener(self.status());
+        }
+
+        if let Some(app) = self.read_app().await {
+            for worker in &app.workers {
+                self.register_lifecycle_events_worker_from_component(worker)
+                    .await;
+            }
+        }
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;

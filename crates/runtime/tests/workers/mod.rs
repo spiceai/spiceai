@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use snafu::ResultExt;
 use spicepod::component::model::Model;
-use spicepod::component::worker::{LoadBalanceParams, RouterConfig, Worker};
+use spicepod::component::worker::{RouterConfig, Routing, TriggerConfig, Worker};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,23 +31,25 @@ use crate::utils::{
 use crate::{DEFAULT_TRACING_MODELS, init_tracing};
 
 fn create_loadbalance_worker(name: &str, models: &[&str], cron: &str, prompt: &str) -> Worker {
-    let mut params = HashMap::new();
-    params.insert("prompt".to_string(), prompt.into());
-
     Worker {
         name: name.to_string(),
         description: None,
-        params,
-        load_balance: Some(LoadBalanceParams {
-            routing: models
+        params: HashMap::new(),
+        routing: Some(Routing {
+            prompt: Some(prompt.to_string()),
+            sql: None,
+            webhook: None,
+            models: models
                 .iter()
                 .map(|m| RouterConfig::RoundRobin {
                     from: (*m).to_string(),
                 })
                 .collect(),
         }),
-        cron: Some(cron.to_string()),
-        sql: None,
+        triggers: Some(TriggerConfig {
+            cron: Some(cron.to_string()),
+            event: None,
+        }),
     }
 }
 
@@ -56,9 +58,16 @@ fn create_sql_worker(name: &str, sql: &str, cron: &str) -> Worker {
         name: name.to_string(),
         description: None,
         params: HashMap::new(),
-        load_balance: None,
-        cron: Some(cron.to_string()),
-        sql: Some(sql.to_string()),
+        routing: Some(Routing {
+            prompt: None,
+            sql: Some(sql.to_string()),
+            webhook: None,
+            models: Vec::new(),
+        }),
+        triggers: Some(TriggerConfig {
+            cron: Some(cron.to_string()),
+            event: None,
+        }),
     }
 }
 

@@ -18,7 +18,6 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
-use serde_json::Value;
 use spicepod::component::worker::Worker as WorkerComponent;
 use tokio::sync::RwLock;
 use workers::RouterModel;
@@ -32,6 +31,7 @@ pub enum WorkerType {
     #[default]
     LoadBalance,
     Sql,
+    Webhook,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,33 +54,57 @@ impl std::fmt::Display for WorkerType {
         match self {
             WorkerType::LoadBalance => write!(f, "load_balance"),
             WorkerType::Sql => write!(f, "sql"),
+            WorkerType::Webhook => write!(f, "webhook"),
         }
     }
 }
 
 #[expect(clippy::result_large_err)]
 fn infer_worker_type(worker: &WorkerComponent) -> Result<WorkerType> {
-    match (worker.load_balance.as_ref(), worker.sql.as_ref()) {
-        (Some(_), None) => Ok(WorkerType::LoadBalance),
-        (None, Some(_)) => Ok(WorkerType::Sql),
+    let routing = worker.routing.as_ref();
+
+    match (
+        routing.and_then(|routing| routing.prompt.as_ref()),
+        routing.and_then(|routing| routing.sql.as_ref()),
+        routing.and_then(|routing| routing.webhook.as_ref()),
+    ) {
+        (Some(_), None, None) => Ok(WorkerType::LoadBalance),
+        (None, Some(_), None) => Ok(WorkerType::Sql),
+        (None, None, Some(_)) => Ok(WorkerType::Webhook),
         _ => Err(super::Error::FailedToInferWorkerType {
             name: worker.name.clone(),
+            details: "set exactly one of 'routing.prompt', 'routing.sql', or 'routing.webhook'"
+                .to_string(),
         }),
     }
 }
 
 #[expect(clippy::result_large_err)]
 pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Arc<dyn Worker>> {
+    worker
+        .validate()
+        .map_err(|details| super::Error::FailedToInferWorkerType {
+            name: worker.name.clone(),
+            details,
+        })?;
+
     let worker_type = infer_worker_type(worker)?;
 
     match worker_type {
         WorkerType::LoadBalance => {
-            let Some(load_balance) = &worker.load_balance else {
-                unreachable!("LoadBalance worker must have load_balance defined");
+            let Some(routing) = &worker.routing else {
+                unreachable!("LoadBalance worker must have routing defined");
             };
 
-            let schedule_parameters = match (worker.cron.clone(), worker.params.get("prompt")) {
-                (Some(cron), Some(Value::String(prompt))) => {
+            let schedule_parameters = match (
+                worker
+                    .triggers
+                    .as_ref()
+                    .and_then(|triggers| triggers.cron.as_ref())
+                    .cloned(),
+                routing.prompt.as_ref(),
+            ) {
+                (Some(cron), Some(prompt)) => {
                     Some(WorkerScheduleParameters::Prompt {
                         cron,
                         prompt: prompt.clone(),
@@ -93,17 +117,10 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
                     );
                     None
                 }
-                (None, Some(Value::String(_))) => {
+                (None, Some(_)) => {
                     tracing::warn!(
                         "Worker '{}' has a 'prompt' but no 'cron' is specified.\nThe worker will not be scheduled to run.\nSpecify a 'cron' parameter and try again.",
                         worker.name
-                    );
-                    None
-                }
-                (_, Some(v)) => {
-                    tracing::warn!(
-                        "Worker '{}' has a 'prompt' but it is not a string: {v}.\nThe worker will not be scheduled to run.\nSpecify a valid 'prompt' parameter and try again.",
-                        worker.name,
                     );
                     None
                 }
@@ -118,7 +135,7 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
 
             let model = RouterModel::new(
                 worker.name.clone(),
-                load_balance.routing.as_slice(),
+                routing.models.as_slice(),
                 Arc::clone(&rt.completion_llms),
             );
             Ok(Arc::new(LoadBalanceWorker::new(
@@ -128,11 +145,19 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
             )))
         }
         WorkerType::Sql => {
-            let Some(sql) = &worker.sql else {
+            let Some(routing) = &worker.routing else {
+                unreachable!("SQL worker must have routing defined");
+            };
+
+            let Some(sql) = &routing.sql else {
                 unreachable!("SQL worker must have sql defined");
             };
 
-            let schedule_parameters = if let Some(cron) = &worker.cron {
+            let schedule_parameters = if let Some(cron) = worker
+                .triggers
+                .as_ref()
+                .and_then(|triggers| triggers.cron.as_ref())
+            {
                 Some(WorkerScheduleParameters::Sql {
                     cron: cron.clone(),
                     sql: sql.clone(),
@@ -151,6 +176,10 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
                 schedule_parameters,
             )))
         }
+        WorkerType::Webhook => Ok(Arc::new(WebhookWorker::new(
+            worker.name.clone(),
+            worker.description.clone(),
+        ))),
     }
 }
 
@@ -239,5 +268,26 @@ impl Worker for SQLWorker {
 
     fn schedule_parameters(&self) -> Option<WorkerScheduleParameters> {
         self.schedule_parameters.clone()
+    }
+}
+
+pub struct WebhookWorker {
+    name: String,
+    description: Option<String>,
+}
+
+impl WebhookWorker {
+    pub fn new(name: String, description: Option<String>) -> Self {
+        Self { name, description }
+    }
+}
+
+impl Worker for WebhookWorker {
+    fn name(&self) -> Cow<'_, str> {
+        self.name.clone().into()
+    }
+
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.description.as_ref().map(Into::into)
     }
 }

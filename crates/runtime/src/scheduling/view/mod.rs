@@ -22,6 +22,7 @@ use tonic::async_trait;
 use tracing_futures::Instrument;
 
 use crate::component::view::View;
+use crate::lifecycle_events::{LifecycleEvent, LifecycleEventLevel, LifecycleEventTopic};
 
 pub struct ViewRefreshTask(Arc<View>);
 
@@ -38,15 +39,59 @@ impl ScheduledTask for ViewRefreshTask {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "acceleration_refresh", input = %view.name.to_string());
         async {
             let runtime = Arc::clone(&view.runtime);
+            let component = format!("view:{}", view.name);
+
+            runtime.emit_lifecycle_event(LifecycleEvent::new(
+                LifecycleEventLevel::Info,
+                LifecycleEventTopic::Crons,
+                component.clone(),
+                "view_refresh_cron",
+                Some("started".to_string()),
+                Some("Started scheduled view refresh".to_string()),
+            ));
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
                 Ok(notifier) => {
                     if let Some(notifier) = notifier {
                         notifier.notified().await;
                     }
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Success,
+                        LifecycleEventTopic::Refreshes,
+                        component,
+                        "view_refresh_cron",
+                        Some("completed".to_string()),
+                        Some("Completed scheduled view refresh".to_string()),
+                    ));
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Success,
+                        LifecycleEventTopic::Accelerations,
+                        format!("view:{}", view.name),
+                        "view_refresh_cron",
+                        Some("completed".to_string()),
+                        Some("Completed accelerated view refresh".to_string()),
+                    ));
                     Ok(())
                 }
-                Err(e) => Err(scheduler::Error::RefreshTaskFailure { source: e.into() }),
+                Err(e) => {
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Error,
+                        LifecycleEventTopic::Refreshes,
+                        component,
+                        "view_refresh_cron",
+                        Some("error".to_string()),
+                        Some(e.to_string()),
+                    ));
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Error,
+                        LifecycleEventTopic::Accelerations,
+                        format!("view:{}", view.name),
+                        "view_refresh_cron",
+                        Some("error".to_string()),
+                        Some(e.to_string()),
+                    ));
+                    Err(scheduler::Error::RefreshTaskFailure { source: e.into() })
+                }
             }
         }
         .instrument(span)

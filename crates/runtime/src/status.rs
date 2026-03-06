@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
@@ -52,6 +52,14 @@ pub struct RuntimeStatus {
     ready_state: Arc<RwLock<RuntimeReadyState>>,
     /// Per-component notifiers for status change subscriptions.
     notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
+    /// Global subscribers that receive all component status updates.
+    status_update_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<ComponentStatusUpdate>>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ComponentStatusUpdate {
+    pub component_name: String,
+    pub status: ComponentStatus,
 }
 
 impl RuntimeStatus {
@@ -63,6 +71,7 @@ impl RuntimeStatus {
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             notifiers: Arc::new(RwLock::new(HashMap::new())),
+            status_update_subscribers: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -101,8 +110,35 @@ impl RuntimeStatus {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = notifiers.get(component_name) {
-            let _ = sender.send(status); // Ignore error if no receivers
+            let _ = sender.send(status.clone()); // Ignore error if no receivers
         }
+
+        // Broadcast the status update to global subscribers, removing closed channels.
+        let mut subscribers = self
+            .status_update_subscribers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subscribers.retain(|sender| {
+            sender
+                .send(ComponentStatusUpdate {
+                    component_name: component_name.to_string(),
+                    status: status.clone(),
+                })
+                .is_ok()
+        });
+    }
+
+    #[must_use]
+    pub fn subscribe_component_status_updates(
+        &self,
+    ) -> mpsc::UnboundedReceiver<ComponentStatusUpdate> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut subscribers = self
+            .status_update_subscribers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subscribers.push(tx);
+        rx
     }
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {

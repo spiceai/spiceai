@@ -22,6 +22,7 @@ use tonic::async_trait;
 use tracing_futures::Instrument;
 
 use crate::component::dataset::Dataset;
+use crate::lifecycle_events::{LifecycleEvent, LifecycleEventLevel, LifecycleEventTopic};
 
 pub struct DatasetRefreshTask(Arc<Dataset>);
 
@@ -37,6 +38,18 @@ impl ScheduledTask for DatasetRefreshTask {
         let dataset = Arc::clone(&self.0);
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "acceleration_refresh", input = %dataset.name.to_string());
         async {
+            let runtime = dataset.runtime();
+            let component = format!("dataset:{}", dataset.name);
+
+            runtime.emit_lifecycle_event(LifecycleEvent::new(
+                LifecycleEventLevel::Info,
+                LifecycleEventTopic::Crons,
+                component.clone(),
+                "dataset_refresh_cron",
+                Some("started".to_string()),
+                Some("Started scheduled dataset refresh".to_string()),
+            ));
+
             match dataset
                 .runtime()
                 .datafusion()
@@ -47,9 +60,43 @@ impl ScheduledTask for DatasetRefreshTask {
                     if let Some(notifier) = notifier {
                         notifier.notified().await;
                     }
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Success,
+                        LifecycleEventTopic::Refreshes,
+                        component,
+                        "dataset_refresh_cron",
+                        Some("completed".to_string()),
+                        Some("Completed scheduled dataset refresh".to_string()),
+                    ));
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Success,
+                        LifecycleEventTopic::Accelerations,
+                        format!("dataset:{}", dataset.name),
+                        "dataset_refresh_cron",
+                        Some("completed".to_string()),
+                        Some("Completed accelerated dataset refresh".to_string()),
+                    ));
                     Ok(())
                 }
-                Err(e) => Err(scheduler::Error::RefreshTaskFailure { source: e.into() }),
+                Err(e) => {
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Error,
+                        LifecycleEventTopic::Refreshes,
+                        component,
+                        "dataset_refresh_cron",
+                        Some("error".to_string()),
+                        Some(e.to_string()),
+                    ));
+                    runtime.emit_lifecycle_event(LifecycleEvent::new(
+                        LifecycleEventLevel::Error,
+                        LifecycleEventTopic::Accelerations,
+                        format!("dataset:{}", dataset.name),
+                        "dataset_refresh_cron",
+                        Some("error".to_string()),
+                        Some(e.to_string()),
+                    ));
+                    Err(scheduler::Error::RefreshTaskFailure { source: e.into() })
+                }
             }
         }
         .instrument(span)

@@ -1419,31 +1419,44 @@ tools:
 # Background worker configurations
 # =============================================================================
 workers:
-  # SQL-based worker with cron
+  # SQL worker — runs a query on a schedule
   - name: daily_aggregation
-    description: Daily data aggregation
-    sql: |
-      INSERT INTO aggregated_data
-      SELECT DATE(created_at) as day, COUNT(*) as count
-      FROM postgres_full
-      GROUP BY 1
-    cron: '0 0 * * *'
-    params:
-      timeout: 300s
-      retry_count: 3
+    routing:
+      sql: |
+        INSERT INTO aggregated_data
+        SELECT DATE(created_at) AS day, COUNT(*) AS count
+        FROM postgres_full
+        GROUP BY 1
+    triggers:
+      cron: '0 0 * * *'
 
-  # Load-balanced worker
+  # Load-balanced model worker — routes prompts across models
   - name: load_balanced_worker
-    description: Worker with load balancing
-    sql: SELECT 1
-    load_balance:
-      routing:
+    routing:
+      prompt: Summarize yesterday's key KPI changes.
+      models:
         - from: model_a
           order: 1
         - from: model_b
           order: 2
-        - from: model_c
-          weight: 50
+    triggers:
+      cron: '0 */6 * * *'
+
+  # Lifecycle webhook — sends all events to an endpoint
+  - name: lifecycle_webhook
+    routing:
+      webhook: https://example.com/spice/lifecycle
+
+  # Lifecycle webhook with event filters
+  - name: lifecycle_webhook_filtered
+    routing:
+      webhook: https://example.com/spice/lifecycle/critical
+    triggers:
+      event:
+        success: enabled
+        errors: enabled
+        datasets: enabled
+        refreshes: enabled
 
 # =============================================================================
 # DEPENDENCIES
