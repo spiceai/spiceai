@@ -278,6 +278,11 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
+          export SPICE_OPENAI_API_KEY='${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}'
+          if [ -z "$SPICE_OPENAI_API_KEY" ]; then
+            echo "SPICE_OPENAI_API_KEY is not available in WSL"
+            exit 1
+          fi
           spice run &> spice.log &
           for i in $(seq 1 180); do
             if [ "$(curl -s http://127.0.0.1:8090/v1/ready)" = "ready" ]; then
