@@ -701,6 +701,19 @@ pub struct Scheduler {
     pub partition_management: Option<PartitionManagement>,
 }
 
+impl Scheduler {
+    /// Returns the configured `max_partitions_per_executor`, falling back to
+    /// the default when no `partition_management` section is present.
+    #[must_use]
+    pub fn max_partitions_per_executor(&self) -> usize {
+        self.partition_management
+            .as_ref()
+            .map_or(default_max_partitions_per_executor(), |pm| {
+                pm.max_partitions_per_executor
+            })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

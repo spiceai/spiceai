@@ -183,14 +183,11 @@ pub struct ClusterServiceImpl {
     metrics_reader: Option<MetricsReader>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
-    /// Maximum number of partitions that can be assigned to a single executor.
-    max_partitions_per_executor: usize,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -199,7 +196,6 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
-        max_partitions_per_executor: usize,
     ) -> Self {
         Self {
             app,
@@ -210,7 +206,6 @@ impl ClusterServiceImpl {
             executor_registry,
             metrics_reader,
             executor_streams: ExecutorControlStreamRegistry::new(),
-            max_partitions_per_executor,
         }
     }
 
@@ -229,7 +224,6 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
-        max_partitions_per_executor: usize,
     ) -> Self {
         Self {
             app,
@@ -241,7 +235,6 @@ impl ClusterServiceImpl {
             metrics_reader,
 
             executor_streams,
-            max_partitions_per_executor,
         }
     }
 
@@ -610,18 +603,21 @@ impl ClusterService for ClusterServiceImpl {
         let app_guard = self.app.read().await;
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
+            let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
+                spicepod::component::runtime::PartitionManagement::default()
+                    .max_partitions_per_executor,
+                |s| s.max_partitions_per_executor(),
+            );
+
             // Find accelerated datasets with partitioning
             for table_ref in super::partition::accelerated_tables(app).keys() {
-                if total_assigned >= self.max_partitions_per_executor {
+                if total_assigned >= max_partitions_per_executor {
                     tracing::debug!(
-                        "Executor {executor_id} reached max_partitions_per_executor ({}) during initial allocation, skipping remaining tables",
-                        self.max_partitions_per_executor
+                        "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
                     );
                     break;
                 }
-                let remaining = self
-                    .max_partitions_per_executor
-                    .saturating_sub(total_assigned);
+                let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
 
                 if partition_manager
                     .get_cached_table_metadata(table_ref)
