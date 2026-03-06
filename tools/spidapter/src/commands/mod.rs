@@ -81,7 +81,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             resources: Some(AppResources {
                 limits: AppResourceLimits {
                     cpu: None,
-                    memory: "8Gi".to_string(),
+                    memory: "32Gi".to_string(),
                     ephemeral_storage: None,
                 },
                 requests: Some(AppResourceRequests {
