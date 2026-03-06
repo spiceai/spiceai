@@ -1240,10 +1240,6 @@ fn sql_text_literal(value: &str) -> String {
 }
 
 async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
-    if !metastore.is_turso() {
-        return;
-    }
-
     if let Err(error) = metastore
         .execute_helper(ExecuteParams {
             sql: "ROLLBACK",
@@ -1251,9 +1247,15 @@ async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
         })
         .await
     {
+        let backend = if metastore.is_turso() {
+            "Turso"
+        } else {
+            "SQLite"
+        };
         tracing::debug!(
+            backend,
             ?error,
-            "Failed to rollback Turso compaction transaction after batch error"
+            "Failed to rollback compaction transaction after batch error"
         );
     }
 }
@@ -2487,6 +2489,42 @@ mod tests {
         assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
 
         // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[test]
+    fn test_sql_text_literal_escapes_single_quotes() {
+        assert_eq!(sql_text_literal("abc'def"), "'abc''def'");
+    }
+
+    #[tokio::test]
+    async fn test_rollback_failed_compaction_transaction_cleans_up_sqlite_batch_error() {
+        let test_db = format!(
+            "sqlite://./.test_compaction_rollback_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let batch_result = catalog
+            .metastore
+            .execute_batch_helper(
+                "BEGIN TRANSACTION; INSERT INTO missing_table VALUES (1); COMMIT;",
+            )
+            .await;
+        assert!(batch_result.is_err(), "Expected batch execution to fail");
+
+        rollback_failed_compaction_transaction(&catalog.metastore).await;
+
+        catalog
+            .metastore
+            .execute_batch_helper("BEGIN TRANSACTION; COMMIT;")
+            .await
+            .expect("Expected rollback helper to clear the failed SQLite transaction");
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
