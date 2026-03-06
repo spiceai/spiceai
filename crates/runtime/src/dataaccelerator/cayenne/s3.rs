@@ -31,6 +31,7 @@ use runtime_parameters::ParameterSpec;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::ExposeSecret;
 use snafu::{ResultExt, Snafu};
+use tokio::sync::Mutex;
 use url::Url;
 
 use super::AccelerationSource;
@@ -382,19 +383,21 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let mut uploads: Vec<ZoneMultipartUpload> = Vec::with_capacity(self.zones.len());
+        let mut uploads: Vec<Arc<Mutex<ZoneMultipartUpload>>> =
+            Vec::with_capacity(self.zones.len());
         for zone in &self.zones {
             match zone.store.put_multipart_opts(location, opts.clone()).await {
                 Ok(upload) => {
-                    uploads.push(ZoneMultipartUpload {
+                    uploads.push(Arc::new(Mutex::new(ZoneMultipartUpload {
                         zone_id: zone.zone_id.clone(),
                         store: Arc::clone(&zone.store),
                         upload,
-                    });
+                    })));
                 }
                 Err(err) => {
                     // Abort any already-started uploads to avoid leaked multipart state.
-                    for mut started in uploads {
+                    for started in uploads {
+                        let mut started = started.lock().await;
                         if let Err(abort_err) = started.upload.abort().await {
                             tracing::warn!(
                                 "Failed to abort multipart upload for zone '{}' after zone '{}' init failure: {abort_err}",
@@ -621,33 +624,54 @@ struct ZoneMultipartUpload {
 struct MultiZoneMultipartUpload {
     location: Path,
     total_zones: usize,
-    uploads: Vec<ZoneMultipartUpload>,
+    uploads: Vec<Arc<Mutex<ZoneMultipartUpload>>>,
 }
 
 #[async_trait::async_trait]
 impl MultipartUpload for MultiZoneMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
-        let mut part_futures = Vec::with_capacity(self.uploads.len());
-        for zone_upload in &mut self.uploads {
-            part_futures.push((
-                zone_upload.zone_id.clone(),
-                zone_upload.upload.put_part(data.clone()),
-            ));
+        let uploads = self.uploads.iter().map(Arc::clone).collect::<Vec<_>>();
+        let mut part_futures = Vec::with_capacity(uploads.len());
+        for zone_upload in &uploads {
+            let zone_upload = Arc::clone(zone_upload);
+            let part_data = data.clone();
+            part_futures.push(async move {
+                let (zone_id, upload_part) = {
+                    let mut zone_upload = zone_upload.lock().await;
+                    (
+                        zone_upload.zone_id.clone(),
+                        zone_upload.upload.put_part(part_data),
+                    )
+                };
+                (zone_id, upload_part.await)
+            });
         }
 
         Box::pin(async move {
-            let results = join_all(
-                part_futures
-                    .into_iter()
-                    .map(|(zone_id, fut)| async move { (zone_id, fut.await) }),
-            )
-            .await;
+            let results = join_all(part_futures).await;
+            let mut first_error: Option<object_store::Error> = None;
 
             for (zone_id, result) in results {
                 if let Err(err) = result {
                     tracing::warn!("Failed multipart part upload in zone '{zone_id}': {err}");
-                    return Err(err);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
+            }
+
+            if let Some(err) = first_error {
+                // Best-effort abort on part upload failure to avoid leaked multipart uploads.
+                for zone_upload in uploads {
+                    let mut zone_upload = zone_upload.lock().await;
+                    if let Err(abort_err) = zone_upload.upload.abort().await {
+                        tracing::warn!(
+                            "Failed multipart abort in zone '{}' after part upload failure: {abort_err}",
+                            zone_upload.zone_id
+                        );
+                    }
+                }
+                return Err(err);
             }
             Ok(())
         })
@@ -658,7 +682,8 @@ impl MultipartUpload for MultiZoneMultipartUpload {
         let mut successful_zone_ids = Vec::new();
         let mut failed_zone_details = Vec::new();
 
-        for zone_upload in &mut self.uploads {
+        for zone_upload in &self.uploads {
+            let mut zone_upload = zone_upload.lock().await;
             match zone_upload.upload.complete().await {
                 Ok(put_result) => {
                     if first_success.is_none() {
@@ -688,12 +713,14 @@ impl MultipartUpload for MultiZoneMultipartUpload {
             .iter()
             .map(std::string::String::as_str)
             .collect();
-        let rollback_targets: Vec<(String, Arc<dyn ObjectStore>)> = self
-            .uploads
-            .iter()
-            .filter(|zone_upload| successful_set.contains(zone_upload.zone_id.as_str()))
-            .map(|zone_upload| (zone_upload.zone_id.clone(), Arc::clone(&zone_upload.store)))
-            .collect();
+        let mut rollback_targets: Vec<(String, Arc<dyn ObjectStore>)> = Vec::new();
+        for zone_upload in &self.uploads {
+            let zone_upload = zone_upload.lock().await;
+            if successful_set.contains(zone_upload.zone_id.as_str()) {
+                rollback_targets
+                    .push((zone_upload.zone_id.clone(), Arc::clone(&zone_upload.store)));
+            }
+        }
 
         for (zone_id, store) in rollback_targets {
             if let Err(err) = store.delete(&self.location).await {
@@ -719,7 +746,8 @@ impl MultipartUpload for MultiZoneMultipartUpload {
 
     async fn abort(&mut self) -> object_store::Result<()> {
         let mut first_error: Option<object_store::Error> = None;
-        for zone_upload in &mut self.uploads {
+        for zone_upload in &self.uploads {
+            let mut zone_upload = zone_upload.lock().await;
             if let Err(err) = zone_upload.upload.abort().await {
                 tracing::warn!(
                     "Failed multipart abort in zone '{}': {err}",
