@@ -16,7 +16,10 @@ limitations under the License.
 
 use arrow::array::{AsArray, RecordBatch};
 use async_trait::async_trait;
-use datafusion::{prelude::{col, lit}, scalar::ScalarValue};
+use datafusion::{
+    prelude::{col, lit},
+    scalar::ScalarValue,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -125,23 +128,22 @@ impl SpiceModelTool for LoadMemoryTool {
                 .checked_sub(last_interval_secs)
                 .ok_or_else(|| io::Error::other("Failed to compute memory cutoff timestamp"))?;
 
-            let Some(provider) = self.rt
-                .datafusion()
-                .get_table(&table_name)
-                .await
-            else {
-                return Err(io::Error::other(format!("Memory table not found: {table_name}")).into());
+            let Some(provider) = self.rt.datafusion().get_table(&table_name).await else {
+                return Err(
+                    io::Error::other(format!("Memory table not found: {table_name}")).into(),
+                );
             };
 
-            let batches = self.rt
+            let batches = self
+                .rt
                 .datafusion()
                 .ctx
                 .read_table(provider)
                 .boxed()?
-                .filter(col("created_at").gt(lit(ScalarValue::TimestampSecond(
-                    Some(created_after),
-                    None,
-                ))))
+                .filter(
+                    col("created_at")
+                        .gt(lit(ScalarValue::TimestampSecond(Some(created_after), None))),
+                )
                 .boxed()?
                 .sort(vec![col("created_at").sort(false, false)])
                 .boxed()?
@@ -191,8 +193,8 @@ impl SpiceModelTool for LoadMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MEMORY_LOAD_LIMIT, LoadMemoryParams, MAX_MEMORY_LOAD_LIMIT,
-        MAX_MEMORY_LOAD_OFFSET, default_memory_load_limit, validate_load_memory_params,
+        DEFAULT_MEMORY_LOAD_LIMIT, LoadMemoryParams, MAX_MEMORY_LOAD_LIMIT, MAX_MEMORY_LOAD_OFFSET,
+        default_memory_load_limit, validate_load_memory_params,
     };
 
     #[test]
@@ -233,6 +235,9 @@ mod tests {
         };
 
         let err = validate_load_memory_params(&params).expect_err("must reject large offset");
-        assert!(err.to_string().contains(&MAX_MEMORY_LOAD_OFFSET.to_string()));
+        assert!(
+            err.to_string()
+                .contains(&MAX_MEMORY_LOAD_OFFSET.to_string())
+        );
     }
 }

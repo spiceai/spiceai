@@ -189,11 +189,11 @@ mod tests {
             thoughts: vec!["ok".to_string(); MAX_MEMORY_THOUGHTS_PER_REQUEST + 1],
         };
 
-        let err =
-            validate_store_memory_params(&params).expect_err("must reject too many thoughts");
-        assert!(err
-            .to_string()
-            .contains(&MAX_MEMORY_THOUGHTS_PER_REQUEST.to_string()));
+        let err = validate_store_memory_params(&params).expect_err("must reject too many thoughts");
+        assert!(
+            err.to_string()
+                .contains(&MAX_MEMORY_THOUGHTS_PER_REQUEST.to_string())
+        );
     }
 
     #[test]
@@ -204,9 +204,10 @@ mod tests {
 
         let err = validate_store_memory_params(&params)
             .expect_err("must reject oversized individual thought");
-        assert!(err
-            .to_string()
-            .contains(&MAX_MEMORY_THOUGHT_BYTES.to_string()));
+        assert!(
+            err.to_string()
+                .contains(&MAX_MEMORY_THOUGHT_BYTES.to_string())
+        );
     }
 
     #[test]
@@ -218,8 +219,9 @@ mod tests {
 
         let err = validate_store_memory_params(&params)
             .expect_err("must reject oversized combined payload");
-        assert!(err
-            .to_string()
-            .contains(&MAX_MEMORY_TOTAL_BYTES.to_string()));
+        assert!(
+            err.to_string()
+                .contains(&MAX_MEMORY_TOTAL_BYTES.to_string())
+        );
     }
 }
