@@ -1165,14 +1165,6 @@ fn generate_hive_spicepod(
             enabled: false,
             ..TelemetryConfig::default()
         },
-        scheduler: setup_config.state_location.as_ref().map(|loc| Scheduler {
-            state_location: loc.clone(),
-            params: Some(Params::from_string_map(HashMap::from([(
-                "s3_auth".to_string(),
-                "key".to_string(),
-            )]))),
-            partition_management: None,
-        }),
         ..Runtime::default()
     };
 
@@ -1251,10 +1243,23 @@ fn generate_initial_spicepod(
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
 ) -> anyhow::Result<SpicepodDefinition> {
-    match setup_config.sink_type {
+    let mut spicepod = match setup_config.sink_type {
         Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id, flight_api_key),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
+    }?;
+
+    if let Some(ref loc) = setup_config.state_location {
+        spicepod.runtime.scheduler = Some(Scheduler {
+            state_location: loc.clone(),
+            params: Some(Params::from_string_map(HashMap::from([(
+                "s3_auth".to_string(),
+                "key".to_string(),
+            )]))),
+            partition_management: None,
+        });
     }
+
+    Ok(spicepod)
 }
 
 #[cfg(test)]
