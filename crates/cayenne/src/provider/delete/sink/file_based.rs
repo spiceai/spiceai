@@ -100,7 +100,7 @@ pub struct FileBasedDeletionSink {
     /// In-memory protected snapshots map (shared with `CayenneTableProvider`).
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
     /// Table ID for catalog operations.
-    table_id: i64,
+    table_id: String,
     /// Table base path for constructing snapshot directory paths.
     table_path: String,
     /// Shared runtime environment for cache invalidation after file deletion.
@@ -130,7 +130,7 @@ impl FileBasedDeletionSink {
         table_name: String,
         catalog: Arc<dyn MetadataCatalog>,
         protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
-        table_id: i64,
+        table_id: String,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
@@ -432,7 +432,7 @@ impl FileBasedDeletionSink {
             // 1. Remove snapshot sequence from catalog
             if let Err(e) = self
                 .catalog
-                .clear_snapshot_sequence(self.table_id, snapshot_id)
+                .clear_snapshot_sequence(&self.table_id, snapshot_id)
                 .await
             {
                 tracing::warn!(
@@ -455,7 +455,7 @@ impl FileBasedDeletionSink {
 
             // 3. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
-                .join(self.table_id.to_string())
+                .join(&self.table_id)
                 .join(snapshot_id);
             match tokio::fs::remove_dir_all(&snapshot_dir).await {
                 Ok(()) => {}

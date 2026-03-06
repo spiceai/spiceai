@@ -68,7 +68,7 @@ async fn create_partitioned_table(
     catalog: &Arc<CayenneCatalog>,
     table_name: &str,
     base_path: &str,
-) -> TestResult<i64> {
+) -> TestResult<String> {
     let schema = create_test_schema();
 
     let table_options = CreateTableOptions {
@@ -122,7 +122,7 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
 
             let handle = tokio::spawn(async move {
                 let mut partition = PartitionMetadata::new_single(
-                    table_id,
+                    table_id.clone(),
                     "partition_date".to_string(),
                     "2024-01-01".to_string(), // Same value for all
                     path.to_string_lossy().to_string(),
@@ -153,7 +153,7 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
             let path = table_dir.join(format!("partition_20240101_{i}"));
 
             let mut partition = PartitionMetadata::new_single(
-                table_id,
+                table_id.clone(),
                 "partition_date".to_string(),
                 "2024-01-01".to_string(), // Same value for all
                 path.to_string_lossy().to_string(),
@@ -174,7 +174,7 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
     );
 
     // Verify the partition exists and can be queried
-    let partitions = fixture.catalog.get_partitions(table_id).await?;
+    let partitions = fixture.catalog.get_partitions(&table_id).await?;
 
     assert_eq!(partitions.len(), 1, "Should have exactly one partition");
     assert_eq!(partitions[0].partition_id, partition_ids[0]);
@@ -205,7 +205,7 @@ async fn test_partition_roundtrip_impl(fixture: TestFixture) -> TestResult<()> {
 
     for value in partition_values {
         let mut partition = PartitionMetadata::new_single(
-            table_id,
+            table_id.clone(),
             "partition_date".to_string(),
             value.to_string(),
             table_dir
@@ -222,7 +222,7 @@ async fn test_partition_roundtrip_impl(fixture: TestFixture) -> TestResult<()> {
     }
 
     // Read back all partitions
-    let partitions = fixture.catalog.get_partitions(table_id).await?;
+    let partitions = fixture.catalog.get_partitions(&table_id).await?;
 
     assert_eq!(partitions.len(), 3, "Should have 3 partitions");
 
@@ -256,8 +256,8 @@ async fn test_delete_file_roundtrip_impl(fixture: TestFixture) -> TestResult<()>
 
     for i in 0..3 {
         let delete_file = DeleteFile {
-            delete_file_id: 0,
-            table_id,
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
             path: table_dir
                 .join(format!("delete_{i}.bin"))
                 .to_string_lossy()
@@ -276,7 +276,7 @@ async fn test_delete_file_roundtrip_impl(fixture: TestFixture) -> TestResult<()>
     }
 
     // Read back all delete files
-    let delete_files = fixture.catalog.get_table_delete_files(table_id).await?;
+    let delete_files = fixture.catalog.get_table_delete_files(&table_id).await?;
 
     assert_eq!(delete_files.len(), 3, "Should have 3 delete files");
 
@@ -362,7 +362,7 @@ async fn test_sequential_partition_stress_impl(fixture: TestFixture) -> TestResu
             .to_string();
 
         let mut partition = PartitionMetadata::new_single(
-            table_id,
+            table_id.clone(),
             "partition_date".to_string(),
             partition_value.clone(),
             path,
@@ -376,7 +376,7 @@ async fn test_sequential_partition_stress_impl(fixture: TestFixture) -> TestResu
     }
 
     // Verify we have exactly num_partitions unique partitions
-    let partitions = fixture.catalog.get_partitions(table_id).await?;
+    let partitions = fixture.catalog.get_partitions(&table_id).await?;
     assert_eq!(
         partitions.len(),
         num_partitions,
@@ -411,7 +411,7 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
 
     // Create first partition
     let mut partition1 = PartitionMetadata::new_single(
-        table_id,
+        table_id.clone(),
         "partition_date".to_string(),
         "2024-06-15".to_string(),
         table_dir.join("partition_v1").to_string_lossy().to_string(),
@@ -424,7 +424,7 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
 
     // Create second partition with same key but different path
     let mut partition2 = PartitionMetadata::new_single(
-        table_id,
+        table_id.clone(),
         "partition_date".to_string(),
         "2024-06-15".to_string(), // Same partition value
         table_dir.join("partition_v2").to_string_lossy().to_string(), // Different path
@@ -443,7 +443,7 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
 
     // Create third partition with same key
     let mut partition3 = PartitionMetadata::new_single(
-        table_id,
+        table_id.clone(),
         "partition_date".to_string(),
         "2024-06-15".to_string(), // Same partition value again
         table_dir.join("partition_v3").to_string_lossy().to_string(),
@@ -461,7 +461,7 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
     );
 
     // Verify only one partition exists in the catalog
-    let all_partitions = fixture.catalog.get_partitions(table_id).await?;
+    let all_partitions = fixture.catalog.get_partitions(&table_id).await?;
     assert_eq!(
         all_partitions.len(),
         1,
@@ -488,7 +488,7 @@ async fn test_constraint_violation_recovery_impl(fixture: TestFixture) -> TestRe
 
     // First, create a partition
     let mut partition1 = PartitionMetadata::new_single(
-        table_id,
+        table_id.clone(),
         "partition_date".to_string(),
         "2024-01-01".to_string(),
         table_dir.join("partition_1").to_string_lossy().to_string(),
@@ -501,7 +501,7 @@ async fn test_constraint_violation_recovery_impl(fixture: TestFixture) -> TestRe
 
     // Now try to create the same partition again (should return same ID)
     let mut partition2 = PartitionMetadata::new_single(
-        table_id,
+        table_id.clone(),
         "partition_date".to_string(),
         "2024-01-01".to_string(), // Same value
         table_dir.join("partition_2").to_string_lossy().to_string(), // Different path
@@ -519,7 +519,7 @@ async fn test_constraint_violation_recovery_impl(fixture: TestFixture) -> TestRe
     );
 
     // Verify only one partition exists
-    let all_partitions = fixture.catalog.get_partitions(table_id).await?;
+    let all_partitions = fixture.catalog.get_partitions(&table_id).await?;
     assert_eq!(all_partitions.len(), 1, "Should have exactly one partition");
 
     Ok(())
