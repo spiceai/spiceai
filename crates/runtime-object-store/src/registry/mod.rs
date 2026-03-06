@@ -158,6 +158,8 @@ impl SpiceObjectStoreRegistry {
     /// lookup on `<bucket>.<endpoint_host>`. If the name resolves the endpoint
     /// supports virtual-hosted style; NXDOMAIN means path style is required.
     fn detect_s3_url_style(bucket_name: &str, endpoint: &str) -> datafusion::error::Result<bool> {
+        use std::net::ToSocketAddrs;
+
         let endpoint_url = Url::parse(endpoint).map_err(|e| {
             DataFusionError::Configuration(format!(
                 "Unable to parse endpoint '{endpoint}' as URL: {e}"
@@ -181,20 +183,14 @@ impl SpiceObjectStoreRegistry {
             "s3_url_style not set for endpoint '{endpoint}'; resolving '{vhost_host}' to detect URL style..."
         );
 
-        use std::net::ToSocketAddrs;
-        match vhost_host.to_socket_addrs() {
-            Ok(_) => {
-                tracing::info!(
-                    "s3_url_style auto-detected: vhost (DNS resolved for '{vhost_host}')"
-                );
-                Ok(true)
-            }
-            Err(_) => {
-                tracing::info!(
-                    "s3_url_style auto-detected: path (DNS lookup failed for '{vhost_host}')"
-                );
-                Ok(false)
-            }
+        if vhost_host.to_socket_addrs().is_ok() {
+            tracing::info!("s3_url_style auto-detected: vhost (DNS resolved for '{vhost_host}')");
+            Ok(true)
+        } else {
+            tracing::info!(
+                "s3_url_style auto-detected: path (DNS lookup failed for '{vhost_host}')"
+            );
+            Ok(false)
         }
     }
 
