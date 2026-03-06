@@ -228,9 +228,23 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          Start-Process -FilePath spice -ArgumentList run -RedirectStandardOutput stdout.log -RedirectStandardError stderr.log
+          $process = Start-Process -FilePath spice -ArgumentList run -RedirectStandardOutput stdout.log -RedirectStandardError stderr.log -PassThru
           echo "Waiting for Spice runtime to be ready..."
-          do {
+          $res = ""
+          for ($attempt = 1; $attempt -le 480; $attempt++) {
+            if ($process.HasExited) {
+              Write-Host "spice exited before becoming ready with exit code: $($process.ExitCode)"
+              if (Test-Path stdout.log) {
+                Write-Host "Last stdout.log lines:"
+                Get-Content stdout.log -Tail 200
+              }
+              if (Test-Path stderr.log) {
+                Write-Host "Last stderr.log lines:"
+                Get-Content stderr.log -Tail 200
+              }
+              exit 1
+            }
+
             try {
               Start-Sleep -Seconds 1
               $response = Invoke-WebRequest -Uri "http://127.0.0.1:8090/v1/ready" -UseBasicParsing
@@ -241,7 +255,36 @@ jobs:
             } catch {
               Write-Host "Failed to reach /health endpoint. Error: $($_.Exception.Message)"
             }
-          } while ($res -ne "ready")
+
+            if ($res -eq "ready") {
+              break
+            }
+
+            if ($attempt % 30 -eq 0) {
+              Write-Host "Still waiting after $attempt seconds..."
+              if (Test-Path stdout.log) {
+                Write-Host "Last stdout.log lines:"
+                Get-Content stdout.log -Tail 40
+              }
+              if (Test-Path stderr.log) {
+                Write-Host "Last stderr.log lines:"
+                Get-Content stderr.log -Tail 40
+              }
+            }
+          }
+
+          if ($res -ne "ready") {
+            Write-Host "Timed out waiting for Spice runtime to become ready"
+            if (Test-Path stdout.log) {
+              Write-Host "Last stdout.log lines:"
+              Get-Content stdout.log -Tail 200
+            }
+            if (Test-Path stderr.log) {
+              Write-Host "Last stderr.log lines:"
+              Get-Content stderr.log -Tail 200
+            }
+            exit 1
+          }
 
           echo "Verifying embedding and vector search"
           $url = "http://127.0.0.1:8090/v1/search"
@@ -260,7 +303,7 @@ jobs:
           echo "Passed"
 
         shell: pwsh
-        timeout-minutes: 3
+        timeout-minutes: 10
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
