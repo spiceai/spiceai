@@ -232,6 +232,168 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!("explain_met_location_size_filtered", explain_met_location_size_filtered);
 
+            // ── Projected queries (not SELECT *) ──
+
+            // Projection with file + metadata columns
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT value, location FROM met_all ORDER BY value, location LIMIT 10")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let projected_value_location = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("projected_value_location", projected_value_location);
+
+            // Metadata-only projection
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT location FROM met_location ORDER BY location LIMIT 10")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let projected_location_only = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("projected_location_only", projected_location_only);
+
+            // Projected query with location filter
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT value, location FROM met_all WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY value")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let projected_value_location_filtered = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("projected_value_location_filtered", projected_value_location_filtered);
+
+            // Projection with partition + metadata columns (no file columns)
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT year, month, location FROM met_all ORDER BY year, month, location LIMIT 10")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let projected_partition_metadata = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("projected_partition_metadata", projected_partition_metadata);
+
+            // ── EmptyExec schema fix: non-existent location ──
+
+            // Non-existent location with SELECT *
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM met_location WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/nonexistent.parquet' ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let empty_result_star = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("empty_result_star", empty_result_star);
+
+            // Non-existent location with projection
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT value, location FROM met_all WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/nonexistent.parquet'")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let empty_result_projected = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("empty_result_projected", empty_result_projected);
+
+            // Multiple metadata columns with projection
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT id, location, size FROM met_all WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let projected_multi_metadata = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("projected_multi_metadata", projected_multi_metadata);
+
+            // ── Scalar functions on metadata columns ──
+            // Verifies that scalar functions (upper, lower, etc.) can be
+            // applied to metadata columns in projections and filters.
+
+            // Scalar function on metadata column with filter
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT value, size, upper(location) FROM met_all WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY value")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let scalar_upper_location = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("scalar_upper_location", scalar_upper_location);
+
+            // ── Mixed column types with alias, multi-predicate filter ──
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT value AS val, location, day FROM met_location WHERE (id = 43) AND (location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=2/data_4.parquet') AND (value IS NOT NULL)")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let mixed_alias_multi_filter = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("mixed_alias_multi_filter", mixed_alias_multi_filter);
+
             Ok(())
         })
         .await
