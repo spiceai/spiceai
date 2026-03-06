@@ -196,6 +196,28 @@ impl CayenneCatalog {
     pub async fn shutdown(&self) -> CatalogResult<()> {
         self.metastore.shutdown().await
     }
+
+    async fn validate_existing_table_configuration(
+        &self,
+        table_name: &str,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<String> {
+        match self.get_table(table_name).await {
+            Ok(stored_metadata) => {
+                if configuration_matches(&stored_metadata, options) {
+                    return Ok(stored_metadata.table_id);
+                }
+
+                Err(CatalogError::ChangedConfiguration {
+                    table_name: table_name.to_string(),
+                })
+            }
+            Err(e) => Err(CatalogError::InvalidMetadata {
+                table_name: table_name.to_string(),
+                source: Box::new(e),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -253,27 +275,10 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .ok();
 
-        if let Some(table_id) = existing_table_id {
-            // Table already exists - check if configuration has changed
-            match self.get_table(&table_name).await {
-                Ok(stored_metadata) => {
-                    if configuration_matches(&stored_metadata, &options) {
-                        // Configuration unchanged, reuse existing table
-                        return Ok(table_id);
-                    }
-
-                    // Configuration changed - return error to prevent accidental reuse of existing table with incompatible schema or settings
-                    return Err(CatalogError::ChangedConfiguration {
-                        table_name: table_name.clone(),
-                    });
-                }
-                Err(e) => {
-                    return Err(CatalogError::InvalidMetadata {
-                        table_name: table_name.clone(),
-                        source: Box::new(e),
-                    });
-                }
-            }
+        if existing_table_id.is_some() {
+            return self
+                .validate_existing_table_configuration(table_name.as_str(), &options)
+                .await;
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -355,18 +360,9 @@ impl MetadataCatalog for CayenneCatalog {
         match insert_result {
             Ok(()) => {}
             Err(CatalogError::ConstraintViolation { .. }) => {
-                // Another concurrent create_table inserted first — return the existing ID
-                let existing_id: String = self
-                    .metastore
-                    .query_row_helper(
-                        QueryRowParams {
-                            sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
-                            params: vec![MetastoreValue::Text(table_name.clone())],
-                        },
-                        |row| row.get_string(0),
-                    )
-                    .await?;
-                return Ok(existing_id);
+                return self
+                    .validate_existing_table_configuration(table_name.as_str(), &options)
+                    .await;
             }
             Err(e) => return Err(e),
         }
@@ -738,6 +734,7 @@ impl MetadataCatalog for CayenneCatalog {
         // Using INSERT OR REPLACE to update sequence if PK already exists
         let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
+        let table_id = table_id.to_string();
 
         for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
@@ -749,7 +746,7 @@ impl MetadataCatalog for CayenneCatalog {
                 base + 3
             ));
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
-            params.push(MetastoreValue::Text(table_id.to_string()));
+            params.push(MetastoreValue::Text(table_id.clone()));
             params.push(MetastoreValue::Blob(pk_bytes));
             params.push(MetastoreValue::Integer(sequence_number));
         }
@@ -957,6 +954,12 @@ impl MetadataCatalog for CayenneCatalog {
         } else {
             1
         };
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_compaction requires at least one attempt".to_string(),
+            });
+        }
+
         for attempt in 1..=max_attempts {
             match self.metastore.execute_batch_helper(&batch_sql).await {
                 Ok(()) => return Ok(()),
@@ -984,9 +987,11 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        unreachable!(
-            "commit_compaction must return from within the retry loop; max_attempts is always >= 1"
-        );
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_compaction exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String> {
