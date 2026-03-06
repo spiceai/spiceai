@@ -454,17 +454,16 @@ fn verify_sqlite_metadata(
         conn.query_row("SELECT COUNT(*) FROM cayenne_table", [], |row| row.get(0))?;
     assert_eq!(table_count, 1, "Expected 1 table in cayenne_table");
 
-    let (table_id, table_uuid, table_name, path, path_is_relative, schema_json): (
-        i64,
+    let (table_id, table_name, path, path_is_relative, schema_json): (
         String,
         String,
         String,
         bool,
         String,
     ) = conn.query_row(
-        "SELECT table_id, table_uuid, table_name, path, path_is_relative, schema_json FROM cayenne_table",
+        "SELECT table_id, table_name, path, path_is_relative, schema_json FROM cayenne_table",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     )?;
 
     assert_eq!(
@@ -477,17 +476,13 @@ fn verify_sqlite_metadata(
         "Expected path to match data directory"
     );
     assert!(!path_is_relative, "Expected path_is_relative to be false");
-    assert!(table_id >= 1, "Expected table_id to be at least 1");
-    assert!(
-        !table_uuid.is_empty(),
-        "Expected table_uuid to be non-empty"
-    );
+    assert!(!table_id.is_empty(), "Expected table_id to be non-empty");
     assert!(
         !schema_json.is_empty(),
         "Expected schema_json to be non-empty"
     );
     println!(
-        "  • Table metadata verified: table_id={table_id}, uuid={table_uuid}, name={table_name}"
+        "  • Table metadata verified: table_id={table_id}, name={table_name}"
     );
 
     // 3. Verify schema_json is base64 encoded (it's stored in Arrow IPC format)

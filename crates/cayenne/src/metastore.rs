@@ -53,7 +53,6 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         name: "cayenne_table",
         columns: &[
             "table_id",
-            "table_uuid",
             "table_name",
             "path",
             "path_is_relative",
