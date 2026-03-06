@@ -56,3 +56,21 @@ pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> = LazyLo
         .u64_counter("flight_do_exchange_data_updates_sent")
         .build()
 });
+
+pub(crate) static DO_PUT_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("flight_do_put_rows_written")
+        .with_description("Cumulative number of rows received and written via Flight DoPut.")
+        .with_unit("rows")
+        .build()
+});
+
+pub(crate) static DO_PUT_BYTES_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("flight_do_put_bytes_written")
+        .with_description(
+            "Cumulative number of bytes (Arrow in-memory size) received and written via Flight DoPut.",
+        )
+        .with_unit("By")
+        .build()
+});
