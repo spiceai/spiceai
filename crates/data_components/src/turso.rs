@@ -149,7 +149,7 @@ use datafusion_federation::{
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
-use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, MVCC_JOURNAL_MODE_VALUE};
+use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
@@ -431,7 +431,7 @@ impl TursoConnectionPool {
 
         // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
         let conn = database.connect().context(TursoDatabaseSnafu)?;
-        conn.pragma_update("journal_mode", MVCC_JOURNAL_MODE_VALUE)
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
             .await
             .context(TursoDatabaseSnafu)?;
 

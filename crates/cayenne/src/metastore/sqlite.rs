@@ -156,7 +156,7 @@ impl SqliteMetastore {
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
             table_id TEXT PRIMARY KEY,
-            table_name TEXT NOT NULL,
+            table_name TEXT NOT NULL UNIQUE,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
@@ -448,17 +448,18 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                conn.prepare_cached(&sql)?.query_row(params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+                conn.prepare_cached(&sql)?
+                    .query_row(params_refs.as_slice(), |row| {
+                        let column_count = row.as_ref().column_count();
+                        let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
+                        for i in 0..column_count {
+                            let value = row.get_ref(i)?;
+                            values.push(convert_sqlite_value(value));
+                        }
 
-                    Ok(values)
-                })
+                        Ok(values)
+                    })
             })
             .await
             .map_err(

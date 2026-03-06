@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
-use turso_shared::MVCC_JOURNAL_MODE_VALUE;
+use turso_shared::JOURNAL_MODE_SQL_LITERAL;
 
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
@@ -136,7 +136,7 @@ impl TursoMetastore {
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
             table_id TEXT PRIMARY KEY,
-            table_name TEXT NOT NULL,
+            table_name TEXT NOT NULL UNIQUE,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
@@ -331,7 +331,7 @@ impl MetastoreBackend for TursoMetastore {
         let conn = self.get_conn().await?;
 
         // BEGIN CONCURRENT requires MVCC mode for concurrent writers.
-        conn.pragma_update("journal_mode", MVCC_JOURNAL_MODE_VALUE)
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to set journal mode: {e}"),
@@ -471,12 +471,12 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut stmt = conn
-            .prepare_cached(params.sql)
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to query row: {e}"),
-            })?;
+        let mut stmt =
+            conn.prepare_cached(params.sql)
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to query row: {e}"),
+                })?;
         let mut rows = stmt
             .query(turso_params)
             .await
@@ -514,12 +514,12 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut stmt = conn
-            .prepare_cached(params.sql)
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to query rows: {e}"),
-            })?;
+        let mut stmt =
+            conn.prepare_cached(params.sql)
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to query rows: {e}"),
+                })?;
         let mut rows = stmt
             .query(turso_params)
             .await

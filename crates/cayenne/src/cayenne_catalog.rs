@@ -326,7 +326,8 @@ impl MetadataCatalog for CayenneCatalog {
         })?;
 
         // Insert table metadata with initial snapshot
-        self.metastore
+        let insert_result = self
+            .metastore
             .execute_helper(ExecuteParams {
                 sql: r"
                     INSERT INTO cayenne_table (
@@ -349,7 +350,26 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Text(vortex_config_json),
                 ],
             })
-            .await?;
+            .await;
+
+        match insert_result {
+            Ok(()) => {}
+            Err(CatalogError::ConstraintViolation { .. }) => {
+                // Another concurrent create_table inserted first — return the existing ID
+                let existing_id: String = self
+                    .metastore
+                    .query_row_helper(
+                        QueryRowParams {
+                            sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
+                            params: vec![MetastoreValue::Text(table_name.clone())],
+                        },
+                        |row| row.get_string(0),
+                    )
+                    .await?;
+                return Ok(existing_id);
+            }
+            Err(e) => return Err(e),
+        }
 
         // Create the initial snapshot directory (only for local paths)
         // Directory structure: [base_path]/[table_id]/[snapshot_id]/
@@ -721,7 +741,13 @@ impl MetadataCatalog for CayenneCatalog {
 
         for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
-            values_parts.push(format!("(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3));
+            values_parts.push(format!(
+                "(?{}, ?{}, ?{}, ?{})",
+                base,
+                base + 1,
+                base + 2,
+                base + 3
+            ));
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(table_id.to_string()));
             params.push(MetastoreValue::Blob(pk_bytes));
@@ -861,7 +887,11 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(results.into_iter().collect())
     }
 
-    async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
+    async fn clear_snapshot_sequence(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?1 AND snapshot_id = ?2",
@@ -939,7 +969,9 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        Ok(())
+        unreachable!(
+            "commit_compaction must return from within the retry loop; max_attempts is always >= 1"
+        );
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String> {
@@ -1357,11 +1389,12 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let catalog_clone = Arc::clone(&catalog);
+            let table_id = table_id.clone();
 
             let handle = tokio::spawn(async move {
                 let partition = PartitionMetadata {
                     partition_id: String::new(), // Will be assigned by catalog
-                    table_id: table_id.clone(),
+                    table_id,
                     partition_columns: vec!["date".to_string()],
                     partition_values: vec!["2024-01-01".to_string()],
                     path: "/tmp/cayenne_test_partition/partition_20240101".to_string(),
@@ -1396,7 +1429,7 @@ mod tests {
 
         // Verify the partition exists and can be queried
         let partitions = catalog
-            .get_partitions(table_id)
+            .get_partitions(&table_id)
             .await
             .expect("Failed to get partitions");
 
@@ -1424,9 +1457,11 @@ mod tests {
         catalog.init().await.expect("Failed to initialize catalog");
 
         // Create a table via the catalog API to get a valid table_id
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let table_options = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema,
@@ -1445,11 +1480,12 @@ mod tests {
         let mut handles = vec![];
         for i in 0..10 {
             let catalog_clone = Arc::clone(&catalog);
+            let table_id = table_id.clone();
 
             let handle = tokio::spawn(async move {
                 let delete_file = DeleteFile {
                     delete_file_id: String::new(), // Will be assigned by catalog
-                    table_id: table_id.clone(),
+                    table_id,
                     source_data_file_path: None,
                     path: format!("/tmp/delete_file_{i}.parquet"),
                     path_is_relative: false,

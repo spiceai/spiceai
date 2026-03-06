@@ -1227,7 +1227,7 @@ fn table_id_dir(
     fixture
         .data_path
         .join(table_name)
-        .join(table.metadata().table_id.to_string())
+        .join(&table.metadata().table_id)
 }
 
 /// Creates a dummy non-empty cache value. The cache rejects empty vecs internally.
