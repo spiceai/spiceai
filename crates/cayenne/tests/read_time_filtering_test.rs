@@ -209,7 +209,7 @@ async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Verify no deletion files initially
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),
@@ -225,7 +225,7 @@ async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Verify deletion file was registered
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),
