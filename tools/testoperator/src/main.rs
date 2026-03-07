@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs,
-    TestCommands, TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs, TestCommands,
+    TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
