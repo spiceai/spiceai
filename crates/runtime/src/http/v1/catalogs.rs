@@ -59,7 +59,7 @@ const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
     params(CatalogFilter),
     responses(
         (status = 200, description = "List of catalogs", content((
-            CatalogInfo = "application/json",
+            CatalogResponseItem = "application/json",
             example = json!([
                 {
                     "from": "spiceai",
