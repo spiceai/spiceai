@@ -104,9 +104,10 @@ impl CatalogProvider for UnityCatalogProvider {
 impl RefreshableCatalogProvider for UnityCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let max_concurrent = 5;
-        let schemas: Vec<_> = self.schemas.values().cloned().collect();
-        let futures = schemas
-            .into_iter()
+        let futures = self
+            .schemas
+            .values()
+            .map(Arc::clone)
             .map(|schema| async move { schema.refresh().await });
 
         futures::stream::iter(futures)

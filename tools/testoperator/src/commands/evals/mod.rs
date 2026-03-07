@@ -20,7 +20,7 @@ use super::{duration_millis_between, get_app_and_start_request};
 use crate::health::HealthMonitor;
 use serde_json::json;
 use spiceai::Client as SpiceClient;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use test_framework::{
     anyhow,
     arrow::{
@@ -138,7 +138,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let url = format!("{HTTP_BASE_URL}{EVALS_ENDPOINT_PREFIX}/{eval}");
     let body = json!({"model": model}).to_string();
 
-    let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let started_at = Instant::now();
 
     let response = http_client
         .post(&url)
@@ -147,7 +147,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
         .send()
         .await?;
 
-    let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let finished_at = Instant::now();
 
     let response_status = response.status();
     let response_msq = response.text().await?;
