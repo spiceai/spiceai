@@ -153,12 +153,9 @@ impl SqliteMetastore {
     }
 
     /// Schema for the `cayenne_table` table.
-    /// Using INTEGER for AUTOINCREMENT is required
-    /// It is unlikely someone will have more than `9223372036854775807` tables (`SQLite` INTEGER max)
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_uuid TEXT NOT NULL,
+            table_id TEXT PRIMARY KEY,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
@@ -172,11 +169,16 @@ impl SqliteMetastore {
         )
     ";
 
+    const TABLE_NAME_UNIQUE_INDEX_DDL: &'static str = r"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_table_name_unique
+        ON cayenne_table(table_name)
+    ";
+
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            delete_file_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -195,8 +197,8 @@ impl SqliteMetastore {
     /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            partition_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             partition_columns_json TEXT NOT NULL,
             partition_values_json TEXT NOT NULL,
             partition_key TEXT NOT NULL,
@@ -218,8 +220,8 @@ impl SqliteMetastore {
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            insert_record_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -234,7 +236,7 @@ impl SqliteMetastore {
     /// <= the delete file's `sequence_number`.
     const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
-            table_id INTEGER NOT NULL,
+            table_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -345,8 +347,9 @@ impl MetastoreBackend for SqliteMetastore {
         conn.call(|conn| {
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {};",
+                "{}; {}; {}; {}; {}; {};",
                 Self::TABLE_TABLE_DDL,
+                Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
                 Self::PARTITION_TABLE_DDL,
                 Self::INSERT_RECORD_TABLE_DDL,
@@ -406,7 +409,7 @@ impl MetastoreBackend for SqliteMetastore {
                 .iter()
                 .map(|v| v as &dyn rusqlite::ToSql)
                 .collect();
-            conn.execute(&sql, params_refs.as_slice())?;
+            conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
             Ok::<_, rusqlite::Error>(())
         })
         .await
@@ -451,17 +454,18 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                conn.query_row(&sql, params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+                conn.prepare_cached(&sql)?
+                    .query_row(params_refs.as_slice(), |row| {
+                        let column_count = row.as_ref().column_count();
+                        let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
+                        for i in 0..column_count {
+                            let value = row.get_ref(i)?;
+                            values.push(convert_sqlite_value(value));
+                        }
 
-                    Ok(values)
-                })
+                        Ok(values)
+                    })
             })
             .await
             .map_err(
@@ -493,7 +497,7 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let rows = stmt.query_map(params_refs.as_slice(), |row| {
                     let column_count = row.as_ref().column_count();
                     let mut values = Vec::with_capacity(column_count);
