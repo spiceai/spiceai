@@ -3,8 +3,9 @@
   "checkpoint_id": "2c1ab48676ba",
   "strategy": "manual-commit",
   "branch": "jeadie/26-02-13/distributed",
-  "checkpoints_count": 1,
+  "checkpoints_count": 0,
   "files_touched": [
+    "Cargo.lock",
     "tools/distributed/Cargo.toml",
     "tools/distributed/README.md",
     "tools/distributed/src/cluster/config.rs",
