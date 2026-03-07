@@ -16,9 +16,10 @@ limitations under the License.
 
 use anyhow::{Context, Result};
 use clap::Args;
-use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::fs as tokio_fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::cluster::{
     paths::expand_tilde,
@@ -116,22 +117,44 @@ async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()>
         process::read_log_tail(log_file, initial_lines).context("Failed to read log file")?;
     println!("{tail}");
 
-    // Track line count (not file size) to avoid TOCTOU and precision loss
-    let mut last_line_count = tail.lines().count();
+    // Track byte offset to avoid re-reading entire file
+    let mut byte_offset = tail.len();
 
     println!("\n--- Following (Ctrl+C to stop) ---\n");
 
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        match fs::read_to_string(log_file) {
-            Ok(contents) => {
-                let lines: Vec<&str> = contents.lines().collect();
-                // Print only new lines since last read
-                for line in lines.iter().skip(last_line_count) {
-                    println!("{line}");
+        match tokio_fs::File::open(log_file).await {
+            Ok(mut file) => {
+                // Seek to the last known position
+                match file.seek(std::io::SeekFrom::Start(byte_offset as u64)).await {
+                    Ok(_) => {
+                        // Read new content
+                        let mut buffer = Vec::new();
+                        match file.read_to_end(&mut buffer).await {
+                            Ok(bytes_read) => {
+                                if bytes_read > 0 {
+                                    // Convert new bytes to string and print line by line
+                                    if let Ok(new_content) = String::from_utf8(buffer) {
+                                        for line in new_content.lines() {
+                                            println!("{line}");
+                                        }
+                                        byte_offset += bytes_read;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                output::warning(&format!("Error reading log file: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        output::warning(&format!("Error seeking in log file: {e}"));
+                        break;
+                    }
                 }
-                last_line_count = lines.len();
             }
             Err(e) => {
                 // File deleted or permission denied - stop following

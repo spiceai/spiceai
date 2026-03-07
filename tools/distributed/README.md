@@ -10,6 +10,14 @@ The `distributed` tool simplifies the management of a distributed Spice cluster 
 
 It provides intuitive commands for starting, stopping, monitoring, and viewing logs of your cluster with automatic TLS certificate management and health checks.
 
+## Platform Support
+
+**Supported:** macOS, Linux (and other Unix-like systems)
+
+**Not Supported:** Windows
+
+This tool uses Unix-specific process management features (POSIX signals) and is not compatible with Windows. For Windows users, please use the Docker-based Spice cluster setup or the WSL (Windows Subsystem for Linux) environment.
+
 ## Installation
 
 ### Using Make (Recommended)
@@ -233,8 +241,8 @@ The tool maintains a `~/.spice/distributed/cluster.state` JSON file to track run
     "http_port": 8090,
     "flight_port": 50051,
     "node_port": 50052,
-    "work_dir": ".distributed/scheduler",
-    "log_file": "cluster_logs/scheduler.log"
+    "work_dir": "/Users/username/.spice/distributed/scheduler",
+    "log_file": "/Users/username/.spice/distributed/logs/scheduler.log"
   },
   "executors": [
     {
@@ -242,8 +250,8 @@ The tool maintains a `~/.spice/distributed/cluster.state` JSON file to track run
       "pid": 12346,
       "http_port": 9090,
       "node_port": 50062,
-      "work_dir": ".distributed/executor1",
-      "log_file": "cluster_logs/executor1.log"
+      "work_dir": "/Users/username/.spice/distributed/executor1",
+      "log_file": "/Users/username/.spice/distributed/logs/executor1.log"
     }
   ]
 }

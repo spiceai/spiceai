@@ -103,6 +103,48 @@ pub fn ensure_certificates(node_names: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Validate that all required TLS files exist for the cluster.
+/// Called when --no-tls-init is used to ensure certificates are already set up.
+pub fn validate_tls_files(num_executors: usize) -> Result<()> {
+    let pki_dir = get_pki_dir()?;
+
+    // Check CA certificate
+    let ca_cert = pki_dir.join("ca.crt");
+    let ca_key = pki_dir.join("ca.key");
+    if !ca_cert.exists() || !ca_key.exists() {
+        return Err(anyhow::anyhow!(
+            "CA certificate files not found in {}. Run 'spice cluster tls init' first.",
+            pki_dir.display()
+        ));
+    }
+
+    // Check scheduler certificate
+    let scheduler_cert = pki_dir.join("scheduler1.crt");
+    let scheduler_key = pki_dir.join("scheduler1.key");
+    if !scheduler_cert.exists() || !scheduler_key.exists() {
+        return Err(anyhow::anyhow!(
+            "Scheduler certificate files not found in {}. Run 'spice cluster tls add scheduler1' first.",
+            pki_dir.display()
+        ));
+    }
+
+    // Check executor certificates
+    for i in 0..num_executors {
+        let executor_name = format!("executor{}", i + 1);
+        let executor_cert = pki_dir.join(format!("{executor_name}.crt"));
+        let executor_key = pki_dir.join(format!("{executor_name}.key"));
+        if !executor_cert.exists() || !executor_key.exists() {
+            return Err(anyhow::anyhow!(
+                "Executor certificate files not found for {} in {}. Run 'spice cluster tls add {executor_name}' first.",
+                executor_name,
+                pki_dir.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Get the path to the spice CLI binary.
 fn get_spice_cli_path() -> Result<PathBuf> {
     // Try to find spice in PATH
