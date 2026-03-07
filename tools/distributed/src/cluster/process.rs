@@ -167,7 +167,7 @@ pub fn is_process_alive(_pid: u32) -> bool {
 /// Note: This function uses blocking operations and should be called from `spawn_blocking` context
 /// when used in async code.
 #[cfg(unix)]
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub fn stop_process(pid: u32, timeout_secs: u64) -> Result<()> {
     let pid = Pid::from_raw(pid as i32);
 
@@ -210,7 +210,7 @@ pub fn stop_process(_pid: u32, _timeout_secs: u64) -> Result<()> {
 
 /// Force kill a process with SIGKILL.
 #[cfg(unix)]
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub fn kill_process(pid: u32) -> Result<()> {
     let pid = Pid::from_raw(pid as i32);
 
