@@ -28,7 +28,9 @@ use spicepod::component::ComponentOrReference;
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth, Flight, Runtime, TelemetryConfig};
+use spicepod::component::runtime::{
+    ApiKey, ApiKeyAuth, Auth, Flight, Runtime, Scheduler, TelemetryConfig,
+};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
@@ -130,6 +132,7 @@ struct SetupConfig {
     region: Option<String>,
     endpoint: Option<String>,
     sink_type: Option<EtlSinkType>,
+    state_location: Option<String>,
 }
 
 impl SetupConfig {
@@ -138,6 +141,7 @@ impl SetupConfig {
             region: metadata_string(metadata, "etl_region"),
             endpoint: metadata_string(metadata, "etl_endpoint"),
             sink_type: None,
+            state_location: metadata_string(metadata, "scheduler_state_location"),
         }
     }
 
@@ -611,7 +615,8 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config, datasets, None)?;
+    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None)?;
+    let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -691,13 +696,13 @@ async fn provision_local_spiced_cluster(
         tokio::fs::create_dir_all(&scheduler_dir).await?;
         tokio::fs::create_dir_all(&executor_dir).await?;
 
-        let spicepod_yaml = generate_initial_spicepod(
+        let spicepod = generate_initial_spicepod(
             &run_id,
             setup_config,
             datasets,
             local_flight_api_key.as_deref(),
         )?;
-        let spicepod_path = write_local_spicepod(&spicepod_yaml, &working_dir).await?;
+        let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;
 
         let run_id_str = run_id.to_string();
         let short_run_id = run_id_str.split('-').next().unwrap_or_default();
@@ -830,10 +835,18 @@ async fn create_local_working_dir(run_id: Uuid) -> anyhow::Result<PathBuf> {
     Ok(run_dir)
 }
 
-async fn write_local_spicepod(spicepod_yaml: &str, working_dir: &Path) -> anyhow::Result<PathBuf> {
+async fn write_local_spicepod(
+    spicepod: &SpicepodDefinition,
+    working_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let spicepod_yaml = serialize_spicepod(spicepod)?;
     let spicepod_path = working_dir.join("spicepod.yaml");
     tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
     Ok(spicepod_path)
+}
+
+fn serialize_spicepod(spicepod: &SpicepodDefinition) -> anyhow::Result<String> {
+    yaml::to_string(spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
 fn allocate_local_ports(host: &str) -> anyhow::Result<LocalPorts> {
@@ -1136,7 +1149,7 @@ fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SpicepodDefinition> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
@@ -1185,10 +1198,10 @@ fn generate_hive_spicepod(
             .push(ComponentOrReference::Component(dataset));
     }
 
-    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+    Ok(spicepod)
 }
 
-fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> anyhow::Result<String> {
+fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -1217,20 +1230,33 @@ fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> anyhow
         Catalog::new("cayenne".to_string(), "spicebench".to_string())
             .with_access(AccessMode::ReadWriteCreate),
     ));
-    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+    spicepod
 }
 
-/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
+/// Generate the initial [`SpicepodDefinition`] for the benchmark run.
 fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
-) -> anyhow::Result<String> {
-    match setup_config.sink_type {
-        Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id, flight_api_key),
+) -> anyhow::Result<SpicepodDefinition> {
+    let mut spicepod = match setup_config.sink_type {
+        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key)),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
+    }?;
+
+    if let Some(ref loc) = setup_config.state_location {
+        spicepod.runtime.scheduler = Some(Scheduler {
+            state_location: loc.clone(),
+            params: Some(Params::from_string_map(HashMap::from([(
+                "s3_auth".to_string(),
+                "key".to_string(),
+            )]))),
+            partition_management: None,
+        });
     }
+
+    Ok(spicepod)
 }
 
 #[cfg(test)]
@@ -1241,13 +1267,23 @@ mod tests {
 
     #[test]
     fn setup_config_parses_metadata() {
-        let metadata = HashMap::from([(
-            "etl_region".to_string(),
-            serde_json::Value::String("us-west-2".to_string()),
-        )]);
+        let metadata = HashMap::from([
+            (
+                "etl_region".to_string(),
+                serde_json::Value::String("us-west-2".to_string()),
+            ),
+            (
+                "scheduler_state_location".to_string(),
+                serde_json::Value::String("s3://my-bucket/state".to_string()),
+            ),
+        ]);
 
         let config = SetupConfig::from_metadata(&metadata);
         assert_eq!(config.region.as_deref(), Some("us-west-2"));
+        assert_eq!(
+            config.state_location.as_deref(),
+            Some("s3://my-bucket/state")
+        );
     }
 
     #[test]
@@ -1279,6 +1315,7 @@ mod tests {
             region: Some("us-west-2".to_string()),
             endpoint: Some("http://localhost:9000".to_string()),
             sink_type: None,
+            state_location: Some("s3://bucket/state".to_string()),
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1295,17 +1332,21 @@ mod tests {
 
         let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None)
             .expect("spicepod should generate");
+        let spicepod_yaml =
+            serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
 
-        assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
-        assert!(spicepod.contains("name: my_table"));
-        assert!(spicepod.contains("file_format: parquet"));
-        assert!(spicepod.contains("s3_region: us-west-2"));
-        assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
-        assert!(spicepod.contains("engine: cayenne"));
-        assert!(spicepod.contains("mode: file"));
-        assert!(spicepod.contains("refresh_mode: full"));
-        assert!(spicepod.contains("telemetry:"));
-        assert!(spicepod.contains("enabled: false"));
+        assert!(spicepod_yaml.contains("from: \"s3://bucket/path/my_table/\""));
+        assert!(spicepod_yaml.contains("name: my_table"));
+        assert!(spicepod_yaml.contains("file_format: parquet"));
+        assert!(spicepod_yaml.contains("s3_region: us-west-2"));
+        assert!(spicepod_yaml.contains("s3_endpoint: \"http://localhost:9000\""));
+        assert!(spicepod_yaml.contains("engine: cayenne"));
+        assert!(spicepod_yaml.contains("mode: file"));
+        assert!(spicepod_yaml.contains("refresh_mode: full"));
+        assert!(spicepod_yaml.contains("telemetry:"));
+        assert!(spicepod_yaml.contains("enabled: false"));
+        assert!(spicepod_yaml.contains("state_location: \"s3://bucket/state\""));
+        assert!(spicepod_yaml.contains("s3_auth: key"));
     }
 
     #[test]
@@ -1314,6 +1355,7 @@ mod tests {
             region: None,
             endpoint: None,
             sink_type: None,
+            state_location: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
