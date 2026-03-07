@@ -1,0 +1,29 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "60d2acac60e0",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-13/distributed",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "tools/distributed/README.md",
+    "tools/distributed/src/cluster/tls.rs",
+    "tools/distributed/src/commands/logs.rs",
+    "tools/distributed/src/commands/start.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/60/d2acac60e0/0/metadata.json",
+      "transcript": "/60/d2acac60e0/0/full.jsonl",
+      "context": "/60/d2acac60e0/0/context.md",
+      "content_hash": "/60/d2acac60e0/0/content_hash.txt",
+      "prompt": "/60/d2acac60e0/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 394,
+    "cache_creation_tokens": 41484,
+    "cache_read_tokens": 2246570,
+    "output_tokens": 13101,
+    "api_call_count": 49
+  }
+}
