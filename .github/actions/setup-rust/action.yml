@@ -5,9 +5,7 @@ inputs:
   toolchain:
     description: 'Rust toolchain to install; defaults to the repository rust-toolchain.toml channel'
     required: false
-  os:
-    description: 'DEPRECATED: no-op; retained only for backward compatibility. runner.os is used instead.'
-    required: false
+
 
 runs:
   using: 'composite'
@@ -52,10 +50,6 @@ runs:
         set -euo pipefail
 
         toolchain='${{ inputs.toolchain }}'
-        if [ -z "$toolchain" ]; then
-          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
-        fi
-
         if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
           toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
         fi
@@ -72,13 +66,6 @@ runs:
       shell: pwsh
       run: |
         $toolchain = "${{ inputs.toolchain }}"
-        if (-not $toolchain) {
-          $activeToolchain = rustup show active-toolchain 2>$null
-          if ($activeToolchain) {
-            $toolchain = ($activeToolchain -split '\s+')[0]
-          }
-        }
-
         if (-not $toolchain -and (Test-Path "rust-toolchain.toml")) {
           $match = Select-String -Path "rust-toolchain.toml" -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
           if ($match) {
@@ -98,22 +85,19 @@ runs:
       run: |
         set -euo pipefail
 
-        requested_toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
+        toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
 
-        rustup toolchain install "$requested_toolchain" --profile minimal
+        rustup set profile minimal
+        rustup toolchain install "$toolchain" \
+          --component cargo \
+          --component rustc \
+          --component rustfmt \
+          --component clippy
+        rustup default "$toolchain"
 
-        resolved_toolchain="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$requested_toolchain" rustc)")")")"
-        if [ -z "$resolved_toolchain" ]; then
-          echo "Failed to resolve installed Rust toolchain for $requested_toolchain" >&2
-          exit 1
-        fi
-
-        rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
-        rustup default "$resolved_toolchain"
-
-        rustup component list --toolchain "$resolved_toolchain" --installed
-        rustup run "$resolved_toolchain" cargo --version
-        rustup run "$resolved_toolchain" rustc --version
+        rustup component list --toolchain "$toolchain" --installed
+        rustup run "$toolchain" cargo --version
+        rustup run "$toolchain" rustc --version
         cargo --version
         rustc --version
 
@@ -121,23 +105,14 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        $requestedToolchain = "${{ steps.resolve-toolchain-windows.outputs.toolchain }}"
+        $toolchain = "${{ steps.resolve-toolchain-windows.outputs.toolchain }}"
 
-        rustup toolchain install $requestedToolchain --profile minimal
+        rustup set profile minimal
+        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        rustup default $toolchain
 
-        $rustcPath = rustup which --toolchain $requestedToolchain rustc
-        if (-not $rustcPath) {
-          Write-Error "Failed to resolve installed Rust toolchain for $requestedToolchain"
-          exit 1
-        }
-
-        $resolvedToolchain = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
-
-        rustup component add cargo rustc rustfmt clippy --toolchain $resolvedToolchain
-        rustup default $resolvedToolchain
-
-        rustup component list --toolchain $resolvedToolchain --installed
-        rustup run $resolvedToolchain cargo --version
-        rustup run $resolvedToolchain rustc --version
+        rustup component list --toolchain $toolchain --installed
+        rustup run $toolchain cargo --version
+        rustup run $toolchain rustc --version
         cargo --version
         rustc --version
