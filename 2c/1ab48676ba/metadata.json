@@ -3,7 +3,7 @@
   "checkpoint_id": "2c1ab48676ba",
   "strategy": "manual-commit",
   "branch": "jeadie/26-02-13/distributed",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "tools/distributed/Cargo.toml",
     "tools/distributed/README.md",
@@ -35,10 +35,10 @@
     }
   ],
   "token_usage": {
-    "input_tokens": 8535,
-    "cache_creation_tokens": 165840,
-    "cache_read_tokens": 8559660,
-    "output_tokens": 51847,
-    "api_call_count": 134
+    "input_tokens": 8543,
+    "cache_creation_tokens": 167859,
+    "cache_read_tokens": 8657385,
+    "output_tokens": 51967,
+    "api_call_count": 135
   }
 }
