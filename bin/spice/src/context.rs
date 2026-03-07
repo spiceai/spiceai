@@ -241,9 +241,9 @@ impl RuntimeContext {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        WSL_ENV_KEYS.iter().any(|key| {
-            get_env(key).is_some_and(|value| !value.trim().is_empty())
-        })
+        WSL_ENV_KEYS
+            .iter()
+            .any(|key| get_env(key).is_some_and(|value| !value.trim().is_empty()))
     }
 
     fn local_runtime_supported_on_platform<F>(is_windows: bool, get_env: F) -> bool
@@ -795,31 +795,43 @@ mod tests {
 
     #[test]
     fn test_local_runtime_supported_on_non_windows() {
-        assert!(RuntimeContext::local_runtime_supported_on_platform(false, |_| None));
+        assert!(RuntimeContext::local_runtime_supported_on_platform(
+            false,
+            |_| None
+        ));
     }
 
     #[test]
     fn test_local_runtime_supported_in_wsl_on_windows() {
-        assert!(RuntimeContext::local_runtime_supported_on_platform(true, |key| {
-            if key == "WSL_DISTRO_NAME" {
-                Some("Ubuntu".to_string())
-            } else {
-                None
+        assert!(RuntimeContext::local_runtime_supported_on_platform(
+            true,
+            |key| {
+                if key == "WSL_DISTRO_NAME" {
+                    Some("Ubuntu".to_string())
+                } else {
+                    None
+                }
             }
-        }));
+        ));
 
-        assert!(RuntimeContext::local_runtime_supported_on_platform(true, |key| {
-            if key == "WSL_INTEROP" {
-                Some("/run/WSL/123_interop".to_string())
-            } else {
-                None
+        assert!(RuntimeContext::local_runtime_supported_on_platform(
+            true,
+            |key| {
+                if key == "WSL_INTEROP" {
+                    Some("/run/WSL/123_interop".to_string())
+                } else {
+                    None
+                }
             }
-        }));
+        ));
     }
 
     #[test]
     fn test_local_runtime_not_supported_on_native_windows() {
-        assert!(!RuntimeContext::local_runtime_supported_on_platform(true, |_| None));
+        assert!(!RuntimeContext::local_runtime_supported_on_platform(
+            true,
+            |_| None
+        ));
     }
 
     #[test]
