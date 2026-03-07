@@ -92,6 +92,18 @@ runs:
         fi
         sccache --version
 
+        list_smb_mounts() {
+          while IFS= read -r mount_line; do
+            case "$mount_line" in
+              *" (smbfs,"*|*" (smbfs)"*)
+                mount_point="${mount_line#* on }"
+                mount_point="${mount_point%% (*}"
+                printf '%s\n' "$mount_point"
+                ;;
+            esac
+          done < <(mount)
+        }
+
         resolve_macos_cache_dir() {
           if [ -n "${{ inputs.macos_sccache_dir }}" ]; then
             printf '%s\n' "${{ inputs.macos_sccache_dir }}"
@@ -112,7 +124,7 @@ runs:
           local mount_point
           while IFS= read -r mount_point; do
             [ -n "$mount_point" ] && smb_mounts+=("$mount_point")
-          done < <(mount | awk -F ' on | \\(' '/\\(smbfs,/ {print $2}')
+          done < <(list_smb_mounts)
 
           for mount_point in "${smb_mounts[@]}"; do
             case "$(basename "$mount_point" | tr '[:upper:]' '[:lower:]')" in
@@ -129,6 +141,8 @@ runs:
           fi
 
           echo "No dedicated SMB cache mount detected; falling back to local cache." >&2
+          echo "Detected SMB mounts:" >&2
+          list_smb_mounts >&2 || true
           printf '%s\n' "$HOME/.cache/sccache"
         }
 

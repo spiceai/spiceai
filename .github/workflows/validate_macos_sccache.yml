@@ -49,6 +49,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          list_smb_mounts() {
+            while IFS= read -r mount_line; do
+              case "$mount_line" in
+                *" (smbfs,"*|*" (smbfs)"*)
+                  printf '%s\n' "$mount_line"
+                  ;;
+              esac
+            done < <(mount)
+          }
+
           if [ "${{ steps.setup-sccache.outputs.enabled }}" != "true" ]; then
             echo "Expected sccache to be enabled on spiceai-macos"
             exit 1
@@ -56,6 +66,10 @@ jobs:
 
           if [ "${{ steps.setup-sccache.outputs.backend }}" != "smb" ]; then
             echo "Expected SMB-backed sccache backend, found: ${{ steps.setup-sccache.outputs.backend }}"
+            echo "Detected smbfs mounts:"
+            list_smb_mounts || true
+            echo "Contents of /Volumes:"
+            ls -la /Volumes || true
             exit 1
           fi
 
@@ -150,13 +164,13 @@ jobs:
           cache_dir_size_kib="$(du -sk "$SCCACHE_DIR" | awk '{print $1}')"
           mount_point="$(df "$SCCACHE_DIR" | tail -1 | awk '{print $NF}')"
 
-            speedup_percent="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.0" if cold <= 0 else f"{((cold - warm) / cold) * 100:.1f}")' "$cold_build_ms" "$warm_build_ms")"
+          speedup_percent="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.0" if cold <= 0 else f"{((cold - warm) / cold) * 100:.1f}")' "$cold_build_ms" "$warm_build_ms")"
 
-            speedup_factor="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.00" if warm <= 0 else f"{cold / warm:.2f}")' "$cold_build_ms" "$warm_build_ms")"
+          speedup_factor="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.00" if warm <= 0 else f"{cold / warm:.2f}")' "$cold_build_ms" "$warm_build_ms")"
 
-            hit_rate_percent="$(python3 -c 'import sys; compile_requests = int(sys.argv[1]); cache_hits = int(sys.argv[2]); print("0.0" if compile_requests <= 0 else f"{cache_hits / compile_requests * 100:.1f}")' "${compile_requests:-0}" "${cache_hits:-0}")"
+          hit_rate_percent="$(python3 -c 'import sys; compile_requests = int(sys.argv[1]); cache_hits = int(sys.argv[2]); print("0.0" if compile_requests <= 0 else f"{cache_hits / compile_requests * 100:.1f}")' "${compile_requests:-0}" "${cache_hits:-0}")"
 
-            cache_dir_size_mb="$(python3 -c 'import sys; print(f"{int(sys.argv[1]) / 1024:.1f}")' "${cache_dir_size_kib:-0}")"
+          cache_dir_size_mb="$(python3 -c 'import sys; print(f"{int(sys.argv[1]) / 1024:.1f}")' "${cache_dir_size_kib:-0}")"
 
           validation_failed="false"
           failure_reason=""
