@@ -173,7 +173,6 @@ fn is_json_output(cmd: &Commands) -> bool {
         Commands::Pods(a) => a.output == OutputFormat::Json,
         Commands::Workers(a) => a.output == OutputFormat::Json,
         Commands::Trace(a) => matches!(a.output, trace::OutputFormat::Json),
-        Commands::Eval(a) => a.output == OutputFormat::Json,
         Commands::Search(a) => a.output == OutputFormat::Json,
         Commands::Query(a) => a.output == OutputFormat::Json,
         Commands::Acceleration(AccelerationArgs {
