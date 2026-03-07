@@ -425,7 +425,7 @@ async fn test_composite_partition_metadata_impl(
 
     // Test creating composite partition metadata directly
     let composite_partition = PartitionMetadata::new_composite(
-        1, // table_id (not important for this test)
+        "test-table-id".to_string(), // table_id (not important for this test)
         vec!["year".to_string(), "month".to_string()],
         vec!["2025".to_string(), "10".to_string()],
         data_path
@@ -452,7 +452,7 @@ async fn test_composite_partition_metadata_impl(
 
     // Test single partition metadata (backward compatibility)
     let single_partition = PartitionMetadata::new_single(
-        1,
+        "test-table-id".to_string(),
         "region".to_string(),
         "us-east-1".to_string(),
         data_path
