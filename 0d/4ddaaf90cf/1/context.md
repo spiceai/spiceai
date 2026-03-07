@@ -1,0 +1,12 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+`pr-bulids` cli is from `tools/pr-builds`. When we do `pr-builds install -b jeadie/26-03-04/fts-partition` we do not check if we have the spiced binary locally for that SHA/commit. We do some deduplication logic in `pr-builds trigger`. We should do similar for install
+
+### Prompt 2
+
+run ` make lint-rust-fix PACKAGES=pr-builds` and fix anything relevant
+
