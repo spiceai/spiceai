@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: empty_result_star
+---
+++
+++
