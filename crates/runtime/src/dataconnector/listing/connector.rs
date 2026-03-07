@@ -256,7 +256,14 @@ impl TableProvider for LocationPruningListingTable {
         }
 
         if files.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(self.schema())));
+            // Apply the projection to the schema so that the EmptyExec output
+            // schema matches what the physical planner expects from the scan.
+            let schema = if let Some(proj) = projection {
+                Arc::new(self.schema().project(proj)?)
+            } else {
+                self.schema()
+            };
+            return Ok(Arc::new(EmptyExec::new(schema)));
         }
 
         let file_groups = vec![FileGroup::new(files)];
@@ -268,16 +275,11 @@ impl TableProvider for LocationPruningListingTable {
 
         let file_source = self.inner.options().format.file_source();
 
-        // Note: We intentionally do NOT pass projection indices to the FileScanConfigBuilder.
-        // The projection indices from the table scan are relative to the full table schema
-        // (file columns + partition columns + metadata columns), but FileScanConfigBuilder
-        // expects indices relative to only the file schema. Passing table-level indices would
-        // cause index-out-of-bounds errors. By omitting projection, DataFusion will read all
-        // columns and apply projections at a higher level.
         let mut builder =
             FileScanConfigBuilder::new(self.object_store_url(), self.file_schema(), file_source)
                 .with_file_groups(file_groups)
                 .with_table_partition_cols(partition_fields)
+                .with_projection_indices(projection.cloned())
                 .with_limit(limit)
                 .with_metadata_cols(self.inner.options().metadata_cols.clone())
                 .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
