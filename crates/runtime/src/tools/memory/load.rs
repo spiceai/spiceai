@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{AsArray, RecordBatch};
+use arrow::array::AsArray;
 use async_trait::async_trait;
 use datafusion::{
     prelude::{col, lit},
@@ -44,7 +44,7 @@ const fn default_memory_load_limit() -> usize {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
-    /// Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: "1h", "2m30s".
+    /// Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. "1h", "2m30s".
     pub last: String,
 
     /// Maximum number of memories to return.

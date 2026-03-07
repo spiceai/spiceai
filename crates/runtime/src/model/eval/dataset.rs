@@ -70,12 +70,15 @@ pub async fn get_eval_data(
             dataset_name: eval.dataset.clone(),
         })?;
 
-    let dataset = TableReference::parse_str(&eval.dataset)
-        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let dataset = TableReference::parse_str(&eval.dataset);
+    let dataset_name = dataset
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        .to_string();
 
     let Some(provider) = df.get_table(&dataset).await else {
         return Err(Error::FailedToQueryDataset {
-            dataset_name: dataset.to_string(),
+            dataset_name: dataset_name.clone(),
             source: Box::new(io::Error::other("Dataset not found")),
         });
     };
@@ -85,18 +88,18 @@ pub async fn get_eval_data(
         .read_table(provider)
         .boxed()
         .context(FailedToQueryDatasetSnafu {
-            dataset_name: dataset.to_string(),
+            dataset_name: dataset_name.clone(),
         })?
         .select(vec![col("input"), col("ideal")])
         .boxed()
         .context(FailedToQueryDatasetSnafu {
-            dataset_name: dataset.to_string(),
+            dataset_name: dataset_name.clone(),
         })?
         .collect()
         .await
         .boxed()
         .context(FailedToQueryDatasetSnafu {
-            dataset_name: dataset.to_string(),
+            dataset_name: dataset_name.clone(),
         })?;
 
     let (inputs, ideals): (Vec<&ArrayRef>, Vec<&ArrayRef>) =
@@ -109,7 +112,7 @@ pub async fn get_eval_data(
         .boxed()
         .context(FailedToParseColumnSnafu {
             column: "input".to_string(),
-            dataset: dataset.to_string(),
+            dataset: dataset_name.clone(),
         })?;
     let input: Vec<DatasetInput> = inputs.into_iter().flatten().collect();
 
@@ -127,7 +130,7 @@ pub async fn get_eval_data(
         .boxed()
         .context(FailedToParseColumnSnafu {
             column: "ideal".to_string(),
-            dataset: dataset.to_string(),
+            dataset: dataset_name,
         })?;
     let ideal: Vec<DatasetOutput> = ideals.into_iter().flatten().collect();
 

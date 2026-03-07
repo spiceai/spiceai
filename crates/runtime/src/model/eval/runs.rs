@@ -29,7 +29,6 @@ use arrow::{
     buffer::OffsetBuffer,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
-use futures::TryStreamExt;
 use snafu::ResultExt;
 
 use super::Result;
@@ -244,9 +243,12 @@ async fn get_eval_run(
     df: Arc<DataFusion>,
     id: &EvalRunId,
 ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(provider) = df.get_table(&EVAL_RUNS_TABLE_REFERENCE).await else {
+    let table_reference = &*EVAL_RUNS_TABLE_REFERENCE;
+
+    let Some(provider) = df.get_table(table_reference).await else {
         return Err(io::Error::other(format!(
-            "Eval runs table not found: {EVAL_RUNS_TABLE_REFERENCE}"
+            "Eval runs table not found: {}",
+            table_reference.to_quoted_string()
         ))
         .into());
     };

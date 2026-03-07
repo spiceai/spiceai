@@ -23,6 +23,7 @@ use http::HeaderMap;
 use opentelemetry::KeyValue;
 use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use sha2::{Digest, Sha256};
 use spicepod::component::runtime::UserAgentCollection;
 use std::sync::atomic::Ordering;
 use std::{
@@ -80,6 +81,8 @@ static CLIENT_CACHE_KEY_REGEX: LazyLock<Regex> =
         Ok(compiled) => compiled,
         Err(e) => unreachable!("Unable to compile regexp: {}", e),
     });
+
+const AUTHORIZATION_SCOPE_FINGERPRINT_BYTES: usize = 16;
 
 #[derive(Copy, Clone)]
 pub struct AsyncMarker {
@@ -247,7 +250,10 @@ impl RequestContext {
     #[must_use]
     pub fn scoped_client_supplied_cache_key(&self) -> Option<String> {
         self.client_supplied_cache_key.as_deref().map(|cache_key| {
-            let auth_scope = self.authorization_header.as_deref().unwrap_or("anonymous");
+            let auth_scope = self
+                .authorization_header
+                .as_deref()
+                .map_or_else(|| "anonymous".to_string(), authorization_scope_fingerprint);
             format!("{auth_scope}:{cache_key}")
         })
     }
@@ -534,6 +540,25 @@ impl RequestContextBuilder {
     }
 }
 
+fn authorization_scope_fingerprint(authorization_header: &str) -> String {
+    let digest = Sha256::digest(authorization_header.as_bytes());
+    let mut fingerprint = String::with_capacity(5 + (AUTHORIZATION_SCOPE_FINGERPRINT_BYTES * 2));
+    fingerprint.push_str("auth:");
+
+    for byte in &digest[..AUTHORIZATION_SCOPE_FINGERPRINT_BYTES] {
+        push_hex_byte(&mut fingerprint, *byte);
+    }
+
+    fingerprint
+}
+
+fn push_hex_byte(buf: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    buf.push(HEX[usize::from(byte >> 4)] as char);
+    buf.push(HEX[usize::from(byte & 0x0f)] as char);
+}
+
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, HeaderValue};
@@ -576,17 +601,44 @@ mod tests {
     }
 
     #[test]
-    fn test_scoped_client_supplied_cache_key_uses_authorization_header() {
-        let ctx = RequestContextBuilder::new(Protocol::Internal)
+    fn test_scoped_client_supplied_cache_key_hashes_authorization_header() {
+        let auth_header_1 = "Bearer alice".to_string();
+        let auth_header_2 = "Bearer bob".to_string();
+
+        let ctx1 = RequestContextBuilder::new(Protocol::Internal)
             .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
             .with_client_supplied_cache_key(Some("shared-key".to_string()))
-            .with_authorization_header(Some("Bearer alice".to_string()))
+            .with_authorization_header(Some(auth_header_1.clone()))
             .build();
 
-        assert_eq!(
-            ctx.scoped_client_supplied_cache_key().as_deref(),
-            Some("Bearer alice:shared-key")
-        );
+        let ctx2 = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .with_authorization_header(Some(auth_header_1.clone()))
+            .build();
+
+        let ctx3 = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .with_authorization_header(Some(auth_header_2))
+            .build();
+
+        let key1 = ctx1
+            .scoped_client_supplied_cache_key()
+            .expect("scoped key should be present");
+        let key2 = ctx2
+            .scoped_client_supplied_cache_key()
+            .expect("scoped key should be present");
+        let key3 = ctx3
+            .scoped_client_supplied_cache_key()
+            .expect("scoped key should be present");
+
+        assert!(key1.ends_with(":shared-key"));
+        assert!(key1.starts_with("auth:"));
+        assert_eq!(key1.len(), "auth:".len() + 32 + ":shared-key".len());
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+        assert!(!key1.contains(&auth_header_1));
     }
 
     #[test]
