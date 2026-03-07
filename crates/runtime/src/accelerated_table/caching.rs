@@ -21,11 +21,10 @@ use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
 use arrow::array::StringArray;
-use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray, UInt16Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
-use cache::RESPONSE_STATUS_COLUMN;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
