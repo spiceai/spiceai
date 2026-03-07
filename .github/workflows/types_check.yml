@@ -51,6 +51,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced and spice CLI
+        id: build-spiced
         uses: ./.github/actions/build-spiced
         with:
           build_cli: 'true'
@@ -61,21 +62,21 @@ jobs:
         if: matrix.target_os == 'darwin'
         run: |
           if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
+            rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /Users/spiceai/build/target/
           fi
 
       - name: Update build cache (Linux)
         if: matrix.target_os == 'linux'
         run: |
           if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
+            rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /home/spiceai/build/target/
           fi
 
       - name: Update build cache (Windows)
         if: matrix.target_os == 'windows'
         run: |
           if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+            Copy-Item -Recurse -Force "${{ steps.build-spiced.outputs.target_dir_relative }}/*" C:/spiceai/build/target
           }
 
   test_acceleration:

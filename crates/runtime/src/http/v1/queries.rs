@@ -440,8 +440,7 @@ pub(crate) async fn get_results(
     };
     let partition = params.partition.unwrap_or(0);
     if let Some(format) = params.format.as_deref() {
-        let normalized = format.to_ascii_lowercase();
-        if normalized != "json" {
+        if !format.eq_ignore_ascii_case("json") {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
