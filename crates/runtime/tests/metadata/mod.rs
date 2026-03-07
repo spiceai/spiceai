@@ -303,7 +303,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             insta::assert_snapshot!("projected_partition_metadata", projected_partition_metadata);
 
             // ── EmptyExec schema: non-existent location ──
-
+ 
             // Non-existent location with SELECT *
             let mut query_result = rt
                 .datafusion()

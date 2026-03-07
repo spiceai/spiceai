@@ -1332,7 +1332,7 @@ struct CayennePartitionCreator {
     partition_by: Vec<PartitionedBy>,
     schema: SchemaRef,
     catalog: Arc<dyn cayenne::MetadataCatalog>,
-    table_id: i64,
+    table_id: String,
     unsupported_type_action: UnsupportedTypeAction,
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
@@ -1376,7 +1376,7 @@ impl CayennePartitionCreator {
         partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
         catalog: Arc<dyn cayenne::MetadataCatalog>,
-        table_id: i64,
+        table_id: String,
         unsupported_type_action: UnsupportedTypeAction,
         retention_filters: Vec<Expr>,
         time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
@@ -1510,7 +1510,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
         // Create partition metadata with composite key support
         let partition_metadata = cayenne::PartitionMetadata::new_composite(
-            self.table_id,
+            self.table_id.clone(),
             partition_column_names,
             partition_value_strings.clone(),
             partition_path.clone(),
@@ -1568,7 +1568,7 @@ impl PartitionCreator for CayennePartitionCreator {
         // Query catalog for existing partitions
         let partitions = self
             .catalog
-            .get_partitions(self.table_id)
+            .get_partitions(&self.table_id)
             .await
             .boxed()
             .context(creator::InferringPartitionsSnafu)?;
