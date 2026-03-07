@@ -234,17 +234,31 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up sccache
+        id: setup-sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ matrix.target.use_minio && secrets.TEST_MINIO_ENDPOINT || '' }}
+
       # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
       # Non-release builds include postgres-accel for benchmark testing
       - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
         working-directory: bin/spiced
+        env:
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.target.use_minio && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.target.use_minio && secrets.TEST_MINIO_SECRET_KEY || '' }}
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
 
       # Release builds exclude optional accelerators from the distributed binary
       - name: Build spiced and spice CLI (release)
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && matrix.target.is_tagged_release
         working-directory: bin/spiced
+        env:
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.target.use_minio && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.target.use_minio && secrets.TEST_MINIO_SECRET_KEY || '' }}
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
 
       - name: tar binary
@@ -278,6 +292,10 @@ jobs:
       - name: Build spiced (odbc)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         working-directory: bin/spiced
+        env:
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.target.use_minio && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.target.use_minio && secrets.TEST_MINIO_SECRET_KEY || '' }}
         run: cargo build --release --features release,odbc,models --target-dir ../../target
 
       - name: tar binary (odbc)
@@ -311,6 +329,10 @@ jobs:
       - name: Build spiced (metal)
         if: matrix.target.target_os == 'darwin'
         working-directory: bin/spiced
+        env:
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.target.use_minio && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.target.use_minio && secrets.TEST_MINIO_SECRET_KEY || '' }}
         run: cargo build --release --features release,models,metal --target-dir ../../target
 
       - name: tar binary (metal)

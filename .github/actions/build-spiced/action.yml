@@ -110,20 +110,8 @@ runs:
             ;;
         esac
 
-    - name: Check if sccache can be set up
-      id: check-sccache
-      shell: bash
-      run: |
-        if [ -z "${{ inputs.minio_endpoint }}" ]; then
-          echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
-          echo "RUSTC_WRAPPER=" >> $GITHUB_OUTPUT
-        else
-          echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_OUTPUT
-        fi
-
     - name: Set up sccache
-      if: steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
+      id: setup-sccache
       uses: ./.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
@@ -154,7 +142,7 @@ runs:
       if: inputs.use_makefile == 'true'
       shell: bash
       env:
-        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
         CARGO_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
@@ -173,7 +161,7 @@ runs:
       if: inputs.use_makefile != 'true'
       shell: bash
       env:
-        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
         CARGO_INCREMENTAL: 0
@@ -192,7 +180,7 @@ runs:
       if: inputs.build_cli == 'true'
       shell: bash
       env:
-        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
         CARGO_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}

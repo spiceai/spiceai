@@ -104,6 +104,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up sccache
+        id: setup-sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
@@ -118,7 +119,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           CARGO_INCREMENTAL: 0
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |

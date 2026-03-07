@@ -96,6 +96,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up sccache
+        id: setup-sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
@@ -119,7 +120,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: make lint-rust
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
@@ -131,7 +132,7 @@ jobs:
           BRANCH: spiceai-52
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-sccache.outputs.enabled == 'true'
         run: sccache --show-stats
 
   # Build and test after linting passes
@@ -175,18 +176,9 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
       - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        id: setup-sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -209,7 +201,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: make build-cli nextest
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
@@ -227,7 +219,7 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-sccache.outputs.enabled == 'true'
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated

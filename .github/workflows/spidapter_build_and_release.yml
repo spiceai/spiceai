@@ -9,6 +9,7 @@ on:
       - 'crates/test-framework/**'
       - 'Cargo.lock'
       - '.github/workflows/spidapter_build_and_release.yml'
+      - '.github/actions/build-cached-rust-binary/**'
       - '.github/actions/build-spidapter/**'
 
   workflow_dispatch:

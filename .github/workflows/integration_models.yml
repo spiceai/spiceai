@@ -79,6 +79,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up sccache
+        id: setup-sccache
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -92,7 +93,7 @@ jobs:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
@@ -443,6 +444,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up sccache
+        id: setup-sccache
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -453,7 +455,7 @@ jobs:
       # Build the test binary without running tests
       - name: Build AI integration test binary
         env:
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |

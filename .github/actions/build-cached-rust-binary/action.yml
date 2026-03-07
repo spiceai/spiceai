@@ -1,0 +1,191 @@
+name: Build Cached Rust Binary
+description: 'Builds a Rust binary with cache, optional MinIO download/upload, and optional installation'
+
+inputs:
+  binary_name:
+    description: 'Binary name and artifact prefix'
+    required: true
+  build_command:
+    description: 'Command used to build the binary from the repository root'
+    required: true
+  install_to_system_path:
+    description: 'Whether to install the binary to the system path'
+    required: false
+    default: 'true'
+  upload_artifact:
+    description: 'Whether to upload the built binary as a workflow artifact'
+    required: false
+    default: 'false'
+  force_rebuild:
+    description: 'Whether to force a rebuild and skip binary cache lookup'
+    required: false
+    default: 'false'
+  download_from_minio:
+    description: 'Whether to try downloading the binary from MinIO before checking the cache'
+    required: false
+    default: 'true'
+  minio_endpoint:
+    description: 'MinIO endpoint used for sccache and binary artifact download/upload'
+    required: false
+  minio_access_key:
+    description: 'MinIO access key used during builds'
+    required: false
+  minio_secret_key:
+    description: 'MinIO secret key used during builds'
+    required: false
+  setup_make:
+    description: 'Whether to run the shared setup-make action before building'
+    required: false
+    default: 'false'
+
+outputs:
+  cache-hit:
+    description: 'Whether the binary was restored from the GitHub cache'
+    value: ${{ steps.cache-binary.outputs.cache-hit }}
+  binary-path:
+    description: 'Path to the built binary'
+    value: ${{ steps.set-path.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect OS
+      id: detect-os
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux)
+            echo "os=linux" >> "$GITHUB_OUTPUT"
+            echo "ext=" >> "$GITHUB_OUTPUT"
+            ;;
+          macOS)
+            echo "os=darwin" >> "$GITHUB_OUTPUT"
+            echo "ext=" >> "$GITHUB_OUTPUT"
+            ;;
+          Windows)
+            echo "os=windows" >> "$GITHUB_OUTPUT"
+            echo "ext=.exe" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            echo "Unsupported OS: $RUNNER_OS"
+            exit 1
+            ;;
+        esac
+
+    - name: Set commit SHA
+      id: commit-sha
+      shell: bash
+      run: |
+        echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+    - name: Download binary from MinIO
+      if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
+      id: minio-download
+      shell: bash
+      run: |
+        binary_path="spice-minio/artifacts/${{ inputs.binary_name }}/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
+        if mc stat "$binary_path"; then
+          echo "Found ${{ inputs.binary_name }} in MinIO"
+          mkdir -p target/release
+          mc cp "$binary_path" "target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
+          chmod +x "target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "${{ inputs.binary_name }} not found in MinIO"
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Restore binary from cache
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
+      id: cache-binary
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}
+        key: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
+
+    - name: Setup Rust
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true')
+      uses: ./.github/actions/setup-rust
+      with:
+        os: ${{ steps.detect-os.outputs.os }}
+
+    - name: Setup cc
+      if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
+      uses: ./.github/actions/setup-cc
+
+    - name: Setup make
+      if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true')) && inputs.setup_make == 'true'
+      uses: ./.github/actions/setup-make
+      with:
+        os: ${{ steps.detect-os.outputs.os }}
+
+    - name: Set up sccache
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true')
+      id: setup-sccache
+      uses: ./.github/actions/setup-sccache
+      with:
+        minio_endpoint: ${{ inputs.minio_endpoint }}
+
+    - name: Build binary
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true')
+      shell: bash
+      run: ${{ inputs.build_command }}
+      env:
+        RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    - name: Save binary to cache
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}
+        key: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
+
+    - name: Upload binary to MinIO
+      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-binary.outputs.cache-hit != 'true')
+      shell: bash
+      run: |
+        mc cp "target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}" "spice-minio/artifacts/${{ inputs.binary_name }}/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
+
+    - name: Install binary to system path (Linux/macOS)
+      if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'
+      shell: bash
+      run: |
+        sudo mkdir -p /usr/local/bin
+        sudo cp "target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}" "/usr/local/bin/${{ inputs.binary_name }}"
+        sudo chmod +x "/usr/local/bin/${{ inputs.binary_name }}"
+
+    - name: Install binary to system path (Windows)
+      if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os == 'windows'
+      shell: bash
+      run: |
+        mkdir -p /c/usr/local/bin
+        cp "target/release/${{ inputs.binary_name }}.exe" "/c/usr/local/bin/${{ inputs.binary_name }}.exe"
+        chmod +x "/c/usr/local/bin/${{ inputs.binary_name }}.exe"
+
+    - name: Set output path
+      id: set-path
+      shell: bash
+      run: |
+        if [ "${{ inputs.install_to_system_path }}" = "true" ]; then
+          if [ "${{ steps.detect-os.outputs.os }}" = "windows" ]; then
+            echo "path=/c/usr/local/bin/${{ inputs.binary_name }}.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=/usr/local/bin/${{ inputs.binary_name }}" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "path=${{ github.workspace }}/target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload binary artifact
+      if: inputs.upload_artifact == 'true'
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}
+        path: target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}
+        retention-days: 28

@@ -3,31 +3,57 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
+    description: 'MinIO endpoint for self-hosted Linux sccache'
     required: false
-    type: string
+  macos_sccache_dir:
+    description: 'Optional cache directory for self-hosted macOS runners; defaults to the detected SMB mount'
+    required: false
+
+outputs:
+  enabled:
+    description: 'Whether sccache was configured for this runner'
+    value: ${{ steps.detect.outputs.enabled }}
+  backend:
+    description: 'Configured sccache backend for this runner'
+    value: ${{ steps.setup-macos.outputs.backend || steps.detect.outputs.backend }}
+  rustc_wrapper:
+    description: 'Rust compiler wrapper to use for subsequent steps'
+    value: ${{ steps.detect.outputs.rustc_wrapper }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Set sccache environment variables
-      if: inputs.minio_endpoint != ''
+    - name: Determine sccache configuration
+      id: detect
       shell: bash
       run: |
-        echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
-        echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
-        echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
-        echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+        if [ "$RUNNER_OS" = "macOS" ] && [ "${{ runner.environment }}" = "self-hosted" ]; then
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "rustc_wrapper=sccache" >> "$GITHUB_OUTPUT"
+        elif [ "$RUNNER_OS" = "Linux" ] && [ "${{ runner.environment }}" = "self-hosted" ] && [ -n "${{ inputs.minio_endpoint }}" ]; then
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "backend=minio" >> "$GITHUB_OUTPUT"
+          echo "rustc_wrapper=sccache" >> "$GITHUB_OUTPUT"
+        else
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "backend=none" >> "$GITHUB_OUTPUT"
+          echo "rustc_wrapper=" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Set up sccache (Linux)
-      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
+      if: steps.detect.outputs.enabled == 'true' && runner.os == 'Linux'
       shell: bash
       run: |
-        sudo apt-get update && sudo apt-get install wget -y
-        wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
-        tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
-        sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        if ! command -v sccache &> /dev/null; then
+          if ! command -v wget &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install wget -y
+          fi
+          wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+          sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        fi
+        sccache --version
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
         cat <<EOF > ~/.config/sccache/config
@@ -40,64 +66,106 @@ runs:
         region = "us-east-1"
         EOF
 
+        export SCCACHE_CACHE_SIZE=200G
+        export SCCACHE_DIRECT=true
+        export SCCACHE_IDLE_TIMEOUT=0
+        export SCCACHE_SETUP=true
+        export RUSTC_WRAPPER=sccache
+        {
+          echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+          echo "SCCACHE_DIRECT=$SCCACHE_DIRECT"
+          echo "SCCACHE_IDLE_TIMEOUT=$SCCACHE_IDLE_TIMEOUT"
+          echo "SCCACHE_SETUP=$SCCACHE_SETUP"
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
+        } >> "$GITHUB_ENV"
+
+        sccache --stop-server || true
+
     - name: Set up sccache (macOS - self-hosted only)
-      if: runner.os == 'macOS' && inputs.minio_endpoint != ''
+      id: setup-macos
+      if: steps.detect.outputs.enabled == 'true' && runner.os == 'macOS' && runner.environment == 'self-hosted'
       shell: bash
       run: |
-        # Only self-hosted macOS runners use sccache (with localhost MinIO)
-        # GitHub-hosted macOS runners use actions cache instead
-
-        # Verify sccache is installed
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
           exit 1
         fi
         sccache --version
 
-        rm -rf ~/.config/sccache/config
-        mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "http://localhost:9000"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        EOF
+        resolve_macos_cache_dir() {
+          if [ -n "${{ inputs.macos_sccache_dir }}" ]; then
+            printf '%s\n' "${{ inputs.macos_sccache_dir }}"
+            return 0
+          fi
 
-    - name: Set up sccache (Windows)
-      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
-      shell: pwsh
-      run: |
-        $ErrorActionPreference = 'Stop'
-        # Download and install sccache
-        $sccacheVersion = "v0.9.1"
-        $sccacheUrl = "https://github.com/mozilla/sccache/releases/download/$sccacheVersion/sccache-$sccacheVersion-x86_64-pc-windows-msvc.zip"
-        $sccacheZip = "$env:TEMP\sccache.zip"
-        $sccacheDir = "$env:USERPROFILE\sccache"
+          if [ -n "${SCCACHE_DIR:-}" ]; then
+            printf '%s\n' "$SCCACHE_DIR"
+            return 0
+          fi
 
-        Invoke-WebRequest -Uri $sccacheUrl -OutFile $sccacheZip
-        Expand-Archive -Path $sccacheZip -DestinationPath $sccacheDir -Force
-        $sccacheExtractedDir = Join-Path $sccacheDir "sccache-$sccacheVersion-x86_64-pc-windows-msvc"
-        $sccacheExePath = Join-Path $sccacheExtractedDir "sccache.exe"
-        if (-not (Test-Path $sccacheExePath)) {
-          Write-Error "sccache.exe not found at expected path: $sccacheExePath"
-          exit 1
+          if [ -d "/Volumes/sccache" ]; then
+            printf '%s\n' "/Volumes/sccache/spiceai-sccache"
+            return 0
+          fi
+
+          local smb_mounts=()
+          local mount_point
+          while IFS= read -r mount_point; do
+            [ -n "$mount_point" ] && smb_mounts+=("$mount_point")
+          done < <(mount | awk -F ' on | \\(' '/\\(smbfs,/ {print $2}')
+
+          for mount_point in "${smb_mounts[@]}"; do
+            case "$(basename "$mount_point" | tr '[:upper:]' '[:lower:]')" in
+              *sccache*|*cache*)
+                printf '%s\n' "$mount_point/spiceai-sccache"
+                return 0
+                ;;
+            esac
+          done
+
+          if [ "${#smb_mounts[@]}" -eq 1 ]; then
+            printf '%s\n' "${smb_mounts[0]}/spiceai-sccache"
+            return 0
+          fi
+
+          echo "No dedicated SMB cache mount detected; falling back to local cache." >&2
+          printf '%s\n' "$HOME/.cache/sccache"
         }
-        $sccacheBinDir = Split-Path $sccacheExePath -Parent
-        echo "$sccacheBinDir" >> $env:GITHUB_PATH
 
-        # Configure sccache
-        $configDir = "$env:APPDATA\Mozilla\sccache"
-        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-        $config = @"
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "${{ inputs.minio_endpoint }}"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        "@
-        $config | Out-File -FilePath "$configDir\config" -Encoding utf8
+        cache_dir="$(resolve_macos_cache_dir)"
+        mkdir -p "$cache_dir"
+        if [ ! -w "$cache_dir" ]; then
+          echo "Error: sccache directory is not writable: $cache_dir"
+          exit 1
+        fi
+
+        backend="local"
+        mount_point="$(df "$cache_dir" | tail -1 | awk '{print $NF}')"
+        mount_line="$(mount | grep -F " on $mount_point (" || true)"
+        if printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
+          backend="smb"
+        fi
+
+        rm -f ~/.config/sccache/config
+
+        export SCCACHE_CACHE_SIZE=200G
+        export SCCACHE_DIRECT=true
+        export SCCACHE_IDLE_TIMEOUT=0
+        export SCCACHE_SETUP=true
+        export RUSTC_WRAPPER=sccache
+        export SCCACHE_DIR="$cache_dir"
+        {
+          echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+          echo "SCCACHE_DIRECT=$SCCACHE_DIRECT"
+          echo "SCCACHE_IDLE_TIMEOUT=$SCCACHE_IDLE_TIMEOUT"
+          echo "SCCACHE_SETUP=$SCCACHE_SETUP"
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
+          echo "SCCACHE_DIR=$SCCACHE_DIR"
+        } >> "$GITHUB_ENV"
+
+        echo "backend=$backend" >> "$GITHUB_OUTPUT"
+
+        echo "Using macOS sccache directory: $SCCACHE_DIR"
+        sccache --stop-server || true
+        sccache --start-server
+
