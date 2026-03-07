@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "554916699a47",
+  "session_id": "e37363f3-bb0c-4582-bc11-bcdc537be6a7",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-07T00:43:14.498828Z",
+  "branch": "jeadie/26-02-13/distributed",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/distributed/src/cluster/state.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "f824706b7932",
+  "token_usage": {
+    "input_tokens": 414,
+    "cache_creation_tokens": 49340,
+    "cache_read_tokens": 2470541,
+    "output_tokens": 18978,
+    "api_call_count": 51
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-07T00:43:14.314012Z",
+    "agent_lines": 0,
+    "human_added": 236,
+    "human_modified": 94,
+    "human_removed": 0,
+    "total_committed": 236,
+    "agent_percentage": 0
+  }
+}
