@@ -6543,6 +6543,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo 0.33.1",
+ "tempfile",
  "tokio",
 ]
 

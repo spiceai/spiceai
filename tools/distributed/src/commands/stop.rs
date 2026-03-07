@@ -18,20 +18,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::path::PathBuf;
 
-use crate::cluster::{process, state::*};
+use crate::cluster::{paths::expand_tilde, process, state::*};
 use crate::output;
-
-/// Expand tilde in path to home directory.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
-    if let Some(path_str) = path.to_str() {
-        if path_str.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(&path_str[2..]);
-            }
-        }
-    }
-    path.clone()
-}
 
 #[derive(Args)]
 pub struct StopArgs {
@@ -63,7 +51,7 @@ pub async fn execute(args: StopArgs) -> Result<()> {
 
     output::info("Stopping distributed Spice cluster...");
 
-    // Stop executors first (in parallel)
+    // Stop executors first (sequentially)
     let mut executor_errors = Vec::new();
     for executor in &state.executors {
         output::info(&format!("Stopping {}...", executor.name));
@@ -98,16 +86,19 @@ pub async fn execute(args: StopArgs) -> Result<()> {
         }
     }
 
-    // Remove state file
-    remove_state(&work_dir).context("Failed to remove cluster state")?;
-
-    // Report results
+    // Report results and remove state file only if all components stopped successfully
     let has_errors = !executor_errors.is_empty() || scheduler_failed;
     if !has_errors {
+        remove_state(&work_dir).context("Failed to remove cluster state")?;
         output::success("Cluster stopped successfully!");
         Ok(())
     } else {
         output::warning("Cluster stopped with some errors. Check the output above for details.");
-        Ok(())
+        output::info(
+            "State file retained for inspection; use 'distributed stop --force' to force cleanup.",
+        );
+        Err(anyhow::anyhow!(
+            "Failed to stop all cluster processes; some components may still be running"
+        ))
     }
 }

@@ -19,20 +19,8 @@ use clap::Args;
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::cluster::{health::*, process, state::*};
+use crate::cluster::{health::*, paths::expand_tilde, process, state::*};
 use crate::output;
-
-/// Expand tilde in path to home directory.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
-    if let Some(path_str) = path.to_str() {
-        if path_str.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(&path_str[2..]);
-            }
-        }
-    }
-    path.clone()
-}
 
 #[derive(Args)]
 pub struct StatusArgs {

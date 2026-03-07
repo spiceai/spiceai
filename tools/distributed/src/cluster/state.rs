@@ -46,11 +46,7 @@ pub struct NodeState {
 impl ClusterState {
     /// Create a new cluster state.
     #[must_use]
-    pub fn new(
-        project_dir: PathBuf,
-        scheduler: NodeState,
-        executors: Vec<NodeState>,
-    ) -> Self {
+    pub fn new(project_dir: PathBuf, scheduler: NodeState, executors: Vec<NodeState>) -> Self {
         Self {
             version: STATE_VERSION.to_string(),
             started_at: Utc::now(),
@@ -97,8 +93,7 @@ pub fn state_exists(work_dir: &Path) -> bool {
 /// Load cluster state from file.
 pub fn load_state(work_dir: &Path) -> Result<ClusterState> {
     let state_path = work_dir.join(STATE_FILE_NAME);
-    let contents =
-        fs::read_to_string(&state_path).context("Failed to read cluster state file")?;
+    let contents = fs::read_to_string(&state_path).context("Failed to read cluster state file")?;
     serde_json::from_str(&contents).context("Failed to parse cluster state file")
 }
 
@@ -118,4 +113,100 @@ pub fn remove_state(work_dir: &Path) -> Result<()> {
         fs::remove_file(&state_path).context("Failed to remove cluster state file")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_state() -> ClusterState {
+        let scheduler = NodeState {
+            name: "scheduler".to_string(),
+            pid: 1000,
+            http_port: 8090,
+            flight_port: Some(50051),
+            node_port: 50052,
+            work_dir: PathBuf::from("/tmp/scheduler"),
+            log_file: PathBuf::from("/tmp/logs/scheduler.log"),
+        };
+
+        let executor = NodeState {
+            name: "executor1".to_string(),
+            pid: 1001,
+            http_port: 9090,
+            flight_port: None,
+            node_port: 50062,
+            work_dir: PathBuf::from("/tmp/executor1"),
+            log_file: PathBuf::from("/tmp/logs/executor1.log"),
+        };
+
+        ClusterState::new(PathBuf::from("/tmp/project"), scheduler, vec![executor])
+    }
+
+    #[test]
+    fn test_save_and_load_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = create_test_state();
+
+        // Save state
+        save_state(&state, temp_dir.path()).unwrap();
+        assert!(state_exists(temp_dir.path()));
+
+        // Load state
+        let loaded = load_state(temp_dir.path()).unwrap();
+        assert_eq!(loaded.scheduler.pid, state.scheduler.pid);
+        assert_eq!(loaded.executors.len(), 1);
+        assert_eq!(loaded.executors[0].name, "executor1");
+    }
+
+    #[test]
+    fn test_state_exists_returns_false_initially() {
+        let temp_dir = TempDir::new().unwrap();
+        assert!(!state_exists(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_remove_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = create_test_state();
+
+        save_state(&state, temp_dir.path()).unwrap();
+        assert!(state_exists(temp_dir.path()));
+
+        remove_state(temp_dir.path()).unwrap();
+        assert!(!state_exists(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_get_log_path_for_scheduler() {
+        let state = create_test_state();
+        let log_path = state.get_log_path("scheduler");
+        assert!(log_path.is_some());
+        assert_eq!(log_path.unwrap(), &state.scheduler.log_file);
+    }
+
+    #[test]
+    fn test_get_log_path_for_executor() {
+        let state = create_test_state();
+        let log_path = state.get_log_path("executor1");
+        assert!(log_path.is_some());
+        assert_eq!(log_path.unwrap(), &state.executors[0].log_file);
+    }
+
+    #[test]
+    fn test_get_log_path_for_nonexistent_component() {
+        let state = create_test_state();
+        let log_path = state.get_log_path("nonexistent");
+        assert!(log_path.is_none());
+    }
+
+    #[test]
+    fn test_list_components() {
+        let state = create_test_state();
+        let components = state.list_components();
+        assert_eq!(components.len(), 2);
+        assert!(components.contains(&"scheduler".to_string()));
+        assert!(components.contains(&"executor1".to_string()));
+    }
 }

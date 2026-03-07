@@ -19,20 +19,8 @@ use clap::Args;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::cluster::{config::*, health::*, process, state::*, tls};
+use crate::cluster::{config::*, health::*, paths::expand_tilde, process, state::*, tls};
 use crate::output;
-
-/// Expand tilde in path to home directory.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
-    if let Some(path_str) = path.to_str() {
-        if path_str.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(&path_str[2..]);
-            }
-        }
-    }
-    path.clone()
-}
 
 #[derive(Args)]
 pub struct StartArgs {
@@ -232,14 +220,23 @@ pub async fn execute(args: StartArgs) -> Result<()> {
     output::success("Cluster started successfully!");
     println!();
     println!("Scheduler:");
-    println!("  scheduler (port {}): PID {}", scheduler_node.http_port, scheduler_node.pid);
+    println!(
+        "  scheduler (port {}): PID {}",
+        scheduler_node.http_port, scheduler_node.pid
+    );
     println!();
     println!("Executors:");
     for node in &executor_nodes {
-        println!("  {} (port {}): PID {}", node.name, node.http_port, node.pid);
+        println!(
+            "  {} (port {}): PID {}",
+            node.name, node.http_port, node.pid
+        );
     }
     println!();
-    output::info(&format!("Logs directory: {}", config.paths.log_dir.display()));
+    output::info(&format!(
+        "Logs directory: {}",
+        config.paths.log_dir.display()
+    ));
     println!();
 
     // Handle detach vs background mode
@@ -278,8 +275,12 @@ async fn wait_for_shutdown(state: &ClusterState) -> Result<()> {
     }
 
     // Remove state file
-    if let Err(e) = remove_state(&state.scheduler.work_dir.parent().unwrap()) {
-        output::warning(&format!("Failed to remove state file: {e}"));
+    if let Some(parent) = state.scheduler.work_dir.parent() {
+        if let Err(e) = remove_state(parent) {
+            output::warning(&format!("Failed to remove state file: {e}"));
+        }
+    } else {
+        output::warning("Failed to remove state file: scheduler work_dir has no parent directory");
     }
 
     output::success("Cluster stopped successfully!");

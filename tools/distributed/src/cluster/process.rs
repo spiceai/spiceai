@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::{anyhow, Context, Result};
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use anyhow::{Context, Result, anyhow};
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, System};
+
+#[cfg(unix)]
+use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
 
 use super::config::ClusterConfig;
 use super::state::NodeState;
@@ -144,6 +147,7 @@ pub fn start_executor(
 }
 
 /// Check if a process is alive using sysinfo.
+#[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -154,7 +158,15 @@ pub fn is_process_alive(pid: u32) -> bool {
     system.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
 
+#[cfg(not(unix))]
+pub fn is_process_alive(_pid: u32) -> bool {
+    false
+}
+
 /// Stop a process gracefully with SIGTERM, falling back to SIGKILL if timeout exceeded.
+/// Note: This function uses blocking operations and should be called from spawn_blocking context
+/// when used in async code.
+#[cfg(unix)]
 pub fn stop_process(pid: u32, timeout_secs: u64) -> Result<()> {
     let pid = Pid::from_raw(pid as i32);
 
@@ -188,7 +200,15 @@ pub fn stop_process(pid: u32, timeout_secs: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn stop_process(_pid: u32, _timeout_secs: u64) -> Result<()> {
+    Err(anyhow!(
+        "Process control is not supported on non-Unix platforms"
+    ))
+}
+
 /// Force kill a process with SIGKILL.
+#[cfg(unix)]
 pub fn kill_process(pid: u32) -> Result<()> {
     let pid = Pid::from_raw(pid as i32);
 
@@ -207,10 +227,30 @@ pub fn kill_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn kill_process(_pid: u32) -> Result<()> {
+    Err(anyhow!(
+        "Process control is not supported on non-Unix platforms"
+    ))
+}
+
 /// Read the last N lines from a log file.
+/// Uses efficient bounded reading when possible to avoid loading large files into memory.
 pub fn read_log_tail(log_file: &Path, lines: usize) -> Result<String> {
-    let contents = fs::read_to_string(log_file).context("Failed to read log file")?;
-    let all_lines: Vec<&str> = contents.lines().collect();
-    let start_index = all_lines.len().saturating_sub(lines);
-    Ok(all_lines[start_index..].join("\n"))
+    use std::io::{BufRead, BufReader};
+
+    let file = fs::File::open(log_file).context("Failed to open log file")?;
+    let reader = BufReader::new(file);
+
+    // Collect last N lines efficiently
+    let mut tail_lines: Vec<String> = Vec::with_capacity(lines);
+    for line in reader.lines() {
+        let line = line.context("Failed to read line from log file")?;
+        tail_lines.push(line);
+        if tail_lines.len() > lines {
+            tail_lines.remove(0);
+        }
+    }
+
+    Ok(tail_lines.join("\n"))
 }

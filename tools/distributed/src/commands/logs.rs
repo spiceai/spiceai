@@ -16,23 +16,12 @@ limitations under the License.
 
 use anyhow::{Context, Result};
 use clap::Args;
+use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use crate::cluster::{process, state::*};
+use crate::cluster::{paths::expand_tilde, process, state::*};
 use crate::output;
-
-/// Expand tilde in path to home directory.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
-    if let Some(path_str) = path.to_str() {
-        if path_str.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(&path_str[2..]);
-            }
-        }
-    }
-    path.clone()
-}
 
 #[derive(Args)]
 pub struct LogsArgs {
@@ -69,10 +58,7 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
         // Try to show logs from log directory anyway
         let log_file = log_dir.join(format!("{}.log", args.component));
         if !log_file.exists() {
-            output::error(&format!(
-                "Log file not found: {}",
-                log_file.display()
-            ));
+            output::error(&format!("Log file not found: {}", log_file.display()));
             return Err(anyhow::anyhow!("Log file not found"));
         }
 
@@ -97,10 +83,7 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
 
     // Check if log file exists
     if !log_file.exists() {
-        output::error(&format!(
-            "Log file not found: {}",
-            log_file.display()
-        ));
+        output::error(&format!("Log file not found: {}", log_file.display()));
         output::info(&format!(
             "The component '{}' may not have started successfully.",
             args.component
@@ -113,24 +96,62 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
 
 fn show_logs_from_file(log_file: &PathBuf, follow: bool, tail_lines: usize) -> Result<()> {
     if follow {
-        // Use tail -f for following logs
-        let status = Command::new("tail")
-            .arg("-f")
-            .arg(log_file)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("Failed to execute 'tail -f'")?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!("Failed to follow log file"));
-        }
+        // Follow mode: print initial tail, then poll for new content
+        follow_log_file(log_file, tail_lines)
     } else {
         // Read last N lines
-        let tail = process::read_log_tail(log_file, tail_lines)
-            .context("Failed to read log file")?;
+        let tail =
+            process::read_log_tail(log_file, tail_lines).context("Failed to read log file")?;
         println!("{tail}");
+        Ok(())
+    }
+}
+
+fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()> {
+    // Print initial tail
+    let tail =
+        process::read_log_tail(log_file, initial_lines).context("Failed to read log file")?;
+    println!("{tail}");
+
+    // Follow for new content
+    let mut last_size = fs::metadata(log_file)
+        .context("Failed to get log file metadata")?
+        .len();
+
+    println!("\n--- Following (Ctrl+C to stop) ---\n");
+
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+
+        let current_size = match fs::metadata(log_file) {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                // File was deleted, stop following
+                break;
+            }
+        };
+
+        if current_size > last_size {
+            // File grew, read new content
+            match fs::read_to_string(log_file).context("Failed to read log file") {
+                Ok(contents) => {
+                    let lines: Vec<&str> = contents.lines().collect();
+                    // Find where we left off based on approximate line count
+                    if !lines.is_empty() {
+                        // Estimate position based on file size ratio
+                        let estimated_start =
+                            (lines.len() as u64 * last_size / current_size).max(0) as usize;
+                        for line in lines.iter().skip(estimated_start) {
+                            println!("{line}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    output::warning(&format!("Error reading updated log: {e}"));
+                }
+            }
+            last_size = current_size;
+        }
     }
 
     Ok(())
