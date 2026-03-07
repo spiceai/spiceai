@@ -339,17 +339,30 @@ impl MetadataCatalog for CayenneCatalog {
         match insert_result {
             Ok(()) => {}
             Err(CatalogError::ConstraintViolation { .. }) => {
-                let existing_id: String = self
-                    .metastore
-                    .query_row_helper(
-                        QueryRowParams {
-                            sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
-                            params: vec![MetastoreValue::Text(table_name.clone())],
-                        },
-                        |row| row.get_string(0),
-                    )
-                    .await?;
-                return Ok(existing_id);
+                // A concurrent create likely won the race. Load the stored metadata,
+                // verify that its configuration matches the requested options, and
+                // ensure the initial snapshot directory exists for local paths.
+                let existing_table = self.get_table(&table_name).await?;
+
+                if !configuration_matches(&existing_table, &options) {
+                    return Err(CatalogError::ChangedConfiguration {
+                        table_name: table_name.clone(),
+                    });
+                }
+
+                // For non-S3 paths, ensure the initial snapshot directory exists.
+                // create_dir_all is idempotent so this is safe even if the winner already created it.
+                if !existing_table.path.starts_with("s3://") {
+                    let snapshot_dir = std::path::PathBuf::from(&existing_table.path)
+                        .join(&existing_table.table_id)
+                        .join(&existing_table.current_snapshot_id);
+
+                    tokio::fs::create_dir_all(&snapshot_dir)
+                        .await
+                        .map_err(|e| CatalogError::Io { source: e })?;
+                }
+
+                return Ok(existing_table.table_id.clone());
             }
             Err(e) => return Err(e),
         }
@@ -537,38 +550,14 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await;
 
-        match insert_result {
-            Ok(()) => Ok(delete_file_id),
-            Err(CatalogError::ConstraintViolation { .. }) => {
-                // Another concurrent operation inserted first — retrieve the existing ID
-                let existing_id: String = self
-                    .metastore
-                    .query_row_helper(
-                        QueryRowParams {
-                            sql: r"
-                            SELECT delete_file_id
-                            FROM cayenne_delete_file
-                            WHERE table_id = ?1 AND path = ?2
-                            ORDER BY delete_file_id DESC
-                            LIMIT 1
-                        ",
-                            params: vec![
-                                MetastoreValue::Text(delete_file.table_id.clone()),
-                                MetastoreValue::Text(delete_file.path.clone()),
-                            ],
-                        },
-                        |row| row.get_string(0),
-                    )
-                    .await
-                    .map_err(|e| CatalogError::FailedToAddDeleteFile {
-                        source: Box::new(e),
-                    })?;
-                Ok(existing_id)
-            }
-            Err(e) => Err(CatalogError::FailedToAddDeleteFile {
-                source: Box::new(e),
-            }),
-        }
+        insert_result.map_or_else(
+            |e| {
+                Err(CatalogError::FailedToAddDeleteFile {
+                    source: Box::new(e),
+                })
+            },
+            |()| Ok(delete_file_id),
+        )
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
@@ -891,6 +880,20 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+        // Validate that both IDs are valid UUIDs before interpolating into SQL.
+        // These are internally generated UUIDv7s, but we validate defensively
+        // since execute_batch_helper doesn't support parameterized queries.
+        let table_uuid = uuid::Uuid::parse_str(table_id).map_err(|_| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!("Invalid table_id UUID: {table_id}"),
+            }
+        })?;
+        let snapshot_uuid = uuid::Uuid::parse_str(new_snapshot_id).map_err(|_| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!("Invalid new_snapshot_id UUID: {new_snapshot_id}"),
+            }
+        })?;
+
         // Execute all operations atomically using a transaction batch.
         // SQLite's execute_batch runs all statements in a single transaction,
         // ensuring atomicity: either all succeed or none takes effect.
@@ -907,10 +910,10 @@ impl MetadataCatalog for CayenneCatalog {
         // but data is not corrupted).
         let batch_sql = format!(
             "BEGIN TRANSACTION; \
-             DELETE FROM cayenne_delete_file WHERE table_id = '{table_id}'; \
-             DELETE FROM cayenne_insert_record WHERE table_id = '{table_id}'; \
-             DELETE FROM cayenne_snapshot_sequence WHERE table_id = '{table_id}'; \
-             UPDATE cayenne_table SET current_snapshot_id = '{new_snapshot_id}' WHERE table_id = '{table_id}'; \
+             DELETE FROM cayenne_delete_file WHERE table_id = '{table_uuid}'; \
+             DELETE FROM cayenne_insert_record WHERE table_id = '{table_uuid}'; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = '{table_uuid}'; \
+             UPDATE cayenne_table SET current_snapshot_id = '{snapshot_uuid}' WHERE table_id = '{table_uuid}'; \
              COMMIT;"
         );
 
