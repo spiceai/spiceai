@@ -298,7 +298,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!("projected_partition_metadata", projected_partition_metadata);
 
-            // ── EmptyExec schema fix: non-existent location ──
+            // ── EmptyExec schema: non-existent location ──
 
             // Non-existent location with SELECT *
             let mut query_result = rt
@@ -333,6 +333,23 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             let empty_result_projected = arrow::util::pretty::pretty_format_batches(&batches)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!("empty_result_projected", empty_result_projected);
+
+            // Location predicate outside configured bucket
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT value, location FROM met_all WHERE location = 's3://not/correct.parquet'")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let outside_bucket_projected = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!("outside_bucket_projected", outside_bucket_projected);
 
             // Multiple metadata columns with projection
             let mut query_result = rt
