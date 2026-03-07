@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 mod mteb_quora;
-use super::get_app_and_start_request;
+use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::{Duration, SystemTime};
 use test_framework::{
@@ -173,13 +173,6 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
-}
-
-fn duration_millis_between(end: Duration, start: Duration) -> anyhow::Result<u64> {
-    let duration = end
-        .checked_sub(start)
-        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
-    Ok(u64::try_from(duration.as_millis())?)
 }
 
 fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {

@@ -32,12 +32,22 @@ runs:
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        rustup toolchain install 1.93.1
-        rustup default 1.93.1
+        TOOLCHAIN=1.93.1
+
+        rustup toolchain install "${TOOLCHAIN}" --profile minimal
+        rustup component add cargo rustc rustfmt clippy --toolchain "${TOOLCHAIN}"
+        rustup default "${TOOLCHAIN}"
+        rustup run "${TOOLCHAIN}" cargo --version
+        rustup run "${TOOLCHAIN}" rustc --version
 
     - name: Install Rust 1.93.1 toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        rustup toolchain install 1.93.1
-        rustup default 1.93.1
+        $toolchain = "1.93.1"
+
+        rustup toolchain install $toolchain --profile minimal
+        rustup component add cargo rustc rustfmt clippy --toolchain $toolchain
+        rustup default $toolchain
+        rustup run $toolchain cargo --version
+        rustup run $toolchain rustc --version

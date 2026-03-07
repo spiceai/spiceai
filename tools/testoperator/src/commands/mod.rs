@@ -218,6 +218,13 @@ pub(crate) async fn create_query_executor(
     Ok(executor)
 }
 
+pub(crate) fn duration_millis_between(end: Duration, start: Duration) -> anyhow::Result<u64> {
+    let duration = end
+        .checked_sub(start)
+        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
+    Ok(u64::try_from(duration.as_millis())?)
+}
+
 #[macro_export]
 macro_rules! wait_test_and_memory {
     ($test:expr, $memory_token:expr, $memory_readings:expr) => {

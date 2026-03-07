@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::args::EvalsTestArgs;
 
-use super::get_app_and_start_request;
+use super::{duration_millis_between, get_app_and_start_request};
 use crate::health::HealthMonitor;
 use serde_json::json;
 use spiceai::Client as SpiceClient;
@@ -226,13 +226,6 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
-}
-
-fn duration_millis_between(end: Duration, start: Duration) -> anyhow::Result<u64> {
-    let duration = end
-        .checked_sub(start)
-        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
-    Ok(u64::try_from(duration.as_millis())?)
 }
 
 async fn execute_sql(
