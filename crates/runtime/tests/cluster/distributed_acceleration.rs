@@ -123,19 +123,19 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r"
-            +---------------+----------------------------------------------------------------------------+
-            | plan_type     | plan                                                                       |
-            +---------------+----------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                          |
-            |               |   TableScan: test_data projection=[id, name, age, city, score]             |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]        |
-            |               |   CooperativeExec                                                          |
-            |               |     BytesProcessedExec                                                     |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data   |
-            |               |                                                                            |
-            +---------------+----------------------------------------------------------------------------+
-            ");
+            insta::assert_snapshot!(plan_fmt, @r#"
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | plan_type     | plan                                                                                                                                                                                    |
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                       |
+            |               |   TableScan: test_data projection=[id, name, age, city, score], full_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
+            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                     |
+            |               |   CooperativeExec                                                                                                                                                                       |
+            |               |     BytesProcessedExec                                                                                                                                                                  |
+            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2'                                  |
+            |               |                                                                                                                                                                                         |
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            "#);
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -202,44 +202,6 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-async fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), anyhow::Error> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    Err(anyhow::Error::msg(format!(
-        "Timed out waiting for port {addr} to become reachable"
-    )))
-}
-
-async fn wait_for_executor_count(
-    executor_manager: &ExecutorManager,
-    expected: usize,
-    timeout: Duration,
-) -> Result<(), anyhow::Error> {
-    let start = Instant::now();
-    loop {
-        let count = executor_manager
-            .get_executor_state()
-            .await
-            .map_err(|err| anyhow::Error::msg(err.to_string()))?
-            .len();
-        if count == expected {
-            return Ok(());
-        }
-        if start.elapsed() > timeout {
-            return Err(anyhow::Error::msg(format!(
-                "Timed out waiting for {expected} executors; found {count}"
-            )));
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-}
 
 /// Return a `SchedulerConfig` pointing at an S3 bucket for partition state.
 ///
