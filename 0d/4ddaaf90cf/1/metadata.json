@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "0d4ddaaf90cf",
+  "session_id": "5c4055f6-48db-4c7b-9337-15e0a5f7b656",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-07T03:45:07.818067Z",
+  "branch": "jeadie/26-03-07/pr-builds",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/pr-builds/src/main.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "69a8d40c6bda",
+  "token_usage": {
+    "input_tokens": 26,
+    "cache_creation_tokens": 29224,
+    "cache_read_tokens": 289819,
+    "output_tokens": 3720,
+    "api_call_count": 16
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-07T03:45:07.739403Z",
+    "agent_lines": 12,
+    "human_added": 0,
+    "human_modified": 9,
+    "human_removed": 0,
+    "total_committed": 21,
+    "agent_percentage": 57.14285714285714
+  }
+}

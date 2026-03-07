@@ -3,7 +3,7 @@
   "checkpoint_id": "0d4ddaaf90cf",
   "strategy": "manual-commit",
   "branch": "jeadie/26-03-07/pr-builds",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "tools/pr-builds/src/main.rs"
   ],
@@ -14,13 +14,20 @@
       "context": "/0d/4ddaaf90cf/0/context.md",
       "content_hash": "/0d/4ddaaf90cf/0/content_hash.txt",
       "prompt": "/0d/4ddaaf90cf/0/prompt.txt"
+    },
+    {
+      "metadata": "/0d/4ddaaf90cf/1/metadata.json",
+      "transcript": "/0d/4ddaaf90cf/1/full.jsonl",
+      "context": "/0d/4ddaaf90cf/1/context.md",
+      "content_hash": "/0d/4ddaaf90cf/1/content_hash.txt",
+      "prompt": "/0d/4ddaaf90cf/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 234,
-    "cache_creation_tokens": 41522,
-    "cache_read_tokens": 1196960,
-    "output_tokens": 2668,
-    "api_call_count": 28
+    "input_tokens": 260,
+    "cache_creation_tokens": 70746,
+    "cache_read_tokens": 1486779,
+    "output_tokens": 6388,
+    "api_call_count": 44
   }
 }
