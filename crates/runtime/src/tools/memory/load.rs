@@ -145,7 +145,10 @@ impl SpiceModelTool for LoadMemoryTool {
                         .gt(lit(ScalarValue::TimestampSecond(Some(created_after), None))),
                 )
                 .boxed()?
-                .sort(vec![col("created_at").sort(false, false)])
+                .sort(vec![
+                    col("created_at").sort(false, false),
+                    col("id").sort(false, false),
+                ])
                 .boxed()?
                 .limit(params.offset, Some(params.limit))
                 .boxed()?

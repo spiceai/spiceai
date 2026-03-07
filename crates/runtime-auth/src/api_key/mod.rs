@@ -180,9 +180,12 @@ mod tests {
     #[test]
     fn test_empty_configured_key_is_ignored() {
         let auth = ApiKeyAuth::new(vec![ApiKey::parse_str(""), ApiKey::parse_str("valid-key")]);
-        let parts = create_request_parts(None);
+        let empty_key_parts = create_request_parts(Some(""));
+        let empty_key_result = auth.http_verify(&empty_key_parts);
+        assert!(matches!(empty_key_result, Ok(AuthVerdict::Deny)));
 
-        let result = auth.http_verify(&parts);
-        assert!(matches!(result, Ok(AuthVerdict::Deny)));
+        let valid_key_parts = create_request_parts(Some("valid-key"));
+        let valid_key_result = auth.http_verify(&valid_key_parts);
+        assert!(matches!(valid_key_result, Ok(AuthVerdict::Allow(_))));
     }
 }

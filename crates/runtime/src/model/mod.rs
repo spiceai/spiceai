@@ -61,16 +61,16 @@ use crate::DataFusion;
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
-    let dataset = TableReference::full(
-        SPICE_DEFAULT_CATALOG,
-        SPICE_DEFAULT_SCHEMA,
-        m.model.datasets[0].clone(),
-    );
+    let dataset = TableReference::parse_str(&m.model.datasets[0]);
+    let dataset_name = dataset
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        .to_string();
 
     let Some(provider) = df.get_table(&dataset).await else {
         return Err(ModelError::UnableToRunModel {
             source: Box::new(io::Error::other(format!(
-                "Model dataset not found: {dataset}"
+                "Model dataset not found: {dataset_name}"
             ))),
         });
     };

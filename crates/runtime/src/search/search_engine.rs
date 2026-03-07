@@ -197,13 +197,14 @@ impl SearchEngine {
             let search_key = SearchKey::from(req.clone());
             let cache_control = request_context.cache_control();
 
-            let scoped_user_cache_key = request_context.scoped_client_supplied_cache_key();
+            let scoped_user_cache_key =
+                if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
+                    request_context.scoped_client_supplied_cache_key()
+                } else {
+                    None
+                };
             let cache_key = match scoped_user_cache_key.as_deref() {
-                Some(cache_key)
-                    if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
-                {
-                    CacheKey::ClientSupplied(cache_key)
-                }
+                Some(cache_key) => CacheKey::ClientSupplied(cache_key),
                 _ => CacheKey::Search(&search_key),
             };
 

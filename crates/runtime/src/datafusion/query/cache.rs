@@ -104,8 +104,14 @@ impl Query {
         parameters: Option<ParamValues>,
         tracker: Option<QueryTracker>,
     ) -> super::Result<PlanOrCached> {
+        let cache_control = request_context.cache_control();
         let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
-        let scoped_user_cache_key = request_context.scoped_client_supplied_cache_key();
+        let scoped_user_cache_key =
+            if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
+                request_context.scoped_client_supplied_cache_key()
+            } else {
+                None
+            };
         let sql_or_user_cache_key = match scoped_user_cache_key.as_deref() {
             Some(user_key) => CacheKey::ClientSupplied(user_key),
             _ => sql_cache_key,
