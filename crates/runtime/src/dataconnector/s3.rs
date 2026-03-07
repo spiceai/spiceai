@@ -26,7 +26,6 @@ use super::{
 
 use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
 };
 
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
