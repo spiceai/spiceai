@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ae68a0efd15c",
+  "session_id": "9c811f18-0abe-4d1e-9c71-dfa421d4baa0",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-07T00:59:34.7036Z",
+  "branch": "jeadie/26-03-04/fts-partition",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/search/src/analyzer_rule.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "db934c9200b6",
+  "token_usage": {
+    "input_tokens": 294,
+    "cache_creation_tokens": 41246,
+    "cache_read_tokens": 1624027,
+    "output_tokens": 11787,
+    "api_call_count": 36
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-07T00:59:34.594465Z",
+    "agent_lines": 14,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 14,
+    "agent_percentage": 100
+  }
+}
