@@ -6,7 +6,7 @@ The DuckDB accelerator supports configuration parameters to control index scan b
 
 ### Checkpoint on Shutdown
 
-The DuckDB accelerator automatically enables `PRAGMA enable_checkpoint_on_shutdown` for all connections. This ensures that any pending changes in the Write-Ahead Log (WAL) are checkpointed when the database is shut down, maintaining data consistency.
+The DuckDB accelerator automatically enables `PRAGMA enable_checkpoint_on_shutdown` for all DuckDB accelerator pooled connections. This ensures that any pending changes in the Write-Ahead Log (WAL) are checkpointed when the database is shut down, maintaining data consistency.
 
 ## Index Scan Parameters
 
@@ -17,7 +17,7 @@ These parameters control when ART (Adaptive Radix Tree) index scans are used for
 The index scan percentage sets a threshold for index scans. An index scan is performed instead of a table scan when the number of matching rows is less than the maximum of `index_scan_max_count` and `index_scan_percentage × total_row_count`.
 
 **Type:** DOUBLE (0.0 to 1.0, representing 0% to 100%)  
-**Default:** 0.001 (0.1%)  
+**Default:** 0.001 (0.1%) — DuckDB's built-in default; Spice forwards the value if set but does not override DuckDB's default  
 **Scope:** Global
 
 **Example:**
@@ -39,7 +39,7 @@ datasets:
 The maximum index scan count sets a threshold for index scans. An index scan is performed instead of a table scan when the number of matching rows is less than the maximum of `index_scan_max_count` and `index_scan_percentage × total_row_count`.
 
 **Type:** UBIGINT (non-negative integer)  
-**Default:** 2048  
+**Default:** 2048 — DuckDB's built-in default; Spice forwards the value if set but does not override DuckDB's default  
 **Scope:** Global
 
 **Example:**
@@ -58,7 +58,7 @@ datasets:
 
 ## Combined Usage
 
-Both parameters can be used together. DuckDB will use an index scan when the number of qualifying rows is less than the maximum of these two thresholds:
+Both parameters can be used together. Spice validates and forwards these settings to DuckDB, which evaluates whether to use an index scan. DuckDB will use an index scan when the number of qualifying rows is less than the maximum of these two thresholds:
 
 ```yaml
 datasets:
