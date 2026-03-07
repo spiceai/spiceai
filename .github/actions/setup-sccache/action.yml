@@ -168,4 +168,3 @@ runs:
         echo "Using macOS sccache directory: $SCCACHE_DIR"
         sccache --stop-server || true
         sccache --start-server
-
