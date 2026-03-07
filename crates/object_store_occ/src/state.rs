@@ -17,7 +17,6 @@ limitations under the License.
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Instant;
 
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
@@ -62,8 +61,6 @@ pub enum WriteResult<T> {
 struct CachedEntry<T> {
     value: T,
     version: UpdateVersion,
-    #[expect(dead_code)]
-    cached_at: Instant,
 }
 
 /// Manages typed objects in an object store with optimistic concurrency control.
@@ -75,6 +72,16 @@ pub struct ObjectState<T> {
     prefix: String,
     cache: RwLock<HashMap<String, CachedEntry<T>>>,
     _marker: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for ObjectState<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectState")
+            .field("prefix", &self.prefix)
+            .field("store", &"Arc<dyn ObjectStore>")
+            .field("cache_size", &self.cache.read().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T> ObjectState<T>
@@ -328,14 +335,9 @@ where
     }
 
     fn update_cache(&self, key: &str, value: T, version: UpdateVersion) {
-        self.cache.write().insert(
-            key.to_string(),
-            CachedEntry {
-                value,
-                version,
-                cached_at: Instant::now(),
-            },
-        );
+        self.cache
+            .write()
+            .insert(key.to_string(), CachedEntry { value, version });
     }
 
     fn remove_from_cache(&self, key: &str) {

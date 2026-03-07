@@ -299,7 +299,8 @@ catalogs:
     from: spice.ai
     params:
       spiceai_api_key: my-api-key
-      spiceai_flight_endpoint: https://flight.spiceai.io
+      # Canonical Spice.ai endpoint parameter used for Flight connections.
+      spiceai_endpoint: https://flight.spiceai.io
       spiceai_http_endpoint: https://api.spiceai.io
 
 # =============================================================================

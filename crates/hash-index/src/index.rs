@@ -328,6 +328,9 @@ impl HashIndexBuilder {
                 }
 
                 let extractor = create_key_extractor(batch, &self.key_columns)?;
+                if extractor.is_empty() {
+                    continue;
+                }
 
                 for row in 0..extractor.len() {
                     let Some(hash) = extractor.hash_key(row) else {
@@ -954,6 +957,9 @@ impl HashIndex {
                 }
 
                 let extractor = create_key_extractor(batch, &self.key_columns)?;
+                if extractor.is_empty() {
+                    continue;
+                }
 
                 for row in 0..extractor.len() {
                     let Some(hash) = extractor.hash_key(row) else {
@@ -1003,6 +1009,9 @@ impl HashIndex {
             }
 
             let extractor = create_key_extractor(batch, &self.key_columns)?;
+            if extractor.is_empty() {
+                continue;
+            }
             let batch_offset_u32 =
                 u32::try_from(batch_offset)
                     .ok()

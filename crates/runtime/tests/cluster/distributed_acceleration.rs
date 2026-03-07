@@ -154,6 +154,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                     node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let scheduler_rt = Arc::new(
@@ -192,7 +193,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             runtime_ready_check(&scheduler_rt).await;
 
             // Wait for port reachability so the executor can connect.
-            wait_for_port("127.0.0.1:50352", Duration::from_secs(30)).await;
+            wait_for_port("127.0.0.1:50352", Duration::from_secs(30)).await?;
 
             // --- Executor 1 ---
             // Executor apps are empty — they receive the dataset definition from
@@ -225,6 +226,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                     node_mtls_key_file: Some(executor1_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor1_rt = Arc::new(
@@ -332,14 +334,18 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
         .await
 }
 
-async fn wait_for_port(addr: &str, timeout: Duration) {
+async fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), anyhow::Error> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
+            return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
     }
+
+    Err(anyhow::Error::msg(format!(
+        "Timed out waiting for port {addr} to become reachable"
+    )))
 }
 
 async fn wait_for_executor_count(

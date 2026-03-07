@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod provider;
+
 use async_trait::async_trait;
 use connection_manager::SqlServerConnectionPool;
 use convert::{map_column_type_to_arrow_type, map_type_name_to_column_type};
@@ -31,6 +33,7 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
+use util::format_datafusion_error;
 
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
@@ -70,7 +73,10 @@ pub enum Error {
     #[snafu(display("Failed to process SQL Server query result: unsupported type '{mssql_type}'"))]
     FailedToDowncastBuilder { mssql_type: String },
 
-    #[snafu(display("Failed to generate SQL for SQL Server query: {source}"))]
+    #[snafu(display(
+        "Failed to generate SQL for SQL Server query: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGenerateSQL { source: DataFusionError },
 }
 
@@ -246,9 +252,9 @@ fn is_time_related_expr(expr: &Expr) -> bool {
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }
-        Expr::ScalarVariable(dara_type, _) => {
+        Expr::ScalarVariable(field, _) => {
             matches!(
-                dara_type,
+                field.data_type(),
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }

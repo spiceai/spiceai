@@ -68,7 +68,7 @@ async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> 
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
@@ -148,8 +148,10 @@ async fn test_int64_pk_basic_deletion() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "int64_pk_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -214,8 +216,10 @@ async fn test_int64_pk_multi_insert_deletion() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "int64_pk_multi",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -305,8 +309,10 @@ async fn test_int64_pk_projection_without_pk() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "int64_pk_proj",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -379,8 +385,10 @@ async fn test_int64_pk_persistence() -> TestResult<()> {
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
-        let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
         let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        );
         ctx.register_table(
             "int64_persist",
             Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -405,13 +413,13 @@ async fn test_int64_pk_persistence() -> TestResult<()> {
         let catalog = Arc::new(CayenneCatalog::new(&db_path)?);
         catalog.init().await?;
 
+        let ctx = SessionContext::new();
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog)
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
                 .open("int64_persist")
                 .await?,
         );
 
-        let ctx = SessionContext::new();
         ctx.register_table(
             "int64_persist",
             Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -459,8 +467,10 @@ async fn test_rowconverter_composite_pk() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "composite_pk_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -538,8 +548,10 @@ async fn test_rowconverter_string_pk() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "string_pk_test",
         Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -620,8 +632,10 @@ async fn test_rowconverter_persistence() -> TestResult<()> {
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
-        let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
         let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        );
         ctx.register_table(
             "rowconv_persist",
             Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -645,13 +659,13 @@ async fn test_rowconverter_persistence() -> TestResult<()> {
         let catalog = Arc::new(CayenneCatalog::new(&db_path)?);
         catalog.init().await?;
 
+        let ctx = SessionContext::new();
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog)
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
                 .open("rowconv_persist")
                 .await?,
         );
 
-        let ctx = SessionContext::new();
         ctx.register_table(
             "rowconv_persist",
             Arc::clone(&table) as Arc<dyn TableProvider>,
@@ -712,8 +726,10 @@ async fn test_position_based_basic() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table("no_pk_basic", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // Insert with duplicate values (allowed without PK)
@@ -785,8 +801,10 @@ async fn test_position_based_multi_insert() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table("no_pk_multi", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // Insert batch 1
@@ -865,8 +883,10 @@ async fn test_position_based_persistence() -> TestResult<()> {
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
 
-        let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
         let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        );
         ctx.register_table("pos_persist", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
         let batch = RecordBatch::try_new(
@@ -887,13 +907,13 @@ async fn test_position_based_persistence() -> TestResult<()> {
         let catalog = Arc::new(CayenneCatalog::new(&db_path)?);
         catalog.init().await?;
 
+        let ctx = SessionContext::new();
         let table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog)
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
                 .open("pos_persist")
                 .await?,
         );
 
-        let ctx = SessionContext::new();
         ctx.register_table("pos_persist", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
         assert_eq!(get_row_count(&ctx, "pos_persist").await?, 4);
@@ -953,7 +973,9 @@ async fn test_strategy_selection() -> TestResult<()> {
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
-    let t1 = Arc::new(CayenneTableProvider::create_table(Arc::clone(&catalog), opts1).await?);
+    let t1 = Arc::new(
+        CayenneTableProvider::create_table(Arc::clone(&catalog), opts1, ctx.runtime_env()).await?,
+    );
     ctx.register_table("t_int64", Arc::clone(&t1) as Arc<dyn TableProvider>)?;
 
     // Table 2: String PK (should use RowConverter strategy)
@@ -970,7 +992,9 @@ async fn test_strategy_selection() -> TestResult<()> {
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
-    let t2 = Arc::new(CayenneTableProvider::create_table(Arc::clone(&catalog), opts2).await?);
+    let t2 = Arc::new(
+        CayenneTableProvider::create_table(Arc::clone(&catalog), opts2, ctx.runtime_env()).await?,
+    );
     ctx.register_table("t_string", Arc::clone(&t2) as Arc<dyn TableProvider>)?;
 
     // Table 3: No PK (should use PositionBased strategy)
@@ -987,7 +1011,9 @@ async fn test_strategy_selection() -> TestResult<()> {
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
-    let t3 = Arc::new(CayenneTableProvider::create_table(Arc::clone(&catalog), opts3).await?);
+    let t3 = Arc::new(
+        CayenneTableProvider::create_table(Arc::clone(&catalog), opts3, ctx.runtime_env()).await?,
+    );
     ctx.register_table("t_nopk", Arc::clone(&t3) as Arc<dyn TableProvider>)?;
 
     // Insert and delete from all three to verify they all work
@@ -1055,8 +1081,10 @@ async fn test_large_scale_deletions() -> TestResult<()> {
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table("large_scale", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // Insert 1000 rows

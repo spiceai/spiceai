@@ -1,0 +1,15 @@
+version: v2
+kind: Spicepod
+name: v2_caching_style
+runtime:
+  caching:
+    sql_results:
+      enabled: true
+      item_ttl: 30s
+      max_size: 64MiB
+      caching_policy: tiny_lfu
+      hashing_algorithm: blake3
+      cache_key_type: sql
+      engine: pingora
+      stale_while_revalidate_ttl: 60s
+      encoding: zstd

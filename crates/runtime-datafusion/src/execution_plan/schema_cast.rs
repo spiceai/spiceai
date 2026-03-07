@@ -37,7 +37,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    PhysicalExpr, PlanProperties,
+    PhysicalExpr, PlanProperties, SortOrderPushdownResult, expressions::PhysicalSortExpr,
 };
 use futures::StreamExt;
 use std::any::Any;
@@ -281,6 +281,13 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }
 

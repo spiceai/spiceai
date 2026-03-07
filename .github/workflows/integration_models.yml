@@ -96,7 +96,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka"
+          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
@@ -108,7 +108,7 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
@@ -130,7 +130,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -183,7 +183,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -275,7 +275,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -324,7 +324,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -369,7 +369,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -404,7 +404,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -457,7 +457,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          FEATURES="flightsql,models,s3_vectors,kafka"
+          FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
@@ -469,7 +469,7 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
@@ -491,7 +491,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test

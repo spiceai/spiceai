@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub(crate) mod s3;
+pub mod s3;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -32,6 +32,7 @@ use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
@@ -97,6 +98,9 @@ pub enum Error {
 
     #[snafu(display("Cayenne S3 acceleration error: {source}"))]
     S3Error { source: s3::Error },
+
+    #[snafu(display("RuntimeEnv is required for Cayenne accelerator but was not provided"))]
+    RuntimeEnvRequired,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -319,12 +323,8 @@ impl CayenneAccelerator {
     ///
     /// Returns a vector of S3 paths, one for each zone. The first zone is the primary zone
     /// used for reads; all zones are used for writes (ACID replication).
-    #[expect(
-        dead_code,
-        reason = "Will be used when multi-zone write support is implemented"
-    )]
     fn cayenne_data_dirs_multi_zone(&self, source: &dyn AccelerationSource) -> Result<Vec<String>> {
-        let zone_ids = s3::get_s3_zone_ids(source);
+        let zone_ids = s3::get_s3_zone_ids(source).context(S3Snafu)?;
         if zone_ids.is_empty() {
             // No multi-zone config, return single path
             return Ok(vec![self.cayenne_data_dir(source)?]);
@@ -407,15 +407,26 @@ impl CayenneAccelerator {
     }
 
     fn resolve_storage_config(&self, source: &dyn AccelerationSource) -> Result<String> {
-        self.file_path(source)
+        let paths = self
+            .cayenne_data_dirs_multi_zone(source)
             .boxed()
-            .context(AccelerationCreationFailedSnafu)
+            .context(AccelerationCreationFailedSnafu)?;
+
+        paths
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::InvalidConfiguration {
+                detail: Arc::from("Unable to resolve Cayenne storage path"),
+            })
     }
 
     fn get_unsupported_type_action(source: &dyn AccelerationSource) -> UnsupportedTypeAction {
         // Check if unsupported_type_action is specified in acceleration params
         if let Some(acceleration) = source.acceleration()
-            && let Some(action_str) = acceleration.params.get("unsupported_type_action")
+            && let Some(action_str) = acceleration
+                .params
+                .get("cayenne_unsupported_type_action")
+                .or_else(|| acceleration.params.get("unsupported_type_action"))
         {
             match action_str.to_lowercase().as_str() {
                 "error" => return UnsupportedTypeAction::Error,
@@ -483,7 +494,11 @@ impl CayenneAccelerator {
             }
 
             // Parse sort columns
-            if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
+            if let Some(sort_cols_str) = acceleration
+                .params
+                .get("cayenne_sort_columns")
+                .or_else(|| acceleration.params.get("sort_columns"))
+            {
                 config.sort_columns = sort_cols_str
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -634,6 +649,7 @@ impl CayenneAccelerator {
         time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
         primary_keys: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
@@ -686,9 +702,14 @@ impl CayenneAccelerator {
             vortex_config,
         };
 
+        // Create shared Cayenne context with the runtime's RuntimeEnv
+        let context =
+            cayenne::CayenneContext::new(&table_options.vortex_config, Arc::clone(&runtime_env));
+
         // Create CayenneTableProvider with object store for S3 Express One Zone
-        let mut builder =
-            CayenneTableProviderBuilder::new(catalog).with_retention_filters(retention_filters);
+        let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_context(context)
+            .with_retention_filters(retention_filters);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -745,7 +766,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("segment_cache_mb")
             .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
             .default("256"),
-        ParameterSpec::component("cayenne_target_file_size_mb")
+        ParameterSpec::component("target_file_size_mb")
             .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
             .default("256"),
         ParameterSpec::component("sort_columns")
@@ -754,7 +775,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
-        ParameterSpec::component("cayenne_upload_concurrency")
+        ParameterSpec::component("upload_concurrency")
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Default: 4.")
             .default("4"),
     ],
@@ -868,23 +889,103 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Handle S3 Express One Zone configuration
         if is_s3_express {
-            // Automatically create the bucket if it doesn't exist and we have the required info
-            let (bucket_name, zone_id, region, access_key, secret_key, session_token) =
-                s3::get_s3_bucket_info(source, &dir_path).boxed()?;
-            if s3::create_s3_express_bucket_if_needed(
-                &bucket_name,
-                &zone_id,
-                &region,
-                access_key,
-                secret_key,
-                session_token,
-            )
-            .await
-            .boxed()?
-            {
-                tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket created)");
+            if s3::is_multi_zone_s3_express(source) {
+                let zone_ids = s3::get_s3_zone_ids(source).map_err(|source| {
+                    Box::new(Error::S3Error { source }) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+                let dataset_name = source.name().to_string().replace(['.', '/'], "_");
+                let app_name = source.app().name.clone();
+
+                let acceleration = source.acceleration().ok_or_else(|| {
+                    Box::new(Error::InvalidConfiguration {
+                        detail: Arc::from(
+                            "Acceleration settings are required for multi-zone S3 Express initialization",
+                        ),
+                    }) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+
+                let s3_auth = acceleration
+                    .params
+                    .get("cayenne_s3_auth")
+                    .map_or("iam_role", String::as_str);
+                let (access_key, secret_key, session_token) = if s3_auth == "key" {
+                    (
+                        acceleration.params.get("cayenne_s3_key").cloned(),
+                        acceleration.params.get("cayenne_s3_secret").cloned(),
+                        acceleration.params.get("cayenne_s3_session_token").cloned(),
+                    )
+                } else {
+                    (None, None, None)
+                };
+
+                for zone_id in &zone_ids {
+                    let bucket_name = s3::generate_bucket_name(&app_name, &dataset_name, zone_id)
+                        .map_err(|source| {
+                        Box::new(Error::S3Error { source })
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+
+                    let region = acceleration
+                        .params
+                        .get("cayenne_s3_region")
+                        .cloned()
+                        .or_else(|| s3::derive_region_from_zone(zone_id))
+                        .ok_or_else(|| Error::InvalidConfiguration {
+                            detail: Arc::from(format!(
+                                "Could not determine region for S3 Express zone '{zone_id}'. Specify 'cayenne_s3_region' parameter"
+                            )),
+                        })?;
+
+                    let created = s3::create_s3_express_bucket_if_needed(
+                        &bucket_name,
+                        zone_id,
+                        &region,
+                        access_key.clone(),
+                        secret_key.clone(),
+                        session_token.clone(),
+                    )
+                    .await
+                    .map_err(|source| {
+                        Box::new(Error::S3Error { source })
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+
+                    if created {
+                        tracing::info!(
+                            "Using S3 Express One Zone storage replica: s3://{bucket_name}/{dataset_name}/ (bucket created)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "Using S3 Express One Zone storage replica: s3://{bucket_name}/{dataset_name}/ (bucket exists)"
+                        );
+                    }
+                }
+
+                tracing::info!(
+                    "Using multi-zone S3 Express One Zone storage: {} zone(s), primary path {dir_path}",
+                    zone_ids.len()
+                );
             } else {
-                tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket exists)");
+                // Automatically create the bucket if it doesn't exist and we have the required info
+                let (bucket_name, zone_id, region, access_key, secret_key, session_token) =
+                    s3::get_s3_bucket_info(source, &dir_path).boxed()?;
+                if s3::create_s3_express_bucket_if_needed(
+                    &bucket_name,
+                    &zone_id,
+                    &region,
+                    access_key,
+                    secret_key,
+                    session_token,
+                )
+                .await
+                .boxed()?
+                {
+                    tracing::info!(
+                        "Using S3 Express One Zone storage: {dir_path} (bucket created)"
+                    );
+                } else {
+                    tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket exists)");
+                }
             }
             tracing::debug!(
                 "S3 Express One Zone is optimized for low-latency access within the same AWS Availability Zone. Access from outside AWS may experience higher latency."
@@ -973,7 +1074,12 @@ impl DataAccelerator for CayenneAccelerator {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // Cayenne requires a RuntimeEnv to share caches (list_files_cache, object stores)
+        // with the main query engine. This must always be provided by the runtime.
+        let runtime_env = runtime_env.context(RuntimeEnvRequiredSnafu).boxed()?;
+
         // Cayenne requires a source for file mode with directory-based storage
         let source = source.ok_or_else(|| {
             Box::new(Error::InvalidConfiguration {
@@ -1056,6 +1162,7 @@ impl DataAccelerator for CayenneAccelerator {
                 time_retention_filter_builder.clone(),
                 primary_keys.clone(),
                 on_conflict.clone(),
+                Arc::clone(&runtime_env),
             )
             .await
             .boxed()?;
@@ -1149,6 +1256,7 @@ impl DataAccelerator for CayenneAccelerator {
                 object_store_config,
                 primary_keys,
                 on_conflict,
+                runtime_env,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -1276,11 +1384,12 @@ impl CayennePartitionCreator {
         object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
         primary_key: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+        runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config);
+        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env);
 
         Self {
             table_name,
@@ -1427,9 +1536,12 @@ impl PartitionCreator for CayennePartitionCreator {
 
         // Create Cayenne table provider for this partition with S3 support.
         // Use the shared context to share footer/segment caches across partitions.
-        let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
-            .with_retention_filters(self.retention_filters.clone())
-            .with_context(Arc::clone(&self.context));
+        let mut builder = cayenne::CayenneTableProviderBuilder::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.runtime_env()),
+        )
+        .with_context(Arc::clone(&self.context))
+        .with_retention_filters(self.retention_filters.clone());
         if let Some(ref retention_builder) = self.time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder.clone());
         }
@@ -1497,9 +1609,12 @@ impl PartitionCreator for CayennePartitionCreator {
 
             // Use builder pattern to pass object store config for S3 support.
             // Use the shared context to share footer/segment caches across partitions.
-            let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
-                .with_retention_filters(self.retention_filters.clone())
-                .with_context(Arc::clone(&self.context));
+            let mut builder = cayenne::CayenneTableProviderBuilder::new(
+                Arc::clone(&self.catalog),
+                Arc::clone(self.context.runtime_env()),
+            )
+            .with_context(Arc::clone(&self.context))
+            .with_retention_filters(self.retention_filters.clone());
             if let Some(ref retention_builder) = self.time_retention_filter_builder {
                 builder = builder.with_time_retention_filter_builder(retention_builder.clone());
             }
@@ -1606,6 +1721,42 @@ mod tests {
         };
         assert!(dir_path.contains("cayenne_data_accelerator_test"));
         assert!(dir_path.ends_with('/'));
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_multi_zone_primary_path_generation() {
+        let app = AppBuilder::new("test-app").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new("orders.dataset".to_string(), "orders.dataset")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [(
+                "cayenne_s3_zone_ids".to_string(),
+                "usw2-az1,usw2-az2".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let accelerator = CayenneAccelerator::new();
+        let primary_data_dir = accelerator
+            .resolve_storage_config(&dataset)
+            .expect("Expected primary multi-zone path");
+
+        assert!(
+            primary_data_dir.starts_with("s3://spice-test-app-orders-dataset--usw2-az1--x-s3/"),
+            "Expected first zone to be primary path, got: {primary_data_dir}"
+        );
+        assert!(primary_data_dir.ends_with("/orders_dataset/"));
     }
 
     #[test]

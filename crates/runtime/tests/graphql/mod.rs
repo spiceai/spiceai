@@ -302,9 +302,11 @@ async fn test_graphql() -> Result<(), String> {
                     "SELECT * FROM test_graphql",
                     "select_all",
                     Some(Box::new(|result_batches| {
+                        let total_rows: usize =
+                            result_batches.iter().map(RecordBatch::num_rows).sum();
+                        assert_eq!(total_rows, 4, "total_rows: {total_rows}");
                         for batch in result_batches {
                             assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         }
                     })),
                 ),
@@ -312,9 +314,11 @@ async fn test_graphql() -> Result<(), String> {
                     "SELECT posts[1]['title'] from test_graphql",
                     "select_posts_title",
                     Some(Box::new(|result_batches| {
+                        let total_rows: usize =
+                            result_batches.iter().map(RecordBatch::num_rows).sum();
+                        assert_eq!(total_rows, 4, "total_rows: {total_rows}");
                         for batch in result_batches {
                             assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
-                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         }
                     })),
                 ),
@@ -384,7 +388,6 @@ async fn test_graphql_pagination() -> Result<(), String> {
                     let mut total = 0;
                     for batch in result_batches {
                         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         total += batch.num_rows();
                     }
                     assert_eq!(total, 4);
@@ -397,7 +400,6 @@ async fn test_graphql_pagination() -> Result<(), String> {
                     let mut total = 0;
                     for batch in result_batches {
                         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         total += batch.num_rows();
                     }
                     assert_eq!(total, 1);

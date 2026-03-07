@@ -22,7 +22,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
-use crate::datafusion::error::SpiceExternalError;
+use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
@@ -75,22 +75,26 @@ pub use snapshots::SnapshotCreationConfig;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to fetch data from the data connector: {source}. Ensure the dataset source path and connector configuration are valid, and try again."
+        "Failed to fetch data from the data connector: {}. Ensure the dataset source path and connector configuration are valid, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to refresh dataset from the data connector: {source}. Verify the dataset configuration and data connector status, and try again."
+        "Failed to refresh dataset from the data connector: {}. Verify the dataset configuration and data connector status, and try again.",
+        format_datafusion_error(source)
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to scan the dataset from the data connector: {source}. Ensure the dataset configuration is valid, and try again."
+        "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToScanTableProvider { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to apply data update to the accelerated dataset: {source}. Ensure the dataset schema is compatible, and try again."
+        "Failed to apply data update to the accelerated dataset: {}. Ensure the dataset schema is compatible, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
@@ -120,7 +124,8 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table: {source}. Is the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table: {}. Is the 'time_column' parameter correct?",
+        format_datafusion_error(source)
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
@@ -130,7 +135,10 @@ pub enum Error {
     #[snafu(display("Failed to filter update data for the accelerated dataset: {source}"))]
     FailedToFilterUpdates { source: ArrowError },
 
-    #[snafu(display("Failed to write data into the accelerated dataset: {source}"))]
+    #[snafu(display(
+        "Failed to write data into the accelerated dataset: {}",
+        format_datafusion_error(source)
+    ))]
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
@@ -251,6 +259,7 @@ pub struct AcceleratedTable {
     last_updated_at: Arc<AtomicI64>,
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
+    cluster_role: Option<ClusterRole>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -887,6 +896,7 @@ impl Builder {
             in_flight_revalidations,
             last_updated_at,
             batch_write_tx,
+            cluster_role: self.cluster_role,
         })
     }
 }
@@ -994,20 +1004,51 @@ impl AcceleratedTable {
         Arc::clone(&self.synchronized_children)
     }
 
-    pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
+    pub async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
-        refresh.sql.clone_from(&refresh_sql);
+        // Preserve existing partition_filters when updating user SQL
+        let existing_partition_filters = refresh
+            .sql
+            .as_ref()
+            .map(|s| s.partition_filters().to_vec())
+            .unwrap_or_default();
 
-        if !is_spice_internal_dataset(&self.dataset_name) {
-            if let Some(sql_str) = &refresh_sql {
-                tracing::info!("[refresh] Updated refresh SQL for {dataset_name} to {sql_str}");
-            } else {
-                tracing::info!("[refresh] Removed refresh SQL for {dataset_name}");
-            }
+        if !existing_partition_filters.is_empty() {
+            refresh_sql.set_partition_filters(existing_partition_filters);
         }
+        if !is_spice_internal_dataset(&self.dataset_name) {
+            tracing::info!(
+                "[refresh] Updated refresh SQL for {dataset_name} to {}",
+                refresh_sql.display_sql()
+            );
+        }
+        refresh.sql = Some(refresh_sql);
 
+        Ok(())
+    }
+
+    /// Update only the partition filters on the refresh SQL, preserving user SQL parts.
+    pub async fn update_partition_filters(
+        &self,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<()> {
+        let mut refresh = self.refresh_params.write().await;
+        if let Some(ref mut sql) = refresh.sql {
+            sql.set_partition_filters(filters);
+        } else {
+            // No user SQL, but we still need partition filters.
+            // Create a minimal RefreshSQL with All columns and only partition filters.
+            let mut sql = crate::accelerated_table::refresh::RefreshSQL::new(
+                self.dataset_name.clone(),
+                crate::accelerated_table::refresh::RefreshSQLColumns::All,
+                vec![],
+                None,
+            );
+            sql.set_partition_filters(filters);
+            refresh.sql = Some(sql);
+        }
         Ok(())
     }
 
@@ -1104,6 +1145,14 @@ impl TableProvider for AcceleratedTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Check if we're in caching mode
         let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+
+        if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
+            let federated_provider = self.federated.table_provider().await;
+            return federated_provider
+                .scan(state, projection, filters, limit)
+                .await;
+        }
 
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
         if !self.refresher().initial_load_completed() && !is_caching_mode {

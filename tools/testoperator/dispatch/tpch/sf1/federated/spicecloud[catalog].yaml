@@ -5,3 +5,7 @@ tests:
     runner_type: spiceai-dev-runners
     query_overrides: spicecloud-catalog
     validate_results: true
+  schema:
+    spicepod_path: federated/spicecloud[catalog].yaml
+    runner_type: spiceai-dev-runners
+    min_tables: 1

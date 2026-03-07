@@ -62,7 +62,7 @@ jobs:
 
       - name: Upload JSON schema artifact
         if: github.event_name != 'workflow_dispatch' || inputs.run_build
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json
@@ -89,7 +89,8 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          python3 -m pip install --user check-jsonschema
+          python3 -m venv .venv
+          .venv/bin/python -m pip install check-jsonschema
 
           echo "## Schema Validation Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -97,7 +98,7 @@ jobs:
           VALIDATION_FAILED=0
           for file in tools/spicepodschema/tests/*.yaml; do
             filename=$(basename "$file")
-            if python3 -m check_jsonschema --schemafile .schema/spicepod.schema.json "$file" 2>&1; then
+            if .venv/bin/check-jsonschema --schemafile .schema/spicepod.schema.json "$file" 2>&1; then
               echo "✅ \`$filename\` - Valid" >> $GITHUB_STEP_SUMMARY
             else
               echo "❌ \`$filename\` - Invalid" >> $GITHUB_STEP_SUMMARY
@@ -105,7 +106,7 @@ jobs:
               echo "<details><summary>Validation errors</summary>" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo '```' >> $GITHUB_STEP_SUMMARY
-              python3 -m check_jsonschema --schemafile .schema/spicepod.schema.json "$file" --verbose 2>&1 || true >> $GITHUB_STEP_SUMMARY
+              { .venv/bin/check-jsonschema --schemafile .schema/spicepod.schema.json "$file" --verbose 2>&1 || true; } >> $GITHUB_STEP_SUMMARY
               echo '```' >> $GITHUB_STEP_SUMMARY
               echo "</details>" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY

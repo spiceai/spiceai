@@ -77,7 +77,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use error::find_datafusion_root;
+use error::{find_datafusion_root, format_datafusion_error};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use query::QueryBuilder;
@@ -164,7 +164,7 @@ pub enum Error {
     #[snafu(display("Unable to delete table: {reason}"))]
     UnableToDeleteTable { reason: String },
 
-    #[snafu(display("Unable to parse SQL: {source}"))]
+    #[snafu(display("Unable to parse SQL: {}", format_datafusion_error(source)))]
     UnableToParseSql { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -173,10 +173,10 @@ pub enum Error {
     #[snafu(display("{source}"))]
     RetentionSql { source: retention_sql::Error },
 
-    #[snafu(display("Unable to get table: {source}"))]
+    #[snafu(display("Unable to get table: {}", format_datafusion_error(source)))]
     UnableToGetTable { source: DataFusionError },
 
-    #[snafu(display("Unable to list tables: {source}"))]
+    #[snafu(display("Unable to list tables: {}", format_datafusion_error(source)))]
     UnableToGetTables { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
@@ -192,10 +192,16 @@ pub enum Error {
     ))]
     MetadataProviderNotImplemented { table_name: String },
 
-    #[snafu(display("Unable to register table in DataFusion: {source}"))]
+    #[snafu(display(
+        "Unable to register table in DataFusion: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
 
-    #[snafu(display("Unable to register {schema} table in DataFusion: {source}"))]
+    #[snafu(display(
+        "Unable to register {schema} table in DataFusion: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterTableToDataFusionSchema {
         schema: String,
         source: DataFusionError,
@@ -212,13 +218,19 @@ pub enum Error {
     #[snafu(display("The table {table_name} is not writable"))]
     TableNotWritable { table_name: String },
 
-    #[snafu(display("Unable to plan the table insert for {table_name}: {source}"))]
+    #[snafu(display(
+        "Unable to plan the table insert for {table_name}: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToPlanTableInsert {
         table_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to execute the table insert for {table_name}: {source}"))]
+    #[snafu(display(
+        "Unable to execute the table insert for {table_name}: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToExecuteTableInsert {
         table_name: String,
         source: DataFusionError,
@@ -254,7 +266,7 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
-    #[snafu(display("Unable to get {schema} schema: {source}"))]
+    #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
         schema: String,
         source: DataFusionError,
@@ -291,7 +303,10 @@ pub enum Error {
     ))]
     ChangeSchemaWithoutDataField { source: ArrowError },
 
-    #[snafu(display("Unable to create streaming data update: {source}"))]
+    #[snafu(display(
+        "Unable to create streaming data update: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
@@ -329,7 +344,16 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {source}"
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+    ))]
+    UnsupportedDistributedAccelerationEngine {
+        dataset_name: String,
+        engine: String,
+    },
+
+    #[snafu(display(
+        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
+        format_datafusion_error(source)
     ))]
     UnableToSetUnderlyingTableProvider {
         component_name: String,
@@ -376,6 +400,30 @@ pub enum Error {
     UnsupportedAccelerationEngineForSnapshots,
 }
 
+/// Validates that the acceleration engine is supported in distributed mode.
+///
+/// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
+/// Returns an error if a distributed role is active and the engine is unsupported.
+fn validate_distributed_engine(
+    cluster_config: &ResolvedClusterConfig,
+    engine: Engine,
+    dataset_name: &str,
+) -> Result<()> {
+    if cluster_config.effective_role().is_some()
+        && !matches!(
+            engine,
+            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+        )
+    {
+        return UnsupportedDistributedAccelerationEngineSnafu {
+            dataset_name: dataset_name.to_string(),
+            engine: engine.to_string(),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
@@ -386,6 +434,10 @@ pub enum Table {
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        /// Initial partition filter expressions to apply before the refresher starts.
+        /// These are set on the `Refresh` during table registration to avoid a race
+        /// where the first refresh runs before partition filters are applied.
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -633,6 +685,7 @@ impl DataFusion {
                 accelerated_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -666,6 +719,7 @@ impl DataFusion {
                         federated_read_table,
                         secrets,
                         bootstrap_status,
+                        initial_partition_filters,
                     )
                     .await?
                 }
@@ -959,6 +1013,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+            vec![],
         )
         .await?;
 
@@ -1527,6 +1582,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1566,16 +1622,17 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
-        let refresh_sql = dataset.refresh_sql();
-        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(
+        let refresh_sql_str = dataset.refresh_sql();
+        let (parsed_refresh_sql, refresh_schema) = if let Some(sql_str) = &refresh_sql_str {
+            let (parsed, schema) = refresh_sql::parse_refresh_sql(
                 dataset.name.clone(),
-                refresh_sql.as_str(),
+                sql_str.as_str(),
                 source_schema,
             )
-            .context(RefreshSqlSnafu)?
+            .context(RefreshSqlSnafu)?;
+            (Some(parsed), schema)
         } else {
-            source_schema
+            (None, source_schema)
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1598,7 +1655,7 @@ impl DataFusion {
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let use_constraints = refresh_sql.is_none();
+        let use_constraints = parsed_refresh_sql.is_none();
 
         let constraints = if use_constraints {
             match &*source_table_provider {
@@ -1608,6 +1665,13 @@ impl DataFusion {
         } else {
             None
         };
+
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration_settings.engine,
+            &dataset.name.to_string(),
+        )?;
 
         let accelerated_table_provider = self
             .accelerator_engine_registry
@@ -1656,8 +1720,8 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-        if let Some(sql) = &refresh_sql {
-            refresh = refresh.sql(sql.clone());
+        if let Some(sql) = parsed_refresh_sql {
+            refresh = refresh.refresh_sql(sql);
         }
         if let Some(format) = dataset.time_format {
             refresh = refresh.time_format(format);
@@ -1693,6 +1757,20 @@ impl DataFusion {
         refresh
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
+
+        // Apply initial partition filters before the refresher starts to avoid a race
+        // where the first refresh runs without partition filters.
+        if !initial_partition_filters.is_empty() {
+            use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+            if let Some(ref mut sql) = refresh.sql {
+                sql.set_partition_filters(initial_partition_filters);
+            } else {
+                let mut sql =
+                    RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
+                sql.set_partition_filters(initial_partition_filters);
+                refresh = refresh.refresh_sql(sql);
+            }
+        }
 
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -1987,6 +2065,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -1995,6 +2074,7 @@ impl DataFusion {
                 federated_read_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
@@ -2050,7 +2130,7 @@ impl DataFusion {
     pub async fn update_refresh_sql(
         &self,
         dataset_name: TableReference,
-        refresh_sql: Option<String>,
+        refresh_sql: String,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
@@ -2058,30 +2138,49 @@ impl DataFusion {
 
         let refresh_schema = table.schema();
 
-        if let Some(sql) = &refresh_sql {
-            let selected_schema = refresh_sql::validate_refresh_sql(
-                dataset_name.clone(),
-                sql,
-                Arc::clone(&refresh_schema),
-            )
-            .context(RefreshSqlSnafu)?;
-            if selected_schema != refresh_schema {
-                return RefreshSqlSchemaChangeDisallowedSnafu {
-                    dataset_name: Arc::from(dataset_name.to_string()),
-                    selected_columns: Arc::from(
-                        selected_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                    refresh_columns: Arc::from(
-                        refresh_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                }
-                .fail();
+        let (parsed, selected_schema) = refresh_sql::parse_refresh_sql(
+            dataset_name.clone(),
+            &refresh_sql,
+            Arc::clone(&refresh_schema),
+        )
+        .context(RefreshSqlSnafu)?;
+        if selected_schema != refresh_schema {
+            return RefreshSqlSchemaChangeDisallowedSnafu {
+                dataset_name: Arc::from(dataset_name.to_string()),
+                selected_columns: Arc::from(
+                    selected_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
+                refresh_columns: Arc::from(
+                    refresh_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
             }
+            .fail();
         }
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table.update_refresh_sql(parsed).await.context(
+                UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Update only the partition filters on an accelerated table's refresh.
+    pub async fn update_partition_filters(
+        &self,
+        dataset_name: TableReference,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<()> {
+        let table = self
+            .get_accelerated_table_provider(&dataset_name.to_string())
+            .await?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
-                .update_refresh_sql(refresh_sql)
+                .update_partition_filters(filters)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -2333,6 +2432,13 @@ impl DataFusion {
                 })?;
 
         let schema = view_table.schema();
+
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration.engine,
+            &table.to_string(),
+        )?;
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()
@@ -3327,6 +3433,152 @@ mod tests {
                 ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
+        }
+    }
+
+    mod validate_distributed_engine_tests {
+        use super::super::*;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+            let config = ClusterConfig {
+                role: Some(role),
+                allow_insecure_connections: true,
+                node_advertise_address: Some("127.0.0.1".to_string()),
+                ..ClusterConfig::default()
+            };
+            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
+        }
+
+        fn make_non_distributed_config() -> ResolvedClusterConfig {
+            ResolvedClusterConfig::try_new(ClusterConfig::default())
+                .expect("valid default cluster config")
+        }
+
+        #[test]
+        fn arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn partitioned_arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
+                .expect("partitioned_arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn cayenne_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn sqlite_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Executor);
+            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn postgresql_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn turso_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result =
+                validate_distributed_engine(&config, Engine::PartitionedDuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn table_mode_partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(
+                &config,
+                Engine::TableModePartitionedDuckDB,
+                "my_dataset",
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn any_engine_allowed_in_non_distributed_mode() {
+            let config = make_non_distributed_config();
+            validate_distributed_engine(&config, Engine::DuckDB, "ds")
+                .expect("duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Sqlite, "ds")
+                .expect("sqlite should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
+                .expect("postgresql should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Turso, "ds")
+                .expect("turso should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PartitionedDuckDB, "ds")
+                .expect("partitioned_duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::TableModePartitionedDuckDB, "ds").expect(
+                "table_mode_partitioned_duckdb should be allowed when not in distributed mode",
+            );
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 }

@@ -19,7 +19,10 @@ use std::{collections::BTreeMap, time::Duration};
 use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
-    types::{CreateAppRequest, CreateDeploymentRequest, UpdateAppRequest},
+    types::{
+        AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
+        CreateDeploymentRequest, UpdateAppRequest,
+    },
 };
 
 pub(crate) mod secrets;
@@ -75,6 +78,17 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
+            resources: Some(AppResources {
+                limits: AppResourceLimits {
+                    cpu: None,
+                    memory: "32Gi".to_string(),
+                    ephemeral_storage: None,
+                },
+                requests: Some(AppResourceRequests {
+                    cpu: Some("0.1".to_string()),
+                    memory: Some("256Mi".to_string()),
+                }),
+            }),
         })
         .await;
 
@@ -150,6 +164,7 @@ pub(crate) async fn apply_spicepod_to_app(
                 image_tag: None,
                 region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
+                resources: None,
             },
         )
         .await?;

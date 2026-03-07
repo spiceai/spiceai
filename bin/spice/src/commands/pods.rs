@@ -18,9 +18,9 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
-use crate::output::{TableRow, write_table};
+use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Arguments for the pods command.
 #[derive(Args, Debug)]
@@ -30,13 +30,18 @@ use serde::Deserialize;
 
 Examples:
   spice pods
+  spice pods -o json
 
 See more at: https://spiceai.org/docs/"#
 )]
-pub struct PodsArgs {}
+pub struct PodsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
 
 /// Spicepod status information from the runtime API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SpicepodStatus {
     pub version: Option<String>,
     pub name: Option<String>,
@@ -64,7 +69,7 @@ impl TableRow for SpicepodStatus {
 }
 
 /// Execute the pods command.
-pub async fn execute(ctx: &RuntimeContext, _args: &PodsArgs) -> Result<()> {
+pub async fn execute(ctx: &RuntimeContext, args: &PodsArgs) -> Result<()> {
     let response = ctx.get("/v1/spicepods").await.map_err(|_| {
         RuntimeUnavailableSnafu {
             endpoint: ctx.http_endpoint().to_string(),
@@ -86,7 +91,10 @@ pub async fn execute(ctx: &RuntimeContext, _args: &PodsArgs) -> Result<()> {
         .build()
     })?;
 
-    write_table(&spicepods);
+    match args.output {
+        OutputFormat::Table => write_table(&spicepods),
+        OutputFormat::Json => write_json(&spicepods)?,
+    }
 
     Ok(())
 }

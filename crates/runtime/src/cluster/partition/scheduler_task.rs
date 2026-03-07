@@ -300,6 +300,12 @@ impl PartitionManagementTask {
                                 error = %e,
                                 "Partition management cycle failed"
                             );
+                            self.status.update_component_status(
+                                "partition_metadata",
+                                ComponentStatus::error_with_message(format!(
+                                    "Management cycle failed: {e}"
+                                )),
+                            );
                         }
                     }
 
@@ -822,10 +828,12 @@ impl PartitionManagementTask {
             }
         }
 
-        tracing::info!(
-            unassigned_count = unassigned.len(),
-            "Found unassigned partitions"
-        );
+        if !unassigned.is_empty() {
+            tracing::info!(
+                unassigned_count = unassigned.len(),
+                "Found unassigned partitions"
+            );
+        }
 
         unassigned
     }
@@ -1027,12 +1035,13 @@ impl PartitionManagementTask {
             }
         }
 
-        tracing::info!(
-            committed_count = committed.len(),
-            failed_count = failed.len(),
-            "Committed partition assignments"
-        );
-
+        if !committed.is_empty() || !failed.is_empty() {
+            tracing::info!(
+                committed_count = committed.len(),
+                failed_count = failed.len(),
+                "Committed partition assignments"
+            );
+        }
         Ok(CommitResult { committed, failed })
     }
 
@@ -1117,11 +1126,13 @@ impl PartitionManagementTask {
             }
         }
 
-        tracing::info!(
-            success_count,
-            failure_count,
-            "Notified executors of partition assignments"
-        );
+        if success_count + failure_count > 0 {
+            tracing::info!(
+                success_count,
+                failure_count,
+                "Notified executors of partition assignments"
+            );
+        }
 
         Ok(())
     }

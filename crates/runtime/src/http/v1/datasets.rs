@@ -60,15 +60,6 @@ pub struct DatasetQueryParams {
 // Re-export the shared type for backwards compatibility
 pub use runtime_api_types::v1::DatasetInfo as DatasetResponseItem;
 
-#[expect(dead_code)]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub(crate) struct Property {
-    pub key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
-}
-
 /// List Datasets
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
@@ -227,7 +218,7 @@ pub(crate) struct MessageResponse {
 #[derive(Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AccelerationRequest {
-    /// SQL statement used for the refresh. Defaults to the `refresh_sql` specified in the spicepod.
+    /// SQL statement used for the refresh. Defaults to current `refresh_sql` configured (either from the spicepod or a previous `refresh_sql` update).
     pub refresh_sql: Option<String>,
 }
 
@@ -431,15 +422,12 @@ pub(crate) async fn acceleration(
             .into_response();
     };
 
-    if payload.refresh_sql.is_none() {
+    let Some(sql) = payload.refresh_sql else {
         return (status::StatusCode::OK).into_response();
-    }
+    };
 
     match df
-        .update_refresh_sql(
-            TableReference::parse_str(&dataset.name),
-            payload.refresh_sql,
-        )
+        .update_refresh_sql(TableReference::parse_str(&dataset.name), sql)
         .await
     {
         Ok(()) => (status::StatusCode::OK).into_response(),

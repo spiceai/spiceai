@@ -28,7 +28,7 @@ use datafusion::{
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
-    physical_expr::OrderingRequirements,
+    physical_expr::{OrderingRequirements, PhysicalSortExpr},
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
         collect,
@@ -40,6 +40,7 @@ use datafusion::{
         limit::GlobalLimitExec,
         metrics::MetricsSet,
         projection::ProjectionExec,
+        sort_pushdown::SortOrderPushdownResult,
         union::UnionExec,
     },
     prelude::Expr,
@@ -47,6 +48,7 @@ use datafusion::{
 use pruning::prune_partition;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use util::format_datafusion_error;
 
 use crate::{
     Partition,
@@ -66,7 +68,10 @@ pub enum Error {
     CreatingPartition { source: super::creator::Error },
     #[snafu(display("Validating expressions failed: {source}"))]
     ValidatingExpressions { source: super::expression::Error },
-    #[snafu(display("Failed to convert schema to DFSchema: {source}"))]
+    #[snafu(display(
+        "Failed to convert schema to DFSchema: {}",
+        format_datafusion_error(source)
+    ))]
     SchemaConversion { source: DataFusionError },
     #[snafu(display("Expected array from partition expression, got scalar"))]
     InvalidPartitionExpression,
@@ -184,6 +189,19 @@ impl PartitionTableProvider {
     pub fn with_insert_strategy(mut self, insert_strategy: Arc<dyn InsertStrategy>) -> Self {
         self.insert_strategy = insert_strategy;
         self
+    }
+
+    /// Returns the table providers for all current partitions.
+    ///
+    /// Callers can use this to apply per-partition operations (e.g., index maintenance)
+    /// that are not part of the standard `TableProvider` interface.
+    pub async fn partition_table_providers(&self) -> Vec<Arc<dyn TableProvider>> {
+        self.partitions
+            .read()
+            .await
+            .values()
+            .map(|p| Arc::clone(&p.table_provider))
+            .collect()
     }
 
     /// Collects all partition column references from all partition expressions.
@@ -432,7 +450,12 @@ impl DeletionSink for PartitionedDeletionSink {
                 let state = session_ctx.state();
 
                 // Execute deletion on this partition
-                let plan = deletion_provider.delete_from(&state, &self.filters).await?;
+                let plan = DeletionTableProvider::delete_from(
+                    deletion_provider.as_ref(),
+                    &state,
+                    &self.filters,
+                )
+                .await?;
 
                 // Execute the deletion plan
                 let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
@@ -611,6 +634,13 @@ impl ExecutionPlan for PartitionedUnionExec {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>, DataFusionError> {
         Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {

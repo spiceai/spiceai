@@ -36,6 +36,7 @@ pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
 pub(crate) mod load;
 pub(crate) mod query;
+pub(crate) mod schema;
 pub(crate) mod search;
 pub(crate) mod streaming;
 pub(crate) mod text_to_sql;

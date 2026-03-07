@@ -35,8 +35,11 @@ pub use search::SearchTestArgs;
 mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
 
+mod schema;
+pub use schema::SchemaTestArgs;
+
 mod streaming;
-pub use streaming::{StreamingDynamodbDispatchArgs, StreamingDynamodbTestArgs};
+pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -67,10 +70,12 @@ pub enum TestCommands {
     Query(DatasetTestArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
-    /// Run multi-config `DynamoDB` streaming benchmarks (ingest once, benchmark many)
-    StreamingDynamodbDispatch(StreamingDynamodbDispatchArgs),
-    /// Run a streaming ingestion benchmark for `DynamoDB` Streams
-    StreamingDynamodb(StreamingDynamodbTestArgs),
+    /// Run a streaming ingestion performance benchmark for `DynamoDB` Streams
+    StreamingDynamodb(StreamingDynamodbArgs),
+    /// Run a streaming `DynamoDB` data correctness test (multi-round CDC verification)
+    StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
+    /// Validate catalog connector schema discovery via `information_schema`
+    Schema(SchemaTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

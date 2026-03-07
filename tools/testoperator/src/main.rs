@@ -24,7 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, TestCommands, TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs,
+    TestCommands, TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -53,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
             })
             | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::TextToSql(TextToSqlArgs { common, .. })
+            | TestCommands::Schema(SchemaTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -89,19 +91,22 @@ async fn main() -> anyhow::Result<()> {
             commands::text_to_sql::run(&args).await?;
         }
         Commands::Run(TestCommands::StreamingDynamodb(args)) => {
-            commands::streaming::run_dynamodb(&args).await?;
+            commands::streaming::run_benchmark(&args).await?;
         }
         Commands::Export(TestCommands::StreamingDynamodb(_)) => {
             return Err(anyhow::anyhow!(
                 "Export is not supported for streaming-dynamodb (spicepods are transformed at runtime)"
             ));
         }
-        Commands::Run(TestCommands::StreamingDynamodbDispatch(args)) => {
-            commands::streaming::run_dispatch(&args).await?;
+        Commands::Run(TestCommands::StreamingDynamodbCorrectness(args)) => {
+            commands::streaming::run_correctness(&args).await?;
         }
-        Commands::Export(TestCommands::StreamingDynamodbDispatch(_)) => {
+        Commands::Run(TestCommands::Schema(args)) => {
+            commands::schema::run(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodbCorrectness(_)) => {
             return Err(anyhow::anyhow!(
-                "Export is not supported for dispatch-dynamodb (spicepods are transformed at runtime)"
+                "Export is not supported for streaming-dynamodb-correctness (spicepods are transformed at runtime)"
             ));
         }
         _ => {

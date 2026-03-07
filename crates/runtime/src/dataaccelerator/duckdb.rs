@@ -37,6 +37,7 @@ use crate::{
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::error::DataFusionError;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::TableProviderFactory,
     datasource::TableProvider,
@@ -411,6 +412,7 @@ impl DataAccelerator for DuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         _partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options.insert("open".to_string(), duckdb_file);
@@ -799,7 +801,7 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -1117,7 +1119,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1173,10 +1175,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1192,10 +1194,10 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1230,10 +1232,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1264,10 +1266,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await

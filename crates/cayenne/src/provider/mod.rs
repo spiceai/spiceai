@@ -40,7 +40,7 @@ limitations under the License.
 //! - [`utils`]: Numeric conversion utilities
 //! - [`constants`]: Shared constants
 //! - [`context`]: Shared context for Cayenne operations
-
+//! - [`staging_wal`]: Staging WAL for crash-safe staged appends
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
@@ -49,6 +49,7 @@ pub(crate) mod deletion_strategy;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
+pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod utils;
@@ -137,6 +138,12 @@ pub enum Error {
     #[snafu(display("Internal error in table '{table}': {message}"))]
     Internal { table: String, message: String },
 
+    /// A previous write was interrupted, leaving the table in a potentially
+    /// inconsistent state. The staging WAL file must be resolved before the
+    /// table can be used.
+    #[snafu(display("Table '{table}' may be in an inconsistent state: {message}"))]
+    IncompleteWrite { table: String, message: String },
+
     /// Operation is not yet implemented.
     #[snafu(display("Unsupported operation: {operation}"))]
     Unsupported { operation: &'static str },
@@ -190,6 +197,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::context::SessionContext;
+    use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion_catalog::TableProvider;
     use datafusion_expr::dml::InsertOp;
     use datafusion_physical_plan::collect;
@@ -217,6 +225,7 @@ mod tests {
     /// Helper to create a test catalog with a table containing sample data
     async fn setup_test_table(
         connection_string: &str,
+        ctx: &SessionContext,
     ) -> (Arc<CayenneCatalog>, crate::metadata::TableMetadata, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory for test");
         let catalog = Arc::new(
@@ -255,10 +264,9 @@ mod tests {
         tracing::info!("Created table '{}' with ID {}", table_name, table_id);
 
         // Create provider and insert test data
-        let ctx = SessionContext::new();
         let catalog_trait: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
-        let provider = CayenneTableProvider::new(table_name, catalog_trait)
+        let provider = CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
             .await
             .expect("Failed to create CayenneTableProvider instance");
 
@@ -320,7 +328,8 @@ mod tests {
 
     /// Core concurrent read test implementation
     async fn test_concurrent_reads_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         // Create multiple concurrent readers
         let num_readers = 20;
@@ -335,9 +344,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider in concurrent reader task");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider in concurrent reader task");
 
                 let mut total_rows = 0;
                 for query_num in 0..num_queries_per_reader {
@@ -414,7 +424,8 @@ mod tests {
 
     /// Test concurrent reads with various filter conditions
     async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         let num_readers = 10;
 
@@ -427,9 +438,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider for filter test reader");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for filter test reader");
 
                 // Register the table with DataFusion so we can run SQL queries
                 ctx.register_table("test_table", Arc::new(provider))
@@ -504,7 +516,8 @@ mod tests {
 
     /// Test concurrent reads with different column projections
     async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         let num_readers = 15;
 
@@ -517,9 +530,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider for projection test reader");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for projection test reader");
 
                 ctx.register_table("test_table", Arc::new(provider))
                     .expect("Failed to register table for projection test");
@@ -589,7 +603,8 @@ mod tests {
 
     /// Stress test with high concurrency (50 readers, 50 queries each)
     async fn test_high_concurrency_stress_impl(connection_string: &str) {
-        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
 
         let num_readers = 50;
         let queries_per_reader = 50;
@@ -604,9 +619,10 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let ctx = SessionContext::new();
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
-                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
-                    .await
-                    .expect("Failed to create provider for stress test reader");
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for stress test reader");
 
                 for _ in 0..queries_per_reader {
                     let plan = provider
@@ -687,7 +703,8 @@ mod tests {
             vortex_config,
         };
 
-        let table = CayenneTableProvider::create_table(catalog, table_options)
+        let ctx = SessionContext::new();
+        let table = CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env())
             .await
             .expect("Failed to create table");
 
@@ -823,10 +840,13 @@ mod tests {
             vortex_config: crate::metadata::VortexConfig::default(),
         };
 
-        let provider =
-            CayenneTableProvider::create_table(Arc::clone(&catalog_trait), table_options)
-                .await
-                .expect("Failed to create table for multi-upsert restart test");
+        let provider = CayenneTableProvider::create_table(
+            Arc::clone(&catalog_trait),
+            table_options,
+            Arc::new(RuntimeEnv::default()),
+        )
+        .await
+        .expect("Failed to create table for multi-upsert restart test");
         let provider = Arc::new(provider);
 
         // ---- Round 1: Initial insert of all 3 users ----
@@ -902,13 +922,13 @@ mod tests {
         let catalog_trait2: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
-        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2)
+        let ctx2 = SessionContext::new();
+        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
             .open("users")
             .await
             .expect("Failed to reopen table after restart");
         let provider2 = Arc::new(provider2);
 
-        let ctx2 = SessionContext::new();
         ctx2.register_table("users", Arc::clone(&provider2) as Arc<dyn TableProvider>)
             .expect("Failed to register table post-restart");
 
@@ -924,5 +944,138 @@ mod tests {
         insta::assert_snapshot!("restart_after_upserts_after_restart", post_results);
 
         tracing::info!("✓ Multi-round upsert data survives restart correctly");
+    }
+
+    /// Regression test: upsert should persist insert records to catalog so state survives restart.
+    #[tokio::test]
+    async fn test_upsert_persists_insert_records_for_restart() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temp directory for upsert restart test");
+        let db_path = temp_dir.path().join("cayenne_upsert_restart.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir)
+            .expect("Failed to create data directory for upsert restart test");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("email", DataType::Utf8, false),
+            Field::new("items_bought", DataType::Int64, false),
+        ]));
+
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string.clone())
+                .expect("Failed to create CayenneCatalog for upsert restart test"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog for upsert restart test");
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+
+        let table_options = CreateTableOptions {
+            table_name: "users".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["email".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "email".to_string()
+            ]))),
+            base_path: data_dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let provider = CayenneTableProvider::create_table(
+            Arc::clone(&catalog_trait),
+            table_options,
+            Arc::new(RuntimeEnv::default()),
+        )
+        .await
+        .expect("Failed to create table for upsert restart test");
+
+        // Initial insert.
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["alice@sample.com"])),
+                Arc::new(Int64Array::from(vec![100])),
+            ],
+        )
+        .expect("to create initial batch");
+        insert_batch(&provider, batch1).await;
+
+        // Upsert same PK with new value (must create delete+insert sequence metadata).
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["alice@sample.com"])),
+                Arc::new(Int64Array::from(vec![101])),
+            ],
+        )
+        .expect("to create upsert batch");
+        insert_batch(&provider, batch2).await;
+
+        let table_id = provider.table_id();
+        let pre_restart_insert_records = catalog
+            .get_insert_records(table_id)
+            .await
+            .expect("Failed to read insert records before restart");
+        assert!(
+            !pre_restart_insert_records.is_empty(),
+            "Upsert should persist insert records in catalog"
+        );
+
+        // Restart by creating fresh catalog/provider instances.
+        drop(provider);
+        drop(catalog);
+
+        let catalog2 = Arc::new(
+            CayenneCatalog::new(connection_string)
+                .expect("Failed to re-create CayenneCatalog after restart"),
+        );
+        catalog2
+            .init()
+            .await
+            .expect("Failed to re-initialize catalog after restart");
+        let catalog_trait2: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
+
+        let persisted_insert_records = catalog2
+            .get_insert_records(table_id)
+            .await
+            .expect("Failed to read insert records after restart");
+        assert!(
+            !persisted_insert_records.is_empty(),
+            "Insert records should survive restart"
+        );
+
+        let ctx2 = SessionContext::new();
+        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
+            .open("users")
+            .await
+            .expect("Failed to reopen table after restart");
+
+        ctx2.register_table("users", Arc::new(provider2) as Arc<dyn TableProvider>)
+            .expect("Failed to register reopened table");
+
+        let df = ctx2
+            .sql("SELECT items_bought FROM users WHERE email = 'alice@sample.com'")
+            .await
+            .expect("Failed to query reopened table");
+        let batches = df
+            .collect()
+            .await
+            .expect("Failed to collect query results after restart");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "Expected a single row for alice");
+
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("items_bought should be Int64")
+            .value(0);
+        assert_eq!(value, 101, "Latest upserted value should be visible");
     }
 }

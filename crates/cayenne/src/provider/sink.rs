@@ -29,6 +29,7 @@ use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
 
+use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
 use super::table::CayenneTableProvider;
 
@@ -180,6 +181,11 @@ impl CayenneDataSink {
     ///
     /// Returns an error if the data cannot be inserted.
     async fn write_all_append(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
+        // Ensure no incomplete write from a previous crash before proceeding.
+        // A leftover staging WAL indicates an interrupted file-move operation,
+        // meaning the table may contain partial data. Block all writes until resolved.
+        self.table.ensure_no_incomplete_write().await?;
+
         // Check for pending PK-based deletions (from explicit DELETE operations).
         //
         // POSITION-BASED STRATEGY: No compaction/new snapshot needed on insert.
@@ -254,12 +260,45 @@ impl CayenneDataSink {
                 .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
                 .await?
         } else {
-            // Write chunks to the current snapshot.
+            // Write chunks to a staging directory, then move to the current snapshot.
+            // This prevents partial files from appearing in the active snapshot on
+            // stream errors, which would advance the watermark past lost data.
             let target_size_bytes = self.context.target_file_size_bytes();
-            let (rows, chunk_count) = self
+
+            // Step 1: Clear staging dir (removes leftovers from previous crash)
+            self.table.clear_staging_dir().await?;
+
+            // Step 2: Write to _staging/ directory
+            let (rows, chunk_count) = match self
                 .table
-                .chunk_and_write_parallel(prepared_stream, target_size_bytes)
-                .await?;
+                .chunk_and_write_parallel_to_snapshot(
+                    prepared_stream,
+                    target_size_bytes,
+                    STAGING_DIR_NAME,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    // Best-effort cleanup — next append's clear_staging_dir() handles leftovers
+                    if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                        tracing::warn!(
+                            "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                            self.table.table_name(),
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+
+            // Step 3: Write staging WAL (records intent before the non-atomic move)
+            self.table.write_staging_wal().await?;
+
+            // Step 4: Move files from staging into current snapshot (atomic on local FS)
+            self.table.move_files_to_current_snapshot().await?;
+
+            // Step 5: Remove staging WAL (signals successful move)
+            self.table.remove_staging_wal().await?;
 
             tracing::debug!(
                 "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
@@ -274,6 +313,10 @@ impl CayenneDataSink {
 
             rows
         };
+
+        // Refresh the listing table before retention/sort so newly written files are visible.
+        // Without this, sort rewrite can read stale data and drop fresh append rows.
+        self.table.refresh_listing_table()?;
 
         // Apply retention filters, sort, and refresh listing table.
         self.apply_retention_if_configured().await?;

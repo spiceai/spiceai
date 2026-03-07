@@ -165,9 +165,9 @@ get_spiced_artifact_name() {
     # Add variant suffix
     if [[ -n "$variant" ]]; then
         if [[ "$variant" == "cuda" ]]; then
-            artifact_name="${artifact_name}_models_cuda_${cuda_version}"
+            artifact_name="${artifact_name}_cuda_${cuda_version}"
         elif [[ "$variant" == "metal" ]]; then
-            artifact_name="${artifact_name}_models_metal"
+            artifact_name="${artifact_name}_metal"
         else
             artifact_name="${artifact_name}_${variant}"
         fi
@@ -199,31 +199,31 @@ test_artifact_name_linux_x86_64_models() {
 test_artifact_name_linux_x86_64_cuda_90() {
     local result
     result=$(get_spiced_artifact_name "linux" "x86_64" "cuda" "90")
-    [[ "$result" == "spiced_models_cuda_90_linux_x86_64.tar.gz" ]]
+    [[ "$result" == "spiced_cuda_90_linux_x86_64.tar.gz" ]]
 }
 
 test_artifact_name_linux_x86_64_cuda_89() {
     local result
     result=$(get_spiced_artifact_name "linux" "x86_64" "cuda" "89")
-    [[ "$result" == "spiced_models_cuda_89_linux_x86_64.tar.gz" ]]
+    [[ "$result" == "spiced_cuda_89_linux_x86_64.tar.gz" ]]
 }
 
 test_artifact_name_linux_x86_64_cuda_87() {
     local result
     result=$(get_spiced_artifact_name "linux" "x86_64" "cuda" "87")
-    [[ "$result" == "spiced_models_cuda_87_linux_x86_64.tar.gz" ]]
+    [[ "$result" == "spiced_cuda_87_linux_x86_64.tar.gz" ]]
 }
 
 test_artifact_name_linux_x86_64_cuda_86() {
     local result
     result=$(get_spiced_artifact_name "linux" "x86_64" "cuda" "86")
-    [[ "$result" == "spiced_models_cuda_86_linux_x86_64.tar.gz" ]]
+    [[ "$result" == "spiced_cuda_86_linux_x86_64.tar.gz" ]]
 }
 
 test_artifact_name_linux_x86_64_cuda_80() {
     local result
     result=$(get_spiced_artifact_name "linux" "x86_64" "cuda" "80")
-    [[ "$result" == "spiced_models_cuda_80_linux_x86_64.tar.gz" ]]
+    [[ "$result" == "spiced_cuda_80_linux_x86_64.tar.gz" ]]
 }
 
 # Test Linux aarch64 artifact names
@@ -255,7 +255,7 @@ test_artifact_name_darwin_aarch64_models() {
 test_artifact_name_darwin_aarch64_metal() {
     local result
     result=$(get_spiced_artifact_name "darwin" "aarch64" "metal")
-    [[ "$result" == "spiced_models_metal_darwin_aarch64.tar.gz" ]]
+    [[ "$result" == "spiced_metal_darwin_aarch64.tar.gz" ]]
 }
 
 # Test Windows artifact names
@@ -318,7 +318,7 @@ test_artifacts_exist_in_latest_release() {
         "spiced_models_linux_x86_64.tar.gz"
         "spiced_models_linux_aarch64.tar.gz"
         "spiced_models_darwin_aarch64.tar.gz"
-        "spiced_models_metal_darwin_aarch64.tar.gz"
+        "spiced_metal_darwin_aarch64.tar.gz"
         "spiced.exe_windows_x86_64.tar.gz"
         "spiced.exe_models_windows_x86_64.tar.gz"
     )

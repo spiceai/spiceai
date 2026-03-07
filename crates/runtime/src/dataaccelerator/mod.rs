@@ -22,6 +22,7 @@ use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
@@ -45,6 +46,7 @@ pub mod arrow;
 pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
 #[cfg(feature = "postgres-accel")]
@@ -345,7 +347,12 @@ impl AcceleratorEngineRegistry {
         };
 
         let table_provider = accelerator
-            .create_external_table(external_table, source, partition_by)
+            .create_external_table(
+                external_table,
+                source,
+                partition_by,
+                Some(ctx.runtime_env()),
+            )
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -366,6 +373,7 @@ pub trait DataAccelerator: Send + Sync {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
@@ -890,7 +898,7 @@ mod accelerator_compat_tests {
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
@@ -1037,7 +1045,7 @@ mod accelerator_compat_tests {
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1051,7 +1059,7 @@ mod accelerator_compat_tests {
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
                     match TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1065,7 +1073,7 @@ mod accelerator_compat_tests {
                 Engine::DuckDB => {
                     use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1078,7 +1086,7 @@ mod accelerator_compat_tests {
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1184,6 +1192,7 @@ mod accelerator_compat_tests {
                         external_table,
                         Some(&dataset),
                         Vec::new(),
+                        None,
                     ))
                     .catch_unwind();
 
@@ -1987,7 +1996,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
@@ -2117,7 +2125,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
@@ -2137,8 +2144,7 @@ mod accelerator_compat_tests {
 
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
-            let plan = table
-                .delete_from(&ctx.state(), &[filter])
+            let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
                 .await
                 .expect("deletion should be successful");
 
@@ -2294,7 +2300,7 @@ mod accelerator_compat_tests {
                     Engine::Sqlite => {
                         use crate::dataaccelerator::sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("SQLite table should be created")
                     }
@@ -2302,7 +2308,7 @@ mod accelerator_compat_tests {
                     Engine::Turso => {
                         use crate::dataaccelerator::turso::TursoAccelerator;
                         TursoAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("Turso table should be created")
                     }
@@ -2310,14 +2316,14 @@ mod accelerator_compat_tests {
                     Engine::DuckDB => {
                         use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                         DuckDBAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("DuckDB table should be created")
                     }
                     Engine::Arrow => {
                         use crate::dataaccelerator::arrow::ArrowAccelerator;
                         ArrowAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("Arrow table should be created")
                     }
@@ -2394,7 +2400,7 @@ mod accelerator_compat_tests {
                         });
 
                         CayenneAccelerator::new()
-                            .create_external_table(external_table, Some(&dataset), Vec::new())
+                            .create_external_table(external_table, Some(&dataset), Vec::new(), None)
                             .await
                             .expect("Vortex table should be created")
                     }
@@ -2910,7 +2916,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::unreadable_literal)]
     async fn test_overwrite_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Turso/SQLite doesn't support INSERT OVERWRITE in the same way - it appends instead

@@ -29,6 +29,7 @@ use datafusion::{
     common::DFSchema,
     datasource::TableProvider,
     error::DataFusionError,
+    execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
@@ -185,6 +186,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let partition_by_last = partition_by
             .last()
@@ -585,7 +587,7 @@ mod tests {
         let accelerator = TablesModePartitionedDuckDBAccelerator::new();
 
         let table = accelerator
-            .create_external_table(external_table, Some(&dataset), partitioned_by)
+            .create_external_table(external_table, Some(&dataset), partitioned_by, None)
             .await
             .expect("accelerated table created");
 

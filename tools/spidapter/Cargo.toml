@@ -13,6 +13,7 @@ arrow.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+dirs = "6"
 reqwest.workspace = true
 runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }
 spice-cloud-client.workspace = true

@@ -45,6 +45,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use data_components::turso::TursoTableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     common::utils::quote_identifier, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
@@ -491,6 +492,7 @@ impl DataAccelerator for TursoAccelerator {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
@@ -693,7 +695,7 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -836,7 +838,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -871,8 +873,7 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -890,8 +891,7 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -938,7 +938,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1068,7 +1068,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1224,7 +1224,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1313,7 +1313,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 
@@ -1379,7 +1379,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 
@@ -1445,7 +1445,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 
@@ -1511,7 +1511,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 

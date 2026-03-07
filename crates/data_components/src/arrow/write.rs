@@ -1702,8 +1702,7 @@ mod tests {
             None,
         )));
 
-        let plan = table
-            .delete_from(&state, &[filter])
+        let plan = DeletionTableProvider::delete_from(&table, &state, &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -2145,8 +2144,7 @@ mod tests {
         let filter1 = col("category").eq(lit("A"));
         let filter2 = col("id").eq(lit("4"));
 
-        let plan = table
-            .delete_from(&state, &[filter1, filter2])
+        let plan = DeletionTableProvider::delete_from(&table, &state, &[filter1, filter2])
             .await
             .expect("deletion should succeed");
 
