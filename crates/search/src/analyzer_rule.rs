@@ -28,7 +28,7 @@ use datafusion::{
     config::ConfigOptions,
     datasource::DefaultTableSource,
     error::Result as DFResult,
-    logical_expr::{Extension, LogicalPlan},
+    logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder},
     optimizer::AnalyzerRule,
 };
 
@@ -71,12 +71,19 @@ impl AnalyzerRule for SearchQueryAnalyzerRule {
             let expanded =
                 provider.to_logical_plan(scan.projection.as_ref(), &scan.filters, scan.fetch)?;
 
+            // Wrap the expanded plan with the original table name as an alias so that parent
+            // operations (Sort, Projection, etc.) can still reference columns using the original
+            // table name. This makes the expansion transparent to the rest of the query.
+            let aliased = LogicalPlanBuilder::new_from_arc(Arc::new(expanded))
+                .alias(scan.table_name.to_string())?
+                .build()?;
+
             let plan = if let Some(callback) = &provider.scan_callback {
                 LogicalPlan::Extension(Extension {
-                    node: Arc::new(SearchTelemetryNode::new(expanded, Arc::clone(callback))),
+                    node: Arc::new(SearchTelemetryNode::new(aliased, Arc::clone(callback))),
                 })
             } else {
-                expanded
+                aliased
             };
 
             Ok(Transformed::yes(plan))
@@ -89,6 +96,7 @@ impl AnalyzerRule for SearchQueryAnalyzerRule {
 mod tests {
     use std::sync::Arc;
 
+    use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         config::ConfigOptions,
@@ -104,9 +112,10 @@ mod tests {
         let rule = SearchQueryAnalyzerRule;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
-        // Create a plain in-memory table provider
+        // Create a plain in-memory table provider with one empty partition
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
         let provider = Arc::new(
-            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![])
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                 .expect("MemTable creation should not fail"),
         );
 
