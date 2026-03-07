@@ -1,0 +1,45 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "2c1ab48676ba",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-02-13/distributed",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "Cargo.lock",
+    "tools/distributed/Cargo.toml",
+    "tools/distributed/README.md",
+    "tools/distributed/src/cluster/config.rs",
+    "tools/distributed/src/cluster/health.rs",
+    "tools/distributed/src/cluster/paths.rs",
+    "tools/distributed/src/cluster/process.rs",
+    "tools/distributed/src/cluster/state.rs",
+    "tools/distributed/src/cluster/tls.rs",
+    "tools/distributed/src/commands/logs.rs",
+    "tools/distributed/src/commands/start.rs",
+    "tools/distributed/src/commands/status.rs",
+    "tools/distributed/src/commands/stop.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/2c/1ab48676ba/0/metadata.json",
+      "transcript": "/2c/1ab48676ba/0/full.jsonl",
+      "context": "/2c/1ab48676ba/0/context.md",
+      "content_hash": "/2c/1ab48676ba/0/content_hash.txt",
+      "prompt": "/2c/1ab48676ba/0/prompt.txt"
+    },
+    {
+      "metadata": "/2c/1ab48676ba/1/metadata.json",
+      "transcript": "/2c/1ab48676ba/1/full.jsonl",
+      "context": "/2c/1ab48676ba/1/context.md",
+      "content_hash": "/2c/1ab48676ba/1/content_hash.txt",
+      "prompt": "/2c/1ab48676ba/1/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 8543,
+    "cache_creation_tokens": 167859,
+    "cache_read_tokens": 8657385,
+    "output_tokens": 51967,
+    "api_call_count": 135
+  }
+}
