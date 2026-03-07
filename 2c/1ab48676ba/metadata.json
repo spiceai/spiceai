@@ -3,7 +3,7 @@
   "checkpoint_id": "2c1ab48676ba",
   "strategy": "manual-commit",
   "branch": "jeadie/26-02-13/distributed",
-  "checkpoints_count": 3,
+  "checkpoints_count": 1,
   "files_touched": [
     "tools/distributed/Cargo.toml",
     "tools/distributed/README.md",
