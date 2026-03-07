@@ -123,7 +123,7 @@ async fn execute_spill_to_disk_and_rehydration(
     let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
     assert!(num_rows > 0);
 
-    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
+    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path);
     tracing::debug!(
         "Expected accelerated database location: {}",
         accelerated_db_file_path.display()
@@ -239,16 +239,13 @@ async fn get_locally_persisted_records(
         .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
 }
 
-fn resolve_local_db_file_path(
-    engine: &str,
-    db_file_path: Option<&str>,
-) -> Result<PathBuf, anyhow::Error> {
+fn resolve_local_db_file_path(engine: &str, db_file_path: Option<&str>) -> PathBuf {
     if let Some(db_file_path) = db_file_path {
         let working_dir = std::env::current_dir().unwrap_or(".".into());
-        return Ok(working_dir.join(db_file_path));
+        return working_dir.join(db_file_path);
     }
 
-    Ok(PathBuf::from(spice_data_base_path()).join(format!("accelerated_{engine}.db")))
+    PathBuf::from(spice_data_base_path()).join(format!("accelerated_{engine}.db"))
 }
 
 fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
