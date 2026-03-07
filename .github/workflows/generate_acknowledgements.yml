@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.1 --profile minimal
 
       - name: Set up make
         if: runner.os != 'macOS'

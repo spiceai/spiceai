@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -595,9 +596,9 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
 fn remove_existing_local_files(path: &Path) {
     let candidates = [
         path.to_path_buf(),
-        PathBuf::from(format!("{}-wal", path.to_string_lossy())),
-        PathBuf::from(format!("{}.wal", path.to_string_lossy())),
-        PathBuf::from(format!("{}-shm", path.to_string_lossy())),
+        path_with_appended_suffix(path, "-wal"),
+        path.with_added_extension("wal"),
+        path_with_appended_suffix(path, "-shm"),
     ];
     for candidate in candidates {
         if let Err(err) = std::fs::remove_file(&candidate)
@@ -609,6 +610,15 @@ fn remove_existing_local_files(path: &Path) {
             );
         }
     }
+}
+
+fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .expect("database path should include a file name");
+    file_name.push(suffix);
+    path.with_file_name(file_name)
 }
 
 #[cfg(feature = "duckdb")]
