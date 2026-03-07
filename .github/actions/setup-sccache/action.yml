@@ -104,50 +104,101 @@ runs:
           done < <(mount)
         }
 
+        probe_cache_dir() {
+          local candidate="$1"
+          local probe_file
+
+          [ -n "$candidate" ] || return 1
+
+          if ! mkdir -p "$candidate" 2>/dev/null; then
+            return 1
+          fi
+
+          if [ ! -w "$candidate" ]; then
+            return 1
+          fi
+
+          probe_file="$candidate/.sccache-probe-$$"
+          if ! touch "$probe_file" 2>/dev/null; then
+            return 1
+          fi
+
+          rm -f "$probe_file"
+          printf '%s\n' "$candidate"
+          return 0
+        }
+
         resolve_macos_cache_dir() {
+          local candidate
           if [ -n "${{ inputs.macos_sccache_dir }}" ]; then
-            printf '%s\n' "${{ inputs.macos_sccache_dir }}"
-            return 0
+            candidate="$(probe_cache_dir "${{ inputs.macos_sccache_dir }}" || true)"
+            if [ -n "$candidate" ]; then
+              printf '%s\n' "$candidate"
+              return 0
+            fi
           fi
 
           if [ -n "${SCCACHE_DIR:-}" ]; then
-            printf '%s\n' "$SCCACHE_DIR"
-            return 0
+            candidate="$(probe_cache_dir "$SCCACHE_DIR" || true)"
+            if [ -n "$candidate" ]; then
+              printf '%s\n' "$candidate"
+              return 0
+            fi
           fi
 
           if [ -d "/Volumes/sccache" ]; then
-            printf '%s\n' "/Volumes/sccache/spiceai-sccache"
-            return 0
+            candidate="$(probe_cache_dir "/Volumes/sccache/spiceai-sccache" || true)"
+            if [ -n "$candidate" ]; then
+              printf '%s\n' "$candidate"
+              return 0
+            fi
           fi
 
           local smb_mounts=()
           local mount_point
+          local cache_candidates=()
           while IFS= read -r mount_point; do
             [ -n "$mount_point" ] && smb_mounts+=("$mount_point")
           done < <(list_smb_mounts)
 
           for mount_point in "${smb_mounts[@]}"; do
-            case "$(basename "$mount_point" | tr '[:upper:]' '[:lower:]')" in
-              *sccache*|*cache*)
-                printf '%s\n' "$mount_point/spiceai-sccache"
-                return 0
-                ;;
-            esac
-          done
+            cache_candidates=(
+              "$mount_point/spiceai-sccache"
+              "$mount_point/.cache/spiceai-sccache"
+              "$mount_point/cache/spiceai-sccache"
+              "$mount_point/tmp/spiceai-sccache"
+              "$mount_point/var/tmp/spiceai-sccache"
+              "$mount_point/data/spiceai-sccache"
+              "$mount_point/data/cache/spiceai-sccache"
+            )
 
-          if [ "${#smb_mounts[@]}" -eq 1 ]; then
-            printf '%s\n' "${smb_mounts[0]}/spiceai-sccache"
+            for candidate in "${cache_candidates[@]}"; do
+              candidate="$(probe_cache_dir "$candidate" || true)"
+              if [ -n "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+          fi
+
+          echo "No writable SMB cache directory detected; falling back to local cache." >&2
+          echo "Detected SMB mounts:" >&2
+          list_smb_mounts >&2 || true
+          candidate="$(probe_cache_dir "$HOME/.cache/sccache" || true)"
+          if [ -n "$candidate" ]; then
+            printf '%s\n' "$candidate"
             return 0
           fi
 
-          echo "No dedicated SMB cache mount detected; falling back to local cache." >&2
-          echo "Detected SMB mounts:" >&2
-          list_smb_mounts >&2 || true
           printf '%s\n' "$HOME/.cache/sccache"
         }
 
         cache_dir="$(resolve_macos_cache_dir)"
-        mkdir -p "$cache_dir"
+        if ! mkdir -p "$cache_dir" 2>/dev/null; then
+          echo "Error: failed to create sccache directory: $cache_dir"
+          exit 1
+        fi
+
         if [ ! -w "$cache_dir" ]; then
           echo "Error: sccache directory is not writable: $cache_dir"
           exit 1

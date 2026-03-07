@@ -68,6 +68,14 @@ jobs:
             echo "Expected SMB-backed sccache backend, found: ${{ steps.setup-sccache.outputs.backend }}"
             echo "Detected smbfs mounts:"
             list_smb_mounts || true
+            while IFS= read -r mount_line; do
+              mount_path="${mount_line#* on }"
+              mount_path="${mount_path%% (*}"
+              if [ -n "$mount_path" ] && [ -d "$mount_path" ]; then
+                echo "Top-level entries for $mount_path:"
+                ls -la "$mount_path" | head -n 50 || true
+              fi
+            done < <(list_smb_mounts)
             echo "Contents of /Volumes:"
             ls -la /Volumes || true
             exit 1
