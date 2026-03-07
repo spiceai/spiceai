@@ -179,7 +179,7 @@ runs:
                 return 0
               fi
             done
-          fi
+          done
 
           echo "No writable SMB cache directory detected; falling back to local cache." >&2
           echo "Detected SMB mounts:" >&2
