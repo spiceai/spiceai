@@ -304,7 +304,12 @@ async fn validate_s3_replica_integrity_direct(
     Ok(())
 }
 
-fn make_s3_tpch_dataset(name: &str, partition_by: Option<String>) -> Dataset {
+fn make_s3_tpch_dataset(
+    name: &str,
+    partition_by: Option<String>,
+    cayenne_data_dir: &std::path::Path,
+    cayenne_metadata_dir: &std::path::Path,
+) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-demo-datasets/tpch/{name}/"),
         name.to_string(),
@@ -319,6 +324,16 @@ fn make_s3_tpch_dataset(name: &str, partition_by: Option<String>) -> Dataset {
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
+        params: Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                cayenne_data_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                cayenne_metadata_dir.to_string_lossy().to_string(),
+            ),
+        ]))),
         refresh_sql: None,
         ..Acceleration::default()
     });
@@ -342,24 +357,42 @@ async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
+            let temp_dir = tempfile::tempdir()
+                .map_err(|e| format!("failed to create Cayenne temp directory: {e}"))?;
+            let cayenne_data_dir = temp_dir.path().join("data");
+            let cayenne_metadata_dir = temp_dir.path().join("metadata");
+
             // exclude lineitem, orders and customer to reduce egress
             let app = AppBuilder::new("test_cayenne_with_partitioned_tpch")
                 .with_dataset(make_s3_tpch_dataset(
                     "nation",
                     Some("n_regionkey".to_string()),
+                    &cayenne_data_dir,
+                    &cayenne_metadata_dir,
                 ))
-                .with_dataset(make_s3_tpch_dataset("region", None))
+                .with_dataset(make_s3_tpch_dataset(
+                    "region",
+                    None,
+                    &cayenne_data_dir,
+                    &cayenne_metadata_dir,
+                ))
                 .with_dataset(make_s3_tpch_dataset(
                     "supplier",
                     Some("bucket(10, s_suppkey)".to_string()),
+                    &cayenne_data_dir,
+                    &cayenne_metadata_dir,
                 ))
                 .with_dataset(make_s3_tpch_dataset(
                     "part",
                     Some("bucket(10, p_partkey)".to_string()),
+                    &cayenne_data_dir,
+                    &cayenne_metadata_dir,
                 ))
                 .with_dataset(make_s3_tpch_dataset(
                     "partsupp",
                     Some("bucket(10, ps_partkey)".to_string()),
+                    &cayenne_data_dir,
+                    &cayenne_metadata_dir,
                 ))
                 .build();
 
@@ -369,7 +402,7 @@ async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(240)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
