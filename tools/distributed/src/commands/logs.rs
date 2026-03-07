@@ -128,7 +128,10 @@ async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()>
         match tokio_fs::File::open(log_file).await {
             Ok(mut file) => {
                 // Seek to the last known position
-                match file.seek(std::io::SeekFrom::Start(byte_offset as u64)).await {
+                match file
+                    .seek(std::io::SeekFrom::Start(byte_offset as u64))
+                    .await
+                {
                     Ok(_) => {
                         // Read new content
                         let mut buffer = Vec::new();
