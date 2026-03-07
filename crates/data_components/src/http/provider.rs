@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{ArrayRef, RecordBatch, StringArray},
+    array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
@@ -134,6 +134,7 @@ struct CachedResponse {
     detected_format: Option<String>,
     response_date: Option<SystemTime>,
     response_status: u16,
+    response_headers: Arc<Vec<(String, String)>>,
 }
 
 impl CachedResponse {
@@ -206,6 +207,7 @@ struct HttpFetchResult {
     detected_format: String,
     response_date: Option<SystemTime>,
     response_status: u16,
+    response_headers: Vec<(String, String)>,
 }
 
 impl HttpFetchResult {
@@ -435,6 +437,21 @@ impl HttpTableProvider {
             Field::new("content", DataType::Utf8, false),
             Field::new("response_status", DataType::UInt16, false),
             Field::new(
+                "response_headers",
+                DataType::Map(
+                    Arc::new(Field::new_struct(
+                        "entries",
+                        vec![
+                            Arc::new(Field::new("keys", DataType::Utf8, false)),
+                            Arc::new(Field::new("values", DataType::Utf8, true)),
+                        ],
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            Field::new(
                 "fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 true,
@@ -653,6 +670,7 @@ impl HttpTableProvider {
             detected_format: Some(result.detected_format.clone()),
             response_date: result.response_date,
             response_status: result.response_status,
+            response_headers: Arc::new(result.response_headers.clone()),
         };
 
         let mut cache_write = self.cache.write().await;
@@ -787,6 +805,13 @@ impl HttpTableProvider {
                 httpdate::parse_http_date(date_str).ok()
             });
 
+        // Capture response headers before consuming the response body
+        let response_headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
         let content = response
             .text()
             .await
@@ -806,6 +831,7 @@ impl HttpTableProvider {
             detected_format,
             response_date,
             response_status: status_code,
+            response_headers,
         })
     }
 
@@ -874,6 +900,7 @@ impl HttpTableProvider {
                 detected_format: cached_response.detected_format.clone().unwrap_or_default(),
                 response_date: cached_response.response_date,
                 response_status: cached_response.response_status,
+                response_headers: (*cached_response.response_headers).clone(),
             });
         }
 
@@ -1032,6 +1059,7 @@ impl HttpExec {
             content,
             response_date,
             response_status,
+            response_headers,
             ..
         } = result;
 
@@ -1093,6 +1121,27 @@ impl HttpExec {
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
                 "response_status" => {
                     Ok(Arc::new(UInt16Array::from(vec![response_status; num_rows])) as ArrayRef)
+                }
+                "response_headers" => {
+                    let mut builder = MapBuilder::new(
+                        Some(MapFieldNames {
+                            entry: "entries".to_string(),
+                            key: "keys".to_string(),
+                            value: "values".to_string(),
+                        }),
+                        StringBuilder::new(),
+                        StringBuilder::new(),
+                    );
+                    for _ in 0..num_rows {
+                        for (k, v) in &response_headers {
+                            builder.keys().append_value(k);
+                            builder.values().append_value(v);
+                        }
+                        builder
+                            .append(true)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    }
+                    Ok(Arc::new(builder.finish()) as ArrayRef)
                 }
                 "fetched_at" => {
                     use arrow::array::TimestampNanosecondArray;

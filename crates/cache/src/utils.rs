@@ -399,7 +399,7 @@ pub(crate) mod tests {
         )
         .expect("to create batch");
 
-        let result = filter_transient_error_responses(&[batch.clone()]);
+        let result = filter_transient_error_responses(&[batch]);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].num_rows(),

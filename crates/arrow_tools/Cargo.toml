@@ -12,10 +12,10 @@ version.workspace = true
 arrow.workspace = true
 arrow-cast.workspace = true
 arrow-schema.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 datafusion.workspace = true
 
 [dev-dependencies]
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
-serde_json.workspace = true
