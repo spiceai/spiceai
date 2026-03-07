@@ -1,0 +1,5 @@
+Read PR comments and address: https://github.com/spiceai/spiceai/pull/9467
+
+---
+
+[Request interrupted by user for tool use]
