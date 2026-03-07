@@ -212,9 +212,10 @@ mod tests {
 
     #[test]
     fn test_store_memory_rejects_oversized_total_payload() {
-        let chunk = "a".repeat((MAX_MEMORY_TOTAL_BYTES / 2) + 1);
+        let chunk = "a".repeat(MAX_MEMORY_THOUGHT_BYTES);
+        let chunk_count = (MAX_MEMORY_TOTAL_BYTES / MAX_MEMORY_THOUGHT_BYTES) + 1;
         let params = StoreMemoryParams {
-            thoughts: vec![chunk.clone(), chunk],
+            thoughts: vec![chunk; chunk_count],
         };
 
         let err = validate_store_memory_params(&params)
