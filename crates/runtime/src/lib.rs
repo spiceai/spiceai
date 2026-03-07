@@ -18,6 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
+use datafusion_expr::Expr;
 use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -34,9 +35,9 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
-use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
-use crate::datafusion::{DataFusion, resolved_equality};
+use crate::datafusion::DataFusion;
+use crate::datafusion::error::format_datafusion_error;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
@@ -46,6 +47,7 @@ use crate::{
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
+use datafusion_proto::bytes::Serializeable;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
@@ -140,6 +142,7 @@ mod view;
 mod worker;
 
 pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
+pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -166,39 +169,39 @@ pub enum Error {
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
-    #[snafu(display("Unable to create data backend: {source}"))]
+    #[snafu(display("Failed to initialize the query engine: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach view: {source}"))]
+    #[snafu(display("Failed to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach dataset index: {source}"))]
+    #[snafu(display("Failed to attach dataset index: {source}"))]
     UnableToAttachIndex { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize data connector: {source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize catalog connector: {source}"))]
     UnableToInitializeCatalogConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM model: {source}"))]
     UnableToInitializeLlm {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize embedding model: {source}"))]
     UnableToInitializeEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM tool: {source}"))]
     UnableToInitializeLlmTool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -329,7 +332,7 @@ pub enum Error {
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
 
-    #[snafu(display("Unable to create metrics table: {source}"))]
+    #[snafu(display("Unable to create metrics table: {}", format_datafusion_error(source)))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
     #[snafu(display("Unable to create eval runs table: {source}"))]
@@ -445,13 +448,17 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to convert partition expression to SQL: {source}"))]
+    #[snafu(display(
+        "Failed to convert partition expression to SQL: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToConvertPartitionExpr { source: DataFusionError },
 }
 
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
+const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -568,6 +575,11 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
+    pub async fn read_app(&self) -> Option<Arc<App>> {
+        let guard = self.app.read().await;
+        guard.clone()
+    }
+
     #[must_use]
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
@@ -636,64 +648,100 @@ impl Runtime {
         }
     }
 
-    async fn update_partition_refresh_sql(
+    pub async fn update_partition_assignments(
+        &self,
+        new_partitions: HashMap<String, Vec<Vec<u8>>>,
+        removed_partitions: HashMap<String, Vec<Vec<u8>>>,
+    ) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+        }) = self.distributed.as_ref()
+        {
+            let mut guard = partition_assignments.write().await;
+
+            // Handle removed partitions
+            for (table_name, partitions) in &removed_partitions {
+                let table_ref = TableReference::parse_str(table_name);
+                if let Some(current_partitions) = guard.get_mut(&table_ref) {
+                    for partition_bytes in partitions {
+                        if let Ok(partition_expr) =
+                            Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                        {
+                            current_partitions.retain(|p| p != &partition_expr);
+                        } else {
+                            tracing::warn!(
+                                "Failed to deserialize removed partition expression for table {table_name}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Handle new partitions
+            for (table_name, partitions) in &new_partitions {
+                let table_ref = TableReference::parse_str(table_name);
+                let current_partitions = guard.entry(table_ref.clone()).or_default();
+                for partition_bytes in partitions {
+                    if let Ok(partition_expr) = ::datafusion_expr::Expr::from_bytes_with_registry(
+                        partition_bytes,
+                        self.df.ctx.as_ref(),
+                    ) {
+                        if !current_partitions.contains(&partition_expr) {
+                            current_partitions.push(partition_expr);
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Failed to deserialize new partition expression for table {table_name}"
+                        );
+                    }
+                }
+            }
+
+            // Identify all affected tables
+            let affected_tables: HashSet<_> = new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .collect();
+            drop(guard); // drop lock before updating tables
+
+            // Take a snapshot of the current assignments without holding the lock across .await
+            let assignments = {
+                let assignments_guard = partition_assignments.read().await;
+                assignments_guard.clone()
+            };
+
+            // Update all affected tables
+            for table_name in affected_tables {
+                let table_ref = TableReference::parse_str(table_name);
+
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table_ref.clone(), &assignments)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table_name}: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to update partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    pub(crate) async fn update_partition_refresh_sql(
         &self,
         table: TableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
-        // Re-construct the refresh SQL with the new partitions
-        // 1. Get the dataset to find the base refresh SQL
-        let (dataset_component, app_arc) = {
-            let app_lock = self.app.read().await;
-            let Some(app_arc) = app_lock.as_ref() else {
-                tracing::debug!("App not initialized when updating partitions for {table}");
-                return Ok(());
-            };
+        let partition_filters =
+            crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
 
-            let Some(ds) = app_arc
-                .datasets
-                .iter()
-                .find(|ds| resolved_equality(ds.name.clone().into(), table.clone()))
-            else {
-                tracing::debug!("Dataset {table} not found in App when updating partitions");
-                return Ok(());
-            };
-            (ds.clone(), Arc::clone(app_arc))
-        };
-
-        let Ok(dataset) =
-            crate::component::dataset::builder::DatasetBuilder::try_from(dataset_component)
-                .and_then(|mut b| {
-                    b = b.with_app(app_arc);
-                    b.with_runtime(Arc::new(self.clone())).build().context(
-                        UnableToBuildDatasetSnafu {
-                            dataset: table.to_string(),
-                        },
-                    )
-                })
-        else {
-            tracing::warn!("Failed to build dataset {table} when updating partitions");
-            return Ok(());
-        };
-
-        // 2. Construct the new SQL
-        let new_sql = update_partitioning_filter_in_refresh_sql(
-            dataset
-                .acceleration
-                .as_ref()
-                .and_then(|a| a.refresh_sql.as_deref()),
-            &table,
-            assignments,
-        )
-        .context(UnableToConvertPartitionExprSnafu)?;
-
-        // 3. Update the AcceleratedTable
         if let Err(e) = self
             .datafusion()
-            .update_refresh_sql(table.clone(), new_sql)
+            .update_partition_filters(table.clone(), partition_filters)
             .await
         {
-            tracing::error!("Failed to update refresh SQL for {table}: {e}");
+            tracing::error!("Failed to update partition filters for {table}: {e}");
         } else {
             tracing::info!("Updated partition assignments for {table}");
             // Trigger a refresh to load the data for the new partitions
@@ -708,45 +756,13 @@ impl Runtime {
     }
 
     /// Returns the partition manager for accelerated table partition metadata (scheduler only).
-    ///
-    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
-    /// a write lock (e.g., during initialization), this returns `None`.
     #[must_use]
     pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
                 partition_manager, ..
-            }) => {
-                if let Ok(guard) = partition_manager.try_read() {
-                    guard.clone()
-                } else {
-                    tracing::debug!(
-                        "Partition manager is currently being initialized. Returning None."
-                    );
-                    None
-                }
-            }
+            }) => Some(Arc::clone(partition_manager)),
             _ => None,
-        }
-    }
-
-    /// Sets the partition manager for accelerated table partition metadata.
-    pub async fn set_partition_manager(&self, manager: Arc<PartitionManager>) {
-        match self.distributed.as_ref() {
-            Some(DistributedNode::Scheduler {
-                partition_manager, ..
-            }) => {
-                let mut guard = partition_manager.write().await;
-                *guard = Some(manager);
-            }
-            Some(DistributedNode::Executor { .. }) => {
-                tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
-            }
-            None => {
-                tracing::warn!(
-                    "Attempted to set partition manager on a non-cluster runtime. Ignoring."
-                );
-            }
         }
     }
 
@@ -964,16 +980,11 @@ impl Runtime {
             None => (None, None),
         };
 
-        if self.df.cluster_config.effective_role().is_some() {
-            tracing::warn!(
-                "Distributed Query (Alpha) is in preview and should not be used in production."
-            );
-        }
-
         // Start Flight server
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
+        let executor_endpoint_auth = endpoint_auth.clone();
         let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
             if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
                 Box::pin(
@@ -984,6 +995,7 @@ impl Runtime {
                             cluster::start_executor_flight_server(
                                 config.flight_bind_address,
                                 Arc::clone(&self_ref),
+                                executor_endpoint_auth,
                                 Some(flight_shutdown),
                             )
                             .await
@@ -994,7 +1006,7 @@ impl Runtime {
                 )
             } else {
                 let cloned_endpoint_auth = endpoint_auth.clone();
-                let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+                let cloned_app_ref = self.read_app().await;
 
                 Box::pin(
                     self.start_runtime_task(
@@ -1144,12 +1156,11 @@ impl Runtime {
 
     /// Updates all of the component statuses to `Initializing`.
     pub async fn set_components_initializing(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -1182,13 +1193,13 @@ impl Runtime {
             }
         }
 
-        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
         for validated_view in valid_views {
             self.status
                 .update_view(&validated_view.view.name, ComponentStatus::Initializing);
@@ -1335,11 +1346,11 @@ impl Runtime {
                             break;
                         }
                         if status.is_ready() {
-                            if let Some(app) = self.app.read().await.as_ref() {
+                            if let Some(app) = self.read_app().await {
                                 let valid_datasets =
-                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
                                 let valid_catalogs =
-                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
                                 if valid_datasets.is_empty() && valid_catalogs.is_empty() {
                                     tracing::info!(
                                         "No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration."
@@ -1363,7 +1374,7 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
-        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+        let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
                 tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)

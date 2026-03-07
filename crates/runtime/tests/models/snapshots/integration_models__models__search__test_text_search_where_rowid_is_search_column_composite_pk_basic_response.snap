@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 6.33,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -15,10 +16,10 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]",
         "id": 525
-      },
-      "score": 6.33
+      }
     },
     {
+      "_score": 6.19,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -28,8 +29,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\).",
         "id": 772
-      },
-      "score": 6.19
+      }
     }
   ]
 }

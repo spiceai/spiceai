@@ -33,7 +33,7 @@ use aws_sdk_dynamodb::{
 use bollard::secret::HealthConfig;
 use runtime::Runtime;
 use spicepod::acceleration::{Mode, RefreshMode};
-use spicepod::component::caching::ResultsCache;
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
@@ -220,7 +220,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset(
                     table_name, PORT2, access_key, secret_key, true,
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })
@@ -322,7 +322,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset(
                     table_name, PORT1, access_key, secret_key, true,
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })
@@ -554,7 +554,6 @@ fn get_acceleration_row_count(duckdb_path: &str, table_name: &str) -> usize {
 
 async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: u64) -> bool {
     use datafusion::sql::TableReference;
-    use runtime::status::ComponentStatus;
 
     let table_ref = TableReference::bare(dataset_name);
     let start = std::time::Instant::now();
@@ -565,7 +564,7 @@ async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: 
         // Check dataset status
         let statuses = rt.datafusion().runtime_status().get_dataset_statuses();
         if let Some(status) = statuses.get(&table_ref)
-            && *status == ComponentStatus::Error
+            && status.is_error()
         {
             return true;
         }
@@ -644,7 +643,7 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
                     duckdb_path_str,
                     Some("ready_after_load"), // Setting doesn't matter for fresh checkpoint
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })
@@ -711,7 +710,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                         duckdb_path_str,
                         Some("ready_after_load"),
                     ))
-                    .with_results_cache(ResultsCache {
+                    .with_sql_cache(SQLResultsCacheConfig {
                         enabled: false,
                         ..Default::default()
                     })
@@ -763,7 +762,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                         duckdb_path_str,
                         Some("ready_after_load"),
                     ))
-                    .with_results_cache(ResultsCache {
+                    .with_sql_cache(SQLResultsCacheConfig {
                         enabled: false,
                         ..Default::default()
                     })
@@ -832,7 +831,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                         duckdb_path_str,
                         Some("ready_before_load"),
                     ))
-                    .with_results_cache(ResultsCache {
+                    .with_sql_cache(SQLResultsCacheConfig {
                         enabled: false,
                         ..Default::default()
                     })
@@ -884,7 +883,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                         duckdb_path_str,
                         Some("ready_before_load"),
                     ))
-                    .with_results_cache(ResultsCache {
+                    .with_sql_cache(SQLResultsCacheConfig {
                         enabled: false,
                         ..Default::default()
                     })
@@ -1010,7 +1009,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
                     table_name, PORT6, access_key, secret_key,
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })

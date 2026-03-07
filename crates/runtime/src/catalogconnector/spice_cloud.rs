@@ -122,7 +122,7 @@ impl SpiceCloudPlatformCatalog {
             .expose()
             .unwrap_or_else(|_| "https://data.spiceai.io");
         let mut props = HashMap::new();
-        if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
+        if let Some(api_key) = self.api_key() {
             props.insert("token".to_string(), api_key.to_string());
         }
 
@@ -197,17 +197,41 @@ impl SpiceCloudPlatformCatalog {
         };
 
         let mut params = HashMap::new();
-        if let ExposedParamLookup::Present(flight_endpoint) =
-            self.params.get("flight_endpoint").expose()
-        {
+        if let Some(flight_endpoint) = self.flight_endpoint() {
             params.insert("spiceai_endpoint".to_string(), flight_endpoint.to_string());
         }
 
-        if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
+        if let Some(api_key) = self.api_key() {
             params.insert("spiceai_api_key".to_string(), api_key.to_string());
         }
 
         template_dataset.with_params(params)
+    }
+
+    fn flight_endpoint(&self) -> Option<&str> {
+        if let ExposedParamLookup::Present(endpoint) = self.params.get("endpoint").expose() {
+            return Some(endpoint);
+        }
+
+        if let ExposedParamLookup::Present(flight_endpoint) =
+            self.params.get("flight_endpoint").expose()
+        {
+            return Some(flight_endpoint);
+        }
+
+        None
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
+            return Some(api_key);
+        }
+
+        if let ExposedParamLookup::Present(token) = self.params.get("token").expose() {
+            return Some(token);
+        }
+
+        None
     }
 
     async fn create_data_connector(
@@ -254,6 +278,8 @@ impl SpiceCloudPlatformCatalog {
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("api_key").secret(),
+    ParameterSpec::component("token").secret(),
+    ParameterSpec::component("endpoint"),
     ParameterSpec::component("flight_endpoint"),
     ParameterSpec::component("http_endpoint"),
 ];
@@ -276,6 +302,10 @@ impl CatalogConnector for SpiceCloudPlatformCatalog {
 fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = catalog_slug.split('/').collect();
 
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(Error::InvalidPath);
+    }
+
     match parts.len() {
         2 | 3 => {
             let org = parts[0].to_string();
@@ -285,5 +315,173 @@ fn parse_catalog_slug(catalog_slug: &str) -> Result<(String, String, String)> {
             Ok((org, app, catalog))
         }
         _ => Err(Error::InvalidPath),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+    use std::sync::Arc;
+
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn test_parse_catalog_slug_org_and_app() {
+        let (org, app, catalog) = parse_catalog_slug("myorg/myapp").expect("valid two-part slug");
+        assert_eq!(org, "myorg");
+        assert_eq!(app, "myapp");
+        assert_eq!(catalog, "spice");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_org_app_and_catalog() {
+        let (org, app, catalog) =
+            parse_catalog_slug("myorg/myapp/mycatalog").expect("valid three-part slug");
+        assert_eq!(org, "myorg");
+        assert_eq!(app, "myapp");
+        assert_eq!(catalog, "mycatalog");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_default_catalog_name() {
+        let (_, _, catalog) = parse_catalog_slug("org/app").expect("valid two-part slug");
+        assert_eq!(catalog, "spice", "default catalog should be 'spice'");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_single_part_fails() {
+        parse_catalog_slug("justorg").expect_err("single-part slug should be invalid");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_four_parts_fails() {
+        parse_catalog_slug("a/b/c/d").expect_err("four-part slug should be invalid");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_empty_fails() {
+        parse_catalog_slug("").expect_err("empty slug should be invalid");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_trailing_slash() {
+        parse_catalog_slug("org/app/").expect_err("trailing slash should produce invalid slug");
+    }
+
+    #[test]
+    fn test_parse_catalog_slug_preserves_case() {
+        let (org, app, catalog) =
+            parse_catalog_slug("MyOrg/MyApp/MyCatalog").expect("valid three-part slug");
+        assert_eq!(org, "MyOrg");
+        assert_eq!(app, "MyApp");
+        assert_eq!(catalog, "MyCatalog");
+    }
+
+    #[tokio::test]
+    async fn test_flight_endpoint_prefers_endpoint_parameter() {
+        let params = Parameters::try_new(
+            "test",
+            vec![
+                (
+                    "spiceai_endpoint".to_string(),
+                    "grpc://new".to_string().into(),
+                ),
+                (
+                    "spiceai_flight_endpoint".to_string(),
+                    "grpc://legacy".to_string().into(),
+                ),
+            ],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(connector.flight_endpoint(), Some("grpc://new"));
+    }
+
+    #[tokio::test]
+    async fn test_flight_endpoint_uses_legacy_flight_endpoint_parameter() {
+        let params = Parameters::try_new(
+            "test",
+            vec![(
+                "spiceai_flight_endpoint".to_string(),
+                "grpc://legacy".to_string().into(),
+            )],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(connector.flight_endpoint(), Some("grpc://legacy"));
+    }
+
+    #[tokio::test]
+    async fn test_flight_endpoint_missing_returns_none() {
+        let params = Parameters::try_new(
+            "test",
+            Vec::<(String, SecretString)>::new(),
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(connector.flight_endpoint(), None);
+    }
+
+    #[tokio::test]
+    async fn test_api_key_prefers_api_key_parameter() {
+        let params = Parameters::try_new(
+            "test",
+            vec![
+                ("spiceai_api_key".to_string(), "api-key".to_string().into()),
+                (
+                    "spiceai_token".to_string(),
+                    "legacy-token".to_string().into(),
+                ),
+            ],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(connector.api_key(), Some("api-key"));
+    }
+
+    #[tokio::test]
+    async fn test_api_key_uses_legacy_token_parameter() {
+        let params = Parameters::try_new(
+            "test",
+            vec![(
+                "spiceai_token".to_string(),
+                "legacy-token".to_string().into(),
+            )],
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+
+        let connector = SpiceCloudPlatformCatalog { params };
+
+        assert_eq!(connector.api_key(), Some("legacy-token"));
     }
 }

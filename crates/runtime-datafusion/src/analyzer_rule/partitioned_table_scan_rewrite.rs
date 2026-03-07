@@ -20,7 +20,7 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
         Result,
-        tree_node::{Transformed, TransformedResult, TreeNode},
+        tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
@@ -39,7 +39,7 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
     fn get_partitions(
         &self,
         table: &TableReference,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)>;
 
     /// Whether partitioning should be applied to the given table.
@@ -94,7 +94,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
         plan: LogicalPlan,
         _config: &ConfigOptions,
     ) -> Result<LogicalPlan, DataFusionError> {
-        plan.transform_up(|plan| {
+        plan.transform_up_with_subqueries(|plan| {
             let LogicalPlan::TableScan(scan) = &plan else {
                 return Ok(Transformed::no(plan));
             };
@@ -104,7 +104,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 
             let providers = self
                 .partition_provider
-                .get_partitions(&scan.table_name, scan.source.schema());
+                .get_partitions(&scan.table_name, &scan.source.schema());
 
             tracing::debug!(
                 "PartitionedTableScanRewrite: {} partitions for '{}' table.",
@@ -140,6 +140,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     },
                 )));
             }
+
             Ok(Transformed::yes(LogicalPlan::Union(Union {
                 inputs: sub_scans,
                 schema: Arc::clone(plan.schema()),

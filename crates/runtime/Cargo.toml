@@ -79,12 +79,13 @@ iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
-jsonwebtoken = "10.3.0"
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
+mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
@@ -150,10 +151,12 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
+snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
+tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
@@ -171,7 +174,7 @@ tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = ">=8.1.1", features = [
     "axum",
@@ -293,8 +296,8 @@ models = [
     "llms/local_embed",
 ]
 mongodb = ["data_components/mongodb"]
-mssql = ["data_components/mssql"]
-mysql = ["db_connection_pool/mysql", "data_components/mysql"]
+mssql = ["dep:tiberius", "data_components/mssql"]
+mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = []
 openapi = [
@@ -322,7 +325,7 @@ sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
-snowflake = ["db_connection_pool/snowflake", "data_components/snowflake"]
+snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
 spark = ["data_components/spark_connect"]
 sqlite = [
     "dep:tokio-rusqlite",

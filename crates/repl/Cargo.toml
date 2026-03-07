@@ -14,7 +14,7 @@ arrow = { workspace = true, features = ["chrono-tz"] }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json.workspace = true
 clap.workspace = true
-dialoguer = "0.11"
+dialoguer = "0.12"
 dirs = "6"
 flight_client = { path = "../flight_client" }
 futures.workspace = true

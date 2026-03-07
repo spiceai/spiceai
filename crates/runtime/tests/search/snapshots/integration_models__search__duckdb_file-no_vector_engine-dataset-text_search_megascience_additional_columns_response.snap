@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 6.33,
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
@@ -17,10 +18,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 525
-      },
-      "score": 6.33
+      }
     },
     {
+      "_score": 6.19,
       "data": {
         "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
@@ -32,8 +33,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 772
-      },
-      "score": 6.19
+      }
     }
   ]
 }

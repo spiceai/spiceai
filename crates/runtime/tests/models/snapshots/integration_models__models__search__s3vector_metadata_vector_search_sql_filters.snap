@@ -7,21 +7,21 @@ snapshot_kind: text
   {
     "id": 863,
     "answer": "Choices create costs and benefits.",
-    "score": 0.878
+    "_score": 0.878
   },
   {
     "id": 1316,
     "answer": "\\(\\boxed{2a + 4b}\\)",
-    "score": 0.837
+    "_score": 0.837
   },
   {
     "id": 590,
     "answer": "\\(\\boxed{x = A + E}\\)",
-    "score": 0.828
+    "_score": 0.828
   },
   {
     "id": 6,
     "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)",
-    "score": 0.821
+    "_score": 0.821
   }
 ]

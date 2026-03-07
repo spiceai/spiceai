@@ -1,12 +1,11 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: resp
-snapshot_kind: text
+expression: resp?
 ---
 [
   {
     "id": 890,
     "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume.",
-    "score": 7.522
+    "_score": 7.522
   }
 ]

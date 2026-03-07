@@ -25,6 +25,7 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     common::DFSchema,
     datasource::TableProvider,
@@ -99,17 +100,17 @@ pub fn get_duckdb_partition_mode(params: &Option<spicepod::param::Params>) -> Du
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create table: {source}"))]
+    #[snafu(display("Failed to create DuckDB acceleration table: {source}"))]
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Acceleration creation failed: {source}"))]
+    #[snafu(display("Failed to create DuckDB acceleration: {source}"))]
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Acceleration initialization failed: {source}"))]
+    #[snafu(display("Failed to initialize DuckDB acceleration: {source}"))]
     AccelerationInitializationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -122,7 +123,7 @@ pub enum Error {
         extension: String,
     },
 
-    #[snafu(display(r"The 'duckdb_file' acceleration parameter is a directory."))]
+    #[snafu(display(r"The 'duckdb_file' acceleration parameter points to a directory instead of a file. Specify a file path."))]
     InvalidFileIsDirectory,
 
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
@@ -284,6 +285,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 

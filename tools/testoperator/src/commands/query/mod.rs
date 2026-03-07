@@ -15,10 +15,7 @@ limitations under the License.
 */
 
 use super::RowCounts;
-use crate::{
-    args::{QueryArgs, QuerySetLoader},
-    health::HealthMonitor,
-};
+use crate::{args::DatasetTestArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -31,7 +28,7 @@ use test_framework::{
     },
 };
 
-pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let mut spiced_instance = SpicedInstance::empty();
 
     spiced_instance
@@ -39,6 +36,9 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .await?;
 
     let health_monitor = HealthMonitor::spawn()?;
+
+    // Create the appropriate query executor based on args
+    let executor = super::create_query_executor(args, &spiced_instance).await?;
 
     // baseline run
     println!("Running benchmark test");
@@ -56,10 +56,8 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .with_parallel_count(1)
         .with_end_condition(EndCondition::QuerySetCompleted(5))
         .with_validate(args.validate)
-        .with_disable_caching(args.disable_caching)
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
-        .with_http_client(args.http_clients)
-        .with_distributed_mode(args.distributed)
+        .with_query_executor(executor)
         .with_query_set(queries)
         .with_query_set_type(query_set.clone())
         .with_query_overrides(query_overrides);
@@ -77,8 +75,7 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
 
     let benchmark_test = SpiceTest::new("local".to_string(), test)
         .with_spiced_instance(spiced_instance)
-        .start()
-        .await?;
+        .start()?;
 
     let test = benchmark_test.wait().await?;
     let row_counts = test.validate_returned_row_counts()?;

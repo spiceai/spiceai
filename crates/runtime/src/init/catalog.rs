@@ -31,13 +31,11 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_catalogs(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(ref app) = self.read_app().await else {
             return;
         };
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
-        drop(app_lock);
         let mut futures = vec![];
         for catalog in &valid_catalogs {
             self.status
@@ -58,8 +56,10 @@ impl Runtime {
                 Ok(connector) => connector,
                 Err(err) => {
                     let catalog_name = &catalog.name;
-                    self.status
-                        .update_catalog(catalog_name, status::ComponentStatus::Error);
+                    self.status.update_catalog(
+                        catalog_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
@@ -92,12 +92,14 @@ impl Runtime {
         let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
         else {
             let catalog_name = &catalog.name;
-            self.status
-                .update_catalog(catalog_name, status::ComponentStatus::Error);
             metrics::catalogs::LOAD_ERROR.add(1, &[]);
             let err = crate::Error::UnknownCatalogConnector {
                 catalog_connector: source,
             };
+            self.status.update_catalog(
+                catalog_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
             warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
             return Err(err);
         };

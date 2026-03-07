@@ -6,6 +6,18 @@ The Spice open source project provides multiple distribution variants to support
 
 > **Note:** Variant distributions (data, allocators, CUDA) are only available in **nightly images** for the open source project. All features and distributions are available in the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://spice.ai/pricing).
 
+## Distribution Availability
+
+| Distribution / Variant | Open Source      | Spice Cloud | Enterprise |
+| ---------------------- | ---------------- | ----------- | ---------- |
+| Default (Data + AI)    | ✅                | ✅           | ✅          |
+| Data-only              | Nightly only     | ✅           | ✅          |
+| NAS (SMB + NFS)        | Nightly only     | ❌           | ✅          |
+| Metal (macOS)          | ✅                | ✅           | ✅          |
+| CUDA (Linux)           | Nightly only     | ✅           | ✅          |
+| Allocator variants     | Nightly only     | ✅           | ✅          |
+| ODBC connector         | Local build only | ✅           | ✅          |
+
 ## Default Distribution
 
 The default distribution includes all features including AI/ML model support. This is the recommended distribution for most users.
@@ -112,6 +124,24 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-cuda
 CUDA_COMPUTE_CAP=89 make install-cuda
 ```
 
+## NAS Distribution
+
+The NAS (Network Attached Storage) distribution adds support for SMB and NFS data connectors, enabling federated queries against data stored on network file shares.
+
+> **[Enterprise](https://spice.ai/pricing):** The NAS distribution is available in nightly builds and with Spice.ai Enterprise.
+
+**Included Features:**
+
+- All default features
+- SMB data connector
+- NFS data connector
+
+**Local Build:**
+
+```bash
+make install-nas
+```
+
 ## Allocator Variants
 
 Different memory allocators can significantly impact performance depending on workload characteristics.
@@ -154,13 +184,13 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 ## Platform Support
 
-| Platform                      | Default | Data            | Metal | CUDA            |
-| ----------------------------- | ------- | --------------- | ----- | --------------- |
-| Linux x86_64                  | ✅       | Nightly         | ❌     | Nightly         |
-| Linux aarch64                 | ✅       | Nightly         | ❌     | ❌               |
-| macOS aarch64 (Apple Silicon) | ✅       | Nightly         | ✅     | ❌               |
-| Windows (WSL)                 | ✅       | Nightly         | ❌     | Nightly         |
-| Windows (Native)              | ❌       | Enterprise only | ❌     | Enterprise only |
+| Platform                      | Default | Data            | NAS             | Metal | CUDA            |
+| ----------------------------- | ------- | --------------- | --------------- | ----- | --------------- |
+| Linux x86_64                  | ✅       | Nightly         | Nightly         | ❌     | Nightly         |
+| Linux aarch64                 | ✅       | Nightly         | Nightly         | ❌     | ❌               |
+| macOS aarch64 (Apple Silicon) | ✅       | Nightly         | Nightly         | ✅     | ❌               |
+| Windows (WSL)                 | ✅       | Nightly         | Nightly         | ❌     | Nightly         |
+| Windows (Native)              | ❌       | Enterprise only | Enterprise only | ❌     | Enterprise only |
 
 > **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing). Open source users on Windows should use Windows Subsystem for Linux (WSL).
 
@@ -170,6 +200,7 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 | --------------------------------------- | ---------------------------- |
 | General purpose with AI capabilities    | Default                      |
 | Data federation only, minimal footprint | Data (nightly)               |
+| Network attached storage (SMB/NFS)      | NAS                          |
 | macOS with GPU acceleration             | Metal                        |
 | Linux with NVIDIA GPU                   | CUDA (nightly)               |
 | Memory allocation benchmarking          | Allocator variants (nightly) |
@@ -179,13 +210,11 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 Some connectors require additional dependencies and are available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing):
 
 - **ODBC** - Connect to any ODBC-compatible data source
-- **NFS** - Network File System support
 
 These can be built locally for development and testing:
 
 ```bash
 make install-odbc
-make install-nfs
 ```
 
 ## Building Custom Distributions

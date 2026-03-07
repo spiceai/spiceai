@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{Int64Array, RecordBatch, UInt64Array};
 use futures::TryStreamExt;
 use spicepod::spec::SpicepodDefinition;
-use test_framework::anyhow::{self, Context, Result};
+use test_framework::anyhow::{Context, Result};
 use test_framework::constants::METRICS_URL;
 use test_framework::spiced::SpicedInstance;
 
@@ -31,10 +31,10 @@ use super::datasets::DatasetType;
 use super::traits::StreamingDataset;
 
 /// Information about a dataset being benchmarked.
-#[expect(dead_code)]
 pub struct DatasetInfo {
     pub dataset: Box<dyn StreamingDataset>,
     pub marker: RecordBatch,
+    #[expect(dead_code)]
     pub record_count: usize,
     /// Original generated data (for mutation testing).
     pub generated_data: Vec<RecordBatch>,
@@ -77,7 +77,7 @@ pub fn write_temp_spicepod(
     std::fs::write(&path, content.clone())
         .with_context(|| format!("Failed to write temp spicepod: {}", path.display()))?;
 
-    println!("    Wrote transformed spicepod to {}", path.display());
+    println!(" Wrote transformed spicepod to {}", path.display());
     println!("{content}");
 
     Ok(path)
@@ -231,57 +231,6 @@ pub async fn wait_for_all_marker_deletions(
 
         if deleted.values().all(|&v| v) {
             println!("All marker deletions confirmed");
-            return Ok(());
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
-/// Poll the snapshots API until at least one snapshot exists for ALL given datasets.
-pub async fn poll_for_all_snapshots(dataset_names: &[&str], timeout: Duration) -> Result<()> {
-    let start = Instant::now();
-    let poll_interval = Duration::from_millis(1000);
-    let client = reqwest::Client::new();
-
-    let mut pending: std::collections::HashSet<&str> = dataset_names.iter().copied().collect();
-
-    loop {
-        if start.elapsed() > timeout {
-            let missing: Vec<_> = pending.iter().copied().collect();
-            return Err(anyhow::anyhow!(
-                "Timeout waiting for snapshot creation. Missing: {missing:?}"
-            ));
-        }
-
-        // Check each pending dataset
-        let mut newly_completed = Vec::new();
-        for dataset_name in &pending {
-            let url =
-                format!("http://localhost:8090/v1/datasets/{dataset_name}/acceleration/snapshots");
-
-            if let Ok(response) = client.get(&url).send().await
-                && response.status().is_success()
-                && let Ok(body) = response.text().await
-            {
-                // Parse JSON response to check if snapshots array is non-empty
-                // Response format: {"dataset_name":"...","snapshots":[...],...}
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-                    && let Some(snapshots) = json.get("snapshots").and_then(|s| s.as_array())
-                    && !snapshots.is_empty()
-                {
-                    println!("Snapshot created for {dataset_name}");
-                    newly_completed.push(*dataset_name);
-                }
-            }
-        }
-
-        for name in newly_completed {
-            pending.remove(name);
-        }
-
-        if pending.is_empty() {
-            println!("All snapshots created");
             return Ok(());
         }
 

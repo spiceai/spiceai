@@ -48,7 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::{ExecutorControlStreamRegistry, ResolvedClusterConfig},
+    crate::cluster::{ExecutorControlStreamRegistry, ExecutorRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -77,7 +77,8 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use error::find_datafusion_root;
+use error::{find_datafusion_root, format_datafusion_error};
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use query::QueryBuilder;
 #[cfg(any(
@@ -107,6 +108,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use tokio_stream::wrappers::ReceiverStream;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -114,10 +116,14 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+#[cfg(not(windows))]
+pub mod cayenne_ddl;
+pub mod composed_catalog;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
 pub mod flight_session_extension;
+pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
@@ -158,7 +164,7 @@ pub enum Error {
     #[snafu(display("Unable to delete table: {reason}"))]
     UnableToDeleteTable { reason: String },
 
-    #[snafu(display("Unable to parse SQL: {source}"))]
+    #[snafu(display("Unable to parse SQL: {}", format_datafusion_error(source)))]
     UnableToParseSql { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -167,10 +173,10 @@ pub enum Error {
     #[snafu(display("{source}"))]
     RetentionSql { source: retention_sql::Error },
 
-    #[snafu(display("Unable to get table: {source}"))]
+    #[snafu(display("Unable to get table: {}", format_datafusion_error(source)))]
     UnableToGetTable { source: DataFusionError },
 
-    #[snafu(display("Unable to list tables: {source}"))]
+    #[snafu(display("Unable to list tables: {}", format_datafusion_error(source)))]
     UnableToGetTables { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
@@ -186,10 +192,16 @@ pub enum Error {
     ))]
     MetadataProviderNotImplemented { table_name: String },
 
-    #[snafu(display("Unable to register table in DataFusion: {source}"))]
+    #[snafu(display(
+        "Unable to register table in DataFusion: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
 
-    #[snafu(display("Unable to register {schema} table in DataFusion: {source}"))]
+    #[snafu(display(
+        "Unable to register {schema} table in DataFusion: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterTableToDataFusionSchema {
         schema: String,
         source: DataFusionError,
@@ -206,17 +218,26 @@ pub enum Error {
     #[snafu(display("The table {table_name} is not writable"))]
     TableNotWritable { table_name: String },
 
-    #[snafu(display("Unable to plan the table insert for {table_name}: {source}"))]
+    #[snafu(display(
+        "Unable to plan the table insert for {table_name}: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToPlanTableInsert {
         table_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to execute the table insert for {table_name}: {source}"))]
+    #[snafu(display(
+        "Unable to execute the table insert for {table_name}: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToExecuteTableInsert {
         table_name: String,
         source: DataFusionError,
     },
+
+    #[snafu(display("No executors available to forward write for table {table_name}"))]
+    NoExecutorsAvailable { table_name: String },
 
     #[snafu(display("Failed to refresh the dataset {dataset_name}. {source}"))]
     UnableToTriggerRefresh {
@@ -245,7 +266,7 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
-    #[snafu(display("Unable to get {schema} schema: {source}"))]
+    #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
         schema: String,
         source: DataFusionError,
@@ -265,6 +286,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[snafu(display("Unable to acquire lock for DDL-enabled catalogs"))]
+    UnableToLockDdlEnabledCatalogs {},
+
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
@@ -279,7 +303,10 @@ pub enum Error {
     ))]
     ChangeSchemaWithoutDataField { source: ArrowError },
 
-    #[snafu(display("Unable to create streaming data update: {source}"))]
+    #[snafu(display(
+        "Unable to create streaming data update: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCreateStreamingUpdate {
         source: datafusion::error::DataFusionError,
     },
@@ -317,7 +344,16 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {source}"
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+    ))]
+    UnsupportedDistributedAccelerationEngine {
+        dataset_name: String,
+        engine: String,
+    },
+
+    #[snafu(display(
+        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
+        format_datafusion_error(source)
     ))]
     UnableToSetUnderlyingTableProvider {
         component_name: String,
@@ -364,6 +400,30 @@ pub enum Error {
     UnsupportedAccelerationEngineForSnapshots,
 }
 
+/// Validates that the acceleration engine is supported in distributed mode.
+///
+/// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
+/// Returns an error if a distributed role is active and the engine is unsupported.
+fn validate_distributed_engine(
+    cluster_config: &ResolvedClusterConfig,
+    engine: Engine,
+    dataset_name: &str,
+) -> Result<()> {
+    if cluster_config.effective_role().is_some()
+        && !matches!(
+            engine,
+            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+        )
+    {
+        return UnsupportedDistributedAccelerationEngineSnafu {
+            dataset_name: dataset_name.to_string(),
+            engine: engine.to_string(),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
@@ -374,6 +434,10 @@ pub enum Table {
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        /// Initial partition filter expressions to apply before the refresher starts.
+        /// These are set on the `Refresh` during table registration to avoid a race
+        /// where the first refresh runs before partition filters are applied.
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -393,16 +457,23 @@ struct DeferredTableRegistration {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    runtime_status: Arc<status::RuntimeStatus>,
+    pub(crate) runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     writable_catalogs: RwLock<HashSet<String>>,
+    /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
+    ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
+    /// Shared store for DDL table options from `CREATE TABLE ... WITH (acceleration.*, dataset.*)`.
+    ddl_options_store: iceberg_ddl::acceleration_options::SharedDdlOptionsStore,
+    /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
+    /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
+    datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
-    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
@@ -410,7 +481,7 @@ pub struct DataFusion {
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
-    io_runtime: Handle,
+    pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
@@ -421,6 +492,8 @@ pub struct DataFusion {
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
+    /// Executor registry for distributed write forwarding (scheduler mode only).
+    pub(crate) executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -542,14 +615,56 @@ impl DataFusion {
                 .await
                 .insert(name.to_string(), Arc::new(deferred_catalog.clone()));
         } else {
-            self.ctx.register_catalog(name, catalog);
+            let catalog_to_register = if name == SPICE_DEFAULT_CATALOG {
+                // When overriding the default catalog, preserve internal schemas
+                self.compose_with_internal_schemas(catalog)
+            } else {
+                catalog
+            };
 
-            if matches!(access, AccessMode::ReadWrite) {
+            self.ctx.register_catalog(name, catalog_to_register);
+
+            if access.allows_ddl() {
+                self.mark_catalog_ddl_enabled(name)?;
+            } else if access.allows_write() {
                 self.mark_catalog_writable(name)?;
             }
         }
 
         Ok(())
+    }
+
+    /// When an external catalog replaces the default `spice` catalog, extract the
+    /// internal schemas (`runtime`, `metadata`, `eval`, `scp`) from the current
+    /// default catalog and wrap the external catalog in a [`ComposedCatalogProvider`]
+    /// that preserves those internal schemas.
+    fn compose_with_internal_schemas(
+        &self,
+        external: Arc<dyn CatalogProvider>,
+    ) -> Arc<dyn CatalogProvider> {
+        use composed_catalog::ComposedCatalogProvider;
+        use std::collections::HashMap;
+
+        let internal_schema_names = [
+            SPICE_RUNTIME_SCHEMA,
+            SPICE_METADATA_SCHEMA,
+            SPICE_SCP_SCHEMA,
+            #[cfg(feature = "models")]
+            SPICE_EVAL_SCHEMA,
+        ];
+
+        let mut internal_schemas: HashMap<String, Arc<dyn datafusion::catalog::SchemaProvider>> =
+            HashMap::new();
+
+        if let Some(current_catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
+            for schema_name in &internal_schema_names {
+                if let Some(schema) = current_catalog.schema(schema_name) {
+                    internal_schemas.insert((*schema_name).to_string(), schema);
+                }
+            }
+        }
+
+        Arc::new(ComposedCatalogProvider::new(external, internal_schemas))
     }
 
     // Returns a Notify if the table supports notifying the runtime when the table is ready.
@@ -570,6 +685,7 @@ impl DataFusion {
                 accelerated_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -603,6 +719,7 @@ impl DataFusion {
                         federated_read_table,
                         secrets,
                         bootstrap_status,
+                        initial_partition_filters,
                     )
                     .await?
                 }
@@ -633,7 +750,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_access_mode, AccessMode::ReadWrite) {
+        if dataset_access_mode.allows_write() {
             self.mark_dataset_writable(&dataset_table_ref)?;
         }
 
@@ -658,6 +775,14 @@ impl DataFusion {
         }
     }
 
+    /// Check if a table reference belongs to a writable catalog.
+    /// Handles both explicit catalog names and bare names (defaults to `SPICE_DEFAULT_CATALOG`).
+    #[must_use]
+    pub fn is_path_catalog_writable(&self, table_reference: &TableReference) -> bool {
+        let catalog = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        self.is_catalog_writable(catalog)
+    }
+
     pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write' is enabled for catalog {catalog_name}. This feature is currently in preview."
@@ -667,6 +792,56 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
             .insert(catalog_name.to_string());
         Ok(())
+    }
+
+    /// Returns true if the catalog allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
+    #[must_use]
+    pub fn is_catalog_ddl_enabled(&self, catalog_name: &str) -> bool {
+        if let Ok(ddl_catalogs) = self.ddl_enabled_catalogs.read() {
+            ddl_catalogs.contains(catalog_name)
+        } else {
+            false
+        }
+    }
+
+    /// Marks a catalog as DDL-enabled, allowing CREATE TABLE, DROP TABLE, etc. operations.
+    pub fn mark_catalog_ddl_enabled(&self, catalog_name: &str) -> Result<()> {
+        tracing::warn!(
+            "Access mode 'read_write_create' is enabled for catalog {catalog_name}. DDL operations are allowed. This feature is currently in preview."
+        );
+        self.ddl_enabled_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
+            .insert(catalog_name.to_string());
+        self.writable_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    /// Returns a reference to the shared DDL options store.
+    ///
+    /// Used by the query execution path to insert options extracted from
+    /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
+    /// are then consumed by the `IcebergDdlAnalyzerRule`.
+    #[must_use]
+    pub fn ddl_options_store(&self) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
+        &self.ddl_options_store
+    }
+
+    /// Returns the shared weak self-reference holder.
+    ///
+    /// The extension planner uses this to obtain a `Weak<DataFusion>` for physical plans.
+    #[must_use]
+    pub fn datafusion_ref(&self) -> &iceberg_ddl::SharedDataFusionRef {
+        &self.datafusion_ref
+    }
+
+    /// Populate the shared weak self-reference. Must be called once after
+    /// wrapping `DataFusion` in `Arc`.
+    pub fn set_self_ref(self: &Arc<Self>) {
+        let _ = self.datafusion_ref.set(Arc::downgrade(self));
     }
 
     pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
@@ -727,35 +902,30 @@ impl DataFusion {
         &self,
         table_reference: &TableReference,
     ) -> Result<Arc<dyn TableProvider>> {
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         let table_name = table_reference.table();
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
-        if let Some(schema_name) = table_reference.schema()
-            && let Some(schema) = self.schema(schema_name)
-        {
-            let table_provider = schema
-                .table(table_name)
-                .await
-                .map_err(find_datafusion_root)
-                .context(UnableToGetTableSnafu)?
-                .ok_or_else(|| {
-                    TableMissingSnafu {
-                        schema: schema_name.to_string(),
-                        table: table_name.to_string(),
-                    }
-                    .build()
-                })
-                .boxed()
-                .context(UnableToGetSchemaTableSnafu)?;
+        let catalog_provider =
+            self.resolve_catalog_provider(table_reference)
+                .context(CatalogMissingSnafu {
+                    catalog: catalog_name.to_string(),
+                })?;
 
-            return Ok(table_provider);
-        }
+        let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)
+            .context(SchemaMissingSnafu {
+                schema: schema_name.to_string(),
+            })?;
 
-        let table_provider = self
-            .ctx
-            .table_provider(TableReference::bare(table_name.to_string()))
+        let table_provider = schema_provider
+            .table(table_name)
             .await
             .map_err(find_datafusion_root)
-            .context(UnableToGetTableSnafu)?;
+            .context(UnableToGetTableSnafu)?
+            .context(TableMissingSnafu {
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
+            })?;
 
         Ok(table_provider)
     }
@@ -791,7 +961,9 @@ impl DataFusion {
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
-                if matches!(access, AccessMode::ReadWrite) {
+                if access.allows_ddl() {
+                    self.mark_catalog_ddl_enabled(name)?;
+                } else if access.allows_write() {
                     self.mark_catalog_writable(name)?;
                 }
             }
@@ -841,6 +1013,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+            vec![],
         )
         .await?;
 
@@ -868,7 +1041,7 @@ impl DataFusion {
         table_reference: &TableReference,
         data_update: DataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(table_reference) {
+        if !self.is_writable(table_reference) && !self.is_path_catalog_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -885,6 +1058,16 @@ impl DataFusion {
             data_update.schema.fields(),
         )
         .context(SchemaMismatchSnafu)?;
+
+        // In distributed scheduler mode, forward Cayenne table writes to an executor
+        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
+            let streaming_update = StreamingDataUpdate::try_from(data_update)
+                .map_err(find_datafusion_root)
+                .context(UnableToCreateStreamingUpdateSnafu)?;
+            return self
+                .forward_write_to_executor(table_reference, streaming_update)
+                .await;
+        }
 
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
@@ -926,7 +1109,7 @@ impl DataFusion {
         table_reference: &TableReference,
         streaming_update: StreamingDataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(table_reference) {
+        if !self.is_writable(table_reference) && !self.is_path_catalog_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -942,6 +1125,13 @@ impl DataFusion {
 
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
+
+        // In distributed scheduler mode, forward Cayenne table writes to an executor
+        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
+            return self
+                .forward_write_to_executor(table_reference, streaming_update)
+                .await;
+        }
 
         let overwrite = match streaming_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
@@ -971,14 +1161,363 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
-        let data_frame = self
-            .ctx
-            .table(dataset)
+    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
+    /// meaning the write should be forwarded to an executor.
+    fn should_forward_cayenne_write(
+        &self,
+        _table_reference: &TableReference,
+        table_provider: &dyn TableProvider,
+    ) -> bool {
+        // Only forward if we have an executor registry (i.e., we are a scheduler)
+        let Some(executor_registry) = &self.executor_registry else {
+            return false;
+        };
+
+        // Check if the table provider is a CayenneTableProvider
+        if table_provider
+            .as_any()
+            .downcast_ref::<cayenne::CayenneTableProvider>()
+            .is_none()
+        {
+            return false;
+        }
+
+        // Check if there are any connected executors with flight clients
+        let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+            return false;
+        };
+        !clients.is_empty()
+    }
+
+    /// Forwards a streaming write to an executor node via Flight `DoPut`.
+    async fn forward_write_to_executor(
+        &self,
+        table_reference: &TableReference,
+        streaming_update: StreamingDataUpdate,
+    ) -> Result<()> {
+        let Some(executor_registry) = self.executor_registry.as_ref() else {
+            return NoExecutorsAvailableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail();
+        };
+
+        // Get an executor's FlightSqlClient
+        let (executor_id, client) = {
+            let clients = executor_registry.flight_sql_clients.read().await;
+            let Some((executor_id, client)) = clients.iter().next() else {
+                tracing::error!(
+                    "No executors available to forward Cayenne write for table {table_reference}"
+                );
+                return NoExecutorsAvailableSnafu {
+                    table_name: table_reference.to_string(),
+                }
+                .fail();
+            };
+            (executor_id.clone(), client.clone())
+        };
+
+        tracing::debug!("Forwarding Cayenne write for table {table_reference} to executor");
+
+        // Resolve the table reference to a fully qualified form so the executor
+        // can locate it regardless of its default catalog/schema settings.
+        let resolved = table_reference
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let descriptor_path = vec![
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        ];
+        let resolved_table = TableReference::full(
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        );
+
+        // Register before the write to minimize post-write routing races.
+        self.register_forwarded_table_partition(executor_registry, &executor_id, resolved_table)
+            .await;
+
+        let schema = streaming_update.data.schema();
+        let stream = streaming_update.data;
+
+        // Build a flight data stream from the record batches.
+        let flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::unfold(stream, |mut s| async move {
+                match s.next().await {
+                    Some(Ok(batch)) => Some((Ok(batch), s)),
+                    Some(Err(e)) => Some((
+                        Err(arrow_flight::error::FlightError::Arrow(
+                            arrow_schema::ArrowError::ExternalError(Box::new(e)),
+                        )),
+                        s,
+                    )),
+                    None => None,
+                }
+            }));
+
+        // Stream directly into the executor's `DoPut` without buffering.
+        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
+        let (encode_result_tx, encode_result_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
+        let io_runtime = self.io_runtime.clone();
+
+        io_runtime.spawn(async move {
+            let mut first = true;
+            let mut flight_data_encoder = Box::pin(flight_data_encoder);
+            loop {
+                match flight_data_encoder.next().await {
+                    Some(Ok(mut fd)) => {
+                        if first {
+                            fd.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_path(
+                                descriptor_path.clone(),
+                            ));
+                            first = false;
+                        }
+
+                        if tx.send(fd).await.is_err() {
+                            let _ = encode_result_tx.send(Ok(()));
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = encode_result_tx.send(Err(e.to_string()));
+                        break;
+                    }
+                    None => {
+                        let _ = encode_result_tx.send(Ok(()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Forward the authorization header from the original request so the
+        // executor can validate the caller's credentials.
+        let auth_header = runtime_request_context::RequestContext::current(
+            runtime_request_context::AsyncMarker::new().await,
+        )
+        .authorization_header()
+        .map(str::to_string);
+
+        let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        if let Some(auth_value) = auth_header
+            && let Ok(val) = auth_value.parse()
+        {
+            request.metadata_mut().insert("authorization", val);
+        }
+
+        let table_name = table_reference.to_string();
+        let mut inner_client = client.into_inner();
+        let response =
+            inner_client
+                .do_put(request)
+                .await
+                .map_err(|e| Error::UnableToExecuteTableInsert {
+                    table_name: table_name.clone(),
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
+
+        // Wait for the server to acknowledge.
+        response
+            .into_inner()
+            .try_collect::<Vec<_>>()
             .await
-            .map_err(find_datafusion_root)
-            .context(UnableToGetTableSnafu)?;
-        Ok(data_frame.schema().as_arrow().clone())
+            .map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_name.clone(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+
+        match encode_result_rx.await {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(e)) => {
+                return Err(Error::UnableToExecuteTableInsert {
+                    table_name,
+                    source: DataFusionError::Execution(format!(
+                        "Failed to encode forwarded Flight stream: {e}"
+                    )),
+                });
+            }
+        }
+
+        tracing::debug!(
+            "Successfully forwarded Cayenne write for table {table_reference} to executor"
+        );
+
+        Ok(())
+    }
+
+    async fn register_forwarded_table_partition(
+        &self,
+        executor_registry: &ExecutorRegistry,
+        executor_id: &str,
+        resolved_table: TableReference,
+    ) {
+        let mut partitions = executor_registry.partitions.write().await;
+        partitions
+            .entry(executor_id.to_string())
+            .or_default()
+            .entry(resolved_table)
+            .or_default();
+    }
+
+    /// Forwards a raw `FlightData` stream to an executor via Flight `DoPut`.
+    ///
+    /// This avoids scheduler-side decode/re-encode overhead and is used as a fast path
+    /// for scheduler -> executor Cayenne write-through ingestion.
+    pub(crate) async fn forward_flight_data_stream_to_executor<S>(
+        &self,
+        table_reference: &TableReference,
+        inbound_stream: S,
+    ) -> Result<()>
+    where
+        S: futures::Stream<Item = std::result::Result<arrow_flight::FlightData, tonic::Status>>
+            + Send
+            + 'static,
+    {
+        let Some(executor_registry) = self.executor_registry.as_ref() else {
+            return NoExecutorsAvailableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail();
+        };
+
+        // Get an executor's FlightSqlClient
+        let (executor_id, client) = {
+            let clients = executor_registry.flight_sql_clients.read().await;
+            let Some((executor_id, client)) = clients.iter().next() else {
+                tracing::error!(
+                    "No executors available to forward Cayenne write for table {table_reference}"
+                );
+                return NoExecutorsAvailableSnafu {
+                    table_name: table_reference.to_string(),
+                }
+                .fail();
+            };
+            (executor_id.clone(), client.clone())
+        };
+
+        tracing::debug!(
+            "Forwarding raw Cayenne DoPut stream for table {table_reference} to executor"
+        );
+
+        let resolved = table_reference
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let descriptor_path = vec![
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        ];
+        let resolved_table = TableReference::full(
+            resolved.catalog.to_string(),
+            resolved.schema.to_string(),
+            resolved.table.to_string(),
+        );
+
+        // Register before the write to minimize post-write routing races.
+        self.register_forwarded_table_partition(executor_registry, &executor_id, resolved_table)
+            .await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
+        let (copy_result_tx, copy_result_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<(), tonic::Status>>();
+
+        let io_runtime = self.io_runtime.clone();
+        io_runtime.spawn(async move {
+            let mut inbound_stream = Box::pin(inbound_stream);
+            let mut is_first = true;
+            loop {
+                match inbound_stream.next().await {
+                    Some(Ok(mut fd)) => {
+                        if is_first {
+                            if let Some(descriptor) = fd.flight_descriptor.as_mut() {
+                                descriptor.path.clone_from(&descriptor_path);
+                            } else {
+                                fd.flight_descriptor =
+                                    Some(arrow_flight::FlightDescriptor::new_path(
+                                        descriptor_path.clone(),
+                                    ));
+                            }
+                            is_first = false;
+                        }
+
+                        if tx.send(fd).await.is_err() {
+                            let _ = copy_result_tx.send(Ok(()));
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = copy_result_tx.send(Err(e));
+                        break;
+                    }
+                    None => {
+                        let _ = copy_result_tx.send(Ok(()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Forward the authorization header from the original request so the
+        // executor can validate the caller's credentials when configured.
+        let auth_header = runtime_request_context::RequestContext::current(
+            runtime_request_context::AsyncMarker::new().await,
+        )
+        .authorization_header()
+        .map(str::to_string);
+
+        let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        if let Some(auth_value) = auth_header
+            && let Ok(val) = auth_value.parse()
+        {
+            request.metadata_mut().insert("authorization", val);
+        }
+
+        let table_name = table_reference.to_string();
+        let mut inner_client = client.into_inner();
+        let response =
+            inner_client
+                .do_put(request)
+                .await
+                .map_err(|e| Error::UnableToExecuteTableInsert {
+                    table_name: table_name.clone(),
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
+
+        // Wait for the server to acknowledge.
+        response
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::UnableToExecuteTableInsert {
+                table_name: table_name.clone(),
+                source: DataFusionError::External(Box::new(e)),
+            })?;
+
+        match copy_result_rx.await {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(e)) => {
+                return Err(Error::UnableToExecuteTableInsert {
+                    table_name,
+                    source: DataFusionError::External(Box::new(e)),
+                });
+            }
+        }
+
+        tracing::debug!(
+            "Successfully forwarded raw Cayenne DoPut stream for table {table_reference} to executor"
+        );
+
+        Ok(())
+    }
+
+    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
+        let table_reference = dataset.into();
+        let table_provider = self.get_table_provider(&table_reference).await?;
+        Ok(table_provider.schema().as_ref().clone())
     }
 
     #[must_use]
@@ -1043,6 +1582,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1054,7 +1594,7 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access() == AccessMode::ReadWrite && !has_on_conflict;
+        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -1082,16 +1622,17 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
-        let refresh_sql = dataset.refresh_sql();
-        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(
+        let refresh_sql_str = dataset.refresh_sql();
+        let (parsed_refresh_sql, refresh_schema) = if let Some(sql_str) = &refresh_sql_str {
+            let (parsed, schema) = refresh_sql::parse_refresh_sql(
                 dataset.name.clone(),
-                refresh_sql.as_str(),
+                sql_str.as_str(),
                 source_schema,
             )
-            .context(RefreshSqlSnafu)?
+            .context(RefreshSqlSnafu)?;
+            (Some(parsed), schema)
         } else {
-            source_schema
+            (None, source_schema)
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1114,7 +1655,7 @@ impl DataFusion {
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let use_constraints = refresh_sql.is_none();
+        let use_constraints = parsed_refresh_sql.is_none();
 
         let constraints = if use_constraints {
             match &*source_table_provider {
@@ -1124,6 +1665,13 @@ impl DataFusion {
         } else {
             None
         };
+
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration_settings.engine,
+            &dataset.name.to_string(),
+        )?;
 
         let accelerated_table_provider = self
             .accelerator_engine_registry
@@ -1172,8 +1720,8 @@ impl DataFusion {
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
-        if let Some(sql) = &refresh_sql {
-            refresh = refresh.sql(sql.clone());
+        if let Some(sql) = parsed_refresh_sql {
+            refresh = refresh.refresh_sql(sql);
         }
         if let Some(format) = dataset.time_format {
             refresh = refresh.time_format(format);
@@ -1209,6 +1757,20 @@ impl DataFusion {
         refresh
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
+
+        // Apply initial partition filters before the refresher starts to avoid a race
+        // where the first refresh runs without partition filters.
+        if !initial_partition_filters.is_empty() {
+            use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+            if let Some(ref mut sql) = refresh.sql {
+                sql.set_partition_filters(initial_partition_filters);
+            } else {
+                let mut sql =
+                    RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
+                sql.set_partition_filters(initial_partition_filters);
+                refresh = refresh.refresh_sql(sql);
+            }
+        }
 
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
@@ -1503,6 +2065,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
+        initial_partition_filters: Vec<datafusion_expr::Expr>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -1511,6 +2074,7 @@ impl DataFusion {
                 federated_read_table,
                 secrets,
                 bootstrap_status,
+                initial_partition_filters,
             )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
@@ -1566,7 +2130,7 @@ impl DataFusion {
     pub async fn update_refresh_sql(
         &self,
         dataset_name: TableReference,
-        refresh_sql: Option<String>,
+        refresh_sql: String,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
@@ -1574,30 +2138,49 @@ impl DataFusion {
 
         let refresh_schema = table.schema();
 
-        if let Some(sql) = &refresh_sql {
-            let selected_schema = refresh_sql::validate_refresh_sql(
-                dataset_name.clone(),
-                sql,
-                Arc::clone(&refresh_schema),
-            )
-            .context(RefreshSqlSnafu)?;
-            if selected_schema != refresh_schema {
-                return RefreshSqlSchemaChangeDisallowedSnafu {
-                    dataset_name: Arc::from(dataset_name.to_string()),
-                    selected_columns: Arc::from(
-                        selected_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                    refresh_columns: Arc::from(
-                        refresh_schema.fields().iter().map(|f| f.name()).join(", "),
-                    ),
-                }
-                .fail();
+        let (parsed, selected_schema) = refresh_sql::parse_refresh_sql(
+            dataset_name.clone(),
+            &refresh_sql,
+            Arc::clone(&refresh_schema),
+        )
+        .context(RefreshSqlSnafu)?;
+        if selected_schema != refresh_schema {
+            return RefreshSqlSchemaChangeDisallowedSnafu {
+                dataset_name: Arc::from(dataset_name.to_string()),
+                selected_columns: Arc::from(
+                    selected_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
+                refresh_columns: Arc::from(
+                    refresh_schema.fields().iter().map(|f| f.name()).join(", "),
+                ),
             }
+            .fail();
         }
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table.update_refresh_sql(parsed).await.context(
+                UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Update only the partition filters on an accelerated table's refresh.
+    pub async fn update_partition_filters(
+        &self,
+        dataset_name: TableReference,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<()> {
+        let table = self
+            .get_accelerated_table_provider(&dataset_name.to_string())
+            .await?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
-                .update_refresh_sql(refresh_sql)
+                .update_partition_filters(filters)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -1650,7 +2233,7 @@ impl DataFusion {
 
         let source_table_provider = match dataset.access() {
             AccessMode::Read => federated_table_provider,
-            AccessMode::ReadWrite => source
+            AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
                 .await
                 .ok_or_else(|| {
@@ -1771,7 +2354,12 @@ impl DataFusion {
                 tracing::error!(
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
-                status.update_view(&table, status::ComponentStatus::Error);
+                status.update_view(
+                    &table,
+                    status::ComponentStatus::error_with_message(format!(
+                        "Dependent table {missing_table} does not exist"
+                    )),
+                );
                 return None;
             }
 
@@ -1782,7 +2370,10 @@ impl DataFusion {
                 Ok(tbl) => tbl,
                 Err(e) => {
                     tracing::error!("Failed to create view {table}: {e}");
-                    status.update_view(&table, status::ComponentStatus::Error);
+                    status.update_view(
+                        &table,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                     return None;
                 }
             };
@@ -1798,7 +2389,10 @@ impl DataFusion {
                     }
                     Err(e) => {
                         tracing::error!("Failed to create view {table}: {e}");
-                        status.update_view(&table, status::ComponentStatus::Error);
+                        status.update_view(
+                            &table,
+                            status::ComponentStatus::error_with_message(e.to_string()),
+                        );
                         return None;
                     }
                 }
@@ -1807,7 +2401,10 @@ impl DataFusion {
             // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), tbl_provider) {
                 tracing::error!("Failed to create view {table}: {e}");
-                status.update_view(&table, status::ComponentStatus::Error);
+                status.update_view(
+                    &table,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
                 return None;
             }
             tracing::info!("{}", view_registered_trace(&table, None));
@@ -1835,6 +2432,13 @@ impl DataFusion {
                 })?;
 
         let schema = view_table.schema();
+
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration.engine,
+            &table.to_string(),
+        )?;
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()
@@ -2036,19 +2640,47 @@ impl DataFusion {
         key: &RawCacheKey,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let Some(plans_cache) = self.plans_cache_provider() else {
-            return session.create_logical_plan(sql).await;
-        };
+        let plans_cache = self.plans_cache_provider();
 
-        if let Some(plan) = plans_cache.get_raw_key(&key.as_u64()).await {
+        if let Some(cache) = plans_cache.as_ref()
+            && let Some(plan) = cache.get_raw_key(&key.as_u64()).await
+        {
             tracing::trace!("using cached plan for {sql}");
             return Ok(plan);
         }
 
-        let plan = session.create_logical_plan(sql).await?;
+        // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning.
+        // This extracts DDL table options, stores them for the analyzer rule,
+        // and returns modified SQL without the WITH clause.
+        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_with_options(
+            sql,
+            &self.ddl_options_store,
+        )?;
+        let (effective_sql, store_key) = match &preprocessed {
+            iceberg_ddl::preprocess::PreprocessResult::Modified {
+                sql: modified,
+                store_key,
+            } => (modified.as_str(), Some(store_key.as_str())),
+            iceberg_ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
+        };
 
-        tracing::trace!("caching plan for {sql}");
-        plans_cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+        let plan = match session.create_logical_plan(effective_sql).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                if let Some(store_key) = store_key {
+                    iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
+                        &self.ddl_options_store,
+                        store_key,
+                    )?;
+                }
+                return Err(e);
+            }
+        };
+
+        if let Some(cache) = plans_cache {
+            tracing::trace!("caching plan for {sql}");
+            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+        }
 
         Ok(plan)
     }
@@ -2801,6 +3433,152 @@ mod tests {
                 ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
+        }
+    }
+
+    mod validate_distributed_engine_tests {
+        use super::super::*;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+            let config = ClusterConfig {
+                role: Some(role),
+                allow_insecure_connections: true,
+                node_advertise_address: Some("127.0.0.1".to_string()),
+                ..ClusterConfig::default()
+            };
+            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
+        }
+
+        fn make_non_distributed_config() -> ResolvedClusterConfig {
+            ResolvedClusterConfig::try_new(ClusterConfig::default())
+                .expect("valid default cluster config")
+        }
+
+        #[test]
+        fn arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn partitioned_arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
+                .expect("partitioned_arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn cayenne_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn sqlite_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Executor);
+            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn postgresql_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn turso_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result =
+                validate_distributed_engine(&config, Engine::PartitionedDuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn table_mode_partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(
+                &config,
+                Engine::TableModePartitionedDuckDB,
+                "my_dataset",
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn any_engine_allowed_in_non_distributed_mode() {
+            let config = make_non_distributed_config();
+            validate_distributed_engine(&config, Engine::DuckDB, "ds")
+                .expect("duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Sqlite, "ds")
+                .expect("sqlite should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
+                .expect("postgresql should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Turso, "ds")
+                .expect("turso should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PartitionedDuckDB, "ds")
+                .expect("partitioned_duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::TableModePartitionedDuckDB, "ds").expect(
+                "table_mode_partitioned_duckdb should be allowed when not in distributed mode",
+            );
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 }

@@ -55,7 +55,7 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("Invalid configuration: {msg}"))]
+    #[snafu(display("Invalid Kafka configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 }
 
@@ -313,7 +313,8 @@ impl DataConnector for Kafka {
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+            refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .map(|(_, schema)| schema)
                 .boxed()
                 .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                     dataconnector: "kafka".to_string(),

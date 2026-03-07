@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(dead_code, clippy::allow_attributes)]
+
 use std::{
     fmt::Display,
     future::Future,
@@ -57,7 +59,6 @@ pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Dur
     assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
 }
 
-#[expect(dead_code)]
 pub(crate) async fn runtime_ready_check_with_timeout_err(
     rt: &Runtime,
     duration: Duration,
@@ -89,7 +90,6 @@ where
 
 /// Returns the duration until the next occurrence of the nearest second.
 /// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
-#[expect(dead_code)]
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
     assert!(
         nearest_second < 60,
@@ -106,7 +106,6 @@ pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Durati
     Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
 }
 
-#[expect(dead_code)]
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
     let mut secrets = runtime::secrets::Secrets::new();
     // Will automatically load `env` as the default
@@ -128,7 +127,6 @@ pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
 
-#[expect(dead_code)]
 pub(crate) async fn run_query(
     rt: &Arc<Runtime>,
     query: &str,
@@ -143,7 +141,6 @@ pub(crate) async fn run_query(
     Ok(results)
 }
 
-#[expect(dead_code)]
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
@@ -151,7 +148,6 @@ pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display,
     Ok(pretty)
 }
 
-#[expect(dead_code)]
 pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,
@@ -226,7 +222,6 @@ struct XaiError {
 /// Verify that a specific model is available from xAI.
 /// This calls the xAI models API directly to check if the model exists.
 /// Returns Ok(()) if the model is available, Err with a descriptive message otherwise.
-#[expect(dead_code)]
 pub(crate) async fn verify_xai_model_available(model_id: &str) -> Result<(), String> {
     let api_key = std::env::var("SPICE_XAI_API_KEY")
         .map_err(|_| "SPICE_XAI_API_KEY environment variable not set".to_string())?;
@@ -268,7 +263,6 @@ pub(crate) async fn verify_xai_model_available(model_id: &str) -> Result<(), Str
 }
 
 /// List all available xAI models
-#[expect(dead_code)]
 pub(crate) async fn list_xai_models() -> Result<Vec<String>, String> {
     let api_key = std::env::var("SPICE_XAI_API_KEY")
         .map_err(|_| "SPICE_XAI_API_KEY environment variable not set".to_string())?;
@@ -308,7 +302,6 @@ pub(crate) async fn list_xai_models() -> Result<Vec<String>, String> {
 }
 
 /// Verify that a specific model is available from `OpenAI`.
-#[expect(dead_code)]
 pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), String> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY")
         .map_err(|_| "SPICE_OPENAI_API_KEY environment variable not set".to_string())?;
@@ -341,7 +334,6 @@ pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), 
 
 /// Anthropic doesn't have a models list API, so we validate using a minimal messages request.
 /// This sends a minimal request to check if the model is accessible.
-#[expect(dead_code)]
 pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(), String> {
     let api_key = std::env::var("SPICE_ANTHROPIC_API_KEY")
         .map_err(|_| "SPICE_ANTHROPIC_API_KEY environment variable not set".to_string())?;
@@ -396,7 +388,6 @@ struct GeminiModelResponse {
 
 /// Verify that a specific model is available from Google Gemini.
 /// This calls the Google Generative AI models API to check if the model exists.
-#[expect(dead_code)]
 pub(crate) async fn verify_google_model_available(model_id: &str) -> Result<(), String> {
     let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
         .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
@@ -436,7 +427,6 @@ pub(crate) async fn verify_google_model_available(model_id: &str) -> Result<(), 
 }
 
 /// List available Google Gemini models
-#[expect(dead_code)]
 pub(crate) async fn list_google_models() -> Result<Vec<String>, String> {
     let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
         .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
@@ -486,7 +476,6 @@ pub(crate) async fn list_google_models() -> Result<Vec<String>, String> {
 /// Since Bedrock uses AWS SDK authentication, we verify by checking if the model ID
 /// matches known Bedrock model patterns.
 /// For runtime verification, the actual health check happens when the model is loaded.
-#[expect(dead_code)]
 pub(crate) fn verify_bedrock_model_available(model_id: &str) -> Result<(), String> {
     // Bedrock model IDs follow specific patterns
     // Examples: amazon.titan-embed-text-v1, anthropic.claude-3-sonnet-20240229-v1:0
@@ -519,7 +508,6 @@ pub(crate) fn verify_bedrock_model_available(model_id: &str) -> Result<(), Strin
 
 /// Verify models from multiple providers in parallel, failing fast if any model is unavailable.
 /// Returns Ok(()) if all models are available, or an error listing all unavailable models.
-#[expect(dead_code)]
 pub(crate) async fn verify_models_available(
     models: &[(&str, &str)], // Vec of (provider, model_id) tuples
 ) -> Result<(), String> {
@@ -557,12 +545,10 @@ pub(crate) async fn verify_models_available(
 }
 
 /// Helper struct for building model verification lists
-#[expect(dead_code)]
 pub struct ModelVerificationBuilder {
     models: Vec<(String, String)>,
 }
 
-#[expect(dead_code)]
 impl ModelVerificationBuilder {
     #[must_use]
     pub fn new() -> Self {

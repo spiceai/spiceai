@@ -45,6 +45,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ));
     }
 
+    // Warn if api_key is set but not connecting to an external instance
+    if args.api_key.is_some() && !args.test_args.common.is_external_instance() {
+        println!("--api-key is only applicable when connecting to an external instance; ignoring");
+    }
+
     // Check if connecting to an external instance or starting a new one
     let (app, mut spiced_instance) = if args.test_args.common.is_external_instance() {
         println!(
@@ -55,7 +60,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         let app = AppBuilder::new(spicepod.name.clone())
             .with_spicepod(spicepod)
             .build();
-        let instance = SpicedInstance::external(&args.test_args.common.spiced_path);
+        let instance = SpicedInstance::external(&args.test_args.common.spiced_path)
+            .with_api_key(args.api_key.clone());
         (app, instance)
     } else {
         let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
@@ -63,9 +69,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         (app, instance)
     };
 
+    println!("Waiting for spiced instance to be ready...");
+
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+
+    println!("spiced instance is ready!");
 
     // Build resource with attributes known upfront, before creating telemetry.
     // This ensures the SdkMeterProvider is created with the correct resource,
@@ -120,6 +130,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         None
     };
 
+    // Create the appropriate query executor based on args
+    let executor = super::create_query_executor(&args.test_args, &spiced_instance).await?;
+
     // warm up run
     println!("Performing warm up");
 
@@ -128,17 +141,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients)
-            .with_distributed_mode(args.test_args.distributed),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
     let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let spiced_instance = warm_up.wait().await?.end()?;
 
@@ -156,17 +167,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients)
-            .with_distributed_mode(args.test_args.distributed),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
@@ -203,9 +212,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let mut test_builder = NotStarted::new()
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
-        .with_disable_caching(args.test_args.disable_caching)
-        .with_http_client(args.test_args.http_clients)
-        .with_distributed_mode(args.test_args.distributed)
+        .with_query_executor(executor)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
 
     // Add streaming metrics sender if exporter is configured
@@ -226,9 +233,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
     let shutdown_token = throughput_test.cancellation_token();
     let test_future = throughput_test.wait();
     tokio::pin!(test_future);

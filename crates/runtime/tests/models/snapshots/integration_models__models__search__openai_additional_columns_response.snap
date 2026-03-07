@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.65,
       "data": {
         "question": "<refined question>"
       },
@@ -18,10 +18,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 6
-      },
-      "score": 0.65
+      }
     },
     {
+      "_score": 0.64,
       "data": {
         "question": "Compare the fractions and write the appropriate sign ('<', '>', or '=') between them:  \n$\\frac{5}{6} \\square \\frac{5}{5}$"
       },
@@ -33,10 +33,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 58
-      },
-      "score": 0.64
+      }
     },
     {
+      "_score": 0.63,
       "data": {
         "question": "Is $\\frac{7 \\text { erasers }}{12 \\text { pencils }}$ an example of a ratio or a rate?"
       },
@@ -48,10 +48,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 543
-      },
-      "score": 0.63
+      }
     },
     {
+      "_score": 0.63,
       "data": {
         "question": "Write the decimal `2.3` in words and then express it as a fraction or mixed number."
       },
@@ -63,8 +63,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 1318
-      },
-      "score": 0.63
+      }
     }
   ]
 }

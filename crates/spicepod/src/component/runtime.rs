@@ -20,7 +20,7 @@ use subtle::ConstantTimeEq;
 
 use super::{
     caching::{Caching, ResultsCache},
-    default_true, is_default, is_default_or_none,
+    default_true, is_default,
 };
 use crate::metric::Metrics;
 use crate::param::Params;
@@ -35,8 +35,6 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[serde(deny_unknown_fields)]
 #[serde(try_from = "RuntimeDeserializer")]
 pub struct Runtime {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
-    pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub caching: Caching,
 
@@ -74,6 +72,10 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
 
+    /// Controls when the runtime is considered ready for the `/v1/ready` endpoint.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ready_state: RuntimeReadyState,
+
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,7 +94,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
-            let duration = fundu::parse_duration(timeout_str)
+            let duration = duration_parse::parse_duration(timeout_str)
                 .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
 
             if duration.is_zero() {
@@ -104,6 +106,21 @@ impl Runtime {
             Ok(None)
         }
     }
+}
+
+/// Controls when the runtime readiness probe reports the runtime as ready.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeReadyState {
+    /// Runtime becomes ready after all registered components have reached `Ready` at least once.
+    #[default]
+    OnLoad,
+    /// Runtime becomes ready once all components have been registered/initialized at least once,
+    /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
+    /// as long as none is `ShuttingDown`.
+    OnRegistration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -241,7 +258,7 @@ impl OtelExporterConfig {
     pub fn push_interval_duration(
         &self,
     ) -> Result<std::time::Duration, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(&self.push_interval).map_err(|e| {
+        let duration = duration_parse::parse_duration(&self.push_interval).map_err(|e| {
             format!(
                 "Failed to parse 'push_interval' value '{}': {e}",
                 self.push_interval
@@ -282,10 +299,24 @@ impl Default for TelemetryConfig {
     }
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Flight {
     pub max_message_size: Option<String>,
+
+    /// Whether to enable rate limiting on Flight `DoPut` (write) requests.
+    /// Defaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.
+    #[serde(default = "default_true")]
+    pub do_put_rate_limit_enabled: bool,
+}
+
+impl Default for Flight {
+    fn default() -> Self {
+        Self {
+            max_message_size: None,
+            do_put_rate_limit_enabled: true,
+        }
+    }
 }
 
 impl Flight {
@@ -406,7 +437,7 @@ impl TaskHistory {
         value: &str,
         field: &str,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(value).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(value).map_err(|e| e.to_string())?;
 
         if duration.as_secs() < TASK_HISTORY_RETENTION_MINIMUM {
             return Err(format!(
@@ -436,7 +467,7 @@ impl TaskHistory {
         };
 
         let duration =
-            fundu::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
+            duration_parse::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -451,8 +482,8 @@ impl TaskHistory {
             return Ok(None);
         };
 
-        let duration =
-            fundu::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(min_plan_duration.as_ref())
+            .map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -664,6 +695,54 @@ pub struct Scheduler {
     /// Optional object store params for the shared cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
+
+    /// Partition management configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_management: Option<PartitionManagement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct PartitionManagement {
+    #[serde(default = "default_partition_management_interval")]
+    pub interval: String,
+
+    #[serde(default = "default_max_assignments_per_cycle")]
+    pub max_assignments_per_cycle: usize,
+
+    #[serde(default = "default_max_partitions_per_executor")]
+    pub max_partitions_per_executor: usize,
+
+    #[serde(default = "default_discovery_timeout")]
+    pub discovery_timeout: String,
+}
+
+fn default_partition_management_interval() -> String {
+    "30s".to_string()
+}
+
+fn default_max_assignments_per_cycle() -> usize {
+    100
+}
+
+fn default_max_partitions_per_executor() -> usize {
+    1000
+}
+
+fn default_discovery_timeout() -> String {
+    "60s".to_string()
+}
+
+impl Default for PartitionManagement {
+    fn default() -> Self {
+        Self {
+            interval: default_partition_management_interval(),
+            max_assignments_per_cycle: default_max_assignments_per_cycle(),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            discovery_timeout: default_discovery_timeout(),
+        }
+    }
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
@@ -671,10 +750,11 @@ pub struct Scheduler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDeserializer {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
+    #[serde(default)]
+    #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub caching: Caching,
+    #[serde(default)]
+    pub caching: Option<Caching>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
     /// If set, the runtime will configure all endpoints to use TLS
@@ -709,6 +789,9 @@ pub struct RuntimeDeserializer {
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
+    /// Controls when the runtime is considered ready for the `/v1/ready` endpoint.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ready_state: RuntimeReadyState,
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -758,9 +841,25 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             (None, None) => None,
         };
 
+        // Convert deprecated runtime.results_cache to runtime.caching.sql_results
+        let caching_was_explicit = deserializer.caching.is_some();
+        let mut caching = deserializer.caching.unwrap_or_default();
+        if let Some(results_cache) = deserializer.results_cache {
+            tracing::warn!(
+                "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
+            );
+            // Only apply the deprecated value if `caching.sql_results` wasn't explicitly set.
+            // When `caching` is absent from YAML, `caching_was_explicit` is false, so we
+            // apply the deprecated value. When `caching` IS in the YAML, we check whether
+            // `sql_results` was also present (non-None) — if so, the new field takes priority.
+            let sql_results_explicit = caching_was_explicit && caching.sql_results.is_some();
+            if !sql_results_explicit {
+                caching.sql_results = Some(results_cache.into());
+            }
+        }
+
         Ok(Runtime {
-            results_cache: deserializer.results_cache,
-            caching: deserializer.caching,
+            caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
             tls: deserializer.tls,
             tracing: deserializer.tracing,
@@ -771,6 +870,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             cors: deserializer.cors,
             flight: deserializer.flight,
             shutdown_timeout: deserializer.shutdown_timeout,
+            ready_state: deserializer.ready_state,
             output_level: deserializer.output_level,
             query: if query == Query::default() {
                 None
@@ -1618,5 +1718,63 @@ mod tests {
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.endpoint, "otel-collector:4317");
         assert_eq!(otel_config.push_interval, "45s");
+    }
+
+    #[test]
+    fn test_results_cache_backward_compat_migration() {
+        // Test that deprecated `results_cache` is migrated to `caching.sql_results`
+        let yaml = r"
+            results_cache:
+                enabled: true
+                item_ttl: 5s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be migrated from results_cache");
+        assert!(sql_results.enabled);
+        assert_eq!(sql_results.item_ttl, Some("5s".to_string()));
+
+        // Test that `caching.sql_results` takes priority over deprecated `results_cache`
+        let yaml = r"
+            results_cache:
+                enabled: false
+                item_ttl: 10s
+            caching:
+                sql_results:
+                    enabled: true
+                    item_ttl: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be present");
+        assert!(
+            sql_results.enabled,
+            "caching.sql_results should take priority"
+        );
+        assert_eq!(sql_results.item_ttl, Some("30s".to_string()));
+    }
+
+    #[test]
+    fn test_runtime_ready_state_default() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.ready_state, RuntimeReadyState::OnLoad);
+    }
+
+    #[test]
+    fn test_runtime_ready_state_on_registration() {
+        let yaml = r"
+            ready_state: on_registration
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.ready_state, RuntimeReadyState::OnRegistration);
     }
 }

@@ -355,6 +355,7 @@ mod tests {
     use runtime_datafusion_index::Index;
 
     use crate::{
+        SEARCH_SCORE_COLUMN_NAME,
         generation::util::append_fields,
         index::{SearchIndex, VectorIndex, VectorScanTableProvider},
     };
@@ -574,7 +575,11 @@ mod tests {
         fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
-                vec![Arc::new(Field::new("score", DataType::Float64, false))],
+                vec![Arc::new(Field::new(
+                    SEARCH_SCORE_COLUMN_NAME,
+                    DataType::Float64,
+                    false,
+                ))],
             );
             Ok(LogicalPlan::TableScan(TableScan::try_new(
                 "explain",
@@ -623,11 +628,7 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        clippy::missing_panics_doc
-    )]
+    #[expect(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     #[must_use]
     pub fn default_value_array(dt: &DataType) -> ArrayRef {
         match dt {
@@ -671,7 +672,6 @@ mod tests {
     }
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
-    #[expect(clippy::missing_panics_doc)]
     #[must_use]
     pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema

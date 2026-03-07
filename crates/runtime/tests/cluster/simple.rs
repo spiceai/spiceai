@@ -16,7 +16,7 @@ limitations under the License.
 
 use app::AppBuilder;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
 use ballista_scheduler::state::executor_manager::ExecutorManager;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -38,6 +38,36 @@ use crate::{
 };
 
 const NAMES_CSV: &str = include_str!("../acceleration/data/names.csv");
+
+/// Replace the temp path in `RecordBatch` string columns before formatting,
+/// so that `pretty_format_batches` produces consistent column widths
+/// regardless of the platform's temp directory path length.
+fn replace_temp_path_in_batches(batches: &[RecordBatch], from: &str, to: &str) -> Vec<RecordBatch> {
+    batches
+        .iter()
+        .map(|batch| {
+            let schema = batch.schema();
+            let new_columns: Vec<ArrayRef> = batch
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    if schema.field(i).data_type() == &arrow::datatypes::DataType::Utf8 {
+                        let str_arr: &StringArray = col.as_string();
+                        let replaced: StringArray = str_arr
+                            .iter()
+                            .map(|v| v.map(|s| s.replace(from, to)))
+                            .collect();
+                        Arc::new(replaced) as ArrayRef
+                    } else {
+                        Arc::clone(col)
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(schema, new_columns).expect("same schema")
+        })
+        .collect()
+}
 
 #[expect(clippy::expect_used)]
 async fn snapshot_names_from_runtime(
@@ -64,21 +94,18 @@ async fn snapshot_names_from_runtime(
         .await
         .expect("collects results");
 
-    let pretty = arrow::util::pretty::pretty_format_batches(&explain_result)
+    let temp_path_suffix = temp_path
+        .as_str()
+        .split_once('/')
+        .expect("should have leading /")
+        .1;
+    let replaced_batches =
+        replace_temp_path_in_batches(&explain_result, temp_path_suffix, "<TEMP_PATH>");
+    let pretty = arrow::util::pretty::pretty_format_batches(&replaced_batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))
         .expect("Should format batches")
         .to_string();
-    insta::assert_snapshot!(
-        format!("explain_{name}"),
-        pretty.replace(
-            temp_path
-                .as_str()
-                .split_once('/')
-                .expect("should have leading /")
-                .1,
-            "<TEMP_PATH>"
-        )
-    );
+    insta::assert_snapshot!(format!("explain_{name}"), pretty);
 
     let result: Vec<RecordBatch> = rt
         .datafusion()
@@ -196,6 +223,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let scheduler_rt = Arc::new(
@@ -253,6 +281,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
 
             let executor_rt = Arc::new(
@@ -325,22 +354,20 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                 .await
                 .expect("should collect results");
 
-            let pretty = arrow::util::pretty::pretty_format_batches(&results)
+            let temp_path_suffix = tempdir
+                .path()
+                .to_string_lossy()
+                .split_once('/')
+                .expect("should have leading /")
+                .1
+                .to_string();
+            let replaced_batches =
+                replace_temp_path_in_batches(&results, &temp_path_suffix, "<TEMP_PATH>");
+            let pretty = arrow::util::pretty::pretty_format_batches(&replaced_batches)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))
                 .expect("Should format batches")
                 .to_string();
-            insta::assert_snapshot!(
-                "explain_simple_cluster_mode_distributed_query",
-                pretty.replace(
-                    tempdir
-                        .path()
-                        .to_string_lossy()
-                        .split_once('/')
-                        .expect("should have leading /")
-                        .1,
-                    "<TEMP_PATH>"
-                )
-            );
+            insta::assert_snapshot!("explain_simple_cluster_mode_distributed_query", pretty);
 
             let query = QueryBuilder::new(
                 "SELECT id, name, age, city, score FROM names ORDER BY id",

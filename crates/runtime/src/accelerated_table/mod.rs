@@ -22,7 +22,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
-use crate::datafusion::error::SpiceExternalError;
+use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
@@ -37,7 +37,6 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::union::UnionExec;
 use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -49,7 +48,7 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
-    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec, wrap_with_filter,
+    schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -76,22 +75,26 @@ pub use snapshots::SnapshotCreationConfig;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to fetch data from the data connector: {}. Ensure the dataset source path and connector configuration are valid, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to refresh dataset from the data connector: {}. Verify the dataset configuration and data connector status, and try again.",
+        format_datafusion_error(source)
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToScanTableProvider { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to apply data update to the accelerated dataset: {}. Ensure the dataset schema is compatible, and try again.",
+        format_datafusion_error(source)
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
@@ -103,7 +106,9 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("Failed to refresh the dataset. {source}"))]
+    #[snafu(display(
+        "Failed to trigger dataset refresh: the refresh worker is no longer running. {source}"
+    ))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
@@ -119,17 +124,21 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table: {source}. Is the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table: {}. Is the 'time_column' parameter correct?",
+        format_datafusion_error(source)
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
 
-    #[snafu(display("Failed to filter update data. {source}"))]
+    #[snafu(display("Failed to filter update data for the accelerated dataset: {source}"))]
     FailedToFilterUpdates { source: ArrowError },
 
-    #[snafu(display("Failed to write data into accelerated table. {source}"))]
+    #[snafu(display(
+        "Failed to write data into the accelerated dataset: {}",
+        format_datafusion_error(source)
+    ))]
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
@@ -159,13 +168,13 @@ pub enum Error {
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Invalid time column format: {source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
-    #[snafu(display("Failed to start refresh task. The task was already started."))]
+    #[snafu(display("Failed to start dataset refresh: the refresh task was already started."))]
     RefreshTaskAlreadyStarted {},
 
-    #[snafu(display("Failed to create RecordBatch: {source}"))]
+    #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
@@ -250,6 +259,7 @@ pub struct AcceleratedTable {
     last_updated_at: Arc<AtomicI64>,
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
+    cluster_role: Option<ClusterRole>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -752,6 +762,9 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let refresh_handle = if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            // Accelerated tables aren't accelerated on scheduler. Immediately ready.
+            self.runtime_status
+                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
             None
         } else {
             refresher.start(acceleration_refresh_mode).await?
@@ -883,6 +896,7 @@ impl Builder {
             in_flight_revalidations,
             last_updated_at,
             batch_write_tx,
+            cluster_role: self.cluster_role,
         })
     }
 }
@@ -990,20 +1004,51 @@ impl AcceleratedTable {
         Arc::clone(&self.synchronized_children)
     }
 
-    pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
+    pub async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
-        refresh.sql.clone_from(&refresh_sql);
+        // Preserve existing partition_filters when updating user SQL
+        let existing_partition_filters = refresh
+            .sql
+            .as_ref()
+            .map(|s| s.partition_filters().to_vec())
+            .unwrap_or_default();
 
-        if !is_spice_internal_dataset(&self.dataset_name) {
-            if let Some(sql_str) = &refresh_sql {
-                tracing::info!("[refresh] Updated refresh SQL for {dataset_name} to {sql_str}");
-            } else {
-                tracing::info!("[refresh] Removed refresh SQL for {dataset_name}");
-            }
+        if !existing_partition_filters.is_empty() {
+            refresh_sql.set_partition_filters(existing_partition_filters);
         }
+        if !is_spice_internal_dataset(&self.dataset_name) {
+            tracing::info!(
+                "[refresh] Updated refresh SQL for {dataset_name} to {}",
+                refresh_sql.display_sql()
+            );
+        }
+        refresh.sql = Some(refresh_sql);
 
+        Ok(())
+    }
+
+    /// Update only the partition filters on the refresh SQL, preserving user SQL parts.
+    pub async fn update_partition_filters(
+        &self,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<()> {
+        let mut refresh = self.refresh_params.write().await;
+        if let Some(ref mut sql) = refresh.sql {
+            sql.set_partition_filters(filters);
+        } else {
+            // No user SQL, but we still need partition filters.
+            // Create a minimal RefreshSQL with All columns and only partition filters.
+            let mut sql = crate::accelerated_table::refresh::RefreshSQL::new(
+                self.dataset_name.clone(),
+                crate::accelerated_table::refresh::RefreshSQLColumns::All,
+                vec![],
+                None,
+            );
+            sql.set_partition_filters(filters);
+            refresh.sql = Some(sql);
+        }
         Ok(())
     }
 
@@ -1100,6 +1145,14 @@ impl TableProvider for AcceleratedTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Check if we're in caching mode
         let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+
+        if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
+            let federated_provider = self.federated.table_provider().await;
+            return federated_provider
+                .scan(state, projection, filters, limit)
+                .await;
+        }
 
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
         if !self.refresher().initial_load_completed() && !is_caching_mode {
@@ -1228,29 +1281,10 @@ impl TableProvider for AcceleratedTable {
             return Ok(accelerated_insert_plan);
         }
 
-        // Duplicate the input into two streams
-        let tee_input: Arc<dyn ExecutionPlan> = Arc::new(TeeExec::new(input, 2));
-
-        // Slice the duplicated stream by partition to get separate streams for the accelerated & federated inserts.
-        let accelerated_input = Arc::new(SliceExec::new(Arc::clone(&tee_input), 0));
-        let accelerated_insert_plan = self
-            .accelerator
-            .insert_into(state, accelerated_input, overwrite)
-            .await?;
-
-        let federated_input = Arc::new(SliceExec::new(tee_input, 1));
+        // Writes go to the federated source. The acceleration refresh
+        // mechanism will pick up the new data on its next cycle.
         let federated_table = self.federated.table_provider().await;
-        let federated_insert_plan = federated_table
-            .insert_into(state, federated_input, overwrite)
-            .await?;
-
-        // Return the equivalent of a UNION ALL that inserts both into the acceleration and federated source tables.
-        let union_plan: Arc<dyn ExecutionPlan> =
-            UnionExec::try_new(vec![accelerated_insert_plan, federated_insert_plan])?;
-
-        self.refresher().set_initial_load_completed(true);
-
-        Ok(union_plan)
+        federated_table.insert_into(state, input, overwrite).await
     }
 }
 

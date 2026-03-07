@@ -27,6 +27,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
+use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
@@ -34,12 +35,17 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::{
+    accelerated_table::AcceleratedTable,
+    cluster::{PartitionManager, partition::executor_selection},
+};
+#[cfg(not(windows))]
+use cayenne::CayenneTableProvider;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to send metrics request to executor {executor_id}: channel closed"))]
+    #[snafu(display("Failed to send control message to executor {executor_id}"))]
     SendFailed { executor_id: String },
 
     #[snafu(display("Failed to receive metrics response from executor {executor_id}: {reason}"))]
@@ -123,7 +129,7 @@ pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 /// - Register executors when they connect via control stream
 /// - Unregister executors when they disconnect
 /// - Request metrics from all connected executors
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
@@ -134,17 +140,27 @@ pub struct ExecutorRegistry {
 
     /// Map of `executor_id` -> table partitions for that executor
     pub partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
+
+    /// Manager for partition metadata. Used to validate partition completeness
+    /// and optimize executor selection. If None, fallback to legacy behavior.
+    partition_manager: Arc<PartitionManager>,
 }
 
 impl ExecutorRegistry {
     /// Creates a new executor registry.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(partition_manager: Arc<PartitionManager>) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
             partitions: Arc::new(RwLock::new(HashMap::new())),
+            partition_manager,
         }
+    }
+
+    #[must_use]
+    pub fn partition_manager(&self) -> Arc<PartitionManager> {
+        Arc::clone(&self.partition_manager)
     }
 
     /// Registers an executor connection.
@@ -182,6 +198,29 @@ impl ExecutorRegistry {
     pub async fn connected_executors(&self) -> Vec<String> {
         let connections = self.connections.read().await;
         connections.keys().cloned().collect()
+    }
+
+    /// Sends a control message to a specific executor.
+    pub async fn send_command(
+        &self,
+        executor_id: &str,
+        command: SchedulerControlMessage,
+    ) -> Result<()> {
+        let connections = self.connections.read().await;
+
+        if let Some(connection) = connections.get(executor_id) {
+            let tx = connection.request_tx.clone();
+            drop(connections);
+
+            tx.send(command).await.map_err(|_| Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            })?;
+            Ok(())
+        } else {
+            Err(Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            })
+        }
     }
 
     /// Requests metrics from all connected executors.
@@ -242,56 +281,182 @@ impl ExecutorRegistry {
     }
 }
 
+fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
+    if table_provider
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .is_some()
+    {
+        return true;
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return inner_provider
+            .as_any()
+            .downcast_ref::<AcceleratedTable>()
+            .is_some();
+    }
+
+    false
+}
+
+fn flight_sql_table_provider(
+    executor_id: &str,
+    client: FlightSqlClient,
+    table: &TableReference,
+    schema: SchemaRef,
+) -> Arc<dyn TableProvider> {
+    Arc::new(FlightSQLTable::create_with_schema(
+        "flightsql",
+        executor_id,
+        client,
+        table.clone(),
+        schema,
+        Arc::new(CookieStore::new()),
+    )) as Arc<dyn TableProvider>
+}
+
 impl TablePartitionProvider for ExecutorRegistry {
-    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
+    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables and Cayenne tables.
     fn should_partition(&self, tbl: &TableScan) -> bool {
         let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
             return false;
         };
-        default
+
+        if is_accelerated_table_provider(&default.table_provider) {
+            return true;
+        }
+
+        #[cfg(not(windows))]
+        if default
             .table_provider
             .as_any()
-            .downcast_ref::<AcceleratedTable>()
+            .downcast_ref::<CayenneTableProvider>()
             .is_some()
+        {
+            return true;
+        }
+
+        false
     }
 
+    /// Enhanced implementation with partition completeness validation and executor optimization.
+    /// - Validates all required partitions are assigned to executors
+    /// - Selects minimal set of executors to cover all partitions
+    /// - Returns empty Vec if partitions are missing (causes `EmptyRelation` in analyzer)
     fn get_partitions(
         &self,
         table: &TableReference,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
-        let Ok(partitions) = self.partitions.try_read() else {
-            tracing::warn!(
-                "For table {table:?}, failed to acquire read lock on ExecutorRegistry partitions"
-            );
-            return Vec::new();
-        };
-
         let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!(
-                "For table {table:?}, failed to acquire read lock on ExecutorRegistry flight_sql_clients"
-            );
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
             return Vec::new();
         };
 
-        partitions
+        // Get partition metadata from manager (async call, requires runtime)
+        let Some(table_metadata) = self.partition_manager.get_cached_table_metadata(table) else {
+            // Non-partitioned accelerated tables don't register partition assignments.
+            // Route to a single executor to avoid duplicate results in multi-executor clusters.
+            let Some((executor_id, client)) = flight_sql_clients
+                .iter()
+                .min_by(|(lhs_id, _), (rhs_id, _)| lhs_id.cmp(rhs_id))
+            else {
+                tracing::warn!(
+                    "For non-partitioned accelerated table {table:?}, no connected executors with FlightSQL clients were found"
+                );
+                return Vec::new();
+            };
+
+            tracing::debug!(
+                "No partition assignments found for accelerated table {table:?}; routing query to executor '{executor_id}'"
+            );
+
+            return vec![(
+                flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
+                Vec::new(),
+            )];
+        };
+
+        // Build set of all required partitions (for now, all partitions in table)
+        // Future: filter based on query predicates
+        let required_partitions: Vec<HashMap<String, String>> = table_metadata
+            .partitions
             .iter()
-            .filter_map(|(executor_id, table_map)| {
+            .map(|p| p.partition_value.clone())
+            .collect();
+
+        if required_partitions.is_empty() {
+            tracing::debug!("No partitions required for table {table}");
+            return Vec::new();
+        }
+
+        // Build map of executor -> partitions from metadata
+        let mut executor_partition_map: std::collections::HashMap<String, Vec<_>> =
+            std::collections::HashMap::new();
+
+        for partition_meta in &table_metadata.partitions {
+            for executor_id in &partition_meta.assigned_executors {
+                executor_partition_map
+                    .entry(executor_id.clone())
+                    .or_default()
+                    .push(partition_meta.partition_value.clone());
+            }
+        }
+
+        // Select minimal set of executors to cover all partitions
+        let selected_executors = match executor_selection::select_executors(
+            &required_partitions,
+            &executor_partition_map,
+        ) {
+            Ok(executors) => executors,
+            Err(executor_selection::Error::MissingPartitions(missing)) => {
+                tracing::error!(
+                    "Cannot execute query on table {}: {} partition(s) not assigned to any executor. Missing partitions: {:?}",
+                    table,
+                    missing.len(),
+                    missing.iter().take(5).collect::<Vec<_>>() // Show first 5 missing partitions
+                );
+                // TODO: return DataFusionError from this trait instead.
+                return Vec::new(); // Empty Vec causes EmptyRelation in rewrite rule
+            }
+        };
+
+        tracing::debug!(
+            "Selected {} executor(s) from {} available for table {} (covering {} partition(s))",
+            selected_executors.len(),
+            executor_partition_map.len(),
+            table,
+            required_partitions.len()
+        );
+
+        // Build result using only selected executors
+        let Ok(executor_partitions) = self.partitions.try_read() else {
+            tracing::warn!("Failed to acquire read lock on partitions");
+            return Vec::new();
+        };
+
+        selected_executors
+            .into_iter()
+            .filter_map(|executor_id| {
+                // Get partition expressions for this executor
+                let table_map = executor_partitions.get(&executor_id)?;
                 let parts = table_map.get(table)?;
-                let Some(client) = flight_sql_clients.get(executor_id) else {
-                    tracing::warn!(
-                        "Executor '{executor_id}' registered with partitions for table {table:?}, but no FlightSQL client found."
-                    );
-                    return None;
-                };
+
+                // Get FlightSQL client for this executor
+                let client = flight_sql_clients.get(&executor_id)?;
+
                 let table_provider = Arc::new(FlightSQLTable::create_with_schema(
                     "flightsql",
-                    executor_id,
+                    &executor_id,
                     client.clone(),
                     table.clone(),
-                    Arc::clone(&schema),
+                    Arc::clone(schema),
                     Arc::new(CookieStore::new()),
-
                 )) as Arc<dyn TableProvider>;
 
                 Some((table_provider, parts.clone()))
@@ -302,11 +467,14 @@ impl TablePartitionProvider for ExecutorRegistry {
 
 #[cfg(test)]
 mod tests {
+    use object_store::memory::InMemory;
+
     use super::*;
 
     #[tokio::test]
     async fn test_register_unregister() {
-        let registry = ExecutorRegistry::new();
+        let registry =
+            ExecutorRegistry::new(Arc::new(PartitionManager::new(Arc::new(InMemory::new()))));
         let (tx, _rx) = mpsc::channel(1);
 
         registry.register("executor-1".to_string(), tx).await;
@@ -322,7 +490,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconnect_replaces_connection() {
-        let registry = ExecutorRegistry::new();
+        let registry =
+            ExecutorRegistry::new(Arc::new(PartitionManager::new(Arc::new(InMemory::new()))));
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
 
@@ -335,7 +504,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_metrics_empty_registry() {
-        let registry = ExecutorRegistry::new();
+        let registry =
+            ExecutorRegistry::new(Arc::new(PartitionManager::new(Arc::new(InMemory::new()))));
         let result = registry.request_metrics_from_all().await;
         assert!(result.is_ok());
         assert!(result.expect("should succeed").is_empty());
@@ -343,7 +513,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_executors() {
-        let registry = ExecutorRegistry::new();
+        let registry =
+            ExecutorRegistry::new(Arc::new(PartitionManager::new(Arc::new(InMemory::new()))));
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
@@ -370,7 +541,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_unregister_nonexistent() {
-        let registry = ExecutorRegistry::new();
+        let registry =
+            ExecutorRegistry::new(Arc::new(PartitionManager::new(Arc::new(InMemory::new()))));
         let (tx, _rx) = mpsc::channel(1);
 
         registry.register("executor-1".to_string(), tx).await;

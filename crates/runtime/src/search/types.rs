@@ -48,6 +48,7 @@ pub struct Match {
     primary_key: HashMap<String, Value>,
 
     /// The similarity of the match to the query
+    #[serde(rename = "_score")]
     score: f64,
 
     /// The name of the dataset where the match was found

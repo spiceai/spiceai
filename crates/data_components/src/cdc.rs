@@ -29,7 +29,7 @@ pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>
 
 #[derive(Debug, Snafu)]
 pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
+    #[snafu(display("Failed to commit CDC change to dataset: {source}"))]
     UnableToCommitChange {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -39,7 +39,7 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    #[snafu(display("Failed to process change data capture update: {source}"))]
     Arrow { source: ArrowError },
 }
 

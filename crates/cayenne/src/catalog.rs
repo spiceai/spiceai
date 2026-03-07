@@ -179,6 +179,15 @@ pub enum CatalogError {
         /// Description of why the partition metadata is invalid
         message: String,
     },
+
+    #[snafu(display("Table '{table_name}' already exists with different configuration. Delete the acceleration, and try again."))]
+    ChangedConfiguration { table_name: String },
+
+    #[snafu(display("Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"))]
+    InvalidMetadata {
+        table_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Result type for catalog operations.
@@ -198,6 +207,9 @@ pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 pub trait MetadataCatalog: Send + Sync {
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
+
+    /// List all table names in the catalog.
+    async fn list_table_names(&self) -> CatalogResult<Vec<String>>;
 
     /// Create a new table.
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<i64>;

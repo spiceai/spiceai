@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
+use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -66,8 +66,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
@@ -80,10 +79,10 @@ impl Runtime {
 
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         // All Cayenne datasets sharing the same metadata directory must have the same
@@ -159,8 +158,12 @@ impl Runtime {
                     path_table_ref,
                     path_table_ref
                 );
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(format!(
+                        "Parent dataset '{path_table_ref}' doesn't exist"
+                    )),
+                );
             }
         }
 
@@ -181,7 +184,7 @@ impl Runtime {
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
-        Arc::clone(&self).load_views(app);
+        Arc::clone(&self).load_views(&app);
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
@@ -235,8 +238,10 @@ impl Runtime {
             Ok(data_connector) => data_connector,
             Err(err) => {
                 let ds_name = &ds.name;
-                self.status
-                    .update_dataset(ds_name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    ds_name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(
                     spaced_tracer,
@@ -286,8 +291,10 @@ impl Runtime {
             let ds_name = &ds.name;
             metrics::datasets::LOAD_ERROR.add(1, &[]);
             error_spaced!(spaced_tracer, "{}{err}", "");
-            self.status
-                .update_dataset(ds_name, status::ComponentStatus::Error);
+            self.status.update_dataset(
+                ds_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
             return;
         }
 
@@ -307,9 +314,10 @@ impl Runtime {
                     }
 
                     let ds_name = &ds.name;
-                    runtime
-                        .status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    runtime.status.update_dataset(
+                        ds_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
@@ -372,8 +380,10 @@ impl Runtime {
                     );
                     federated_table
                 } else {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     if let DataConnectorError::UnsupportedDataType { .. } = err {
                         error_spaced!(spaced_tracer, "{}{err}", "");
@@ -447,8 +457,10 @@ impl Runtime {
                 Ok(())
             }
             Err(err) => {
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: crate::datafusion::Error::RefreshSql { .. },
@@ -543,7 +555,7 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if Arc::clone(&self)
+                if let Err(e) = Arc::clone(&self)
                     .register_loaded_dataset(
                         Arc::clone(&ds),
                         Arc::clone(&connector),
@@ -551,16 +563,19 @@ impl Runtime {
                         BootstrapStatus::None,
                     )
                     .await
-                    .is_err()
                 {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                 }
             }
             Err(e) => {
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
             }
         }
     }
@@ -622,6 +637,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
+                    vec![],
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -743,6 +759,7 @@ impl Runtime {
 
         // Apply partition filters if assigned (Executor mode)
         let mut ds = ds;
+        let mut initial_partition_filters = vec![];
         // Only apply partition logic if the dataset is configured for partitioning
         if ds
             .acceleration
@@ -751,22 +768,17 @@ impl Runtime {
             && let Some(assignments) = self.partition_assignments()
         {
             let assignments = assignments.read().await;
-            let mut ds_mod = (*ds).clone();
-            if let Some(new_sql) = update_partitioning_filter_in_refresh_sql(
-                ds.acceleration
-                    .as_ref()
-                    .and_then(|acc| acc.refresh_sql.as_deref()),
-                &ds.name,
-                &assignments,
-            )
-            .context(crate::UnableToConvertPartitionExprSnafu)?
-            {
+            let partition_filters = get_partition_filter_exprs(&ds.name, &assignments);
+            if !partition_filters.is_empty() {
                 tracing::debug!(
-                    "For table={}, adding filters to refresh_sql for assigned partitions. New refresh_sql={new_sql}",
+                    "For table={}, extracted {} partition filter(s) for assigned partitions.",
                     ds.name,
+                    partition_filters.len(),
                 );
+                initial_partition_filters = partition_filters;
+                // Clear partition_by and convert engine to unpartitioned
+                let mut ds_mod = (*ds).clone();
                 if let Some(acc) = ds_mod.acceleration.as_mut() {
-                    acc.refresh_sql = Some(new_sql);
                     acc.partition_by = vec![];
                     acc.engine = acc.engine.to_unpartitioned();
                 }
@@ -818,6 +830,7 @@ impl Runtime {
                     accelerated_table,
                     secrets: self.secrets(),
                     bootstrap_status,
+                    initial_partition_filters,
                 },
             )
             .await
@@ -959,7 +972,10 @@ impl Runtime {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        status.update_dataset(
+                            ds_name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         return (ds.name.clone(), Err(err));
@@ -979,7 +995,10 @@ impl Runtime {
                     }
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        status.update_dataset(
+                            ds_name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         (ds.name.clone(), Err(err))

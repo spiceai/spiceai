@@ -59,11 +59,13 @@ hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
 iceberg = { workspace = true, features = ["storage-gcs", "storage-s3"] }
+parquet = { workspace = true }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
+mysql_async = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
@@ -99,7 +101,7 @@ tracing.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 zip = "7.2.0"
 tokio-stream.workspace = true
@@ -137,6 +139,7 @@ kafka = ["dep:rdkafka"]
 mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
+    "dep:mysql_async",
     "datafusion-table-providers/mysql",
     "datafusion-table-providers/mysql-federation",
 ]

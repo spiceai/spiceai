@@ -21,7 +21,6 @@ use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::{DFSchema, exec_err};
-use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
@@ -42,6 +41,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
@@ -57,6 +57,7 @@ use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
+use util::format_datafusion_error;
 
 use crate::Read;
 
@@ -75,7 +76,8 @@ pub enum Error {
     DeltaCheckpointError { source: delta_kernel::Error },
 
     #[snafu(display(
-        "Failed to plan or execute a Delta Lake table due to the following error: {source}"
+        "Failed to plan or execute a Delta Lake table due to the following error: {}",
+        format_datafusion_error(source)
     ))]
     DeltaTableExecutionError { source: DataFusionError },
 
@@ -196,18 +198,10 @@ impl DeltaTable {
         };
 
         let engine = match table_object_store {
-            Some(object_store) => Arc::new(DefaultEngine::new(
-                object_store.into(),
-                Arc::new(TokioBackgroundExecutor::default()),
+            Some(object_store) => Arc::new(DefaultEngine::new(object_store.into())),
+            None => Arc::new(DefaultEngine::new(
+                store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
             )),
-            None => Arc::new(
-                DefaultEngine::try_new(
-                    &table_url,
-                    storage_options,
-                    Arc::new(TokioBackgroundExecutor::default()),
-                )
-                .map_err(handle_delta_error)?,
-            ),
         };
 
         let snapshot = Snapshot::builder_for(table_url.clone())
@@ -301,7 +295,11 @@ impl DeltaTable {
                 })
                 .collect::<Vec<_>>()
         });
-        let parquet_source = ParquetSource::new(TableParquetOptions::default())
+        let table_schema = datafusion_datasource::TableSchema::new(
+            Arc::clone(schema),
+            partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
+        );
+        let parquet_source = ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
@@ -314,15 +312,12 @@ impl DeltaTable {
         ))
         .context(DeltaTableExecutionSnafu)?;
 
-        let file_scan_config_builder = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::clone(schema),
-            Arc::new(parquet_source),
-        )
-        .with_limit(limit)
-        .with_projection_indices(new_projections)
-        .with_table_partition_cols(partition_cols.to_vec())
-        .with_file_group(FileGroup::new(partitioned_files.to_vec()));
+        let file_scan_config_builder =
+            FileScanConfigBuilder::new(object_store_url, Arc::new(parquet_source))
+                .with_limit(limit)
+                .with_projection_indices(new_projections)
+                .context(DeltaTableExecutionSnafu)?
+                .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 
         Ok(DataSourceExec::from_data_source(
             file_scan_config_builder.build(),

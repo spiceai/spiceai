@@ -8,7 +8,9 @@ use snafu::prelude::*;
 pub enum Error {
     #[snafu(display("Nested arrays or objects are not supported as parameter values"))]
     NestedValues,
-    #[snafu(display("Unsupported JSON number format"))]
+    #[snafu(display(
+        "Unsupported JSON number format in query parameter. Use integers or floating point values."
+    ))]
     UnsupportedJsonNumberFormat,
     #[snafu(display("Parameters must be a JSON array or an object"))]
     JsonArrayOrObjectRequired,

@@ -18,12 +18,18 @@ limitations under the License.
 //!
 //! Uses `SpiceTest` from test-framework to run TPCH queries with validation,
 //! collecting per-query metrics (timing, status, row counts).
+//!
+//! Expected results are generated at runtime using `DuckDB`'s `dbgen` extension
+//! at the target scale factor, so verification works for any SF (not just SF=1).
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
+use duckdb::Connection;
 use test_framework::TestType;
-use test_framework::anyhow::Result;
+use test_framework::anyhow::{Context, Result};
+use test_framework::execution::FlightExecutor;
 use test_framework::metrics::{
     DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus,
 };
@@ -36,10 +42,6 @@ use test_framework::spicetest::datasets::{EndCondition, NotStarted};
 pub struct VerificationResult {
     /// The `SpicedInstance` (returned for continued use)
     pub spiced_instance: SpicedInstance,
-    /// Per-query metrics collected during verification
-    pub metrics: QueryMetrics<DatasetMetrics, NoExtendedMetrics>,
-    /// Row counts per query
-    pub row_counts: BTreeMap<Arc<str>, usize>,
     /// Whether all queries passed
     pub all_passed: bool,
 }
@@ -62,6 +64,7 @@ pub async fn run_verification(
     config_name: &str,
     iterations: usize,
     scale_factor: f64,
+    with_explain_plan_snapshot: bool,
 ) -> Result<VerificationResult> {
     println!("\n{}", "=".repeat(60));
     println!("Starting TPCH Query Verification (SpiceTest)");
@@ -82,7 +85,22 @@ pub async fn run_verification(
         iterations
     );
 
-    // Create SpiceTest state
+    // Generate expected results at runtime using DuckDB for the target scale factor
+    let validation_data = generate_expected_results(scale_factor, &queries)?;
+    println!(
+        "Generated expected results for {} queries at SF={scale_factor}",
+        validation_data.len()
+    );
+
+    // Create query executor for running queries against the spiced instance
+    let spice_client = spiced_instance
+        .spice_client(None, false)
+        .await
+        .context("Failed to create Flight client for query verification")?;
+    let executor: Box<dyn test_framework::execution::QueryExecutor> =
+        Box::new(FlightExecutor::new(Arc::new(spice_client)));
+
+    // Create SpiceTest state with runtime-generated validation data
     let state = NotStarted::new()
         .with_parallel_count(1)
         .with_query_set(queries)
@@ -90,20 +108,23 @@ pub async fn run_verification(
         .with_validate(true)
         .with_scale_factor(scale_factor)
         .with_query_set_type(QuerySet::Tpch)
-        .with_query_overrides(Some(QueryOverrides::DynamoDB));
+        .with_query_overrides(Some(QueryOverrides::DynamoDB))
+        .with_validation_data(validation_data)
+        .with_query_executor(executor);
 
     // Create and run SpiceTest (name differentiates snapshots per config)
-    let test = SpiceTest::new(format!("streaming_{config_name}"), state)
+    let mut test = SpiceTest::new(format!("streaming_{config_name}"), state)
         .with_spiced_instance(spiced_instance)
-        .with_progress_bars(false)
-        .with_explain_plan_snapshot()
-        .start()
-        .await?
-        .wait()
-        .await?;
+        .with_progress_bars(false);
+
+    if with_explain_plan_snapshot {
+        test = test.with_explain_plan_snapshot();
+    }
+
+    let test = test.start()?.wait().await?;
 
     // Collect metrics
-    let row_counts = test.validate_returned_row_counts()?;
+    let _row_counts = test.validate_returned_row_counts()?;
     let all_passed = test.succeeded();
     let metrics: QueryMetrics<DatasetMetrics, NoExtendedMetrics> =
         test.collect(TestType::Streaming)?;
@@ -138,8 +159,100 @@ pub async fn run_verification(
 
     Ok(VerificationResult {
         spiced_instance,
-        metrics,
-        row_counts,
         all_passed,
     })
+}
+
+/// Generate expected TPC-H query results at the given scale factor using `DuckDB`.
+///
+/// Creates an in-memory `DuckDB` database, generates TPC-H data with `dbgen`,
+/// then runs each query to produce the expected `RecordBatch` results.
+fn generate_expected_results(
+    scale_factor: f64,
+    queries: &[Query],
+) -> Result<HashMap<Arc<str>, Vec<RecordBatch>>> {
+    println!("Generating expected TPC-H results at SF={scale_factor} using DuckDB...");
+
+    let conn =
+        Connection::open_in_memory().context("Failed to open in-memory DuckDB connection")?;
+
+    conn.execute_batch("INSTALL tpch; LOAD tpch;")
+        .context("Failed to load TPC-H extension")?;
+
+    conn.execute_batch(&format!("CALL dbgen(sf={scale_factor});"))
+        .context("Failed to generate TPC-H data")?;
+
+    // Recreate tables with Decimal→DOUBLE casts to match streaming dataset types.
+    // Dates are kept as native DATE (not VARCHAR) so TPC-H date comparisons
+    // and arithmetic (e.g., `l_shipdate >= date '1994-01-01'`) work correctly.
+    // The Date32↔Utf8 type difference is handled by `datatype_equivalent`.
+    conn.execute_batch(
+        "CREATE OR REPLACE TABLE lineitem AS SELECT
+            l_orderkey, l_partkey, l_suppkey, l_linenumber,
+            CAST(l_quantity AS BIGINT) AS l_quantity,
+            CAST(l_extendedprice AS DOUBLE) AS l_extendedprice,
+            CAST(l_discount AS DOUBLE) AS l_discount,
+            CAST(l_tax AS DOUBLE) AS l_tax,
+            l_returnflag, l_linestatus,
+            l_shipdate, l_commitdate, l_receiptdate,
+            l_shipinstruct, l_shipmode, l_comment
+        FROM lineitem;
+
+        CREATE OR REPLACE TABLE orders AS SELECT
+            o_orderkey, o_custkey, o_orderstatus,
+            CAST(o_totalprice AS DOUBLE) AS o_totalprice,
+            o_orderdate,
+            o_orderpriority, o_clerk, o_shippriority, o_comment
+        FROM orders;
+
+        CREATE OR REPLACE TABLE customer AS SELECT
+            c_custkey, c_name, c_address, c_nationkey, c_phone,
+            CAST(c_acctbal AS DOUBLE) AS c_acctbal,
+            c_mktsegment, c_comment
+        FROM customer;
+
+        CREATE OR REPLACE TABLE supplier AS SELECT
+            s_suppkey, s_name, s_address, s_nationkey, s_phone,
+            CAST(s_acctbal AS DOUBLE) AS s_acctbal,
+            s_comment
+        FROM supplier;
+
+        CREATE OR REPLACE TABLE part AS SELECT
+            p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container,
+            CAST(p_retailprice AS DOUBLE) AS p_retailprice,
+            p_comment
+        FROM part;
+
+        CREATE OR REPLACE TABLE partsupp AS SELECT
+            ps_partkey, ps_suppkey, ps_availqty,
+            CAST(ps_supplycost AS DOUBLE) AS ps_supplycost,
+            ps_comment
+        FROM partsupp;",
+    )
+    .context("Failed to recreate TPC-H tables with streaming-compatible types")?;
+
+    let mut validation_data = HashMap::new();
+
+    for query in queries {
+        let sql = query.to_sql_with_inlined_params();
+
+        match conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_arrow([]) {
+                Ok(arrow_result) => {
+                    let batches: Vec<RecordBatch> = arrow_result.collect();
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    println!("  {}: {row_count} rows", query.name);
+                    validation_data.insert(Arc::clone(&query.name), batches);
+                }
+                Err(e) => {
+                    eprintln!("  Warning: Failed to execute {}: {e}", query.name);
+                }
+            },
+            Err(e) => {
+                eprintln!("  Warning: Failed to prepare {}: {e}", query.name);
+            }
+        }
+    }
+
+    Ok(validation_data)
 }

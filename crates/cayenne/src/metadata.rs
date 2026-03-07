@@ -228,7 +228,7 @@ impl PartitionMetadata {
 }
 
 /// Which compression strategy to use for the Vortex layout.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionStrategy {
     /// Uses the default Vortex Btrblocks compression.
     #[default]
@@ -240,9 +240,13 @@ pub enum CompressionStrategy {
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
-    /// Footer cache size in MB
+    /// Footer cache size in MB.
+    ///
+    /// Currently ignored in Spice.ai `2.0.0-unstable`.
     pub footer_cache_mb: usize,
-    /// Segment cache size in MB
+    /// Segment cache size in MB.
+    ///
+    /// Currently ignored in Spice.ai `2.0.0-unstable`.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows

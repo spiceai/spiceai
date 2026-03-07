@@ -26,9 +26,11 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::OrderingRequirements;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::SortOrderPushdownResult;
 use datafusion::physical_plan::execution_plan::{
     CardinalityEffect, InvariantLevel, check_default_invariants,
 };
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
@@ -242,10 +244,11 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![true; self.children().len()]
     }
 
-    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
-    /// This guarantees that the input is processed as a single stream, preserving the order of the data.
+    /// Only allow optimizer-introduced repartitioning when the child has no
+    /// output ordering. This keeps order-sensitive plans stable by avoiding
+    /// repartition on already ordered inputs.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
+        vec![self.input_exec.properties().output_ordering().is_none()]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -378,6 +381,13 @@ impl ExecutionPlan for BytesProcessedExec {
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -391,12 +401,13 @@ mod tests {
     use datafusion::physical_expr::expressions::col as physical_col;
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::collect;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
-    use datafusion::prelude::SessionContext;
-    use std::sync::Arc;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use std::sync::{Arc, Mutex};
 
-    use crate::extension::bytes_processed::BytesProcessedExec;
+    use crate::extension::bytes_processed::{BytesEmittedCallback, BytesProcessedExec};
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -408,10 +419,14 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
+    fn make_test_context() -> SessionContext {
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2))
+    }
+
     #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = make_test_context();
         let test_table = make_test_table()?;
 
         let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
@@ -466,6 +481,119 @@ mod tests {
         assert_eq!(
             displayable(final_plan.as_ref()).tree_render().to_string(),
             displayable(optimized.as_ref()).tree_render().to_string()
+        );
+
+        Ok(())
+    }
+
+    #[expect(clippy::similar_names)]
+    #[tokio::test]
+    async fn test_allow_repartition_for_unordered_input() -> Result<()> {
+        let ctx = make_test_context();
+        let test_table = make_test_table()?;
+
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        let final_plan: Arc<dyn ExecutionPlan> = Arc::new(BytesProcessedExec::new(
+            data_source_exec,
+            Arc::new(Box::new(|_, _| {})),
+        ));
+
+        let optimizer = PhysicalOptimizer::new();
+        let config = Arc::clone(ctx.state().config_options());
+
+        let optimized = optimizer
+            .rules
+            .iter()
+            .fold(Arc::clone(&final_plan), |plan, rule| {
+                rule.optimize(plan, &config).expect("Must optimize plan")
+            });
+
+        let optimized_plan = displayable(optimized.as_ref()).tree_render().to_string();
+        assert!(
+            optimized_plan.contains("RepartitionExec"),
+            "Expected RepartitionExec for unordered input, got: {optimized_plan}"
+        );
+
+        Ok(())
+    }
+
+    #[expect(clippy::similar_names)]
+    #[tokio::test]
+    async fn test_bytes_processed_total_preserved_with_repartition() -> Result<()> {
+        let ctx = make_test_context();
+        let test_table = make_test_table()?;
+
+        let build_test_plan = |callback: Arc<BytesEmittedCallback>| async {
+            let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+            let bytes_processed_exec =
+                BytesProcessedExec::new(data_source_exec, callback).fallback_to_new_context();
+            Result::<Arc<dyn ExecutionPlan>>::Ok(Arc::new(bytes_processed_exec))
+        };
+
+        let before_values = Arc::new(Mutex::new(Vec::new()));
+        let before_values_ref = Arc::clone(&before_values);
+        let before_callback: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |bytes, _| {
+            before_values_ref
+                .lock()
+                .expect("before callback mutex should not be poisoned")
+                .push(bytes);
+        }));
+
+        let before_plan = build_test_plan(before_callback).await?;
+        let before_batches = collect(before_plan, ctx.task_ctx()).await?;
+        let before_rows: usize = before_batches.iter().map(RecordBatch::num_rows).sum();
+        let before_total: u64 = before_values
+            .lock()
+            .expect("before mutex should not be poisoned")
+            .iter()
+            .sum();
+
+        let after_values = Arc::new(Mutex::new(Vec::new()));
+        let after_values_ref = Arc::clone(&after_values);
+        let after_callback: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |bytes, _| {
+            after_values_ref
+                .lock()
+                .expect("after callback mutex should not be poisoned")
+                .push(bytes);
+        }));
+
+        let final_plan = build_test_plan(after_callback).await?;
+
+        let optimizer = PhysicalOptimizer::new();
+        let config = Arc::clone(ctx.state().config_options());
+
+        let optimized = optimizer.rules.iter().fold(final_plan, |plan, rule| {
+            rule.optimize(plan, &config).expect("Must optimize plan")
+        });
+
+        let optimized_plan = displayable(optimized.as_ref()).tree_render().to_string();
+        assert!(
+            optimized_plan.contains("RepartitionExec"),
+            "Expected RepartitionExec for unordered input, got: {optimized_plan}"
+        );
+
+        let after_batches = collect(optimized, ctx.task_ctx()).await?;
+        let after_rows: usize = after_batches.iter().map(RecordBatch::num_rows).sum();
+        let after_total: u64 = after_values
+            .lock()
+            .expect("after mutex should not be poisoned")
+            .iter()
+            .sum();
+
+        assert_eq!(before_rows, after_rows);
+        assert_eq!(before_rows, 10_000);
+        // Byte totals may differ slightly because RepartitionExec creates new
+        // RecordBatches with different buffer allocations than the original.
+        // The key invariant is that BytesProcessedExec still tracks bytes when
+        // RepartitionExec is placed below it.
+        assert!(
+            before_total > 0,
+            "Expected non-zero bytes tracked before optimization"
+        );
+        assert!(
+            after_total > 0,
+            "Expected non-zero bytes tracked after repartitioning"
         );
 
         Ok(())

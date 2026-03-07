@@ -45,13 +45,16 @@ use std::{
     time::Duration,
 };
 use token_provider::TokenProvider;
-use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+use util::{
+    fibonacci_backoff::{Backoff, FibonacciBackoffBuilder},
+    format_datafusion_error,
+};
 
 mod datatypes;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Not implemented"))]
+    #[snafu(display("This Databricks SQL Warehouse operation is not implemented"))]
     NotImplemented,
 
     #[snafu(display("HTTP client build failed: {source}"))]
@@ -95,7 +98,7 @@ pub enum Error {
     #[snafu(display("Failed to read Arrow stream: {source}"))]
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
 
-    #[snafu(display("Failed to create table provider: {source}"))]
+    #[snafu(display("Failed to create table provider: {}", format_datafusion_error(source)))]
     TableProviderCreationFailed { source: DataFusionError },
 
     #[snafu(display("Failed to initialize SQL table: {source}"))]

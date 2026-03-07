@@ -87,8 +87,10 @@ async fn setup_int64_pk_table(
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     Ok((table, ctx, schema))
@@ -102,7 +104,7 @@ async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> 
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
@@ -458,7 +460,10 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -478,13 +483,13 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
     // Reopen the table
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
     let table2 = Arc::new(
-        CayenneTableProviderBuilder::new(catalog)
+        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
             .open(table_name)
             .await?,
     );
 
-    let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
     // Verify deletions persisted

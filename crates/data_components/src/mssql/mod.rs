@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod provider;
+
 use async_trait::async_trait;
 use connection_manager::SqlServerConnectionPool;
 use convert::{map_column_type_to_arrow_type, map_type_name_to_column_type};
@@ -31,6 +33,7 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
+use util::format_datafusion_error;
 
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
@@ -39,36 +42,41 @@ mod execution_plan;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error executing query: {source}"))]
+    #[snafu(display("Failed to execute query on SQL Server: {source}"))]
     QueryError { source: tiberius::error::Error },
 
-    #[snafu(display("Unable to connect: {source}"))]
+    #[snafu(display("Failed to connect to SQL Server: {source}"))]
     SqlServerAccessError { source: tiberius::error::Error },
 
-    #[snafu(display("Unable to connect: {source}"))]
+    #[snafu(display("Failed to connect to SQL Server: {source}"))]
     ConnectionPoolError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to retrieve table schema"))]
+    #[snafu(display("Failed to retrieve table schema from SQL Server"))]
     SchemaRetrieval,
 
-    #[snafu(display("Unable to retrieve schema: table '{table}' does not exist"))]
+    #[snafu(display(
+        "Unable to retrieve schema: table '{table}' does not exist in the SQL Server database"
+    ))]
     SchemaRetrievalTableNotFound { table: String },
 
-    #[snafu(display("Unsupported data type: {data_type}"))]
+    #[snafu(display("Unsupported SQL Server data type: {data_type}"))]
     UnsupportedType { data_type: String },
 
-    #[snafu(display("Failed to build record batch: {source}"))]
+    #[snafu(display("Failed to process SQL Server query result: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
-    #[snafu(display("No builder found for index {index}"))]
+    #[snafu(display("Failed to process SQL Server query result: no column at index {index}"))]
     NoBuilderForIndex { index: usize },
 
-    #[snafu(display("Failed to downcast builder for {mssql_type}"))]
+    #[snafu(display("Failed to process SQL Server query result: unsupported type '{mssql_type}'"))]
     FailedToDowncastBuilder { mssql_type: String },
 
-    #[snafu(display("Unable to generate SQL: {source}"))]
+    #[snafu(display(
+        "Failed to generate SQL for SQL Server query: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGenerateSQL { source: DataFusionError },
 }
 
@@ -244,9 +252,9 @@ fn is_time_related_expr(expr: &Expr) -> bool {
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }
-        Expr::ScalarVariable(dara_type, _) => {
+        Expr::ScalarVariable(field, _) => {
             matches!(
-                dara_type,
+                field.data_type(),
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }

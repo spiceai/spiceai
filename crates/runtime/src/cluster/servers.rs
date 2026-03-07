@@ -16,13 +16,17 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use super::composite_flight_service::CompositeFlightService;
+use crate::auth::EndpointAuth;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
-use crate::flight::{Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error};
+use crate::flight::{
+    Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error, session_auth,
+};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
+use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -107,9 +111,6 @@ pub async fn start_internal_cluster_server(
         })
         .unwrap_or_else(|| bind_address.to_string());
 
-    // Get partition manager if available (scheduler only)
-    let partition_manager = rt.partition_manager();
-
     // Use the shared executor stream registry if available (created during scheduler init).
     // This allows the scheduler callback to broadcast PollNow to connected executors.
     let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {
@@ -121,7 +122,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
-            partition_manager,
             executor_streams,
         )
     } else {
@@ -133,7 +133,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
-            partition_manager,
         )
     };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
@@ -175,9 +174,20 @@ pub async fn start_internal_cluster_server(
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
+    endpoint_auth: EndpointAuth,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
     let tls_config = rt.df.cluster_config.tls_config();
+    let has_flight_auth = endpoint_auth.flight_basic_auth.is_some();
+
+    // In executor mode, never allow unauthenticated Flight DoPut without mTLS.
+    // Scheduler-trusted forwarding mode requires authenticated scheduler identity via mTLS.
+    if !has_flight_auth && tls_config.is_none() {
+        return Err(Error::InsecureConfiguration {
+            message: "Executor Flight server requires either API key auth or cluster mTLS. Configure endpoint auth or enable mTLS for scheduler-trusted forwarding.".to_string(),
+        });
+    }
+
     let mut server = Server::builder();
 
     if let Some(tls_config) = tls_config {
@@ -195,26 +205,44 @@ pub async fn start_executor_flight_server(
         );
     }
 
+    if !has_flight_auth {
+        tracing::warn!(
+            "Executor Flight API key auth is disabled; accepting scheduler-trusted DoPut requires cluster mTLS"
+        );
+    }
+
     // Create composite Flight service that handles both Ballista and Spice protocols
-    let spice_service = SpiceFlightService::new(None);
+    let spice_service =
+        SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
     let session_store = spice_service.session_store();
     let composite_service = CompositeFlightService::new(spice_service);
 
     // Get app for request context
     let app = rt.app.read().await.as_ref().map(Arc::clone);
 
+    // Wrap the auth in session-awareness to accept session IDs as bearer tokens
+    let session_aware_auth = session_auth::with_session_awareness(
+        endpoint_auth.flight_basic_auth,
+        session_store.clone(),
+    );
+    let auth_layer = tower::ServiceBuilder::new()
+        .layer(BasicAuthLayer::new(session_aware_auth))
+        .into_inner();
+
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();
 
-    // Add middleware layers for request context and rate limiting
+    // Add middleware layers for request context, auth, and rate limiting
     let mut server = server
         .layer(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
-        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
-            RateLimits::default().flight_write_limit,
-        )));
+        .layer(auth_layer)
+        .layer(WriteRateLimitLayer::new(
+            RateLimiter::direct(RateLimits::default().flight_write_limit),
+            true,
+        ));
 
     let server = server.add_service(
         arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)

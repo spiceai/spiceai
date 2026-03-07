@@ -26,7 +26,6 @@ use crate::cluster::partition::metadata::PartitionValue;
 
 use super::metadata::{PartitionMetadata, TablePartitionMetadata};
 
-#[expect(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
@@ -36,10 +35,13 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to get current time: {source}"))]
-    TimeError { source: std::time::SystemTimeError },
+    SystemTime { source: std::time::SystemTimeError },
 
     #[snafu(display("Partition {partition} not found in table {table}"))]
     PartitionNotFound { table: String, partition: String },
+
+    #[snafu(display("No partition metadata found for table {table}"))]
+    TableMetadataNotFound { table: String },
 
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
@@ -53,6 +55,7 @@ static PARTITION_PREFIX: &str = "accelerations/partitions/";
 ///
 /// Uses optimistic concurrency control to safely coordinate partition assignments
 /// across multiple schedulers without locks.
+#[derive(Debug)]
 pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
 }
@@ -152,13 +155,10 @@ impl PartitionManager {
 
         loop {
             let now_ms = now_ms()?;
-            let mut metadata =
-                self.get_table_metadata(table)
-                    .await?
-                    .ok_or_else(|| Error::PartitionNotFound {
-                        table: key.clone(),
-                        partition: "any".to_string(),
-                    })?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut allocated: Vec<_> = metadata
                 .partitions
@@ -205,6 +205,57 @@ impl PartitionManager {
         }
     }
 
+    /// Assigns a partition to an executor in the metadata store.
+    pub async fn assign_partition(
+        &self,
+        table: &TableReference,
+        partition_value: &PartitionValue,
+        executor_id: &str,
+    ) -> Result<()> {
+        let key = table.to_string();
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(Some(5))
+            .build();
+
+        loop {
+            let now_ms = now_ms()?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
+
+            let mut updated = false;
+            for partition in &mut metadata.partitions {
+                if partition.partition_value == *partition_value {
+                    partition.assign_to(executor_id.to_string(), now_ms);
+                    updated = true;
+                    break;
+                }
+            }
+
+            if !updated {
+                return Err(Error::PartitionNotFound {
+                    table: key.clone(),
+                    partition: format!("{partition_value:?}"),
+                });
+            }
+
+            metadata.updated_at = now_ms;
+
+            match self.write_metadata(&key, metadata).await {
+                Ok(()) => return Ok(()),
+                Err(Error::ConcurrentModification { .. }) => {
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(Error::ConcurrentModification { table: key.clone() });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// List all tables with partition metadata.
     pub async fn list_tables(&self) -> Result<Vec<String>> {
         self.state.list_keys().await.context(MetadataAccessSnafu {
@@ -220,7 +271,11 @@ impl PartitionManager {
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.
-    async fn write_metadata(&self, key: &str, metadata: TablePartitionMetadata) -> Result<()> {
+    pub(crate) async fn write_metadata(
+        &self,
+        key: &str,
+        metadata: TablePartitionMetadata,
+    ) -> Result<()> {
         match self
             .state
             .insert_or_update(key, &metadata)
@@ -241,5 +296,5 @@ fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
-        .map_err(|source| Error::TimeError { source })
+        .context(SystemTimeSnafu)
 }

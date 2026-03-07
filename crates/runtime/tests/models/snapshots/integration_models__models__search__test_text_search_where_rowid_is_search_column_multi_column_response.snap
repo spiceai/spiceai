@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.01,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -15,10 +15,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs",
       "matches": {
         "question": [
@@ -27,10 +27,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\)."
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -39,8 +39,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
-      },
-      "score": 0.01
+      }
     }
   ]
 }

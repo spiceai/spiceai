@@ -38,18 +38,18 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create data connector"))]
+    #[snafu(display("Internal table does not support read-write mode"))]
     NoReadWriteProvider {},
 
-    #[snafu(display("Unable to create data connector"))]
+    #[snafu(display("Failed to create internal data connector: {source}"))]
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
-    #[snafu(display("Unable to create source table provider"))]
+    #[snafu(display("Failed to create source for internal table: {source}"))]
     UnableToCreateSourceTableProvider { source: DataConnectorError },
 
-    #[snafu(display("Unable to create accelerated table provider: {source}"))]
+    #[snafu(display("Failed to create accelerated storage for internal table: {source}"))]
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
 
     #[snafu(display(
@@ -60,7 +60,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to build accelerated table: {source}"))]
+    #[snafu(display("Failed to build accelerated internal table: {source}"))]
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
     },
@@ -156,6 +156,7 @@ pub async fn create_internal_accelerated_table(
         runtime.tokio_io_runtime(),
     );
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
+    builder.write_to_accelerator_only();
 
     builder.retention(retention);
 

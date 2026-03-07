@@ -61,7 +61,7 @@ pub fn spawn_snapshot_interval_task(
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
-    _bootstrap_status: crate::dataaccelerator::BootstrapStatus,
+    bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -79,21 +79,20 @@ pub fn spawn_snapshot_interval_task(
         runtime_status.wait_for_ready().await;
 
         // Determine the initial delay based on last checkpoint time
-        let initial_delay = match checkpointer.last_checkpoint_time().await {
-            Ok(Some(last_checkpoint)) => {
-                let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
-                if elapsed >= interval_duration {
-                    // Enough time has passed, create snapshot immediately
-                    Duration::ZERO
-                } else {
-                    // Wait until interval_duration has passed since last checkpoint
-                    interval_duration - elapsed
+        let initial_delay = if bootstrap_status.is_bootstrapped() {
+            match checkpointer.last_checkpoint_time().await {
+                Ok(Some(last_checkpoint)) => {
+                    let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
+                    if elapsed >= interval_duration {
+                        Duration::ZERO
+                    } else {
+                        interval_duration - elapsed
+                    }
                 }
+                Ok(None) | Err(_) => Duration::ZERO,
             }
-            Ok(None) | Err(_) => {
-                // No previous checkpoint or error getting it, create immediately
-                Duration::ZERO
-            }
+        } else {
+            Duration::ZERO
         };
 
         if !initial_delay.is_zero() {

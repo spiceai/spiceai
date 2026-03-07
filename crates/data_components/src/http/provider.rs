@@ -54,7 +54,7 @@ use std::{
 use tokio::sync::RwLock;
 use url::Url;
 use util::{
-    RetryError, retry,
+    RetryError, format_datafusion_error, retry,
     retry_strategy::{BackoffMethod, RetryBackoff, RetryBackoffBuilder},
 };
 
@@ -77,10 +77,10 @@ pub enum Error {
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
 
-    #[snafu(display("Arrow error: {source}"))]
+    #[snafu(display("Failed to process HTTP response data: {source}"))]
     Arrow { source: ArrowError },
 
-    #[snafu(display("DataFusion error: {source}"))]
+    #[snafu(display("Failed to execute HTTP query: {}", format_datafusion_error(source)))]
     DataFusion { source: DataFusionError },
 
     #[snafu(display("Filter rejected: {message}"))]

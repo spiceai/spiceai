@@ -14,19 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
+use crate::Error::{self, FailedToStartClusterExecutor};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
-use crate::cluster::partition::executor_request_initial_partitions;
+use crate::cluster::partition::{
+    executor_request_initial_partitions,
+    scheduler_task::{PartitionManagementConfig, PartitionManagementTask},
+};
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
-    CLUSTER_INTERNAL_SERVER, CLUSTER_SCHEDULER_REGISTRY, FailedToStartClusterExecutorSnafu,
+    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_MANAGEMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
+    FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
 use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::TableReference;
 use app::App;
@@ -39,7 +44,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -54,6 +59,7 @@ use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+use futures::future::try_join_all;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
@@ -90,7 +96,7 @@ pub enum DistributedNode {
         executor_registry: Arc<ExecutorRegistry>,
 
         /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<RwLock<Option<Arc<PartitionManager>>>>,
+        partition_manager: Arc<PartitionManager>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -113,8 +119,9 @@ impl DistributedNode {
     }
 }
 
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+type SchedulerEndpointOverride = Arc<
+    dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+>;
 
 struct SchedulerPollHandle {
     cancel: CancellationToken,
@@ -177,8 +184,10 @@ fn spawn_scheduler_poll_loop(
                 SchedulerConnectionState::NeedsEndpoint => {
                     let endpoint_url =
                         normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
-                    let scheduler_endpoint = match create_grpc_client_endpoint(endpoint_url.clone())
-                    {
+                    let scheduler_endpoint = match create_grpc_client_endpoint(
+                        endpoint_url.clone(),
+                        Some(&GrpcClientConfig::default()),
+                    ) {
                         Ok(endpoint) => endpoint,
                         Err(err) => {
                             tracing::warn!(
@@ -390,7 +399,7 @@ fn update_scheduler_pollers(
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-mod executor_registry;
+pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
 mod scheduler_registry;
@@ -750,15 +759,13 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
     rt.df
         .bind_scheduler_server(Arc::new(scheduler))
-        .map_err(|e| FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
+        .boxed()
+        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.df
         .bind_executor_stream_registry(executor_stream_registry)
-        .map_err(|e| FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
+        .boxed()
+        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
@@ -777,84 +784,123 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     let cloned_shutdown = internal_server_shutdown.clone();
     let internal_server_rt = Arc::clone(rt);
     let internal_server_peers = Arc::clone(&scheduler_peers);
+    let scheduler_executor_registry_clone = Arc::clone(&scheduler_executor_registry);
     let internal_server_fut = async move {
         start_internal_cluster_server(
             internal_server_rt,
             Some(cloned_shutdown),
-            Arc::clone(&scheduler_executor_registry),
+            scheduler_executor_registry_clone,
             internal_server_peers,
         )
         .await
         .context(UnableToStartClusterServerSnafu)
     };
     let self_for_task = Arc::clone(rt);
-    let internal_server_future = self_for_task
-        .start_runtime_task(
-            CLUSTER_INTERNAL_SERVER,
-            Some(internal_server_shutdown),
-            internal_server_fut,
-        )
-        .await;
+    #[expect(clippy::type_complexity)]
+    let mut futures: Vec<Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>> =
+        vec![Box::pin(
+            self_for_task
+                .start_runtime_task(
+                    CLUSTER_INTERNAL_SERVER,
+                    Some(internal_server_shutdown),
+                    internal_server_fut,
+                )
+                .await,
+        )];
 
-    let scheduler_registry_future = {
-        let app = rt.app.read().await;
-        let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
-        if let Some(config) = config {
-            // Initialize partition manager with the configured object store
-            match partition::build_partition_metadata_store(rt, &config).await {
-                Ok(store) => {
-                    let partition_manager = Arc::new(PartitionManager::new(store));
-                    rt.set_partition_manager(Arc::clone(&partition_manager))
-                        .await;
+    let Some(app) = rt.read_app().await else {
+        tracing::warn!(
+            "No app found in runtime during cluster scheduler initialization; skipping scheduler registry and partition manager setup"
+        );
+        return Ok(None);
+    };
 
-                    // Initialize partition metadata for all accelerated tables
-                    if let Err(err) =
-                        partition::initialize_partition_metadata(rt, &partition_manager).await
-                    {
-                        tracing::warn!(
-                            "Failed to initialize partition metadata during scheduler startup: {err}"
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("Failed to build partition metadata store: {err}");
-                }
+    if let Some(config) = app.runtime.scheduler.clone() {
+        if let Some(partition_manager) = rt.partition_manager() {
+            // Initialize partition metadata for all accelerated tables
+            if let Err(err) = partition::initialize_partition_metadata(
+                rt.datafusion(),
+                Arc::clone(&app),
+                &partition_manager,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to initialize partition metadata during scheduler startup: {err}"
+                );
             }
 
-            let registry_shutdown = CancellationToken::new();
-            let registry_shutdown_for_task = registry_shutdown.clone();
-            let peers = Arc::clone(&scheduler_peers);
-            let self_ref = Arc::clone(rt);
-            let registry_task = async move {
-                start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)
-                    .await
-                    .map_err(|err| crate::Error::FailedToRegisterScheduler {
-                        source: Box::new(err),
-                    })
+            // Start partition management task
+            let pm_shutdown = CancellationToken::new();
+            let pm_config = match config
+                .partition_management
+                .clone()
+                .map(PartitionManagementConfig::try_from)
+            {
+                Some(Ok(cfg)) => cfg,
+                None => PartitionManagementConfig::default(),
+                Some(Err(err)) => {
+                    tracing::warn!(
+                        "Failed to parse partition management config, partition management task will not be started: {err}"
+                    );
+                    return Ok(None);
+                }
             };
-            Some(
+            // Register partition_metadata as Initializing so `/v1/ready`
+            // waits for metadata seeding to complete before reporting ready.
+            rt.status
+                .update_component_status("partition_metadata", ComponentStatus::Initializing);
+
+            let pm_task = PartitionManagementTask::new(
+                rt.app(),
+                rt.datafusion(),
+                Arc::clone(&partition_manager),
+                Arc::clone(&scheduler_executor_registry),
+                Arc::clone(&rt.status),
+                pm_config,
+                pm_shutdown.clone(),
+            );
+
+            futures.push(Box::pin(
                 self_for_task
                     .start_runtime_task(
-                        CLUSTER_SCHEDULER_REGISTRY,
-                        Some(registry_shutdown_for_task),
-                        registry_task,
+                        CLUSTER_PARTITION_MANAGEMENT_TASK,
+                        Some(pm_shutdown),
+                        async move {
+                            pm_task
+                                .run()
+                                .await
+                                .boxed()
+                                .context(FailedToRegisterSchedulerSnafu)
+                        },
                     )
                     .await,
+            ));
+        }
+
+        let registry_shutdown = CancellationToken::new();
+        let registry_shutdown_for_task = registry_shutdown.clone();
+        let peers = Arc::clone(&scheduler_peers);
+        let self_ref = Arc::clone(rt);
+        let scheduler_registry_fut = self_for_task
+            .start_runtime_task(
+                CLUSTER_SCHEDULER_REGISTRY,
+                Some(registry_shutdown_for_task),
+                async move {
+                    start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)
+                        .await
+                        .map_err(|err| crate::Error::FailedToRegisterScheduler {
+                            source: Box::new(err),
+                        })
+                },
             )
-        } else {
-            None
-        }
-    };
+            .await;
+        futures.push(Box::pin(scheduler_registry_fut));
+    }
 
-    let cluster_future = async move {
-        if let Some(registry_future) = scheduler_registry_future {
-            tokio::try_join!(internal_server_future, registry_future).map(|_| ())
-        } else {
-            internal_server_future.await
-        }
-    };
-
-    Ok(Some(Box::pin(cluster_future)))
+    Ok(Some(Box::pin(async move {
+        try_join_all(futures).await.map(|_| ())
+    })))
 }
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
@@ -1153,6 +1199,17 @@ pub async fn initialize_cluster_executor(
     let control_stream_metrics_reader = rt.metrics_reader().cloned();
     let shutdown_token_for_manager = shutdown_token.clone();
 
+    let partition_update_handler_rt = Arc::clone(&rt);
+    let partition_update_handler: Option<
+        crate::cluster::control_stream_client::PartitionUpdateHandler,
+    > = Some(Arc::new(move |new_partitions, removed_partitions| {
+        let rt = Arc::clone(&partition_update_handler_rt);
+        Box::pin(async move {
+            rt.update_partition_assignments(new_partitions, removed_partitions)
+                .await;
+        })
+    }));
+
     // Thread to handle:
     //  - periodic refresh of scheduler membership
     //  - spawning/stopping scheduler poll loops as membership changes
@@ -1167,6 +1224,7 @@ pub async fn initialize_cluster_executor(
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
+            partition_update_handler,
             Some(Arc::clone(&executor_for_manager)),
         );
 
@@ -1258,6 +1316,7 @@ pub async fn initialize_cluster_executor(
         let initial_partitions = executor_request_initial_partitions(
             cluster_client.clone(),
             rt.datafusion().cluster_config.node_advertise_url(),
+            rt.datafusion().ctx.as_ref(),
         )
         .await
         .map_err(|status| FailedToStartClusterExecutor {
@@ -1340,9 +1399,13 @@ async fn create_scheduler_server(
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
-    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
-        .clone()
-        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
+        client_tls_config.clone().map(|tls_config| {
+            Arc::new(move |ep: Endpoint| {
+                ep.tls_config(tls_config.clone())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }) as _
+        });
 
     // Convert shuffle_format param to ballista ShuffleFormat
     #[cfg(feature = "vortex")]
@@ -1489,13 +1552,25 @@ async fn create_scheduler_server(
                 cfg = cfg.with_ballista_shuffle_storage_url(storage_url);
             }
 
-            Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
-                    .with_config(cfg)
-                    .with_runtime_env(default_runtime_env(io_runtime.clone()))
-                    .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
-                    .build(),
-            )
+            // Filter out PartitionedTableScanRewrite from analyzer rules.
+            // That rule rewrites TableScans into UNION ALL of FlightSQL partitions
+            // for sync query distribution; Ballista handles distribution natively
+            // for async queries, and FlightSqlExec has no codec support.
+            let spice_state = current_context.as_ref().state();
+            let distributed_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = spice_state
+                .analyzer()
+                .rules
+                .iter()
+                .filter(|r| r.name() != "PartitionedTableScanRewrite")
+                .map(Arc::clone)
+                .collect();
+
+            Ok(SessionStateBuilder::new_from_existing(spice_state)
+                .with_config(cfg)
+                .with_runtime_env(default_runtime_env(io_runtime.clone()))
+                .with_analyzer_rules(distributed_analyzer_rules)
+                .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
+                .build())
         });
 
     // Create config_producer that dynamically sets target_partitions based on cluster capacity
@@ -1549,6 +1624,10 @@ async fn create_scheduler_server(
 
         // Faster failure detection: 30s timeout with 10s heartbeat interval
         executor_timeout_seconds: 30,
+
+        // The Spice executor uses pull-based polling (execution_loop::poll_loop),
+        // so the scheduler must use PullStaged to register executors via PollWork RPCs.
+        scheduling_policy: ballista_core::config::TaskSchedulingPolicy::PullStaged,
         ..Default::default()
     };
 

@@ -21,7 +21,7 @@ use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
 use crate::output::TableOutput;
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use snafu::ensure;
 use std::collections::HashMap;
 
@@ -29,7 +29,7 @@ use std::collections::HashMap;
 const SUPPORTED_TRACE_TASKS: &[&str] = &[
     "ai",
     "ai_chat",
-    "accelerated_refresh",
+    "acceleration_refresh",
     "ai_completion",
     "eval_run",
     "nsql",
@@ -52,6 +52,8 @@ pub enum OutputFormat {
     /// Display results as a table (default)
     #[default]
     Table,
+    /// Output results as pretty-printed JSON
+    Json,
     /// Output the SQL query that would be executed
     Sql,
 }
@@ -91,12 +93,12 @@ pub struct TraceArgs {
     pub truncate: Option<usize>,
 
     /// Output format
-    #[arg(long, value_enum, default_value = "table")]
+    #[arg(long, short = 'o', value_enum, default_value = "table")]
     pub output: OutputFormat,
 }
 
 /// Task history record from the runtime.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TaskHistory {
     trace_id: String,
     span_id: String,
@@ -158,6 +160,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &TraceArgs) -> Result<()> {
     if traces.is_empty() {
         eprintln!("Error: No events found");
         return Ok(());
+    }
+
+    // JSON output: emit raw trace records
+    if matches!(args.output, OutputFormat::Json) {
+        return crate::output::write_json(&traces);
     }
 
     // Build tree and display

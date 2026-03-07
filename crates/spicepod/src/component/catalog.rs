@@ -74,6 +74,12 @@ impl Catalog {
             metrics: None,
         }
     }
+
+    #[must_use]
+    pub fn with_access(mut self, access: AccessMode) -> Self {
+        self.access = access;
+        self
+    }
 }
 
 impl WithDependsOn<Catalog> for Catalog {

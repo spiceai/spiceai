@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
+arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
@@ -38,7 +39,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 url.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 uuid = { version = "1", features = ["v7"] }
 
 [features]

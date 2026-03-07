@@ -19,8 +19,11 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 mod list_models;
+mod responses;
 
 pub use list_models::XaiModelLister;
+
+use std::sync::Arc;
 
 use async_openai::{
     Client,
@@ -34,12 +37,14 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
+use runtime_rate_control::RateController;
 use serde_json::json;
 
 use crate::chat::{
     Chat, Error,
     nsql::{SqlGeneration, json::JsonSchemaSqlGeneration},
 };
+use crate::openai::default_rate_controller;
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 static DEFAULT_MODEL: &str = "grok-3";
@@ -48,6 +53,7 @@ static DEFAULT_MODEL: &str = "grok-3";
 pub struct Xai {
     pub model: String, // Xai model
     pub client: Client<OpenAIConfig>,
+    pub rate_controller: Arc<RateController>,
 }
 
 impl Xai {
@@ -60,6 +66,7 @@ impl Xai {
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
             client: Client::with_config(cfg),
+            rate_controller: default_rate_controller(),
         }
     }
 
@@ -143,12 +150,19 @@ impl Chat for Xai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
         let stream = self
             .client
             .chat()
             .create_stream(self.alter_request(req))
             .await?;
 
+        drop(permit);
         Ok(Box::pin(stream))
     }
 
@@ -156,6 +170,15 @@ impl Chat for Xai {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        self.client.chat().create(self.alter_request(req)).await
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+        let resp = self.client.chat().create(self.alter_request(req)).await?;
+
+        drop(permit);
+        Ok(resp)
     }
 }

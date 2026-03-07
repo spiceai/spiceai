@@ -71,7 +71,7 @@ mod handshake;
 mod metrics;
 pub mod middleware;
 mod session;
-mod session_auth;
+pub(crate) mod session_auth;
 mod util;
 
 pub use session::SessionStore;
@@ -210,7 +210,16 @@ impl Service {
     ) -> Result<(Schema, Option<Schema>), Status> {
         let query = QueryBuilder::new(sql, datafusion).build();
 
-        query.get_schema().await.map_err(handle_datafusion_error)
+        let (dataset_schema, parameter_schema) =
+            query.get_schema().await.map_err(handle_datafusion_error)?;
+
+        // The logical plan may report Utf8View/BinaryView, but the physical
+        // execution (with `expand_views_at_output = true`) will produce
+        // LargeUtf8/LargeBinary.  Align the advertised schema so that
+        // `get_flight_info` and `do_get` are consistent.
+        let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
+
+        Ok((dataset_schema, parameter_schema))
     }
 
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
@@ -405,6 +414,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
         | DataFusionError::ParquetError(_)
         | DataFusionError::Substrait(_)
         | DataFusionError::Configuration(_)
+        | DataFusionError::Ffi(_)
         | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
     }
 }
@@ -533,10 +543,11 @@ pub async fn start(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
-        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
-            rate_limits.flight_write_limit,
-        )))
-        .layer(auth_layer);
+        .layer(auth_layer)
+        .layer(WriteRateLimitLayer::new(
+            RateLimiter::direct(rate_limits.flight_write_limit),
+            rate_limits.flight_write_enabled,
+        ));
 
     let server = server
         .add_service(spice_flight_service)
@@ -568,6 +579,9 @@ pub async fn start(
 
 pub struct RateLimits {
     pub flight_write_limit: Quota,
+    /// Whether write rate limiting is enabled. When `false`, the rate limiter
+    /// layer is still present but the check function always succeeds.
+    pub flight_write_enabled: bool,
 }
 
 impl RateLimits {
@@ -581,6 +595,12 @@ impl RateLimits {
         self.flight_write_limit = rate_limit;
         self
     }
+
+    #[must_use]
+    pub fn with_flight_write_enabled(mut self, enabled: bool) -> Self {
+        self.flight_write_enabled = enabled;
+        self
+    }
 }
 
 impl Default for RateLimits {
@@ -590,6 +610,7 @@ impl Default for RateLimits {
             flight_write_limit: Quota::per_minute(
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
+            flight_write_enabled: true,
         }
     }
 }
