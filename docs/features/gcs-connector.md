@@ -92,22 +92,22 @@ datasets:
 
 ## Parameters
 
-| Parameter                             | Type    | Default | Description                                                          |
-| ------------------------------------- | ------- | ------- | -------------------------------------------------------------------- |
-| `gcs_service_account_path`            | string  | none    | Path to a GCS service account JSON key file                          |
-| `gcs_service_account_key`             | string  | none    | GCS service account JSON key as a string                             |
-| `gcs_application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set |
-| `gcs_skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                       |
-| `allow_http`                          | boolean | `false` | Allow insecure HTTP connections                                      |
-| `gcs_max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                        |
-| `gcs_retry_timeout`                   | string  | *       | Retry timeout duration                                               |
-| `gcs_backoff_initial_duration`        | string  | *       | Initial backoff duration                                             |
-| `gcs_backoff_max_duration`            | string  | *       | Maximum backoff duration                                             |
-| `gcs_backoff_base`                    | float   | *       | Base of the exponential backoff                                      |
-| `client_timeout`                      | string  | none    | Timeout for GCS client operations                                    |
-| `file_format`                         | string  | none    | File format: `parquet`, `csv`, `json`, `jsonl`                       |
-| `json_format`                         | string  | none    | JSON sub-format when `file_format` is `json`: `json` or `ndjson`     |
-| `hive_partitioning_enabled`           | boolean | `false` | Enable Hive-style partitioning                                       |
+| Parameter                             | Type    | Default | Description                                                                           |
+| ------------------------------------- | ------- | ------- | ------------------------------------------------------------------------------------- |
+| `gcs_service_account_path`            | string  | none    | Path to a GCS service account JSON key file                                           |
+| `gcs_service_account_key`             | string  | none    | GCS service account JSON key as a string                                              |
+| `gcs_application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set                  |
+| `gcs_skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                                        |
+| `allow_http`                          | boolean | `false` | Allow insecure HTTP connections                                                       |
+| `gcs_max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                                         |
+| `gcs_retry_timeout`                   | string  | *       | Retry timeout duration                                                                |
+| `gcs_backoff_initial_duration`        | string  | *       | Initial backoff duration                                                              |
+| `gcs_backoff_max_duration`            | string  | *       | Maximum backoff duration                                                              |
+| `gcs_backoff_base`                    | float   | *       | Base of the exponential backoff                                                       |
+| `client_timeout`                      | string  | none    | Timeout for GCS client operations                                                     |
+| `file_format`                         | string  | none    | File format: `parquet`, `csv`, `json`, `jsonl`                                        |
+| `json_format`                         | string  | `jsonl` | JSON sub-format when `file_format` is `json`: `jsonl`, `ndjson`, `ldjson`, or `array` |
+| `hive_partitioning_enabled`           | boolean | `false` | Enable Hive-style partitioning                                                        |
 
 \* Retry/backoff parameters use `object_store` crate defaults when not specified.
 
@@ -137,7 +137,7 @@ datasets:
 
 ### JSON / NDJSON
 
-For JSON data, use `file_format: json`. For newline-delimited JSON, set the `json_format` parameter:
+For JSON data, use `file_format: json`. By default, `json_format` is `jsonl` (JSON Lines). Supported values: `jsonl`, `ndjson`, `ldjson` (all newline-delimited), or `array` (JSON array format):
 
 ```yaml
 datasets:

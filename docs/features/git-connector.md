@@ -54,13 +54,13 @@ datasets:
 
 ### Parameters
 
-| Parameter        | Type    | Default     | Description                                                                                                            |
-| ---------------- | ------- | ----------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `include`        | string  | none        | Glob pattern(s) to filter files. Separate multiple patterns with `;` or `,`                                            |
-| `fetch_content`  | boolean | `false`     | Whether to fetch file content into the `content` column                                                                |
-| `cache_path`     | string  | System temp | Custom path for the local repository cache                                                                             |
-| `max_files`      | integer | `5000`      | Maximum number of files to include (hard cap: 50,000)                                                                  |
-| `max_file_bytes` | integer | `524288`    | Maximum file size in bytes for content fetching (512 KiB default, hard cap: 5 MiB). Files larger than this are skipped |
+| Parameter        | Type    | Default     | Description                                                                                                                                             |
+| ---------------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include`        | string  | none        | Glob pattern(s) to filter files. Separate multiple patterns with `;` or `,`                                                                             |
+| `fetch_content`  | boolean | `false`     | Whether to fetch file content into the `content` column                                                                                                 |
+| `cache_path`     | string  | System temp | Custom path for the local repository cache                                                                                                              |
+| `max_files`      | integer | `5000`      | Maximum number of files to include (hard cap: 50,000)                                                                                                   |
+| `max_file_bytes` | integer | `524288`    | Maximum file size in bytes (512 KiB default, hard cap: 5 MiB). Files larger than this are excluded from results entirely, regardless of `fetch_content` |
 
 ### Example with Parameters
 

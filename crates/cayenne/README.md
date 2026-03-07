@@ -10,7 +10,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 - **Vortex Data Files**: High-performance columnar storage with compression
 - **Deletion Vectors**: Efficient delete tracking using Arrow IPC files, supporting both position-based and key-based deletion
 - **Sequence-Based Ordering**: Iceberg-style sequence numbers for correct delete/insert ordering across snapshots
-- **Partition Support**: File-based partitioning with composite partition keys
+- **Partition Metadata**: File-based partitioning; metadata supports composite partition keys (current public API exposes a single partition column)
 - **Staging WAL**: Crash-safe write-ahead log for in-progress writes
 
 ## Architecture
@@ -33,13 +33,14 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 │  ┌────────────────────────────────────┐  │
 │  │   Vortex Data Lake                 │  │
 │  │                                    │  │
-│  │  ├─ <snapshot_id>/                 │  │
-│  │  │   ├─ data_001.vortex            │  │
-│  │  │   ├─ data_002.vortex            │  │
-│  │  │   └─ deletions/                 │  │
-│  │  │       └─ del_001.arrow          │  │
-│  │  └─ <snapshot_id>/                 │  │
-│  │      └─ ...                        │  │
+│  │  └─ <table_id>/                    │  │
+│  │      ├─ <snapshot_id>/              │  │
+│  │      │   ├─ data_001.vortex         │  │
+│  │      │   ├─ data_002.vortex         │  │
+│  │      │   └─ deletions/              │  │
+│  │      │       └─ del_001.arrow       │  │
+│  │      └─ <snapshot_id>/              │  │
+│  │          └─ ...                     │  │
 │  └────────────────────────────────────┘  │
 │                                          │
 │  ┌────────────────────────────────────┐  │
@@ -344,8 +345,8 @@ use cayenne::{
     CayenneCatalog, CayenneTableProviderBuilder, CreateTableOptions,
 };
 
-// Create catalog (returns CatalogResult)
-let catalog = Arc::new(CayenneCatalog::new("/data/catalog.db").await?);
+// Create catalog (synchronous, returns CatalogResult)
+let catalog = Arc::new(CayenneCatalog::new("sqlite:///data/catalog.db")?);
 catalog.init().await?;
 
 // Create table
