@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ae68a0efd15c",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-03-04/fts-partition",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "crates/search/src/analyzer_rule.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ae/68a0efd15c/0/metadata.json",
+      "transcript": "/ae/68a0efd15c/0/full.jsonl",
+      "context": "/ae/68a0efd15c/0/context.md",
+      "content_hash": "/ae/68a0efd15c/0/content_hash.txt",
+      "prompt": "/ae/68a0efd15c/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 12,
+    "cache_creation_tokens": 22824,
+    "cache_read_tokens": 329924,
+    "output_tokens": 2260,
+    "api_call_count": 10
+  }
+}
