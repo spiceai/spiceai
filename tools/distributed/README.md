@@ -209,13 +209,13 @@ distributed logs executor2 --follow
 │       ├── executor2.log    # Executor 2 logs
 │       └── executor3.log    # Executor 3 logs
 └── pki/                     # TLS certificates
-├── ca.crt                # CA certificate
-├── ca.key                # CA private key
-├── scheduler1.crt        # Scheduler certificate
-├── scheduler1.key        # Scheduler private key
-├── executor1.crt         # Executor 1 certificate
-├── executor1.key         # Executor 1 private key
-└── ...                   # Additional executor certificates
+    ├── ca.crt               # CA certificate
+    ├── ca.key               # CA private key
+    ├── scheduler1.crt       # Scheduler certificate
+    ├── scheduler1.key       # Scheduler private key
+    ├── executor1.crt        # Executor 1 certificate
+    ├── executor1.key        # Executor 1 private key
+    └── ...                  # Additional executor certificates
 ```
 
 ### State Management
@@ -254,7 +254,7 @@ The tool maintains a `~/.spice/distributed/cluster.state` JSON file to track run
 The tool automatically initializes TLS certificates using the `spice cluster tls` commands:
 
 1. Initializes CA if not present (`spice cluster tls init`)
-2. Generates certificates for scheduler and all executors (`spice cluster tls add <node-name>`)
+2. Generates certificates for scheduler and all executors (`spice cluster tls add <node-name>` for each node)
 
 You can skip TLS initialization with `--no-tls-init` if certificates are already set up.
 
@@ -276,7 +276,8 @@ The tool provides clear error messages for common issues:
 - **Cluster already running**: Suggests using `distributed stop` first
 - **Health check failures**: Shows last 10 lines of log file
 - **Port conflicts**: Surfaces errors from the runtime; adjust ports manually as needed
-- **TLS initialization errors**: Shows error and suggests manual initialization
+- **TLS initialization errors**: Shows error and suggests manual initialization with `spice cluster tls` commands
+- **Missing TLS files**: When using `--no-tls-init`, ensure certificates exist before starting
 
 ## Process Management
 
@@ -384,11 +385,12 @@ distributed start --scheduler-http 8091 --executor-http 9091
 # Manually initialize TLS
 spice cluster tls init
 
-# Generate certificates
+# Generate certificates for scheduler and all executors
 spice cluster tls add scheduler1
 spice cluster tls add executor1
 spice cluster tls add executor2
-# ... for each executor
+spice cluster tls add executor3
+# ... repeat 'add' command for each executor node
 ```
 
 ### Process won't stop

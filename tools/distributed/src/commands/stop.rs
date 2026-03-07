@@ -18,7 +18,11 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::path::PathBuf;
 
-use crate::cluster::{paths::expand_tilde, process, state::*};
+use crate::cluster::{
+    paths::expand_tilde,
+    process,
+    state::{load_state, remove_state, state_exists},
+};
 use crate::output;
 
 #[derive(Args)]
@@ -51,44 +55,67 @@ pub async fn execute(args: StopArgs) -> Result<()> {
 
     output::info("Stopping distributed Spice cluster...");
 
-    // Stop executors first (sequentially)
-    let mut executor_errors = Vec::new();
+    // Stop executors first (sequentially, in blocking tasks)
+    let mut has_executor_errors = false;
     for executor in &state.executors {
         output::info(&format!("Stopping {}...", executor.name));
-        let result = if args.force {
-            process::kill_process(executor.pid)
-        } else {
-            process::stop_process(executor.pid, args.timeout)
-        };
+        let name = executor.name.clone();
+        let pid = executor.pid;
+        let timeout = args.timeout;
+        let force = args.force;
+
+        let result = tokio::task::spawn_blocking(move || {
+            if force {
+                process::kill_process(pid)
+            } else {
+                process::stop_process(pid, timeout)
+            }
+        })
+        .await;
 
         match result {
-            Ok(()) => output::success(&format!("{} stopped", executor.name)),
+            Ok(Ok(())) => output::success(&format!("{name} stopped")),
+            Ok(Err(e)) => {
+                output::warning(&format!("Failed to stop {name}: {e}"));
+                has_executor_errors = true;
+            }
             Err(e) => {
-                output::warning(&format!("Failed to stop {}: {e}", executor.name));
-                executor_errors.push((executor.name.clone(), e));
+                output::warning(&format!("Failed to stop {name}: task failed: {e}"));
+                has_executor_errors = true;
             }
         }
     }
 
     // Stop scheduler
     output::info("Stopping scheduler...");
-    let scheduler_result = if args.force {
-        process::kill_process(state.scheduler.pid)
-    } else {
-        process::stop_process(state.scheduler.pid, args.timeout)
-    };
+    let scheduler_pid = state.scheduler.pid;
+    let scheduler_timeout = args.timeout;
+    let scheduler_force = args.force;
 
-    let scheduler_failed = scheduler_result.is_err();
+    let scheduler_result = tokio::task::spawn_blocking(move || {
+        if scheduler_force {
+            process::kill_process(scheduler_pid)
+        } else {
+            process::stop_process(scheduler_pid, scheduler_timeout)
+        }
+    })
+    .await;
+
+    let mut scheduler_failed = false;
     match scheduler_result {
-        Ok(()) => output::success("Scheduler stopped"),
-        Err(e) => {
+        Ok(Ok(())) => output::success("Scheduler stopped"),
+        Ok(Err(e)) => {
             output::warning(&format!("Failed to stop scheduler: {e}"));
+            scheduler_failed = true;
+        }
+        Err(e) => {
+            output::warning(&format!("Failed to stop scheduler: task failed: {e}"));
+            scheduler_failed = true;
         }
     }
 
     // Report results and remove state file only if all components stopped successfully
-    let has_errors = !executor_errors.is_empty() || scheduler_failed;
-    if !has_errors {
+    if !has_executor_errors && !scheduler_failed {
         remove_state(&work_dir).context("Failed to remove cluster state")?;
         output::success("Cluster stopped successfully!");
         Ok(())

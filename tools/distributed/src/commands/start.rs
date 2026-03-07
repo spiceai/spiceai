@@ -19,7 +19,14 @@ use clap::Args;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::cluster::{config::*, health::*, paths::expand_tilde, process, state::*, tls};
+use crate::cluster::{
+    config::ClusterConfig,
+    health::{HealthCheck, get_health_url},
+    paths::expand_tilde,
+    process,
+    state::{ClusterState, NodeState, remove_state, save_state, state_exists},
+    tls,
+};
 use crate::output;
 
 #[derive(Args)]
@@ -90,22 +97,26 @@ pub async fn execute(args: StartArgs) -> Result<()> {
     }
 
     // Build configuration
-    let mut config = ClusterConfig::default();
-    config.num_executors = args.executors;
-    config.scheduler.http_port = args.scheduler_http;
-    config.scheduler.flight_port = args.scheduler_flight;
-    config.scheduler.node_port = args.scheduler_node;
-    config.executors.base_http_port = args.executor_http;
-    config.executors.base_node_port = args.executor_node;
-    config.paths.log_dir = log_dir;
-    config.paths.work_dir = work_dir;
-    config.paths.project_dir = project_dir;
-    if let Some(spiced_path) = args.spiced_path {
-        config.paths.spiced_path = expand_tilde(&spiced_path);
-    }
-    config.detach = args.detach;
-    config.skip_tls_init = args.no_tls_init;
-    config.skip_health_check = args.no_health_check;
+    #[expect(clippy::field_reassign_with_default)]
+    let config = {
+        let mut cfg = ClusterConfig::default();
+        cfg.num_executors = args.executors;
+        cfg.scheduler.http_port = args.scheduler_http;
+        cfg.scheduler.flight_port = args.scheduler_flight;
+        cfg.scheduler.node_port = args.scheduler_node;
+        cfg.executors.base_http_port = args.executor_http;
+        cfg.executors.base_node_port = args.executor_node;
+        cfg.paths.log_dir = log_dir;
+        cfg.paths.work_dir = work_dir;
+        cfg.paths.project_dir = project_dir;
+        if let Some(spiced_path) = args.spiced_path {
+            cfg.paths.spiced_path = expand_tilde(&spiced_path);
+        }
+        cfg.detach = args.detach;
+        cfg.skip_tls_init = args.no_tls_init;
+        cfg.skip_health_check = args.no_health_check;
+        cfg
+    };
 
     // Validate spiced binary exists
     if !config.paths.spiced_path.exists() {
@@ -261,17 +272,37 @@ async fn wait_for_shutdown(state: &ClusterState) -> Result<()> {
         }
     }
 
-    // Stop all processes
+    // Stop all processes in background tasks to avoid blocking the runtime
     for executor in &state.executors {
         output::info(&format!("Stopping {}...", executor.name));
-        if let Err(e) = process::stop_process(executor.pid, 10) {
-            output::warning(&format!("Failed to stop {}: {e}", executor.name));
+        let name = executor.name.clone();
+        let pid = executor.pid;
+        let stop_result = tokio::task::spawn_blocking(move || process::stop_process(pid, 10)).await;
+        match stop_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                output::warning(&format!("Failed to stop {name}: {e}"));
+            }
+            Err(e) => {
+                output::warning(&format!("Failed to stop {name}: shutdown task failed: {e}"));
+            }
         }
     }
 
     output::info("Stopping scheduler...");
-    if let Err(e) = process::stop_process(state.scheduler.pid, 10) {
-        output::warning(&format!("Failed to stop scheduler: {e}"));
+    let scheduler_pid = state.scheduler.pid;
+    let scheduler_stop_result =
+        tokio::task::spawn_blocking(move || process::stop_process(scheduler_pid, 10)).await;
+    match scheduler_stop_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            output::warning(&format!("Failed to stop scheduler: {e}"));
+        }
+        Err(e) => {
+            output::warning(&format!(
+                "Failed to stop scheduler: shutdown task failed: {e}"
+            ));
+        }
     }
 
     // Remove state file

@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use std::sync::OnceLock;
 use std::time::Duration;
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub struct HealthCheck {
     pub max_attempts: usize,
@@ -59,10 +62,12 @@ impl HealthCheck {
 
     /// Check health of a service via HTTP GET to /health endpoint.
     pub async fn check_health(&self, url: &str) -> Result<bool> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .context("Failed to build HTTP client")?;
+        let client = HTTP_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        });
 
         match client.get(url).send().await {
             Ok(response) => Ok(response.status().is_success()),

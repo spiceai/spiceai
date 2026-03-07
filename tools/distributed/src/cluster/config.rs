@@ -28,6 +28,7 @@ pub struct ClusterConfig {
 }
 
 #[derive(Debug, Clone)]
+#[expect(clippy::struct_field_names)]
 pub struct SchedulerConfig {
     pub http_port: u16,
     pub flight_port: u16,
@@ -80,18 +81,21 @@ impl Default for ClusterConfig {
 impl ClusterConfig {
     /// Get the HTTP port for a specific executor index (0-based).
     #[must_use]
+    #[expect(clippy::cast_possible_truncation)]
     pub fn executor_http_port(&self, index: usize) -> u16 {
         self.executors.base_http_port + index as u16
     }
 
     /// Get the node port for a specific executor index (0-based).
     #[must_use]
+    #[expect(clippy::cast_possible_truncation)]
     pub fn executor_node_port(&self, index: usize) -> u16 {
         self.executors.base_node_port + index as u16
     }
 
     /// Get the executor name for a specific index (0-based).
     #[must_use]
+    #[expect(clippy::unused_self)]
     pub fn executor_name(&self, index: usize) -> String {
         format!("executor{}", index + 1)
     }

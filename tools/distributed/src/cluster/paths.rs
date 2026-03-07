@@ -14,68 +14,64 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
-
 /// Expand tilde in path to home directory.
 ///
 /// Handles:
 /// - `~/path/to/file` → `/home/user/path/to/file`
 /// - `~` → `/home/user`
 /// - `~user/path` → not supported, returned as-is
-pub fn expand_tilde(path: &PathBuf) -> PathBuf {
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return path.clone(),
+pub fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+    let Some(path_str) = path.to_str() else {
+        return path.to_path_buf();
     };
 
-    // Handle bare "~" as the home directory.
+    let Some(home) = dirs::home_dir() else {
+        return path.to_path_buf();
+    };
+
     if path_str == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-        return path.clone();
+        home
+    } else if let Some(rest) = path_str.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        path.to_path_buf()
     }
-
-    // Handle paths starting with "~/...".
-    if let Some(stripped) = path_str.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-
-    path.clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_expand_tilde_with_path() {
-        let input = PathBuf::from("~/test/path");
-        let result = expand_tilde(&input);
-        let home = dirs::home_dir().unwrap();
+        let input = Path::new("~/test/path");
+        let result = expand_tilde(input);
+        let home = dirs::home_dir().expect("home directory should be available");
         assert_eq!(result, home.join("test/path"));
     }
 
     #[test]
     fn test_expand_tilde_bare() {
-        let input = PathBuf::from("~");
-        let result = expand_tilde(&input);
-        assert_eq!(result, dirs::home_dir().unwrap());
+        let input = Path::new("~");
+        let result = expand_tilde(input);
+        assert_eq!(
+            result,
+            dirs::home_dir().expect("home directory should be available")
+        );
     }
 
     #[test]
     fn test_no_tilde_expansion() {
-        let input = PathBuf::from("/absolute/path");
-        let result = expand_tilde(&input);
+        let input = Path::new("/absolute/path");
+        let result = expand_tilde(input);
         assert_eq!(result, input);
     }
 
     #[test]
     fn test_relative_path_no_tilde() {
-        let input = PathBuf::from("relative/path");
-        let result = expand_tilde(&input);
+        let input = Path::new("relative/path");
+        let result = expand_tilde(input);
         assert_eq!(result, input);
     }
 }

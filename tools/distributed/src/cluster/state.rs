@@ -77,6 +77,7 @@ impl ClusterState {
     }
 
     /// Get all nodes (scheduler + executors).
+    #[expect(dead_code)]
     pub fn all_nodes(&self) -> Vec<&NodeState> {
         let mut nodes = vec![&self.scheduler];
         nodes.extend(&self.executors);
@@ -146,15 +147,15 @@ mod tests {
 
     #[test]
     fn test_save_and_load_state() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp directory");
         let state = create_test_state();
 
         // Save state
-        save_state(&state, temp_dir.path()).unwrap();
+        save_state(&state, temp_dir.path()).expect("failed to save state");
         assert!(state_exists(temp_dir.path()));
 
         // Load state
-        let loaded = load_state(temp_dir.path()).unwrap();
+        let loaded = load_state(temp_dir.path()).expect("failed to load state");
         assert_eq!(loaded.scheduler.pid, state.scheduler.pid);
         assert_eq!(loaded.executors.len(), 1);
         assert_eq!(loaded.executors[0].name, "executor1");
@@ -162,19 +163,19 @@ mod tests {
 
     #[test]
     fn test_state_exists_returns_false_initially() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp directory");
         assert!(!state_exists(temp_dir.path()));
     }
 
     #[test]
     fn test_remove_state() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp directory");
         let state = create_test_state();
 
-        save_state(&state, temp_dir.path()).unwrap();
+        save_state(&state, temp_dir.path()).expect("failed to save state");
         assert!(state_exists(temp_dir.path()));
 
-        remove_state(temp_dir.path()).unwrap();
+        remove_state(temp_dir.path()).expect("failed to remove state");
         assert!(!state_exists(temp_dir.path()));
     }
 
@@ -183,7 +184,10 @@ mod tests {
         let state = create_test_state();
         let log_path = state.get_log_path("scheduler");
         assert!(log_path.is_some());
-        assert_eq!(log_path.unwrap(), &state.scheduler.log_file);
+        assert_eq!(
+            log_path.expect("log path should exist"),
+            &state.scheduler.log_file
+        );
     }
 
     #[test]
@@ -191,7 +195,10 @@ mod tests {
         let state = create_test_state();
         let log_path = state.get_log_path("executor1");
         assert!(log_path.is_some());
-        assert_eq!(log_path.unwrap(), &state.executors[0].log_file);
+        assert_eq!(
+            log_path.expect("log path should exist"),
+            &state.executors[0].log_file
+        );
     }
 
     #[test]

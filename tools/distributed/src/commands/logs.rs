@@ -20,7 +20,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::cluster::{paths::expand_tilde, process, state::*};
+use crate::cluster::{
+    paths::expand_tilde,
+    process,
+    state::{load_state, state_exists},
+};
 use crate::output;
 
 #[derive(Args)]
@@ -62,23 +66,22 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
             return Err(anyhow::anyhow!("Log file not found"));
         }
 
-        return show_logs_from_file(&log_file, args.follow, args.tail);
+        return show_logs_from_file(&log_file, args.follow, args.tail).await;
     }
 
     // Load state
     let state = load_state(&work_dir).context("Failed to load cluster state")?;
 
     // Get log file path from state
-    let log_file = match state.get_log_path(&args.component) {
-        Some(path) => path.clone(),
-        None => {
-            output::error(&format!("Component '{}' not found.", args.component));
-            output::info("Available components:");
-            for component in state.list_components() {
-                println!("  - {component}");
-            }
-            return Err(anyhow::anyhow!("Component not found"));
+    let log_file = if let Some(path) = state.get_log_path(&args.component) {
+        path.clone()
+    } else {
+        output::error(&format!("Component '{}' not found.", args.component));
+        output::info("Available components:");
+        for component in state.list_components() {
+            println!("  - {component}");
         }
+        return Err(anyhow::anyhow!("Component not found"));
     };
 
     // Check if log file exists
@@ -91,13 +94,13 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
         return Err(anyhow::anyhow!("Log file not found"));
     }
 
-    show_logs_from_file(&log_file, args.follow, args.tail)
+    show_logs_from_file(&log_file, args.follow, args.tail).await
 }
 
-fn show_logs_from_file(log_file: &PathBuf, follow: bool, tail_lines: usize) -> Result<()> {
+async fn show_logs_from_file(log_file: &PathBuf, follow: bool, tail_lines: usize) -> Result<()> {
     if follow {
         // Follow mode: print initial tail, then poll for new content
-        follow_log_file(log_file, tail_lines)
+        follow_log_file(log_file, tail_lines).await
     } else {
         // Read last N lines
         let tail =
@@ -107,50 +110,36 @@ fn show_logs_from_file(log_file: &PathBuf, follow: bool, tail_lines: usize) -> R
     }
 }
 
-fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()> {
+async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()> {
     // Print initial tail
     let tail =
         process::read_log_tail(log_file, initial_lines).context("Failed to read log file")?;
     println!("{tail}");
 
-    // Follow for new content
-    let mut last_size = fs::metadata(log_file)
-        .context("Failed to get log file metadata")?
-        .len();
+    // Track line count (not file size) to avoid TOCTOU and precision loss
+    let mut last_line_count = tail.lines().count();
 
     println!("\n--- Following (Ctrl+C to stop) ---\n");
 
     loop {
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let current_size = match fs::metadata(log_file) {
-            Ok(metadata) => metadata.len(),
-            Err(_) => {
-                // File was deleted, stop following
+        match fs::read_to_string(log_file) {
+            Ok(contents) => {
+                let lines: Vec<&str> = contents.lines().collect();
+                // Print only new lines since last read
+                for line in lines.iter().skip(last_line_count) {
+                    println!("{line}");
+                }
+                last_line_count = lines.len();
+            }
+            Err(e) => {
+                // File deleted or permission denied - stop following
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    output::warning(&format!("Error reading log file: {e}"));
+                }
                 break;
             }
-        };
-
-        if current_size > last_size {
-            // File grew, read new content
-            match fs::read_to_string(log_file).context("Failed to read log file") {
-                Ok(contents) => {
-                    let lines: Vec<&str> = contents.lines().collect();
-                    // Find where we left off based on approximate line count
-                    if !lines.is_empty() {
-                        // Estimate position based on file size ratio
-                        let estimated_start =
-                            (lines.len() as u64 * last_size / current_size).max(0) as usize;
-                        for line in lines.iter().skip(estimated_start) {
-                            println!("{line}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    output::warning(&format!("Error reading updated log: {e}"));
-                }
-            }
-            last_size = current_size;
         }
     }
 

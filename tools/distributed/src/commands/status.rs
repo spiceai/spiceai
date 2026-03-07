@@ -19,7 +19,12 @@ use clap::Args;
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::cluster::{health::*, paths::expand_tilde, process, state::*};
+use crate::cluster::{
+    health::{HealthCheck, get_health_url},
+    paths::expand_tilde,
+    process,
+    state::{load_state, state_exists},
+};
 use crate::output;
 
 #[derive(Args)]
@@ -86,8 +91,11 @@ pub async fn execute(args: StatusArgs) -> Result<()> {
 
     // Output
     if args.json {
+        // Compute running status from node statuses: running if any node is healthy or running
+        let running = scheduler_status.status != "stopped"
+            || executor_statuses.iter().any(|s| s.status != "stopped");
         let cluster_status = ClusterStatus {
-            running: true,
+            running,
             scheduler: scheduler_status.clone(),
             executors: executor_statuses.clone(),
         };
@@ -110,9 +118,7 @@ pub async fn execute(args: StatusArgs) -> Result<()> {
 async fn check_node_status(name: &str, pid: u32, http_port: u16) -> NodeStatus {
     let is_alive = process::is_process_alive(pid);
 
-    let status = if !is_alive {
-        "stopped".to_string()
-    } else {
+    let status = if is_alive {
         let health_check = HealthCheck::default();
         let health_url = get_health_url(http_port);
         match health_check.check_health(&health_url).await {
@@ -120,6 +126,8 @@ async fn check_node_status(name: &str, pid: u32, http_port: u16) -> NodeStatus {
             Ok(false) => "unhealthy".to_string(),
             Err(_) => "not responding".to_string(),
         }
+    } else {
+        "stopped".to_string()
     };
 
     NodeStatus {
@@ -134,16 +142,16 @@ fn print_node_status(status: &NodeStatus) {
     let symbol = match status.status.as_str() {
         "healthy" => "✓",
         "stopped" => "✗",
-        "unhealthy" => "⚠",
-        "not responding" => "⚠",
+        "unhealthy" | "not responding" => "⚠",
         _ => "?",
     };
 
     let colored_status = match status.status.as_str() {
         "healthy" => ansi_colors::Color::Green.paint(&status.status).to_string(),
         "stopped" => ansi_colors::Color::Red.paint(&status.status).to_string(),
-        "unhealthy" => ansi_colors::Color::Yellow.paint(&status.status).to_string(),
-        "not responding" => ansi_colors::Color::Yellow.paint(&status.status).to_string(),
+        "unhealthy" | "not responding" => {
+            ansi_colors::Color::Yellow.paint(&status.status).to_string()
+        }
         _ => status.status.clone(),
     };
 

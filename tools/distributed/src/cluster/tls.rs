@@ -25,6 +25,7 @@ pub fn get_pki_dir() -> Result<PathBuf> {
 }
 
 /// Check if TLS certificates exist for the given node names.
+#[expect(dead_code)]
 pub fn certificates_exist(node_names: &[&str]) -> Result<bool> {
     let pki_dir = get_pki_dir()?;
     for name in node_names {
@@ -105,11 +106,11 @@ pub fn ensure_certificates(node_names: &[&str]) -> Result<()> {
 /// Get the path to the spice CLI binary.
 fn get_spice_cli_path() -> Result<PathBuf> {
     // Try to find spice in PATH
-    if let Ok(output) = Command::new("which").arg("spice").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout);
-            return Ok(PathBuf::from(path.trim()));
-        }
+    if let Ok(output) = Command::new("which").arg("spice").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout);
+        return Ok(PathBuf::from(path.trim()));
     }
 
     // Fallback to default location

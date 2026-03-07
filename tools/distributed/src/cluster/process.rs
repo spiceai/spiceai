@@ -164,9 +164,10 @@ pub fn is_process_alive(_pid: u32) -> bool {
 }
 
 /// Stop a process gracefully with SIGTERM, falling back to SIGKILL if timeout exceeded.
-/// Note: This function uses blocking operations and should be called from spawn_blocking context
+/// Note: This function uses blocking operations and should be called from `spawn_blocking` context
 /// when used in async code.
 #[cfg(unix)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub fn stop_process(pid: u32, timeout_secs: u64) -> Result<()> {
     let pid = Pid::from_raw(pid as i32);
 
@@ -209,6 +210,7 @@ pub fn stop_process(_pid: u32, _timeout_secs: u64) -> Result<()> {
 
 /// Force kill a process with SIGKILL.
 #[cfg(unix)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub fn kill_process(pid: u32) -> Result<()> {
     let pid = Pid::from_raw(pid as i32);
 
@@ -235,22 +237,24 @@ pub fn kill_process(_pid: u32) -> Result<()> {
 }
 
 /// Read the last N lines from a log file.
-/// Uses efficient bounded reading when possible to avoid loading large files into memory.
+/// Uses efficient bounded reading to avoid loading large files into memory.
 pub fn read_log_tail(log_file: &Path, lines: usize) -> Result<String> {
+    use std::collections::VecDeque;
     use std::io::{BufRead, BufReader};
 
     let file = fs::File::open(log_file).context("Failed to open log file")?;
     let reader = BufReader::new(file);
 
-    // Collect last N lines efficiently
-    let mut tail_lines: Vec<String> = Vec::with_capacity(lines);
+    // Use VecDeque for O(1) removal instead of Vec's O(n) remove(0)
+    let mut tail_lines: VecDeque<String> = VecDeque::with_capacity(lines);
     for line in reader.lines() {
         let line = line.context("Failed to read line from log file")?;
-        tail_lines.push(line);
+        tail_lines.push_back(line);
         if tail_lines.len() > lines {
-            tail_lines.remove(0);
+            tail_lines.pop_front();
         }
     }
 
-    Ok(tail_lines.join("\n"))
+    let result: Vec<String> = tail_lines.into_iter().collect();
+    Ok(result.join("\n"))
 }
