@@ -1,0 +1,38 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "2c1ab48676ba",
+  "session_id": "e37363f3-bb0c-4582-bc11-bcdc537be6a7",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-07T02:47:18.713614Z",
+  "branch": "jeadie/26-02-13/distributed",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "tools/distributed/Cargo.toml",
+    "tools/distributed/README.md",
+    "tools/distributed/src/cluster/paths.rs",
+    "tools/distributed/src/cluster/process.rs",
+    "tools/distributed/src/cluster/state.rs",
+    "tools/distributed/src/commands/logs.rs",
+    "tools/distributed/src/commands/start.rs",
+    "tools/distributed/src/commands/status.rs",
+    "tools/distributed/src/commands/stop.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "c511e12a716f",
+  "token_usage": {
+    "input_tokens": 8057,
+    "cache_creation_tokens": 88564,
+    "cache_read_tokens": 4666710,
+    "output_tokens": 31302,
+    "api_call_count": 75
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-07T02:47:18.40362Z",
+    "agent_lines": 0,
+    "human_added": 101,
+    "human_modified": 90,
+    "human_removed": 0,
+    "total_committed": 151,
+    "agent_percentage": 0
+  }
+}
