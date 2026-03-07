@@ -1,0 +1,13 @@
+Read and summarise PR comments on https://github.com/spiceai/spiceai/pull/9467
+
+---
+
+Fix all
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+use Makefile
