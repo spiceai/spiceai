@@ -118,10 +118,7 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
         data_type,
-        DataType::Interval(_)
-            | DataType::Duration(_)
-            | DataType::Map(_, _)
-            | DataType::FixedSizeBinary(_)
+        DataType::Interval(_) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
     )
 }
 
@@ -757,7 +754,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .default("sqlite"),
         ParameterSpec::runtime("file_watcher"),
         ParameterSpec::component("unsupported_type_action")
-            .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
+            .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("footer_cache_mb")

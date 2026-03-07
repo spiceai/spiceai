@@ -36,7 +36,7 @@ pub mod backend;
 pub mod lru_cache;
 pub mod metrics;
 mod simple_cache;
-mod utils;
+pub mod utils;
 
 pub mod encoding;
 pub mod key;

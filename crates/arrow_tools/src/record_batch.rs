@@ -15,10 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{
-        Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
-        new_null_array,
-    },
+    array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, new_null_array},
     buffer::{Buffer, OffsetBuffer},
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
@@ -82,10 +79,6 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
             ) {
                 if field.contains(existing_field) {
                     Ok(Arc::clone(column))
-                } else if matches!(existing_field.data_type(), DataType::Map(_, _))
-                    && matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-                {
-                    Ok(Arc::new(map_array_to_json_string(column)) as ArrayRef)
                 } else {
                     {
                         return cast(&*Arc::clone(column), field.data_type())
@@ -115,41 +108,6 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
     }
 
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
-}
-
-/// Convert a `MapArray` to a `StringArray` by serializing each row as a JSON object.
-///
-/// Each map entry `{key: value}` becomes a JSON object like `{"key1":"value1","key2":"value2"}`.
-/// Null rows produce null strings.
-fn map_array_to_json_string(array: &ArrayRef) -> StringArray {
-    let map_array = array
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .expect("expected MapArray");
-    let keys = map_array.keys().as_string::<i32>();
-    let values = map_array.values().as_string::<i32>();
-
-    (0..map_array.len())
-        .map(|row_idx| {
-            if map_array.is_null(row_idx) {
-                return None;
-            }
-            let start = map_array.value_offsets()[row_idx] as usize;
-            let end = map_array.value_offsets()[row_idx + 1] as usize;
-
-            let mut obj = serde_json::Map::new();
-            for entry_idx in start..end {
-                let key = keys.value(entry_idx);
-                let value = if values.is_null(entry_idx) {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(values.value(entry_idx).to_string())
-                };
-                obj.insert(key.to_string(), value);
-            }
-            Some(serde_json::Value::Object(obj).to_string())
-        })
-        .collect()
 }
 
 /// Flattens a list of struct types with a single field into a list of primitive types.

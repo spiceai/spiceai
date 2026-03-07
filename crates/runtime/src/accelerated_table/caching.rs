@@ -1750,9 +1750,12 @@ mod tests {
     use duckdb::AccessMode;
 
     use super::*;
-    use arrow::array::{Int32Array, RecordBatch, StringArray, TimestampNanosecondArray};
+    use arrow::array::{
+        Int32Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array,
+    };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use async_trait::async_trait;
+    use cache::utils::RESPONSE_STATUS_COLUMN;
     use datafusion::catalog::Session;
     use datafusion::common::{Constraint, Constraints, ToDFSchema};
     use datafusion::datasource::TableType;
