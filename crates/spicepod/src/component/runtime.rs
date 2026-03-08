@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -596,6 +596,11 @@ impl ApiKey {
                 key: input.to_string(),
             }
         }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_ref().is_empty()
     }
 }
 

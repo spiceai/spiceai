@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,8 +15,10 @@ limitations under the License.
 */
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use arrow::record_batch::RecordBatch;
-use futures::TryStreamExt;
+use datafusion::prelude::col;
+use datafusion::sql::TableReference;
 use model_components::model::{Error as ModelError, Model};
+use std::io;
 use std::result::Result;
 use std::sync::Arc;
 
@@ -46,25 +48,35 @@ use crate::DataFusion;
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
-    match df
-        .query_builder(
-            &(format!(
-                "select * from {SPICE_DEFAULT_CATALOG}.{SPICE_DEFAULT_SCHEMA}.{} order by ts asc",
-                m.model.datasets[0]
-            )),
-        )
-        .build()
-        .run()
-        .await
-    {
-        Ok(query_result) => match query_result.data.try_collect().await {
-            Ok(d) => m.run(d),
-            Err(e) => Err(ModelError::UnableToRunModel {
-                source: Box::new(e),
-            }),
-        },
-        Err(e) => Err(ModelError::UnableToRunModel {
+    let dataset = TableReference::parse_str(&m.model.datasets[0]);
+    let dataset_name = dataset
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        .to_string();
+
+    let Some(provider) = df.get_table(&dataset).await else {
+        return Err(ModelError::UnableToRunModel {
+            source: Box::new(io::Error::other(format!(
+                "Model dataset not found: {dataset_name}"
+            ))),
+        });
+    };
+
+    let batches = df
+        .ctx
+        .read_table(provider)
+        .map_err(|e| ModelError::UnableToRunModel {
             source: Box::new(e),
-        }),
-    }
+        })?
+        .sort(vec![col("ts").sort(true, false)])
+        .map_err(|e| ModelError::UnableToRunModel {
+            source: Box::new(e),
+        })?
+        .collect()
+        .await
+        .map_err(|e| ModelError::UnableToRunModel {
+            source: Box::new(e),
+        })?;
+
+    m.run(batches)
 }
