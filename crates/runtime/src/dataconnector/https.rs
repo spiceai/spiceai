@@ -20,7 +20,6 @@ use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOpt
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
-use crate::register_data_connector;
 
 use snafu::prelude::*;
 use std::any::Any;
