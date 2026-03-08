@@ -117,12 +117,16 @@ impl BackendMode {
 }
 
 fn parse_backend_mode(raw_value: &str) -> Result<BackendMode, String> {
-    match raw_value.trim().to_ascii_lowercase().as_str() {
-        "" | "scp" => Ok(BackendMode::Scp),
-        "local" => Ok(BackendMode::Local),
-        value => Err(format!(
+    let value = raw_value.trim();
+
+    if value.is_empty() || value.eq_ignore_ascii_case("scp") {
+        Ok(BackendMode::Scp)
+    } else if value.eq_ignore_ascii_case("local") {
+        Ok(BackendMode::Local)
+    } else {
+        Err(format!(
             "Invalid {SPIDAPTER_BACKEND_ENV} value '{value}'. Supported values: scp, local"
-        )),
+        ))
     }
 }
 

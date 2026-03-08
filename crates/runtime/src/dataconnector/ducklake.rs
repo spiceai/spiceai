@@ -19,7 +19,7 @@ limitations under the License.
 //! Connects to specific tables in a `DuckLake` catalog using `DuckDB` with the `ducklake` extension.
 
 use crate::{
-    component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect, register_data_connector,
+    component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect,
 };
 use async_trait::async_trait;
 use data_components::Read;

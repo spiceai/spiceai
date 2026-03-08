@@ -16260,6 +16260,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "runtime-auth",
+ "sha2 0.10.9",
  "spicepod",
  "tokio",
  "tracing",

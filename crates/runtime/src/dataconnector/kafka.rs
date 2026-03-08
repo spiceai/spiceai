@@ -42,7 +42,6 @@ use crate::{
     datafusion::refresh_sql,
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, ParameterSpec, Parameters},
-    register_data_connector,
 };
 
 /// Default max records to scan to infer the schema

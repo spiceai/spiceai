@@ -22,7 +22,6 @@ use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::Debezi
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::register_data_connector;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
