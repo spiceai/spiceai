@@ -1224,10 +1224,8 @@ fn table_id_dir(
     table: &CayenneTableProvider,
     table_name: &str,
 ) -> std::path::PathBuf {
-    fixture
-        .data_path
-        .join(table_name)
-        .join(&table.metadata().table_id)
+    let meta = table.metadata();
+    fixture.data_path.join(table_name).join(&meta.table_id)
 }
 
 /// Creates a dummy non-empty cache value. The cache rejects empty vecs internally.

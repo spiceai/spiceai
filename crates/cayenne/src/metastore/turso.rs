@@ -145,7 +145,7 @@ impl TursoMetastore {
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
             table_id TEXT PRIMARY KEY,
-            table_name TEXT NOT NULL UNIQUE,
+            table_name TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
@@ -156,6 +156,11 @@ impl TursoMetastore {
             vortex_config_json TEXT,
             current_sequence_number BIGINT NOT NULL DEFAULT 0
         )
+    ";
+
+    const TABLE_NAME_UNIQUE_INDEX_DDL: &'static str = r"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_table_name_unique
+        ON cayenne_table(table_name)
     ";
 
     /// Schema for the `cayenne_delete_file` table.
@@ -341,8 +346,9 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
+            Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,

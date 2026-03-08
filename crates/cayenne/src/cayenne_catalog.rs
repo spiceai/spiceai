@@ -201,11 +201,11 @@ impl CayenneCatalog {
         &self,
         table_name: &str,
         options: &CreateTableOptions,
-    ) -> CatalogResult<String> {
+    ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
             Ok(stored_metadata) => {
                 if configuration_matches(&stored_metadata, options) {
-                    return Ok(stored_metadata.table_id);
+                    return Ok(stored_metadata);
                 }
 
                 Err(CatalogError::ChangedConfiguration {
@@ -278,7 +278,8 @@ impl MetadataCatalog for CayenneCatalog {
         if existing_table_id.is_some() {
             return self
                 .validate_existing_table_configuration(table_name.as_str(), &options)
-                .await;
+                .await
+                .map(|stored_metadata| stored_metadata.table_id);
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -360,9 +361,13 @@ impl MetadataCatalog for CayenneCatalog {
         match insert_result {
             Ok(()) => {}
             Err(CatalogError::ConstraintViolation { .. }) => {
-                return self
+                let existing_table = self
                     .validate_existing_table_configuration(table_name.as_str(), &options)
-                    .await;
+                    .await?;
+
+                ensure_snapshot_directory_exists(&existing_table).await?;
+
+                return Ok(existing_table.table_id);
             }
             Err(e) => return Err(e),
         }
@@ -552,7 +557,9 @@ impl MetadataCatalog for CayenneCatalog {
 
         match insert_result {
             Ok(()) => Ok(delete_file_id),
-            Err(CatalogError::ConstraintViolation { .. }) => {
+            Err(CatalogError::ConstraintViolation { message })
+                if is_delete_file_unique_constraint_violation_message(&message) =>
+            {
                 // Another concurrent operation inserted first — retrieve the existing ID
                 let existing_id: String = self
                     .metastore
@@ -1078,7 +1085,8 @@ impl MetadataCatalog for CayenneCatalog {
 
         match insert_result {
             Ok(()) => return Ok(partition_id),
-            Err(CatalogError::ConstraintViolation { .. }) => {}
+            Err(CatalogError::ConstraintViolation { message })
+                if is_partition_unique_constraint_violation_message(&message) => {}
             Err(e) => {
                 return Err(CatalogError::FailedToAddPartition {
                     source: Box::new(e),
@@ -1240,8 +1248,41 @@ fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
     }
 }
 
+fn is_delete_file_unique_constraint_violation_message(message: &str) -> bool {
+    constraint_violation_message_contains_all(
+        message,
+        &["unique", "cayenne_delete_file", "table_id", "path"],
+    ) || constraint_violation_message_contains_all(message, &["idx_cayenne_delete_file_table_path"])
+}
+
+fn is_partition_unique_constraint_violation_message(message: &str) -> bool {
+    constraint_violation_message_contains_all(
+        message,
+        &["unique", "cayenne_partition", "table_id", "partition_key"],
+    )
+}
+
+fn constraint_violation_message_contains_all(message: &str, required_parts: &[&str]) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    required_parts.iter().all(|part| normalized.contains(part))
+}
+
 fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
+    if table.path.starts_with("s3://") {
+        return Ok(());
+    }
+
+    let snapshot_dir = std::path::PathBuf::from(&table.path)
+        .join(&table.table_id)
+        .join(&table.current_snapshot_id);
+
+    tokio::fs::create_dir_all(&snapshot_dir)
+        .await
+        .map_err(|e| CatalogError::Io { source: e })
 }
 
 async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
@@ -2503,6 +2544,49 @@ mod tests {
     #[test]
     fn test_sql_text_literal_escapes_single_quotes() {
         assert_eq!(sql_text_literal("abc'def"), "'abc''def'");
+    }
+
+    #[test]
+    fn test_delete_file_unique_constraint_violation_message_matches_expected_conflicts() {
+        let messages = [
+            "UNIQUE constraint failed: cayenne_delete_file.table_id, cayenne_delete_file.path",
+            "constraint failed: idx_cayenne_delete_file_table_path",
+        ];
+
+        for message in messages {
+            assert!(is_delete_file_unique_constraint_violation_message(message));
+        }
+    }
+
+    #[test]
+    fn test_delete_file_unique_constraint_violation_message_rejects_unrelated_constraints() {
+        let messages = [
+            "FOREIGN KEY constraint failed",
+            "UNIQUE constraint failed: cayenne_table.table_name",
+        ];
+
+        for message in messages {
+            assert!(!is_delete_file_unique_constraint_violation_message(message));
+        }
+    }
+
+    #[test]
+    fn test_partition_unique_constraint_violation_message_matches_expected_conflicts() {
+        let message =
+            "UNIQUE constraint failed: cayenne_partition.table_id, cayenne_partition.partition_key";
+        assert!(is_partition_unique_constraint_violation_message(message));
+    }
+
+    #[test]
+    fn test_partition_unique_constraint_violation_message_rejects_unrelated_constraints() {
+        let messages = [
+            "FOREIGN KEY constraint failed",
+            "UNIQUE constraint failed: cayenne_delete_file.table_id, cayenne_delete_file.path",
+        ];
+
+        for message in messages {
+            assert!(!is_partition_unique_constraint_violation_message(message));
+        }
     }
 
     #[tokio::test]

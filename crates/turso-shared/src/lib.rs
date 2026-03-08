@@ -53,7 +53,7 @@ pub const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;
 pub fn retry_backoff_delay(attempt: u32) -> Duration {
     // Clamp the exponent to avoid shifting by 64+ bits, which would panic.
     let exponent = attempt.saturating_sub(1).min(63);
-    let backoff_multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let backoff_multiplier = 1_u64 << exponent;
 
     Duration::from_millis(DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS.saturating_mul(backoff_multiplier))
 }
