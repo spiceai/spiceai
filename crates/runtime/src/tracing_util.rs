@@ -15,8 +15,6 @@ limitations under the License.
 */
 
 use datafusion::sql::TableReference;
-use opentelemetry::trace::TraceId;
-use rand::RngCore;
 
 use crate::{
     component::dataset::{
