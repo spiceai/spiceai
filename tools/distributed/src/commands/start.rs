@@ -131,7 +131,13 @@ pub async fn execute(args: StartArgs) -> Result<()> {
     output::info("Starting distributed Spice cluster...");
 
     // Initialize TLS if needed
-    if !config.skip_tls_init {
+    if config.skip_tls_init {
+        // When skipping TLS initialization, validate that required files already exist
+        output::info("Validating existing TLS certificates...");
+        tls::validate_tls_files(config.num_executors).context(
+            "TLS certificates not found. Please run TLS initialization or use 'spice cluster tls' commands",
+        )?;
+    } else {
         output::info("Initializing TLS certificates...");
         tls::ensure_tls_initialized().context("Failed to initialize TLS")?;
 
@@ -145,12 +151,6 @@ pub async fn execute(args: StartArgs) -> Result<()> {
         node_names.extend(&executor_refs);
 
         tls::ensure_certificates(&node_names).context("Failed to generate certificates")?;
-    } else {
-        // When skipping TLS initialization, validate that required files already exist
-        output::info("Validating existing TLS certificates...");
-        tls::validate_tls_files(config.num_executors).context(
-            "TLS certificates not found. Please run TLS initialization or use 'spice cluster tls' commands",
-        )?;
     }
 
     // Start scheduler
