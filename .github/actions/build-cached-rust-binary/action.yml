@@ -79,11 +79,17 @@ runs:
         echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
     - name: Download binary from MinIO
-      if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
+      if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true' && inputs.minio_endpoint != ''
       id: minio-download
       shell: bash
       run: |
-        binary_path="spice-minio/artifacts/${{ inputs.binary_name }}/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
+        if ! command -v mc >/dev/null 2>&1; then
+          echo "MinIO client is unavailable; skipping download"
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        binary_path="spice-minio/artifacts/${{ inputs.binary_name }}/${{ steps.detect-os.outputs.os }}-${{ runner.arch }}/${{ steps.commit-sha.outputs.sha }}/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
         if mc stat "$binary_path"; then
           echo "Found ${{ inputs.binary_name }} in MinIO"
           mkdir -p target/release
@@ -98,11 +104,11 @@ runs:
     - name: Restore binary from cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-binary
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}
-        key: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
+        key: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}-${{ runner.arch }}-${{ steps.commit-sha.outputs.sha }}
 
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-binary.outputs.cache-hit != 'true')
@@ -142,13 +148,18 @@ runs:
       with:
         path: |
           target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}
-        key: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
+        key: ${{ inputs.binary_name }}-${{ steps.detect-os.outputs.os }}-${{ runner.arch }}-${{ steps.commit-sha.outputs.sha }}
 
     - name: Upload binary to MinIO
-      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-binary.outputs.cache-hit != 'true')
+      if: inputs.download_from_minio == 'true' && inputs.minio_endpoint != '' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-binary.outputs.cache-hit != 'true')
       shell: bash
       run: |
-        mc cp "target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}" "spice-minio/artifacts/${{ inputs.binary_name }}/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
+        if ! command -v mc >/dev/null 2>&1; then
+          echo "MinIO client is unavailable; skipping upload"
+          exit 0
+        fi
+
+        mc cp "target/release/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}" "spice-minio/artifacts/${{ inputs.binary_name }}/${{ steps.detect-os.outputs.os }}-${{ runner.arch }}/${{ steps.commit-sha.outputs.sha }}/${{ inputs.binary_name }}${{ steps.detect-os.outputs.ext }}"
 
     - name: Install binary to system path (Linux/macOS)
       if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'

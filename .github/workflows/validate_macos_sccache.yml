@@ -111,7 +111,14 @@ jobs:
             exit 1
           fi
 
-          mount_line="$(mount | grep -F " on $mount_point (")"
+          mount_line="$(mount | grep -F " on $mount_point (" || true)"
+          if [ -z "$mount_line" ]; then
+            echo "Unable to find mount entry for $mount_point"
+            echo "Current mounts:"
+            mount || true
+            exit 1
+          fi
+
           echo "SCCACHE_DIR=$SCCACHE_DIR"
           echo "Mount point=$mount_point"
           echo "Mount line=$mount_line"
