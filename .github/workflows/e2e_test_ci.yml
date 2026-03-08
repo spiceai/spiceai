@@ -1010,8 +1010,8 @@ jobs:
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            # { engine: turso, mode: memory },
-            # { engine: turso, mode: file },
+            { engine: turso, mode: memory },
+            { engine: turso, mode: file },
             # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
