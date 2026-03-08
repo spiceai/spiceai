@@ -53,6 +53,7 @@ pub use lru_cache::LruCache;
 pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
+pub use utils::batches_to_cache;
 pub use utils::RESPONSE_STATUS_COLUMN;
 pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;

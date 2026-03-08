@@ -31,6 +31,16 @@ use futures::StreamExt;
 
 pub const RESPONSE_STATUS_COLUMN: &str = "response_status";
 
+const HTTP_RESULT_COLUMNS: [&str; 7] = [
+    "request_path",
+    "request_query",
+    "request_body",
+    "content",
+    RESPONSE_STATUS_COLUMN,
+    "response_headers",
+    "fetched_at",
+];
+
 /// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
 /// from record batches before caching.
 ///
@@ -94,6 +104,73 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
     result
 }
 
+fn is_http_result_batch(batch: &RecordBatch) -> bool {
+    let schema = batch.schema();
+
+    schema.column_with_name(RESPONSE_STATUS_COLUMN).is_some()
+        && schema
+            .fields()
+            .iter()
+            .all(|field| HTTP_RESULT_COLUMNS.contains(&field.name().as_str()))
+        && schema
+            .fields()
+            .iter()
+            .any(|field| field.name() != RESPONSE_STATUS_COLUMN)
+}
+
+fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
+    let Some(first_batch) = batches.first() else {
+        return false;
+    };
+
+    if !is_http_result_batch(first_batch) {
+        return false;
+    }
+
+    for batch in batches {
+        let Some(col_idx) = batch
+            .schema()
+            .column_with_name(RESPONSE_STATUS_COLUMN)
+            .map(|(idx, _)| idx)
+        else {
+            return false;
+        };
+
+        let Some(status_array) = batch.column(col_idx).as_any().downcast_ref::<UInt16Array>()
+        else {
+            tracing::warn!(
+                "'{RESPONSE_STATUS_COLUMN}' column is not UInt16Array, skipping transient HTTP cache validation"
+            );
+            return false;
+        };
+
+        if status_array
+            .iter()
+            .flatten()
+            .any(|status| status == 429 || (500..600).contains(&status))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns the batches that should be written to cache.
+///
+/// For HTTP-shaped results, any presence of a transient error response (5xx/429)
+/// skips the entire cache write to avoid storing a partial result set. Non-HTTP
+/// results are returned unchanged, even if they contain a `response_status`
+/// column for unrelated business logic.
+#[must_use]
+pub fn batches_to_cache(batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
+    if has_transient_http_error_responses(batches) {
+        return None;
+    }
+
+    Some(batches.to_vec())
+}
+
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -126,33 +203,36 @@ pub fn to_cached_record_batch_stream(
         }
 
         if records_size < cache_max_size {
-            // Filter out transient HTTP error responses (5xx/429) before caching.
-            // Non-HTTP results pass through unchanged.
-            let records_to_cache = filter_transient_error_responses(&records);
-            if records_to_cache.is_empty() && !records.is_empty() {
-                tracing::debug!("All query results were transient errors, skipping cache storage");
-            } else if !records_to_cache.is_empty() {
-                let cached_at = std::time::Instant::now();
-                let encoder = cache_provider.encoder();
+            match batches_to_cache(&records) {
+                None if !records.is_empty() => {
+                    tracing::debug!(
+                        "Transient HTTP error responses were present, skipping cache storage"
+                    );
+                }
+                Some(records_to_cache) if !records_to_cache.is_empty() => {
+                    let cached_at = std::time::Instant::now();
+                    let encoder = cache_provider.encoder();
 
-                match CachedQueryResult::from_batches(
-                    &records_to_cache,
-                    cache_schema,
-                    input_tables,
-                    cached_at,
-                    encoder,
-                )
-                .await
-                {
-                    Ok(cached_result) => {
-                        if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                            tracing::error!("Failed to cache query results: {e}");
+                    match CachedQueryResult::from_batches(
+                        &records_to_cache,
+                        cache_schema,
+                        input_tables,
+                        cached_at,
+                        encoder,
+                    )
+                    .await
+                    {
+                        Ok(cached_result) => {
+                            if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                                tracing::error!("Failed to cache query results: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to encode query results for caching: {e}");
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to encode query results for caching: {e}");
-                    }
                 }
+                _ => {}
             }
         }
     };

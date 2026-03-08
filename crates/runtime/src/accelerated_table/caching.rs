@@ -565,14 +565,19 @@ impl CacheRefreshHelper {
         // Fetch fresh data for this specific entry
         let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
 
-        // Filter out transient error responses (5xx/429) - they should not be cached
-        let batches = cache::filter_transient_error_responses(&batches);
-
-        if batches.is_empty() {
+        // Skip cache writes if the source response contains transient HTTP errors.
+        let Some(batches) = cache::batches_to_cache(&batches) else {
             tracing::debug!(
-                "No cacheable data for dataset={dataset_name} (source returned empty or transient error)"
+                "No cacheable data for dataset={dataset_name} (source returned transient HTTP error responses)"
             );
             // Remove from in-flight since no data to write
+            let mut in_flight = in_flight_revalidations.lock().await;
+            in_flight.remove(&cache_key);
+            return Ok(0);
+        };
+
+        if batches.is_empty() {
+            tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
             let mut in_flight = in_flight_revalidations.lock().await;
             in_flight.remove(&cache_key);
             return Ok(0);
@@ -1213,43 +1218,44 @@ impl CacheRefreshHelper {
                 let batch_schema = batches[0].schema();
                 tracing::trace!("Fetched batch schema:\n{}", SchemaDisplay(&batch_schema));
 
-                // Filter out transient error responses (5xx/429) for caching - they
-                // should not be persisted. User still receives all data.
-                let batches_for_cache = cache::filter_transient_error_responses(&batches);
+                // Skip cache writes if the source response contains transient HTTP
+                // errors. User still receives all fetched data.
+                let batches_for_cache = cache::batches_to_cache(&batches);
 
                 // Clone batches for propagation to children.
                 // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
-                let batches_for_propagate = batches_for_cache.clone();
+                let batches_for_propagate = batches_for_cache.clone().unwrap_or_default();
                 let filters_clone: Vec<Expr> = filters.to_vec();
                 let cache_key = compute_cache_key_from_filters(filters);
 
-                // Only cache if we have cacheable (non-transient-error) data
-                if batches_for_cache.is_empty() {
-                    tracing::debug!(
-                        "Fetch returned transient error response, skipping cache write for dataset={dataset_name}"
-                    );
-                } else {
-                    let cache_rows: usize =
-                        batches_for_cache.iter().map(RecordBatch::num_rows).sum();
-
-                    // Send write request to batched consumer
-                    let write_request = CacheWriteRequest {
-                        batches: batches_for_cache,
-                        filters: filters.to_vec(),
-                        is_upsert: is_expired,
-                        cache_key,
-                    };
-                    if let Err(e) = batch_write_tx.send(write_request).await {
-                        tracing::warn!(
-                            "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
+                if let Some(batches_for_cache) = batches_for_cache {
+                    if batches_for_cache.is_empty() {
+                        tracing::debug!(
+                            "Fetch returned no rows, skipping cache write for dataset={dataset_name}"
                         );
                     } else {
-                        tracing::trace!(
-                            "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows, is_upsert={is_expired}",
-                        );
+                        let cache_rows: usize =
+                            batches_for_cache.iter().map(RecordBatch::num_rows).sum();
+
+                        // Send write request to batched consumer
+                        let write_request = CacheWriteRequest {
+                            batches: batches_for_cache,
+                            filters: filters.to_vec(),
+                            is_upsert: is_expired,
+                            cache_key,
+                        };
+                        if let Err(e) = batch_write_tx.send(write_request).await {
+                            tracing::warn!(
+                                "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
+                            );
+                        } else {
+                            tracing::trace!(
+                                "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows, is_upsert={is_expired}",
+                            );
+                        }
                     }
 
-                    // Propagate filtered data to children (same as parent - excludes 5xx for consistency)
+                    // Propagate cacheable data to children.
                     let synchronized_children_clone = Arc::clone(&synchronized_children);
                     let dataset_name_clone = dataset_name.to_string();
                     io_runtime.spawn(async move {
@@ -1423,6 +1429,10 @@ impl CacheRefreshHelper {
                                 }
                             }
                         });
+                    } else {
+                        tracing::debug!(
+                            "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
+                        );
                     }
                 }
                 CacheFreshness::Expired => {
