@@ -384,6 +384,209 @@ pub(crate) mod tests {
         ]))
     }
 
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_preserves_non_http_response_status_column() {
+        use arrow::array::Int32Array;
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(UInt16Array::from(vec![500])),
+            ],
+        )
+        .expect("to create batch");
+
+        let raw_cache_key = crate::key::CacheKey::Query("non-http-response-status", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(batch.clone())]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["local_table".into()])),
+        );
+
+        let output_batches = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+        assert_eq!(output_batches.len(), 1);
+        assert_eq!(output_batches[0].num_rows(), 1);
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed")
+            .expect(
+                "non-HTTP query results should still be cached even if they contain a response_status column",
+            );
+
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        assert_eq!(cached_batches.len(), 1);
+        assert_eq!(cached_batches[0].num_rows(), 1);
+
+        let cached_status = cached_batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("cached response_status should remain UInt16Array");
+        assert_eq!(cached_status.value(0), 500);
+    }
+
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_skips_mixed_http_success_and_transient_rows() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["ok", "server error"])),
+                Arc::new(UInt16Array::from(vec![200, 500])),
+            ],
+        )
+        .expect("to create batch");
+
+        let raw_cache_key = crate::key::CacheKey::Query("mixed-http-status-rows", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(batch.clone())]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["http_table".into()])),
+        );
+
+        let output_batches = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+        assert_eq!(output_batches.len(), 1);
+        assert_eq!(output_batches[0].num_rows(), 2);
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "mixed HTTP success/error results should not be cached as a partial result set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_to_cached_record_batch_stream_skips_http_results_when_any_batch_is_transient_error() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = create_http_response_schema();
+        let ok_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["ok"])),
+                Arc::new(UInt16Array::from(vec![200])),
+            ],
+        )
+        .expect("to create ok batch");
+        let error_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["rate limited"])),
+                Arc::new(UInt16Array::from(vec![429])),
+            ],
+        )
+        .expect("to create error batch");
+
+        let raw_cache_key = crate::key::CacheKey::Query("mixed-http-status-batches", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![
+                Ok::<RecordBatch, DataFusionError>(ok_batch.clone()),
+                Ok::<RecordBatch, DataFusionError>(error_batch.clone()),
+            ]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["http_table".into()])),
+        );
+
+        let output_batches = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+        assert_eq!(output_batches.len(), 2);
+        assert_eq!(output_batches[0].num_rows(), 1);
+        assert_eq!(output_batches[1].num_rows(), 1);
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "HTTP results should not be cached if any batch contains only transient errors"
+        );
+    }
+
     #[test]
     fn test_filter_no_response_status_column() {
         let schema = Arc::new(Schema::new(vec![
