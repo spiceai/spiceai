@@ -455,11 +455,26 @@ impl Query {
         input_tables: Arc<HashSet<TableReference>>,
     ) {
         if let Some(cache_provider) = df.results_cache_provider() {
+            // Skip cache writes if the revalidation result contains transient HTTP
+            // error responses. Preserve the existing stale cache entry instead of
+            // storing a partial result set.
+            let Some(batches_to_cache) = cache::batches_to_cache(&batches) else {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation returned transient HTTP error responses, preserving stale cache"
+                );
+                return;
+            };
+
+            if batches_to_cache.is_empty() {
+                return;
+            }
+
             let cached_at = std::time::Instant::now();
             let encoder = cache_provider.encoder();
 
             match cache::result::query::CachedQueryResult::from_batches(
-                &batches,
+                &batches_to_cache,
                 input_tables,
                 cached_at,
                 encoder,

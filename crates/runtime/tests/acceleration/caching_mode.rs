@@ -653,8 +653,8 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
             ));
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("sqlite".to_string()),
-                mode: Mode::Memory,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
                 ..Acceleration::default()

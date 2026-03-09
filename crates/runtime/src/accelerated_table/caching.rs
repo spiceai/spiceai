@@ -21,8 +21,8 @@ use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
 use arrow::array::StringArray;
-use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray, UInt16Array};
-use arrow::compute::{cast, filter_record_batch};
+use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
@@ -423,8 +423,6 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
     })
 }
 
-const RESPONSE_STATUS_COLUMN: &str = "response_status";
-
 /// Helper functions for cache refresh operations
 pub struct CacheRefreshHelper;
 
@@ -567,14 +565,19 @@ impl CacheRefreshHelper {
         // Fetch fresh data for this specific entry
         let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
 
-        // Filter out transient error responses (5xx/429) - they should not be cached
-        let batches = retain_cacheable_responses(batches)?;
-
-        if batches.is_empty() {
+        // Skip cache writes if the source response contains transient HTTP errors.
+        let Some(batches) = cache::batches_to_cache(&batches) else {
             tracing::debug!(
-                "No cacheable data for dataset={dataset_name} (source returned empty or transient error)"
+                "No cacheable data for dataset={dataset_name} (source returned transient HTTP error responses)"
             );
             // Remove from in-flight since no data to write
+            let mut in_flight = in_flight_revalidations.lock().await;
+            in_flight.remove(&cache_key);
+            return Ok(0);
+        };
+
+        if batches.is_empty() {
+            tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
             let mut in_flight = in_flight_revalidations.lock().await;
             in_flight.remove(&cache_key);
             return Ok(0);
@@ -1215,66 +1218,63 @@ impl CacheRefreshHelper {
                 let batch_schema = batches[0].schema();
                 tracing::trace!("Fetched batch schema:\n{}", SchemaDisplay(&batch_schema));
 
-                // Filter out transient error responses (5xx/429) for caching - they
-                // should not be persisted. User still receives all data.
-                let batches_for_cache = match retain_cacheable_responses(batches.clone()) {
-                    Ok(filtered) => filtered,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to filter transient error responses for caching for dataset={dataset_name}: {e}"
-                        );
-                        Vec::new() // Skip caching on error, but still return data to user
-                    }
-                };
+                // Skip cache writes if the source response contains transient HTTP
+                // errors. User still receives all fetched data.
+                let batches_for_cache = cache::batches_to_cache(&batches);
 
                 // Clone batches for propagation to children.
                 // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
-                let batches_for_propagate = batches_for_cache.clone();
+                let batches_for_propagate = batches_for_cache.clone().unwrap_or_default();
                 let filters_clone: Vec<Expr> = filters.to_vec();
                 let cache_key = compute_cache_key_from_filters(filters);
 
-                // Only cache if we have cacheable (non-transient-error) data
-                if batches_for_cache.is_empty() {
-                    tracing::debug!(
-                        "Fetch returned transient error response, skipping cache write for dataset={dataset_name}"
-                    );
-                } else {
-                    let cache_rows: usize =
-                        batches_for_cache.iter().map(RecordBatch::num_rows).sum();
-
-                    // Send write request to batched consumer
-                    let write_request = CacheWriteRequest {
-                        batches: batches_for_cache,
-                        filters: filters.to_vec(),
-                        is_upsert: is_expired,
-                        cache_key,
-                    };
-                    if let Err(e) = batch_write_tx.send(write_request).await {
-                        tracing::warn!(
-                            "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
+                if let Some(batches_for_cache) = batches_for_cache {
+                    if batches_for_cache.is_empty() {
+                        tracing::debug!(
+                            "Fetch returned no rows, skipping cache write for dataset={dataset_name}"
                         );
                     } else {
-                        tracing::trace!(
-                            "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows, is_upsert={is_expired}",
+                        let cache_rows: usize =
+                            batches_for_cache.iter().map(RecordBatch::num_rows).sum();
+
+                        // Send write request to batched consumer
+                        let write_request = CacheWriteRequest {
+                            batches: batches_for_cache,
+                            filters: filters.to_vec(),
+                            is_upsert: is_expired,
+                            cache_key,
+                        };
+                        if let Err(e) = batch_write_tx.send(write_request).await {
+                            tracing::warn!(
+                                "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
+                            );
+                        } else {
+                            tracing::trace!(
+                                "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows, is_upsert={is_expired}",
+                            );
+                        }
+
+                        // Propagate cacheable data to children.
+                        let synchronized_children_clone = Arc::clone(&synchronized_children);
+                        let dataset_name_clone = dataset_name.to_string();
+                        io_runtime.spawn(async move {
+                            Self::propagate_to_synchronized_children(
+                                &synchronized_children_clone,
+                                &dataset_name_clone,
+                                &filters_clone,
+                                &batches_for_propagate,
+                                is_expired,
+                            )
+                            .await;
+                        });
+
+                        tracing::debug!(
+                            "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
                         );
                     }
-
-                    // Propagate filtered data to children (same as parent - excludes 5xx for consistency)
-                    let synchronized_children_clone = Arc::clone(&synchronized_children);
-                    let dataset_name_clone = dataset_name.to_string();
-                    io_runtime.spawn(async move {
-                        Self::propagate_to_synchronized_children(
-                            &synchronized_children_clone,
-                            &dataset_name_clone,
-                            &filters_clone,
-                            &batches_for_propagate,
-                            is_expired,
-                        )
-                        .await;
-                    });
-
+                } else {
                     tracing::debug!(
-                        "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                        "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
                     );
                 }
 
@@ -1433,6 +1433,10 @@ impl CacheRefreshHelper {
                                 }
                             }
                         });
+                    } else {
+                        tracing::debug!(
+                            "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
+                        );
                     }
                 }
                 CacheFreshness::Expired => {
@@ -1748,60 +1752,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     }
 }
 
-/// Retain only cacheable responses (exclude 5xx server errors and 429 Too Many Requests)
-/// from batches before caching.
-///
-/// These errors are typically transient (e.g., server overload, temporary outage,
-/// rate limiting) and should not be persisted in the cache. This ensures that
-/// temporary failures don't pollute the cache with error responses that would be
-/// served to subsequent requests.
-///
-/// Returns an error if the `response_status` column is missing or has the wrong type,
-/// as this indicates a schema bug in the HTTP connector code path.
-fn retain_cacheable_responses(batches: Vec<RecordBatch>) -> DataFusionResult<Vec<RecordBatch>> {
-    let mut result = Vec::with_capacity(batches.len());
-
-    for batch in batches {
-        // Get the response_status column index - must exist for HTTP connector batches
-        let col_idx = batch
-            .schema()
-            .index_of(RESPONSE_STATUS_COLUMN)
-            .map_err(|_| {
-                DataFusionError::Internal(format!(
-                    "Missing required '{RESPONSE_STATUS_COLUMN}' column in HTTP response batch"
-                ))
-            })?;
-
-        // Get the response_status column as UInt16Array
-        let status_array = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "'{RESPONSE_STATUS_COLUMN}' column must be UInt16Array"
-                ))
-            })?;
-
-        // Create boolean mask: true for status codes that should be cached
-        // (exclude 5xx server errors and 429 Too Many Requests)
-        let mask: arrow::array::BooleanArray = status_array
-            .iter()
-            .map(|status| status.map(|s| !(500..600).contains(&s) && s != 429))
-            .collect();
-
-        // Apply filter
-        let filtered = filter_record_batch(&batch, &mask)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-        if filtered.num_rows() > 0 {
-            result.push(filtered);
-        }
-    }
-
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "duckdb")]
@@ -1814,9 +1764,12 @@ mod tests {
     use duckdb::AccessMode;
 
     use super::*;
-    use arrow::array::{Int32Array, RecordBatch, StringArray, TimestampNanosecondArray};
+    use arrow::array::{
+        Int32Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array,
+    };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use async_trait::async_trait;
+    use cache::utils::RESPONSE_STATUS_COLUMN;
     use datafusion::catalog::Session;
     use datafusion::common::{Constraint, Constraints, ToDFSchema};
     use datafusion::datasource::TableType;
@@ -2745,7 +2698,7 @@ mod tests {
             let path = StringArray::from(vec!["/api/users"]);
             let query = StringArray::from(vec!["id=1"]);
             let data = StringArray::from(vec!["fresh_user_data"]);
-            let status = UInt16Array::from(vec![200]); // 200 OK - will pass retain_cacheable_responses
+            let status = UInt16Array::from(vec![200]); // 200 OK - will pass filter_transient_error_responses
 
             #[expect(clippy::cast_possible_truncation)]
             let now = SystemTime::now()
@@ -3200,7 +3153,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 3, "All 2xx rows should be kept");
@@ -3222,7 +3175,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 3, "All 4xx rows should be kept");
@@ -3240,7 +3193,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert!(result.is_empty(), "All 5xx rows should be filtered out");
     }
@@ -3262,7 +3215,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 3, "Should keep 3 non-5xx rows");
@@ -3280,7 +3233,7 @@ mod tests {
 
     #[test]
     fn test_filter_5xx_responses_empty_batches() {
-        let result = retain_cacheable_responses(vec![]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[]);
         assert!(result.is_empty(), "Empty input should return empty output");
     }
 
@@ -3315,8 +3268,7 @@ mod tests {
         )
         .expect("to create batch3");
 
-        let result = retain_cacheable_responses(vec![batch1, batch2, batch3])
-            .expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch1, batch2, batch3]);
 
         assert_eq!(
             result.len(),
@@ -3344,7 +3296,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 2, "Should keep 499 and 600");
@@ -3370,7 +3322,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert!(
             result.is_empty(),
@@ -3395,7 +3347,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+        let result = cache::filter_transient_error_responses(&[batch]);
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(
