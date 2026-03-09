@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, SchemaTestArgs,
-    TestCommands, TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs, TestCommands,
+    TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -52,7 +52,6 @@ async fn main() -> anyhow::Result<()> {
                 test_args: DatasetTestArgs { common, .. },
                 ..
             })
-            | TestCommands::Evals(EvalsTestArgs { common, .. })
             | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::TextToSql(TextToSqlArgs { common, .. })
             | TestCommands::Schema(SchemaTestArgs { common, .. })
@@ -76,9 +75,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Dispatch(args) => {
             commands::dispatch::dispatch(args).await?;
-        }
-        Commands::Run(TestCommands::Evals(args)) => {
-            commands::evals::run(&args).await?;
         }
         #[cfg(feature = "append")]
         Commands::Run(TestCommands::Append(args)) => {

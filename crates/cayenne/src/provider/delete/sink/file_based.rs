@@ -39,6 +39,7 @@ use crate::provider::Error;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
@@ -100,7 +101,7 @@ pub struct FileBasedDeletionSink {
     /// In-memory protected snapshots map (shared with `CayenneTableProvider`).
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
     /// Table ID for catalog operations.
-    table_id: i64,
+    table_id: String,
     /// Table base path for constructing snapshot directory paths.
     table_path: String,
     /// Shared runtime environment for cache invalidation after file deletion.
@@ -130,7 +131,7 @@ impl FileBasedDeletionSink {
         table_name: String,
         catalog: Arc<dyn MetadataCatalog>,
         protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
-        table_id: i64,
+        table_id: String,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
@@ -307,11 +308,13 @@ impl FileBasedDeletionSink {
                 .clone()
         };
 
-        // A single throwaway SessionContext for the entire operation. It only
-        // provides the object-store registry.
+        // Use the shared RuntimeEnv which has S3 object stores pre-registered.
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
         // shared ListingTable and are unaffected by this SessionContext.
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(&self.runtime_env),
+        );
 
         // Get the object store for file deletion
         let object_store_url = listing_table
@@ -432,7 +435,7 @@ impl FileBasedDeletionSink {
             // 1. Remove snapshot sequence from catalog
             if let Err(e) = self
                 .catalog
-                .clear_snapshot_sequence(self.table_id, snapshot_id)
+                .clear_snapshot_sequence(&self.table_id, snapshot_id)
                 .await
             {
                 tracing::warn!(
@@ -455,7 +458,7 @@ impl FileBasedDeletionSink {
 
             // 3. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
-                .join(self.table_id.to_string())
+                .join(&self.table_id)
                 .join(snapshot_id);
             match tokio::fs::remove_dir_all(&snapshot_dir).await {
                 Ok(()) => {}

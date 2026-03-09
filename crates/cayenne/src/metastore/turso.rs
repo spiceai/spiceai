@@ -30,6 +30,7 @@ use turso::{Builder, Connection, Database, Value as TursoValue};
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
     db: Arc<Mutex<Option<Database>>>,
+    conn: Arc<Mutex<Option<Connection>>>,
     connection_string: String,
 }
 
@@ -46,6 +47,7 @@ impl TursoMetastore {
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
             db: Arc::new(Mutex::new(None)),
+            conn: Arc::new(Mutex::new(None)),
             connection_string: connection_string.into(),
         }
     }
@@ -91,8 +93,14 @@ impl TursoMetastore {
         Ok(db)
     }
 
-    /// Get a connection from the database.
+    /// Get or create a cached connection from the database.
     async fn get_conn(&self) -> CatalogResult<Connection> {
+        let mut conn_guard = self.conn.lock().await;
+
+        if let Some(conn) = conn_guard.as_ref() {
+            return Ok(conn.clone());
+        }
+
         let db = self.get_db().await?;
         let conn = db.connect().map_err(|e| CatalogError::Database {
             message: format!("Failed to connect to Turso database: {e}"),
@@ -105,14 +113,28 @@ impl TursoMetastore {
                 message: format!("Failed to set busy timeout: {e}"),
             })?;
 
+        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set synchronous mode: {e}"),
+            })?;
+
+        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set cache size: {e}"),
+            })?;
+
+        *conn_guard = Some(conn.clone());
         Ok(conn)
     }
 
     /// Schema for the `cayenne_table` table.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_uuid TEXT NOT NULL,
+            table_id TEXT PRIMARY KEY,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
@@ -126,11 +148,16 @@ impl TursoMetastore {
         )
     ";
 
+    const TABLE_NAME_UNIQUE_INDEX_DDL: &'static str = r"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_table_name_unique
+        ON cayenne_table(table_name)
+    ";
+
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            delete_file_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -149,8 +176,8 @@ impl TursoMetastore {
     /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            partition_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             partition_columns_json TEXT NOT NULL,
             partition_values_json TEXT NOT NULL,
             partition_key TEXT NOT NULL,
@@ -172,8 +199,8 @@ impl TursoMetastore {
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            insert_record_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -188,7 +215,7 @@ impl TursoMetastore {
     /// <= the delete file's `sequence_number`.
     const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
-            table_id INTEGER NOT NULL,
+            table_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -307,26 +334,11 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
 
-        // NORMAL synchronous mode: safe with WAL, more performant than FULL
-        // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
-        conn.execute("PRAGMA synchronous = NORMAL", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set synchronous mode: {e}"),
-            })?;
-
-        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
-        // Larger cache reduces disk I/O for frequently accessed metadata
-        conn.execute("PRAGMA cache_size = -32768", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set cache size: {e}"),
-            })?;
-
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
+            Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,
@@ -409,7 +421,11 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        conn.execute(params.sql, turso_params)
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(convert_turso_error)?;
+        stmt.execute(turso_params)
             .await
             .map_err(convert_turso_error)?;
 
@@ -437,12 +453,18 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut rows =
-            conn.query(params.sql, turso_params)
+        let mut stmt =
+            conn.prepare_cached(params.sql)
                 .await
                 .map_err(|e| CatalogError::Database {
                     message: format!("Failed to query row: {e}"),
                 })?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to query row: {e}"),
+            })?;
 
         let row = rows.next().await.map_err(|e| CatalogError::Database {
             message: format!("Failed to fetch row: {e}"),
@@ -474,12 +496,18 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        let mut rows =
-            conn.query(params.sql, turso_params)
+        let mut stmt =
+            conn.prepare_cached(params.sql)
                 .await
                 .map_err(|e| CatalogError::Database {
                     message: format!("Failed to query rows: {e}"),
                 })?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to query rows: {e}"),
+            })?;
 
         let mut results = Vec::new();
 

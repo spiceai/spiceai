@@ -352,8 +352,8 @@ impl CayenneTableProvider {
 
     /// Returns the table ID from the catalog.
     #[must_use]
-    pub(crate) fn table_id(&self) -> i64 {
-        self.table_metadata.table_id
+    pub(crate) fn table_id(&self) -> &str {
+        &self.table_metadata.table_id
     }
 
     /// Returns a reference to the write lock for serializing insert operations.
@@ -373,7 +373,7 @@ impl CayenneTableProvider {
     pub(crate) fn snapshot_dir_path_for(&self, snapshot_id: &str) -> std::path::PathBuf {
         Self::snapshot_dir_path(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             snapshot_id,
         )
     }
@@ -383,7 +383,7 @@ impl CayenneTableProvider {
     /// This clears any existing delete files since overwrite replaces all data.
     pub(crate) async fn commit_overwrite(&self, new_snapshot_id: &str) -> CatalogResult<()> {
         self.catalog
-            .commit_compaction(self.table_metadata.table_id, new_snapshot_id)
+            .commit_compaction(&self.table_metadata.table_id, new_snapshot_id)
             .await
     }
 
@@ -393,7 +393,7 @@ impl CayenneTableProvider {
     pub(crate) fn update_listing_table_for_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             new_snapshot_id,
         );
 
@@ -439,17 +439,17 @@ impl CayenneTableProvider {
             {
                 tracing::warn!(
                     "Failed to cleanup old S3 snapshots for table {}: {err}",
-                    self.table_metadata.table_id
+                    &self.table_metadata.table_id
                 );
             }
         } else {
             let table_path = self.table_metadata.path.clone();
-            let table_id = self.table_metadata.table_id;
+            let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = Self::cleanup_old_snapshots_blocking(
                     &table_path,
-                    table_id,
+                    &table_id,
                     &current_snapshot,
                     &protected_snapshot_ids,
                 ) {
@@ -473,11 +473,11 @@ impl CayenneTableProvider {
     /// * `snapshot_id` - The snapshot identifier
     pub(super) fn snapshot_dir_path(
         table_path: &str,
-        table_id: i64,
+        table_id: &str,
         snapshot_id: &str,
     ) -> std::path::PathBuf {
         std::path::PathBuf::from(table_path)
-            .join(table_id.to_string())
+            .join(table_id)
             .join(snapshot_id)
     }
 
@@ -528,7 +528,7 @@ impl CayenneTableProvider {
 
         let snapshot_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             snapshot_id,
         );
 
@@ -698,7 +698,7 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table (local path or S3 URL)
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_url(table_path: &str, table_id: i64, snapshot_id: &str) -> String {
+    fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
         if table_path.starts_with("s3://") {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
@@ -742,7 +742,7 @@ impl CayenneTableProvider {
             // Local FS: remove and recreate the directory
             let staging_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 STAGING_DIR_NAME,
             );
             match tokio::fs::remove_dir_all(&staging_dir).await {
@@ -781,12 +781,12 @@ impl CayenneTableProvider {
     async fn move_staging_files_local(&self, current_snapshot: &str) -> Result<()> {
         let staging_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             STAGING_DIR_NAME,
         );
         let target_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             current_snapshot,
         );
 
@@ -977,11 +977,11 @@ impl CayenneTableProvider {
     /// It must be called from within `tokio::task::spawn_blocking`.
     fn cleanup_old_snapshots_blocking(
         table_path: &str,
-        table_id: i64,
+        table_id: &str,
         current_snapshot_id: &str,
         protected_snapshot_ids: &HashSet<String>,
     ) -> CatalogResult<()> {
-        let table_dir = std::path::PathBuf::from(table_path).join(table_id.to_string());
+        let table_dir = std::path::PathBuf::from(table_path).join(table_id);
 
         // Check if table directory exists
         if !table_dir.exists() {
@@ -1120,7 +1120,7 @@ impl CayenneTableProvider {
         // All tables have a snapshot ID (created on table initialization)
         let snapshot_dir_url = Self::snapshot_dir_url(
             &table_metadata.path,
-            table_metadata.table_id,
+            &table_metadata.table_id,
             &table_metadata.current_snapshot_id,
         );
 
@@ -1175,10 +1175,10 @@ impl CayenneTableProvider {
         // Load deletion vectors and insert records once at initialization
         // to avoid repeated SQLite queries on every scan.
         // Returns the fully constructed PkDeletionStrategy with embedded caches.
-        let table_id = table_metadata.table_id;
+        let table_id = table_metadata.table_id.clone();
         let catalog_for_load = Arc::clone(&catalog);
         let pk_deletion_strategy =
-            Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy_kind)
+            Self::load_deletion_vectors_all(&table_id, catalog_for_load, pk_deletion_strategy_kind)
                 .await?;
 
         let listing_table = Self::create_listing_table(
@@ -1192,8 +1192,16 @@ impl CayenneTableProvider {
         // Protected snapshots are those with sequence > max_delete_sequence.
         // They contain data written after deletions and should skip deletion filtering.
         let protected_snapshots =
-            Self::load_protected_snapshots(Arc::clone(&catalog), table_id, &pk_deletion_strategy)
+            Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
+
+        // Register the S3 object store in the shared RuntimeEnv once during
+        // construction. Every code path that creates a SessionContext from
+        // `self.context.runtime_env()` (e.g. `create_session_context`, keyset
+        // loading, deletion sinks) will automatically inherit the store.
+        if let Some(ref config) = object_store_config {
+            Self::register_object_store_if_needed(context.runtime_env(), config);
+        }
 
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
@@ -1303,7 +1311,7 @@ impl CayenneTableProvider {
         // Record the snapshot's sequence number in the catalog
         self.catalog
             .set_snapshot_sequence(
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &new_snapshot_id,
                 sequence_number,
             )
@@ -1392,7 +1400,7 @@ impl CayenneTableProvider {
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             snapshot_id,
         );
 
@@ -1741,7 +1749,7 @@ impl CayenneTableProvider {
             guard.clone()
         };
 
-        let ctx = SessionContext::new();
+        let ctx = self.create_session_context();
         // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
 
@@ -1814,7 +1822,7 @@ impl CayenneTableProvider {
         for (snapshot_id, max_delete_seq_at_creation) in &protected_snapshots {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 snapshot_id,
             );
 
@@ -2284,7 +2292,7 @@ impl CayenneTableProvider {
         // the next delete will be properly filtered.
         let delete_sequence = self
             .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Failed to get delete sequence number: {err}"),
@@ -2362,7 +2370,7 @@ impl CayenneTableProvider {
         if !pk_bytes_list_for_insert_records.is_empty() {
             self.catalog
                 .add_insert_records_batch(
-                    self.table_metadata.table_id,
+                    &self.table_metadata.table_id,
                     pk_bytes_list_for_insert_records,
                     insert_sequence,
                 )
@@ -2612,7 +2620,7 @@ impl CayenneTableProvider {
             if is_s3 {
                 let snapshot_url = Self::snapshot_dir_url(
                     &self.table_metadata.path,
-                    self.table_metadata.table_id,
+                    &self.table_metadata.table_id,
                     &new_snapshot_id,
                 );
 
@@ -2713,7 +2721,7 @@ impl CayenneTableProvider {
         // the catalog yet, avoiding an inconsistent state.
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             &new_snapshot_id,
         );
         let new_listing_table = Self::create_listing_table(
@@ -2766,22 +2774,17 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Create a `SessionContext` for data operations, registering object store if configured.
+    /// Create a `SessionContext` for data operations using the shared `RuntimeEnv`.
+    ///
+    /// The shared `RuntimeEnv` (from [`CayenneContext`]) already has the S3 object
+    /// store registered during construction, so all sessions created here inherit
+    /// it automatically. This also shares the `list_files` cache and other
+    /// runtime-level caches with the main Spice query engine.
     fn create_session_context(&self) -> SessionContext {
-        let ctx = SessionContext::new();
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
-
-        // Register object store if configured for remote storage (e.g., S3 Express One Zone)
-        if let Some(ref config) = self.object_store_config {
-            Self::register_object_store_if_needed(&ctx.runtime_env(), config);
-        } else if is_s3 {
-            tracing::warn!(
-                "Creating SessionContext for S3 table {} but no object_store_config!",
-                self.table_metadata.table_name
-            );
-        }
-
-        ctx
+        SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(self.context.runtime_env()),
+        )
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -2835,6 +2838,7 @@ impl CayenneTableProvider {
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
+            Arc::clone(self.context.runtime_env()),
         );
 
         let deleted_count =
@@ -2865,7 +2869,7 @@ impl CayenneTableProvider {
     /// Returns an error if deletion vectors cannot be loaded from the catalog.
     async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
         let fresh_strategy = Self::load_deletion_vectors_all(
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
         )
@@ -3133,7 +3137,7 @@ impl CayenneTableProvider {
         let current_snapshot = self.get_current_snapshot_id()?;
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             &current_snapshot,
         );
 
@@ -3211,7 +3215,7 @@ impl CayenneTableProvider {
     ///
     /// The fully constructed `PkDeletionStrategy` with all caches populated.
     async fn load_deletion_vectors_all(
-        table_id: i64,
+        table_id: &str,
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
@@ -3390,7 +3394,7 @@ impl CayenneTableProvider {
     /// They contain data written after deletions and should skip deletion filtering.
     async fn load_protected_snapshots(
         catalog: Arc<dyn MetadataCatalog>,
-        table_id: i64,
+        table_id: &str,
         strategy: &PkDeletionStrategyWithCache,
     ) -> CatalogResult<HashMap<String, i64>> {
         // Only PK-based strategies support sequence-ordered snapshot protection.
@@ -3515,7 +3519,7 @@ impl CayenneTableProvider {
             // Create listing table for this snapshot
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &snapshot_id,
             );
 
@@ -4113,7 +4117,7 @@ impl TableProvider for CayenneTableProvider {
             })?;
             let snapshot_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &current_snapshot,
             );
             Self::ensure_snapshot_dir_exists(&snapshot_dir)
@@ -4191,7 +4195,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.protected_snapshots),
-                self.table_metadata.table_id,
+                self.table_metadata.table_id.clone(),
                 self.table_metadata.path.clone(),
                 Arc::clone(self.context.runtime_env()),
             )),
@@ -4221,6 +4225,7 @@ impl CayenneTableProvider {
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
                 snapshot_tables,
+                Arc::clone(self.context.runtime_env()),
             )),
             &self.table_metadata.schema,
         )))
@@ -4245,7 +4250,7 @@ impl CayenneTableProvider {
         for (snapshot_id, _) in protected_snapshots {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &snapshot_id,
             );
 

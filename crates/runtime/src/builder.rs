@@ -343,12 +343,6 @@ impl RuntimeBuilder {
             None
         };
 
-        let evals = self
-            .app
-            .as_ref()
-            .map(|a| a.evals.clone())
-            .unwrap_or_default();
-
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
             df,
@@ -357,8 +351,6 @@ impl RuntimeBuilder {
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
-            evals: Arc::new(RwLock::new(evals)),
-            eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),

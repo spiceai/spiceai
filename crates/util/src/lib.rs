@@ -109,7 +109,7 @@ pub fn pretty_print_number(num: usize) -> String {
 /// ```
 #[must_use]
 pub fn parse_enabled(value: &str) -> bool {
-    value.to_lowercase() == "enabled"
+    value.eq_ignore_ascii_case("enabled")
 }
 
 pub async fn shutdown_signal() {
