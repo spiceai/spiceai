@@ -17,7 +17,6 @@ limitations under the License.
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 const STATE_FILE_NAME: &str = "cluster.state";
@@ -92,26 +91,34 @@ pub fn state_exists(work_dir: &Path) -> bool {
 }
 
 /// Load cluster state from file.
-pub fn load_state(work_dir: &Path) -> Result<ClusterState> {
+pub async fn load_state(work_dir: &Path) -> Result<ClusterState> {
     let state_path = work_dir.join(STATE_FILE_NAME);
-    let contents = fs::read_to_string(&state_path).context("Failed to read cluster state file")?;
+    let contents = tokio::fs::read_to_string(&state_path)
+        .await
+        .context("Failed to read cluster state file")?;
     serde_json::from_str(&contents).context("Failed to parse cluster state file")
 }
 
 /// Save cluster state to file.
-pub fn save_state(state: &ClusterState, work_dir: &Path) -> Result<()> {
-    fs::create_dir_all(work_dir).context("Failed to create working directory")?;
+pub async fn save_state(state: &ClusterState, work_dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(work_dir)
+        .await
+        .context("Failed to create working directory")?;
     let state_path = work_dir.join(STATE_FILE_NAME);
     let contents = serde_json::to_string_pretty(state).context("Failed to serialize state")?;
-    fs::write(&state_path, contents).context("Failed to write cluster state file")?;
+    tokio::fs::write(&state_path, contents)
+        .await
+        .context("Failed to write cluster state file")?;
     Ok(())
 }
 
 /// Remove cluster state file.
-pub fn remove_state(work_dir: &Path) -> Result<()> {
+pub async fn remove_state(work_dir: &Path) -> Result<()> {
     let state_path = work_dir.join(STATE_FILE_NAME);
     if state_path.exists() {
-        fs::remove_file(&state_path).context("Failed to remove cluster state file")?;
+        tokio::fs::remove_file(&state_path)
+            .await
+            .context("Failed to remove cluster state file")?;
     }
     Ok(())
 }
@@ -145,17 +152,21 @@ mod tests {
         ClusterState::new(PathBuf::from("/tmp/project"), scheduler, vec![executor])
     }
 
-    #[test]
-    fn test_save_and_load_state() {
+    #[tokio::test]
+    async fn test_save_and_load_state() {
         let temp_dir = TempDir::new().expect("failed to create temp directory");
         let state = create_test_state();
 
         // Save state
-        save_state(&state, temp_dir.path()).expect("failed to save state");
+        save_state(&state, temp_dir.path())
+            .await
+            .expect("failed to save state");
         assert!(state_exists(temp_dir.path()));
 
         // Load state
-        let loaded = load_state(temp_dir.path()).expect("failed to load state");
+        let loaded = load_state(temp_dir.path())
+            .await
+            .expect("failed to load state");
         assert_eq!(loaded.scheduler.pid, state.scheduler.pid);
         assert_eq!(loaded.executors.len(), 1);
         assert_eq!(loaded.executors[0].name, "executor1");
@@ -167,15 +178,19 @@ mod tests {
         assert!(!state_exists(temp_dir.path()));
     }
 
-    #[test]
-    fn test_remove_state() {
+    #[tokio::test]
+    async fn test_remove_state() {
         let temp_dir = TempDir::new().expect("failed to create temp directory");
         let state = create_test_state();
 
-        save_state(&state, temp_dir.path()).expect("failed to save state");
+        save_state(&state, temp_dir.path())
+            .await
+            .expect("failed to save state");
         assert!(state_exists(temp_dir.path()));
 
-        remove_state(temp_dir.path()).expect("failed to remove state");
+        remove_state(temp_dir.path())
+            .await
+            .expect("failed to remove state");
         assert!(!state_exists(temp_dir.path()));
     }
 

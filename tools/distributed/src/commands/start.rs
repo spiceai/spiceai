@@ -230,7 +230,9 @@ pub async fn execute(args: StartArgs) -> Result<()> {
         scheduler_node.clone(),
         executor_nodes.clone(),
     );
-    save_state(&state, &config.paths.work_dir).context("Failed to save cluster state")?;
+    save_state(&state, &config.paths.work_dir)
+        .await
+        .context("Failed to save cluster state")?;
 
     // Print status
     println!();
@@ -313,7 +315,7 @@ async fn wait_for_shutdown(state: &ClusterState) -> Result<()> {
 
     // Remove state file
     if let Some(parent) = state.scheduler.work_dir.parent() {
-        if let Err(e) = remove_state(parent) {
+        if let Err(e) = remove_state(parent).await {
             output::warning(&format!("Failed to remove state file: {e}"));
         }
     } else {

@@ -51,7 +51,9 @@ pub async fn execute(args: StopArgs) -> Result<()> {
     }
 
     // Load state
-    let state = load_state(&work_dir).context("Failed to load cluster state")?;
+    let state = load_state(&work_dir)
+        .await
+        .context("Failed to load cluster state")?;
 
     output::info("Stopping distributed Spice cluster...");
 
@@ -116,7 +118,9 @@ pub async fn execute(args: StopArgs) -> Result<()> {
 
     // Report results and remove state file only if all components stopped successfully
     if !has_executor_errors && !scheduler_failed {
-        remove_state(&work_dir).context("Failed to remove cluster state")?;
+        remove_state(&work_dir)
+            .await
+            .context("Failed to remove cluster state")?;
         output::success("Cluster stopped successfully!");
         Ok(())
     } else {

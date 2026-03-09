@@ -71,7 +71,9 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
     }
 
     // Load state
-    let state = load_state(&work_dir).context("Failed to load cluster state")?;
+    let state = load_state(&work_dir)
+        .await
+        .context("Failed to load cluster state")?;
 
     // Get log file path from state
     let log_file = if let Some(path) = state.get_log_path(&args.component) {
@@ -138,13 +140,13 @@ async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()>
                         match file.read_to_end(&mut buffer).await {
                             Ok(bytes_read) => {
                                 if bytes_read > 0 {
-                                    // Convert new bytes to string and print line by line
-                                    if let Ok(new_content) = String::from_utf8(buffer) {
-                                        for line in new_content.lines() {
-                                            println!("{line}");
-                                        }
-                                        byte_offset += bytes_read;
+                                    // Convert new bytes to string (lossy) and print line by line;
+                                    // always advance offset even if bytes are not valid UTF-8
+                                    let new_content = String::from_utf8_lossy(&buffer);
+                                    for line in new_content.lines() {
+                                        println!("{line}");
                                     }
+                                    byte_offset += bytes_read;
                                 }
                             }
                             Err(e) => {

@@ -169,33 +169,50 @@ pub fn is_process_alive(_pid: u32) -> bool {
 #[cfg(unix)]
 #[expect(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub fn stop_process(pid: u32, timeout_secs: u64) -> Result<()> {
-    let pid = Pid::from_raw(pid as i32);
+    let nix_pid = Pid::from_raw(pid as i32);
+    let spid = sysinfo::Pid::from_u32(pid);
 
-    // Check if process is alive
-    if !is_process_alive(pid.as_raw() as u32) {
+    // Reuse a single System instance to avoid repeated allocation during the polling loop
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    if system.process(spid).is_none() {
         return Ok(());
     }
 
     // Send SIGTERM
-    signal::kill(pid, Signal::SIGTERM).context("Failed to send SIGTERM")?;
+    signal::kill(nix_pid, Signal::SIGTERM).context("Failed to send SIGTERM")?;
 
     // Wait for process to terminate
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
-        if !is_process_alive(pid.as_raw() as u32) {
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[spid]),
+            true,
+            ProcessRefreshKind::everything(),
+        );
+        if system.process(spid).is_none() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     // Process didn't terminate, send SIGKILL
-    signal::kill(pid, Signal::SIGKILL).context("Failed to send SIGKILL")?;
+    signal::kill(nix_pid, Signal::SIGKILL).context("Failed to send SIGKILL")?;
 
     // Wait a bit more for SIGKILL to take effect
     std::thread::sleep(Duration::from_secs(1));
 
-    if is_process_alive(pid.as_raw() as u32) {
-        return Err(anyhow!("Failed to kill process {pid}"));
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    if system.process(spid).is_some() {
+        return Err(anyhow!("Failed to kill process {nix_pid}"));
     }
 
     Ok(())

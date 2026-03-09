@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -69,10 +69,12 @@ impl HealthCheck {
                 .unwrap_or_else(|_| reqwest::Client::new())
         });
 
-        match client.get(url).send().await {
-            Ok(response) => Ok(response.status().is_success()),
-            Err(_) => Ok(false),
-        }
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to connect to health endpoint")?;
+        Ok(response.status().is_success())
     }
 }
 

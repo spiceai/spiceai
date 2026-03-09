@@ -72,7 +72,9 @@ pub async fn execute(args: StatusArgs) -> Result<()> {
     }
 
     // Load state
-    let state = load_state(&work_dir).context("Failed to load cluster state")?;
+    let state = load_state(&work_dir)
+        .await
+        .context("Failed to load cluster state")?;
 
     // Check scheduler status
     let scheduler_status = check_node_status(
