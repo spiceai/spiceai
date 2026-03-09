@@ -1253,24 +1253,28 @@ impl CacheRefreshHelper {
                                 "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows, is_upsert={is_expired}",
                             );
                         }
+
+                        // Propagate cacheable data to children.
+                        let synchronized_children_clone = Arc::clone(&synchronized_children);
+                        let dataset_name_clone = dataset_name.to_string();
+                        io_runtime.spawn(async move {
+                            Self::propagate_to_synchronized_children(
+                                &synchronized_children_clone,
+                                &dataset_name_clone,
+                                &filters_clone,
+                                &batches_for_propagate,
+                                is_expired,
+                            )
+                            .await;
+                        });
+
+                        tracing::debug!(
+                            "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                        );
                     }
-
-                    // Propagate cacheable data to children.
-                    let synchronized_children_clone = Arc::clone(&synchronized_children);
-                    let dataset_name_clone = dataset_name.to_string();
-                    io_runtime.spawn(async move {
-                        Self::propagate_to_synchronized_children(
-                            &synchronized_children_clone,
-                            &dataset_name_clone,
-                            &filters_clone,
-                            &batches_for_propagate,
-                            is_expired,
-                        )
-                        .await;
-                    });
-
+                } else {
                     tracing::debug!(
-                        "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                        "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
                     );
                 }
 
