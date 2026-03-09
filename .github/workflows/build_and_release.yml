@@ -108,6 +108,7 @@ jobs:
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 use_minio: useMinio,
+                is_tagged_release: isTaggedRelease,
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: macosRunner,
@@ -115,6 +116,7 @@ jobs:
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 use_minio: false,
+                is_tagged_release: isTaggedRelease,
               }
             ];
 
@@ -127,6 +129,7 @@ jobs:
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 use_minio: false,
+                is_tagged_release: isTaggedRelease,
               });
             }
 
@@ -238,7 +241,15 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       ## Build spiced and spice CLI
+      # Non-release builds include postgres-accel for benchmark testing
       - name: Build spiced and spice CLI
+        if: ${{ !matrix.target.is_tagged_release }}
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features ${{ matrix.flavor.features }},postgres-accel -p spiced -p spice --target-dir ../../target
+
+      # Release builds exclude optional accelerators from the distributed binary
+      - name: Build spiced and spice CLI (release)
+        if: ${{ matrix.target.is_tagged_release }}
         working-directory: bin/spiced
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features ${{ matrix.flavor.features }} -p spiced -p spice --target-dir ../../target
 

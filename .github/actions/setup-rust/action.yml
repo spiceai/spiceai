@@ -28,16 +28,26 @@ runs:
           echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         }
 
-    - name: Install latest Rust stable toolchain (Linux/macOS)
+    - name: Install Rust 1.93.1 toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        rustup toolchain install 1.91
-        rustup default 1.91
+        TOOLCHAIN=1.93.1
 
-    - name: Install latest Rust stable toolchain (Windows)
+        rustup toolchain install "${TOOLCHAIN}" --profile minimal
+        rustup component add cargo rustc rustfmt clippy --toolchain "${TOOLCHAIN}"
+        rustup default "${TOOLCHAIN}"
+        rustup run "${TOOLCHAIN}" cargo --version
+        rustup run "${TOOLCHAIN}" rustc --version
+
+    - name: Install Rust 1.93.1 toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        rustup toolchain install 1.91
-        rustup default 1.91
+        $toolchain = "1.93.1"
+
+        rustup toolchain install $toolchain --profile minimal
+        rustup component add cargo rustc rustfmt clippy --toolchain $toolchain
+        rustup default $toolchain
+        rustup run $toolchain cargo --version
+        rustup run $toolchain rustc --version

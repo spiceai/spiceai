@@ -26,7 +26,6 @@ use super::{
 
 use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
 };
 
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
@@ -133,6 +132,9 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region").secret(),
             ParameterSpec::component("endpoint").secret(),
+            ParameterSpec::component("url_style")
+                .description("Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.")
+                .one_of(&["vhost", "path"]),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
             ParameterSpec::component("session_token").secret(),
@@ -275,6 +277,7 @@ impl ListingTableConnector for S3 {
             vec![
                 "region",
                 "endpoint",
+                "url_style",
                 "key",
                 "secret",
                 "client_timeout",
@@ -325,3 +328,96 @@ impl ListingTableConnector for S3 {
 }
 
 register_data_connector!("s3", S3Factory);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        builder::RuntimeBuilder,
+        component::dataset::{Dataset, builder::DatasetBuilder},
+    };
+    use app::AppBuilder;
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    fn create_test_connector(params: Parameters) -> S3 {
+        S3 {
+            params,
+            runtime: None,
+            tokio_io_runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
+        Parameters::try_new(
+            "s3_test",
+            params,
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid S3 test parameters")
+    }
+
+    async fn create_test_dataset(from: &str) -> Dataset {
+        DatasetBuilder::try_new(from.to_string(), "test")
+            .expect("dataset builder should be created")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
+            .build()
+            .expect("dataset should be built")
+    }
+
+    #[tokio::test]
+    async fn test_url_style_not_set_omits_fragment() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        // When url_style is not set, it should not appear in fragments (auto-detect at runtime)
+        let fragment = object_store_url.fragment().unwrap_or("");
+        assert!(
+            !fragment.contains("url_style"),
+            "url_style should not be in fragment when not set, got: {fragment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_url_style_vhost_is_included_in_fragments() {
+        let params = create_test_parameters(vec![(
+            "s3_url_style".to_string(),
+            "vhost".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(object_store_url.fragment(), Some("url_style=vhost"));
+    }
+
+    #[tokio::test]
+    async fn test_url_style_path_is_included_in_fragments() {
+        let params = create_test_parameters(vec![(
+            "s3_url_style".to_string(),
+            "path".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(object_store_url.fragment(), Some("url_style=path"));
+    }
+}

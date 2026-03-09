@@ -503,8 +503,8 @@ fn build_delete_file(
     })?;
 
     Ok(DeleteFile {
-        delete_file_id: 0,
-        table_id: table.table_id,
+        delete_file_id: String::new(),
+        table_id: table.table_id.clone(),
         source_data_file_path,
         path: file_path.to_string_lossy().to_string(),
         path_is_relative: false,
@@ -555,8 +555,7 @@ mod tests {
 
     fn build_table_metadata(temp_dir: &TempDir) -> TableMetadata {
         TableMetadata {
-            table_id: 42,
-            table_uuid: Uuid::now_v7().to_string(),
+            table_id: "test-table-id".to_string(),
             table_name: "test_table".to_string(),
             path: temp_dir.path().to_string_lossy().to_string(),
             path_is_relative: false,
