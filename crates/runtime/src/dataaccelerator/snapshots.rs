@@ -284,7 +284,6 @@ mod tests {
     use spicepod::acceleration::SnapshotsCompaction;
     use spicepod::component::snapshot::Snapshots;
     use std::sync::Weak;
-    use tokio::sync::RwLock;
 
     struct MockSource {
         name: TableReference,
@@ -292,29 +291,6 @@ mod tests {
     }
 
     impl MockSource {
-        fn cayenne(name: &str, snapshots_enabled: bool) -> Arc<dyn AccelerationSource> {
-            let mut accel = Acceleration {
-                engine: Engine::Cayenne,
-                mode: Mode::File,
-                ..Default::default()
-            };
-            if snapshots_enabled {
-                let snapshots = Arc::new(Snapshots::default());
-                let secrets = Weak::new();
-                let handle = tokio::runtime::Handle::current();
-                accel.snapshot_behavior = SnapshotBehavior::Enabled(
-                    snapshots,
-                    secrets,
-                    handle,
-                    SnapshotsCompaction::Disabled,
-                );
-            }
-            Arc::new(MockSource {
-                name: TableReference::bare(name),
-                acceleration: Some(accel),
-            })
-        }
-
         fn cayenne_with_metadata_dir(
             name: &str,
             metadata_dir: &str,
@@ -394,7 +370,7 @@ mod tests {
 
         let result = validate_cayenne_snapshot_consistency(&sources);
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("expected error");
         assert!(
             matches!(
                 err,
@@ -413,7 +389,7 @@ mod tests {
 
         let result = validate_cayenne_snapshot_consistency(&sources);
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("expected error");
         assert!(
             matches!(
                 err,
@@ -433,7 +409,7 @@ mod tests {
             )];
 
         let result = validate_cayenne_snapshot_consistency(&sources);
-        assert!(result.is_ok());
+        result.expect("expected Ok");
     }
 
     #[tokio::test]
@@ -444,7 +420,7 @@ mod tests {
         ];
 
         let result = validate_cayenne_snapshot_consistency(&sources);
-        assert!(result.is_ok());
+        result.expect("expected Ok");
     }
 
     #[tokio::test]
@@ -455,6 +431,6 @@ mod tests {
         ];
 
         let result = validate_cayenne_snapshot_consistency(&sources);
-        assert!(result.is_ok());
+        result.expect("expected Ok");
     }
 }
