@@ -157,10 +157,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
         data_type,
-        DataType::Interval(_)
-            | DataType::Duration(_)
-            | DataType::Map(_, _)
-            | DataType::FixedSizeBinary(_)
+        DataType::Interval(_) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
     )
 }
 
@@ -1598,7 +1595,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("sqlite"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("unsupported_type_action")
-        .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
+        .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
     // S3 Express One Zone authentication parameters (used when file_path is an S3 Express path)
     ParameterSpec::component("cayenne_s3_region")
@@ -2400,7 +2397,27 @@ mod tests {
     use crate::component::dataset::acceleration::{Acceleration, Mode};
     use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion_table_providers::UnsupportedTypeAction;
     use std::sync::Arc;
+
+    fn http_response_headers_field() -> Field {
+        Field::new(
+            "response_headers",
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", DataType::Utf8, false)),
+                        Arc::new(Field::new("values", DataType::Utf8, true)),
+                    ],
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )
+    }
 
     #[tokio::test]
     async fn test_cayenne_file_path_generation() {
@@ -2646,6 +2663,48 @@ mod tests {
             None
         );
         assert_eq!(CayenneAccelerator::derive_region_from_zone("invalid"), None);
+    }
+
+    #[test]
+    fn test_transform_schema_for_vortex_preserves_http_response_headers_map() {
+        let schema = Schema::new(vec![
+            Field::new("response_status", DataType::UInt16, false),
+            http_response_headers_field(),
+        ]);
+
+        let transformed = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("HTTP response headers map should be supported by Cayenne/Vortex");
+
+        assert_eq!(transformed, schema);
+    }
+
+    #[test]
+    fn test_transform_schema_for_vortex_only_flags_truly_unsupported_types() {
+        let schema = Schema::new(vec![
+            http_response_headers_field(),
+            Field::new(
+                "duration_col",
+                DataType::Duration(TimeUnit::Millisecond),
+                true,
+            ),
+        ]);
+
+        let error = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("duration should remain unsupported in error mode");
+
+        match error {
+            Error::UnsupportedDataTypes { details } => {
+                assert!(
+                    details.contains("duration_col"),
+                    "expected duration column in unsupported type error, got: {details}"
+                );
+                assert!(
+                    !details.contains("response_headers"),
+                    "response_headers map should not be reported as unsupported: {details}"
+                );
+            }
+            other => panic!("expected UnsupportedDataTypes error, got: {other}"),
+        }
     }
 
     #[test]
