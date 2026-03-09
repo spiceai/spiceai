@@ -74,6 +74,7 @@ impl AllocationResult {
         all
     }
 
+    #[must_use]
     pub fn count(&self) -> usize {
         self.previously_assigned.len() + self.newly_assigned.len()
     }
