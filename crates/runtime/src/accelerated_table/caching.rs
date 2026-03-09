@@ -1435,7 +1435,7 @@ impl CacheRefreshHelper {
                         });
                     } else {
                         tracing::debug!(
-                            "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
+                            "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
                         );
                     }
                 }
