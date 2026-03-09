@@ -40,10 +40,6 @@ pub struct PartitionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assigned_at: Option<u128>,
 }
-struct AllocationResult {
-    previously_assigned: Vec<PartitionValue>,
-    newly_assigned: Vec<PartitionValue>,
-}
 
 impl PartitionMetadata {
     #[must_use]

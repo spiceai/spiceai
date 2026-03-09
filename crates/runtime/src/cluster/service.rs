@@ -655,7 +655,7 @@ impl ClusterService for ClusterServiceImpl {
                                 }
                             }
                         }
-                        total_assigned += newly_assigned.len();
+                        total_assigned += newly_assigned;
                         table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
                     Err(e) => {

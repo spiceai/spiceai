@@ -70,7 +70,7 @@ impl AllocationResult {
     #[must_use]
     pub fn all_assigned(self) -> Vec<PartitionValue> {
         let mut all = self.previously_assigned;
-        all.extend(self.newly_assigned.clone());
+        all.extend(self.newly_assigned);
         all
     }
 
@@ -159,7 +159,6 @@ impl PartitionManager {
 
     /// Allocates unassigned partitions to an executor.
     ///
-    /// Returns the list of allocated partitions.
     /// Uses OCC to atomically update metadata.
     pub async fn allocate_partitions(
         &self,
