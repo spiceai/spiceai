@@ -78,17 +78,18 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
-            resources: Some(AppResources {
-                limits: AppResourceLimits {
-                    cpu: None,
-                    memory: "16Gi".to_string(),
-                    ephemeral_storage: None,
-                },
-                requests: Some(AppResourceRequests {
-                    cpu: Some("0.1".to_string()),
-                    memory: Some("256Mi".to_string()),
-                }),
-            }),
+            resources: None,
+            // resources: Some(AppResources {
+            //     limits: AppResourceLimits {
+            //         cpu: None,
+            //         memory: "16Gi".to_string(),
+            //         ephemeral_storage: None,
+            //     },
+            //     requests: Some(AppResourceRequests {
+            //         cpu: Some("0.1".to_string()),
+            //         memory: Some("256Mi".to_string()),
+            //     }),
+            // }),
         })
         .await;
 
