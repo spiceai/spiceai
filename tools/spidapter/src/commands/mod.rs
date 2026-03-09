@@ -253,13 +253,13 @@ pub(crate) async fn wait_for_deployment_ready(
 /// Replaces the `-data` suffix with `-flight` and constructs `https://{flight_cname}.spiceai.io`.
 /// For example, `us-east-1-dev-aws-data` becomes `https://us-east-1-dev-aws-flight.spiceai.io`.
 pub(crate) fn flight_url_from_cname(cname: &str) -> String {
-    // let flight_cname = if let Some(prefix) = cname.strip_suffix("-data") {
-    //     format!("{prefix}-flight")
-    // } else {
-    //     cname.to_string()
-    // };
-    // format!("https://{flight_cname}.spiceai.io")
-    "https://us-east-1-dev-aws-nlb-flight.spiceai.io:32011".to_string()
+    let flight_cname = if let Some(prefix) = cname.strip_suffix("-data") {
+        format!("{prefix}-flight")
+    } else {
+        cname.to_string()
+    };
+    format!("https://{flight_cname}.spiceai.io")
+    // "https://us-east-1-dev-aws-nlb-flight.spiceai.io:32011".to_string()
 }
 
 /// Sanitize a spicepod name for use as a Spice Cloud app name.
