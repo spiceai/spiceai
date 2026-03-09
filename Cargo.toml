@@ -196,7 +196,7 @@ iceberg-datafusion = "0.8.0"
 iceberg_test_utils = "0.8.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
-insta = { version = "1.46.1", features = ["filters"] }
+insta = { version = "1.46.3", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
 logos = "0.16.0"
