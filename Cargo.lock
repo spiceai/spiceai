@@ -80,7 +80,7 @@ checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
  "cipher 0.4.4",
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -91,7 +91,7 @@ checksum = "7e713c57c2a2b19159e7be83b9194600d7e8eb3b7c2cd67e671adf47ce189a05"
 dependencies = [
  "cfg-if",
  "cipher 0.5.0-rc.1",
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -356,7 +356,7 @@ dependencies = [
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "thiserror 2.0.18",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "zstd",
 ]
 
@@ -716,7 +716,7 @@ dependencies = [
  "clickhouse-rs",
  "datafusion-table-providers",
  "snafu",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -1429,7 +1429,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -2121,7 +2121,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -2172,7 +2172,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -2193,7 +2193,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -2286,7 +2286,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
@@ -2321,7 +2321,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
  "vortex-ipc 0.1.0 (git+https://github.com/spiceai/vortex?branch=spiceai-52)",
 ]
@@ -2358,7 +2358,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -2689,7 +2689,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "constant_time_eq",
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -2921,7 +2921,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "time",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -3474,7 +3474,7 @@ dependencies = [
  "turso",
  "url",
  "util",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex",
  "vortex-datafusion",
  "vortex-scan",
@@ -3574,6 +3574,17 @@ dependencies = [
  "quote",
  "regex",
  "vob",
+]
+
+[[package]]
+name = "chacha20"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.0",
 ]
 
 [[package]]
@@ -3793,7 +3804,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -4311,7 +4322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bb320cac8a0750d7f25280aa97b09c26edfe161164238ecbbb31092b079e735"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "proptest",
  "serde_core",
 ]
@@ -4433,6 +4444,15 @@ name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
 ]
@@ -4927,7 +4947,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto 0.2.9",
@@ -4943,7 +4963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f9200d1d13637f15a6acb71e758f64624048d85b31a5fdbfd8eca1e2687d0b7"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.11.0-rc.3",
  "fiat-crypto 0.3.0",
@@ -5270,7 +5290,7 @@ dependencies = [
  "twox-hash",
  "url",
  "util",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "zip 7.4.0",
 ]
 
@@ -5341,7 +5361,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "zstd",
 ]
 
@@ -5656,7 +5676,7 @@ dependencies = [
  "regex",
  "sha2 0.10.9",
  "unicode-segmentation",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -6048,7 +6068,7 @@ dependencies = [
  "substrait",
  "tokio",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -6104,7 +6124,7 @@ dependencies = [
  "tokio-rusqlite",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -6189,7 +6209,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "z85",
 ]
 
@@ -8245,6 +8265,7 @@ dependencies = [
  "js-sys",
  "libc",
  "r-efi",
+ "rand_core 0.10.0",
  "wasip2",
  "wasip3",
  "wasm-bindgen",
@@ -8433,7 +8454,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "x509-parser 0.15.1",
 ]
 
@@ -8487,7 +8508,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -9365,7 +9386,7 @@ dependencies = [
  "tokio",
  "typed-builder 0.20.1",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "zstd",
 ]
 
@@ -9407,7 +9428,7 @@ dependencies = [
  "tokio",
  "tracing",
  "typed-builder 0.20.1",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -9422,7 +9443,7 @@ dependencies = [
  "iceberg",
  "parquet",
  "tokio",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -10135,7 +10156,7 @@ version = "0.2.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d546793a04a1d3049bd192856f804cfe96356e2cf36b54b4e575155babe9f41"
 dependencies = [
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -11374,7 +11395,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "variantly",
  "vob",
 ]
@@ -11407,7 +11428,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "utoipa",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -11539,7 +11560,7 @@ dependencies = [
  "portable-atomic",
  "smallvec 1.15.1",
  "tagptr",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -11605,7 +11626,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tokio-util",
  "typed-builder 0.22.0",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "webpki-roots 1.0.5",
 ]
 
@@ -11785,7 +11806,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "time",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -12780,7 +12801,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -13745,7 +13766,7 @@ dependencies = [
  "serde",
  "sha1 0.11.0-rc.2",
  "thiserror 2.0.18",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -13787,7 +13808,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.16.1",
+ "hashbrown 0.5.0",
  "parking_lot 0.12.5",
  "rand 0.8.5",
 ]
@@ -13959,7 +13980,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash 0.5.1",
 ]
@@ -13971,7 +13992,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffd40cc99d0fbb02b4b3771346b811df94194bc103983efa0203c8893755085"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "universal-hash 0.6.0-rc.2",
 ]
 
@@ -14052,7 +14073,7 @@ dependencies = [
  "postgres-protocol",
  "serde_core",
  "serde_json",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -14341,7 +14362,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -14815,6 +14836,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.1",
+ "rand_core 0.10.0",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14870,6 +14902,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
 
 [[package]]
 name = "rand_distr"
@@ -15574,7 +15612,7 @@ dependencies = [
  "rkyv_derive",
  "seahash",
  "tinyvec",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -15617,7 +15655,7 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -15951,7 +15989,7 @@ dependencies = [
  "util",
  "utoipa",
  "utoipa-swagger-ui",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex",
  "vortex-datafusion",
  "workers",
@@ -15993,7 +16031,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -16870,7 +16908,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -16889,7 +16927,7 @@ dependencies = [
  "stable_deref_trait",
  "thiserror 2.0.18",
  "tokio",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "yoke 0.8.1",
 ]
 
@@ -17349,7 +17387,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
 
@@ -17360,7 +17398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5e046edf639aa2e7afb285589e5405de2ef7e61d4b0ac1e30256e3eab911af9"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.11.0-rc.3",
 ]
 
@@ -17377,7 +17415,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
 
@@ -17388,7 +17426,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1e3878ab0f98e35b2df35fe53201d088299b41a6bb63e3e34dada2ac4abd924"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.11.0-rc.3",
 ]
 
@@ -17769,7 +17807,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -17825,7 +17863,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -17899,7 +17937,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -18176,7 +18214,7 @@ dependencies = [
  "spicepod",
  "system-adapter-protocol",
  "tokio",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "yaml",
 ]
 
@@ -18349,7 +18387,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "windows 0.62.2",
  "windows-registry",
  "zeroize",
@@ -18839,7 +18877,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -18923,7 +18961,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "time",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "winapi",
 ]
 
@@ -19198,7 +19236,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "util",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "yaml",
 ]
 
@@ -19423,7 +19461,7 @@ dependencies = [
  "tokio-rustls 0.24.1",
  "tokio-util",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -20406,7 +20444,7 @@ dependencies = [
  "turso_parser",
  "twox-hash",
  "uncased",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -20491,7 +20529,7 @@ dependencies = [
  "tracing",
  "turso_core",
  "turso_parser",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -20619,7 +20657,7 @@ dependencies = [
  "typespec",
  "typespec_macros",
  "url",
- "uuid 1.21.0",
+ "uuid 1.22.0",
 ]
 
 [[package]]
@@ -21062,13 +21100,13 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
+checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "getrandom 0.4.1",
  "js-sys",
- "rand 0.9.2",
+ "rand 0.10.0",
  "serde_core",
  "sha1_smol",
  "wasm-bindgen",
@@ -21376,7 +21414,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1a6dc54f18e6c9514e4273cbd736bcbfbcbe16d5)",
 ]
@@ -21470,7 +21508,7 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex-alp",
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1a6dc54f18e6c9514e4273cbd736bcbfbcbe16d5)",
  "vortex-btrblocks",
@@ -21619,7 +21657,7 @@ dependencies = [
  "termtree",
  "tokio",
  "tracing",
- "uuid 1.21.0",
+ "uuid 1.22.0",
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1a6dc54f18e6c9514e4273cbd736bcbfbcbe16d5)",
  "vortex-btrblocks",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1a6dc54f18e6c9514e4273cbd736bcbfbcbe16d5)",
