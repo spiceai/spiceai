@@ -680,10 +680,7 @@ mod tests {
         ];
 
         if let Some(file_format) = file_format {
-            params.push((
-                "file_format".to_string(),
-                file_format.to_string().into(),
-            ));
+            params.push(("file_format".to_string(), file_format.to_string().into()));
         }
 
         let params = Parameters::try_new(

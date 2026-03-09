@@ -597,7 +597,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_to_cached_record_batch_stream_skips_http_results_when_any_batch_is_transient_error() {
+    async fn test_to_cached_record_batch_stream_skips_http_results_when_any_batch_is_transient_error()
+     {
         use datafusion::error::DataFusionError;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::TryStreamExt;

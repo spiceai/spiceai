@@ -1629,8 +1629,8 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
-    use std::time::Duration;
     use std::sync::Arc;
+    use std::time::Duration;
     use url::Url;
 
     fn base_provider() -> HttpTableProvider {
@@ -2187,7 +2187,11 @@ mod tests {
             .await
             .expect("batch should be created from cached response");
 
-        assert_eq!(batch.num_rows(), 2, "JSON array content should yield two rows");
+        assert_eq!(
+            batch.num_rows(),
+            2,
+            "JSON array content should yield two rows"
+        );
 
         let headers_col = batch
             .column(5)
