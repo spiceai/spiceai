@@ -189,7 +189,7 @@ jobs:
             echo "$((end_ms - start_ms))"
           }
 
-          cargo init --bin --quiet --vcs none "$temp_dir"
+          cargo init --name sccache-smoke-test --bin --quiet --vcs none "$temp_dir"
           cat <<'EOF' > "$temp_dir/src/main.rs"
           fn main() {
               println!("sccache smoke test");
