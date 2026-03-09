@@ -61,6 +61,7 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
+use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
@@ -604,9 +605,8 @@ impl ClusterService for ClusterServiceImpl {
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
             let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
-                spicepod::component::runtime::PartitionManagement::default()
-                    .max_partitions_per_executor,
-                |s| s.max_partitions_per_executor(),
+                runtime::PartitionManagement::default().max_partitions_per_executor,
+                runtime::Scheduler::max_partitions_per_executor,
             );
 
             // Find accelerated datasets with partitioning
