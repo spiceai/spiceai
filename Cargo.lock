@@ -9683,9 +9683,9 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.18.3"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9375e112e4b463ec1b1c6c011953545c65a30164fbab5b581df32b3abf0dcb88"
+checksum = "25470f23803092da7d239834776d653104d551bc4d7eacaf31e6837854b8e9eb"
 dependencies = [
  "console 0.16.2",
  "portable-atomic",
@@ -11319,7 +11319,7 @@ dependencies = [
  "http 1.4.0",
  "image 0.25.9",
  "indexmap 2.13.0",
- "indicatif 0.18.3",
+ "indicatif 0.18.4",
  "interprocess",
  "itertools 0.14.0",
  "libc",
@@ -19170,7 +19170,7 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
- "indicatif 0.18.3",
+ "indicatif 0.18.4",
  "insta",
  "nix 0.30.1",
  "object_store",
