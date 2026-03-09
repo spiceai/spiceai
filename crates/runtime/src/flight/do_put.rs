@@ -30,6 +30,7 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use opentelemetry::KeyValue;
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
 use tokio::sync::mpsc::{self, Sender};
@@ -380,7 +381,7 @@ fn create_response_stream(
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx).await;
+            yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
         }
 
         // Use a single pinned Sleep future that is reset on each received message,
@@ -440,7 +441,7 @@ fn create_response_stream(
                             };
 
                             // Only report errors; a success message is sent as the final step upon successful write completion
-                            if let Err(err) = handle_record_batch(new_batch, &batch_tx).await {
+                            if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
                                 yield Err(err);
                                 break;
                             }
@@ -476,8 +477,13 @@ fn create_response_stream(
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
+    path: &str,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
+
+    let labels = [KeyValue::new("dataset", path.to_string())];
+    metrics::DO_PUT_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+    metrics::DO_PUT_BYTES_WRITTEN.add(batch.get_array_memory_size() as u64, &labels);
 
     if let Err(e) = batch_tx.send(Ok(batch)).await {
         tracing::error!("Error sending record batch to write channel: {e}");

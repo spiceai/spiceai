@@ -21,9 +21,7 @@ use snafu::ResultExt;
 
 use std::{any::Any, pin::Pin, sync::Arc};
 
-use crate::{
-    component::dataset::Dataset, register_data_connector, tools::memory::MEMORY_TABLE_SCHEMA,
-};
+use crate::{component::dataset::Dataset, tools::memory::MEMORY_TABLE_SCHEMA};
 use datafusion::datasource::TableProvider;
 use futures::Future;
 

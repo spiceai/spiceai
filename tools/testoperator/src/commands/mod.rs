@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
@@ -216,6 +220,13 @@ pub(crate) async fn create_query_executor(
     };
 
     Ok(executor)
+}
+
+pub(crate) fn duration_millis_between(end: Instant, start: Instant) -> anyhow::Result<u64> {
+    let duration = end
+        .checked_duration_since(start)
+        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
+    Ok(u64::try_from(duration.as_millis())?)
 }
 
 #[macro_export]

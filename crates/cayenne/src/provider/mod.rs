@@ -1015,9 +1015,9 @@ mod tests {
         .expect("to create upsert batch");
         insert_batch(&provider, batch2).await;
 
-        let table_id = provider.table_id();
+        let table_id = provider.table_id().to_string();
         let pre_restart_insert_records = catalog
-            .get_insert_records(table_id)
+            .get_insert_records(&table_id)
             .await
             .expect("Failed to read insert records before restart");
         assert!(
@@ -1041,7 +1041,7 @@ mod tests {
             Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
         let persisted_insert_records = catalog2
-            .get_insert_records(table_id)
+            .get_insert_records(&table_id)
             .await
             .expect("Failed to read insert records after restart");
         assert!(

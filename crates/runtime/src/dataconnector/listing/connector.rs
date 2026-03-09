@@ -256,7 +256,14 @@ impl TableProvider for LocationPruningListingTable {
         }
 
         if files.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(self.schema())));
+            // Apply the projection to the schema so that the EmptyExec output
+            // schema matches what the physical planner expects from the scan.
+            let schema = if let Some(proj) = projection {
+                Arc::new(self.schema().project(proj)?)
+            } else {
+                self.schema()
+            };
+            return Ok(Arc::new(EmptyExec::new(schema)));
         }
 
         let file_groups = vec![FileGroup::new(files)];

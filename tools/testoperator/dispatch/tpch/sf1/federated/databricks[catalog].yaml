@@ -18,5 +18,5 @@ tests:
     duration: 28800
   schema:
     spicepod_path: federated/databricks[catalog].yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     min_tables: 1

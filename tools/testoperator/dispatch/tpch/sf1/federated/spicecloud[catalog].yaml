@@ -7,5 +7,5 @@ tests:
     validate_results: true
   schema:
     spicepod_path: federated/spicecloud[catalog].yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     min_tables: 1
