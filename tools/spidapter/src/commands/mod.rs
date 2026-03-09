@@ -259,7 +259,7 @@ pub(crate) fn flight_url_from_cname(cname: &str) -> String {
     //     cname.to_string()
     // };
     // format!("https://{flight_cname}.spiceai.io")
-    "https://us-east-1-dev-aws-nlb-flight.spiceai.io".to_string()
+    "https://us-east-1-dev-aws-nlb-flight.spiceai.io:32011".to_string()
 }
 
 /// Sanitize a spicepod name for use as a Spice Cloud app name.
