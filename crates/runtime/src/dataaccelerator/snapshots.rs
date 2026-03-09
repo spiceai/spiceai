@@ -143,7 +143,7 @@ pub(crate) async fn validate_snapshot_paths(
         }
     }
 
-    for (path, datasets) in paths.into_iter().filter(|(_, ds)| ds.len() > 1) {
+    if let Some((path, datasets)) = paths.into_iter().find(|(_, ds)| ds.len() > 1) {
         return Err(SharedAccelerationSnapshotError::DuckDbSharedFile {
             datasets: datasets.join(", "),
             path: path.display().to_string(),
