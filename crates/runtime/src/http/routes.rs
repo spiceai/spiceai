@@ -96,8 +96,6 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::models::get,
         v1::workers::get,
         v1::nsql::post,
-        v1::eval::list,
-        v1::eval::post,
         v1::inference::get,
         v1::inference::post,
         v1::tools::list,
@@ -193,7 +191,7 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 
 // Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
 // Applied at three levels:
-// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings, evals)
+// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings)
 //    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
 // 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
 //    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
@@ -282,17 +280,11 @@ pub(crate) fn routes(
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
             .route("/v1/tools/{*name}", post(v1::tools::post))
-            // Deprecated, use /v1/evals/:name instead
+            // Deprecated, use /v1/tools/:name instead
             .route("/v1/tool/{name}", post(v1::tools::post))
-            .route(
-                "/v1/evals/{name}",
-                post(v1::eval::post).layer(ModelContextLayer),
-            )
-            .route("/v1/evals", get(v1::eval::list))
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(Arc::clone(&rt.completion_llms)))
             .layer(Extension(Arc::clone(&rt.models)))
-            .layer(Extension(Arc::clone(&rt.eval_scorers)))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))

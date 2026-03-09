@@ -63,11 +63,6 @@ pub fn from_app(app: App) -> SpicepodDefinition {
             .into_iter()
             .map(ComponentOrReference::Component)
             .collect(),
-        evals: app
-            .evals
-            .into_iter()
-            .map(ComponentOrReference::Component)
-            .collect(),
         catalogs: app
             .catalogs
             .into_iter()
