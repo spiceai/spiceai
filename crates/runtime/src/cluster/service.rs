@@ -632,7 +632,9 @@ impl ClusterService for ClusterServiceImpl {
                     .allocate_partitions(table_ref, executor_id, remaining)
                     .await
                 {
-                    Ok(partitions) => {
+                    Ok(result) => {
+                        let newly_assigned = result.newly_assigned.len();
+                        let partitions = result.all_assigned();
                         if partitions.is_empty() {
                             continue;
                         }
@@ -653,7 +655,7 @@ impl ClusterService for ClusterServiceImpl {
                                 }
                             }
                         }
-                        total_assigned += partitions.len();
+                        total_assigned += newly_assigned.len();
                         table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
                     Err(e) => {
