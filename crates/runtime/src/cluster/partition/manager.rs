@@ -61,7 +61,7 @@ pub struct PartitionManager {
 }
 
 #[derive(Debug, Clone)]
-struct AllocationResult {
+pub struct AllocationResult {
     pub previously_assigned: Vec<PartitionValue>,
     pub newly_assigned: Vec<PartitionValue>,
 }
