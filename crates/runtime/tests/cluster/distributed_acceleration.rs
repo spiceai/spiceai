@@ -57,16 +57,17 @@ const TEST_DATA_CSV: &str = r"id,name,age,city,score
 ";
 
 /// Test that distributed acceleration with `bucket()` partitioning works end to end
-/// with multiple executors.
+/// with an executor.
 ///
-/// Sets up a cluster with 1 scheduler + 1 executors accelerating data
+/// Sets up a cluster with 1 scheduler + 1 executor accelerating data
 /// with `partition_by: bucket(3, id)` using the Cayenne engine. Verifies:
 /// - `bucket()` UDF can be used in the dataset definition for partitioning
 /// - Queries return correct, complete results across all executors
 /// - EXPLAIN plans correctly reflect the distributed execution plan
 ///
-/// Each executor uses its own `cayenne_data_dir` and `cayenne_metadata_dir` to
-/// avoid filesystem contention between in-process executors.
+/// The dataset configures a single Cayenne `base_dir` that is shared by all
+/// in-process executors for this test, using an isolated temporary directory
+/// per test run to avoid interference with other tests.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), anyhow::Error> {

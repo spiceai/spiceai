@@ -38,11 +38,9 @@ limitations under the License.
 //! ```
 //!
 //! Each `ClusterHarness` automatically:
-//! - Sets up a temporary directory shared by all nodes
 //! - Initialises a per-harness PKI (CA + per-node mTLS certs)
 //! - Allocates unique, non-overlapping ports for every node
 //! - Starts each node's servers and waits until they are ready
-//! - Provides per-executor data directories for Cayenne file-mode tests
 
 use app::{App, AppBuilder};
 use arrow::array::RecordBatch;
