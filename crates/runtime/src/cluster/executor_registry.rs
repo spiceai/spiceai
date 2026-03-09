@@ -358,12 +358,19 @@ impl TablePartitionProvider for ExecutorRegistry {
             return Vec::new();
         };
 
+        // Get live connections for liveness checks
+        let Ok(connections) = self.connections.try_read() else {
+            tracing::warn!("Failed to acquire read lock on connections");
+            return Vec::new();
+        };
+
         // Get partition metadata from manager (async call, requires runtime)
         let Some(table_metadata) = self.partition_manager.get_cached_table_metadata(table) else {
             // Non-partitioned accelerated tables don't register partition assignments.
             // Route to a single executor to avoid duplicate results in multi-executor clusters.
             let Some((executor_id, client)) = flight_sql_clients
                 .iter()
+                .filter(|(executor_id, _)| connections.contains_key(*executor_id))
                 .min_by(|(lhs_id, _), (rhs_id, _)| lhs_id.cmp(rhs_id))
             else {
                 tracing::warn!(
@@ -395,12 +402,26 @@ impl TablePartitionProvider for ExecutorRegistry {
             return Vec::new();
         }
 
-        // Build map of executor -> partitions from metadata
+        // Get live connections to filter out dead executors
+        let Ok(connections) = self.connections.try_read() else {
+            tracing::warn!("Failed to acquire read lock on connections");
+            return Vec::new();
+        };
+
+        // Build map of executor -> partitions from metadata, excluding dead executors
         let mut executor_partition_map: std::collections::HashMap<String, Vec<_>> =
             std::collections::HashMap::new();
 
         for partition_meta in &table_metadata.partitions {
             for executor_id in &partition_meta.assigned_executors {
+                // Skip executors that are not currently alive
+                if !connections.contains_key(executor_id) {
+                    tracing::debug!(
+                        "Executor '{}' has partition assignment but is no longer alive; excluding from selection",
+                        executor_id
+                    );
+                    continue;
+                }
                 executor_partition_map
                     .entry(executor_id.clone())
                     .or_default()
@@ -416,7 +437,7 @@ impl TablePartitionProvider for ExecutorRegistry {
             Ok(executors) => executors,
             Err(executor_selection::Error::MissingPartitions(missing)) => {
                 tracing::error!(
-                    "Cannot execute query on table {}: {} partition(s) not assigned to any executor. Missing partitions: {:?}",
+                    "Cannot execute query on table {}: {} partition(s) not assigned to any alive executor. Missing partitions: {:?}",
                     table,
                     missing.len(),
                     missing.iter().take(5).collect::<Vec<_>>() // Show first 5 missing partitions

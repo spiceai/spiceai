@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use datafusion::{
@@ -55,6 +55,60 @@ impl SpiceObjectStoreRegistry {
         }
     }
 
+    /// Parse `url_style` parameter. Returns `Some(true)` for vhost, `Some(false)` for path,
+    /// `None` when not explicitly set (auto-detect).
+    fn parse_s3_url_style(
+        params: &HashMap<String, String>,
+    ) -> datafusion::error::Result<Option<bool>> {
+        match params.get("url_style").map(String::as_str) {
+            Some("path") => Ok(Some(false)),
+            Some("vhost") => Ok(Some(true)),
+            None => Ok(None),
+            Some(value) => Err(DataFusionError::Configuration(format!(
+                "{value} is not a valid value for url_style"
+            ))),
+        }
+    }
+
+    fn endpoint_for_s3_url_style(
+        endpoint: &str,
+        bucket_name: &str,
+        virtual_hosted_style_request: bool,
+    ) -> datafusion::error::Result<String> {
+        if !virtual_hosted_style_request {
+            return Ok(endpoint.to_string());
+        }
+
+        let mut endpoint_url = Url::parse(endpoint).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to parse endpoint '{endpoint}' as URL: {e}"
+            ))
+        })?;
+
+        let Some(host) = endpoint_url.host_str() else {
+            return Err(DataFusionError::Configuration(format!(
+                "No host found in endpoint URL: {endpoint}"
+            )));
+        };
+
+        let virtual_hosted = format!("{bucket_name}.{host}");
+        endpoint_url.set_host(Some(&virtual_hosted)).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to set virtual-hosted endpoint host to {virtual_hosted}: {e}"
+            ))
+        })?;
+
+        Ok(endpoint_url.to_string().trim_end_matches('/').to_string())
+    }
+
+    /// Returns `true` if the endpoint host is an IP address.
+    fn endpoint_is_ip(endpoint: &str) -> bool {
+        Url::parse(endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.parse::<IpAddr>().is_ok()))
+            .unwrap_or(false)
+    }
+
     fn prepare_s3_object_store(
         &self,
         url: &Url,
@@ -65,20 +119,104 @@ impl SpiceObjectStoreRegistry {
             ));
         };
 
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let explicit_url_style = Self::parse_s3_url_style(&params)?;
+        let endpoint = params.get("endpoint");
+
+        let virtual_hosted = match explicit_url_style {
+            Some(v) => v,
+            None => {
+                // Auto-detect: IP endpoints must use path-style.
+                if endpoint.is_some_and(|e| Self::endpoint_is_ip(e)) {
+                    tracing::info!("s3_url_style not set; using path style for IP endpoint");
+                    false
+                } else if let Some(ep) = endpoint {
+                    // Non-IP custom endpoint — DNS probe to detect style.
+                    match Self::detect_s3_url_style(bucket_name, ep) {
+                        Ok(detected) => detected,
+                        Err(e) => {
+                            tracing::warn!(
+                                "s3_url_style detection failed ({e:#}), defaulting to vhost"
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    // No custom endpoint (standard AWS) — vhost.
+                    true
+                }
+            }
+        };
+
+        self.build_s3_object_store(bucket_name, &params, virtual_hosted)
+    }
+
+    /// Detect whether vhost or path style should be used by performing a DNS
+    /// lookup on `<bucket>.<endpoint_host>`. If the name resolves the endpoint
+    /// supports virtual-hosted style; NXDOMAIN means path style is required.
+    fn detect_s3_url_style(bucket_name: &str, endpoint: &str) -> datafusion::error::Result<bool> {
+        use std::net::ToSocketAddrs;
+
+        let endpoint_url = Url::parse(endpoint).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to parse endpoint '{endpoint}' as URL: {e}"
+            ))
+        })?;
+
+        let Some(host) = endpoint_url.host_str() else {
+            return Err(DataFusionError::Configuration(format!(
+                "No host found in endpoint URL: {endpoint}"
+            )));
+        };
+
+        let port = endpoint_url.port().unwrap_or(match endpoint_url.scheme() {
+            "https" => 443,
+            _ => 80,
+        });
+
+        let vhost_host = format!("{bucket_name}.{host}:{port}");
+
+        tracing::info!(
+            "s3_url_style not set for endpoint '{endpoint}'; resolving '{vhost_host}' to detect URL style..."
+        );
+
+        if vhost_host.to_socket_addrs().is_ok() {
+            tracing::info!("s3_url_style auto-detected: vhost (DNS resolved for '{vhost_host}')");
+            Ok(true)
+        } else {
+            tracing::info!(
+                "s3_url_style auto-detected: path (DNS lookup failed for '{vhost_host}')"
+            );
+            Ok(false)
+        }
+    }
+
+    fn build_s3_object_store(
+        &self,
+        bucket_name: &str,
+        params: &HashMap<String, String>,
+        virtual_hosted_style_request: bool,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let mut s3_builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
             .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
             .with_allow_http(true);
         let mut client_options = ClientOptions::default();
 
-        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
-            .into_owned()
-            .collect();
+        s3_builder = s3_builder.with_virtual_hosted_style_request(virtual_hosted_style_request);
 
         if let Some(region) = params.get("region") {
             s3_builder = s3_builder.with_region(region);
         }
         if let Some(endpoint) = params.get("endpoint") {
+            let endpoint = Self::endpoint_for_s3_url_style(
+                endpoint,
+                bucket_name,
+                virtual_hosted_style_request,
+            )?;
             s3_builder = s3_builder.with_endpoint(endpoint);
         }
         if let Some(timeout) = params.get("client_timeout") {
@@ -766,5 +904,120 @@ mod tests {
     #[tokio::test]
     async fn test_default_runtime_env() {
         let _ = default_runtime_env(Handle::current());
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_not_set_returns_none() {
+        let params = HashMap::new();
+        assert_eq!(
+            SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_path() {
+        let params = HashMap::from([("url_style".to_string(), "path".to_string())]);
+        assert_eq!(
+            SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
+            Some(Some(false))
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_vhost() {
+        let params = HashMap::from([("url_style".to_string(), "vhost".to_string())]);
+        assert_eq!(
+            SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
+            Some(Some(true))
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_invalid_value() {
+        let params = HashMap::from([("url_style".to_string(), "invalid".to_string())]);
+        let _ = SpiceObjectStoreRegistry::parse_s3_url_style(&params)
+            .expect_err("invalid url_style should error");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_path_keeps_endpoint() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "spiceai-public-datasets",
+            false,
+        )
+        .expect("path-style endpoint should parse");
+
+        assert_eq!(endpoint, "https://t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_adds_bucket_prefix() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "spiceai-public-datasets",
+            true,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(endpoint, "https://spiceai-public-datasets.t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_always_prepends_bucket() {
+        // Even when bucket name matches the start of the host, always prepend.
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://spiceai-public-datasets.t3.storage.dev",
+            "spiceai-public-datasets",
+            true,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(
+            endpoint,
+            "https://spiceai-public-datasets.spiceai-public-datasets.t3.storage.dev"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_with_port_preserves_port() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "http://minio:9000",
+            "bucket",
+            true,
+        )
+        .expect("virtual-hosted endpoint with port should parse");
+
+        assert_eq!(endpoint, "http://bucket.minio:9000");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_bucket_matches_host_prefix() {
+        // Bucket "t3" with endpoint "t3.storage.dev" — must still prepend.
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "t3",
+            true,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(endpoint, "https://t3.t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_is_ip() {
+        assert!(SpiceObjectStoreRegistry::endpoint_is_ip(
+            "http://192.168.1.100:9000"
+        ));
+        assert!(SpiceObjectStoreRegistry::endpoint_is_ip(
+            "http://127.0.0.1:9000"
+        ));
+        assert!(!SpiceObjectStoreRegistry::endpoint_is_ip(
+            "https://t3.storage.dev"
+        ));
+        assert!(!SpiceObjectStoreRegistry::endpoint_is_ip(
+            "http://minio:9000"
+        ));
     }
 }

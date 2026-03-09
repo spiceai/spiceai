@@ -4,14 +4,15 @@ The Git data connector enables you to query files from Git repositories (local o
 
 ## Features
 
-- **Multiple Protocols**: Supports HTTPS and SSH Git URLs
+- **Multiple Protocols**: Supports HTTPS, SSH (`ssh://`, `git+ssh://`), local file (`file://`), and `git@host:repo` URLs
 - **Version Tracking**: Includes commit SHA, tree SHA, and version information
 - **Branch/Tag/Commit Support**: Query any Git reference (branch, tag, or specific commit)
 - **File Filtering**: Use glob patterns to filter which files are included
-- **Content Fetching**: Optionally fetch file content
+- **Content Fetching**: Optionally fetch file content (controlled by `fetch_content` parameter)
+- **File Limits**: Configurable maximum file count and file size for content fetching
 - **Timestamp Tracking**: Provides created_at and updated_at timestamps from Git history
 - **Automatic Caching**: Clones repositories locally for fast subsequent queries
-- **Refresh Support**: Updates repository on each refresh
+- **Automatic Updates**: Fetches latest changes from remote on each scan
 
 ## Configuration
 
@@ -53,11 +54,13 @@ datasets:
 
 ### Parameters
 
-| Parameter       | Type    | Default     | Description                                                                                                                                                                 |
-| --------------- | ------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `include`       | string  | none        | Glob pattern(s) to filter files. Separate multiple patterns with `;` or `,`                                                                                                 |
-| `fetch_content` | boolean | `false`     | Whether to fetch file content into the `content` column. **Note**: Content is automatically fetched if embeddings or full-text search is configured on the `content` column |
-| `cache_path`    | string  | System temp | Custom path for the local repository cache                                                                                                                                  |
+| Parameter        | Type    | Default     | Description                                                                                                                                             |
+| ---------------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include`        | string  | none        | Glob pattern(s) to filter files. Separate multiple patterns with `;` or `,`                                                                             |
+| `fetch_content`  | boolean | `false`     | Whether to fetch file content into the `content` column                                                                                                 |
+| `cache_path`     | string  | System temp | Custom path for the local repository cache                                                                                                              |
+| `max_files`      | integer | `5000`      | Maximum number of files to include (hard cap: 50,000)                                                                                                   |
+| `max_file_bytes` | integer | `524288`    | Maximum file size in bytes (512 KiB default, hard cap: 5 MiB). Files larger than this are excluded from results entirely, regardless of `fetch_content` |
 
 ### Example with Parameters
 
@@ -83,7 +86,7 @@ datasets:
 
 ### Embeddings and Full-Text Search
 
-The Git connector automatically detects when embeddings or full-text search is configured on the `content` column and will automatically fetch file content, even if `fetch_content` is not explicitly set:
+When using embeddings or full-text search on the `content` column, you must set `fetch_content: 'true'` to ensure file content is available:
 
 ```yaml
 datasets:
@@ -92,6 +95,7 @@ datasets:
     description: Documentation files with embeddings for semantic search
     params:
       include: 'docs/**/*.md;README.md'
+      fetch_content: 'true'
     columns:
       - name: content
         embeddings:
@@ -99,25 +103,23 @@ datasets:
             model: text-embedding-3-small
 ```
 
-In this example, the `content` column will be automatically fetched because embeddings are configured, without needing to set `fetch_content: 'true'`.
-
 ## Schema
 
 The Git connector provides the following columns:
 
-| Column       | Type      | Description                                                                                                   |
-| ------------ | --------- | ------------------------------------------------------------------------------------------------------------- |
-| `path`       | String    | Full path to the file in the repository                                                                       |
-| `name`       | String    | File name                                                                                                     |
-| `size`       | Int64     | File size in bytes                                                                                            |
-| `sha`        | String    | Git object SHA of the file (blob SHA)                                                                         |
-| `mode`       | String    | File mode (e.g., "100644" for regular file)                                                                   |
-| `tree_sha`   | String    | SHA of the tree containing this file                                                                          |
-| `commit_sha` | String    | SHA of the commit being queried                                                                               |
-| `version`    | String    | Short version of the commit SHA (first 7 characters)                                                          |
-| `created_at` | Timestamp | First commit time for this file (milliseconds since epoch)                                                    |
-| `updated_at` | Timestamp | Most recent commit time for this file (milliseconds since epoch)                                              |
-| `content`    | String    | File content (only if `fetch_content: "true"` or if embeddings/full-text search is configured on this column) |
+| Column       | Type      | Description                                                      |
+| ------------ | --------- | ---------------------------------------------------------------- |
+| `name`       | String    | File name                                                        |
+| `path`       | String    | Full path to the file in the repository                          |
+| `size`       | Int64     | File size in bytes                                               |
+| `sha`        | String    | Git object SHA of the file (blob SHA)                            |
+| `mode`       | String    | File mode (e.g., "100644" for regular file)                      |
+| `tree_sha`   | String    | SHA of the tree containing this file                             |
+| `commit_sha` | String    | SHA of the commit being queried                                  |
+| `version`    | String    | Short version of the commit SHA (first 7 characters)             |
+| `created_at` | Timestamp | First commit time for this file (milliseconds since epoch)       |
+| `updated_at` | Timestamp | Most recent commit time for this file (milliseconds since epoch) |
+| `content`    | String    | File content (only present when `fetch_content: "true"` is set)  |
 
 ## Example Queries
 
@@ -183,17 +185,19 @@ WHERE c.sha != v.sha;
 ## How It Works
 
 1. **Initial Clone**: On first access, the connector clones the repository to a local cache directory
-2. **Updates**: On refresh, it fetches the latest changes from the remote
+2. **Updates**: On each scan (including query execution), it fetches the latest changes from the remote
 3. **File Listing**: Walks the Git tree at the specified reference (branch/tag/commit)
 4. **History**: Walks the commit history to determine when files were first created and last modified
 5. **Filtering**: Applies glob patterns if specified to include only matching files
+6. **File Limits**: Enforces `max_files` and `max_file_bytes` limits to prevent excessive resource usage
 
 ## Performance Considerations
 
 - **First Query**: May take time to clone large repositories
 - **Subsequent Queries**: Fast, reading from local cache
 - **Refresh**: Only fetches updates, not a full re-clone
-- **Content Fetching**: Enabling `fetch_content` increases memory usage and query time
+- **Content Fetching**: Enabling `fetch_content` increases memory usage and query time. Files exceeding `max_file_bytes` are skipped.
+- **File Limits**: By default, only the first 5,000 files are included. Adjust `max_files` for larger repositories.
 - **Large Repositories**: Consider using `include` patterns to limit the files processed
 
 ## Limitations
