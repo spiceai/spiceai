@@ -121,8 +121,7 @@ runs:
         rustup default "$requested_toolchain"
 
         rustup component list --toolchain "$requested_toolchain" --installed
-        rustup run "$requested_toolchain" cargo --version
-        rustup run "$requested_toolchain" rustc --version
+        rustup show active-toolchain
         cargo --version
         rustc --version
 
@@ -138,7 +137,6 @@ runs:
         rustup default $requestedToolchain
 
         rustup component list --toolchain $requestedToolchain --installed
-        rustup run $requestedToolchain cargo --version
-        rustup run $requestedToolchain rustc --version
+        rustup show active-toolchain
         cargo --version
         rustc --version
