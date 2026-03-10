@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "4cf8c54fd069",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-03-10/9702",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/llms/src/bedrock/chat/mod.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/4c/f8c54fd069/0/metadata.json",
+      "transcript": "/4c/f8c54fd069/0/full.jsonl",
+      "context": "/4c/f8c54fd069/0/context.md",
+      "content_hash": "/4c/f8c54fd069/0/content_hash.txt",
+      "prompt": "/4c/f8c54fd069/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 49,
+    "cache_creation_tokens": 36577,
+    "cache_read_tokens": 994542,
+    "output_tokens": 14104,
+    "api_call_count": 33
+  }
+}
