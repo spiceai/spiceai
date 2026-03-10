@@ -1,0 +1,207 @@
+Help me fix the git commit changes. Here's the fail build.
+
+    Building [=====================> ] 1025/1028: llms(test), llms
+
+error[E0277]: the trait bound `std::string::String: std::convert::From<std::option::Option<serde_json::Value>>` is not satisfied
+   --> crates/llms/src/bedrock/chat/mod.rs:438:37
+    |
+438 | ...                   .schema(schema)
+    |                        ------ ^^^^^^ the trait `std::convert::From<std::option::Option<serde_json::Value>>` is not implemented for `std::string::String`
+    |                        |
+    |                        required by a bound introduced by this call
+    |
+    = help: the following other types implement trait `std::convert::From<T>`:
+              `std::string::String` implements `std::convert::From<&mut str>`
+              `std::string::String` implements `std::convert::From<&std::string::String>`
+              `std::string::String` implements `std::convert::From<&str>`
+              `std::string::String` implements `std::convert::From<&tendril::tendril::Tendril<tendril::fmt::UTF8, A>>`
+              `std::string::String` implements `std::convert::From<&tendril::tendril::Tendril<tendril::fmt::UTF8, A>>`
+              `std::string::String` implements `std::convert::From<async_openai::types::embeddings::EmbeddingVector>`
+              `std::string::String` implements `std::convert::From<aws_config::imds::client::SensitiveString>`
+              `std::string::String` implements `std::convert::From<aws_smithy_runtime_api::http::headers::header_value::HeaderValue>`
+            and 27 others
+    = note: required for `std::option::Option<serde_json::Value>` to implement `std::convert::Into<std::string::String>`
+note: required by a bound in `aws_sdk_bedrockruntime::types::builders::JsonSchemaDefinitionBuilder::schema`
+   --> /Users/jeadie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-sdk-bedrockruntime-1.126.0/src/types/_json_schema_definition.rs:47:41
+    |
+ 47 |     pub fn schema(mut self, input: impl ::std::convert::Into<::std::string::String>) -> Self {
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `JsonSchemaDefinitionBuilder::schema`
+
+error[E0277]: the trait bound `std::string::String: std::convert::From<std::option::Option<std::string::String>>` is not satisfied
+   --> crates/llms/src/bedrock/chat/mod.rs:440:42
+    |
+440 | ...                   .description(description)
+    |                        ----------- ^^^^^^^^^^^ the trait `std::convert::From<std::option::Option<std::string::String>>` is not implemented for `std::string::String`
+    |                        |
+    |                        required by a bound introduced by this call
+    |
+    = help: the following other types implement trait `std::convert::From<T>`:
+              `std::string::String` implements `std::convert::From<&mut str>`
+              `std::string::String` implements `std::convert::From<&std::string::String>`
+              `std::string::String` implements `std::convert::From<&str>`
+              `std::string::String` implements `std::convert::From<&tendril::tendril::Tendril<tendril::fmt::UTF8, A>>`
+              `std::string::String` implements `std::convert::From<&tendril::tendril::Tendril<tendril::fmt::UTF8, A>>`
+              `std::string::String` implements `std::convert::From<async_openai::types::embeddings::EmbeddingVector>`
+              `std::string::String` implements `std::convert::From<aws_config::imds::client::SensitiveString>`
+              `std::string::String` implements `std::convert::From<aws_smithy_runtime_api::http::headers::header_value::HeaderValue>`
+            and 27 others
+    = note: required for `std::option::Option<std::string::String>` to implement `std::convert::Into<std::string::String>`
+note: required by a bound in `aws_sdk_bedrockruntime::types::builders::JsonSchemaDefinitionBuilder::description`
+   --> /Users/jeadie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-sdk-bedrockruntime-1.126.0/src/types/_json_schema_definition.rs:75:46
+    |
+ 75 |     pub fn description(mut self, input: impl ::std::convert::Into<::std::string::String>) -> Self {
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `JsonSchemaDefinitionBuilder::description`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `llms` (lib) due to 2 previous errors
+
+Verify via `make lint-rust-fix PACKAGES="llms"`
+
+---
+
+Also, try `make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal,snapshots"` after its all working.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+<task-notification>
+<task-id>bxfgtg21g</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-jeadie-Github-spiceai/tasks/bxfgtg21g.output</output-file>
+<status>killed</status>
+<summary>Background command "Install dev build with specified features" was stopped</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-jeadie-Github-spiceai/tasks/bxfgtg21g.output
+
+---
+
+[Request interrupted by user]
+
+---
+
+hmmm, didn't work. `ValidationException: The provided request is not valid`
+
+
+read these docs: https://aws.amazon.com/blogs/machine-learning/structured-outputs-on-amazon-bedrock-schema-compliant-ai-responses/
+
+---
+
+[Request interrupted by user]
+
+---
+
+it relates to how we provide `OutputFormat::structure` in the `JsonSchemaDefinition`. 
+
+Here is their python example
+
+```python
+import boto3
+import json
+# Initialize the Bedrock Runtime client
+bedrock_runtime = boto3.client(
+    service_name='bedrock-runtime',
+    region_name='us-east-1'  # Choose your preferred region
+)
+# Define your JSON schema
+extraction_schema = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Customer name"},
+        "email": {"type": "string", "description": "Customer email address"},
+        "plan_interest": {"type": "string", "description": "Product plan of interest"},
+        "demo_requested": {"type": "boolean", "description": "Whether a demo was requested"}
+    },
+    "required": ["name", "email", "plan_interest", "demo_requested"],
+    "additionalProperties": False
+}
+# Make the request with structured outputs
+response = bedrock_runtime.converse(
+    modelId="us.anthropic.claude-opus-4-5-20251101-v1:0",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "text": "Extract the key information from this email: John Smith (john@example.com) is interested in our Enterprise plan and wants to schedule a demo for next Tuesday at 2pm."
+                }
+            ]
+        }
+    ],
+    inferenceConfig={
+        "maxTokens": 1024
+    },
+    outputConfig={
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": json.dumps(extraction_schema),
+                    "name": "lead_extraction",
+                    "description": "Extract lead information from customer emails"
+                }
+            }
+        }
+    }
+)
+# Parse the schema-compliant JSON response
+result = json.loads(response["output"]["message"]["content"][0]["text"])
+print(json.dumps(result, indent=2))
+```
+
+---
+
+[Request interrupted by user]
+
+---
+
+#[non_exhaustive]
+#[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::fmt::Debug)]
+pub struct JsonSchemaDefinition {
+    /// <p>The JSON schema to constrain the model's output. For more information, see <a href="https://json-schema.org/understanding-json-schema/reference">JSON Schema Reference</a>.</p>
+    pub schema: ::std::string::String,
+    /// <p>The name of the JSON schema.</p>
+    pub name: ::std::option::Option<::std::string::String>,
+    /// <p>A description of the JSON schema.</p>
+    pub description: ::std::option::Option<::std::string::String>,
+}
+
+---
+
+It might be my config
+
+bedrock_response_format:
+        type: json_schema
+        json_schema:
+          name: response
+          schema:
+            type: object
+            properties:
+              response:
+                type: string
+                description: The comprehensive answer to the user's question.
+              similar_questions:
+                type: array
+                items:
+                  type: string
+                description: The titles of 5 similar questions found in the dataset, or a message indicating no similar questions were found.
+              sources:
+                type: array
+                items:
+                  type: string
+                description: A list of sources consulted. For websites, include only links. For datasets, include the dataset name, adjusted to a manner that is presentable to a human (E.g., if `spice.public.questions` was used, present it as 'spice.public.questions (Dataset)'). Mention the type of source consulted (website or dataset).
+              tools_used:
+                type: array
+                items:
+                  type: string
+                description: A list of tools used during the response generation.
+            required:
+              - response
+              - similar_questions
+              - sources
+              - tools_used
+            strict: true
+
+Need to update this to have "output_config.format.schema: For object type, additionalProperties must be explicitly set to false"
