@@ -95,6 +95,18 @@ impl Runtime {
         }
 
         let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
+
+        // Validate that no datasets with snapshots share acceleration files
+        let initialized_sources: Vec<Arc<dyn AccelerationSource>> = valid_datasets
+            .iter()
+            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
+            .map(|ds| ds.clone_arc())
+            .collect();
+        if let Err(err) = validate_snapshot_paths(initialized_sources).await {
+            tracing::error!("{err}");
+            return;
+        }
+
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
@@ -1010,13 +1022,6 @@ impl Runtime {
         let results = join_all(init_futures).await;
         let init_results: HashMap<TableReference, Result<BootstrapStatus>> =
             results.into_iter().collect();
-
-        let initialized_datasets: Vec<Arc<dyn AccelerationSource>> = datasets
-            .iter()
-            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
-            .map(|ds| ds.clone_arc())
-            .collect();
-        validate_snapshot_paths(initialized_datasets).await;
 
         init_results
     }
