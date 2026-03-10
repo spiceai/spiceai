@@ -253,14 +253,16 @@ impl BedrockConverse {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(Self::merge_consecutive_tool_result_messages)
+            .map(Self::merge_consecutive_tool_result_messages)?
     }
 
     /// Bedrock requires all `ToolResult` blocks for a multi-tool-use assistant turn to be
-    /// in a single `User` message. OpenAI sends each tool result as a separate `Tool` message,
+    /// in a single `User` message. `OpenAI` sends each tool result as a separate `Tool` message,
     /// which we convert into separate `User` messages. This function merges consecutive `User`
     /// messages that contain only `ToolResult` content blocks into a single `User` message.
-    fn merge_consecutive_tool_result_messages(messages: Vec<Message>) -> Vec<Message> {
+    fn merge_consecutive_tool_result_messages(
+        messages: Vec<Message>,
+    ) -> Result<Vec<Message>, BuildError> {
         let mut merged: Vec<Message> = Vec::with_capacity(messages.len());
 
         for msg in messages {
@@ -288,8 +290,7 @@ impl BedrockConverse {
                         *prev = MessageBuilder::default()
                             .set_content(Some(combined))
                             .set_role(Some(ConversationRole::User))
-                            .build()
-                            .expect("merging valid messages");
+                            .build()?;
                     }
                 } else {
                     merged.push(msg);
