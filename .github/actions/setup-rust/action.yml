@@ -123,15 +123,30 @@ runs:
 
         setup_toolchain() {
           local toolchain="$1"
+          local cargo_bin
+          local toolchain_bin
 
           rustup toolchain install "$toolchain" --profile minimal
           rustup component add cargo rustc rustfmt clippy --toolchain "$toolchain"
           rustup default "$toolchain"
 
+          cargo_bin="$(rustup which cargo --toolchain "$toolchain")"
+          toolchain_bin="$(dirname "$cargo_bin")"
+
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          echo "CARGO=$cargo_bin" >> "$GITHUB_ENV"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+
+          export PATH="$toolchain_bin:$cargo_home/bin:$PATH"
+          export RUSTUP_TOOLCHAIN="$toolchain"
+          export CARGO="$cargo_bin"
+          export RUSTC="$toolchain_bin/rustc"
+
           rustup component list --toolchain "$toolchain" --installed
           rustup show active-toolchain
-          cargo --version
-          rustc --version
+          "$cargo_bin" --version
+          "$toolchain_bin/rustc" --version
         }
 
         for toolchain in "${toolchain_candidates[@]}"; do
