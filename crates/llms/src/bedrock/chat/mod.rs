@@ -300,7 +300,7 @@ impl BedrockConverse {
             }
         }
 
-        merged
+        Ok(merged)
     }
 
     /// Convert [`ChatCompletionRequestMessage`] that are [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`SystemContentBlock`] format.
