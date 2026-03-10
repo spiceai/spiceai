@@ -114,16 +114,36 @@ runs:
         export PATH="$cargo_home/bin:$PATH"
 
         requested_toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
+        host_triple="$( (rustc -vV 2>/dev/null || true) | awk '/^host: / { print $2; exit }')"
 
-        rustup toolchain install "$requested_toolchain" --profile minimal
+        toolchain_candidates=("$requested_toolchain")
+        if [ -n "$host_triple" ] && [ "${requested_toolchain%-$host_triple}" = "$requested_toolchain" ]; then
+          toolchain_candidates+=("$requested_toolchain-$host_triple")
+        fi
 
-        rustup component add cargo rustc rustfmt clippy --toolchain "$requested_toolchain"
-        rustup default "$requested_toolchain"
+        setup_toolchain() {
+          local toolchain="$1"
 
-        rustup component list --toolchain "$requested_toolchain" --installed
-        rustup show active-toolchain
-        cargo --version
-        rustc --version
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup component add cargo rustc rustfmt clippy --toolchain "$toolchain"
+          rustup default "$toolchain"
+
+          rustup component list --toolchain "$toolchain" --installed
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+        }
+
+        for toolchain in "${toolchain_candidates[@]}"; do
+          if setup_toolchain "$toolchain"; then
+            exit 0
+          fi
+
+          echo "Rust setup verification failed for $toolchain, trying next candidate..." >&2
+        done
+
+        echo "Failed to set up Rust toolchain. Tried: ${toolchain_candidates[*]}" >&2
+        exit 1
 
     - name: Install Rust toolchain (Windows)
       if: runner.os == 'Windows'
