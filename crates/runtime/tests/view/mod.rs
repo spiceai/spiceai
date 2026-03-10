@@ -752,9 +752,14 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
     test_request_context()
         .scope(async {
             let test_csv = "id,name,value\n1,Alice,100\n2,Bob,200\n3,Charlie,300";
-            std::fs::write("./test_view_zero_results.csv", test_csv).expect("write file");
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let csv_path = temp_dir.path().join("test_view_zero_results.csv");
+            std::fs::write(&csv_path, test_csv).expect("write file");
 
-            let dataset = Dataset::new("file:./test_view_zero_results.csv", "zero_results_data");
+            let dataset = Dataset::new(
+                format!("file:{}", csv_path.to_string_lossy()),
+                "zero_results_data",
+            );
 
             let mut view = View::new("zero_results_view".to_string());
             view.sql =
@@ -819,7 +824,6 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
             );
 
             rt.shutdown().await;
-            std::fs::remove_file("./test_view_zero_results.csv").ok();
 
             Ok(())
         })

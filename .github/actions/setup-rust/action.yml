@@ -5,9 +5,6 @@ inputs:
   toolchain:
     description: 'Rust toolchain to install; defaults to the repository rust-toolchain.toml channel'
     required: false
-  os:
-    description: 'DEPRECATED: no-op; retained only for backward compatibility. runner.os is used instead.'
-    required: false
 
 runs:
   using: 'composite'
