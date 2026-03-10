@@ -137,6 +137,7 @@ struct SetupConfig {
     endpoint: Option<String>,
     sink_type: Option<EtlSinkType>,
     state_location: Option<String>,
+    flight_url: Option<String>,
 }
 
 impl SetupConfig {
@@ -146,6 +147,7 @@ impl SetupConfig {
             endpoint: metadata_string(metadata, "etl_endpoint"),
             sink_type: None,
             state_location: metadata_string(metadata, "scheduler_state_location"),
+            flight_url: metadata_string(metadata, "flight_url"),
         }
     }
 
@@ -601,7 +603,7 @@ async fn provision_spice_cloud_app(
     let cloud = commands::build_cloud_client(api_url_override)?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
+    let flight_url = setup_config.flight_url.clone().unwrap_or_else(|| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));

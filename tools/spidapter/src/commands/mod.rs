@@ -78,18 +78,17 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
-            resources: None,
-            // resources: Some(AppResources {
-            //     limits: AppResourceLimits {
-            //         cpu: None,
-            //         memory: "16Gi".to_string(),
-            //         ephemeral_storage: None,
-            //     },
-            //     requests: Some(AppResourceRequests {
-            //         cpu: Some("0.1".to_string()),
-            //         memory: Some("256Mi".to_string()),
-            //     }),
-            // }),
+            resources: Some(AppResources {
+                limits: AppResourceLimits {
+                    cpu: None,
+                    memory: "16Gi".to_string(),
+                    ephemeral_storage: None,
+                },
+                requests: Some(AppResourceRequests {
+                    cpu: Some("0.1".to_string()),
+                    memory: Some("256Mi".to_string()),
+                }),
+            }),
         })
         .await;
 
@@ -259,7 +258,6 @@ pub(crate) fn flight_url_from_cname(cname: &str) -> String {
         cname.to_string()
     };
     format!("https://{flight_cname}.spiceai.io")
-    // "https://us-east-1-dev-aws-nlb-flight.spiceai.io:32011".to_string()
 }
 
 /// Sanitize a spicepod name for use as a Spice Cloud app name.
