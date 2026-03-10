@@ -40,7 +40,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionTools,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FunctionCall, FunctionCallStream, FunctionType, Role, StopConfiguration,
+    FunctionCall, FunctionCallStream, FunctionType, ResponseFormat, ResponseFormatJsonSchema, Role,
+    StopConfiguration,
 };
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::error::{BuildError, SdkError};
@@ -56,8 +57,9 @@ use aws_sdk_bedrockruntime::types::{
     ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
     ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
     ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
-    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration, Message,
-    MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock,
+    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration,
+    JsonSchemaDefinition, Message, MessageStartEvent, MessageStopEvent, OutputConfig, OutputFormat,
+    OutputFormatStructure, OutputFormatType, SystemContentBlock, ToolResultContentBlock,
     ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
 use aws_smithy_types::Document;
@@ -386,6 +388,7 @@ impl BedrockConverse {
             metadata,
             tools,
             tool_choice,
+            response_format,
             ..
         } = req;
 
@@ -412,6 +415,41 @@ impl BedrockConverse {
             .transpose()
             .map_err(|e: BuildError| to_api_error(e.to_string()))?;
 
+        let output_config: Option<OutputConfig> = match response_format {
+            Some(ResponseFormat::JsonObject) => {
+                return Err(to_api_error(
+                    "Bedrock does not support 'response_format.type: json_object', only 'json_schema'.",
+                ));
+            }
+            Some(ResponseFormat::JsonSchema {
+                json_schema:
+                    ResponseFormatJsonSchema {
+                        name,
+                        schema: Some(schema),
+                        description,
+                        strict: _,
+                    },
+            }) => Some(
+                OutputConfig::builder()
+                    .text_format(
+                        OutputFormat::builder()
+                            .r#type(OutputFormatType::JsonSchema)
+                            .structure(OutputFormatStructure::JsonSchema(
+                                JsonSchemaDefinition::builder()
+                                    .set_schema(Some(schema.to_string()))
+                                    .name(name)
+                                    .set_description(description)
+                                    .build()
+                                    .map_err(|e| to_api_error(e.to_string()))?,
+                            ))
+                            .build()
+                            .map_err(|e| to_api_error(e.to_string()))?,
+                    )
+                    .build(),
+            ),
+            _ => None,
+        };
+
         let mut bldr = client
             .client
             .converse()
@@ -420,6 +458,7 @@ impl BedrockConverse {
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
+            .set_output_config(output_config)
             .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(metadata) = metadata {
