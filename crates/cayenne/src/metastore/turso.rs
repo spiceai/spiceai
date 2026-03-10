@@ -18,7 +18,7 @@ limitations under the License.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreValue, QueryParams,
-    QueryRowParams,
+    QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
@@ -121,6 +121,12 @@ impl TursoMetastore {
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to set journal mode: {e}"),
+            })?;
+
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to enable foreign keys: {e}"),
             })?;
 
         // NORMAL synchronous mode: safe with MVCC, more performant than FULL
@@ -364,7 +370,7 @@ impl MetastoreBackend for TursoMetastore {
         conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, ())
             .await
             .map_err(|e| CatalogError::Database {
-                message: format!("Failed to enforce unique delete-file paths for cayenne_delete_file; existing metadata may contain duplicate (table_id, path) rows: {e}"),
+                message: duplicate_delete_file_index_error_message("Turso/libSQL", e),
             })?;
 
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored

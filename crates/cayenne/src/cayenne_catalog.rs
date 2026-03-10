@@ -33,6 +33,16 @@ use turso_shared::{
     BEGIN_TRANSACTION_SQL, COMMIT_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
 };
 
+struct ExistingDeleteFileRecord {
+    delete_file_id: String,
+    path_is_relative: bool,
+    format: String,
+    delete_count: i64,
+    file_size_bytes: i64,
+    source_data_file_path: Option<String>,
+    sequence_number: i64,
+}
+
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
 pub(crate) enum MetastoreImpl {
@@ -560,13 +570,15 @@ impl MetadataCatalog for CayenneCatalog {
             Err(CatalogError::ConstraintViolation { message })
                 if is_delete_file_unique_constraint_violation_message(&message) =>
             {
-                // Another concurrent operation inserted first — retrieve the existing ID
-                let existing_id: String = self
+                // Another concurrent operation inserted first — only treat this as idempotent
+                // when the existing row matches the incoming delete-file metadata.
+                let existing_record: ExistingDeleteFileRecord = self
                     .metastore
                     .query_row_helper(
                         QueryRowParams {
                             sql: r"
-                            SELECT delete_file_id
+                            SELECT delete_file_id, path_is_relative, format, delete_count,
+                                   file_size_bytes, source_data_file_path, sequence_number
                             FROM cayenne_delete_file
                             WHERE table_id = ?1 AND path = ?2
                             ORDER BY delete_file_id DESC
@@ -577,13 +589,30 @@ impl MetadataCatalog for CayenneCatalog {
                                 MetastoreValue::Text(delete_file.path.clone()),
                             ],
                         },
-                        |row| row.get_string(0),
+                        |row| {
+                            Ok(ExistingDeleteFileRecord {
+                                delete_file_id: row.get_string(0)?,
+                                path_is_relative: row.get_bool(1)?,
+                                format: row.get_string(2)?,
+                                delete_count: row.get_i64(3)?,
+                                file_size_bytes: row.get_i64(4)?,
+                                source_data_file_path: row.get_optional_string(5)?,
+                                sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
+                            })
+                        },
                     )
                     .await
                     .map_err(|e| CatalogError::FailedToAddDeleteFile {
                         source: Box::new(e),
                     })?;
-                Ok(existing_id)
+
+                validate_existing_delete_file_record(&delete_file, &existing_record).map_err(
+                    |e| CatalogError::FailedToAddDeleteFile {
+                        source: Box::new(e),
+                    },
+                )?;
+
+                Ok(existing_record.delete_file_id)
             }
             Err(e) => Err(CatalogError::FailedToAddDeleteFile {
                 source: Box::new(e),
@@ -1248,6 +1277,46 @@ fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
     }
 }
 
+fn validate_existing_delete_file_record(
+    incoming: &DeleteFile,
+    existing: &ExistingDeleteFileRecord,
+) -> CatalogResult<()> {
+    let mut mismatched_fields = Vec::new();
+
+    if existing.path_is_relative != incoming.path_is_relative {
+        mismatched_fields.push("path_is_relative");
+    }
+    if existing.format != incoming.format {
+        mismatched_fields.push("format");
+    }
+    if existing.delete_count != incoming.delete_count {
+        mismatched_fields.push("delete_count");
+    }
+    if existing.file_size_bytes != incoming.file_size_bytes {
+        mismatched_fields.push("file_size_bytes");
+    }
+    if existing.source_data_file_path != incoming.source_data_file_path {
+        mismatched_fields.push("source_data_file_path");
+    }
+    if existing.sequence_number != incoming.sequence_number {
+        mismatched_fields.push("sequence_number");
+    }
+
+    if mismatched_fields.is_empty() {
+        return Ok(());
+    }
+
+    Err(CatalogError::ConstraintViolation {
+        message: format!(
+            "Delete file path '{}' for table '{}' already exists as '{}' with conflicting metadata in fields: {}",
+            incoming.path,
+            incoming.table_id,
+            existing.delete_file_id,
+            mismatched_fields.join(", ")
+        ),
+    })
+}
+
 fn is_delete_file_unique_constraint_violation_message(message: &str) -> bool {
     constraint_violation_message_contains_all(
         message,
@@ -1701,6 +1770,89 @@ mod tests {
 
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].path, "/tmp/delete_file_same_path.parquet");
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_same_delete_file_path_rejects_conflicting_metadata() {
+        let test_db = format!(
+            "sqlite://./.test_conflicting_delete_file_same_path_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_conflicting_same_path".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/delete_file_same_path_conflict.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 10,
+            file_size_bytes: 512,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+
+        let first_id = catalog
+            .add_delete_file(delete_file.clone())
+            .await
+            .expect("initial add_delete_file should succeed");
+
+        let mut conflicting_delete_file = delete_file;
+        conflicting_delete_file.file_size_bytes = 1024;
+
+        let err = catalog
+            .add_delete_file(conflicting_delete_file)
+            .await
+            .expect_err("conflicting same-path metadata should be rejected");
+
+        match err {
+            CatalogError::FailedToAddDeleteFile { source } => match *source {
+                CatalogError::ConstraintViolation { message } => {
+                    assert!(
+                        message.contains("file_size_bytes"),
+                        "expected file_size_bytes mismatch in error, got: {message}"
+                    );
+                }
+                other => panic!("expected nested ConstraintViolation, got: {other}"),
+            },
+            other => panic!("expected FailedToAddDeleteFile, got: {other}"),
+        }
+
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+
+        assert_eq!(delete_files.len(), 1);
+        assert_eq!(delete_files[0].delete_file_id, first_id);
+        assert_eq!(delete_files[0].file_size_bytes, 512);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

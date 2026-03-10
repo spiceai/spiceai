@@ -21,7 +21,7 @@ limitations under the License.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreValue, QueryParams,
-    QueryRowParams,
+    QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
@@ -381,7 +381,7 @@ impl MetastoreBackend for SqliteMetastore {
         .await
         .map_err(
             |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to enforce unique delete-file paths for cayenne_delete_file; existing metadata may contain duplicate (table_id, path) rows: {e}"),
+                message: duplicate_delete_file_index_error_message("SQLite", e),
             },
         )?;
 

@@ -123,12 +123,15 @@ runs:
           local cargo_bin
           local toolchain_bin
 
-          rustup toolchain install "$toolchain" --profile minimal
-          rustup component add cargo rustc rustfmt clippy --toolchain "$toolchain"
-          rustup default "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal || return 1
+          rustup component add cargo rustc rustfmt clippy --toolchain "$toolchain" || return 1
+          rustup default "$toolchain" || return 1
 
-          cargo_bin="$(rustup which cargo --toolchain "$toolchain")"
-          toolchain_bin="$(dirname "$cargo_bin")"
+          cargo_bin="$(rustup which cargo --toolchain "$toolchain")" || return 1
+          toolchain_bin="$(dirname "$cargo_bin")" || return 1
+
+          [ -x "$cargo_bin" ] || return 1
+          [ -x "$toolchain_bin/rustc" ] || return 1
 
           echo "$toolchain_bin" >> "$GITHUB_PATH"
           echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
@@ -140,10 +143,10 @@ runs:
           export CARGO="$cargo_bin"
           export RUSTC="$toolchain_bin/rustc"
 
-          rustup component list --toolchain "$toolchain" --installed
-          rustup show active-toolchain
-          "$cargo_bin" --version
-          "$toolchain_bin/rustc" --version
+          rustup component list --toolchain "$toolchain" --installed || return 1
+          rustup show active-toolchain || return 1
+          "$cargo_bin" --version || return 1
+          "$toolchain_bin/rustc" --version || return 1
         }
 
         for toolchain in "${toolchain_candidates[@]}"; do

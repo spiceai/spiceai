@@ -18268,6 +18268,7 @@ dependencies = [
  "spicepod",
  "system-adapter-protocol",
  "tokio",
+ "url",
  "uuid 1.21.0",
  "yaml",
 ]
