@@ -22,12 +22,16 @@ runs:
 
         if [ -f "$cargo_home/env" ]; then
           source "$cargo_home/env" || true
+        elif [ -f "$HOME/.cargo/env" ]; then
+          source "$HOME/.cargo/env" || true
         fi
 
         if [ ! -x "$cargo_home/bin/rustup" ]; then
           curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
           if [ -f "$cargo_home/env" ]; then
             source "$cargo_home/env" || true
+          elif [ -f "$HOME/.cargo/env" ]; then
+            source "$HOME/.cargo/env" || true
           fi
         fi
 
@@ -86,15 +90,25 @@ runs:
         set -euo pipefail
 
         toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
+        toolchain_bin_dir=''
 
-        rustup set profile minimal
         rustup toolchain install "$toolchain" \
+          --profile minimal \
           --component cargo \
           --component rustc \
           --component rustfmt \
-          --component clippy
-        rustup default "$toolchain"
+          --component clippy \
+          --no-self-update
 
+        toolchain_bin_dir="$(dirname "$(rustup which --toolchain "$toolchain" cargo)")"
+
+        echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+        echo "$toolchain_bin_dir" >> "$GITHUB_PATH"
+
+        export RUSTUP_TOOLCHAIN="$toolchain"
+        export PATH="$toolchain_bin_dir:$PATH"
+
+        rustup show active-toolchain
         rustup component list --toolchain "$toolchain" --installed
         rustup run "$toolchain" cargo --version
         rustup run "$toolchain" rustc --version
@@ -106,11 +120,19 @@ runs:
       shell: pwsh
       run: |
         $toolchain = "${{ steps.resolve-toolchain-windows.outputs.toolchain }}"
+        $toolchainBinDir = ""
 
-        rustup set profile minimal
-        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
-        rustup default $toolchain
+        rustup toolchain install $toolchain --profile minimal --component cargo --component rustc --component rustfmt --component clippy --no-self-update
 
+        $toolchainBinDir = Split-Path (rustup which --toolchain $toolchain cargo)
+
+        "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+        $toolchainBinDir >> $env:GITHUB_PATH
+
+        $env:RUSTUP_TOOLCHAIN = $toolchain
+        $env:PATH = "$toolchainBinDir;$env:PATH"
+
+        rustup show active-toolchain
         rustup component list --toolchain $toolchain --installed
         rustup run $toolchain cargo --version
         rustup run $toolchain rustc --version
