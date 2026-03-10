@@ -116,20 +116,20 @@ fn has_scheduler_state_location(spicepod_yaml: &str) -> bool {
 mod tests {
     use super::*;
 
-    const BASIC_SPICEPOD_YAML: &str = r#"
+    const BASIC_SPICEPOD_YAML: &str = "
 name: test
 version: v2
 kind: spicepod
-"#;
+";
 
-    const SCHEDULER_SPICEPOD_YAML: &str = r#"
+    const SCHEDULER_SPICEPOD_YAML: &str = "
 name: test
 version: v2
 kind: spicepod
 runtime:
   scheduler:
     state_location: s3://bucket/path
-"#;
+";
 
     #[test]
     fn includes_required_aws_secrets_when_scheduler_state_location_is_set() {

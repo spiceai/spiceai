@@ -1325,6 +1325,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             sink_type: None,
             state_location: Some("s3://bucket/state".to_string()),
+            flight_url: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1365,6 +1366,7 @@ mod tests {
             endpoint: None,
             sink_type: None,
             state_location: None,
+            flight_url: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
