@@ -115,13 +115,38 @@ jobs:
             touch ~/.zshrc
           fi
 
-      - name: Test install.sh with shell detection
+      - name: Test install.sh with shell detection (bash)
+        if: matrix.shell == 'bash'
         shell: bash
         env:
-          SHELL: /bin/${{ matrix.shell }}
+          SHELL: /bin/bash
         run: |
           chmod +x install/install.sh
-          ${{ matrix.shell }} ./install/install.sh
+          ./install/install.sh
+
+          # Verify binary was installed
+          if [ ! -f "$HOME/.spice/bin/spice" ]; then
+            echo "ERROR: spice binary not found at $HOME/.spice/bin/spice"
+            exit 1
+          fi
+
+          # Verify binary is executable
+          if [ ! -x "$HOME/.spice/bin/spice" ]; then
+            echo "ERROR: spice binary is not executable"
+            exit 1
+          fi
+
+          # Verify it runs
+          "$HOME/.spice/bin/spice" version
+
+      - name: Test install.sh with shell detection (zsh)
+        if: matrix.shell == 'zsh'
+        shell: zsh {0}
+        env:
+          SHELL: /bin/zsh
+        run: |
+          chmod +x install/install.sh
+          ./install/install.sh
 
           # Verify binary was installed
           if [ ! -f "$HOME/.spice/bin/spice" ]; then
