@@ -53,7 +53,7 @@ runs:
 
         toolchain='${{ inputs.toolchain }}'
         if [ -z "$toolchain" ]; then
-          toolchain="$(rustup show active-toolchain 2>/dev/null | awk '{ print $1; exit }')"
+          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
         fi
 
         if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
