@@ -5,6 +5,9 @@ inputs:
   toolchain:
     description: 'Rust toolchain to install; defaults to the repository rust-toolchain.toml channel'
     required: false
+  os:
+    description: 'DEPRECATED: no-op; retained only for backward compatibility. runner.os is used instead.'
+    required: false
 
 runs:
   using: 'composite'
@@ -61,17 +64,6 @@ runs:
           toolchain='stable'
         fi
 
-        default_host="$(rustup show 2>/dev/null | awk -F ': ' '/^Default host:/ { print $2; exit }')"
-        if [ -n "$default_host" ]; then
-          case "$toolchain" in
-            *-"$default_host")
-              ;;
-            stable|beta|nightly|stable-*|beta-*|nightly-*|[0-9]*)
-              toolchain="${toolchain}-${default_host}"
-              ;;
-          esac
-        fi
-
         echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
 
     - name: Resolve Rust toolchain (Windows)
@@ -98,14 +90,6 @@ runs:
           $toolchain = "stable"
         }
 
-        $defaultHostMatch = rustup show 2>$null | Select-String -Pattern '^Default host:\s+(.+)$' | Select-Object -First 1
-        if ($defaultHostMatch) {
-          $defaultHost = $defaultHostMatch.Matches[0].Groups[1].Value
-          if ($toolchain -notlike "*-$defaultHost" -and ($toolchain -match '^(stable|beta|nightly)(-.+)?$' -or $toolchain -match '^\d')) {
-            $toolchain = "$toolchain-$defaultHost"
-          }
-        }
-
         "toolchain=$toolchain" >> $env:GITHUB_OUTPUT
 
     - name: Install Rust toolchain (Linux/macOS)
@@ -114,15 +98,22 @@ runs:
       run: |
         set -euo pipefail
 
-        toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
+        requested_toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
 
-        rustup toolchain install "$toolchain" --profile minimal
-        rustup component add cargo rustc rustfmt clippy --toolchain "$toolchain"
-        rustup default "$toolchain"
+        rustup toolchain install "$requested_toolchain" --profile minimal
 
-        rustup component list --toolchain "$toolchain" --installed
-        rustup run "$toolchain" cargo --version
-        rustup run "$toolchain" rustc --version
+        resolved_toolchain="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$requested_toolchain" rustc)")")")"
+        if [ -z "$resolved_toolchain" ]; then
+          echo "Failed to resolve installed Rust toolchain for $requested_toolchain" >&2
+          exit 1
+        fi
+
+        rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
+        rustup default "$resolved_toolchain"
+
+        rustup component list --toolchain "$resolved_toolchain" --installed
+        rustup run "$resolved_toolchain" cargo --version
+        rustup run "$resolved_toolchain" rustc --version
         cargo --version
         rustc --version
 
@@ -130,14 +121,23 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        $toolchain = "${{ steps.resolve-toolchain-windows.outputs.toolchain }}"
+        $requestedToolchain = "${{ steps.resolve-toolchain-windows.outputs.toolchain }}"
 
-        rustup toolchain install $toolchain --profile minimal
-        rustup component add cargo rustc rustfmt clippy --toolchain $toolchain
-        rustup default $toolchain
+        rustup toolchain install $requestedToolchain --profile minimal
 
-        rustup component list --toolchain $toolchain --installed
-        rustup run $toolchain cargo --version
-        rustup run $toolchain rustc --version
+        $rustcPath = rustup which --toolchain $requestedToolchain rustc
+        if (-not $rustcPath) {
+          Write-Error "Failed to resolve installed Rust toolchain for $requestedToolchain"
+          exit 1
+        }
+
+        $resolvedToolchain = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
+
+        rustup component add cargo rustc rustfmt clippy --toolchain $resolvedToolchain
+        rustup default $resolvedToolchain
+
+        rustup component list --toolchain $resolvedToolchain --installed
+        rustup run $resolvedToolchain cargo --version
+        rustup run $resolvedToolchain rustc --version
         cargo --version
         rustc --version

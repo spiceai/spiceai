@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
+use turso_shared::JOURNAL_MODE_SQL_LITERAL;
+
+const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
@@ -113,7 +116,14 @@ impl TursoMetastore {
                 message: format!("Failed to set busy timeout: {e}"),
             })?;
 
-        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set journal mode: {e}"),
+            })?;
+
+        // NORMAL synchronous mode: safe with MVCC, more performant than FULL
         conn.execute("PRAGMA synchronous = NORMAL", ())
             .await
             .map_err(|e| CatalogError::Database {
@@ -319,7 +329,7 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
 /// Convert Turso errors to `CatalogError`, distinguishing constraint violations.
 fn convert_turso_error(e: turso::Error) -> CatalogError {
     match e {
-        // turso 0.4.x uses dedicated Constraint variant for constraint violations
+        // turso exposes a dedicated Constraint variant for constraint violations
         turso::Error::Constraint(ref msg) => CatalogError::ConstraintViolation {
             message: msg.clone(),
         },
@@ -349,6 +359,12 @@ impl MetastoreBackend for TursoMetastore {
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
+            })?;
+
+        conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to enforce unique delete-file paths for cayenne_delete_file; existing metadata may contain duplicate (table_id, path) rows: {e}"),
             })?;
 
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored

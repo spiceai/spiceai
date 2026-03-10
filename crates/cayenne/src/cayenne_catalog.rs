@@ -28,6 +28,10 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use turso_shared::{
+    is_retryable_write_conflict_message, retry_backoff_delay, BEGIN_CONCURRENT_SQL,
+    BEGIN_TRANSACTION_SQL, COMMIT_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
+};
 
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
@@ -38,6 +42,18 @@ pub(crate) enum MetastoreImpl {
 }
 
 impl MetastoreImpl {
+    #[must_use]
+    pub(crate) fn is_turso(&self) -> bool {
+        #[cfg(feature = "turso")]
+        {
+            matches!(self, Self::Turso(_))
+        }
+        #[cfg(not(feature = "turso"))]
+        {
+            false
+        }
+    }
+
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -64,10 +80,10 @@ impl MetastoreImpl {
         }
     }
 
-    /// Helper to execute a batch of SQL statements atomically.
+    /// Helper to execute a batch of SQL statements.
     ///
-    /// For `SQLite`, this runs all statements in a single transaction.
-    /// The entire batch succeeds or fails as a unit.
+    /// Callers that require atomicity must include explicit `BEGIN ... COMMIT`
+    /// statements in the SQL they pass to this helper.
     pub(crate) async fn execute_batch_helper(&self, sql: &str) -> CatalogResult<()> {
         match self {
             MetastoreImpl::Sqlite(m) => m.execute_batch(sql).await,
@@ -180,6 +196,28 @@ impl CayenneCatalog {
     pub async fn shutdown(&self) -> CatalogResult<()> {
         self.metastore.shutdown().await
     }
+
+    async fn validate_existing_table_configuration(
+        &self,
+        table_name: &str,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<TableMetadata> {
+        match self.get_table(table_name).await {
+            Ok(stored_metadata) => {
+                if configuration_matches(&stored_metadata, options) {
+                    return Ok(stored_metadata);
+                }
+
+                Err(CatalogError::ChangedConfiguration {
+                    table_name: table_name.to_string(),
+                })
+            }
+            Err(e) => Err(CatalogError::InvalidMetadata {
+                table_name: table_name.to_string(),
+                source: Box::new(e),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -237,27 +275,11 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .ok();
 
-        if let Some(table_id) = existing_table_id {
-            // Table already exists - check if configuration has changed
-            match self.get_table(&table_name).await {
-                Ok(stored_metadata) => {
-                    if configuration_matches(&stored_metadata, &options) {
-                        // Configuration unchanged, reuse existing table
-                        return Ok(table_id);
-                    }
-
-                    // Configuration changed - return error to prevent accidental reuse of existing table with incompatible schema or settings
-                    return Err(CatalogError::ChangedConfiguration {
-                        table_name: table_name.clone(),
-                    });
-                }
-                Err(e) => {
-                    return Err(CatalogError::InvalidMetadata {
-                        table_name: table_name.clone(),
-                        source: Box::new(e),
-                    });
-                }
-            }
+        if existing_table_id.is_some() {
+            return self
+                .validate_existing_table_configuration(table_name.as_str(), &options)
+                .await
+                .map(|stored_metadata| stored_metadata.table_id);
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -339,30 +361,13 @@ impl MetadataCatalog for CayenneCatalog {
         match insert_result {
             Ok(()) => {}
             Err(CatalogError::ConstraintViolation { .. }) => {
-                // A concurrent create likely won the race. Load the stored metadata,
-                // verify that its configuration matches the requested options, and
-                // ensure the initial snapshot directory exists for local paths.
-                let existing_table = self.get_table(&table_name).await?;
+                let existing_table = self
+                    .validate_existing_table_configuration(table_name.as_str(), &options)
+                    .await?;
 
-                if !configuration_matches(&existing_table, &options) {
-                    return Err(CatalogError::ChangedConfiguration {
-                        table_name: table_name.clone(),
-                    });
-                }
+                ensure_snapshot_directory_exists(&existing_table).await?;
 
-                // For non-S3 paths, ensure the initial snapshot directory exists.
-                // create_dir_all is idempotent so this is safe even if the winner already created it.
-                if !existing_table.path.starts_with("s3://") {
-                    let snapshot_dir = std::path::PathBuf::from(&existing_table.path)
-                        .join(&existing_table.table_id)
-                        .join(&existing_table.current_snapshot_id);
-
-                    tokio::fs::create_dir_all(&snapshot_dir)
-                        .await
-                        .map_err(|e| CatalogError::Io { source: e })?;
-                }
-
-                return Ok(existing_table.table_id.clone());
+                return Ok(existing_table.table_id);
             }
             Err(e) => return Err(e),
         }
@@ -550,14 +555,40 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await;
 
-        insert_result.map_or_else(
-            |e| {
-                Err(CatalogError::FailedToAddDeleteFile {
-                    source: Box::new(e),
-                })
-            },
-            |()| Ok(delete_file_id),
-        )
+        match insert_result {
+            Ok(()) => Ok(delete_file_id),
+            Err(CatalogError::ConstraintViolation { message })
+                if is_delete_file_unique_constraint_violation_message(&message) =>
+            {
+                // Another concurrent operation inserted first — retrieve the existing ID
+                let existing_id: String = self
+                    .metastore
+                    .query_row_helper(
+                        QueryRowParams {
+                            sql: r"
+                            SELECT delete_file_id
+                            FROM cayenne_delete_file
+                            WHERE table_id = ?1 AND path = ?2
+                            ORDER BY delete_file_id DESC
+                            LIMIT 1
+                        ",
+                            params: vec![
+                                MetastoreValue::Text(delete_file.table_id.clone()),
+                                MetastoreValue::Text(delete_file.path.clone()),
+                            ],
+                        },
+                        |row| row.get_string(0),
+                    )
+                    .await
+                    .map_err(|e| CatalogError::FailedToAddDeleteFile {
+                        source: Box::new(e),
+                    })?;
+                Ok(existing_id)
+            }
+            Err(e) => Err(CatalogError::FailedToAddDeleteFile {
+                source: Box::new(e),
+            }),
+        }
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
@@ -710,6 +741,7 @@ impl MetadataCatalog for CayenneCatalog {
         // Using INSERT OR REPLACE to update sequence if PK already exists
         let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
+        let table_id = table_id.to_string();
 
         for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
@@ -721,7 +753,7 @@ impl MetadataCatalog for CayenneCatalog {
                 base + 3
             ));
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
-            params.push(MetastoreValue::Text(table_id.to_string()));
+            params.push(MetastoreValue::Text(table_id.clone()));
             params.push(MetastoreValue::Blob(pk_bytes));
             params.push(MetastoreValue::Integer(sequence_number));
         }
@@ -880,23 +912,20 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
-        // Validate that both IDs are valid UUIDs before interpolating into SQL.
-        // These are internally generated UUIDv7s, but we validate defensively
-        // since execute_batch_helper doesn't support parameterized queries.
-        let table_uuid = uuid::Uuid::parse_str(table_id).map_err(|_| {
-            CatalogError::InvalidOperationNoSource {
-                message: format!("Invalid table_id UUID: {table_id}"),
+        // Validate that IDs are well-formed UUIDs to prevent SQL injection.
+        // Both values are generated internally via uuid::Uuid::now_v7(), but we enforce
+        // the invariant here since they are interpolated into batch SQL.
+        for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
+            if uuid::Uuid::parse_str(value).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("{name} is not a valid UUID: {value}"),
+                });
             }
-        })?;
-        let snapshot_uuid = uuid::Uuid::parse_str(new_snapshot_id).map_err(|_| {
-            CatalogError::InvalidOperationNoSource {
-                message: format!("Invalid new_snapshot_id UUID: {new_snapshot_id}"),
-            }
-        })?;
+        }
 
         // Execute all operations atomically using a transaction batch.
-        // SQLite's execute_batch runs all statements in a single transaction,
-        // ensuring atomicity: either all succeed or none takes effect.
+        // Atomicity is provided by explicit BEGIN ... COMMIT statements in `batch_sql`,
+        // ensuring either all statements succeed or none takes effect.
         //
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
@@ -908,23 +937,68 @@ impl MetadataCatalog for CayenneCatalog {
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
         // but data is not corrupted).
+        let begin_transaction = if self.metastore.is_turso() {
+            BEGIN_CONCURRENT_SQL
+        } else {
+            BEGIN_TRANSACTION_SQL
+        };
+
+        let table_id_literal = sql_text_literal(table_id);
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         let batch_sql = format!(
-            "BEGIN TRANSACTION; \
-             DELETE FROM cayenne_delete_file WHERE table_id = '{table_uuid}'; \
-             DELETE FROM cayenne_insert_record WHERE table_id = '{table_uuid}'; \
-             DELETE FROM cayenne_snapshot_sequence WHERE table_id = '{table_uuid}'; \
-             UPDATE cayenne_table SET current_snapshot_id = '{snapshot_uuid}' WHERE table_id = '{table_uuid}'; \
-             COMMIT;"
+            "{begin_transaction}; \
+             DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal}; \
+             {COMMIT_SQL};"
         );
 
-        self.metastore
-            .execute_batch_helper(&batch_sql)
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
-                source: Box::new(e),
-            })?;
+        // BEGIN CONCURRENT may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at commit time.
+        // Retry a few times with backoff to improve throughput under concurrent writers.
+        let max_attempts = if self.metastore.is_turso() {
+            DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS
+        } else {
+            1
+        };
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_compaction requires at least one attempt".to_string(),
+            });
+        }
 
-        Ok(())
+        for attempt in 1..=max_attempts {
+            match self.metastore.execute_batch_helper(&batch_sql).await {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if self.metastore.is_turso()
+                        && attempt < max_attempts
+                        && is_retryable_turso_write_conflict(&e) =>
+                {
+                    rollback_failed_compaction_transaction(&self.metastore).await;
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying Turso BEGIN CONCURRENT compaction transaction after conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    rollback_failed_compaction_transaction(&self.metastore).await;
+                    return Err(CatalogError::FailedToSetCurrentSnapshot {
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_compaction exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String> {
@@ -1011,7 +1085,8 @@ impl MetadataCatalog for CayenneCatalog {
 
         match insert_result {
             Ok(()) => return Ok(partition_id),
-            Err(CatalogError::ConstraintViolation { .. }) => {}
+            Err(CatalogError::ConstraintViolation { message })
+                if is_partition_unique_constraint_violation_message(&message) => {}
             Err(e) => {
                 return Err(CatalogError::FailedToAddPartition {
                     source: Box::new(e),
@@ -1163,6 +1238,71 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
         Ok(true)
+    }
+}
+
+fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
+    match error {
+        CatalogError::Database { message } => is_retryable_write_conflict_message(message),
+        _ => false,
+    }
+}
+
+fn is_delete_file_unique_constraint_violation_message(message: &str) -> bool {
+    constraint_violation_message_contains_all(
+        message,
+        &["unique", "cayenne_delete_file", "table_id", "path"],
+    ) || constraint_violation_message_contains_all(message, &["idx_cayenne_delete_file_table_path"])
+}
+
+fn is_partition_unique_constraint_violation_message(message: &str) -> bool {
+    constraint_violation_message_contains_all(
+        message,
+        &["unique", "cayenne_partition", "table_id", "partition_key"],
+    )
+}
+
+fn constraint_violation_message_contains_all(message: &str, required_parts: &[&str]) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    required_parts.iter().all(|part| normalized.contains(part))
+}
+
+fn sql_text_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
+    if table.path.starts_with("s3://") {
+        return Ok(());
+    }
+
+    let snapshot_dir = std::path::PathBuf::from(&table.path)
+        .join(&table.table_id)
+        .join(&table.current_snapshot_id);
+
+    tokio::fs::create_dir_all(&snapshot_dir)
+        .await
+        .map_err(|e| CatalogError::Io { source: e })
+}
+
+async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
+    if let Err(error) = metastore
+        .execute_helper(ExecuteParams {
+            sql: "ROLLBACK",
+            params: vec![],
+        })
+        .await
+    {
+        let backend = if metastore.is_turso() {
+            "Turso"
+        } else {
+            "SQLite"
+        };
+        tracing::debug!(
+            backend,
+            ?error,
+            "Failed to rollback compaction transaction after batch error"
+        );
     }
 }
 
@@ -1477,6 +1617,91 @@ mod tests {
         assert_eq!(delete_files.len(), 10);
 
         // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_delete_file_creation_is_idempotent_for_same_path() {
+        let test_db = format!(
+            "sqlite://./.test_concurrent_delete_file_same_path_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_same_path".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_id = table_id.clone();
+
+            let handle = tokio::spawn(async move {
+                let delete_file = DeleteFile {
+                    delete_file_id: String::new(),
+                    table_id,
+                    source_data_file_path: None,
+                    path: "/tmp/delete_file_same_path.parquet".to_string(),
+                    path_is_relative: false,
+                    format: "parquet".to_string(),
+                    delete_count: 10,
+                    file_size_bytes: 512,
+                    deletion_type: DeletionType::default(),
+                    sequence_number: 1,
+                };
+
+                catalog_clone.add_delete_file(delete_file).await
+            });
+
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        let mut delete_file_ids = vec![];
+        for result in results {
+            let delete_file_id = result
+                .expect("Task panicked")
+                .expect("add_delete_file failed");
+            delete_file_ids.push(delete_file_id);
+        }
+
+        let unique_ids: std::collections::HashSet<_> = delete_file_ids.iter().collect();
+        assert_eq!(
+            unique_ids.len(),
+            1,
+            "All concurrent add_delete_file calls for the same path should return the same delete_file_id"
+        );
+
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+
+        assert_eq!(delete_files.len(), 1);
+        assert_eq!(delete_files[0].path, "/tmp/delete_file_same_path.parquet");
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
@@ -2192,6 +2417,203 @@ mod tests {
         assert_eq!(table_id_1, table_id_2);
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test that `commit_compaction` clears delete files, insert records, and
+    /// snapshot sequences, and updates the active snapshot pointer.
+    #[tokio::test]
+    async fn test_commit_compaction_clears_metadata() {
+        let test_db = format!(
+            "sqlite://./.test_commit_compaction_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        // Create a table.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "compaction_test".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/cayenne_compaction_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+
+        // Add a delete file so there is something to clear.
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: None,
+            path: "/tmp/delete.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 5,
+            file_size_bytes: 256,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+        catalog
+            .add_delete_file(delete_file)
+            .await
+            .expect("Failed to add delete file");
+
+        // Verify delete file exists before compaction.
+        let before = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(before.len(), 1, "Expected 1 delete file before compaction");
+
+        // Commit compaction with a new snapshot ID.
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_compaction(&table_id, &new_snapshot_id)
+            .await
+            .expect("commit_compaction failed");
+
+        // Verify delete files were cleared.
+        let after = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after compaction");
+        assert!(
+            after.is_empty(),
+            "Delete files should be cleared after compaction"
+        );
+
+        // Verify the snapshot pointer was updated.
+        let table = catalog
+            .get_table("compaction_test")
+            .await
+            .expect("Failed to get table after compaction");
+        assert_eq!(
+            table.current_snapshot_id, new_snapshot_id,
+            "Snapshot pointer should be updated after compaction"
+        );
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Test that `commit_compaction` rejects non-UUID identifiers.
+    #[tokio::test]
+    async fn test_commit_compaction_rejects_invalid_uuid() {
+        let test_db = format!(
+            "sqlite://./.test_compaction_invalid_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let valid_uuid = uuid::Uuid::now_v7().to_string();
+
+        // Invalid table_id should fail.
+        let result = catalog
+            .commit_compaction("'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .await;
+        assert!(result.is_err(), "Should reject non-UUID table_id");
+
+        // Invalid new_snapshot_id should fail.
+        let result = catalog.commit_compaction(&valid_uuid, "not-a-uuid").await;
+        assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[test]
+    fn test_sql_text_literal_escapes_single_quotes() {
+        assert_eq!(sql_text_literal("abc'def"), "'abc''def'");
+    }
+
+    #[test]
+    fn test_delete_file_unique_constraint_violation_message_matches_expected_conflicts() {
+        let messages = [
+            "UNIQUE constraint failed: cayenne_delete_file.table_id, cayenne_delete_file.path",
+            "constraint failed: idx_cayenne_delete_file_table_path",
+        ];
+
+        for message in messages {
+            assert!(is_delete_file_unique_constraint_violation_message(message));
+        }
+    }
+
+    #[test]
+    fn test_delete_file_unique_constraint_violation_message_rejects_unrelated_constraints() {
+        let messages = [
+            "FOREIGN KEY constraint failed",
+            "UNIQUE constraint failed: cayenne_table.table_name",
+        ];
+
+        for message in messages {
+            assert!(!is_delete_file_unique_constraint_violation_message(message));
+        }
+    }
+
+    #[test]
+    fn test_partition_unique_constraint_violation_message_matches_expected_conflicts() {
+        let message =
+            "UNIQUE constraint failed: cayenne_partition.table_id, cayenne_partition.partition_key";
+        assert!(is_partition_unique_constraint_violation_message(message));
+    }
+
+    #[test]
+    fn test_partition_unique_constraint_violation_message_rejects_unrelated_constraints() {
+        let messages = [
+            "FOREIGN KEY constraint failed",
+            "UNIQUE constraint failed: cayenne_delete_file.table_id, cayenne_delete_file.path",
+        ];
+
+        for message in messages {
+            assert!(!is_partition_unique_constraint_violation_message(message));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rollback_failed_compaction_transaction_cleans_up_sqlite_batch_error() {
+        let test_db = format!(
+            "sqlite://./.test_compaction_rollback_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let batch_result = catalog
+            .metastore
+            .execute_batch_helper(
+                "BEGIN TRANSACTION; INSERT INTO missing_table VALUES (1); COMMIT;",
+            )
+            .await;
+        assert!(batch_result.is_err(), "Expected batch execution to fail");
+
+        rollback_failed_compaction_transaction(&catalog.metastore).await;
+
+        catalog
+            .metastore
+            .execute_batch_helper("BEGIN TRANSACTION; COMMIT;")
+            .await
+            .expect("Expected rollback helper to clear the failed SQLite transaction");
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
