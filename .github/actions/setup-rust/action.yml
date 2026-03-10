@@ -53,11 +53,20 @@ runs:
 
         toolchain='${{ inputs.toolchain }}'
         if [ -z "$toolchain" ]; then
+          if [ -f rust-toolchain.toml ]; then
+            toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+          fi
+        fi
+
+        if [ -z "$toolchain" ]; then
           toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
         fi
 
-        if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
-          toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+        if [ -n "$toolchain" ]; then
+          host_triple="$( (rustc -vV 2>/dev/null || true) | awk '/^host: / { print $2; exit }')"
+          if [ -n "$host_triple" ] && [ "${toolchain%-$host_triple}" != "$toolchain" ]; then
+            toolchain="${toolchain%-$host_triple}"
+          fi
         fi
 
         if [ -z "$toolchain" ]; then
@@ -73,16 +82,18 @@ runs:
       run: |
         $toolchain = "${{ inputs.toolchain }}"
         if (-not $toolchain) {
-          $activeToolchain = rustup show active-toolchain 2>$null
-          if ($activeToolchain) {
-            $toolchain = ($activeToolchain -split '\s+')[0]
+          if (Test-Path "rust-toolchain.toml") {
+            $match = Select-String -Path "rust-toolchain.toml" -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
+            if ($match) {
+              $toolchain = $match.Matches[0].Groups[1].Value
+            }
           }
         }
 
-        if (-not $toolchain -and (Test-Path "rust-toolchain.toml")) {
-          $match = Select-String -Path "rust-toolchain.toml" -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
-          if ($match) {
-            $toolchain = $match.Matches[0].Groups[1].Value
+        if (-not $toolchain) {
+          $activeToolchain = rustup show active-toolchain 2>$null
+          if ($activeToolchain) {
+            $toolchain = ($activeToolchain -split '\s+')[0]
           }
         }
 
@@ -98,22 +109,20 @@ runs:
       run: |
         set -euo pipefail
 
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        echo "$cargo_home/bin" >> "$GITHUB_PATH"
+        export PATH="$cargo_home/bin:$PATH"
+
         requested_toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
 
         rustup toolchain install "$requested_toolchain" --profile minimal
 
-        resolved_toolchain="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$requested_toolchain" rustc)")")")"
-        if [ -z "$resolved_toolchain" ]; then
-          echo "Failed to resolve installed Rust toolchain for $requested_toolchain" >&2
-          exit 1
-        fi
+        rustup component add cargo rustc rustfmt clippy --toolchain "$requested_toolchain"
+        rustup default "$requested_toolchain"
 
-        rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
-        rustup default "$resolved_toolchain"
-
-        rustup component list --toolchain "$resolved_toolchain" --installed
-        rustup run "$resolved_toolchain" cargo --version
-        rustup run "$resolved_toolchain" rustc --version
+        rustup component list --toolchain "$requested_toolchain" --installed
+        rustup run "$requested_toolchain" cargo --version
+        rustup run "$requested_toolchain" rustc --version
         cargo --version
         rustc --version
 
@@ -125,19 +134,11 @@ runs:
 
         rustup toolchain install $requestedToolchain --profile minimal
 
-        $rustcPath = rustup which --toolchain $requestedToolchain rustc
-        if (-not $rustcPath) {
-          Write-Error "Failed to resolve installed Rust toolchain for $requestedToolchain"
-          exit 1
-        }
+        rustup component add cargo rustc rustfmt clippy --toolchain $requestedToolchain
+        rustup default $requestedToolchain
 
-        $resolvedToolchain = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
-
-        rustup component add cargo rustc rustfmt clippy --toolchain $resolvedToolchain
-        rustup default $resolvedToolchain
-
-        rustup component list --toolchain $resolvedToolchain --installed
-        rustup run $resolvedToolchain cargo --version
-        rustup run $resolvedToolchain rustc --version
+        rustup component list --toolchain $requestedToolchain --installed
+        rustup run $requestedToolchain cargo --version
+        rustup run $requestedToolchain rustc --version
         cargo --version
         rustc --version
