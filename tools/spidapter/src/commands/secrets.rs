@@ -94,8 +94,7 @@ fn include_scheduler_state_location_aws_secrets(
             .or_insert_with(|| ENV_STORE_NAME.to_string());
     }
 
-    if !secret_refs.contains_key(AWS_SESSION_TOKEN)
-        && std::env::var_os(AWS_SESSION_TOKEN).is_some()
+    if !secret_refs.contains_key(AWS_SESSION_TOKEN) && std::env::var_os(AWS_SESSION_TOKEN).is_some()
     {
         secret_refs.insert(AWS_SESSION_TOKEN.to_string(), ENV_STORE_NAME.to_string());
     }
@@ -167,7 +166,10 @@ runtime:
 
         include_scheduler_state_location_aws_secrets(SCHEDULER_SPICEPOD_YAML, &mut secret_refs);
 
-        assert_eq!(secret_refs.get(AWS_ACCESS_KEY_ID), Some(&"custom-store".to_string()));
+        assert_eq!(
+            secret_refs.get(AWS_ACCESS_KEY_ID),
+            Some(&"custom-store".to_string())
+        );
         assert_eq!(
             secret_refs.get(AWS_SECRET_ACCESS_KEY),
             Some(&ENV_STORE_NAME.to_string())
