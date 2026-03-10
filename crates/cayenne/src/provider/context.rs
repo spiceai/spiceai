@@ -164,7 +164,7 @@ impl CayenneContext {
         }
 
         let vortex_opts = VortexTableOptions {
-            target_file_size_mb: 0,
+            target_file_size_mb: config.target_vortex_file_size_mb,
             ..VortexTableOptions::default()
         };
 

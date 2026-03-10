@@ -22,7 +22,6 @@ limitations under the License.
 use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
     PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, STAGING_WAL_FILENAME,
-    WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -44,7 +43,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::sink::DataSinkExec;
-use datafusion::execution::context::{SessionContext, SessionState};
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
@@ -1369,8 +1368,7 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Write a stream of record batches to a specific snapshot directory, chunking into
-    /// parallel writes for efficiency.
+    /// Write a stream of record batches to a specific snapshot directory.
     ///
     /// This is used during compaction operations where data needs to be written to a
     /// new snapshot.
@@ -1383,14 +1381,14 @@ impl CayenneTableProvider {
     ///
     /// # Returns
     ///
-    /// A tuple of (total rows written, number of files written)
+    /// A tuple of (total rows written, number of writer operations)
     ///
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
     pub(crate) async fn chunk_and_write_parallel_to_snapshot(
         &self,
-        mut stream: SendableRecordBatchStream,
+        stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         snapshot_id: &str,
     ) -> Result<(u64, usize)> {
@@ -1412,100 +1410,47 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        // Create session context once with object store registered (if S3),
-        // then share the session state across all parallel write tasks.
+        // Create session context once with object store registered (if S3).
         let session_state = Arc::new(self.create_session_context().state());
-
-        // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let semaphore = Arc::clone(self.context.upload_semaphore());
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
         let start_time = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let total_bytes_written = Arc::new(AtomicUsize::new(0));
-        let files_written = Arc::new(AtomicUsize::new(0));
-        let mut write_tasks = tokio::task::JoinSet::new();
+        let total_rows_written = Arc::new(AtomicU64::new(0));
 
         // Log when starting S3 upload process
         if is_s3_storage {
             tracing::info!(
-                "Starting S3 upload to snapshot {} for table {} (target chunk size: {})",
+                "Starting S3 upload to snapshot {} for table {} (writer target file size: {})",
                 snapshot_id,
                 self.table_metadata.table_name,
                 format_bytes(target_size_bytes)
             );
         }
 
-        // Pre-allocate chunk vector with estimated capacity
-        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
-        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
-        let mut current_size = 0usize;
-        let mut total_rows = 0u64;
-        let mut chunk_count = 0usize;
+        let tracked_schema = Arc::clone(&self.table_metadata.schema);
+        let tracked_stream = {
+            let total_bytes_written = Arc::clone(&total_bytes_written);
+            let total_rows_written = Arc::clone(&total_rows_written);
+            let last_progress_ms = Arc::clone(&last_progress_ms);
+            let table_name = self.table_metadata.table_name.clone();
+            let start = start_time;
 
-        let snapshot_listing_table = Arc::new(snapshot_listing_table);
+            stream.map(move |batch_result| {
+                if let Ok(batch) = &batch_result {
+                    total_bytes_written
+                        .fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                    #[expect(clippy::cast_possible_truncation)]
+                    total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-
-            let batch_size = batch.get_array_memory_size();
-
-            // If adding this batch would exceed target size and we have data, write current chunk
-            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
-                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|_| {
-                    Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: WRITE_SEMAPHORE_CLOSED,
-                    }
-                })?;
-
-                let chunk_to_write = std::mem::replace(
-                    &mut current_chunk,
-                    Vec::with_capacity(estimated_batches_per_chunk),
-                );
-                let chunk_size = current_size;
-                current_size = 0;
-                chunk_count += 1;
-
-                let listing_table_clone = Arc::clone(&snapshot_listing_table);
-                let total_bytes = Arc::clone(&total_bytes_written);
-                let files_count = Arc::clone(&files_written);
-                let progress_time = Arc::clone(&last_progress_ms);
-                let is_s3 = is_s3_storage;
-                let table_name = self.table_metadata.table_name.clone();
-                let start = start_time;
-                let current_chunk_num = chunk_count;
-                let state = Arc::clone(&session_state);
-
-                if is_s3 {
-                    tracing::info!(
-                        "Starting S3 upload for {} chunk {} ({})...",
-                        table_name,
-                        current_chunk_num,
-                        format_bytes(chunk_size)
-                    );
-                }
-
-                write_tasks.spawn(async move {
-                    let result = Self::write_chunk_to_listing_table(
-                        &listing_table_clone,
-                        chunk_to_write,
-                        &state,
-                    )
-                    .await;
-
-                    if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
-                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
-
+                    if is_s3_storage {
                         let elapsed = start.elapsed();
                         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = progress_time.load(Ordering::Relaxed);
-                        let should_log =
-                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
-                        if should_log {
-                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                        let last_logged = last_progress_ms.load(Ordering::Relaxed);
+                        if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
+                            let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
                             let throughput = if elapsed.as_secs_f64() > 0.0 {
                                 #[expect(clippy::cast_precision_loss)]
                                 let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
@@ -1514,75 +1459,39 @@ impl CayenneTableProvider {
                                 "calculating...".to_string()
                             };
                             tracing::info!(
-                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                "S3 upload for {}: streamed {} in {:.1}s, {}",
                                 table_name,
-                                file_num,
                                 format_bytes(bytes_so_far),
                                 elapsed.as_secs_f64(),
                                 throughput
                             );
-                            progress_time.store(elapsed_ms, Ordering::Relaxed);
+                            last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
                         }
                     }
-
-                    drop(permit);
-                    result
-                });
-            }
-
-            current_size += batch_size;
-            current_chunk.push(batch);
-        }
-
-        // Write final chunk if non-empty
-        if !current_chunk.is_empty() {
-            let permit =
-                Arc::clone(&semaphore)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: WRITE_SEMAPHORE_CLOSED,
-                    })?;
-
-            chunk_count += 1;
-            let final_chunk_size = current_size;
-
-            let listing_table_clone = Arc::clone(&snapshot_listing_table);
-            let total_bytes = Arc::clone(&total_bytes_written);
-            let files_count = Arc::clone(&files_written);
-            let is_s3 = is_s3_storage;
-            let state = Arc::clone(&session_state);
-
-            write_tasks.spawn(async move {
-                let result =
-                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk, &state)
-                        .await;
-
-                if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
-                    files_count.fetch_add(1, Ordering::Relaxed);
                 }
+                batch_result
+            })
+        };
 
-                drop(permit);
-                result
-            });
-        }
+        let tracked_stream = RecordBatchStreamAdapter::new(tracked_schema.clone(), tracked_stream);
+        let stream_exec = Arc::new(StreamingExec::new(
+            tracked_schema,
+            Box::pin(tracked_stream),
+        ));
 
-        // Wait for all writes to complete and collect row counts
-        while let Some(result) = write_tasks.join_next().await {
-            let row_count = result.map_err(|e| Error::TaskPanicked {
-                table: self.table_metadata.table_name.clone(),
-                source: e,
-            })??;
-            total_rows += row_count;
-        }
+        let insert_plan = snapshot_listing_table
+            .insert_into(session_state.as_ref(), stream_exec, InsertOp::Append)
+            .await?;
+
+        collect(insert_plan, session_state.task_ctx()).await?;
+
+        let total_rows = total_rows_written.load(Ordering::Relaxed);
+        let writer_ops = if total_rows > 0 { 1 } else { 0 };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
             let elapsed = start_time.elapsed();
             let total_bytes = total_bytes_written.load(Ordering::Relaxed);
-            let files_count = files_written.load(Ordering::Relaxed);
             let throughput = if elapsed.as_secs_f64() > 0.0 {
                 #[expect(clippy::cast_precision_loss)]
                 let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
@@ -1591,57 +1500,18 @@ impl CayenneTableProvider {
                 "N/A".to_string()
             };
             tracing::info!(
-                "Completed S3 upload for {} to snapshot {}: {} rows in {} files ({}) in {:.1}s, {}",
+                "Completed S3 upload for {} to snapshot {}: {} rows across {} writer operation(s) ({}) in {:.1}s, {}",
                 self.table_metadata.table_name,
                 snapshot_id,
                 total_rows,
-                files_count,
+                writer_ops,
                 format_bytes(total_bytes),
                 elapsed.as_secs_f64(),
                 throughput
             );
         }
 
-        Ok((total_rows, chunk_count))
-    }
-
-    /// Write a chunk of record batches to a specific `ListingTable`.
-    ///
-    /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
-    ///
-    /// # Arguments
-    ///
-    /// * `listing_table` - The listing table to write to
-    /// * `chunk` - Record batches to write
-    /// * `state` - Shared session state (with object store already registered for S3)
-    async fn write_chunk_to_listing_table(
-        listing_table: &ListingTable,
-        chunk: Vec<RecordBatch>,
-        state: &SessionState,
-    ) -> Result<u64> {
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let schema = chunk[0].schema();
-        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
-
-        // Create a stream from the chunk batches
-        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
-        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-        let stream_exec = Arc::new(StreamingExec::new(
-            Arc::clone(&schema),
-            Box::pin(chunk_stream),
-        ));
-
-        let insert_plan = listing_table
-            .insert_into(state, stream_exec, InsertOp::Append)
-            .await?;
-
-        collect(insert_plan, state.task_ctx()).await?;
-
-        Ok(row_count)
+        Ok((total_rows, writer_ops))
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
