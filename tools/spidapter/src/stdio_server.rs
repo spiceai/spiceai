@@ -601,7 +601,8 @@ async fn provision_spice_cloud_app(
     let cloud = commands::build_cloud_client(api_url_override)?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
+    let flight_url = std::env::var("SPIDAPTER_FLIGHT_URL")
+        .unwrap_or_else(|_| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
