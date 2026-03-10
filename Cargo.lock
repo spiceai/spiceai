@@ -3000,7 +3000,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c6d47a4e2961fb8721bcfc54feae6455f2f64e7054f9bc67e875f0e77f4c58d"
 dependencies = [
  "rust_decimal",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "serde",
  "utf8-width",
 ]
@@ -9721,9 +9721,9 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.18.3"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9375e112e4b463ec1b1c6c011953545c65a30164fbab5b581df32b3abf0dcb88"
+checksum = "25470f23803092da7d239834776d653104d551bc4d7eacaf31e6837854b8e9eb"
 dependencies = [
  "console 0.16.2",
  "portable-atomic",
@@ -9801,9 +9801,9 @@ dependencies = [
 
 [[package]]
 name = "insta"
-version = "1.46.1"
+version = "1.46.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "248b42847813a1550dafd15296fd9748c651d0c32194559dbc05d804d54b21e8"
+checksum = "e82db8c87c7f1ccecb34ce0c24399b8a73081427f3c7c50a5d597925356115e4"
 dependencies = [
  "console 0.15.11",
  "once_cell",
@@ -10685,7 +10685,7 @@ dependencies = [
  "reqwest-eventsource",
  "rstest 0.26.1",
  "runtime-rate-control",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "secrecy",
  "serde",
  "serde_json",
@@ -11311,7 +11311,7 @@ dependencies = [
  "mistralrs-macros",
  "rand 0.9.2",
  "reqwest 0.13.1",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
@@ -11370,7 +11370,7 @@ dependencies = [
  "http 1.4.0",
  "image 0.25.9",
  "indexmap 2.13.0",
- "indicatif 0.18.3",
+ "indicatif 0.18.4",
  "interprocess",
  "itertools 0.14.0",
  "libc",
@@ -11402,7 +11402,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "rustfft",
  "safetensors 0.7.0",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "scraper",
  "serde",
  "serde-big-array",
@@ -15284,9 +15284,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.2"
+version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843bc0191f75f3e22651ae5f1e72939ab2f72a4bc30fa80a066bd66edefc24d4"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -15977,7 +15977,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "s3_vectors",
  "scheduler",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "scopeguard",
  "scylla",
  "search",
@@ -16837,13 +16837,13 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54e910108742c57a770f492731f99be216a52fadd361b06c8fb59d74ccc267d2"
+checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.0",
+ "schemars_derive 1.2.1",
  "serde",
  "serde_json",
 ]
@@ -16862,9 +16862,9 @@ dependencies = [
 
 [[package]]
 name = "schemars_derive"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4908ad288c5035a8eb12cfdf0d49270def0a268ee162b75eeee0f85d155a7c45"
+checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -17363,7 +17363,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.13.0",
  "schemars 0.9.0",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "serde_core",
  "serde_json",
  "serde_with_macros",
@@ -18187,7 +18187,7 @@ dependencies = [
  "futures",
  "object_store",
  "regex",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "serde",
  "serde-value",
  "serde_json",
@@ -18235,7 +18235,7 @@ dependencies = [
  "regex",
  "runtime",
  "runtime-parameters",
- "schemars 1.2.0",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "spicepod",
@@ -19262,7 +19262,7 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
- "indicatif 0.18.3",
+ "indicatif 0.18.4",
  "insta",
  "nix 0.30.1",
  "object_store",
