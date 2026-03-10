@@ -208,13 +208,6 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                     reason: "'refresh_sql' is not supported".to_string(),
                 });
             }
-
-            if acc.on_zero_results == acceleration::ZeroResultsAction::UseSource {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name,
-                    reason: "Only 'on_zero_results: return_empty' is supported".to_string(),
-                });
-            }
         }
 
         Ok(ViewBuilder {
