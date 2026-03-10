@@ -112,8 +112,6 @@ runs:
         rustup default "$resolved_toolchain"
 
         rustup component list --toolchain "$resolved_toolchain" --installed
-        rustup run "$resolved_toolchain" cargo --version
-        rustup run "$resolved_toolchain" rustc --version
         cargo --version
         rustc --version
 
@@ -137,7 +135,5 @@ runs:
         rustup default $resolvedToolchain
 
         rustup component list --toolchain $resolvedToolchain --installed
-        rustup run $resolvedToolchain cargo --version
-        rustup run $resolvedToolchain rustc --version
         cargo --version
         rustc --version
