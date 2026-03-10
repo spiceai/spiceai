@@ -95,11 +95,11 @@ jobs:
               ;;
             local)
               if [ -n "$detected_smb_mounts" ]; then
-                echo "Detected SMB mounts, but setup-sccache selected the local backend"
+                echo "setup-sccache selected the local backend; SMB mounts may exist, but SCCACHE_DIR must not be on an smbfs mount."
                 print_smb_mount_diagnostics
-                exit 1
+              else
+                echo "No writable SMB mount detected; validating the local fallback backend."
               fi
-              echo "No writable SMB mount detected; validating the local fallback backend."
               ;;
             *)
               echo "Unexpected sccache backend: $backend"
@@ -190,9 +190,14 @@ jobs:
           }
 
           cargo init --name sccache-smoke-test --bin --quiet --vcs none "$temp_dir"
+            cat <<'EOF' > "$temp_dir/src/lib.rs"
+            pub fn smoke_test_message() -> &'static str {
+              "sccache smoke test"
+            }
+            EOF
           cat <<'EOF' > "$temp_dir/src/main.rs"
           fn main() {
-              println!("sccache smoke test");
+              println!("{}", sccache_smoke_test::smoke_test_message());
           }
           EOF
 
@@ -205,8 +210,11 @@ jobs:
           sccache --show-stats | tee "$stats_file"
 
           compile_requests="$(awk '/^Compile requests[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          compile_requests_executed="$(awk '/^Compile requests executed[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           cache_hits="$(awk '/^Cache hits[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           cache_misses="$(awk '/^Cache misses[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          compilations="$(awk '/^Compilations[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          non_cacheable_calls="$(awk '/^Non-cacheable calls[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           cache_dir_size_kib="$(du -sk "$SCCACHE_DIR" | awk '{print $1}')"
           mount_point="$(df "$SCCACHE_DIR" | tail -1 | awk '{print $NF}')"
 
@@ -226,6 +234,11 @@ jobs:
             failure_reason="Expected at least one compile request"
           fi
 
+          if [ "$validation_failed" != "true" ] && [ "${compile_requests_executed:-0}" -le 0 ] && [ "${compilations:-0}" -le 0 ]; then
+            validation_failed="true"
+            failure_reason="Expected at least one cacheable Rust compilation request; sccache reported only non-cacheable calls"
+          fi
+
           if [ "$validation_failed" != "true" ] && [ "${cache_hits:-0}" -le 0 ]; then
             validation_failed="true"
             failure_reason="Expected at least one sccache hit after rebuilding the smoke test"
@@ -237,8 +250,11 @@ jobs:
             echo "speedup_percent=$speedup_percent"
             echo "speedup_factor=$speedup_factor"
             echo "compile_requests=${compile_requests:-0}"
+            echo "compile_requests_executed=${compile_requests_executed:-0}"
             echo "cache_hits=${cache_hits:-0}"
             echo "cache_misses=${cache_misses:-0}"
+            echo "compilations=${compilations:-0}"
+            echo "non_cacheable_calls=${non_cacheable_calls:-0}"
             echo "hit_rate_percent=$hit_rate_percent"
             echo "cache_dir_size_mb=$cache_dir_size_mb"
             echo "mount_point=$mount_point"
@@ -264,8 +280,11 @@ jobs:
           SPEEDUP_PERCENT: ${{ steps.measure-sccache.outputs.speedup_percent }}
           SPEEDUP_FACTOR: ${{ steps.measure-sccache.outputs.speedup_factor }}
           COMPILE_REQUESTS: ${{ steps.measure-sccache.outputs.compile_requests }}
+          COMPILE_REQUESTS_EXECUTED: ${{ steps.measure-sccache.outputs.compile_requests_executed }}
           CACHE_HITS: ${{ steps.measure-sccache.outputs.cache_hits }}
           CACHE_MISSES: ${{ steps.measure-sccache.outputs.cache_misses }}
+          COMPILATIONS: ${{ steps.measure-sccache.outputs.compilations }}
+          NON_CACHEABLE_CALLS: ${{ steps.measure-sccache.outputs.non_cacheable_calls }}
           HIT_RATE_PERCENT: ${{ steps.measure-sccache.outputs.hit_rate_percent }}
           CACHE_DIR_SIZE_MB: ${{ steps.measure-sccache.outputs.cache_dir_size_mb }}
           MOUNT_POINT: ${{ steps.measure-sccache.outputs.mount_point }}
@@ -292,8 +311,11 @@ jobs:
             echo "| Warm build | ${WARM_BUILD_MS:-0} ms |"
             echo "| Warm speedup | ${SPEEDUP_FACTOR:-0.00}x (${SPEEDUP_PERCENT:-0.0}%) |"
             echo "| Compile requests | ${COMPILE_REQUESTS:-0} |"
+            echo "| Compile requests executed | ${COMPILE_REQUESTS_EXECUTED:-0} |"
+            echo "| Compilations | ${COMPILATIONS:-0} |"
             echo "| Cache hits | ${CACHE_HITS:-0} |"
             echo "| Cache misses | ${CACHE_MISSES:-0} |"
+            echo "| Non-cacheable calls | ${NON_CACHEABLE_CALLS:-0} |"
             echo "| Hit rate | ${HIT_RATE_PERCENT:-0.0}% |"
             echo
             if [ -n "${STATS_FILE:-}" ] && [ -f "$STATS_FILE" ]; then

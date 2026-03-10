@@ -66,7 +66,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Run install script tests
-        shell: ${{ matrix.shell }} {0}
+        shell: bash
         run: |
           chmod +x test/scripts/install-scripts-test.sh
           ${{ matrix.shell }} test/scripts/install-scripts-test.sh --live
@@ -106,7 +106,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Create shell profile
-        shell: ${{ matrix.shell }} {0}
+        shell: bash
         run: |
           if [ "${{ matrix.shell }}" = "bash" ]; then
             touch ~/.bashrc
@@ -116,12 +116,12 @@ jobs:
           fi
 
       - name: Test install.sh with shell detection
-        shell: ${{ matrix.shell }} {0}
+        shell: bash
         env:
           SHELL: /bin/${{ matrix.shell }}
         run: |
           chmod +x install/install.sh
-          ./install/install.sh
+          ${{ matrix.shell }} ./install/install.sh
 
           # Verify binary was installed
           if [ ! -f "$HOME/.spice/bin/spice" ]; then
@@ -139,7 +139,7 @@ jobs:
           "$HOME/.spice/bin/spice" version
 
       - name: Verify PATH instructions
-        shell: ${{ matrix.shell }} {0}
+        shell: bash
         run: |
           # Check that the shell profile was updated with PATH
           profile_file=""
