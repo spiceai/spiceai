@@ -190,11 +190,11 @@ jobs:
           }
 
           cargo init --name sccache-smoke-test --bin --quiet --vcs none "$temp_dir"
-            cat <<'EOF' > "$temp_dir/src/lib.rs"
-            pub fn smoke_test_message() -> &'static str {
+          cat <<'EOF' > "$temp_dir/src/lib.rs"
+          pub fn smoke_test_message() -> &'static str {
               "sccache smoke test"
-            }
-            EOF
+          }
+          EOF
           cat <<'EOF' > "$temp_dir/src/main.rs"
           fn main() {
               println!("{}", sccache_smoke_test::smoke_test_message());
