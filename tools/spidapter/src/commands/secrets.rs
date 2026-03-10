@@ -109,8 +109,7 @@ fn has_scheduler_state_location(spicepod_yaml: &str) -> bool {
     spicepod
         .runtime
         .scheduler
-        .map(|scheduler| !scheduler.state_location.trim().is_empty())
-        .unwrap_or(false)
+        .is_some_and(|scheduler| !scheduler.state_location.trim().is_empty())
 }
 
 #[cfg(test)]
