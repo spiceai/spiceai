@@ -98,10 +98,18 @@ pub enum Error {
 
     #[snafu(display("Embedding dimension is too large to fit into an i32"))]
     EmbeddingDimensionTooLarge { source: TryFromIntError },
+
+    #[snafu(display(
+        "Embedding dimension mismatch: expected {expected} but got {actual} at row {row_index}"
+    ))]
+    EmbeddingDimensionMismatch {
+        expected: usize,
+        actual: usize,
+        row_index: usize,
+    },
 }
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
-#[allow(clippy::too_many_lines)]
 pub async fn write(
     index: &S3Vector,
     table: &S3VectorsTable,
@@ -194,6 +202,7 @@ async fn process_single_batch(
     }
 
     // Update the embedding column in the batch with computed embeddings
+    // Ideally, we can just do `S3VectorPartitionedTable::insert_into` (or similar) with this big boy
     let updated_record = update_embedding_column_in_batch(
         &record,
         &index.embedded_column,
@@ -206,8 +215,17 @@ async fn process_single_batch(
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
 
+    let spill_index = index.spill_index().await.context(CannotWriteIndexSnafu {
+        index: index.name().to_string(),
+    })?;
+
     table
-        .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
+        .write_data(
+            filtered_embeddings,
+            filtered_primary_key,
+            filtered_metadata,
+            spill_index,
+        )
         .await
         .context(CannotWriteIndexSnafu {
             index: index.name().to_string(),
@@ -451,7 +469,7 @@ fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
     dimension: i32,
@@ -478,14 +496,23 @@ fn create_embedding_array(
     let field = Field::new_list_field(DataType::Float32, false);
     builder = builder.with_field(field);
 
-    for embedding_opt in embedding_vectors {
+    let expected_dim = dimension as usize;
+    for (row_index, embedding_opt) in embedding_vectors.iter().enumerate() {
         if let Some(embedding) = embedding_opt {
+            // Validate embedding dimension matches expected dimension
+            if embedding.len() != expected_dim {
+                return Err(Box::new(Error::EmbeddingDimensionMismatch {
+                    expected: expected_dim,
+                    actual: embedding.len(),
+                    row_index,
+                }));
+            }
             // Optimized: append_slice automatically marks all values as valid
             // without needing to allocate a separate validity vector
             builder.values().append_slice(embedding);
             builder.append(true);
         } else {
-            builder.values().append_nulls(dimension as usize);
+            builder.values().append_nulls(expected_dim);
             builder.append(false);
         }
     }
@@ -493,8 +520,17 @@ fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
-/// Filter out zero vectors (all values in the vector are 0.0)
-#[allow(clippy::type_complexity)]
+/// Filter out invalid embedding vectors where all values are either zero or NaN.
+///
+/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs).
+/// A vector with any valid non-zero, non-NaN value is kept.
+/// For example:
+/// - `[0.0, 0.0]` -> filtered (all zeros)
+/// - `[NaN, NaN]` -> filtered (all NaN)
+/// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
+/// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
+/// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+#[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
     mut primary_keys: Vec<Option<String>>,
@@ -508,14 +544,15 @@ fn filter_zero_vectors(
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
         if let Some(embedding) = &embeddings[i]
-            && embedding.iter().all(|&x| x == 0.0)
+            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
+            && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
         {
             let key_str = primary_keys
                 .get(i)
                 .and_then(|k| k.as_ref().map(String::as_str))
                 .unwrap_or("unknown");
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
             );
 
             embeddings.remove(i);
@@ -536,7 +573,7 @@ mod tests {
     use arrow::datatypes::{DataType, Schema};
 
     // Helper function to create a test RecordBatch with text and embedding columns
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn create_test_record_batch_with_embeddings(
         texts: Vec<Option<&str>>,
         embeddings: Vec<Option<Vec<f32>>>,
@@ -589,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     fn test_create_embedding_array_valid_embeddings() {
         let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
 
@@ -632,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     fn test_update_embedding_column_in_batch_with_existing_column() {
         let record = create_test_record_batch_with_embeddings(
             vec![Some("hello"), Some("world")],
@@ -666,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     fn test_update_embedding_column_in_batch_append_embedding_column() {
         let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
 
@@ -744,5 +781,99 @@ mod tests {
         assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
         assert_eq!(filtered_embeddings[1], None);
         assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
+    }
+
+    /// Test that filter_zero_vectors correctly filters out NaN embeddings.
+    #[test]
+    fn test_filter_nan_vectors() {
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        let embeddings = vec![
+            Some(vec![1.0, 2.0]),           // Keep - valid values
+            Some(vec![f32::NAN, f32::NAN]), // Filter out (all NaN)
+            Some(vec![f32::NAN, 0.0]),      // Filter out (mixed NaN/zero - all invalid)
+            Some(vec![3.0, 4.0]),           // Keep - valid values
+            Some(vec![0.0, f32::NAN]),      // Filter out (mixed zero/NaN - all invalid)
+        ];
+        let keys = vec![
+            Some("key1".to_string()),
+            Some("key2".to_string()),
+            Some("key3".to_string()),
+            Some("key4".to_string()),
+            Some("key5".to_string()),
+        ];
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "test".to_string(),
+            vec![
+                Some(Value::String("a".to_string())),
+                Some(Value::String("b".to_string())),
+                Some(Value::String("c".to_string())),
+                Some(Value::String("d".to_string())),
+                Some(Value::String("e".to_string())),
+            ],
+        );
+
+        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+            filter_zero_vectors(embeddings, keys, metadata, "test_index");
+
+        // Should keep only the 2 valid vectors
+        assert_eq!(filtered_embeddings.len(), 2);
+        assert_eq!(filtered_keys.len(), 2);
+        assert_eq!(filtered_metadata["test"].len(), 2);
+
+        // Check that valid vectors were kept
+        assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
+        assert_eq!(filtered_embeddings[1], Some(vec![3.0, 4.0]));
+        assert_eq!(filtered_keys[0], Some("key1".to_string()));
+        assert_eq!(filtered_keys[1], Some("key4".to_string()));
+    }
+
+    /// Test that create_embedding_array correctly detects dimension mismatch.
+    #[test]
+    fn test_embedding_dimension_mismatch() {
+        // Embeddings with mismatched dimensions: expected 2, but row 1 has 3
+        let embeddings = vec![
+            Some(vec![0.1, 0.2]),      // dimension 2 - correct
+            Some(vec![0.3, 0.4, 0.5]), // dimension 3 - MISMATCH!
+        ];
+
+        let result = create_embedding_array(&embeddings, 2);
+
+        assert!(
+            result.is_err(),
+            "Should fail when embedding dimensions don't match"
+        );
+        let error = *result.expect_err("Expected error for dimension mismatch");
+        match error {
+            Error::EmbeddingDimensionMismatch {
+                expected,
+                actual,
+                row_index,
+            } => {
+                assert_eq!(expected, 2, "Expected dimension should be 2");
+                assert_eq!(actual, 3, "Actual dimension should be 3");
+                assert_eq!(row_index, 1, "Mismatch should be at row 1");
+            }
+            _ => panic!("Expected EmbeddingDimensionMismatch error, got: {error:?}"),
+        }
+    }
+
+    /// Test that create_embedding_array accepts embeddings with correct dimensions.
+    #[test]
+    fn test_embedding_dimension_correct() {
+        let embeddings = vec![
+            Some(vec![0.1, 0.2, 0.3]),
+            Some(vec![0.4, 0.5, 0.6]),
+            None, // Null embeddings should be handled correctly
+            Some(vec![0.7, 0.8, 0.9]),
+        ];
+
+        let result = create_embedding_array(&embeddings, 3);
+        assert!(
+            result.is_ok(),
+            "Should succeed when all embedding dimensions match"
+        );
     }
 }

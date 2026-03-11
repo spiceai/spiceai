@@ -2,5 +2,6 @@
 source: crates/cayenne/tests/partition_pruning_test.rs
 expression: explain_plan
 ---
-SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
-  DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/<FILE>.vortex]]}, projection=[id, region, value], file_type=vortex, predicate: region@1 = us-east-1 OR region@1 = eu-west-1
+CayenneAccelerationExec
+  SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
+    DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/<FILE>.vortex]]}, projection=[id, region, value], file_type=vortex, predicate: region@1 = us-east-1 OR region@1 = eu-west-1

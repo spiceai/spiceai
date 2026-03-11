@@ -61,15 +61,12 @@ impl Model {
             });
         };
 
-        params.insert(
-            "name".to_string(),
-            SecretString::from(model.name.to_string()),
-        );
+        params.insert("name".to_string(), SecretString::from(model.name.clone()));
         params.insert("path".to_string(), SecretString::from(path(&model.from)));
         params.insert("from".to_string(), SecretString::from(path(&model.from)));
         params.insert(
             "files".to_string(),
-            SecretString::from(model.get_all_file_paths().join(",").to_string()),
+            SecretString::from(model.get_all_file_paths().join(",")),
         );
 
         let model_source: Option<Box<dyn ModelSource>> = source.into();

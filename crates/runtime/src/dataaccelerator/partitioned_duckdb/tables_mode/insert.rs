@@ -35,11 +35,11 @@ use datafusion_optimizer_rules::pass_thru::PassThruExec;
 use datafusion_table_providers::{
     duckdb::{TableDefinition, write_settings::DuckDBWriteSettings},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-    util::on_conflict::OnConflict,
+    util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
 use futures::StreamExt;
 use runtime_table_partition::{
-    creator::filename::encode_key,
+    creator::filename::encode_composite_key,
     expression::PartitionedBy,
     insert::{InsertStrategy, PartitionContext, partition_batch},
 };
@@ -57,6 +57,7 @@ pub struct DuckDBPartitionedInsertStrategy {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
     write_settings: DuckDBWriteSettings,
     partition_buffer_config: PartitionBufferConfig,
 }
@@ -67,6 +68,7 @@ impl DuckDBPartitionedInsertStrategy {
         pool: Arc<DuckDbConnectionPool>,
         table_definition: Arc<TableDefinition>,
         on_conflict: Option<OnConflict>,
+        upsert_options: UpsertOptions,
         source: &dyn AccelerationSource,
     ) -> Self {
         let write_settings = if let Some(acceleration) = source.acceleration() {
@@ -93,6 +95,7 @@ impl DuckDBPartitionedInsertStrategy {
             pool,
             table_definition,
             on_conflict,
+            upsert_options,
             write_settings,
             partition_buffer_config,
         }
@@ -130,13 +133,12 @@ impl DuckDBPartitionedInsertStrategy {
                                         let partitions_map = partitions
                                             .into_iter()
                                             .map(|p| {
-                                                let key = encode_key(&p.partition_value).map_err(
-                                                    |e| {
+                                                let key = encode_composite_key(&p.partition_values)
+                                                    .map_err(|e| {
                                                         DataFusionError::Execution(format!(
                                                             "Failed to encode partition key: {e}"
                                                         ))
-                                                    },
-                                                )?;
+                                                    })?;
                                                 Ok((key, p))
                                             })
                                             .collect::<Result<HashMap<_, _>, DataFusionError>>();
@@ -187,10 +189,25 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let schema = Arc::clone(&ctx.schema);
 
+        // DuckDB table-based inserts support exactly one partition column
+        let partition_by = match ctx.partition_by.as_slice() {
+            [] => {
+                return Err(DataFusionError::Configuration(
+                    "Partition configuration required".to_string(),
+                ));
+            }
+            [single] => single,
+            _ => {
+                return Err(DataFusionError::Configuration(
+                    "DuckDB table-based inserts support exactly one partition column; multi-column partitioning is not supported".to_string(),
+                ));
+            }
+        };
+
         let partitioner = Arc::new(BatchPartitioner::new(
-            &ctx.partition_by.expression,
+            &partition_by.expression,
             Arc::clone(&schema),
-            &ctx.partition_by,
+            partition_by,
         )?);
 
         let data_sink = DuckDBPartitionedDataSink::new(
@@ -198,6 +215,7 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             Arc::clone(&self.table_definition),
             insert_op,
             self.on_conflict.clone(),
+            self.upsert_options.clone(),
             schema,
             partitioner,
         )

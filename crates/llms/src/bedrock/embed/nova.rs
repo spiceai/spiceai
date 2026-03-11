@@ -17,15 +17,13 @@ limitations under the License.
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use snafu::ensure;
 
 use crate::{
     bedrock::embed::BedrockEmbeddingConfig,
-    embeddings::{Error as EmbedError, FailedToExtractEmbeddingsSnafu, Result as EmbedResult},
+    embeddings::{Error as EmbedError, Result as EmbedResult},
 };
 
 pub const NOVA_MULTIMODAL_EMBED_V2: &str = "amazon.nova-2-multimodal-embeddings-v1:0";
-const MAX_NOVA_TEXT_LENGTH: usize = 8192;
 
 #[derive(Debug)]
 pub struct NovaConfig {
@@ -60,37 +58,25 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
     }
 
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<NovaEmbedRequest>> {
-        input_text
+        Ok(input_text
             .into_iter()
-            .map(|t| {
-                ensure!(
-                    t.len() <= MAX_NOVA_TEXT_LENGTH,
-                    FailedToExtractEmbeddingsSnafu {
-                        message: format!(
-                            "Input text length {} exceeds maximum supported length {MAX_NOVA_TEXT_LENGTH}",
-                            t.len(),
-                        )
-                    }
-                );
-
-                Ok(NovaEmbedRequest {
-                    schema_version: Some("nova-multimodal-embed-v1".to_string()),
-                    task_type: NovaTaskType::SingleEmbedding,
-                    single_embedding_params: NovaSingleEmbeddingParams {
-                        embedding_purpose: self.embedding_purpose.clone(),
-                        embedding_dimension: Some(self.dimensions),
-                        text: Some(NovaTextInput {
-                            truncation_mode: self.truncation_mode.clone(),
-                            value: Some(t),
-                            source: None,
-                        }),
-                        image: None,
-                        audio: None,
-                        video: None,
-                    },
-                })
+            .map(|t| NovaEmbedRequest {
+                schema_version: Some("nova-multimodal-embed-v1".to_string()),
+                task_type: NovaTaskType::SingleEmbedding,
+                single_embedding_params: NovaSingleEmbeddingParams {
+                    embedding_purpose: self.embedding_purpose.clone(),
+                    embedding_dimension: Some(self.dimensions),
+                    text: Some(NovaTextInput {
+                        truncation_mode: self.truncation_mode.clone(),
+                        value: Some(t),
+                        source: None,
+                    }),
+                    image: None,
+                    audio: None,
+                    video: None,
+                },
             })
-            .collect::<EmbedResult<Vec<NovaEmbedRequest>>>()
+            .collect::<Vec<NovaEmbedRequest>>())
     }
 }
 

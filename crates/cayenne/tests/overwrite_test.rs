@@ -17,14 +17,27 @@ limitations under the License.
 //! Test INSERT OVERWRITE functionality for Cayenne
 
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+
+use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog, STAGING_DIR_NAME};
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
+/// List snapshot directories under a table dir, excluding the `_staging` directory.
+fn snapshot_dirs(table_dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
+    std::fs::read_dir(table_dir)
+        .expect("read table dir")
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().is_dir() && e.file_name() != STAGING_DIR_NAME)
+        .collect()
+}
+
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE functionality...");
 
@@ -50,16 +63,20 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         table_name: "test_overwrite".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig::default(),
     };
 
-    let table = CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
+            .await?;
+    let table_id = table.metadata().table_id.clone();
     println!("✓ Table created");
 
     // 3. Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("test_overwrite", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
@@ -85,11 +102,8 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check how many snapshot subdirectories exist before overwrite
     // Directory structure: [data_path]/[table_id]/[snapshot_id]/
-    let table_dir = data_path.join("1"); // table_id = 1
-    let snapshots_before: Vec<_> = std::fs::read_dir(&table_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .collect();
+    let table_dir = data_path.join(&table_id);
+    let snapshots_before = snapshot_dirs(&table_dir);
     println!("✓ Snapshots before overwrite: {}", snapshots_before.len());
 
     ctx.sql("INSERT OVERWRITE test_overwrite VALUES (10, 'new_first'), (20, 'new_second')")
@@ -102,10 +116,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 7. Check snapshot count after overwrite and cleanup
-    let snapshots_after: Vec<_> = std::fs::read_dir(&table_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .collect();
+    let snapshots_after = snapshot_dirs(&table_dir);
     println!("✓ Snapshots after overwrite: {}", snapshots_after.len());
 
     // After full refresh, old snapshots should be automatically cleaned up
@@ -149,19 +160,16 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ New overwrite data is accessible");
 
     // 9. Verify snapshot directory uses UUIDv7 naming
-    let snapshot_dirs: Vec<_> = std::fs::read_dir(&table_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .collect();
+    let snap_dirs = snapshot_dirs(&table_dir);
     assert_eq!(
-        snapshot_dirs.len(),
+        snap_dirs.len(),
         1,
         "Expected 1 snapshot directory (current snapshot)"
     );
     println!("✓ Snapshot directory uses UUIDv7 naming");
 
     // Verify that the snapshot directory name is a valid UUID
-    for entry in &snapshot_dirs {
+    for entry in &snap_dirs {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         // UUIDs have the format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars with dashes)
@@ -178,7 +186,6 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE cleanup of old snapshots...");
 
@@ -204,16 +211,20 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
         table_name: "test_cleanup".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig::default(),
     };
 
-    let table = CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
+            .await?;
+    let table_id = table.metadata().table_id.clone();
     println!("✓ Table created");
 
     // 3. Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("test_cleanup", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
@@ -225,11 +236,8 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
     println!("✓ Initial data inserted (2 rows)");
 
     // 5. Get initial snapshot count
-    let table_dir = data_path.join("1"); // table_id = 1
-    let snapshots_after_insert: Vec<_> = std::fs::read_dir(&table_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .collect();
+    let table_dir = data_path.join(&table_id);
+    let snapshots_after_insert = snapshot_dirs(&table_dir);
     println!(
         "✓ Snapshots after initial insert: {}",
         snapshots_after_insert.len()
@@ -251,10 +259,7 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 7. Check that old snapshot was cleaned up
-    let snapshots_after_first_overwrite: Vec<_> = std::fs::read_dir(&table_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .collect();
+    let snapshots_after_first_overwrite = snapshot_dirs(&table_dir);
     println!(
         "✓ Snapshots after first overwrite: {}",
         snapshots_after_first_overwrite.len()
@@ -276,10 +281,7 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 9. Check that second old snapshot was also cleaned up
-    let snapshots_after_second_overwrite: Vec<_> = std::fs::read_dir(&table_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .collect();
+    let snapshots_after_second_overwrite = snapshot_dirs(&table_dir);
     println!(
         "✓ Snapshots after second overwrite: {}",
         snapshots_after_second_overwrite.len()

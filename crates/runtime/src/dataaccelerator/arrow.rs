@@ -16,15 +16,18 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, common::Constraints, datasource::TableProvider,
+    execution::context::SessionContext, logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::parameters::ParameterSpec;
+use crate::register_data_accelerator;
 
 use super::{AccelerationSource, DataAccelerator};
 
@@ -47,7 +50,13 @@ impl Default for ArrowAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_watcher")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::runtime("hash_index")
+        .description("Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled."),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+];
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
@@ -62,16 +71,40 @@ impl DataAccelerator for ArrowAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: CreateExternalTable,
-        _source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<PartitionedBy>,
+        mut cmd: CreateExternalTable,
+        source: Option<&dyn AccelerationSource>,
+        _partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        ensure!(
-            partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
-                msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
-            }
-        );
+        // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
+        // which overwrites the entire table. Primary key constraints cause uniqueness validation
+        // errors during inserts because Arrow doesn't support upsert operations.
+        let is_caching_mode = source
+            .and_then(|s| s.acceleration())
+            .and_then(|a| a.refresh_mode.as_ref())
+            .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
+
+        if is_caching_mode {
+            cmd.constraints = Constraints::new_unverified(vec![]);
+        }
+
+        // Extract sort_columns from acceleration params if provided
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(sort_cols_str) = acceleration.params.get("sort_columns")
+        {
+            cmd.options
+                .insert("sort_columns".to_string(), sort_cols_str.clone());
+        }
+
+        // Extract hash_index from acceleration params if provided
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(hash_index_str) = acceleration.params.get("hash_index")
+        {
+            cmd.options
+                .insert("hash_index".to_string(), hash_index_str.clone());
+        }
 
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
@@ -89,3 +122,5 @@ impl DataAccelerator for ArrowAccelerator {
         PARAMETERS
     }
 }
+
+register_data_accelerator!(Engine::Arrow, ArrowAccelerator);

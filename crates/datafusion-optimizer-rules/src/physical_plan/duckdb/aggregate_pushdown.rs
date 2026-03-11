@@ -6,7 +6,9 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, Statistics, exec_err, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
+use datafusion::physical_expr::{
+    Distribution, OrderingRequirements, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, InvariantLevel};
 use datafusion::physical_plan::filter_pushdown::{
@@ -14,7 +16,9 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DuckDBDialect;
 use datafusion_expr::LogicalPlan;
@@ -73,7 +77,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input.required_input_distribution()
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -85,7 +89,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![true]
+        vec![false]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -138,7 +142,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     // Deprecated, but need to allow because `missing_trait_methods` complains otherwise
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     fn statistics(&self) -> Result<Statistics> {
         self.input.statistics()
     }
@@ -162,6 +166,13 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         self.input.cardinality_effect()
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 
     fn try_swapping_with_projection(
@@ -241,6 +252,7 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
 
             let optimized_sql = unparser.plan_to_sql(&marker.logical_plan)?;
             let logical_plan_schema = Arc::clone(marker.logical_plan.schema().inner());
+
             let rewritten = duck_exec
                 .clone()
                 .with_optimized_sql(optimized_sql.to_string(), Some(logical_plan_schema));

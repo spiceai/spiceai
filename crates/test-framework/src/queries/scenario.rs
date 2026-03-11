@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use super::Query;
 
 /// A scenario query definition that can be loaded from a YAML file
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ScenarioQueryDefinition {
     /// Unique name for the query
     pub name: String,
@@ -37,7 +37,7 @@ pub struct ScenarioQueryDefinition {
 }
 
 /// Expected results for query validation
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum ExpectedResults {
     /// Path to a CSV file containing expected results
@@ -54,7 +54,7 @@ pub enum ExpectedResults {
 }
 
 /// A collection of scenario queries loaded from a file
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ScenarioQuerySet {
     /// Optional name for the query set
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,7 +68,7 @@ impl ScenarioQuerySet {
     /// Load a scenario query set from a YAML file
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())?;
-        let query_set: ScenarioQuerySet = serde_yaml::from_str(&content)?;
+        let query_set: ScenarioQuerySet = yaml::from_str(&content)?;
         Ok(query_set)
     }
 
@@ -246,7 +246,7 @@ queries:
         - "2, Bob"
 "#;
 
-        let query_set: ScenarioQuerySet = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        let query_set: ScenarioQuerySet = yaml::from_str(yaml).expect("Failed to parse YAML");
         assert_eq!(query_set.name, Some("test_queries".to_string()));
         assert_eq!(query_set.queries.len(), 3);
         assert_eq!(query_set.queries[0].name, "simple_select");

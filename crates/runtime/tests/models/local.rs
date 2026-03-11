@@ -24,7 +24,7 @@ mod embeddings {
 
     use anyhow::Result;
     use app::AppBuilder;
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use spicepod::component::{embeddings::Embeddings, model::ModelFile};
 
     use crate::{
@@ -40,7 +40,7 @@ mod embeddings {
     /// Currently expects model to only need `tokenizer.json`, `config.json`, and `model.safetensors` files.
     async fn create_local_embedding_from_hf(model_id: &str, name: &str) -> Result<Embeddings> {
         let mut model_path =
-            dirs::home_dir().ok_or(anyhow::anyhow!("Could not find home directory"))?;
+            util::home_dir::home_dir().ok_or(anyhow::anyhow!("Could not find home directory"))?;
         model_path.push(".spice/models");
         model_path.push(name);
         create_dir_all(&model_path)?;

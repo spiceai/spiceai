@@ -29,6 +29,7 @@ use datafusion::{
     common::DFSchema,
     datasource::TableProvider,
     error::DataFusionError,
+    execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
@@ -40,7 +41,7 @@ use datafusion_table_providers::{
         TableDefinition, write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
-    util::on_conflict::OnConflict,
+    util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
 use duckdb::AccessMode;
 use runtime_table_partition::{
@@ -51,6 +52,7 @@ use runtime_table_partition::{
 };
 use snafu::{OptionExt, prelude::*};
 
+use crate::dataaccelerator::{BootstrapStatus, upsert_dedup::UpsertDedupTableProvider};
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
@@ -66,6 +68,7 @@ use crate::{
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
+    register_data_accelerator,
 };
 
 type Result<T, E = super::Error> = std::result::Result<T, E>;
@@ -142,7 +145,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(acceleration_settings) = source.acceleration() {
             ensure!(
                 matches!(acceleration_settings.mode, Mode::File),
@@ -175,7 +178,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             }
             self.get_shared_pool(source).await?;
         }
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     async fn create_external_table(
@@ -183,9 +186,10 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let partition_by_first = partition_by
-            .first()
+        let partition_by_last = partition_by
+            .last()
             .context(super::PartitionByRequiredSnafu)?
             .clone();
 
@@ -201,7 +205,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             DuckDBPartitionCreator::new(
                 self.get_shared_pool(source).await?,
                 cmd.clone(),
-                partition_by_first,
+                partition_by_last,
                 Arc::clone(&schema),
                 &self.duckdb_factory,
             )
@@ -213,6 +217,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             self.get_shared_pool(source).await?,
             creator.table_definition(),
             creator.on_conflict().cloned(),
+            creator.upsert_options().clone(),
             source,
         ));
 
@@ -246,6 +251,7 @@ struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
     partition_by: PartitionedBy,
     schema: SchemaRef,
 }
@@ -270,20 +276,37 @@ impl DuckDBPartitionCreator {
             .ok_or("Expected PolyTableProvider but got different table provider type")?;
 
         let writer = poly_table.writer();
+        let writer = extract_duckdb_writer(&writer)?;
 
-        let writer = writer
-            .as_any()
-            .downcast_ref::<DuckDBTableWriter>()
-            .ok_or("Expected DuckDBTableWriter but got different writer type")?;
+        // Extract UpsertOptions from cmd options
+        let upsert_options = Self::extract_upsert_options(&cmd);
 
         Ok(Self {
             pool,
             cmd,
             table_definition: writer.table_definition(),
             on_conflict: writer.on_conflict().cloned(),
+            upsert_options,
             partition_by,
             schema,
         })
+    }
+
+    /// Extracts `UpsertOptions` from the command options.
+    fn extract_upsert_options(cmd: &CreateExternalTable) -> UpsertOptions {
+        let remove_duplicates = cmd
+            .options
+            .get("upsert_remove_duplicates")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let last_write_wins = cmd
+            .options
+            .get("upsert_last_write_wins")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+        UpsertOptions {
+            remove_duplicates,
+            last_write_wins,
+        }
     }
 
     pub(crate) fn table_definition(&self) -> Arc<TableDefinition> {
@@ -292,6 +315,10 @@ impl DuckDBPartitionCreator {
 
     pub fn on_conflict(&self) -> Option<&OnConflict> {
         self.on_conflict.as_ref()
+    }
+
+    pub fn upsert_options(&self) -> &UpsertOptions {
+        &self.upsert_options
     }
 
     fn list_partitioned_tables(&self) -> Result<Vec<String>, creator::Error> {
@@ -329,7 +356,7 @@ impl DuckDBPartitionCreator {
 impl PartitionCreator for DuckDBPartitionCreator {
     async fn create_partition(
         &self,
-        _partition_value: ScalarValue,
+        _partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
         Err(creator::Error::CreatePartition {
             source: "Table-based partitions must not be manually created".into(),
@@ -384,7 +411,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
             partitions.push(Partition {
-                partition_value,
+                partition_values: vec![partition_value],
                 table_provider,
             });
         }
@@ -410,6 +437,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 }
             })
             .collect())
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        if self.cmd.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.cmd.constraints)
+        }
     }
 }
 
@@ -439,6 +474,33 @@ async fn get_pool(
     ))
 }
 
+/// Extracts the `DuckDBTableWriter` from a table provider, handling the case where
+/// it may be wrapped in an `UpsertDedupTableProvider` when upsert options are enabled.
+fn extract_duckdb_writer(
+    writer: &Arc<dyn TableProvider>,
+) -> std::result::Result<&DuckDBTableWriter, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(w) = writer.as_any().downcast_ref::<DuckDBTableWriter>() {
+        Ok(w)
+    } else if let Some(upsert_provider) = writer.as_any().downcast_ref::<UpsertDedupTableProvider>()
+    {
+        upsert_provider
+            .inner()
+            .as_any()
+            .downcast_ref::<DuckDBTableWriter>()
+            .ok_or_else(|| "UpsertDedupTableProvider inner is not DuckDBTableWriter".into())
+    } else {
+        Err(
+            "Expected DuckDBTableWriter or UpsertDedupTableProvider but got different writer type"
+                .into(),
+        )
+    }
+}
+
+register_data_accelerator!(
+    Engine::TableModePartitionedDuckDB,
+    TablesModePartitionedDuckDBAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,7 +523,6 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_tables_mode_partitioned_duckdb_accelerator() {
         // Ensure no previous database version exists
         let test_db_path = "./test_table.db";
@@ -508,6 +569,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -525,7 +587,7 @@ mod tests {
         let accelerator = TablesModePartitionedDuckDBAccelerator::new();
 
         let table = accelerator
-            .create_external_table(external_table, Some(&dataset), partitioned_by)
+            .create_external_table(external_table, Some(&dataset), partitioned_by, None)
             .await
             .expect("accelerated table created");
 

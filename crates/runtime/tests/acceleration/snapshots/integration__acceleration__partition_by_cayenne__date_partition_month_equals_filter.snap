@@ -4,5 +4,6 @@ expression: sanitized_plan
 ---
 FilterExec: date_part(month, order_date@2) = 3
   SchemaCastScanExec
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex

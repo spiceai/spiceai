@@ -105,7 +105,7 @@ impl DeletionTableProvider for PolyTableProvider {
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.delete.delete_from(state, filters).await
+        DeletionTableProvider::delete_from(&*self.delete, state, filters).await
     }
 }
 

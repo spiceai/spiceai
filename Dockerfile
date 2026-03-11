@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.93.1
 FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
@@ -13,11 +13,13 @@ COPY . /build
 WORKDIR /build
 
 ARG CARGO_FEATURES=default
+ARG CARGO_NO_DEFAULT_FEATURES=false
 ARG RUST_PROFILE=release
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
 ARG TARGETARCH
 ENV CARGO_FEATURES=$CARGO_FEATURES \
+    CARGO_NO_DEFAULT_FEATURES=$CARGO_NO_DEFAULT_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
     CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
     RUST_PROFILE=$RUST_PROFILE
@@ -31,7 +33,11 @@ RUN \
       amd64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=x86-64" ;; \
       *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
     esac && \
-    cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
+    if [ "${CARGO_NO_DEFAULT_FEATURES}" = "true" ]; then \
+      cargo build --profile "${RUST_PROFILE}" --no-default-features ${CARGO_FEATURES:+--features ${CARGO_FEATURES}}; \
+    else \
+      cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
+    fi && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
 FROM debian:bookworm-slim as sandbox-setup
@@ -44,7 +50,7 @@ ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25
 
 # Install required packages
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 findutils --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 findutils tzdata --no-install-recommends \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
     fi \
@@ -55,6 +61,7 @@ RUN mkdir -p /spice_sandbox/bin && \
     mkdir -p /spice_sandbox/lib && \
     mkdir -p /spice_sandbox/usr/lib && \
     mkdir -p /spice_sandbox/usr/local/bin && \
+    mkdir -p /spice_sandbox/usr/share && \
     mkdir -p /spice_sandbox/etc && \
     mkdir -p /spice_sandbox/etc/ssl && \
     mkdir -p /spice_sandbox/dev && \
@@ -66,6 +73,9 @@ COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
 
 # Copy CA certificates
 RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
+
+# Copy timezone database (IANA tzdb) - used by jiff, chrono, libc, and other timezone-aware libraries
+RUN cp -r /usr/share/zoneinfo /spice_sandbox/usr/share/zoneinfo
 
 # Copy every dependent library reported by ldd
 RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
@@ -109,7 +119,7 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     fi
 
 # Minimal passwd & group for the nobody user
-RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
+RUN echo 'nobody:x:65534:65534:nobody:/app:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
     echo 'nogroup:x:65534:' > /spice_sandbox/etc/group
 
 # Create DuckDB directory in sandbox
@@ -134,7 +144,10 @@ EXPOSE 8090 50051
 
 WORKDIR /app
 
+ENV HOME=/app
 ENV HF_HOME=/.cache/huggingface
 ENV HF_HUB_CACHE=/.cache/huggingface/hub
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
 
 ENTRYPOINT ["/usr/local/bin/spiced"]

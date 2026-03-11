@@ -31,7 +31,7 @@ use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
 
-use crate::utils::test_request_context;
+use crate::utils::{register_test_connectors, test_request_context};
 use crate::{ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
@@ -269,6 +269,7 @@ fn make_graphql_dataset(
 async fn test_graphql() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -301,9 +302,11 @@ async fn test_graphql() -> Result<(), String> {
                     "SELECT * FROM test_graphql",
                     "select_all",
                     Some(Box::new(|result_batches| {
+                        let total_rows: usize =
+                            result_batches.iter().map(RecordBatch::num_rows).sum();
+                        assert_eq!(total_rows, 4, "total_rows: {total_rows}");
                         for batch in result_batches {
                             assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         }
                     })),
                 ),
@@ -311,9 +314,11 @@ async fn test_graphql() -> Result<(), String> {
                     "SELECT posts[1]['title'] from test_graphql",
                     "select_posts_title",
                     Some(Box::new(|result_batches| {
+                        let total_rows: usize =
+                            result_batches.iter().map(RecordBatch::num_rows).sum();
+                        assert_eq!(total_rows, 4, "total_rows: {total_rows}");
                         for batch in result_batches {
                             assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
-                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         }
                     })),
                 ),
@@ -344,6 +349,7 @@ async fn test_graphql() -> Result<(), String> {
 async fn test_graphql_pagination() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let (tx, addr) = start_server().await?;
@@ -382,7 +388,6 @@ async fn test_graphql_pagination() -> Result<(), String> {
                     let mut total = 0;
                     for batch in result_batches {
                         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         total += batch.num_rows();
                     }
                     assert_eq!(total, 4);
@@ -395,7 +400,6 @@ async fn test_graphql_pagination() -> Result<(), String> {
                     let mut total = 0;
                     for batch in result_batches {
                         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         total += batch.num_rows();
                     }
                     assert_eq!(total, 1);
@@ -427,6 +431,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
 #[tokio::test]
 async fn test_graphql_pagination_with_limit() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let (tx, addr) = start_server().await?;

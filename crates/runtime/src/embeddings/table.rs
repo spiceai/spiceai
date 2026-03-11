@@ -548,10 +548,7 @@ impl TableProvider for EmbeddingTable {
                         let embedding_fields = self.embedding_fields(field);
                         computed_columns_meta.insert(
                             base_column_name.clone(),
-                            embedding_fields
-                                .iter()
-                                .map(|f| f.name().to_string())
-                                .collect(),
+                            embedding_fields.iter().map(|f| f.name().clone()).collect(),
                         );
                         embedding_fields
                     })
@@ -662,7 +659,7 @@ impl TableProvider for EmbeddingTable {
             .schema()
             .fields
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect();
 
         let push_downs = filters

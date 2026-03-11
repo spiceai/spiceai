@@ -16,12 +16,12 @@ async-openai.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false, optional = true }
 runtime-request-context = { path = "../runtime-request-context" }
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tract-core.workspace = true
+util = { path = "../util" }
 
 [dev-dependencies]
 async-stream.workspace = true
@@ -30,4 +30,4 @@ tracing-subscriber.workspace = true
 tracing-test = "0.2"
 
 [features]
-models = []
+models = ["dep:llms"]

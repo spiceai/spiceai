@@ -75,14 +75,24 @@ impl DigestMany {
         }
     }
 
-    fn make_scalar_function_args(args: Vec<ColumnarValue>) -> ScalarFunctionArgs {
+    fn make_scalar_function_args(
+        args: Vec<ColumnarValue>,
+        return_field: FieldRef,
+    ) -> ScalarFunctionArgs {
         ScalarFunctionArgs {
             args,
             number_rows: 1,
             arg_fields: vec![],
-            return_field: Arc::new(Field::new("ignored_name", DataType::Utf8, false)),
+            return_field,
             config_options: Arc::new(ConfigOptions::default()),
         }
+    }
+
+    fn get_hash_fn_return_field(hash_fn: &ScalarUDF) -> DataFusionResult<FieldRef> {
+        hash_fn.return_field_from_args(ReturnFieldArgs {
+            arg_fields: &[FieldRef::new(Field::new("dummy", DataType::Utf8, false))],
+            scalar_arguments: &[Some(&ScalarValue::Utf8(Some(String::new())))],
+        })
     }
 }
 
@@ -111,12 +121,7 @@ impl ScalarUDFImpl for DigestMany {
             let hash_fn =
                 Self::concrete_hash_function(Some(ColumnarValue::Scalar((*scalar_value).clone())))?;
 
-            let dummy_rfa = ReturnFieldArgs {
-                arg_fields: &[FieldRef::new(Field::new("dummy", DataType::Utf8, false))],
-                scalar_arguments: &[Some(&ScalarValue::Utf8(Some(String::new())))],
-            };
-
-            hash_fn.return_field_from_args(dummy_rfa)
+            Self::get_hash_fn_return_field(&hash_fn)
         } else {
             exec_err!("{DIGEST_UDF_NAME}: cannot determine return type")
         }
@@ -138,9 +143,13 @@ impl ScalarUDFImpl for DigestMany {
                 }
             }
 
-            return hash_fn.invoke_with_args(Self::make_scalar_function_args(vec![
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me))),
-            ]));
+            // Get the correct return field from the hash function (e.g., md5 returns Utf8View in DataFusion v51+)
+            let return_field = Self::get_hash_fn_return_field(&hash_fn)?;
+
+            return hash_fn.invoke_with_args(Self::make_scalar_function_args(
+                vec![ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me)))],
+                return_field,
+            ));
         }
 
         // We have arrays - need to process row by row
@@ -181,13 +190,16 @@ impl ScalarUDFImpl for DigestMany {
 
         let concatenated_array = Arc::new(concatenated_builder.finish()) as ArrayRef;
 
+        // Query the hash function's return field (e.g., md5 returns Utf8View in DataFusion v51+)
+        let return_field = Self::get_hash_fn_return_field(&hash_fn)?;
+
         // Hash entire array in one call - hash function can leverage SIMD internally
         // This is more efficient than N separate hash calls for N rows
         hash_fn.invoke_with_args(ScalarFunctionArgs {
             args: vec![ColumnarValue::Array(concatenated_array)],
             number_rows: num_rows,
             arg_fields: vec![],
-            return_field: Arc::new(Field::new("hash", DataType::Utf8, false)),
+            return_field,
             config_options: Arc::new(ConfigOptions::default()),
         })
     }

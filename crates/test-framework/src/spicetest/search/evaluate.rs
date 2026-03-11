@@ -32,7 +32,7 @@ use std::collections::HashMap;
 ///
 /// # Reference
 /// MTEB `RetrievalEvaluator`: <https://github.com/embeddings-benchmark/mteb/blob/03347ebfe4809056e0fd2894fcae69dcdd2ed964/mteb/evaluation/evaluators/RetrievalEvaluator.py#L500>
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 #[must_use]
 pub(crate) fn calculate_ndcg<S: ::std::hash::BuildHasher>(
     qrels: &HashMap<String, HashMap<String, i32, S>, S>,
@@ -56,7 +56,7 @@ pub(crate) fn calculate_ndcg<S: ::std::hash::BuildHasher>(
     ndcg_at_k_values.into_iter().sum::<f64>() / len as f64
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn dcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
     relevance_scores
         .iter()

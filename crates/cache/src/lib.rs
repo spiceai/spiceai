@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,18 +32,30 @@ use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
+pub mod backend;
 pub mod lru_cache;
 pub mod metrics;
 mod simple_cache;
-mod utils;
+pub mod utils;
 
 pub mod encoding;
 pub mod key;
 pub mod result;
 
+pub use backend::CacheBackend;
+pub use backend::CacheBackendBuilder;
+pub use backend::MokaBackend;
+
+#[cfg(feature = "pingora")]
+pub use backend::PingoraBackend;
+
 pub use lru_cache::LruCache;
+pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
+pub use utils::RESPONSE_STATUS_COLUMN;
+pub use utils::batches_to_cache;
+pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -138,7 +150,7 @@ pub enum HashBuilder {
 }
 
 impl std::hash::BuildHasher for HashBuilder {
-    type Hasher = Box<dyn Hasher>;
+    type Hasher = Box<dyn Hasher + Send + Sync + 'static>;
 
     fn build_hasher(&self) -> Self::Hasher {
         match self {
@@ -223,7 +235,7 @@ mod xxhash_compat {
     }
 
     impl Hasher for XxHash3_128Wrapper {
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         fn finish(&self) -> u64 {
             let hasher_copy = self.hasher.clone();
             let hash128 = hasher_copy.finish_128();
@@ -382,7 +394,13 @@ impl QueryResultsCacheProvider {
         // Cache TTL should be the base TTL plus the stale-while-revalidate window
         // so entries aren't evicted before they can be served as stale
         let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
-        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
+        let cache = Arc::new(LruCache::new(
+            cache_max_size,
+            cache_ttl,
+            hash_builder,
+            config.caching_policy,
+            config.engine,
+        ));
 
         let encoder = encoding::get_encoder(config.encoding);
 

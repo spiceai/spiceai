@@ -12,11 +12,9 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - uses: actions/setup-go@v6
-
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.1 --profile minimal
 
       - name: Set up make
         if: runner.os != 'macOS'
@@ -26,7 +24,6 @@ jobs:
         shell: bash
         run: |
           echo -e "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > acknowledgements.md
-          make -s generate-acknowledgements-go
           make -s generate-acknowledgements-rust
           sed -i.bak -e 's/\"//g' -e 's/,/, /g' -e 's/,  /, /g' acknowledgements.md
           rm acknowledgements.md.bak

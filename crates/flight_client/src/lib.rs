@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -44,6 +44,8 @@ use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 use tonic::transport::Channel;
 
+pub mod arrow_flight_factory;
+pub mod cookie;
 pub mod tls;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
@@ -175,6 +177,11 @@ pub enum Error {
 
     #[snafu(display("Connection is reset by the server. Please retry the request. {source}"))]
     ConnectionReset { source: TonicStatusError },
+
+    #[snafu(display("Flight connection error: {source}"))]
+    ArrowFlightError {
+        source: arrow_flight::error::FlightError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -252,8 +259,11 @@ impl FlightClient {
     ///
     /// # Arguments
     ///
-    /// * `username` - The username to use.
-    /// * `password` - The password to use.
+    /// * `url` - The URL to connect to.
+    /// * `credentials` - The credentials to use for authentication.
+    /// * `metadata` - Optional metadata to include with requests.
+    /// * `ca_certificate_path` - Optional path to a CA certificate file (PEM format)
+    ///   for TLS verification. If not provided, system certificates will be used.
     ///
     /// # Errors
     ///
@@ -262,8 +272,9 @@ impl FlightClient {
         url: Arc<str>,
         credentials: Credentials,
         metadata: Option<tonic::metadata::MetadataMap>,
+        ca_certificate_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel(&url)
+        let flight_channel = tls::new_tls_flight_channel(&url, ca_certificate_path)
             .await
             .context(UnableToConnectToServerSnafu)?;
 
@@ -656,7 +667,6 @@ impl FlightClient {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     if is_connection_reset_error(&e) {
         return Error::ConnectionReset {
@@ -668,6 +678,7 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     }
 }
 
+#[must_use]
 pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
     match error.code() {
         tonic::Code::Internal | tonic::Code::Cancelled | tonic::Code::Unknown => {

@@ -9,9 +9,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow = { workspace = true }
 arrow-schema.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+data_components = { path = "../data_components" }
 datafusion.workspace = true
 futures.workspace = true
 parking_lot = "0.12"
@@ -21,6 +23,7 @@ spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
 tokio-stream.workspace = true
 tracing.workspace = true
+util = { path = "../util" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

@@ -30,18 +30,17 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use opentelemetry::KeyValue;
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
-use tokio::{
-    sync::mpsc::{self, Sender},
-    time::sleep,
-};
+use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use async_stream::stream;
 
 use crate::{
+    config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
     timing::TimedStream,
@@ -49,7 +48,7 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{
-    Service, flightsql::prepared_statement_query, metrics,
+    Service, flightsql, flightsql::prepared_statement_query, metrics,
     middleware::rate_limit::RateLimiterExtension,
 };
 
@@ -73,19 +72,72 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
-    if let Ok(message) = Any::decode(&*fd.cmd)
-        && let Command::CommandPreparedStatementQuery(query) =
-            Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
-    {
-        return prepared_statement_query::do_put_query(query, streaming_flight).await;
-    }
+    // Extract table path from FlightSQL commands if present
+    let table_path_override = if let Ok(message) = Any::decode(&*fd.cmd) {
+        match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
+            Command::CommandPreparedStatementQuery(query) => {
+                return prepared_statement_query::do_put_query(query, streaming_flight).await;
+            }
+            Command::CommandPreparedStatementUpdate(query) => {
+                return flightsql::prepared_statement_update::do_put_update(
+                    query,
+                    streaming_flight,
+                )
+                .await;
+            }
+            Command::CommandStatementUpdate(cmd) => {
+                return flightsql::statement_update::do_put(cmd).await;
+            }
+            Command::CommandStatementIngest(ingest_cmd) => {
+                // Handle FlightSQL bulk ingestion command
+                // Prefer descriptor path when command is under-qualified (table only).
+                // This preserves fully-qualified paths forwarded by the scheduler.
+                match (ingest_cmd.catalog.as_ref(), ingest_cmd.schema.as_ref()) {
+                    (Some(catalog), Some(schema)) => Some(vec![
+                        catalog.clone(),
+                        schema.clone(),
+                        ingest_cmd.table.clone(),
+                    ]),
+                    // If command is under-qualified, prefer descriptor path if present,
+                    // because scheduler forwarding includes fully-qualified path parts.
+                    (Some(catalog), None) => {
+                        if fd.path.is_empty() {
+                            Some(vec![catalog.clone(), ingest_cmd.table.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                    (None, Some(schema)) => {
+                        if fd.path.is_empty() {
+                            Some(vec![schema.clone(), ingest_cmd.table.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                    (None, None) => {
+                        if fd.path.is_empty() {
+                            Some(vec![ingest_cmd.table.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // Check if the request should be rate limited.
     if let Some(rate_limit_check) = rate_limit_check_fn {
         rate_limit_check()?;
     }
 
-    match RequestContext::current(AsyncMarker::new().await).auth_principal() {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    match context.auth_principal() {
         Some(principal) => {
             if !principal
                 .groups()
@@ -98,9 +150,15 @@ pub(crate) async fn handle(
             }
         }
         None => {
-            return Err(Status::unauthenticated(
-                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
-            ));
+            if allow_scheduler_trusted_executor_write(&datafusion) {
+                tracing::debug!(
+                    "Allowing unauthenticated DoPut on executor in mTLS scheduler-trusted mode"
+                );
+            } else {
+                return Err(Status::unauthenticated(
+                    "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+                ));
+            }
         }
     }
 
@@ -114,23 +172,50 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
-    if fd.path.is_empty() {
+    // Use table path from FlightSQL command if available, otherwise use descriptor path
+    let path_vec = table_path_override.as_ref().unwrap_or(&fd.path);
+
+    if path_vec.is_empty() {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No path provided"));
     }
 
-    let path = TableReference::parse_str(&fd.path.join("."));
+    let path = match path_vec.len() {
+        3 => TableReference::full(
+            path_vec[0].as_str(),
+            path_vec[1].as_str(),
+            path_vec[2].as_str(),
+        ),
+        2 => TableReference::partial(path_vec[0].as_str(), path_vec[1].as_str()),
+        _ => TableReference::parse_str(&path_vec.join(".")),
+    };
+    let path = normalize_path_table_reference(path, &datafusion);
 
     // Initializing tracking here so that both counter and duration have consistent path dimensions
     let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
 
-    let context = RequestContext::current(AsyncMarker::new().await);
-    let datafusion = get_current_datafusion(&context);
-
-    if !datafusion.is_writable(&path) {
+    if !datafusion.is_writable(&path) && !datafusion.is_path_catalog_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
+    }
+
+    // Fast path: for scheduler -> executor Cayenne writes, forward raw FlightData
+    // directly to executor to avoid decode/re-encode overhead on scheduler.
+    if should_forward_raw_cayenne_write(&datafusion, &path).await {
+        use futures::stream;
+
+        let inbound = futures::StreamExt::chain(
+            stream::once(async move { Ok(first_message.clone()) }),
+            streaming_flight,
+        );
+        datafusion
+            .forward_flight_data_stream_to_executor(&path, inbound)
+            .await
+            .map_err(|e| Status::internal(format!("Write operation failed: {e}")))?;
+
+        let output = futures::stream::iter(vec![Ok(PutResult::default())]);
+        return Ok(Response::new(Box::pin(output)));
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
@@ -149,12 +234,123 @@ pub(crate) async fn handle(
     }
 
     let first_message = first_message.clone();
-    let response_stream =
-        create_response_stream(path, schema, datafusion, streaming_flight, &first_message);
+    let response_stream = create_response_stream(
+        path,
+        schema,
+        Arc::clone(&datafusion),
+        streaming_flight,
+        &first_message,
+    );
+    let response_stream = context.scope_stream(response_stream);
 
     let timed_stream = TimedStream::new(response_stream, move || start);
 
     Ok(Response::new(Box::pin(timed_stream)))
+}
+
+fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
+    datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
+        && datafusion.cluster_config.tls_config().is_some()
+}
+
+async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableReference) -> bool {
+    if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
+        return false;
+    }
+
+    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
+        return false;
+    };
+
+    let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+        return false;
+    };
+    if clients.is_empty() {
+        return false;
+    }
+    drop(clients);
+
+    let Some(table_provider) = datafusion.get_table(path).await else {
+        return false;
+    };
+
+    table_provider
+        .as_any()
+        .downcast_ref::<cayenne::CayenneTableProvider>()
+        .is_some()
+}
+
+fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
+    // NOTE: this uses synchronous `table_exist` checks on schema providers. These
+    // checks are expected to be in-memory lookups in current catalog implementations.
+    match path {
+        TableReference::Full { .. } => path,
+        TableReference::Partial { schema, table } => {
+            let matching_catalogs = datafusion
+                .ctx
+                .catalog_names()
+                .into_iter()
+                .filter(|catalog_name| {
+                    datafusion
+                        .ctx
+                        .catalog(catalog_name)
+                        .and_then(|catalog| catalog.schema(schema.as_ref()))
+                        .is_some_and(|schema_provider| {
+                            schema_provider.table_exist(table.as_ref())
+                                || datafusion.is_catalog_writable(catalog_name)
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if matching_catalogs.len() == 1 {
+                return TableReference::full(
+                    matching_catalogs[0].clone(),
+                    schema.to_string(),
+                    table.to_string(),
+                );
+            }
+
+            TableReference::partial(schema, table)
+        }
+        TableReference::Bare { table } => {
+            let table_name = table.to_string();
+            let matching_tables = datafusion
+                .ctx
+                .catalog_names()
+                .into_iter()
+                .flat_map(|catalog_name| {
+                    let table_name_for_catalog = table_name.clone();
+                    datafusion
+                        .ctx
+                        .catalog(&catalog_name)
+                        .into_iter()
+                        .flat_map(move |catalog| {
+                            let catalog_name = catalog_name.clone();
+                            let table_name = table_name_for_catalog.clone();
+                            catalog
+                                .schema_names()
+                                .into_iter()
+                                .filter_map(move |schema_name| {
+                                    let table_name = table_name.clone();
+                                    catalog
+                                        .schema(&schema_name)
+                                        .filter(|schema_provider| {
+                                            schema_provider.table_exist(table_name.as_str())
+                                        })
+                                        .map(|_| (catalog_name.clone(), schema_name, table_name))
+                                })
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if matching_tables.len() == 1 {
+                let (catalog, schema, table_name) = matching_tables[0].clone();
+                return TableReference::full(catalog, schema, table_name);
+            }
+
+            TableReference::bare(table_name)
+        }
+    }
 }
 
 fn create_response_stream(
@@ -176,7 +372,7 @@ fn create_response_stream(
     .ok();
 
     stream! {
-        // channel to propogate new record batches to the data writing stream
+        // channel to propagate new record batches to the data writing stream
         let (batch_tx, batch_rx)= mpsc::channel::<Result<RecordBatch, DataFusionError>>(100);
 
         let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), Box::new(ReceiverStream::new(batch_rx))));
@@ -185,12 +381,18 @@ fn create_response_stream(
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx).await;
+            yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
         }
+
+        // Use a single pinned Sleep future that is reset on each received message,
+        // rather than creating a new timer allocation on every loop iteration.
+        let idle_timeout = Duration::from_secs(120);
+        let deadline = tokio::time::sleep(idle_timeout);
+        tokio::pin!(deadline);
 
         loop {
             tokio::select! {
-                () = sleep(Duration::from_secs(120)) => {
+                () = &mut deadline => {
                     tracing::error!("Timeout: no record batch received within 120 seconds");
                     yield Err(Status::deadline_exceeded("Timeout: no record batch received within 120 seconds"));
                     break;
@@ -198,7 +400,20 @@ fn create_response_stream(
                 // Poll the writing task to check if it has completed with an error while processing the data
                 write_result = &mut write_future => {
                     match write_result {
-                        Ok(()) => unreachable!("Write operation should not complete successfully before the end of the stream"),
+                        Ok(()) => {
+                            // The write operation completed before the flight stream
+                            // ended. This can happen when the data sink does not
+                            // consume the input stream or finishes early. Drain
+                            // remaining messages and report success.
+                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
+                            while let Some(msg) = streaming_flight.next().await {
+                                if let Err(e) = msg {
+                                    tracing::error!("Error reading remaining message after early write completion: {e}");
+                                }
+                            }
+                            yield Ok(PutResult::default());
+                            break;
+                        }
                         Err(e) => {
                             tracing::error!("Write operation failed. Details included in the response.");
                             yield Err(Status::internal(format!("Write operation failed: {e}")));
@@ -209,6 +424,9 @@ fn create_response_stream(
                 message = streaming_flight.next() => {
                     match message {
                         Some(Ok(message)) => {
+                            // Reset the idle timeout on each received message
+                            deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+
                             let new_batch = match flight_data_to_arrow_batch(
                                 &message,
                                 Arc::clone(&schema),
@@ -223,7 +441,7 @@ fn create_response_stream(
                             };
 
                             // Only report errors; a success message is sent as the final step upon successful write completion
-                            if let Err(err) = handle_record_batch(new_batch, &batch_tx).await {
+                            if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
                                 yield Err(err);
                                 break;
                             }
@@ -259,17 +477,13 @@ fn create_response_stream(
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
+    path: &str,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
 
-    // 32,768 is four times the default batch size in DataFusion (`datafusion.execution.batch_size`), which defaults to 8,192.
-    if batch.num_rows() > 32_768 {
-        return Err(Status::invalid_argument(format!(
-            "The provided batch contains too many rows. Maximum allowed: {allowed}, received: {received}.",
-            allowed = 32_768,
-            received = batch.num_rows()
-        )));
-    }
+    let labels = [KeyValue::new("dataset", path.to_string())];
+    metrics::DO_PUT_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+    metrics::DO_PUT_BYTES_WRITTEN.add(batch.get_array_memory_size() as u64, &labels);
 
     if let Err(e) = batch_tx.send(Ok(batch)).await {
         tracing::error!("Error sending record batch to write channel: {e}");

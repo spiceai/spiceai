@@ -18,8 +18,12 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
+use serde::{Deserialize, Serialize};
 
-use crate::flight::{PreparedStatementParamColumn, create_param_batch};
+use crate::{
+    flight::{PreparedStatementParamColumn, create_param_batch},
+    spiced::SpicedInstance,
+};
 
 pub mod parameterized;
 pub mod scenario;
@@ -119,6 +123,7 @@ macro_rules! add_tpcds_query_overrides {
         }
     }
 }
+
 macro_rules! generate_clickbench_queries {
   ( $( $i:literal ),* ) => {
       vec![
@@ -147,7 +152,7 @@ macro_rules! generate_clickbench_query_overrides {
   }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
     pub sql: Arc<str>,
@@ -182,6 +187,34 @@ impl Query {
 
             create_param_batch(columns)
         })
+    }
+
+    /// Converts parameterized SQL to raw SQL with parameters substituted as literals
+    /// for use with endpoints that don't support parameterized queries.
+    #[must_use]
+    pub fn to_sql_with_inlined_params(&self) -> Arc<str> {
+        match &self.parameters {
+            Some(params) if !params.is_empty() => {
+                let mut sql = self.sql.as_ref().to_string();
+
+                // Handle different parameter formats
+                if sql.contains('?') {
+                    // Positional format: replace ? with actual values
+                    for param in params {
+                        sql = sql.replacen('?', &param.to_sql_literal(), 1);
+                    }
+                } else {
+                    // Named format: replace $1, $2, etc. with actual values
+                    for (i, param) in params.iter().enumerate() {
+                        let placeholder = format!("${}", i + 1);
+                        sql = sql.replace(&placeholder, &param.to_sql_literal());
+                    }
+                }
+
+                sql.into()
+            }
+            _ => Arc::clone(&self.sql),
+        }
     }
 
     /// Rewrite table references in the query to use a reference schema.
@@ -249,7 +282,8 @@ impl Query {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum QuerySet {
     #[default]
     Tpch,
@@ -258,6 +292,7 @@ pub enum QuerySet {
     ParameterizedTpch,
     /// Scenario query set loaded from a file
     Scenario {
+        #[serde(skip)]
         queries: Vec<Query>,
         scenario_set: scenario::ScenarioQuerySet,
     },
@@ -291,13 +326,18 @@ impl From<&(&'static str, u32)> for TableWithRowCount {
 }
 
 impl QuerySet {
-    #[must_use]
-    pub fn get_queries(&self, overrides: Option<QueryOverrides>) -> Vec<Query> {
+    #[expect(clippy::unused_async)]
+    pub async fn get_queries(
+        &self,
+        overrides: Option<QueryOverrides>,
+        _instance: Option<&SpicedInstance>,
+        _random_param_set_count: Option<usize>,
+    ) -> anyhow::Result<Vec<Query>> {
         match self {
-            QuerySet::Tpch => get_tpch_test_queries(overrides),
-            QuerySet::Tpcds => get_tpcds_test_queries(overrides),
-            QuerySet::Clickbench => get_clickbench_test_queries(overrides),
-            QuerySet::Scenario { queries, .. } => queries.clone(),
+            QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
+            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
+            QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
+            QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
                     "parameterized",
@@ -322,7 +362,7 @@ impl QuerySet {
                     q21 // q22 -- Invalid argument error: column types must match schema types, expected Float64 but found Decimal128(38, 10) at column index 7
                 );
 
-                add_tpch_parameters(queries)
+                Ok(add_tpch_parameters(queries))
             }
         }
     }
@@ -453,6 +493,40 @@ impl QuerySet {
             _ => Ok(None),
         }
     }
+
+    /// Returns query names that should be skipped for row count validation.
+    #[must_use]
+    pub fn get_row_count_validation_skip_queries(
+        &self,
+        _overrides: Option<QueryOverrides>,
+        scale_factor: f64,
+    ) -> Vec<&'static str> {
+        match self {
+            QuerySet::Tpch | QuerySet::ParameterizedTpch => {
+                // Skip these queries for SF != 1 because their thresholds are SF-dependent
+                // https://github.com/spiceai/spiceai/issues/8755
+                if (scale_factor - 1.0).abs() > f64::EPSILON {
+                    vec!["tpch_q11"]
+                } else {
+                    vec![]
+                }
+            }
+            QuerySet::Tpcds => {
+                // TPCDS queries that return 0 rows and should skip row count validation
+                vec![
+                    "tpcds_q8",
+                    "tpcds_q29",
+                    "tpcds_q37",
+                    "tpcds_q41",
+                    "tpcds_q44",
+                    "tpcds_q54",
+                    "tpcds_q58",
+                    "tpcds_q76",
+                ]
+            }
+            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+        }
+    }
 }
 
 impl Display for QuerySet {
@@ -484,6 +558,7 @@ pub enum QueryOverrides {
     ODBCDatabricks,
     DuckDB,
     DuckDBOnZeroResults,
+    DuckDBPartitioned,
     Snowflake,
     Oracle,
     IcebergSF1,
@@ -511,7 +586,6 @@ impl QueryOverrides {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let queries = generate_tpch_queries!(
@@ -521,7 +595,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
 
     match overrides {
         Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
-            queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
+            queries, 2,  // https://github.com/spiceai/spiceai/issues/8379
+            4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
         ),
         Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
@@ -679,6 +754,12 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             simple_q6,
             simple_q7
         ),
+        Some(QueryOverrides::DuckDBPartitioned) => remove_tpch_query!(
+            queries,
+            17, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/8384
+            20, // Physical plan does not support logical expression ScalarSubquery(<subquery>); https://github.com/spiceai/spiceai/issues/8384
+            21  // Binder Error; https://github.com/spiceai/spiceai/issues/8384
+        ),
         _ => queries,
     }
 }
@@ -770,7 +851,8 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             )
         }
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
-            queries, 8, 38, 87 // LEFT SEMI, and LEFT ANTI
+            queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
+            64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
         ),
         Some(_) | None => queries,
     }
@@ -827,6 +909,81 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_to_sql_with_inlined_params_named_format() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE id = $1 AND name = $2 AND price > $3".into(),
+            false,
+        );
+        query.parameters = Some(vec![
+            ParameterValue::Number(123),
+            ParameterValue::String("test_name".into()),
+            ParameterValue::Float(99.99),
+        ]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE id = 123 AND name = 'test_name' AND price > 99.99"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_positional_format() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE id = ? AND name = ? AND active = ?".into(),
+            false,
+        );
+        query.parameters = Some(vec![
+            ParameterValue::Number(456),
+            ParameterValue::String("positional_test".into()),
+            ParameterValue::Number(1),
+        ]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE id = 456 AND name = 'positional_test' AND active = 1"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_string_escaping() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE comment = ?".into(),
+            false,
+        );
+        query.parameters = Some(vec![ParameterValue::String(
+            "It's a test with 'quotes'".into(),
+        )]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE comment = 'It''s a test with ''quotes'''"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_no_parameters() {
+        let query = Query::new("test_query".into(), "SELECT * FROM table".into(), false);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(result.as_ref(), "SELECT * FROM table");
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_empty_parameters() {
+        let mut query = Query::new("test_query".into(), "SELECT * FROM table".into(), false);
+        query.parameters = Some(vec![]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(result.as_ref(), "SELECT * FROM table");
+    }
 
     #[test]
     fn test_rewrite_simple_query() {

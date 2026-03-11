@@ -89,3 +89,66 @@ pub fn to_change_batch(
 
     Ok(change_batch)
 }
+
+pub fn vector_to_change_batch(
+    table_schema: &SchemaRef,
+    primary_key: &[String],
+    changes: &[&ChangeEvent],
+) -> super::Result<ChangeBatch> {
+    let schema = changes_schema(table_schema);
+
+    let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
+
+    for change in changes {
+        struct_builder.append(true);
+
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let field_builder = struct_builder.field_builder_array(idx);
+            match field.name().as_str() {
+                "op" => {
+                    let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                    str_builder.append_value(change.payload.op.to_string());
+                }
+                "primary_keys" => {
+                    let list_builder =
+                        downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)?;
+                    if primary_key.is_empty() {
+                        list_builder.append(false);
+                    } else {
+                        let str_builder = downcast_builder::<StringBuilder>(list_builder.values())?;
+                        for key in primary_key {
+                            str_builder.append_value(key);
+                        }
+                        list_builder.append(true);
+                    }
+                }
+                "data" => {
+                    let change_data = match change.payload.op {
+                        Op::Delete => change
+                            .payload
+                            .before
+                            .clone()
+                            .context(super::DeleteOpWithoutBeforeFieldSnafu)?,
+                        _ => change.payload.after.clone(),
+                    };
+
+                    let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)?;
+
+                    super::append_value_to_struct_builder(change_data, data_struct_builder)?;
+                }
+                _ => unreachable!("Unexpected field in changes schema {}", field.name()),
+            }
+        }
+    }
+
+    let struct_array = struct_builder.finish();
+    let record_batch: RecordBatch = struct_array.into();
+
+    let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
+        unreachable!(
+            "Record batch was constructed with the correct schema, so this shouldn't fail"
+        );
+    };
+
+    Ok(change_batch)
+}

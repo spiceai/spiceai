@@ -103,24 +103,21 @@ impl MetadataColumns {
     pub fn non_filterable_names(&self) -> Vec<String> {
         self.non_filterable()
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect()
     }
 
     #[must_use]
     pub fn filterable_names(&self) -> Vec<String> {
-        self.filterable()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect()
+        self.filterable().iter().map(|f| f.name().clone()).collect()
     }
 
     #[must_use]
     pub fn all_names(&self) -> Vec<String> {
         self.non_filterable()
             .iter()
-            .map(|f| f.name().to_string())
-            .chain(self.filterable().iter().map(|f| f.name().to_string()))
+            .map(|f| f.name().clone())
+            .chain(self.filterable().iter().map(|f| f.name().clone()))
             .collect()
     }
 }

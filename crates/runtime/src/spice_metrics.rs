@@ -17,10 +17,11 @@ limitations under the License.
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
-use opentelemetry_sdk::metrics::MetricError;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -37,10 +38,13 @@ use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error creating metrics table: {source}"))]
+    #[snafu(display("Failed to create the internal metrics table: {source}"))]
     UnableToCreateMetricsTable { source: InternalTableError },
 
-    #[snafu(display("Error registering metrics table: {source}"))]
+    #[snafu(display(
+        "Failed to register the internal metrics table: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterToMetricsTable { source: DataFusionError },
 }
 
@@ -60,7 +64,7 @@ impl SpiceMetricsExporter {
 
 #[async_trait]
 impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
+    async fn export(&self, metrics: RecordBatch) -> OTelSdkResult {
         let data_update = DataUpdate {
             schema: metrics.schema(),
             data: vec![metrics],
@@ -69,21 +73,21 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
 
         let Some(df) = self.datafusion.upgrade() else {
             // this should never happen as the exporter must be shutdown before the DataFusion instance is dropped
-            return Err(MetricError::Other(
-                "Failed to export metrics as the DataFusion instance has already been dropped.\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
+            return Err(OTelSdkError::InternalFailure(
+                "Failed to export metrics as the DataFusion instance has already been dropped. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
             ));
         };
 
         df.write_data(&get_metrics_table_reference(), data_update)
             .await
-            .map_err(|e| MetricError::Other(e.to_string()))
+            .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
+    fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricError> {
+    fn shutdown(&self) -> OTelSdkResult {
         Ok(())
     }
 }

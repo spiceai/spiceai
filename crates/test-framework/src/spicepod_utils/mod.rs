@@ -30,7 +30,7 @@ use spicepod::{
 /// - If the file fails to be deserialized
 pub fn load_spicepod(path: PathBuf) -> anyhow::Result<SpicepodDefinition> {
     let spicepod_str = std::fs::read_to_string(path)?;
-    let spicepod: SpicepodDefinition = serde_yaml::from_str(&spicepod_str)?;
+    let spicepod: SpicepodDefinition = yaml::from_str(&spicepod_str)?;
     Ok(spicepod)
 }
 
@@ -60,11 +60,6 @@ pub fn from_app(app: App) -> SpicepodDefinition {
             .collect(),
         datasets: app
             .datasets
-            .into_iter()
-            .map(ComponentOrReference::Component)
-            .collect(),
-        evals: app
-            .evals
             .into_iter()
             .map(ComponentOrReference::Component)
             .collect(),

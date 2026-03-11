@@ -27,10 +27,11 @@ use axum::{
 };
 use csv::Writer;
 use http::StatusCode;
+use runtime_api_types::v1::ModelMetadata;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{Runtime, model::LLMResponsesModelStore, status::ComponentStatus};
+use crate::{Runtime, model::LLMResponsesModelStore};
 
 use super::Format;
 
@@ -50,19 +51,9 @@ pub struct ModelsQueryParams {
     pub metadata_fields: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct OpenAIModelResponse {
-    object: String,
-    data: Vec<OpenAIModel>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub(crate) struct Metadata {
-    pub supports_responses_api: bool,
-}
+// Re-export shared types for backwards compatibility
+pub use runtime_api_types::v1::ModelInfo as OpenAIModel;
+pub use runtime_api_types::v1::ModelListResponse as OpenAIModelResponse;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) enum MetadataKeys {
@@ -78,29 +69,6 @@ impl TryFrom<&str> for MetadataKeys {
             _ => Err(format!("Invalid metadata key: {value}")),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct OpenAIModel {
-    /// The name of the model
-    id: String,
-
-    /// The type of the model (always `model`)
-    object: String,
-
-    /// The source from which the model was loaded (e.g., `openai`, `spiceai`)
-    owned_by: String,
-
-    /// The datasets associated with this model, if any
-    datasets: Option<Vec<String>>,
-
-    /// The status of the model (e.g., `ready`, `initializing`, `error`)
-    status: Option<ComponentStatus>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<Metadata>,
 }
 
 fn get_metadata_keys(params: &ModelsQueryParams) -> Result<Vec<MetadataKeys>, String> {
@@ -119,12 +87,12 @@ fn generate_metadata(
     model_name: &str,
     metadata_keys: &Vec<MetadataKeys>,
     responses_models: &HashSet<String>,
-) -> Option<Metadata> {
+) -> Option<ModelMetadata> {
     if metadata_keys.is_empty() {
         return None;
     }
 
-    let mut metadata = Metadata::default();
+    let mut metadata = ModelMetadata::default();
     for key in metadata_keys {
         match key {
             MetadataKeys::SupportsResponsesAPI => {
@@ -138,6 +106,9 @@ fn generate_metadata(
 /// List Models
 ///
 /// List all models, both machine learning and language models, available in the runtime.
+/// When `status=true` and a model is in `Error`, the response also includes:
+/// - `error`: structured code object with `category`, `type`, and stable `code`
+/// - `error_message`: user-visible details
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models",
@@ -155,23 +126,31 @@ fn generate_metadata(
                         "object": "model",
                         "owned_by": "openai",
                         "datasets": null,
-                        "status": "ready"
+                        "status": "ready",
+                        "error": null,
+                        "error_message": null
                     },
                     {
                         "id": "text-embedding-ada-002",
                         "object": "model",
                         "owned_by": "openai-internal",
                         "datasets": ["text-dataset-1", "text-dataset-2"],
-                        "status": "ready"
+                        "status": "error",
+                        "error": {
+                            "category": "model",
+                            "type": "auth",
+                            "code": "model.auth"
+                        },
+                        "error_message": "Invalid API key"
                     }
                 ]
             })
         ), (
             String = "text/csv",
             example = "
-id,object,owned_by,datasets,status
-gpt-4,model,openai,,ready
-text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",ready
+id,object,owned_by,datasets,status,error,error_message
+gpt-4,model,openai,,ready,,
+text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",error,model.auth,Invalid API key
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing models", content((
@@ -218,12 +197,28 @@ pub(crate) async fn get(
                 } else {
                     Some(m.datasets.clone())
                 };
+                let status = statuses.get(&m.name).cloned();
+                let error = status.as_ref().and_then(|s| {
+                    if s.is_error() {
+                        Some(runtime_api_types::v1::ComponentError::from_status_message(
+                            runtime_api_types::v1::ComponentErrorCategory::Model,
+                            s.error_message(),
+                        ))
+                    } else {
+                        None
+                    }
+                });
+                let error_message = status
+                    .as_ref()
+                    .and_then(|s| s.error_message().map(String::from));
                 OpenAIModel {
                     id: m.name.clone(),
                     object: "model".to_string(),
                     owned_by: m.from.clone(),
                     datasets: d,
-                    status: statuses.get(&m.name).copied(),
+                    status,
+                    error,
+                    error_message,
                     metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
                 }
             })
@@ -243,21 +238,33 @@ pub(crate) async fn get(
         HashMap::default()
     };
     let worker_registry = rt.workers.read().await;
-    let workers = worker_registry
-        .iter()
-        .filter_map(|(name, worker)| {
-            Arc::clone(worker).as_model()?;
-            Some(OpenAIModel {
-                id: name.clone(),
-                object: "model".to_string(),
-                owned_by: "spiceai".to_string(),
-                datasets: None,
-                status: worker_statuses.get(name).copied(),
-                metadata: generate_metadata(name, &metadata_keys, &responses_models),
-            })
+    models.extend(worker_registry.iter().filter_map(|(name, worker)| {
+        Arc::clone(worker).as_model()?;
+        let status = worker_statuses.get(name).cloned();
+        let error = status.as_ref().and_then(|s| {
+            if s.is_error() {
+                Some(runtime_api_types::v1::ComponentError::from_status_message(
+                    runtime_api_types::v1::ComponentErrorCategory::Worker,
+                    s.error_message(),
+                ))
+            } else {
+                None
+            }
+        });
+        let error_message = status
+            .as_ref()
+            .and_then(|s| s.error_message().map(String::from));
+        Some(OpenAIModel {
+            id: name.clone(),
+            object: "model".to_string(),
+            owned_by: "spiceai".to_string(),
+            datasets: None,
+            status,
+            error,
+            error_message,
+            metadata: generate_metadata(name, &metadata_keys, &responses_models),
         })
-        .collect::<Vec<OpenAIModel>>();
-    models.extend(workers.into_iter());
+    }));
 
     match params.format {
         Format::Json => (

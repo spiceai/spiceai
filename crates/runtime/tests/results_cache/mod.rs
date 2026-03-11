@@ -23,15 +23,18 @@ use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::{
-    component::{caching::ResultsCache, dataset::Dataset},
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
     param::Params,
 };
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
-        format!("s3://spiceai-demo-datasets/tpch/{name}/").to_string(),
+        format!("s3://spiceai-demo-datasets/tpch/{name}/"),
         name.to_string(),
     );
     test_dataset.params = Some(Params::from_string_map(
@@ -46,16 +49,17 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
 #[tokio::test]
 async fn results_cache_system_queries() -> Result<(), String> {
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
-            let results_cache = ResultsCache {
+            let sql_results_cache = SQLResultsCacheConfig {
                 item_ttl: Some("60s".to_string()),
                 ..Default::default()
             };
 
             let app = AppBuilder::new("cache_test")
-                .with_results_cache(results_cache)
+                .with_sql_cache(sql_results_cache)
                 .with_dataset(make_s3_tpch_dataset("customer"))
                 .build();
 
@@ -66,24 +70,17 @@ async fn results_cache_system_queries() -> Result<(), String> {
 
             cloned_rt.load_components().await;
 
-            assert!(
-                execute_query_and_check_cache_status(
-                    &rt,
-                    "show tables",
-                    CacheStatus::CacheDisabled
-                )
+            execute_query_and_check_cache_status(&rt, "show tables", CacheStatus::CacheDisabled)
                 .await
-                .is_ok()
-            );
-            assert!(
-                execute_query_and_check_cache_status(
-                    &rt,
-                    "describe customer",
-                    CacheStatus::CacheDisabled
-                )
-                .await
-                .is_ok()
-            );
+                .expect("should run query successfully");
+
+            execute_query_and_check_cache_status(
+                &rt,
+                "describe customer",
+                CacheStatus::CacheDisabled,
+            )
+            .await
+            .expect("should run query successfully");
 
             Ok(())
         })

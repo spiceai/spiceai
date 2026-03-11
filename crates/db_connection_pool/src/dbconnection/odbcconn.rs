@@ -74,11 +74,11 @@ pub type ODBCDbConnectionPool<'a> =
 pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ArrowError { source: arrow::error::ArrowError },
-    #[snafu(display("arrow_odbc error: {source}"))]
+    #[snafu(display("ODBC driver error: {source}"))]
     ArrowODBCError { source: arrow_odbc::Error },
-    #[snafu(display("odbc_api Error: {source}"))]
+    #[snafu(display("ODBC connection error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
-    #[snafu(display("odbc_api Error: {message}"))]
+    #[snafu(display("ODBC connection error: {message}"))]
     ODBCAPIErrorNoSource { message: String },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     TryFromError { source: std::num::TryFromIntError },
@@ -125,11 +125,26 @@ impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self {
-        ODBCConnection {
-            conn: Arc::new(conn.into()),
-            params: Arc::new(HashMap::new()),
-        }
+    fn new(_: Connection<'a>) -> Self {
+        unimplemented!(
+            "ODBCConnection::new() is not used; use the constructor with parameters instead"
+        )
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "ODBC tables() requires driver-specific implementation".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetSchemas {
+            source: "ODBC schemas() requires driver-specific implementation".into(),
+        })
     }
 
     async fn get_schema(
@@ -197,7 +212,7 @@ where
             let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
-            let mut statement = prepared.into_statement();
+            let mut statement = prepared.into_handle();
 
             bind_parameters(&mut statement, &params)?;
 
@@ -266,7 +281,7 @@ where
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
-        let mut statement = prepared.into_statement();
+        let mut statement = prepared.into_handle();
 
         bind_parameters(&mut statement, params)?;
 
@@ -367,12 +382,21 @@ mod tests {
 
     use super::*;
 
-    // This test crudely validates that parameters are being received by the ODBC driver
+    // This test crudely validates that parameters are being received by the ODBC driver.
+    // Requires SQLite ODBC driver to be installed: `apt install libsqliteodbc` or equivalent.
+    #[ignore = "Requires SQLite ODBC driver"]
     #[cfg(feature = "odbc")]
     #[tokio::test]
     async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(HashMap::new()).expect("Must create ODBC pool");
+        // We provide a dummy connection_string since ODBCPool::new requires it,
+        // but we use driver_connect directly which ignores it
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            secrecy::SecretString::from("Driver={SQLite}"),
+        );
+        let pool = ODBCPool::new(params).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(
@@ -388,7 +412,7 @@ mod tests {
         let mut statement = driver_cxn
             .prepare("select * from (select 'hopper' as name, 100 as age) as cats where name = ? and age = ?")
             .expect("Must prepare")
-            .into_statement();
+            .into_handle();
 
         let params: Vec<Box<dyn ODBCSyncParameter>> = vec![
             Box::new("hopper".into_parameter()),

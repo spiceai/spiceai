@@ -5,12 +5,13 @@ edition = "2021"
 license = "Apache-2.0"
 name = "cayenne"
 repository = "https://github.com/spiceai/spiceai"
-version = "0.1.0"
+version.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -21,36 +22,34 @@ data_components = { path = "../data_components" }
 datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
+hash-index = { path = "../hash-index" }
+object_store = { workspace = true }
+parking_lot = { workspace = true }
 roaring = { workspace = true }
+runtime-datafusion = { path = "../runtime-datafusion" }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
+turso-shared = { workspace = true }
+url = { workspace = true }
+util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
-vortex-alp = { workspace = true }
-vortex-array = { workspace = true }
-vortex-bytebool = { workspace = true }
 vortex-datafusion = { workspace = true }
-vortex-datetime-parts = { workspace = true }
-vortex-decimal-byte-parts = { workspace = true }
-vortex-dict = { workspace = true }
-vortex-fastlanes = { workspace = true }
-vortex-fsst = { workspace = true }
-vortex-runend = { workspace = true }
-vortex-sequence = { workspace = true }
+vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
-vortex-sparse = { workspace = true }
-vortex-zigzag = { workspace = true }
-
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -64,11 +63,19 @@ turso = ["dep:turso"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
+datafusion-federation.workspace = true
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
+rstest = "0.26.1"
 tempfile = { workspace = true }
+test-framework = { path = "../test-framework" }
+test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 
 [[bench]]
 harness = false
 name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "deletion_strategies"

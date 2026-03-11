@@ -36,11 +36,11 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("ConnectionPoolError: {source}"))]
+    #[snafu(display("Failed to connect to ClickHouse: {source}"))]
     ConnectionPoolError {
         source: clickhouse_rs::errors::Error,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to execute ClickHouse query: {source}"))]
     QueryError {
         source: clickhouse_rs::errors::Error,
     },
@@ -94,7 +94,11 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
         let mut conn = self.conn.lock().await;
-        let query = format!("SELECT name FROM system.tables WHERE database = '{schema}'");
+        let conn = &mut *conn;
+
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_schema = schema.replace('\'', "''");
+        let query = format!("SELECT name FROM system.tables WHERE database = '{escaped_schema}'");
         let block = conn
             .query(&query)
             .fetch_all()
@@ -114,6 +118,8 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
         let mut conn = self.conn.lock().await;
+        let conn = &mut *conn;
+
         let query = "SELECT name FROM system.databases WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')";
         let block = conn
             .query(query)
@@ -141,12 +147,15 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
 
         let (database, table) = match table_reference {
             TableReference::Full { schema, table, .. }
-            | TableReference::Partial { schema, table } => (schema, table),
-            TableReference::Bare { table } => (&self.db, table),
+            | TableReference::Partial { schema, table } => (schema.as_ref(), table.as_ref()),
+            TableReference::Bare { table } => (self.db.as_ref(), table.as_ref()),
         };
 
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_database = database.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
         let query = format!(
-            "SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{table}'",
+            "SELECT name, type FROM system.columns WHERE database = '{escaped_database}' AND table = '{escaped_table}'",
         );
 
         let block = conn

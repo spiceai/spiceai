@@ -25,4 +25,6 @@ pub enum AccessMode {
     #[default]
     Read,
     ReadWrite,
+    /// Full read-write access including DDL operations (CREATE TABLE, DROP TABLE, etc.)
+    ReadWriteCreate,
 }

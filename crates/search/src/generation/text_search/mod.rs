@@ -29,11 +29,12 @@ use datafusion::{
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
 };
 
+use ::util::format_datafusion_error;
 use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Index, ReloadPolicy, TantivyError,
+    Searcher, TantivyError,
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
@@ -84,7 +85,10 @@ pub enum Error {
     #[snafu(display("Failed to infer an Arrow schema from JSON format. Error: {source}"))]
     ArrowSchemaError { source: ArrowError },
 
-    #[snafu(display("Failed to convert JSON values to Arrow format. Error: {source}"))]
+    #[snafu(display(
+        "Failed to convert JSON values to Arrow format. Error: {}",
+        format_datafusion_error(source)
+    ))]
     ArrowConversionError { source: DataFusionError },
 
     #[snafu(display("Failed to convert underlying search data into JSON format. Error: {source}"))]
@@ -113,7 +117,10 @@ pub enum Error {
     #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
     FailedToRetrieveDataFromIndex { source: TantivyError },
 
-    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
+    #[snafu(display(
+        "Failed to retrieve the data from the underlying table: {}.",
+        format_datafusion_error(source)
+    ))]
     FailedToRetrieveDataFromSource { source: DataFusionError },
 
     #[snafu(display("Failed to insert data into the full text search index: {source}.",))]
@@ -157,7 +164,7 @@ impl Error {
 impl std::fmt::Debug for FullTextSearchFieldIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FullTextSearchFieldIndex")
-            .field("schema", &self.search_schema)
+            .field("schema", self.reader.schema())
             .field("field", &self.field)
             .field("primary_key", &self.primary_key)
             .field("type_hints", &self.type_hints)
@@ -169,9 +176,7 @@ impl std::fmt::Debug for FullTextSearchFieldIndex {
 #[derive(Clone)]
 pub struct FullTextSearchFieldIndex {
     // These are components from a [`tantivy::Index`] required to perform a search on a  [`tantivy::Index`] at a given commit.
-    pub search_schema: tantivy::schema::Schema,
     reader: tantivy::Searcher,
-    tokenizer_manager: tantivy::tokenizer::TokenizerManager,
 
     pub field: String,
     pub primary_key: Vec<String>,
@@ -183,16 +188,13 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(index: &Index, field: String, primary_key: Vec<String>) -> Result<Self> {
+    pub fn try_new(
+        index_search: Searcher,
+        field: String,
+        primary_key: Vec<String>,
+    ) -> Result<Self> {
         let fts = Self {
-            search_schema: index.schema(),
-            reader: index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommitWithDelay)
-                .try_into()
-                .context(TextSearchSnafu)?
-                .searcher(),
-            tokenizer_manager: index.tokenizers().clone(),
+            reader: index_search,
             field,
             primary_key,
             type_hints: HashMap::from([(
@@ -211,7 +213,7 @@ impl FullTextSearchFieldIndex {
             if !cols.contains(pk) {
                 return Err(Error::TextSearchIndexMissingColummn {
                     missing: pk.clone(),
-                    index_columns: cols.clone(),
+                    index_columns: cols,
                 });
             }
         }
@@ -221,6 +223,7 @@ impl FullTextSearchFieldIndex {
 
     ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
     fn schema(&self) -> Arc<Schema> {
+        let search_schema = self.reader.schema();
         let fields = self
             .all_columns()
             .iter()
@@ -228,8 +231,8 @@ impl FullTextSearchFieldIndex {
                 let (data_type, nullable) = if let Some(f) = self.get_type_hint(field_name) {
                     (f.data_type().clone(), f.is_nullable())
                 } else {
-                    let f = self.search_schema.get_field(field_name).ok()?;
-                    let entry = self.search_schema.get_field_entry(f);
+                    let f = search_schema.get_field(field_name).ok()?;
+                    let entry = search_schema.get_field_entry(f);
                     (tantivy_to_arrow_type(entry.field_type())?, false)
                 };
                 Some(Field::new(field_name, data_type, nullable))
@@ -259,7 +262,8 @@ impl FullTextSearchFieldIndex {
 
     #[must_use]
     pub fn all_columns(&self) -> Vec<String> {
-        self.search_schema
+        self.reader
+            .schema()
             .fields()
             .filter_map(|(_, f)| {
                 if f.is_stored() {
@@ -273,14 +277,15 @@ impl FullTextSearchFieldIndex {
 
     fn query_parser(&self) -> QueryParser {
         let default_field = self
-            .search_schema
+            .reader
+            .schema()
             .find_field(self.field.as_str())
             .map(|(f, _)| vec![f])
             .unwrap_or_default();
         QueryParser::new(
-            self.search_schema.clone(),
+            self.reader.schema().clone(),
             default_field,
-            self.tokenizer_manager.clone(),
+            self.reader.index().tokenizers().clone(),
         )
     }
 
@@ -334,7 +339,7 @@ impl FullTextSearchFieldIndex {
 
                 let mut doc_w_col_names = doc
                     .into_iter()
-                    .map(|(f, v)| (self.search_schema.get_field_name(f), v))
+                    .map(|(f, v)| (self.reader.schema().get_field_name(f), v))
                     .filter(|(name, _)| all_cols.contains(&(*name).to_string()))
                     .collect::<HashMap<_, _>>();
 

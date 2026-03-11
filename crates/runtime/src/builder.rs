@@ -14,8 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::DistributedNode;
+use crate::cluster::ExecutorRegistry;
+use crate::cluster::PartitionManager;
+use crate::cluster::ResolvedClusterConfig;
+use crate::cluster::partition;
+use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
+use crate::metrics_reader::MetricsReader;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -31,7 +38,10 @@ use crate::{
     tracers,
 };
 use app::App;
-use spicepod::component::caching::Caching;
+use datafusion::optimizer::AnalyzerRule;
+use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
+use spicepod::component::runtime::Runtime as SpicepodRuntime;
+use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -48,6 +58,7 @@ pub struct RuntimeBuilder {
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    metrics_reader: Option<MetricsReader>,
     runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
     io_runtime: Option<Handle>,
@@ -55,6 +66,7 @@ pub struct RuntimeBuilder {
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
+    resolved_cluster_config: Option<ResolvedClusterConfig>,
 }
 
 impl RuntimeBuilder {
@@ -66,6 +78,7 @@ impl RuntimeBuilder {
             datasets_health_monitor_enabled: false,
             metrics_endpoint: None,
             prometheus_registry: None,
+            metrics_reader: None,
             autoload_extensions: HashMap::new(),
             runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
@@ -74,6 +87,7 @@ impl RuntimeBuilder {
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
+            resolved_cluster_config: None,
         }
     }
 
@@ -146,7 +160,24 @@ impl RuntimeBuilder {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
+    pub fn with_resolved_cluster_config(
+        mut self,
+        resolved_cluster_config: ResolvedClusterConfig,
+    ) -> Self {
+        self.resolved_cluster_config = Some(resolved_cluster_config);
+        self
+    }
+
+    /// Sets the metrics reader for on-demand OTLP metrics collection in cluster mode.
+    ///
+    /// This reader is used by:
+    /// - `GetMetrics` RPC to return local metrics to peer schedulers
+    /// - Executors responding to metrics requests from schedulers via control stream
+    pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
+        self.metrics_reader = Some(metrics_reader);
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -160,55 +191,104 @@ impl RuntimeBuilder {
         catalogconnector::register_all().await;
         document_parse::register_all().await;
 
-        let query = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.query.clone())
-            .unwrap_or_default();
+        // Resolve the effective spicepod runtime config: config override > app > default.
+        let spicepod_rt = self.runtime_config.runtime.clone().unwrap_or_else(|| {
+            self.app
+                .as_ref()
+                .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
+        });
+
+        let query = spicepod_rt.query.clone().unwrap_or_default();
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
 
-        let metrics = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.metrics.clone());
+        let metrics = spicepod_rt.metrics.clone();
 
-        let dataset_parallelism = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.dataset_load_parallelism);
+        let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
 
-        let task_history = self
-            .app
-            .as_ref()
-            .is_none_or(|app| app.runtime.task_history.enabled);
+        let task_history = spicepod_rt.task_history.enabled;
 
-        let mut caching_config = self
-            .app
-            .as_ref()
-            .map_or(Caching::default(), |app| app.runtime.caching.clone());
-        if let Some(results_cache) = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.results_cache.clone())
-        {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release. Use `caching.sql_results` instead. For more information, visit: https://spiceai.org/docs/features/caching"
-                );
+        let runtime_ready_state = spicepod_rt.ready_state;
+
+        self.runtime_status
+            .set_ready_state(match runtime_ready_state {
+                SpicepodRuntimeReadyState::OnLoad => status::RuntimeReadyState::OnLoad,
+                SpicepodRuntimeReadyState::OnRegistration => {
+                    status::RuntimeReadyState::OnRegistration
+                }
             });
-            caching_config.sql_results = Some(results_cache.into());
-        }
 
-        let caching = Runtime::init_caching(Some(&caching_config));
-        #[cfg(feature = "cluster")]
-        let cluster_config = Arc::new(self.runtime_config.cluster.clone());
+        // URL tables are opt-in via `runtime.params.url_tables=enabled`
+        let url_tables_enabled =
+            spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
 
+        let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
+        let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
 
+        let distributed: Option<DistributedNode> = match self
+            .resolved_cluster_config
+            .as_ref()
+            .and_then(ResolvedClusterConfig::effective_role)
+        {
+            Some(ClusterRole::Scheduler) => {
+                if let Some(scheduler_config) = self
+                    .app
+                    .as_ref()
+                    .and_then(|app| app.runtime.scheduler.clone())
+                {
+                    match partition::build_partition_metadata_store(
+                        io_runtime.clone(),
+                        Arc::clone(&secrets),
+                        &scheduler_config,
+                    )
+                    .await
+                    {
+                        Ok(store) => {
+                            let partition_manager = Arc::new(PartitionManager::new(store));
+
+                            Some(DistributedNode::Scheduler {
+                                peers: Arc::new(RwLock::new(HashMap::new())),
+                                // Initialized later when scheduler registry starts
+                                job_executor: Arc::new(RwLock::new(None)),
+                                executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
+                                    &partition_manager,
+                                ))),
+                                partition_manager,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to initialize partition metadata store for scheduler: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory partition store."
+                    );
+                    let partition_manager = Arc::new(PartitionManager::new(Arc::new(
+                        object_store::memory::InMemory::new(),
+                    )));
+                    Some(DistributedNode::Scheduler {
+                        peers: Arc::new(RwLock::new(HashMap::new())),
+                        job_executor: Arc::new(RwLock::new(None)),
+                        executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
+                            &partition_manager,
+                        ))),
+                        partition_manager,
+                    })
+                }
+            }
+            Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
+                partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+            }),
+            None => None, // No cluster config means we're running in standalone mode
+        };
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -220,12 +300,25 @@ impl RuntimeBuilder {
         .with_task_history(task_history)
         .with_caching(caching)
         .with_metrics(metrics)
-        .with_resource_monitor(resource_monitor.clone());
+        .with_resource_monitor(resource_monitor.clone())
+        .with_url_tables(url_tables_enabled);
 
-        #[cfg(feature = "cluster")]
+        if let Some(DistributedNode::Scheduler {
+            executor_registry, ..
+        }) = distributed.as_ref()
         {
-            df_builder = df_builder.with_cluster_config(cluster_config);
-        };
+            df_builder = df_builder
+                .with_executor_registry(Arc::clone(executor_registry))
+                .with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(Arc::clone(
+                    executor_registry,
+                )
+                    as Arc<dyn TablePartitionProvider>))
+                    as Arc<dyn AnalyzerRule + Send + Sync>]);
+        }
+
+        if let Some(resolved_cluster_config) = self.resolved_cluster_config {
+            df_builder = df_builder.with_cluster_config(resolved_cluster_config);
+        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -238,12 +331,10 @@ impl RuntimeBuilder {
         }
 
         let df = Arc::new(df);
+        df.set_self_ref();
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
-            let is_task_history_enabled = self
-                .app
-                .as_ref()
-                .is_some_and(|app| app.runtime.task_history.enabled);
+            let is_task_history_enabled = spicepod_rt.task_history.enabled;
             let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df))
                 .with_task_history_enabled(is_task_history_enabled);
             datasets_health_monitor.start();
@@ -251,14 +342,6 @@ impl RuntimeBuilder {
         } else {
             None
         };
-
-        let secrets = Self::load_secrets(self.app.as_ref()).await;
-
-        let evals = self
-            .app
-            .as_ref()
-            .map(|a| a.evals.clone())
-            .unwrap_or_default();
 
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
@@ -268,18 +351,17 @@ impl RuntimeBuilder {
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
-            evals: Arc::new(RwLock::new(evals)),
-            eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
-            secrets: Arc::new(RwLock::new(secrets)),
+            secrets,
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
+            metrics_reader: self.metrics_reader,
             rate_limits: self.rate_limits.unwrap_or_default(),
             io_runtime,
             status: self.runtime_status,
@@ -287,6 +369,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };
@@ -332,7 +415,7 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     let memory_limit = memory_limit?;
     let original_memory_limit = memory_limit.clone();
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let memory_limit = byte_unit::Byte::from_str(&memory_limit)
         .ok()
         // losing the fractional part of a byte is not a problem

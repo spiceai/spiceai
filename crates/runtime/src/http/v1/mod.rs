@@ -18,14 +18,15 @@ pub mod catalogs;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
-pub mod eval;
 pub mod iceberg;
 pub mod inference;
 pub mod responses;
+pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
 pub mod packages;
+pub mod queries;
 pub mod query;
 pub mod ready;
 pub mod search;
@@ -120,10 +121,12 @@ pub struct ResponseMetadata {
 
 impl ResponseMetadata {
     /// Creates an empty `ResponseMetadata`
+    #[must_use]
     pub fn empty() -> Self {
         Self { sql: None }
     }
 
+    #[must_use]
     pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
         self.sql = Some(sql.into());
         self
@@ -136,6 +139,7 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
+    #[must_use]
     pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
             Self::Json => "application/json",
@@ -147,6 +151,7 @@ impl ResponseMimeType {
         HeaderValue::from_str(media_type).ok()
     }
 
+    #[must_use]
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
@@ -174,10 +179,18 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
+    // First check the runtime status which tracks the actual component state
+    // (Initializing, Refreshing, Ready, Error, etc.)
+    let dataset_statuses = df.runtime_status().get_dataset_statuses();
+    if let Some(status) = dataset_statuses.get(&ds.name) {
+        return status.clone();
+    }
+
+    // Fallback: if not in runtime status, check if table exists
     if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
-        ComponentStatus::Error
+        ComponentStatus::error()
     }
 }
 

@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Check for existing PR
         id: check_pr
@@ -38,9 +38,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust stable
+      - name: Install Rust 1.93.1
         if: steps.check_pr.outputs.skip != 'true'
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.93.1 --profile minimal
+
+      - name: Set up make
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-cc
 
       - name: Build Cargo project
         if: steps.check_pr.outputs.skip != 'true'
@@ -63,7 +71,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: openapi.json
           path: .schema/openapi.json

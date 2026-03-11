@@ -22,18 +22,17 @@ use runtime::{
     component::view::ViewBuilder,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
 use spicepod::component::{dataset::Dataset, view::View};
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 #[cfg(feature = "duckdb")]
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -42,6 +41,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
     use duckdb::AccessMode;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -92,9 +92,16 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
             let view = ViewBuilder::try_from(view_copy).expect("to parse view")
                 .build_with(Arc::clone(&rt), Arc::new(app_copy));
 
-            // Ensure Checkpoint is created after initial view load
+            // Ensure Checkpoint is created after initial view load (poll since checkpoint creation is async)
             let checkpoint = DatasetCheckpoint::try_new(&view, OpenOption::OpenExisting).await.expect("Failed to create view checkpoint");
-            assert!(checkpoint.exists().await, "Checkpoint does not exist");
+            let checkpoint_timeout = std::time::Duration::from_secs(30);
+            let checkpoint_start = std::time::Instant::now();
+            while !checkpoint.exists().await {
+                if checkpoint_start.elapsed() > checkpoint_timeout {
+                    return Err(anyhow::anyhow!("Timed out waiting for checkpoint to exist"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             let last_checkpoint_time = checkpoint
                 .last_checkpoint_time()
                 .await
@@ -182,6 +189,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -292,6 +300,7 @@ async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -388,6 +397,7 @@ async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -470,6 +480,350 @@ async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
 
             // Clean up test file
             std::fs::remove_file("./test_multi_view_dataset.csv").ok();
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            // Create test dataset
+            let csv_data = "id,name,value\n1,test1,100\n2,test2,200\n3,test3,300";
+            std::fs::write("./test_validation.csv", csv_data).expect("to write CSV file");
+
+            let dataset = Dataset::new("file:./test_validation.csv", "validation_data");
+
+            configure_test_datafusion();
+
+            // Test 1: Valid SQL - should succeed
+            {
+                let mut view = View::new("valid_view".to_string());
+                view.sql = Some("SELECT * FROM validation_data".to_string());
+
+                let app = app::AppBuilder::new("test_valid_sql")
+                    .with_dataset(dataset.clone())
+                    .with_view(view)
+                    .build();
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let cloned_rt = Arc::clone(&rt);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // View should be ready
+                let view_statuses = rt.status().get_view_statuses();
+                let view_status = view_statuses.get(&TableReference::bare("valid_view"));
+                if let Some(status) = view_status {
+                    if *status != runtime::status::ComponentStatus::Ready {
+                        return Err(anyhow::anyhow!(
+                            "Valid view should be ready, got {status:?}"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Valid view status not found"));
+                }
+
+                rt.shutdown().await;
+            }
+
+            // Test 2: Invalid SQL syntax - should fail with error
+            {
+                let mut view = View::new("invalid_syntax_view".to_string());
+                view.sql = Some("SELECT * FORM validation_data".to_string()); // FORM instead of FROM
+
+                let app = app::AppBuilder::new("test_invalid_syntax")
+                    .with_dataset(dataset.clone())
+                    .with_view(view)
+                    .build();
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let cloned_rt = Arc::clone(&rt);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // View should be in error state
+                let view_statuses = rt.status().get_view_statuses();
+                let view_status = view_statuses.get(&TableReference::bare("invalid_syntax_view"));
+                if let Some(status) = view_status {
+                    if !status.is_error() {
+                        return Err(anyhow::anyhow!(
+                            "Invalid SQL view should be in error state, got {status:?}"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Invalid SQL view status not found"));
+                }
+
+                rt.shutdown().await;
+            }
+
+            // Test 3: Empty SQL - should fail
+            {
+                let mut view = View::new("empty_sql_view".to_string());
+                view.sql = Some(String::new());
+
+                let app = app::AppBuilder::new("test_empty_sql")
+                    .with_dataset(dataset.clone())
+                    .with_view(view)
+                    .build();
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let cloned_rt = Arc::clone(&rt);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // View should be in error state
+                let view_statuses = rt.status().get_view_statuses();
+                let view_status = view_statuses.get(&TableReference::bare("empty_sql_view"));
+                if let Some(status) = view_status {
+                    if !status.is_error() {
+                        return Err(anyhow::anyhow!(
+                            "Empty SQL view should be in error state, got {status:?}"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Empty SQL view status not found"));
+                }
+
+                rt.shutdown().await;
+            }
+
+            // Test 4: Multiple statements - should fail
+            {
+                let mut view = View::new("multi_statement_view".to_string());
+                view.sql = Some("SELECT * FROM validation_data; SELECT COUNT(*) FROM validation_data".to_string());
+
+                let app = app::AppBuilder::new("test_multi_statement")
+                    .with_dataset(dataset.clone())
+                    .with_view(view)
+                    .build();
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let cloned_rt = Arc::clone(&rt);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // View should be in error state
+                let view_statuses = rt.status().get_view_statuses();
+                let view_status = view_statuses.get(&TableReference::bare("multi_statement_view"));
+                if let Some(status) = view_status {
+                    if !status.is_error() {
+                        return Err(anyhow::anyhow!(
+                            "Multi-statement view should be in error state, got {status:?}"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Multi-statement view status not found"));
+                }
+
+                rt.shutdown().await;
+            }
+
+            // Test 5: Non-SELECT statement - should fail
+            {
+                let mut view = View::new("insert_view".to_string());
+                view.sql = Some("INSERT INTO validation_data VALUES (4, 'test4', 400)".to_string());
+
+                let app = app::AppBuilder::new("test_non_select")
+                    .with_dataset(dataset.clone())
+                    .with_view(view)
+                    .build();
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let cloned_rt = Arc::clone(&rt);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // View should be in error state
+                let view_statuses = rt.status().get_view_statuses();
+                let view_status = view_statuses.get(&TableReference::bare("insert_view"));
+                if let Some(status) = view_status {
+                    if !status.is_error() {
+                        return Err(anyhow::anyhow!(
+                            "Non-SELECT view should be in error state, got {status:?}"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Non-SELECT view status not found"));
+                }
+
+                rt.shutdown().await;
+            }
+
+            // Test 6: Complex valid SQL with joins and aggregations - should succeed
+            {
+                let mut view = View::new("complex_valid_view".to_string());
+                view.sql = Some(
+                    "SELECT name, SUM(value) as total_value FROM validation_data GROUP BY name HAVING SUM(value) > 50".to_string()
+                );
+
+                let app = app::AppBuilder::new("test_complex_valid")
+                    .with_dataset(dataset.clone())
+                    .with_view(view)
+                    .build();
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let cloned_rt = Arc::clone(&rt);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = cloned_rt.load_components() => {}
+                }
+
+                // View should be ready
+                let view_statuses = rt.status().get_view_statuses();
+                let view_status = view_statuses.get(&TableReference::bare("complex_valid_view"));
+                if let Some(status) = view_status {
+                    if *status != runtime::status::ComponentStatus::Ready {
+                        return Err(anyhow::anyhow!(
+                            "Complex valid view should be ready, got {status:?}"
+                        ));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Complex valid view status not found"));
+                }
+
+                // Verify the view can be queried
+                let query_result = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM complex_valid_view")
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .expect("collects results");
+
+                if query_result.is_empty() {
+                    return Err(anyhow::anyhow!("Query should return results"));
+                }
+
+                rt.shutdown().await;
+            }
+
+            // Clean up test file
+            std::fs::remove_file("./test_validation.csv").ok();
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let test_csv = "id,name,value\n1,Alice,100\n2,Bob,200\n3,Charlie,300";
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let csv_path = temp_dir.path().join("test_view_zero_results.csv");
+            std::fs::write(&csv_path, test_csv).expect("write file");
+
+            let dataset = Dataset::new(
+                format!("file:{}", csv_path.to_string_lossy()),
+                "zero_results_data",
+            );
+
+            let mut view = View::new("zero_results_view".to_string());
+            view.sql =
+                Some("SELECT id, name, value FROM zero_results_data WHERE id > 0".to_string());
+            view.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Full),
+                on_zero_results: ZeroResultsAction::UseSource,
+                ..Acceleration::default()
+            });
+
+            let app = app::AppBuilder::new("test_view_zero_results")
+                .with_dataset(dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // Verify the view is ready and queryable with on_zero_results: use_source
+            let status = rt.status();
+            let view_statuses = status.get_view_statuses();
+            let view_ref = TableReference::bare("zero_results_view");
+            let view_status = view_statuses
+                .get(&view_ref)
+                .expect("zero_results_view should exist");
+            assert_eq!(
+                *view_status,
+                runtime::status::ComponentStatus::Ready,
+                "zero_results_view should be ready, got {view_status:?}"
+            );
+
+            // Query the accelerated view - data should be available
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM zero_results_view ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+
+            let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            let result_str = pretty.to_string();
+            assert!(
+                result_str.contains("Alice"),
+                "Expected results to contain data, got: {result_str}"
+            );
+
+            rt.shutdown().await;
 
             Ok(())
         })

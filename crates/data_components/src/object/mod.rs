@@ -115,7 +115,7 @@ pub(crate) fn parse_prefix_and_regex(
                 .strip_suffix(filename.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            Some(filename.to_string()),
+            Some(filename.clone()),
         ))
     } else if let Some(ext) = extension {
         Ok((

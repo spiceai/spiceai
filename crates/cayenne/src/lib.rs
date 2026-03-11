@@ -55,12 +55,15 @@ limitations under the License.
 
 pub mod catalog;
 pub mod cayenne_catalog;
-pub mod deletion;
 pub mod metadata;
 pub mod metastore;
+pub mod optimizer_rules;
 pub mod provider;
 
 pub use catalog::MetadataCatalog;
 pub use cayenne_catalog::CayenneCatalog;
-pub use metadata::{DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata};
-pub use provider::CayenneTableProvider;
+pub use metadata::{DataFile, DeleteFile, ObjectStoreConfig, PartitionMetadata, TableMetadata};
+pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
+pub use provider::{
+    CayenneContext, CayenneTableProvider, CayenneTableProviderBuilder, TimeRetentionFilterBuilder,
+};

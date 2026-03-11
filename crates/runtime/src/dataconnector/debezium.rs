@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
@@ -37,8 +38,8 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -57,7 +58,7 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to generate Debezium refresh SQL: {source}"))]
     RefreshSql { source: refresh_sql::Error },
 }
 
@@ -66,10 +67,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Debezium {
     kafka_config: KafkaConfig,
+    batching: (usize, Duration),
 }
 
 impl Debezium {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters) -> Result<Self> {
         let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
@@ -149,7 +151,24 @@ impl Debezium {
             metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
-        Ok(Self { kafka_config })
+        let batch_max_size = params
+            .get("batch_max_size")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10000);
+
+        let batch_max_duration = params
+            .get("batch_max_duration")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(1));
+
+        Ok(Self {
+            kafka_config,
+            batching: (batch_max_size, batch_max_duration),
+        })
     }
 }
 
@@ -205,6 +224,12 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
     ParameterSpec::runtime("kafka_consumer_group_id")
         .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
+    ParameterSpec::runtime("batch_max_size")
+        .description("Maximum number of change events to batch together before processing")
+        .default("10000"),
+    ParameterSpec::runtime("batch_max_duration")
+        .description("Maximum time to wait for a batch to fill before processing")
+        .default("1s"),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -230,6 +255,8 @@ impl DataConnectorFactory for DebeziumFactory {
         PARAMETERS
     }
 }
+
+register_data_connector!("debezium", DebeziumFactory);
 
 #[async_trait]
 impl DataConnector for Debezium {
@@ -286,6 +313,20 @@ impl DataConnector for Debezium {
         let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
             Some(metadata) => {
+                if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
+                    ensure!(
+                        config_consumer_group_id == &metadata.consumer_group_id,
+                        super::InvalidConfigurationNoSourceSnafu {
+                            dataconnector: "debezium",
+                            message: format!(
+                                "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{config_consumer_group_id}'). Remove the acceleration file or rename the dataset to proceed.",
+                                metadata.consumer_group_id
+                            ),
+                            connector_component: ConnectorComponent::from(dataset),
+                        }
+                    );
+                }
+
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
                     &metadata.consumer_group_id,
                     &self.kafka_config,
@@ -331,7 +372,8 @@ impl DataConnector for Debezium {
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+            refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .map(|(_, schema)| schema)
                 .boxed()
                 .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                     dataconnector: "debezium".to_string(),
@@ -347,6 +389,7 @@ impl DataConnector for Debezium {
             refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
+            self.batching,
         ));
 
         Ok(debezium_kafka)
@@ -356,7 +399,13 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {

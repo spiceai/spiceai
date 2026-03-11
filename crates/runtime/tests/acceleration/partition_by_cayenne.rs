@@ -125,6 +125,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            // Keep a per-test metadata DB to avoid SQLite contention with other concurrent Cayenne tests.
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -138,6 +140,10 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             params.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
 
             dataset.acceleration = Some(Acceleration {
@@ -259,6 +265,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -273,6 +280,10 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = spicepod::param::Params::from_string_map(param_map);
 
@@ -383,7 +394,6 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 /// 4. Data with NULL partition values can be queried correctly
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -398,6 +408,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -411,6 +422,10 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = Params::from_string_map(param_map);
 
@@ -536,7 +551,6 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
 /// This test verifies NULL handling specifically for numeric partition columns
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -551,6 +565,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -564,6 +579,10 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = Params::from_string_map(param_map);
 
@@ -704,6 +723,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -717,6 +737,10 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = Params::from_string_map(param_map);
 
@@ -816,6 +840,92 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
             let sanitized_plan = sanitize_file_paths(&plan_str);
             insta::assert_snapshot!("date_partition_month_in_filter", sanitized_plan);
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test that `bucket()` can be used in `refresh_sql` and is executed successfully.
+///
+/// `SELECT * FROM bucket_refresh_test WHERE bucket(5, id) = 0` executes without errors
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(target_os = "windows"))]
+async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let test_file = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?
+                .join("tests/acceleration/data/partition_test.csv");
+
+            if !test_file.exists() {
+                return Err(anyhow::anyhow!(
+                    "Test data file not found: {}",
+                    test_file.display()
+                ));
+            }
+
+            let temp_dir = tempfile::tempdir()
+                .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
+            let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
+
+            crate::configure_test_datafusion();
+
+            let mut dataset = Dataset::new(
+                format!("file://{}", test_file.display()),
+                "bucket_refresh_test",
+            );
+
+            let mut params = HashMap::new();
+            params.insert(
+                "cayenne_file_path".to_string(),
+                cayenne_path.display().to_string(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            );
+
+            // Use refresh_sql with bucket() to filter rows — this exercises the
+            // refresh-task SessionContext which must have bucket() registered.
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                refresh_sql: Some(
+                    "SELECT * FROM bucket_refresh_test WHERE bucket(5, id) = 0".to_string(),
+                ),
+                params: Some(Params::from_string_map(params)),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("test_refresh_sql_with_bucket")
+                .with_dataset(dataset)
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // The dataset should have loaded successfully with the bucket() refresh_sql.
+            // Query the table to verify rows were actually loaded (only bucket 0 rows).
+            let result =
+                execute_rt_sql(&rt, "SELECT * FROM bucket_refresh_test ORDER BY id").await?;
+            let formatted = arrow::util::pretty::pretty_format_batches(&result)
+                .map_err(|e| anyhow::anyhow!("Failed to format batches: {e}"))?
+                .to_string();
+            insta::assert_snapshot!("refresh_sql_with_bucket_function", formatted);
 
             Ok(())
         })

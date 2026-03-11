@@ -54,13 +54,70 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Starts a minimal HTTP server that only serves the `/health` endpoint.
+///
+/// This is used by cluster executors which need a health endpoint for Kubernetes
+/// probes but don't require the full HTTP API.
+pub(crate) async fn start_health_only<A>(
+    bind_address: A,
+    shutdown_signal: Option<CancellationToken>,
+) -> Result<()>
+where
+    A: ToSocketAddrs + Debug,
+{
+    use axum::routing::get;
+
+    let routes = Router::new().route("/health", get(|| async { "ok\n" }));
+
+    let listener = TcpListener::bind(&bind_address)
+        .await
+        .context(UnableToBindServerToPortSnafu)?;
+    tracing::info!("Spice Runtime HTTP health endpoint listening on {bind_address:?}");
+
+    let shutdown_signal = shutdown_signal.unwrap_or_default();
+
+    let (shutdown_notify, _) = watch::channel(());
+
+    loop {
+        tokio::select! {
+            conn = listener.accept() => {
+                let stream = match conn {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        tracing::debug!("Error accepting connection to serve HTTP request: {e}");
+                        continue;
+                    }
+                };
+
+                process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
+            },
+            () = shutdown_signal.cancelled() => {
+                tracing::debug!("Health HTTP server received shutdown signal");
+                drop(listener);
+                let num_active = shutdown_notify.receiver_count();
+                if num_active > 0 {
+                    tracing::info!(
+                        "Detected {num_active} active health check requests. Waiting for completion before shutting down..."
+                    );
+                }
+                shutdown_notify.send(()).ok();
+                shutdown_notify.closed().await;
+                break;
+            }
+        }
+    }
+
+    tracing::debug!("Health HTTP server stopped");
+
+    Ok(())
+}
+
 pub(crate) async fn start<A>(
     bind_address: A,
     rt: Arc<Runtime>,
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
-    auth_provider: Arc<dyn HttpAuth + Send + Sync>,
-    has_auth: bool,
+    auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -75,11 +132,7 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    let auth_layer = if has_auth {
-        Some(AuthLayer::new(auth_provider))
-    } else {
-        None
-    };
+    let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
     drop(app);
 
@@ -265,11 +318,9 @@ mod tests {
 
         // Verify that the shutdown does not fail if there are no active connections
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     #[tokio::test]
@@ -304,16 +355,12 @@ mod tests {
 
         // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(5), request_completion_handle)
-                .await
-                .is_ok()
-        );
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+            .await
+            .expect("should complete request after shutdown");
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     fn build_test_http_client() -> reqwest::Client {

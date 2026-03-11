@@ -34,7 +34,7 @@ const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
@@ -58,16 +58,18 @@ impl DebeziumKafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.get_sqlite(conn).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => None,
@@ -78,16 +80,18 @@ impl DebeziumKafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),

@@ -300,3 +300,5 @@ impl RateLimiter for NoOpRateLimiter {
         Ok(())
     }
 }
+
+register_data_connector!("git", GitFactory);

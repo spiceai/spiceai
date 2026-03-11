@@ -75,7 +75,7 @@ impl DatabricksDelta {
                     storage_options.insert("timeout".into(), value.clone());
                 }
                 _ => {
-                    storage_options.insert(key.to_string(), value.clone());
+                    storage_options.insert(key.clone(), value.clone());
                 }
             }
         }
@@ -85,7 +85,6 @@ impl DatabricksDelta {
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }
 
-    #[allow(clippy::implicit_hasher)]
     pub async fn resolve_table_uri(
         &self,
         table_reference: TableReference,

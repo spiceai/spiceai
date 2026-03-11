@@ -2,6 +2,7 @@
 import subprocess
 import json
 import sys
+import re
 
 def run_git(cmd):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
@@ -80,7 +81,26 @@ def main():
             pr_number, username, title = pr_info
             print(f"- {title} by [@{username}](https://github.com/{username}) in [#{pr_number}](https://github.com/{owner}/{repo}/pull/{pr_number})")
         else:
-            print(f"- !!!! (PR NOT FOUND) - {commit_title} - https://github.com/{owner}/{repo}/commit/{commit_hash}/")
+            # Try to find PR number in commit message
+            pr_num_result = re.search(r"\(#(\d+)\)", commit_title)
+            if pr_num_result:
+                pr_number = pr_num_result.group(1)
+                commit_title_clean = re.sub(r"\(#\d+\)", "", commit_title).strip()
+                try:
+                    pr_info = json.loads(subprocess.check_output([
+                            "gh", "pr", "view", str(pr_number),
+                            "--json", "number,author",
+                            "--repo", f"{owner}/{repo}"
+                        ]))
+                except:
+                    print(f"- !!!! (PR NOT FOUND): {commit_title} - https://github.com/{owner}/{repo}/commit/{commit_hash}/")
+                    continue
+
+                username = pr_info["author"]["login"]
+                print(f"- {commit_title_clean} by [@{username}](https://github.com/{username}) in [#{pr_number}](https://github.com/{owner}/{repo}/pull/{pr_number})")
+            else:
+                # If everything else fails, print commit title with the link to github
+                print(f"- !!!! (PR NOT FOUND): {commit_title} - https://github.com/{owner}/{repo}/commit/{commit_hash}/")
 
 if __name__ == "__main__":
     main()

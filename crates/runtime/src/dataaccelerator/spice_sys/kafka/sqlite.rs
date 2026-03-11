@@ -72,7 +72,7 @@ impl KafkaSys {
                     ],
                 )?;
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(Error::external)
@@ -101,10 +101,13 @@ impl KafkaSys {
                         consumer_group_id,
                         topic,
                         schema: KafkaSys::deserialize_schema(&schema_json)
-                            .map_err(|err| tokio_rusqlite::Error::Other(Box::new(err)))?,
+                            .map_err(|err| {
+                                tracing::warn!("Failed to deserialize Kafka schema from SQLite: {err}");
+                                rusqlite::Error::InvalidQuery
+                            })?,
                     })
                 } else {
-                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                    Err(rusqlite::Error::QueryReturnedNoRows)
                 }
             })
             .await
@@ -138,15 +141,12 @@ mod tests {
             .build()
             .expect("to create dataset");
 
+        // Use a unique database file per test to avoid locking conflicts
+        let db_file = format!(".spice/data/kafka_sqlite_test_{ds_name}.db");
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,
             mode: Mode::File,
-            params: [(
-                "sqlite_file".to_string(),
-                ".spice/data/kafka_sqlite_test.db".to_string(),
-            )]
-            .into_iter()
-            .collect(),
+            params: [("sqlite_file".to_string(), db_file)].into_iter().collect(),
             ..Default::default()
         });
 

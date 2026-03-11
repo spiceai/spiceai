@@ -37,7 +37,7 @@ impl Acceleration {
         schema
             .flattened_fields()
             .into_iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -74,7 +74,7 @@ impl Acceleration {
         Ok(())
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn table_constraints(&self, schema: SchemaRef) -> dataset::Result<Option<Constraints>> {
         if self.indexes.is_empty() && self.primary_key.is_none() {
             tracing::trace!(

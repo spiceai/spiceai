@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,12 +23,15 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::{DFSchema, SchemaError};
+use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast;
 use datafusion_expr::{Expr, LogicalPlan};
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
@@ -194,12 +197,14 @@ impl SearchEngine {
             let search_key = SearchKey::from(req.clone());
             let cache_control = request_context.cache_control();
 
-            let cache_key = match request_context.client_supplied_cache_key() {
-                Some(cache_key)
-                    if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
-                {
-                    CacheKey::ClientSupplied(cache_key)
-                }
+            let scoped_user_cache_key =
+                if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
+                    request_context.scoped_client_supplied_cache_key()
+                } else {
+                    None
+                };
+            let cache_key = match scoped_user_cache_key.as_deref() {
+                Some(cache_key) => CacheKey::ClientSupplied(cache_key),
                 _ => CacheKey::Search(&search_key),
             };
 
@@ -334,7 +339,7 @@ impl SearchEngine {
                         &tbl,
                         get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
                         table_cols,
-                        primary_keys.to_vec(),
+                        primary_keys.iter().map(|pk| Column::from_qualified_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
                         *limit
                     ).await.context(SearchPipelineSnafu)?;
@@ -507,12 +512,7 @@ fn wrap_cache_to_result(
         if results.is_empty() {
             tracing::trace!("No results to cache for tables: {expected_keys:?}");
             return;
-        } else if !expected_keys
-            .iter()
-            .filter(|key| !results.contains_key(key))
-            .collect::<Vec<_>>()
-            .is_empty()
-        {
+        } else if expected_keys.iter().any(|key| !results.contains_key(key)) {
             tracing::trace!(
                 "Not all expected keys were found in the cached results: {expected_keys:?}"
             );

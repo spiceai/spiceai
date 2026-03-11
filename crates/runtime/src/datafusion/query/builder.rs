@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
     parameters: Option<ParamValues>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
 }
 
@@ -38,7 +40,14 @@ impl<'a> QueryBuilder<'a> {
             sql,
             parameters: None,
             query_id: Uuid::new_v4(),
+            table_allowlist: None,
         }
+    }
+
+    #[must_use]
+    pub fn allow_tables(mut self, allowed_tables: ResolvedTableAwareAllowlist) -> Self {
+        self.table_allowlist = Some(allowed_tables);
+        self
     }
 
     #[must_use]
@@ -79,6 +88,7 @@ impl<'a> QueryBuilder<'a> {
             sql: QueryMethod::Text {
                 sql: Arc::clone(&sql),
                 parameters: self.parameters,
+                table_allowlist: self.table_allowlist,
             },
             tracker,
         }

@@ -114,7 +114,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
     /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
     /// materialized CTE with filters _only_ on index columns
-    #[allow(clippy::too_many_lines)]
     fn build_cte(
         select: &Select,
         indexes: &[(ColumnReference, IndexType)],
@@ -136,8 +135,8 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
         // Find the first index we can bind (we can only bind one)
         let bindable_index = indexes.iter().find_map(|(cr, _)| {
-            if cr.columns.iter().all(|c| simple_filter_idents.contains(c)) {
-                Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
+            if cr.iter().all(|c| simple_filter_idents.contains(c)) {
+                Some(cr.iter().map(String::from).collect::<HashSet<_>>())
             } else {
                 None
             }
@@ -274,7 +273,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         Some((cte, cte_filters))
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn rewrite_statement(
         statement: &Statement,
         indexes: &[(ColumnReference, IndexType)],
@@ -449,16 +447,13 @@ mod tests {
 
     fn make_index(columns: &[&str]) -> (ColumnReference, IndexType) {
         (
-            ColumnReference {
-                columns: columns.iter().map(|s| (*s).to_string()).collect(),
-            },
+            ColumnReference::new(columns.iter().map(|s| (*s).to_string()).collect()),
             IndexType::Enabled,
         )
     }
 
     #[test]
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::type_complexity)]
     fn test_rewrite_statement() {
         let test_cases: Vec<(&str, Vec<(ColumnReference, IndexType)>, Option<&str>)> = vec![
             // core query we want to optimize

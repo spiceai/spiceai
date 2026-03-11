@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
@@ -50,6 +52,47 @@ pub struct Https {
 impl std::fmt::Display for Https {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "https")
+    }
+}
+
+impl Https {
+    /// Determines if the dataset uses a structured file format (parquet, csv, etc.)
+    /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
+    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+        let file_format = self
+            .params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
+
+        // Check if explicitly configured as a structured format
+        if matches!(
+            file_format.as_str(),
+            "parquet" | "csv" | "tsv" | "arrow" | "avro"
+        ) {
+            return true;
+        }
+
+        // If file_format is "auto", try to detect from URL extension
+        if file_format == "auto"
+            && let Ok(url) = Url::parse(&dataset.from)
+            && let Some(mut path) = url.path_segments()
+            && let Some(last_segment) = path.next_back()
+        {
+            let extension = last_segment
+                .split('.')
+                .next_back()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+
+            return matches!(
+                extension.as_str(),
+                "parquet" | "csv" | "tsv" | "arrow" | "avro"
+            );
+        }
+
+        false
     }
 }
 
@@ -221,7 +264,9 @@ impl Https {
     fn parse_custom_headers(&self, dataset_name: &str) -> HeaderMap {
         let mut custom_headers = HeaderMap::new();
         if let Some(headers_str) = self.params.get("http_headers").expose().ok() {
-            for header in headers_str.split(',') {
+            // Split by semicolon or comma
+            let delimiter = if headers_str.contains(';') { ';' } else { ',' };
+            for header in headers_str.split(delimiter) {
                 let parts: Vec<&str> = header.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     let name = parts[0].trim();
@@ -385,48 +430,46 @@ impl DataConnector for Https {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        // Determine file format - default to "auto" if not specified
-        let file_format = self
-            .params
-            .get("file_format")
-            .expose()
-            .ok()
-            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
-
-        // For structured file formats (parquet, csv, arrow, avro), delegate to ListingTableConnector
-        // which properly handles file parsing with correct schemas
-        let mut is_structured_format = matches!(
-            file_format.as_str(),
-            "parquet" | "csv" | "tsv" | "arrow" | "avro"
-        );
-
-        // If file_format is "auto", try to detect from URL extension
-        if file_format == "auto"
-            && let Ok(url) = Url::parse(&dataset.from)
-            && let Some(mut path) = url.path_segments()
-            && let Some(last_segment) = path.next_back()
-        {
-            let extension = last_segment
-                .split('.')
-                .next_back()
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-
-            is_structured_format = matches!(
-                extension.as_str(),
-                "parquet" | "csv" | "tsv" | "arrow" | "avro"
-            );
-        }
-
-        if is_structured_format {
-            // Use ListingTableConnector for file-based structured formats
+        if self.is_structured_format(dataset) {
+            // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
+            // which properly handles file parsing with correct schemas
             let listing_connector =
                 HttpListingConnector::new(self.params.clone(), Handle::current());
             return listing_connector.read_provider(dataset).await;
         }
 
+        // Validate acceleration mode for HTTP connector (JSON API endpoints only)
+        // Structured file formats (parquet, csv, etc.) are handled by ListingTableConnector above
+        // and support full refresh mode without refresh_sql
+        if let Some(acceleration) = &dataset.acceleration
+            && acceleration.enabled
+        {
+            let refresh_mode = self.resolve_refresh_mode(acceleration.refresh_mode);
+
+            // HTTP connector only supports append or caching mode unless refresh_sql is provided
+            if matches!(refresh_mode, RefreshMode::Full) && dataset.refresh_sql().is_none() {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: "HTTP connector with acceleration mode 'full' requires 'refresh_sql' to be specified. Supported acceleration modes without refresh_sql are 'append' or 'caching'.".to_string(),
+                    });
+            }
+        }
+
         // For JSON API endpoints and other formats, use HttpTableProvider
         self.create_http_table_provider(dataset)
+    }
+
+    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+        // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
+        // that require filters to work properly, so skip health monitoring for them.
+        if self.is_structured_format(dataset) {
+            ComponentInitialization::default()
+        } else {
+            ComponentInitialization::OnStartup(StartupOptions {
+                dataset_health_monitor: DatasetHealthMonitor::Disabled,
+            })
+        }
     }
 }
 
@@ -603,5 +646,150 @@ impl ListingTableConnector for HttpListingConnector {
         u.set_fragment(Some(&build_fragments(&self.params, vec!["client_timeout"])));
 
         Ok(u)
+    }
+}
+
+register_data_connector!(
+    register_http_connector,
+    REGISTER_HTTP_CONNECTOR,
+    "http",
+    HttpsFactory
+);
+register_data_connector!(
+    register_https_connector,
+    REGISTER_HTTPS_CONNECTOR,
+    "https",
+    HttpsFactory
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::parameters::Parameters;
+    use crate::secrets::Secrets;
+    use app::AppBuilder;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+
+    async fn test_connector(file_format: Option<&str>) -> Https {
+        let mut params: Vec<(String, SecretString)> = vec![
+            ("client_timeout".to_string(), "1".to_string().into()),
+            ("connect_timeout".to_string(), "1".to_string().into()),
+        ];
+
+        if let Some(file_format) = file_format {
+            params.push(("file_format".to_string(), file_format.to_string().into()));
+        }
+
+        let params = Parameters::try_new(
+            "connector https",
+            params,
+            "http",
+            Arc::new(RwLock::new(Secrets::default())),
+            &PARAMETERS,
+        )
+        .await
+        .expect("test connector parameters should be valid");
+
+        Https { params }
+    }
+
+    async fn test_dataset(
+        from: &str,
+        refresh_mode: RefreshMode,
+        refresh_sql: Option<&str>,
+    ) -> Dataset {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new(from.to_string(), "http_test")
+            .expect("dataset builder should be created")
+            .with_app(app)
+            .with_runtime(runtime)
+            .build()
+            .expect("dataset should build");
+
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(refresh_mode),
+            refresh_sql: refresh_sql.map(std::string::ToString::to_string),
+            ..Default::default()
+        });
+
+        dataset
+    }
+
+    fn assert_invalid_url_error(error: DataConnectorError) {
+        match error {
+            DataConnectorError::InvalidConfiguration { message, .. } => {
+                assert!(
+                    message.contains("not a valid URL"),
+                    "expected invalid URL error, got: {message}"
+                );
+            }
+            other => panic!("expected invalid URL error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_full_refresh_requires_refresh_sql_for_unstructured_endpoints() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("full refresh without refresh_sql should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("requires 'refresh_sql'"),
+                    "expected refresh_sql validation error, got: {message}"
+                );
+            }
+            other => panic!("expected refresh_sql validation error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_append_refresh_without_refresh_sql_reaches_provider_validation() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("not a url", RefreshMode::Append, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("append mode should continue to provider validation");
+
+        assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_http_caching_refresh_without_refresh_sql_reaches_provider_validation() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("not a url", RefreshMode::Caching, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("caching mode should continue to provider validation");
+
+        assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_http_structured_full_refresh_without_refresh_sql_bypasses_json_validation() {
+        let connector = test_connector(Some("csv")).await;
+        let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("structured formats should bypass JSON refresh_sql validation");
+
+        assert_invalid_url_error(error);
     }
 }

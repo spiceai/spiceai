@@ -54,6 +54,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix
@@ -63,7 +71,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -102,7 +110,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -119,17 +127,15 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version: ${{ env.GOVER }}
           cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -142,114 +148,226 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build spiced
+      - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models"
-
-      - name: Build spiced (macOS)
-        if: matrix.target.target_os == 'darwin'
-        env:
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v5
-        if: matrix.target.target_os != 'windows'
+        uses: ./.github/actions/build-spiced
         with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
+          features: 'tpc-extension,models,postgres-accel'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
-  build-macos-pr:
-    name: Build macOS aarch64 binaries (PR)
-    runs-on: spiceai-macos
-    if: github.event_name == 'pull_request'
-    needs: setup-matrix
-    env:
-      GOVER: 1.25.3
-      GOOS: darwin
-      GOARCH: arm64
+      - name: Build spiced and spice CLI (macOS)
+        if: matrix.target.target_os == 'darwin'
+        uses: ./.github/actions/build-spiced
+        with:
+          features: 'tpc-extension,models,postgres-accel,metal'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
+  setup-model-matrix:
+    name: Setup model strategy matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:
-      - uses: actions/checkout@v5
+      - name: Set up matrix
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "spiceai-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              },
+              {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "spiceai-macos",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64"
+              }
+            ];
+
+            const isPrEvent = context.eventName === 'pull_request';
+            return isPrEvent ? matrix.slice(0, 1) : matrix;
+
+  test_openai_model:
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 5
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-model-matrix
+    if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
-      - name: Configure Cargo directories (self-hosted macOS)
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
         run: |
-          set -euo pipefail
-          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
-          mkdir -p "$cargo_home/bin"
-          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
 
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/trunk' }}
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build spiced (macOS)
+      - name: Start spice runtime
         env:
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
+          spice run &> spice.log &
 
-      - name: make spice executable
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 1
         run: |
-          mv target/release/spice spice
-          chmod +x spice
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v5
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
+
+  test_hf_model:
+    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 10
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-model-matrix
+    if: ${{ github.event_name != 'pull_request' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          name: build_darwin_aarch64
-          path: |
-            spice
-            spiced
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 5
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -266,10 +384,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -308,7 +426,7 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
-  
+
       - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
@@ -342,10 +460,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -404,15 +522,16 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration: [{}, { engine: arrow, mode: memory }]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -496,6 +615,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration:
           [
@@ -503,6 +623,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -519,12 +640,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
@@ -542,7 +662,7 @@ jobs:
           createdb -h localhost -U postgres testdb_acc
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -688,6 +808,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -704,13 +825,12 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install PostgreSQL
         if: matrix.acceleration.engine == 'postgres'
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Install MySQL (Linux)
@@ -750,7 +870,7 @@ jobs:
           mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -898,7 +1018,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
@@ -934,7 +1054,7 @@ jobs:
           clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1000,7 +1120,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
@@ -1021,7 +1141,7 @@ jobs:
           ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1088,19 +1208,19 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
-            # { engine: turso, mode: memory },
-            # { engine: turso, mode: file },
+            { engine: cayenne, mode: file },
+            { engine: turso, mode: memory },
+            { engine: turso, mode: file },
             # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Check PostgreSQL
@@ -1120,7 +1240,7 @@ jobs:
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth.recent_blocks;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1232,10 +1352,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1256,7 +1376,7 @@ jobs:
           echo "  caching:" >> spicepod.yaml
           echo "    sql_results:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      eviction_policy: lru" >> spicepod.yaml
+          echo "      caching_policy: lru" >> spicepod.yaml
           echo "      max_size: 128MiB" >> spicepod.yaml
           echo "      item_ttl: 300s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
@@ -1387,10 +1507,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1540,7 +1660,7 @@ jobs:
           SA_PASSWORD: 1StrongPwd!!
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install mssql-tools
         run: |
@@ -1556,7 +1676,7 @@ jobs:
           /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1643,10 +1763,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1745,10 +1865,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1905,10 +2025,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

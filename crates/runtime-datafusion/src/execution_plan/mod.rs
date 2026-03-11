@@ -61,6 +61,55 @@ impl TableScanParams {
     }
 }
 
+/// Wraps an input `ExecutionPlan` with a `FilterExec` for the given filters.
+///
+/// This is useful when a `TableProvider` does not fully support filter pushdown
+/// (i.e., returns `Inexact` or `Unsupported` for some filters). The caller should
+/// pass only the filters that need to be re-applied after scanning.
+///
+/// If `filters` is empty, the input plan is returned unchanged.
+///
+/// # Errors
+///
+/// Returns an error if the filter expression cannot be created or applied.
+pub fn wrap_with_filter(
+    input: Arc<dyn ExecutionPlan>,
+    state: &dyn Session,
+    filters: &[Expr],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(session_state) = state.as_any().downcast_ref::<SessionState>() else {
+        return Err(datafusion::error::DataFusionError::Internal(
+            "Failed to downcast Session to SessionState".to_string(),
+        ));
+    };
+
+    let Some(joined_filters) = filters.iter().cloned().reduce(|left, right| {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::And,
+            Box::new(right),
+        ))
+    }) else {
+        tracing::trace!("No filters to apply to input plan");
+        return Ok(input);
+    };
+
+    let input_schema = input.schema();
+    let input_dfschema = Arc::clone(&input_schema).to_dfschema()?;
+
+    tracing::trace!("Wrapping execution plan with FilterExec for: {joined_filters}");
+
+    let physical_expr = create_physical_expr(
+        &joined_filters,
+        &input_dfschema,
+        session_state.execution_props(),
+    )?;
+
+    let filtered_input = FilterExec::try_new(physical_expr, input)?;
+
+    Ok(Arc::new(filtered_input))
+}
+
 /// Filters an input `ExecutionPlan` using the filters in `TableScanParams`.
 pub(crate) fn filter_plan(
     input: Arc<dyn ExecutionPlan>,

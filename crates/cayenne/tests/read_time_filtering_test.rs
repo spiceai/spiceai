@@ -18,16 +18,26 @@ limitations under the License.
 //!
 //! These tests verify that deletion vector filtering is applied during reads.
 
+mod common;
+
 use arrow::array::{Int64Array, RecordBatch, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
 };
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -57,17 +67,17 @@ async fn setup_test_table(
         table_name: "test_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    // Create table provider
-    let table_provider =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
-    // Create session context for queries
+    // Create session context and table provider
     let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "test_table",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,
@@ -94,16 +104,7 @@ async fn insert_test_data(table_provider: &Arc<CayenneTableProvider>) -> TestRes
         ],
     )?;
 
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-
-    table_provider
-        .insert(boxed_stream)
+    common::insert_batch(table_provider.as_ref(), batch)
         .await
         .map_err(Into::into)
 }
@@ -113,7 +114,8 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table_provider.as_ref(), &ctx.state(), &[filter])
+        .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 
@@ -207,7 +209,7 @@ async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Verify no deletion files initially
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),
@@ -223,7 +225,7 @@ async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Verify deletion file was registered
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),

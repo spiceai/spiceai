@@ -25,13 +25,13 @@ on:
 jobs:
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -70,11 +70,11 @@ jobs:
           echo "Arch: $(uname -m)"
 
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       # Set up Docker
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       # Install kubectl
       - name: Install kubectl
@@ -124,14 +124,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           CHART_VERSION="${{ inputs.chart_version }}"
-          
+
           if [ "$CHART_VERSION" = "latest" ] || [ -z "$CHART_VERSION" ]; then
             # Get latest release tag from GitHub
             RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
             echo "Using latest release version: $RELEASE_VERSION"
-            # Replace '+' with '-' for Docker image tag compatibility (Kubernetes doesn't allow + in image tags)
-            IMAGE_TAG="${RELEASE_VERSION}-models"
-            echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1). 
+            IMAGE_TAG="${RELEASE_VERSION#v}-models"
+            echo "version=${RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
             echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=github-release" >> $GITHUB_OUTPUT
           else
@@ -176,7 +176,7 @@ jobs:
           helm package .
           CHART_FILE=$(ls spiceai-*.tgz)
           cd ../..
-          
+
           helm install spice-test ./deploy/chart/$CHART_FILE \
             --namespace spice-system \
             --create-namespace \
@@ -194,7 +194,7 @@ jobs:
           kubectl get deployments -n spice-system
           kubectl get pods -n spice-system
           kubectl get services -n spice-system
-          
+
           # Wait for pod to be ready
           kubectl wait --for=condition=Ready pod -l app=spice-test -n spice-system --timeout=300s
 
@@ -210,14 +210,14 @@ jobs:
         run: |
           POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
           echo "Testing health endpoint on pod: $POD_NAME"
-          
+
           # Port forward in background
           kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
           PF_PID=$!
-          
+
           # Wait for port forward to be ready
           sleep 5
-          
+
           # Test health endpoint
           for i in {1..30}; do
             if curl -s http://localhost:8090/health | grep -q "ok"; then
@@ -228,7 +228,7 @@ jobs:
             echo "Attempt $i: Health check not ready yet..."
             sleep 2
           done
-          
+
           kill $PF_PID || true
           echo "Health check failed after 30 attempts"
           exit 1
@@ -238,14 +238,14 @@ jobs:
         run: |
           POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
           echo "Testing ready endpoint on pod: $POD_NAME"
-          
+
           # Port forward in background
           kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
           PF_PID=$!
-          
+
           # Wait for port forward to be ready
           sleep 5
-          
+
           # Test ready endpoint
           for i in {1..30}; do
             if curl -s http://localhost:8090/v1/ready | grep -q "ready"; then
@@ -256,7 +256,7 @@ jobs:
             echo "Attempt $i: Ready check not ready yet..."
             sleep 2
           done
-          
+
           kill $PF_PID || true
           echo "Ready check failed after 30 attempts"
           exit 1
@@ -266,21 +266,21 @@ jobs:
         run: |
           POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
           echo "Testing SQL query endpoint on pod: $POD_NAME"
-          
+
           # Port forward in background
           kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
           PF_PID=$!
-          
+
           # Wait for port forward to be ready
           sleep 5
-          
+
           # Test simple SQL query
           RESPONSE=$(curl -s -X POST http://localhost:8090/v1/sql \
             -H "Content-Type: application/json" \
-            -d '{"query": "SELECT 1 as test"}')
-          
+            -d '{"sql": "SELECT 1 as test", "parameters": {}}')
+
           echo "Query response: $RESPONSE"
-          
+
           if echo "$RESPONSE" | jq -e '.[] | select(.test == 1)' > /dev/null; then
             echo "SQL query test passed!"
             kill $PF_PID || true
@@ -296,7 +296,7 @@ jobs:
         run: |
           helm list -n spice-system
           helm status spice-test -n spice-system
-          
+
           # Check if release is deployed
           if helm status spice-test -n spice-system | grep -q "STATUS: deployed"; then
             echo "Helm release is deployed successfully!"
@@ -309,17 +309,17 @@ jobs:
       - name: Test Helm upgrade
         run: |
           echo "Testing Helm upgrade..."
-          
+
           # Upgrade with same values (should be idempotent)
           helm upgrade spice-test ./deploy/chart \
             --namespace spice-system \
             --set image.repository=ghcr.io/spiceai/spiceai \
-            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set image.tag=${{ steps.chart-version.outputs.version }}-models \
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \
             --timeout 5m
-          
+
           # Verify upgrade succeeded
           if helm status spice-test -n spice-system | grep -q "STATUS: deployed"; then
             echo "Helm upgrade test passed!"

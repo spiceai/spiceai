@@ -190,6 +190,14 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn with_params(self, params: Params) -> Self {
+        Self {
+            params: Some(params),
+            ..self
+        }
+    }
+
+    #[must_use]
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
@@ -233,10 +241,10 @@ impl Dataset {
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.to_string());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.to_string(), v.to_string());
+            metadata.insert(k.clone(), v.to_string());
         }
         metadata
     }
@@ -345,7 +353,7 @@ struct DatasetDeserializer {
     check_availability: CheckAvailability,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
 
@@ -401,7 +409,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
 #[cfg(test)]
 mod check_availability_tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_check_availability_enabled_by_default() {
@@ -409,7 +417,7 @@ mod check_availability_tests {
             name: test
             from: file://test.csv
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
 
@@ -420,7 +428,7 @@ mod check_availability_tests {
             from: file://test.csv
             check_availability: disabled
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Disabled);
     }
 
@@ -431,16 +439,15 @@ mod check_availability_tests {
             from: file://test.csv
             check_availability: auto
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_invalid_type_action_migration() {
@@ -450,7 +457,7 @@ mod tests {
             from: test
             invalid_type_action: warn
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(
             dataset.unsupported_type_action,
             Some(UnsupportedTypeAction::Warn)
@@ -462,7 +469,7 @@ mod tests {
             from: test
             unsupported_type_action: warn
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(
             dataset.unsupported_type_action,
             Some(UnsupportedTypeAction::Warn)
@@ -475,7 +482,7 @@ mod tests {
             invalid_type_action: error
             unsupported_type_action: warn
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(
             dataset.unsupported_type_action,
             Some(UnsupportedTypeAction::Warn)
@@ -486,7 +493,7 @@ mod tests {
             name: test
             from: test
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.unsupported_type_action, None);
     }
 }

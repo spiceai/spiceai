@@ -16,25 +16,44 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, sync::Arc};
 
+use arrow::array::{Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, DFSchema, project_schema},
+    common::{Constraints, DFSchema, Statistics, project_schema},
+    config::ConfigOptions,
     datasource::TableType,
     error::DataFusionError,
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
+    physical_expr::{OrderingRequirements, PhysicalSortExpr},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
+        collect,
+        empty::EmptyExec,
+        execution_plan::{CardinalityEffect, InvariantLevel},
+        filter_pushdown::{
+            ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+        },
+        limit::GlobalLimitExec,
+        metrics::MetricsSet,
+        projection::ProjectionExec,
+        sort_pushdown::SortOrderPushdownResult,
+        union::UnionExec,
+    },
     prelude::Expr,
 };
 use pruning::prune_partition;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use util::format_datafusion_error;
 
 use crate::{
     Partition,
     creator::PartitionCreator,
-    creator::filename::encode_key,
+    creator::filename::encode_composite_key,
     expression::{PartitionedBy, validate_scalar_compatibility},
     insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
@@ -43,65 +62,81 @@ pub mod pruning;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Only a single 'partition_by' expression is supported, but {num_partition_by} were given."
-    ))]
-    PartitionByViolation { num_partition_by: usize },
+    #[snafu(display("At least one 'partition_by' expression is required, but none were given."))]
+    PartitionByRequired,
     #[snafu(display("Creating partition failed: {source}"))]
     CreatingPartition { source: super::creator::Error },
     #[snafu(display("Validating expressions failed: {source}"))]
     ValidatingExpressions { source: super::expression::Error },
-    #[snafu(display("Failed to convert schema to DFSchema: {source}"))]
+    #[snafu(display(
+        "Failed to convert schema to DFSchema: {}",
+        format_datafusion_error(source)
+    ))]
     SchemaConversion { source: DataFusionError },
     #[snafu(display("Expected array from partition expression, got scalar"))]
     InvalidPartitionExpression,
+    #[snafu(display(
+        "Partition has {actual} values but expected {expected} (one per partition_by expression)"
+    ))]
+    PartitionValueCountMismatch { expected: usize, actual: usize },
 }
 
-pub(crate) type ScalarValueString = String;
+/// Composite partition key string, used as `HashMap` key.
+/// For a single partition expression, this is just the encoded value (e.g., "us-east-1").
+/// For multiple partition expressions, this is a path-like string (e.g., "2025/10/15").
+pub(crate) type CompositePartitionKey = String;
 
 #[derive(Debug)]
 pub struct PartitionTableProvider {
     creator: Arc<dyn PartitionCreator>,
-    partition_by: PartitionedBy,
-    partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
+    /// The partition expressions. For hierarchical partitions like
+    /// `partition_by: [year, month]`, this contains all expressions in order.
+    partition_by: Vec<PartitionedBy>,
+    partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
     schema: SchemaRef,
     insert_strategy: Arc<dyn InsertStrategy>,
 }
 
 impl PartitionTableProvider {
-    /// Checks if a filter expression contains or references the partition expression.
+    /// Checks if a filter expression contains or references any of the partition expressions.
     /// This is used to identify filters that can be used for partition pruning.
-    fn filter_contains_partition_expr(filter: &Expr, partition_expr: &Expr) -> bool {
+    fn filter_contains_any_partition_expr(
+        filter: &Expr,
+        partition_exprs: &[PartitionedBy],
+    ) -> bool {
         use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 
-        // Check if filter contains the partition expression
         let mut contains = false;
         let _ = filter.apply(|expr| {
-            if expr == partition_expr {
-                contains = true;
-                Ok(TreeNodeRecursion::Stop)
-            } else {
-                Ok(TreeNodeRecursion::Continue)
+            for p in partition_exprs {
+                if expr == &p.expression {
+                    contains = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
             }
+            Ok(TreeNodeRecursion::Continue)
         });
         contains
     }
 
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
-    /// the first expression in `partition_by`.
+    /// the given partition expressions.
+    ///
+    /// For hierarchical partitioning (e.g., year/month/day), pass multiple expressions
+    /// in the order they should be applied.
     ///
     /// # Errors
-    /// This function will return an Error when the `partition_by` expression
-    /// validation fails.
+    /// This function will return an Error when:
+    /// - No partition expressions are provided
+    /// - Partition expression validation fails
+    /// - Existing partitions have incompatible values
     pub async fn new(
         creator: Arc<dyn PartitionCreator>,
-        mut partition_by: Vec<PartitionedBy>,
+        partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
-        let num_partition_by = partition_by.len();
-        let partition_by = partition_by
-            .pop()
-            .context(PartitionByViolationSnafu { num_partition_by })?;
+        ensure!(!partition_by.is_empty(), PartitionByRequiredSnafu);
+
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
@@ -112,24 +147,33 @@ impl PartitionTableProvider {
         let partitions: Result<HashMap<_, _>, Error> = partitions
             .into_iter()
             .map(|p| {
-                validate_scalar_compatibility(
-                    &partition_by.expression,
-                    &p.partition_value,
-                    &df_schema,
-                )
-                .context(ValidatingExpressionsSnafu)?;
-                let key = encode_key(&p.partition_value).map_err(|e| Error::CreatingPartition {
-                    source: crate::creator::Error::CreatePartition {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    },
+                // Validate that partition has the correct number of values
+                ensure!(
+                    p.partition_values.len() == partition_by.len(),
+                    PartitionValueCountMismatchSnafu {
+                        expected: partition_by.len(),
+                        actual: p.partition_values.len(),
+                    }
+                );
+
+                // Validate each partition value is compatible with its expression
+                for (expr, value) in partition_by.iter().zip(p.partition_values.iter()) {
+                    validate_scalar_compatibility(&expr.expression, value, &df_schema)
+                        .context(ValidatingExpressionsSnafu)?;
+                }
+
+                let key = encode_composite_key(&p.partition_values).map_err(|e| {
+                    Error::CreatingPartition {
+                        source: crate::creator::Error::CreatePartition {
+                            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                        },
+                    }
                 })?;
                 Ok((key, p))
             })
             .collect();
 
-        let partitions = partitions?;
-
-        let partitions = Arc::new(RwLock::new(partitions));
+        let partitions = Arc::new(RwLock::new(partitions?));
 
         Ok(Self {
             creator,
@@ -146,6 +190,27 @@ impl PartitionTableProvider {
         self.insert_strategy = insert_strategy;
         self
     }
+
+    /// Returns the table providers for all current partitions.
+    ///
+    /// Callers can use this to apply per-partition operations (e.g., index maintenance)
+    /// that are not part of the standard `TableProvider` interface.
+    pub async fn partition_table_providers(&self) -> Vec<Arc<dyn TableProvider>> {
+        self.partitions
+            .read()
+            .await
+            .values()
+            .map(|p| Arc::clone(&p.table_provider))
+            .collect()
+    }
+
+    /// Collects all partition column references from all partition expressions.
+    fn all_partition_columns(&self) -> std::collections::HashSet<&datafusion::common::Column> {
+        self.partition_by
+            .iter()
+            .flat_map(|p| p.expression.column_refs())
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -159,7 +224,7 @@ impl TableProvider for PartitionTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        None
+        self.creator.constraints()
     }
 
     fn table_type(&self) -> TableType {
@@ -182,13 +247,14 @@ impl TableProvider for PartitionTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         // Split filters into partition filters (for pruning) and data filters (for partition scans)
         // NOTE: Filters can be BOTH partition filters AND data filters for transform partitions
-        let partition_columns = self.partition_by.expression.column_refs();
+        let partition_columns = self.all_partition_columns();
 
         // Pre-compute column references for all filters to avoid repeated expression tree traversals
         let filter_columns_cache: Vec<_> =
             filters.iter().map(|filter| filter.column_refs()).collect();
 
         // Collect partition filters (used for pruning)
+        // A filter can prune partitions if it involves ANY of the partition columns
         let partition_filters: Vec<_> = filters
             .iter()
             .cloned()
@@ -197,7 +263,7 @@ impl TableProvider for PartitionTableProvider {
                 // A filter is a partition filter (for pruning) if:
                 // 1. It has no column references (constant expression like WHERE true), OR
                 // 2. All its column references are in the partition expression columns, OR
-                // 3. The filter directly involves the partition expression itself
+                // 3. The filter directly involves any partition expression itself
                 if filter_columns.is_empty() {
                     return Some(filter);
                 }
@@ -209,8 +275,8 @@ impl TableProvider for PartitionTableProvider {
                     return Some(filter);
                 }
 
-                // Check if the filter contains the partition expression
-                if Self::filter_contains_partition_expr(&filter, &self.partition_by.expression) {
+                // Check if the filter contains any partition expression
+                if Self::filter_contains_any_partition_expr(&filter, &self.partition_by) {
                     return Some(filter);
                 }
 
@@ -219,22 +285,33 @@ impl TableProvider for PartitionTableProvider {
             .collect();
 
         // Collect data filters (applied to partition scans)
-        // Exclude filters that are simple column filters matching the partition expression exactly
+        // Exclude filters that are simple column filters matching a simple partition expression exactly
         // For example, with partition_by region:
         //   - WHERE region = 'us-east-1' should NOT be a data filter (partition handles it)
         // But with partition_by bucket(3, user_id):
         //   - WHERE user_id = 100 SHOULD be a data filter (partition only determines bucket)
+        let simple_partition_cols: std::collections::HashSet<_> = self
+            .partition_by
+            .iter()
+            .filter_map(|p| {
+                if let Expr::Column(col) = &p.expression {
+                    Some(col)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let data_filters: Vec<_> = filters
             .iter()
             .zip(filter_columns_cache.iter())
             .filter(|(_filter, filter_cols)| {
-                // If the partition expression is just a simple column reference,
-                // and this filter is on that exact column, exclude it from data filters
-                if let Expr::Column(partition_col) = &self.partition_by.expression {
-                    // Check if this filter references only the partition column
-                    if filter_cols.len() == 1 && filter_cols.iter().next() == Some(&partition_col) {
-                        return false; // Exclude from data filters
-                    }
+                // If this filter references only a simple partition column, exclude it
+                if filter_cols.len() == 1
+                    && let Some(col) = filter_cols.iter().next()
+                    && simple_partition_cols.contains(col)
+                {
+                    return false; // Exclude from data filters
                 }
                 // For all other cases (transform expressions, multiple columns, etc.), keep as data filter
                 true
@@ -245,14 +322,29 @@ impl TableProvider for PartitionTableProvider {
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            if prune_partition(
-                &partition_filters,
-                &self.partition_by.expression,
-                &partition.partition_value,
-                &self.schema,
-            )? {
+            // Check if this partition should be pruned based on ANY partition expression
+            let mut should_prune = false;
+            for (idx, partition_expr) in self.partition_by.iter().enumerate() {
+                // Get the partition value for this expression
+                let partition_value = partition.partition_values.get(idx).ok_or_else(|| {
+                    DataFusionError::Internal(format!("Partition missing value at index {idx}"))
+                })?;
+
+                if prune_partition(
+                    &partition_filters,
+                    &partition_expr.expression,
+                    partition_value,
+                    &self.schema,
+                )? {
+                    should_prune = true;
+                    break;
+                }
+            }
+
+            if should_prune {
                 continue;
             }
+
             let plan = partition
                 .table_provider
                 .scan(state, projection, &data_filters, limit)
@@ -268,7 +360,7 @@ impl TableProvider for PartitionTableProvider {
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
             })?,
-            plans => Arc::new(UnionExec::new(plans)),
+            plans => Arc::new(PartitionedUnionExec::try_new(plans)?),
         };
 
         if let Some(limit) = limit {
@@ -297,6 +389,276 @@ impl TableProvider for PartitionTableProvider {
     }
 }
 
+/// Implement `DeletionTableProvider` to support retention checks and delete operations
+/// on partitioned tables. Deletion is applied to all partitions.
+#[async_trait]
+impl DeletionTableProvider for PartitionTableProvider {
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Collect all partitions that need deletion
+        let partitions = self.partitions.read().await;
+        let partition_list: Vec<_> = partitions.values().cloned().collect();
+        drop(partitions);
+
+        // Create a deletion sink that will iterate over all partitions
+        let deletion_sink = Arc::new(PartitionedDeletionSink::new(
+            partition_list,
+            filters.to_vec(),
+            state.task_ctx(),
+        ));
+
+        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
+    }
+}
+
+/// A deletion sink that applies deletion filters to all partitions in a partitioned table.
+struct PartitionedDeletionSink {
+    partitions: Vec<Partition>,
+    filters: Vec<Expr>,
+    task_ctx: Arc<TaskContext>,
+}
+
+impl PartitionedDeletionSink {
+    fn new(partitions: Vec<Partition>, filters: Vec<Expr>, task_ctx: Arc<TaskContext>) -> Self {
+        Self {
+            partitions,
+            filters,
+            task_ctx,
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for PartitionedDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut total_deleted = 0u64;
+
+        for partition in &self.partitions {
+            // Try to downcast the partition's table provider to DeletionTableProvider
+            // The partition's table provider might be a CayenneTableProvider or similar
+            // that implements DeletionTableProvider
+            let deletion_provider = data_components::delete::get_deletion_provider(Arc::clone(
+                &partition.table_provider,
+            ));
+
+            if let Some(deletion_provider) = deletion_provider {
+                // Create a simple session state for executing the deletion
+                let session_ctx = datafusion::execution::context::SessionContext::new();
+                let state = session_ctx.state();
+
+                // Execute deletion on this partition
+                let plan = DeletionTableProvider::delete_from(
+                    deletion_provider.as_ref(),
+                    &state,
+                    &self.filters,
+                )
+                .await?;
+
+                // Execute the deletion plan
+                let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
+
+                // Extract the count from results
+                for batch in results {
+                    if let Some(count_col) = batch.column_by_name("count")
+                        && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
+                    {
+                        for i in 0..uint_array.len() {
+                            if !uint_array.is_null(i) {
+                                total_deleted += uint_array.value(i);
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    partition_values = ?partition.partition_values,
+                    "Partition table provider does not support deletion. Skipping."
+                );
+            }
+        }
+
+        Ok(total_deleted)
+    }
+}
+
+#[derive(Debug)]
+struct PartitionedUnionExec {
+    inner_union: Arc<dyn ExecutionPlan>,
+}
+
+impl PartitionedUnionExec {
+    fn try_new(partitions: Vec<Arc<dyn ExecutionPlan>>) -> Result<Self, DataFusionError> {
+        let inner_union = UnionExec::try_new(partitions)?;
+        Ok(Self { inner_union })
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+impl ExecutionPlan for PartitionedUnionExec {
+    fn name(&self) -> &'static str {
+        "PartitionedUnionExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "PartitionedUnionExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.inner_union.properties()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner_union.schema()
+    }
+
+    fn check_invariants(&self, check: InvariantLevel) -> Result<(), DataFusionError> {
+        self.inner_union.check_invariants(check)
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.inner_union.required_input_distribution()
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        self.inner_union.required_input_ordering()
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        self.inner_union.maintains_input_order()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        self.inner_union.benefits_from_input_partitioning()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inner_union.children()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if children.is_empty() {
+            return Err(DataFusionError::Plan(
+                "PartitionedUnionExec requires at least one child".to_string(),
+            ));
+        }
+
+        Ok(Arc::new(PartitionedUnionExec::try_new(children)?))
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(None)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        self.inner_union.execute(partition, context)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner_union.metrics()
+    }
+
+    fn statistics(&self) -> Result<Statistics, DataFusionError> {
+        #[expect(deprecated)]
+        self.inner_union.statistics()
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Statistics, DataFusionError> {
+        self.inner_union.partition_statistics(partition)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.inner_union.supports_limit_pushdown()
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        self.inner_union.cardinality_effect()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        self.inner_union.try_swapping_with_projection(projection)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription, DataFusionError> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
+    }
+
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+}
+
+impl DisplayAs for PartitionedUnionExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "PartitionedUnionExec")
+            }
+            DisplayFormatType::TreeRender => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,7 +683,7 @@ mod tests {
     impl PartitionCreator for MockCreator {
         async fn create_partition(
             &self,
-            _partition_value: ScalarValue,
+            _partition_values: Vec<ScalarValue>,
         ) -> Result<Partition, super::super::creator::Error> {
             unreachable!("create_partition not needed for scan tests")
         }
@@ -333,7 +695,7 @@ mod tests {
             Ok(data
                 .iter()
                 .map(|(val, provider)| Partition {
-                    partition_value: val.clone(),
+                    partition_values: vec![val.clone()],
                     table_provider: Arc::clone(provider),
                 })
                 .collect())
@@ -409,8 +771,8 @@ mod tests {
 
         // With 2 partitions and no filters, should produce a UnionExec
         assert!(
-            plan.as_any().is::<UnionExec>(),
-            "Expected UnionExec for multiple partitions"
+            plan.as_any().is::<PartitionedUnionExec>(),
+            "Expected PartitionedUnionExec for multiple partitions"
         );
     }
 

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow::datatypes::DataType;
 use datafusion::{
     datasource::listing::ListingTableUrl, error::DataFusionError, execution::SessionState,
@@ -26,16 +27,22 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to list all files when inferring partitions: {source}"))]
+    #[snafu(display(
+        "Failed to list files when inferring data partitions: {}",
+        format_datafusion_error(source)
+    ))]
     ListAllFiles { source: DataFusionError },
 
-    #[snafu(display("Found mixed partition values: {sorted_diff:?}"))]
+    #[snafu(display("Inconsistent partition columns found across files: {sorted_diff:?}"))]
     MixedPartitionValues { sorted_diff: [Vec<String>; 2] },
 
-    #[snafu(display("Prefix: {prefix} does not contain file: {file_path}"))]
+    #[snafu(display("File path '{file_path}' is not under the expected prefix '{prefix}'"))]
     FileNotContainedInPrefix { prefix: Path, file_path: Path },
 
-    #[snafu(display("Could not get object store: {source}"))]
+    #[snafu(display(
+        "Failed to access the object store: {}",
+        format_datafusion_error(source)
+    ))]
     ObjectStore { source: DataFusionError },
 }
 
@@ -245,8 +252,6 @@ mod tests {
         let path = object_store::path::Path::from("data");
 
         let stripped = strip_prefix(&table_url, &path).expect("Failed to strip prefix");
-        let parts: Vec<&str> = stripped.collect();
-
-        assert!(parts.is_empty());
+        assert_eq!(stripped.count(), 0);
     }
 }

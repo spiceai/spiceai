@@ -42,8 +42,9 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
 use moka::future::FutureExt;
 use search::{
-    generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
-    provider::SearchQueryProvider,
+    generation::text_search::index::FullTextDatabaseIndex,
+    index::SearchIndex,
+    provider::{SearchQueryProvider, UdtfSource},
 };
 use std::any::Any;
 use std::sync::LazyLock;
@@ -58,8 +59,30 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
-pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+
+/// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
+/// to pass through for RRF (Reciprocal Rank Fusion) operations.
+///
+/// This is required because `DataFusion` v51+ rejects named arguments for functions that use
+/// `VariadicAny` signature. The `UserDefined` signature type allows us to:
+/// 1. Accept any types (like `VariadicAny`)
+/// 2. Support named parameters via `with_parameter_names()`
+pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    // Parameter names that can be passed as named arguments.
+    // These are passthrough parameters used by RRF and other table functions.
+    let param_names = vec![
+        "tbl".to_string(),
+        "query".to_string(),
+        "column".to_string(),
+        "limit".to_string(),
+        "include_score".to_string(),
+        "rank_weight".to_string(),
+    ];
+    // SAFETY: These are valid ASCII parameter names
+    Signature::user_defined(Volatility::Stable)
+        .with_parameter_names(param_names)
+        .unwrap_or_else(|_| unreachable!("valid parameter names for text_search"))
+});
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
@@ -78,8 +101,8 @@ impl TextSearchTableFuncArgs {
         let TextSearchTableFuncArgs { column, tbl, .. } = &self;
         let col: String = if let Some(col) = column {
             if !search_fields.contains(col) {
-                return Err(DataFusionError::Internal(format!(
-                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
+                return Err(DataFusionError::Plan(format!(
+                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}",
                     search_fields.join(", ")
                 )));
             }
@@ -90,14 +113,14 @@ impl TextSearchTableFuncArgs {
             match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
-                    return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
+                    return Err(DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
                         search_fields.len()
                     )));
                 }
                 _ => {
-                    return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index."
+                    return Err(DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index"
                     )));
                 }
             }
@@ -251,7 +274,7 @@ impl TextSearchTableFunc {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
-            query: q.to_string(),
+            query: q.clone(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,
@@ -270,7 +293,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 
@@ -294,7 +317,16 @@ impl TableFunctionImpl for TextSearchTableFunc {
         // Select single column if needed.
         let column = args.column(&fts_index.search_fields)?;
         let mut fts_index = fts_index.clone();
-        fts_index.search_fields = vec![column];
+        fts_index.search_fields = vec![column.clone()];
+
+        // Create UDTF source for distributed serialization
+        let udtf_source = UdtfSource::TextSearch {
+            table: args.tbl.to_string(),
+            query: args.query.clone(),
+            column: Some(column),
+            limit: args.limit,
+            include_score: args.include_score,
+        };
 
         Ok(Arc::new(
             SearchQueryProvider::try_from_index(
@@ -303,6 +335,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 args.query.as_str(),
                 args.limit,
             )?
+            .with_udtf_source(udtf_source)
             .call_on_scan(Arc::new(|| {
                 async {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -333,5 +366,10 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         Self::scalar_invocation_error()
+    }
+
+    /// Required for `UserDefined` signature - accepts any types like `VariadicAny` would.
+    fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        Ok(arg_types.to_vec())
     }
 }

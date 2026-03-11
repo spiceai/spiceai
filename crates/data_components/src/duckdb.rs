@@ -26,9 +26,9 @@ use datafusion::{
 use datafusion_table_providers::{
     duckdb::{DuckDB, DuckDBTableFactory, TableDefinition, write::DuckDBTableWriter},
     sql::{
-        db_connection_pool::duckdbpool::DuckDbConnectionPool, sql_provider_datafusion::expr::Engine,
+        db_connection_pool::duckdbpool::DuckDbConnectionPool,
+        sql_provider_datafusion::expr::{self, Engine},
     },
-    util,
 };
 use duckdb::Transaction;
 use snafu::prelude::*;
@@ -36,16 +36,16 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
+    #[snafu(display("Failed to delete data from DuckDB table: {source}"))]
     UnableToDeleteDuckdbData { source: duckdb::Error },
 
-    #[snafu(display("Unable to query data from the duckdb table: {source}"))]
+    #[snafu(display("Failed to query data from DuckDB table: {source}"))]
     UnableToQueryData { source: duckdb::Error },
 
-    #[snafu(display("Unable to commit transaction: {source}"))]
+    #[snafu(display("Failed to commit DuckDB transaction: {source}"))]
     UnableToCommitTransaction { source: duckdb::Error },
 
-    #[snafu(display("Unable to begin duckdb transaction: {source}"))]
+    #[snafu(display("Failed to begin DuckDB transaction: {source}"))]
     UnableToBeginTransaction { source: duckdb::Error },
 
     #[snafu(display(
@@ -134,10 +134,21 @@ impl DeletionSink for DuckDBDeletionSink {
                     }
                 };
 
-                let sql = util::filters_to_sql(&filters, Some(Engine::DuckDB))
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let count = delete_from(&table_name.to_string(), tx, &sql)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                // When filters is empty, return 0 to prevent accidental full table deletion.
+                // This is intentional - callers must provide explicit filters for deletion.
+                let count = if filters.is_empty() {
+                    0
+                } else {
+                    let sql_filters: Result<Vec<String>, _> = filters
+                        .iter()
+                        .map(|f| expr::to_sql_with_engine(f, Some(Engine::DuckDB)))
+                        .collect();
+                    let sql = sql_filters
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                        .join(" AND ");
+                    delete_from(&table_name.to_string(), tx, &sql)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                };
 
                 Ok(count)
             },

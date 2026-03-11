@@ -9,10 +9,11 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
-- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary.
+- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary, or URL to an already-running spiced instance's Flight endpoint (e.g., `http://localhost:50051` to connect to an external instance).
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 - `--disable-progress-bars`: Disable progress bars during the test.
+- `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
 ## Use cases
 
@@ -141,6 +142,8 @@ testoperator run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data 
 A load test replicates a throughput test, but instead of running for a set number of query executions (2 by default for throughput tests) load tests run for a specified duration. A load test uses the same command options as a throughput test, with the additional options:
 
 - `--duration <SECONDS>`: The duration of the load test to run in seconds.
+- `--run-until-stopped`: Continue the load phase until manually interrupted (Ctrl+C). Warm-up and baseline still use `--duration` to size their runs.
+- `--mark-query-failed-if-exceeds <DURATION>`: Mark queries as failed if they exceed this duration threshold (e.g., "500ms", "2s"). Useful for identifying slow queries that should be treated as failures in metrics.
 
 A load test will match the specified duration as a best-effort. A load test will never be shorter than the specified duration, but can be longer than the specified duration if there are running queries when the end duration is passed. For example, a `--duration 10` is specified but a query that takes 60 seconds runs. The load test will end after the query finishes, taking 60 seconds instead of 10.
 
@@ -279,20 +282,32 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
 
-### Running Evaluation tests
-
-Run model evaluations (evals) test. In addition to the common options, supports specifying:
-
-- `--model <MODEL NAME>`: The language model (as named in Spicepod) to test against. If not specified, the first model from the Spicepod definition will be used.
-- `--eval <EVAL NAME>`: The eval name (as named in Spicepod) to test against. If not specified, the first eval from the Spicepod definition will be used.
-
-`testoperator run evals [OPTIONS]`
-
 ### Running Vector Search Tests
 
 Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
 
 `testoperator run search [OPTIONS]`
+
+### Running Text-to-SQL tests
+
+Running text to sql tests with the testoperator is still experimental.
+
+```bash
+testoperator run text-to-sql [OPTIONS]
+```
+Where options are:
+- `--model <MODEL NAME>`: The language model (named in spicepod) to perform text-to-sql.
+- `--queryset-file <FILE_PATH>`: File path to a JSONL of test questions and expected SQL (see `--queryset` for format). Cannot be used in conjunction with `--queryset`
+- `--queryset`: inline JSON array of test questions and expected SQL. Example:
+  ```bash
+    testoperator run text-to-sql --queryset '[ 
+      {"question": "how many sales have I made", "sql": "select count(1) from sales"},
+      {"question": "Who has the most sales?", "sql": "select sold_by from sales group by sold_by order by count(1) desc limit 1"}
+    ]'
+    --model foo
+  ```
+- `--sample-data-enabled`: Whether to use the `sample_data_enabled` HTTP parameter in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `sample_data_enabled`.
+- `--return-sql`: Whether to use the `Accept: application/sql` HTTP header in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `Accept`. 
 
 ### Running Append Tests
 

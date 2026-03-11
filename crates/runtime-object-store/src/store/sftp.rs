@@ -17,24 +17,30 @@ limitations under the License.
 use std::{
     io::{Read, Seek, SeekFrom},
     net::TcpStream,
-    ops::Range,
     sync::Arc,
     time::Duration,
 };
 
-use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::DateTime;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use ssh2::Session;
 
-#[derive(Debug)]
-struct SFTPClient {
+use super::common::{
+    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
+    process_directory_entries_shallow, resolve_range,
+};
+
+const STORE_NAME: &str = "SFTP";
+
+#[derive(Clone)]
+struct SFTPClientConfig {
     user: String,
     password: String,
     host: String,
@@ -42,7 +48,19 @@ struct SFTPClient {
     timeout: Option<Duration>,
 }
 
-impl SFTPClient {
+impl std::fmt::Debug for SFTPClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SFTPClientConfig")
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl SFTPClientConfig {
     fn new(
         user: String,
         password: String,
@@ -59,7 +77,7 @@ impl SFTPClient {
         }
     }
 
-    fn get_client(&self) -> object_store::Result<Session> {
+    fn connect(&self) -> object_store::Result<Session> {
         let stream = match self.timeout {
             Some(timeout) => TcpStream::connect_timeout(
                 &format!("{}:{}", self.host, self.port).parse().map_err(
@@ -86,9 +104,9 @@ impl SFTPClient {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SFTPObjectStore {
-    client: Arc<SFTPClient>,
+    config: Arc<SFTPClientConfig>,
 }
 
 impl std::fmt::Display for SFTPObjectStore {
@@ -107,29 +125,150 @@ impl SFTPObjectStore {
         timeout: Option<Duration>,
     ) -> Self {
         Self {
-            client: Arc::new(SFTPClient::new(user, password, host, port, timeout)),
+            config: Arc::new(SFTPClientConfig::new(user, password, host, port, timeout)),
         }
+    }
+
+    /// List a single directory and return its entries (blocking).
+    fn list_directory_blocking(
+        session: &Session,
+        dir_path: &str,
+    ) -> object_store::Result<Vec<DirEntry>> {
+        let sftp = session.sftp().map_err(handle_error)?;
+        let entries = sftp
+            .readdir(std::path::Path::new(dir_path))
+            .map_err(handle_error)?;
+
+        let mut result = Vec::new();
+        for (path, stat) in entries {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_default();
+
+            if stat.is_dir() {
+                result.push(DirEntry::directory(name));
+            } else if stat.is_file() {
+                let size = stat.size.unwrap_or(0);
+                #[expect(clippy::cast_possible_wrap)]
+                let last_modified = DateTime::from_timestamp(stat.mtime.unwrap_or(0) as i64, 0)
+                    .unwrap_or_else(chrono::Utc::now);
+                result.push(DirEntry::file(name, size, last_modified));
+            }
+        }
+        Ok(result)
+    }
+
+    /// List all files recursively starting from a given path.
+    async fn list_all_files(
+        &self,
+        prefix: Option<String>,
+    ) -> object_store::Result<Vec<ObjectMeta>> {
+        let config = Arc::clone(&self.config);
+        let prefix = prefix.unwrap_or_else(|| "/".to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let session = config.connect()?;
+            let mut results = Vec::new();
+            let mut queue = vec![prefix];
+
+            while let Some(current_path) = queue.pop() {
+                let entries = Self::list_directory_blocking(&session, &current_path)?;
+                let (files, dirs) = process_directory_entries(&current_path, entries);
+                results.extend(files);
+                queue.extend(dirs);
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))?
+    }
+
+    /// List a single directory level (for `list_with_delimiter`).
+    async fn list_directory_shallow(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<ListResult> {
+        let config = Arc::clone(&self.config);
+        let prefix_str = prefix.map_or("/".to_string(), |p| {
+            let s = p.to_string();
+            if s.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{s}")
+            }
+        });
+
+        tokio::task::spawn_blocking(move || {
+            let session = config.connect()?;
+            let entries = Self::list_directory_blocking(&session, &prefix_str)?;
+            Ok(process_directory_entries_shallow(&prefix_str, entries))
+        })
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))?
+    }
+
+    /// Get file metadata without reading content.
+    async fn get_file_metadata(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        let config = Arc::clone(&self.config);
+        let location = location.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let session = config.connect()?;
+            let sftp = session.sftp().map_err(handle_error)?;
+            let location_string = format!("/{location}");
+
+            let stat = sftp
+                .stat(std::path::Path::new(&location_string))
+                .map_err(|e| object_store::Error::NotFound {
+                    path: location_string.clone(),
+                    source: e.into(),
+                })?;
+
+            let size = stat.size.ok_or_else(|| object_store::Error::Generic {
+                store: STORE_NAME,
+                source: "No size found for file".into(),
+            })?;
+
+            #[expect(clippy::cast_possible_wrap)]
+            let last_modified = DateTime::from_timestamp(
+                stat.mtime.ok_or_else(|| object_store::Error::Generic {
+                    store: STORE_NAME,
+                    source: "No modification time found for file".into(),
+                })? as i64,
+                0,
+            )
+            .ok_or_else(|| object_store::Error::Generic {
+                store: STORE_NAME,
+                source: "Failed to construct DateTime".into(),
+            })?;
+
+            Ok(build_object_meta(location, size, last_modified))
+        })
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))?
     }
 }
 
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
 ) -> object_store::Error {
-    object_store::Error::Generic {
-        store: "SFTP",
-        source: error.into(),
-    }
+    generic_error(STORE_NAME, error)
 }
 
 #[async_trait]
 impl ObjectStore for SFTPObjectStore {
     async fn put_opts(
         &self,
-        _: &Path,
-        _: PutPayload,
-        _: PutOptions,
+        _location: &Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        unimplemented!()
+        Err(object_store::Error::NotSupported {
+            source: "SFTP put_opts not implemented".into(),
+        })
     }
 
     async fn put_multipart_opts(
@@ -137,236 +276,201 @@ impl ObjectStore for SFTPObjectStore {
         _location: &Path,
         _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        unimplemented!()
+        Err(object_store::Error::NotSupported {
+            source: "SFTP put_multipart_opts not implemented".into(),
+        })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn get_opts(
         &self,
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = Arc::clone(&self.client);
+        let config = Arc::clone(&self.config);
         let location = location.clone();
 
-        // Perform blocking operations in spawn_blocking
-        let (object_meta, start, end, data_to_read) = tokio::task::spawn_blocking(move || {
-            let client = client.get_client()?;
-            let mut file = client
+        // Perform all blocking operations in spawn_blocking, including reading the data
+        let (object_meta, start, end, data) = tokio::task::spawn_blocking(move || {
+            let session = config.connect()?;
+            let location_string = format!("/{location}");
+            let mut file = session
                 .sftp()
                 .map_err(handle_error)?
-                .open(std::path::Path::new(location.as_ref()))
+                .open(std::path::Path::new(&location_string))
                 .map_err(handle_error)?;
 
-            let object_meta = ObjectMeta {
-                location: location.clone(),
-                size: file.stat().map_err(handle_error)?.size.ok_or_else(|| {
-                    object_store::Error::Generic {
-                        store: "SFTP",
-                        source: "No size found for file".into(),
-                    }
-                })?,
+            let file_stat = file.stat().map_err(handle_error)?;
+            let size = file_stat.size.ok_or_else(|| object_store::Error::Generic {
+                store: STORE_NAME,
+                source: "No size found for file".into(),
+            })?;
 
-                #[allow(clippy::cast_possible_wrap)]
-                last_modified: DateTime::from_timestamp(
-                    file.stat().map_err(handle_error)?.mtime.ok_or(
-                        object_store::Error::Generic {
-                            store: "SFTP",
-                            source: "No modification time found for file".into(),
-                        },
-                    )? as i64,
-                    0,
-                )
-                .ok_or_else(|| object_store::Error::Generic {
-                    store: "SFTP",
-                    source: "Failed to construct DataTime".into(),
-                })?,
-                e_tag: None,
-                version: None,
-            };
+            #[expect(clippy::cast_possible_wrap)]
+            let last_modified = DateTime::from_timestamp(
+                file_stat
+                    .mtime
+                    .ok_or_else(|| object_store::Error::Generic {
+                        store: STORE_NAME,
+                        source: "No modification time found for file".into(),
+                    })? as i64,
+                0,
+            )
+            .ok_or_else(|| object_store::Error::Generic {
+                store: STORE_NAME,
+                source: "Failed to construct DateTime".into(),
+            })?;
 
-            let mut start = 0;
-            let mut end = object_meta.size;
-            let mut data_to_read = end;
+            let object_meta = build_object_meta(location.clone(), size, last_modified);
 
-            if let Some(GetRange::Bounded(range)) = options.range {
-                data_to_read = range.end - range.start;
-                start = range.start;
-                end = range.end;
-            }
+            let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
 
-            Ok::<_, object_store::Error>((object_meta, start, end, data_to_read))
-        })
-        .await
-        .map_err(|e| object_store::Error::Generic {
-            store: "SFTP",
-            source: e.into(),
-        })??;
+            // Seek to start position
+            file.seek(SeekFrom::Start(start)).map_err(handle_error)?;
 
-        let client = Arc::clone(&self.client);
-        let location_clone = object_meta.location.clone();
-
-        let stream = stream! {
-            let client = Arc::clone(&client);
-            let location = location_clone.clone();
-            let mut file_result = tokio::task::spawn_blocking(move || {
-                let client = client.get_client()?;
-                let mut file = client
-                    .sftp()
-                    .map_err(handle_error)?
-                    .open(std::path::Path::new(location.as_ref()))
-                    .map_err(handle_error)?;
-                file.seek(SeekFrom::Start(start)).map_err(handle_error)?;
-                Ok::<_, object_store::Error>(file)
-            })
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "SFTP",
-                source: e.into(),
-            })??;
-
-            let mut total = 0;
-            let mut buf = vec![0; 4096];
-            loop {
-                if total > data_to_read {
-                    break;
-                }
-
-                let read_result = tokio::task::spawn_blocking(move || {
-                    let n = file_result
-                        .read(&mut buf)
-                        .map_err(handle_error)? as u64;
-                    Ok::<_, object_store::Error>((file_result, buf, n))
-                })
-                .await
-                .map_err(|e| object_store::Error::Generic {
-                    store: "SFTP",
-                    source: e.into(),
-                })??;
-
-                file_result = read_result.0;
-                buf = read_result.1;
-                let mut n = read_result.2;
-
-                total += n;
+            // Read all requested data
+            #[expect(clippy::cast_possible_truncation)]
+            let mut buffer = vec![0u8; data_to_read as usize];
+            let mut total_read = 0;
+            while total_read < buffer.len() {
+                let n = file.read(&mut buffer[total_read..]).map_err(handle_error)?;
                 if n == 0 {
                     break;
                 }
-                if total > data_to_read {
-                    n -= total - data_to_read;
-                }
-
-                yield Ok(Bytes::copy_from_slice(&buf[..usize::try_from(n).map_err(handle_error)?]));
+                total_read += n;
             }
-        };
+            buffer.truncate(total_read);
+
+            Ok::<_, object_store::Error>((object_meta, start, end, buffer))
+        })
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))??;
+
+        let stream = futures::stream::once(async move { Ok(Bytes::from(data)) });
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(Box::pin(stream)),
             meta: object_meta,
-            range: Range { start, end },
+            range: build_byte_range(start, end),
             attributes: Attributes::default(),
         })
     }
 
-    async fn delete(&self, _: &Path) -> object_store::Result<()> {
-        unimplemented!()
+    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        self.get_file_metadata(location).await
+    }
+
+    async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+        Err(object_store::Error::NotSupported {
+            source: "SFTP delete not implemented".into(),
+        })
     }
 
     fn delete_stream<'a>(
         &'a self,
-        _: BoxStream<'a, object_store::Result<Path>>,
+        _locations: BoxStream<'a, object_store::Result<Path>>,
     ) -> BoxStream<'a, object_store::Result<Path>> {
-        unimplemented!()
+        futures::stream::once(async {
+            Err(object_store::Error::NotSupported {
+                source: "SFTP delete_stream not implemented".into(),
+            })
+        })
+        .boxed()
     }
 
-    fn list(
-        &self,
-        location: Option<&Path>,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let location = location
-            .map(ToOwned::to_owned)
-            .map_or("/".to_string(), |x| x.to_string());
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let store = self.clone();
+        let prefix_str = prefix.map(|p| {
+            let s = p.to_string();
+            if s.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{s}")
+            }
+        });
 
-        let client = Arc::clone(&self.client);
-
-        let stream = stream! {
-            let client_clone = Arc::clone(&client);
-            let location_clone = location.clone();
-
-            let entries = tokio::task::spawn_blocking(move || {
-                let session = client_clone.get_client()?;
-                let mut queue = vec![location_clone];
-                let mut all_entries = Vec::new();
-
-                while let Some(item) = queue.pop() {
-                    let list = session
-                        .sftp()
-                        .map_err(handle_error)?
-                        .readdir(std::path::Path::new(&item))
-                        .map_err(handle_error)?;
-
-                    for entry in list {
-                        if entry.1.is_dir() {
-                            queue.push(entry.0.to_string_lossy().to_string());
-                        } else {
-                            all_entries.push(entry);
-                        }
-                    }
-                }
-
-                Ok::<_, object_store::Error>(all_entries)
-            })
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "SFTP",
-                source: e.into(),
-            })??;
-
-            for entry in entries {
-                yield Ok(ObjectMeta {
-                    location: Path::from(entry.0.to_str().ok_or_else(|| object_store::Error::Generic {
-                        store: "SFTP",
-                        source: "Failed to convert path".into(),
-                    })?),
-                    size: entry.1.size.ok_or_else(|| object_store::Error::Generic {
-                        store: "SFTP",
-                        source: "No size found for file".into(),
-                    })?,
-                    #[allow(clippy::cast_possible_wrap)]
-                    last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
-                            store: "SFTP",
-                            source: "No modification time found for file".into(),
-                        })? as i64, 0)
-                        .ok_or_else(|| object_store::Error::Generic {
-                            store: "SFTP",
-                            source: "Failed to construct DataTime".into(),
-                        })?,
-                    e_tag: None,
-                    version: None,
-                })
+        let fut = async move {
+            match store.list_all_files(prefix_str).await {
+                Ok(files) => futures::stream::iter(files.into_iter().map(Ok)).boxed(),
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
             }
         };
 
-        Box::pin(stream)
+        futures::stream::once(fut).flatten().boxed()
     }
 
     fn list_with_offset(
         &self,
-        _: Option<&Path>,
-        _: &Path,
+        _prefix: Option<&Path>,
+        _offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        unimplemented!()
+        futures::stream::once(async {
+            Err(object_store::Error::NotSupported {
+                source: "SFTP list_with_offset not implemented".into(),
+            })
+        })
+        .boxed()
     }
 
-    async fn list_with_delimiter(&self, _: Option<&Path>) -> object_store::Result<ListResult> {
-        unimplemented!()
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.list_directory_shallow(prefix).await
     }
 
-    async fn copy(&self, _: &Path, _: &Path) -> object_store::Result<()> {
-        unimplemented!()
+    async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        Err(object_store::Error::NotSupported {
+            source: "SFTP copy not implemented".into(),
+        })
     }
 
-    async fn copy_if_not_exists(&self, _: &Path, _: &Path) -> object_store::Result<()> {
-        unimplemented!()
+    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        Err(object_store::Error::NotSupported {
+            source: "SFTP copy_if_not_exists not implemented".into(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn test_sftp_object_store_display() {
+        let store = SFTPObjectStore::new(
+            "user".to_string(),
+            "password".to_string(),
+            "sftp.example.com".to_string(),
+            "22".to_string(),
+            None,
+        );
+        assert_eq!(format!("{store}"), "SFTP");
+    }
+
+    #[test]
+    fn test_sftp_client_config_with_timeout() {
+        let config = SFTPClientConfig::new(
+            "user".to_string(),
+            "pass".to_string(),
+            "localhost".to_string(),
+            "22".to_string(),
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(config.host, "localhost");
+        assert!(config.timeout.is_some());
+    }
+
+    #[test]
+    fn test_dir_entry_file_creation() {
+        let ts = Utc::now();
+        let entry = DirEntry::file("report.pdf".to_string(), 4096, ts);
+        assert!(!entry.is_dir);
+        assert_eq!(entry.size, 4096);
+        assert_eq!(entry.name, "report.pdf");
+    }
+
+    #[test]
+    fn test_generic_error_creation() {
+        let err = generic_error(STORE_NAME, "test error");
+        let err_str = format!("{err}");
+        assert!(err_str.contains("SFTP"));
     }
 }

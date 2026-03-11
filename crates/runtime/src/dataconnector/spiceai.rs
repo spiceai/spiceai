@@ -38,8 +38,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::Dataset;
-use crate::federated_table::FederatedTable;
+use crate::{component::dataset::Dataset, federated_table::FederatedTable};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -161,6 +160,21 @@ const PARAMETERS: &[ParameterSpec] = &[
 const HEADER_ORG: &str = "spiceai-org";
 const HEADER_APP: &str = "spiceai-app";
 
+fn get_api_key(params: &ConnectorParams) -> Result<secrecy::SecretString> {
+    if let Some(api_key) = params.parameters.get("api_key").ok() {
+        return Ok(api_key.clone());
+    }
+
+    if let Some(token) = params.parameters.get("token").ok() {
+        return Ok(token.clone());
+    }
+
+    MissingRequiredParameterSnafu {
+        parameter: "api_key or token".to_string(),
+    }
+    .fail()
+}
+
 impl DataConnectorFactory for SpiceAIFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -186,13 +200,10 @@ impl DataConnectorFactory for SpiceAIFactory {
                 }
             })?;
 
-            let api_key = params
-                .parameters
-                .get("api_key")
-                .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
+            let api_key = get_api_key(&params)?;
             let credentials = Credentials::new("", api_key.clone());
 
-            let mut flight_client = FlightClient::try_new(url, credentials, None)
+            let mut flight_client = FlightClient::try_new(url, credentials, None, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
 
@@ -352,6 +363,8 @@ impl DataConnector for SpiceAI {
     }
 }
 
+register_data_connector!("spice.ai", SpiceAIFactory);
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
     OrgAppPath {
@@ -406,7 +419,7 @@ pub fn subscribe_to_append_stream(
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
                                 match ChangeBatch::try_new(batch).map(|rb| {
-                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
+                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {
                                     Ok(change_batch) => yield Ok(change_batch),
                                     Err(e) => {
@@ -441,9 +454,45 @@ impl CommitChange for SpiceAIChangeCommiter {
 mod tests {
     use super::*;
     use crate::component::dataset::builder::DatasetBuilder;
+    use crate::parameters::Parameters;
+    use runtime_secrets::Secrets;
+    use secrecy::ExposeSecret;
+    use secrecy::SecretString;
+    use tokio::runtime::Handle;
+    use tokio::sync::RwLock;
+
+    async fn make_params(params: Vec<(String, SecretString)>) -> ConnectorParams {
+        let app = app::AppBuilder::new("test").build();
+        let runtime = crate::Runtime::builder().build().await;
+
+        let dataset = DatasetBuilder::try_new("spice.ai/test.table".to_string(), "bar")
+            .expect("failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(runtime))
+            .build()
+            .expect("failed to build dataset");
+
+        let parameters = Parameters::try_new(
+            "test",
+            params,
+            "spiceai",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("parameters should be valid");
+
+        ConnectorParams {
+            parameters,
+            unsupported_type_action: None,
+            component: ConnectorComponent::Dataset(Arc::new(dataset)),
+            app: None,
+            runtime: None,
+            io_runtime: Handle::current(),
+        }
+    }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_spice_dataset_path() {
         let tests = vec![
             (
@@ -554,5 +603,44 @@ mod tests {
             let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_api_key_prefers_api_key() {
+        let params = make_params(vec![
+            ("spiceai_api_key".to_string(), "api-key".to_string().into()),
+            (
+                "spiceai_token".to_string(),
+                "legacy-token".to_string().into(),
+            ),
+        ])
+        .await;
+
+        let api_key = get_api_key(&params).expect("api key should resolve from api_key");
+        assert_eq!(api_key.expose_secret(), "api-key");
+    }
+
+    #[tokio::test]
+    async fn test_get_api_key_uses_legacy_token() {
+        let params = make_params(vec![(
+            "spiceai_token".to_string(),
+            "legacy-token".to_string().into(),
+        )])
+        .await;
+
+        let api_key = get_api_key(&params).expect("api key should resolve from token fallback");
+        assert_eq!(api_key.expose_secret(), "legacy-token");
+    }
+
+    #[tokio::test]
+    async fn test_get_api_key_missing_returns_error() {
+        let params = make_params(vec![]).await;
+
+        let error = get_api_key(&params).expect_err("missing credentials should return an error");
+        assert!(matches!(
+            error,
+            Error::MissingRequiredParameter { parameter }
+            if parameter == "api_key or token"
+        ));
     }
 }

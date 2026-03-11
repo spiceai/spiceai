@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use datafusion::{
     catalog::TableProvider,
+    common::Column,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::SendableRecordBatchStream,
@@ -28,9 +29,10 @@ use datafusion::{
         },
     },
 };
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, ident, lit};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
+use util::format_datafusion_error;
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
@@ -47,7 +49,8 @@ pub enum Error {
     CandidateAggregationError { source: aggregation::Error },
 
     #[snafu(display(
-        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: {source}"
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {}",
+        format_datafusion_error(source)
     ))]
     SearchRequestConstructionError { source: DataFusionError },
 
@@ -94,19 +97,19 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
     }
 
     /// Runs the search pipeline with the provided parameters.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         query: String,
         tbl: &TableReference,
         opt_filter: Option<Expr>,
         addition_projection: Vec<Expr>,
-        primary_keys: Vec<String>,
+        primary_keys: Vec<Column>,
         keywords: Vec<String>,
         limit: usize,
     ) -> std::result::Result<Option<AggregationResult>, Error> {
         let columns: Vec<_> = [
-            primary_keys.iter().map(|pk| ident(pk.clone())).collect(),
+            primary_keys.iter().map(|c| col(c.clone())).collect(),
             addition_projection,
             vec![ident(SEARCH_SCORE_COLUMN_NAME)],
         ]
@@ -309,21 +312,21 @@ pub(crate) mod tests {
     fn test_search_request_parse_keywords() {
         let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test keyword with a space
         let keywords = vec!["keyword 1".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test empty keyword
         let keywords = vec![String::new()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test escaping keyword
         let keywords = vec!["'); DROP TABLE testing;".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_err());
+        result.expect_err("should be invalid search keywords");
     }
 }

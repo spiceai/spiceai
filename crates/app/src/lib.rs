@@ -24,11 +24,10 @@ pub use spicepod;
 use spicepod::{
     Spicepod,
     component::{
-        caching::{CacheConfig, ResultsCache},
+        caching::{CacheConfig, SQLResultsCacheConfig},
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
-        eval::Eval,
         management::Management,
         model::Model,
         runtime::{CorsConfig, Runtime, TlsConfig},
@@ -61,8 +60,6 @@ pub struct App {
     pub models: Vec<Model>,
 
     pub embeddings: Vec<Embeddings>,
-
-    pub evals: Vec<Eval>,
 
     pub tools: Vec<Tool>,
 
@@ -100,7 +97,6 @@ impl Default for App {
             views: vec![],
             models: vec![],
             embeddings: vec![],
-            evals: vec![],
             tools: vec![],
             workers: vec![],
             spicepods: vec![],
@@ -131,7 +127,6 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
-    evals: Vec<Eval>,
     tools: Vec<Tool>,
     workers: Vec<Worker>,
     spicepods: Vec<Spicepod>,
@@ -151,7 +146,6 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
-            evals: vec![],
             tools: vec![],
             workers: vec![],
             spicepods: vec![],
@@ -160,13 +154,14 @@ impl AppBuilder {
             snapshots: None,
         }
     }
-
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
         self.runtime = spicepod.runtime.clone();
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
-        self.management.clone_from(&spicepod.management);
+        if let Some(ref management) = spicepod.management {
+            self.management = Some(management.clone());
+        }
         if let Some(ref snapshot) = spicepod.snapshots {
             self.snapshots = Some(snapshot.clone());
         }
@@ -175,10 +170,43 @@ impl AppBuilder {
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
-        self.evals.extend(spicepod.evals.clone());
         self.tools.extend(spicepod.tools.clone());
         self.workers.extend(spicepod.workers.clone());
         self.spicepods.push(spicepod);
+        self
+    }
+
+    /// Load a spicepod dependency into the app builder.
+    ///
+    /// As a dependency, `.runtime`, `.management`, and `.snapshots` configurations will be ignored.
+    #[must_use]
+    pub fn with_spicepod_dependency(mut self, mut spicepod: Spicepod) -> AppBuilder {
+        if spicepod.runtime != Runtime::default() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Spicepod dependency has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. runtime configuration from dependency will be ignored."
+                );
+            });
+        }
+        spicepod.runtime = self.runtime.clone();
+
+        if spicepod.management.is_some() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Spicepod dependency has 'management' field(s) defined. Management configuration must be set in primary spicepod. management configuration from dependency will be ignored."
+                );
+            });
+        }
+        spicepod.management = None;
+        if spicepod.snapshots.is_some() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Spicepod dependency has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. snapshots configuration from dependency will be ignored."
+                );
+            });
+        }
+        spicepod.snapshots = None;
+        self = self.with_spicepod(spicepod);
         self
     }
 
@@ -219,12 +247,6 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_eval(mut self, eval: Eval) -> AppBuilder {
-        self.evals.push(eval);
-        self
-    }
-
-    #[must_use]
     pub fn with_embedding(mut self, embedding: Embeddings) -> AppBuilder {
         self.embeddings.push(embedding);
         self
@@ -243,8 +265,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
-        self.runtime.results_cache = Some(results_cache);
+    pub fn with_sql_cache(mut self, sql_results: SQLResultsCacheConfig) -> AppBuilder {
+        self.runtime.caching.sql_results = Some(sql_results);
         self
     }
 
@@ -313,7 +335,6 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
-            evals: self.evals,
             tools: self.tools,
             workers: self.workers,
             spicepods: self.spicepods,
@@ -331,7 +352,6 @@ impl AppBuilder {
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();
@@ -344,7 +364,6 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
-        let mut evals: Vec<Eval> = vec![];
         let mut tools: Vec<Tool> = vec![];
         let mut workers: Vec<Worker> = vec![];
 
@@ -366,10 +385,6 @@ impl AppBuilder {
 
         for embedding in &spicepod.embeddings {
             embeddings.push(embedding.clone());
-        }
-
-        for eval in &spicepod.evals {
-            evals.push(eval.clone());
         }
 
         for tool in &spicepod.tools {
@@ -405,10 +420,6 @@ impl AppBuilder {
             }
             for embedding in &dependent_spicepod.embeddings {
                 embeddings.push(embedding.clone());
-            }
-
-            for eval in &dependent_spicepod.evals {
-                evals.push(eval.clone());
             }
 
             for tool in &dependent_spicepod.tools {
@@ -448,14 +459,6 @@ impl AppBuilder {
 
         spicepods.push(spicepod);
 
-        if snapshots.is_some() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Snapshots configuration is defined. Acceleration snapshots (preview) enabled."
-                );
-            });
-        }
-
         Ok(App {
             name: root_spicepod_name,
             secrets,
@@ -465,7 +468,6 @@ impl AppBuilder {
             views,
             models,
             embeddings,
-            evals,
             tools,
             workers,
             spicepods,

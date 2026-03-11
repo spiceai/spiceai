@@ -1,6 +1,8 @@
+#![allow(dead_code, clippy::allow_attributes)]
+
 use crate::postgres::common;
 use crate::postgres::common::get_pg_params;
-use crate::utils::runtime_ready_check;
+use crate::utils::{register_test_connectors, runtime_ready_check};
 use crate::{configure_test_datafusion, configure_test_datafusion_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -92,7 +94,6 @@ pub(crate) fn get_dataset_no_time_column(port: usize) -> Dataset {
 }
 
 /// Get dataset with Unix timestamp column (INT) to work around Vortex v0.52.1 timestamp metadata bug
-#[allow(dead_code)]
 pub(crate) fn get_dataset_unix_time(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:test_table", "test_table");
     ds.params = Some(Params::from_string_map(
@@ -146,6 +147,40 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
     Ok(db_conn)
 }
 
+/// Initialize postgres with a test table that includes a `value` column for testing upsert behavior.
+/// The table has: id (PK), `created_at` (timestamp), value (text)
+pub(crate) async fn initialize_postgres_with_value_column(
+    port: usize,
+) -> Result<PostgresConnection, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error connecting: {e}"))?;
+
+    execute_ps_sql(
+        &db_conn,
+        "
+                CREATE TABLE test_table (
+                    id SERIAL PRIMARY KEY,
+                    created_at TIMESTAMP(3) WITH TIME ZONE,
+                    value TEXT
+                )",
+    )
+    .await?;
+
+    execute_ps_sql(
+        &db_conn,
+        "INSERT INTO test_table (created_at, value) VALUES (date_trunc('milliseconds', now()), 'initial_value')",
+    )
+    .await?;
+
+    execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
+
+    Ok(db_conn)
+}
+
 pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,
@@ -153,7 +188,6 @@ pub(crate) async fn start_test_runtime(
     start_test_runtime_with_dataset(port, acceleration, get_dataset(port)).await
 }
 
-#[allow(dead_code)]
 pub(crate) async fn start_test_runtime_no_time_column(
     port: usize,
     acceleration: Acceleration,
@@ -161,7 +195,6 @@ pub(crate) async fn start_test_runtime_no_time_column(
     start_test_runtime_with_dataset(port, acceleration, get_dataset_no_time_column(port)).await
 }
 
-#[allow(dead_code)]
 pub(crate) async fn start_test_runtime_unix_time(
     port: usize,
     acceleration: Acceleration,
@@ -174,6 +207,8 @@ async fn start_test_runtime_with_dataset(
     acceleration: Acceleration,
     mut dataset: Dataset,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
+    register_test_connectors().await;
+
     dataset.acceleration = Some(acceleration);
     let app = AppBuilder::new("test_acceleration_refresh")
         .with_dataset(dataset)

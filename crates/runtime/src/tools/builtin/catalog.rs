@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
@@ -22,6 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     Runtime,
+    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     tools::{
         catalog::SpiceToolCatalog, factory::IndividualToolFactory, options::SpiceToolsOptions,
     },
@@ -51,16 +54,45 @@ pub enum Error {
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
 pub struct BuiltinToolCatalog {
     rt: Arc<Runtime>,
+    /// An optional table allowlist. Overriden by any per-tool `table_allowlist` param.
+    model_table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
+
 impl BuiltinToolCatalog {
     pub(crate) fn new(rt: Arc<Runtime>) -> Self {
-        Self { rt }
+        Self {
+            rt,
+            model_table_allowlist: None,
+        }
+    }
+
+    /// Create a new `BuiltinToolCatalog` with a table allowlist applied to all tools.
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: ResolvedTableAwareAllowlist) -> Self {
+        self.model_table_allowlist = Some(allowlist);
+        self
     }
 
     pub(crate) fn name() -> &'static str {
         "auto"
+    }
+
+    pub(crate) fn is_builtin_tool(name: &str) -> bool {
+        [
+            "websearch",
+            "get_readiness",
+            "search",
+            "table_schema",
+            "sql",
+            "sample_distinct_columns",
+            "random_sample",
+            "top_n_sample",
+            "list_datasets",
+        ]
+        .contains(&name)
     }
 
     pub(crate) fn construct_builtin(
@@ -91,6 +123,27 @@ impl BuiltinToolCatalog {
             (_, None) => "",
         };
 
+        // Use model-level table allowlist if set, otherwise parse from params
+        let table_allowlist: Option<ResolvedTableAwareAllowlist> =
+            if let Some(allowlist) = params.get("table_allowlist") {
+                let tables = allowlist
+                    .expose_secret()
+                    .split(',')
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>();
+                Some(
+                    ResolvedTableAwareAllowlist::with_defaults(
+                        SPICE_DEFAULT_CATALOG,
+                        SPICE_DEFAULT_SCHEMA,
+                    )
+                    .with_table_patterns(tables)
+                    .boxed()
+                    .context(FailedToConstructToolSnafu { id })?,
+                )
+            } else {
+                self.model_table_allowlist.clone()
+            };
+
         match id {
             "websearch" => Ok(Arc::new(
                 WebSearchTool::try_new(name, Some(description), params)
@@ -101,44 +154,41 @@ impl BuiltinToolCatalog {
                 Some(name),
                 Some(description),
             ))),
-            "search" => Ok(Arc::new(SearchTool::new(
-                Arc::clone(&self.rt),
-                Some(name),
-                Some(description),
-            ))),
-            "table_schema" => Ok(Arc::new(TableSchemaTool::new(
-                Arc::clone(&self.rt),
-                Some(name),
-                Some(description),
-            ))),
+            "search" => Ok(Arc::new(
+                SearchTool::new(Arc::clone(&self.rt), Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
+            )),
+            "table_schema" => Ok(Arc::new(
+                TableSchemaTool::new(Arc::clone(&self.rt), Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
+            )),
             "sql" => Ok(Arc::new(SqlTool::new(
                 self.rt.datafusion(),
                 Some(name),
                 Some(description),
+                table_allowlist,
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), Some(description)),
+                    .with_overrides(Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), Some(description)),
+                    .with_overrides(Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), Some(description)),
+                    .with_overrides(Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
             )),
-            "list_datasets" => {
-                let table_allowlist: Option<Vec<&str>> = params
-                    .get("table_allowlist")
-                    .map(|t| t.expose_secret().split(',').map(str::trim).collect());
-                Ok(Arc::new(ListDatasetsTool::new(
-                    Some(name),
-                    Some(description),
-                    table_allowlist,
-                    Arc::clone(&self.rt),
-                )))
-            }
+            "list_datasets" => Ok(Arc::new(ListDatasetsTool::new(
+                Some(name),
+                Some(description),
+                table_allowlist,
+                Arc::clone(&self.rt),
+            ))),
             _ => Err(Error::UnknownBuiltinTool { id: id.to_string() }),
         }
     }
@@ -185,5 +235,8 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
 
     fn name(&self) -> &str {
         Self::name()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

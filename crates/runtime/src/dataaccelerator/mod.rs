@@ -22,16 +22,18 @@ use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
+    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
+use linkme::distributed_slice;
+use runtime_acceleration::snapshot::{AccelerationLayout, SnapshotDownloadInfo};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -39,31 +41,15 @@ use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
-use self::arrow::ArrowAccelerator;
-
-#[cfg(not(windows))]
-use self::cayenne::CayenneAccelerator;
-#[cfg(feature = "duckdb")]
-use self::duckdb::DuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(feature = "postgres")]
-use self::postgres::PostgresAccelerator;
-#[cfg(feature = "sqlite")]
-use self::sqlite::SqliteAccelerator;
-#[cfg(feature = "turso")]
-use self::turso::TursoAccelerator;
-
 pub mod arrow;
 #[cfg(not(windows))]
 pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -72,8 +58,79 @@ pub mod turso;
 
 mod snapshots;
 pub mod spice_sys;
+pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
+pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
+
+#[derive(Clone, Copy)]
+pub struct AcceleratorRegistration {
+    pub engine: Engine,
+    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+}
+
+impl AcceleratorRegistration {
+    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+        Self {
+            engine,
+            constructor,
+        }
+    }
+}
+
+/// Distributed slice that automatically collects all data accelerator registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_accelerator!`] macro.
+#[distributed_slice]
+pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
+
+/// Registers a data accelerator for a given engine.
+///
+/// This macro creates a constructor function for the specified accelerator type and
+/// registers it in the global distributed slice of data accelerators. This allows
+/// the runtime to discover and instantiate accelerators for supported engines.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_accelerator!(Engine::Foo, FooAccelerator);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_accelerator!(
+///     my_accel_fn,
+///     MY_ACCEL_STATIC,
+///     Engine::Bar,
+///     BarAccelerator
+/// );
+/// ```
+///
+/// Using this macro automatically adds the accelerator to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_accelerator {
+    ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataaccelerator::DataAccelerator> {
+            ::std::sync::Arc::new(<$accelerator>::new())
+        }
+
+        #[linkme::distributed_slice($crate::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataaccelerator::AcceleratorRegistration =
+            $crate::dataaccelerator::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    ($engine:expr, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $accelerator
+            );
+        }
+    };
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -141,43 +198,23 @@ impl AcceleratorEngineRegistry {
     }
 
     pub(crate) async fn register_all(&self) {
-        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::PartitionedDuckDB,
-            Arc::new(PartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::TableModePartitionedDuckDB,
-            Arc::new(TablesModePartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "postgres")]
-        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
-            .await;
-        #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
-            .await;
-        #[cfg(feature = "turso")]
-        self.register_accelerator_engine(Engine::Turso, Arc::new(TursoAccelerator::new()))
-            .await;
-        #[cfg(not(windows))]
-        self.register_accelerator_engine(Engine::Cayenne, Arc::new(CayenneAccelerator::new()))
-            .await;
+        for registration in DATA_ACCELERATOR_REGISTRATIONS {
+            self.register_accelerator_engine(registration.engine, (registration.constructor)())
+                .await;
+        }
     }
 
     pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.clear();
+        // Shutdown each accelerator before clearing the registry
+        for (engine, accelerator) in registry.drain() {
+            if let Err(e) = accelerator.shutdown().await {
+                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
+            }
+        }
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -246,16 +283,14 @@ impl AcceleratorEngineRegistry {
         .indexes(acceleration_settings.indexes.clone());
 
         // If there are constraints from the federated table, then add them to the accelerated table
-        // and automatically configure upsert behavior for them. This can be overridden by the user.
+        // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
         if let Some(constraints) = constraints
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
             let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                ColumnReference::new(primary_keys),
-                UpsertOptions::default(),
-            ));
+            external_table_builder = external_table_builder
+                .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
         }
 
         if let Some(on_conflict) =
@@ -268,6 +303,10 @@ impl AcceleratorEngineRegistry {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
         }
 
+        // Pass UpsertOptions for constraint validation behavior
+        external_table_builder =
+            external_table_builder.upsert_options(acceleration_settings.upsert_options());
+
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
                 if !constraints.is_empty() {
@@ -279,11 +318,9 @@ impl AcceleratorEngineRegistry {
                         let primary_keys: Vec<String> =
                             get_primary_keys_from_constraints(&constraints, &schema);
                         if !primary_keys.is_empty() {
-                            external_table_builder =
-                                external_table_builder.on_conflict(OnConflict::Upsert(
-                                    ColumnReference::new(primary_keys),
-                                    UpsertOptions::default(),
-                                ));
+                            external_table_builder = external_table_builder.on_conflict(
+                                OnConflict::Upsert(ColumnReference::new(primary_keys)),
+                            );
                         }
                     }
                 }
@@ -310,7 +347,12 @@ impl AcceleratorEngineRegistry {
         };
 
         let table_provider = accelerator
-            .create_external_table(external_table, source, partition_by)
+            .create_external_table(
+                external_table,
+                source,
+                partition_by,
+                Some(ctx.runtime_env()),
+            )
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -331,6 +373,7 @@ pub trait DataAccelerator: Send + Sync {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
@@ -342,12 +385,30 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
+    /// Returns the storage layout configuration for this accelerator.
+    ///
+    /// Returns the appropriate `AccelerationLayout` for this engine type:
+    /// - File-based accelerators (`DuckDB`, `SQLite`) return `AccelerationLayout::file`
+    /// - Directory-based accelerators (Cayenne) return `AccelerationLayout::cayenne`
+    ///
+    /// This is used for snapshots and size metrics.
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
+        // Default: use file-based layout if file_path is available
+        if let Ok(path) = self.file_path(source) {
+            AccelerationLayout::file(PathBuf::from(path))
+        } else {
+            AccelerationLayout::default()
+        }
+    }
+
     /// Initialize the accelerator for a component
+    /// Returns `WasBootstrapped::yes()` if the accelerator was initialized from existing data,
+    /// `WasBootstrapped::no()` otherwise.
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(BootstrapStatus::none())
     }
 
     /// Check if the accelerator is initialized for a component
@@ -406,6 +467,7 @@ pub struct AcceleratorExternalTableBuilder {
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -420,6 +482,7 @@ impl AcceleratorExternalTableBuilder {
             indexes: HashMap::new(),
             constraints: None,
             on_conflict: None,
+            upsert_options: UpsertOptions::default(),
         }
     }
 
@@ -450,6 +513,12 @@ impl AcceleratorExternalTableBuilder {
     #[must_use]
     pub fn constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = Some(constraints);
+        self
+    }
+
+    #[must_use]
+    pub fn upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
+        self.upsert_options = upsert_options;
         self
     }
 
@@ -496,7 +565,21 @@ impl AcceleratorExternalTableBuilder {
         }
 
         if let Some(on_conflict) = self.on_conflict {
-            options.insert("on_conflict".to_string(), on_conflict.to_string());
+            let on_conflict_str = on_conflict.to_string();
+            tracing::debug!("Adding on_conflict to options: {}", on_conflict_str);
+            options.insert("on_conflict".to_string(), on_conflict_str);
+        }
+
+        // Pass upsert_options as JSON serialized string
+        if self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins {
+            options.insert(
+                "upsert_remove_duplicates".to_string(),
+                self.upsert_options.remove_duplicates.to_string(),
+            );
+            options.insert(
+                "upsert_last_write_wins".to_string(),
+                self.upsert_options.last_write_wins.to_string(),
+            );
         }
 
         let constraints = match self.constraints {
@@ -516,6 +599,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -574,6 +658,29 @@ pub async fn acceleration_file_path(
     Ok(PathBuf::from(file))
 }
 
+/// Gets the storage layout for the given acceleration source.
+///
+/// This function retrieves the registered accelerator for the source's engine
+/// and returns the engine-specific layout. Different engines use
+/// different layout types:
+/// - File-based engines (`DuckDB`, `SQLite`): `AccelerationLayout::file`
+/// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
+///
+/// This is used for snapshots and size metrics.
+pub async fn get_acceleration_layout(
+    source: &dyn AccelerationSource,
+) -> Result<AccelerationLayout, FilePathError> {
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
+
+    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+        .await
+        .context(AcceleratorEngineUnavailableSnafu {
+            engine: acceleration_settings.engine,
+        })?;
+
+    Ok(accelerator.acceleration_layout(source))
+}
+
 pub(crate) fn get_primary_keys_from_constraints(
     constraints: &Constraints,
     schema: &SchemaRef,
@@ -585,7 +692,7 @@ pub(crate) fn get_primary_keys_from_constraints(
                 Some(
                     col_indexes
                         .iter()
-                        .map(|&col_index| schema.field(col_index).name().to_string()),
+                        .map(|&col_index| schema.field(col_index).name().clone()),
                 )
             } else {
                 None
@@ -604,6 +711,39 @@ async fn get_registered_accelerator(
         .accelerator_engine_registry()
         .get_accelerator_engine(engine)
         .await
+}
+
+/// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
+/// during initialization, and carries any metadata from the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapStatus {
+    Bootstrapped(SnapshotDownloadInfo),
+    None,
+}
+
+impl BootstrapStatus {
+    #[must_use]
+    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
+        Self::Bootstrapped(info)
+    }
+
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::None
+    }
+
+    #[must_use]
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, Self::Bootstrapped { .. })
+    }
+
+    #[must_use]
+    pub const fn last_updated_at(&self) -> Option<i64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => info.last_updated_at,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -729,7 +869,7 @@ mod test {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::redundant_closure_for_method_calls,
     clippy::uninlined_format_args,
     clippy::bool_assert_comparison,
@@ -758,7 +898,7 @@ mod accelerator_compat_tests {
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
@@ -890,6 +1030,7 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -904,7 +1045,7 @@ mod accelerator_compat_tests {
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -918,7 +1059,7 @@ mod accelerator_compat_tests {
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
                     match TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -932,7 +1073,7 @@ mod accelerator_compat_tests {
                 Engine::DuckDB => {
                     use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -945,7 +1086,7 @@ mod accelerator_compat_tests {
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -1051,6 +1192,7 @@ mod accelerator_compat_tests {
                         external_table,
                         Some(&dataset),
                         Vec::new(),
+                        None,
                     ))
                     .catch_unwind();
 
@@ -1854,7 +1996,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
@@ -1876,7 +2017,10 @@ mod accelerator_compat_tests {
             assert_eq!(total_rows, 100, "{:?}: should have {} rows", engine, 100);
 
             // Test 2: Filter with WHERE clause (id > 50)
-            // Note: Arrow and Vortex engines don't support filter pushdown, so they return all rows
+            // Note: Arrow and Vortex engines don't support filter pushdown at the TableProvider
+            // level (via scan() method). Vortex supports filter pushdown at the physical plan
+            // level via DataFusion's FilterPushdown optimizer rule, but that only applies when
+            // running SQL queries, not when calling scan() directly.
             let filter = col("id").gt(lit(50_i64));
             let scan = table
                 .scan(&ctx.state(), None, &[filter], None)
@@ -1910,7 +2054,8 @@ mod accelerator_compat_tests {
             );
 
             // Test 4: LIMIT clause
-            // Note: Arrow and Vortex engines don't support limit pushdown
+            // Note: Arrow doesn't support limit pushdown. Vortex supports limit pushdown via
+            // FileScanConfig.limit at the TableProvider level when scan() is called with a limit.
             let limit = Some(10);
             let scan = table
                 .scan(&ctx.state(), None, &[], limit)
@@ -1930,7 +2075,9 @@ mod accelerator_compat_tests {
             }
 
             // Test 5: Combined filter + projection + limit
-            // Note: Arrow and Vortex engines don't support filter/limit pushdown
+            // Note: Arrow doesn't support filter/limit pushdown at the TableProvider level.
+            // Vortex supports limit pushdown via FileScanConfig.limit but filter pushdown
+            // only works via DataFusion's physical optimizer (when running SQL queries).
             let filter = col("id").lt(lit(30_i64));
             let projection = Some(vec![1_usize]); // name only
             let limit = Some(5);
@@ -1978,7 +2125,6 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
@@ -1998,8 +2144,7 @@ mod accelerator_compat_tests {
 
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
-            let plan = table
-                .delete_from(&ctx.state(), &[filter])
+            let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
                 .await
                 .expect("deletion should be successful");
 
@@ -2131,7 +2276,7 @@ mod accelerator_compat_tests {
                 if _mode == "file" {
                     options.insert("file".to_string(), location.clone());
                 }
-                options.insert("mode".to_string(), _mode.to_string());
+                options.insert("mode".to_string(), _mode.clone());
 
                 let external_table = CreateExternalTable {
                     schema: df_schema,
@@ -2140,6 +2285,7 @@ mod accelerator_compat_tests {
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,
+                    or_replace: false,
                     definition: None,
                     order_exprs: vec![],
                     unbounded: false,
@@ -2154,7 +2300,7 @@ mod accelerator_compat_tests {
                     Engine::Sqlite => {
                         use crate::dataaccelerator::sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("SQLite table should be created")
                     }
@@ -2162,7 +2308,7 @@ mod accelerator_compat_tests {
                     Engine::Turso => {
                         use crate::dataaccelerator::turso::TursoAccelerator;
                         TursoAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("Turso table should be created")
                     }
@@ -2170,14 +2316,14 @@ mod accelerator_compat_tests {
                     Engine::DuckDB => {
                         use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                         DuckDBAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("DuckDB table should be created")
                     }
                     Engine::Arrow => {
                         use crate::dataaccelerator::arrow::ArrowAccelerator;
                         ArrowAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new())
+                            .create_external_table(external_table, None, Vec::new(), None)
                             .await
                             .expect("Arrow table should be created")
                     }
@@ -2254,7 +2400,7 @@ mod accelerator_compat_tests {
                         });
 
                         CayenneAccelerator::new()
-                            .create_external_table(external_table, Some(&dataset), Vec::new())
+                            .create_external_table(external_table, Some(&dataset), Vec::new(), None)
                             .await
                             .expect("Vortex table should be created")
                     }
@@ -2378,7 +2524,9 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            // (when calling scan() directly). Filter pushdown for Vortex only works via
+            // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
@@ -2404,7 +2552,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2428,7 +2576,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2454,7 +2602,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2602,9 +2750,10 @@ mod accelerator_compat_tests {
                 .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow doesn't support filter or limit pushdown, so it returns all rows
-            // Vortex doesn't support filter pushdown but does support limit pushdown
-            // DuckDB supports both filter and limit pushdown
+            // Arrow doesn't support filter or limit pushdown at the TableProvider level
+            // Vortex doesn't support filter pushdown at TableProvider level (only via physical
+            // optimizer when running SQL), but does support limit pushdown via FileScanConfig.limit
+            // DuckDB supports both filter and limit pushdown at TableProvider level
             if engine == Engine::Arrow {
                 // No pushdown - returns all 10 rows
                 assert_eq!(
@@ -2767,16 +2916,8 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
     async fn test_overwrite_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
-            // Turso/SQLite doesn't support INSERT OVERWRITE in the same way - it appends instead
-            // This is a known limitation of the tokio-rusqlite table implementation
-            if engine == Engine::Turso {
-                println!("  Skipping Turso - INSERT OVERWRITE not fully supported");
-                return;
-            }
-
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 

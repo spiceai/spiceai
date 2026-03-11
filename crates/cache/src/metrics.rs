@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -160,7 +160,7 @@ pub trait CacheMetrics: Send + Sync {
         Self: Sized;
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn calculate_hit_ratio(hits: u64, total: u64) -> f64 {
     if total > 0 {
         hits as f64 / total as f64

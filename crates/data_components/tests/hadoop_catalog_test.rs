@@ -43,7 +43,7 @@ fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
     HadoopCatalogBuilder::default().with_warehouse_root("file:///tmp/hadoop_warehouse")
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     #[cfg(not(feature = "test_hadoop_catalog_docker"))]
     let minio_endpoint = std::env::var("MINIO_ENDPOINT")
@@ -73,7 +73,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 #[ctor]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn before_all() {
     let mut guard = DOCKER_COMPOSE_ENV
         .write()
@@ -89,7 +89,7 @@ fn before_all() {
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 #[dtor]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn after_all() {
     let mut guard = DOCKER_COMPOSE_ENV
         .write()
@@ -100,7 +100,7 @@ fn after_all() {
     }
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
     vec![
         #[cfg(feature = "test_hadoop_catalog_docker")]
@@ -313,7 +313,7 @@ mod tests {
         }
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     async fn load_table_and_check_results(
         namespace: NamespaceIdent,
         catalog: &HadoopCatalog,

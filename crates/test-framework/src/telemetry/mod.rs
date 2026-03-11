@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, LazyLock};
+pub mod streaming;
+
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Duration;
 
 use anyhow::Result;
 
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Meter, MeterProvider};
 
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::reader::MetricReader;
@@ -27,9 +30,11 @@ use opentelemetry_sdk::{
     metrics::{SdkMeterProvider, data::ResourceMetrics},
 };
 
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use secrecy::SecretString;
 use telemetry::exporter::TelemetryExporterBuilder;
-pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
+pub use telemetry::meter::METER_PROVIDER_ONCE;
+use telemetry::noop::NoopMeterProvider;
 use telemetry::reader::InitialReader;
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
@@ -40,18 +45,63 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-pub static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
+/// The global meter for benchmark telemetry.
+///
+/// Initialized explicitly by [`Telemetry::new_with_resource()`] or
+/// [`Telemetry::with_otlp_resource()`] after the provider is set.
+/// Using `OnceLock` prevents the ordering issue where early access
+/// with `LazyLock` would permanently lock the meter to a noop provider.
+///
+/// When metrics are disabled and `METER` is never initialized, all
+/// metric operations fall through to noop via the `meter()` helper.
+pub static METER: OnceLock<Meter> = OnceLock::new();
+
+/// Shared noop meter used when `METER` has not been initialized.
+/// This avoids allocating a new `NoopMeterProvider` on every `meter()` call.
+static NOOP_METER: LazyLock<Meter> =
+    LazyLock::new(|| NoopMeterProvider::new().meter("benchmarks_telemetry"));
+
+/// Returns the initialized meter, or a shared noop meter if not yet initialized.
+#[must_use]
+pub fn meter() -> Meter {
+    METER.get().cloned().unwrap_or_else(|| NOOP_METER.clone())
+}
+
+#[derive(Debug, Clone)]
+pub struct OtlpExporterConfig {
+    pub endpoint: Arc<str>,
+    pub headers: Vec<(String, String)>,
+    pub timeout: Duration,
+}
+
+enum TelemetryBackend {
+    Arrow { api_key: Option<SecretString> },
+    Otlp(OtlpExporterConfig),
+}
 
 pub struct Telemetry {
     reader: InitialReader,
     resource: Resource,
     setup: bool,
-    api_key: Option<SecretString>,
+    backend: TelemetryBackend,
 }
 
 impl Telemetry {
+    /// Create telemetry with empty resource.
+    /// Use `set_resource()` later to set the actual resource before calling `emit()`.
     #[must_use]
-    pub fn new(resource: &Resource, api_key_name: &str) -> Self {
+    pub fn new(api_key_name: &str) -> Self {
+        let resource = Resource::builder_empty().build();
+        Self::new_with_resource(&resource, api_key_name)
+    }
+
+    /// Create telemetry with a resource provided upfront.
+    ///
+    /// Use this when the resource attributes are already available at creation time.
+    /// For most cases, prefer `new()` + `set_resource()` to ensure telemetry is initialized
+    /// before any metrics calls.
+    #[must_use]
+    pub fn new_with_resource(resource: &Resource, api_key_name: &str) -> Self {
         let reader = InitialReader::default();
 
         let provider = SdkMeterProvider::builder()
@@ -59,22 +109,69 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        let setup = if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
+        let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
+        let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
+        if !setup {
             println!("Telemetry disabled");
-            false
-        } else {
-            true
-        };
+        }
+
+        // Initialize METER after the provider is set to avoid binding to a noop meter.
+        let _ = METER.set(provider.meter("benchmarks_telemetry"));
+
+        let api_key = std::env::var(api_key_name)
+            .ok()
+            .as_deref()
+            .map(|key| SecretString::new(key.into()));
 
         Self {
             reader,
             resource: resource.clone(),
             setup,
-            api_key: std::env::var(api_key_name)
-                .ok()
-                .as_deref()
-                .map(|key| SecretString::new(key.into())),
+            backend: TelemetryBackend::Arrow { api_key },
         }
+    }
+
+    #[must_use]
+    pub fn with_otlp(config: OtlpExporterConfig) -> Self {
+        let resource = Resource::builder_empty().build();
+        Self::with_otlp_resource(config, resource)
+    }
+
+    /// Create telemetry with OTLP backend and a resource provided upfront.
+    ///
+    /// Use this when the resource attributes are already available at creation time.
+    #[must_use]
+    pub fn with_otlp_resource(config: OtlpExporterConfig, resource: Resource) -> Self {
+        let reader = InitialReader::default();
+
+        let provider = SdkMeterProvider::builder()
+            .with_resource(resource.clone())
+            .with_reader(reader.clone())
+            .build();
+
+        let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
+        let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
+        if !setup {
+            println!("Telemetry disabled");
+        }
+
+        // Initialize METER after the provider is set to avoid binding to a noop meter.
+        let _ = METER.set(provider.meter("benchmarks_telemetry"));
+
+        Self {
+            reader,
+            resource,
+            setup,
+            backend: TelemetryBackend::Otlp(config),
+        }
+    }
+
+    /// Set the resource to be used when emitting metrics.
+    ///
+    /// Call this after collecting all the resource attributes (e.g., `spiced_version`, `commit_sha`)
+    /// but before calling `emit()`.
+    pub fn set_resource(&mut self, resource: Resource) {
+        self.resource = resource;
     }
 
     pub async fn emit(&self) -> Result<()> {
@@ -82,35 +179,51 @@ impl Telemetry {
             return Ok(());
         }
 
-        if let Some(api_key) = &self.api_key {
-            println!("Emitting to exporter at {}", *ENDPOINT);
-            let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
-                TelemetryExporterBuilder::new()
-                    .with_credentials(flight_client::Credentials::Bearer {
-                        token: api_key.clone().into(),
-                        prefix: false,
-                    })
-                    .with_service_name("benchmarks_telemetry".into())
-                    .with_endpoint(Arc::clone(&ENDPOINT))
-                    .build()
-                    .await?,
-            );
+        match &self.backend {
+            TelemetryBackend::Arrow { api_key } => {
+                if let Some(api_key) = api_key {
+                    println!("Emitting to exporter at {}", *ENDPOINT);
+                    let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
+                        TelemetryExporterBuilder::new()
+                            .with_credentials(flight_client::Credentials::Bearer {
+                                token: api_key.clone().into(),
+                                prefix: false,
+                            })
+                            .with_service_name("benchmarks_telemetry".into())
+                            .with_endpoint(Arc::clone(&ENDPOINT))
+                            .build()
+                            .await?,
+                    );
 
-            let mut rm = ResourceMetrics {
-                resource: self.resource.clone(),
-                scope_metrics: vec![],
-            };
+                    let mut rm = ResourceMetrics::default();
 
-            self.reader.collect(&mut rm)?;
+                    self.reader.collect(&mut rm)?;
 
-            telemetry_exporter
-                .export(&mut rm)
-                .await
-                .unwrap_or_else(|err| {
-                    println!("Failed to export initial telemetry: {err:?}");
-                });
-        } else {
-            println!("No API key provided, telemetry is disabled");
+                    // Note: In OpenTelemetry SDK 0.31+, ResourceMetrics.resource is set by the
+                    // pipeline during collection and cannot be overridden.
+
+                    telemetry_exporter.export(&rm).await.unwrap_or_else(|err| {
+                        println!("Failed to export initial telemetry: {err:?}");
+                    });
+                } else {
+                    println!("No API key provided, telemetry is disabled");
+                }
+            }
+            TelemetryBackend::Otlp(config) => {
+                let mut rm = ResourceMetrics::default();
+                // Note: Resource is set by the pipeline during collection.
+                self.reader.collect(&mut rm)?;
+
+                let exporter = MetricExporter::builder()
+                    .with_tonic()
+                    .with_timeout(config.timeout)
+                    .with_endpoint(config.endpoint.as_ref())
+                    .build()?;
+                exporter
+                    .export(&rm)
+                    .await
+                    .unwrap_or_else(|err| println!("Failed to export OTLP telemetry: {err:?}"));
+            }
         }
 
         Ok(())

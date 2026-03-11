@@ -86,22 +86,21 @@ runs:
     - name: Cache spicepod-validator binary
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-validator
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
         key: spicepod-validator-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
-        lookup-only: true
 
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
-      uses: spiceai/spiceai/.github/actions/setup-rust@trunk
+      uses: ./.github/actions/setup-rust
       with:
         os: ${{ steps.detect-os.outputs.os }}
 
     - name: Setup cc
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
-      uses: spiceai/spiceai/.github/actions/setup-cc@trunk
+      uses: ./.github/actions/setup-cc
 
     - name: Check if sccache can be set up
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
@@ -118,16 +117,21 @@ runs:
 
     - name: Set up sccache
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
-      uses: spiceai/spiceai/.github/actions/setup-sccache@trunk
+      uses: ./.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
+        os: ${{ steps.detect-os.outputs.os }}
+
+    - name: Set up make
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
+      uses: ./.github/actions/setup-make
+      with:
         os: ${{ steps.detect-os.outputs.os }}
 
     - name: Build spicepod-validator
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
       shell: bash
-      run: |
-        cargo build -p spicepod-validator --release
+      run: make build-validator
       env:
         RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
@@ -137,7 +141,7 @@ runs:
 
     - name: Save to cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
@@ -162,7 +166,7 @@ runs:
       shell: bash
       run: |
         mkdir -p /c/usr/local/bin
-        copy target/release/spicepod-validator.exe /c/usr/local/bin/spicepod-validator.exe
+        cp target/release/spicepod-validator.exe /c/usr/local/bin/spicepod-validator.exe
         chmod +x /c/usr/local/bin/spicepod-validator.exe
 
     - name: Set output path

@@ -92,7 +92,7 @@ pub struct Endpoint(pub String);
 pub struct CatalogId(pub String);
 
 impl UnityCatalog {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Result<Self> {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {

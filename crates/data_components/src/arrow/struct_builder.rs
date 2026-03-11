@@ -192,7 +192,7 @@ impl StructBuilder {
     /// Constructs and validates contents in the builder to ensure that
     /// - fields and `field_builders` are of equal length
     /// - the number of items in individual `field_builders` are equal to `self.len()`
-    #[allow(clippy::manual_assert)]
+    #[expect(clippy::manual_assert)]
     fn validate_content(&self) {
         if self.fields.len() != self.field_builders.len() {
             panic!("Number of fields is not equal to the number of field_builders.");

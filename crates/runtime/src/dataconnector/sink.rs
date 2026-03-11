@@ -198,10 +198,17 @@ impl DataSink for SinkDataSink {
 
     async fn write_all(
         &self,
-        _data: SendableRecordBatchStream,
+        mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        Ok(0)
+        use futures::StreamExt as _;
+        // Drain the stream to satisfy the streaming contract even though
+        // the sink discards the data.
+        let mut rows: u64 = 0;
+        while let Some(batch) = data.next().await {
+            rows += batch?.num_rows() as u64;
+        }
+        Ok(rows)
     }
 }
 
@@ -223,3 +230,5 @@ impl DisplayAs for SinkDataSink {
         write!(f, "SinkDataSink")
     }
 }
+
+register_data_connector!("sink", SinkConnectorFactory);

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
 use async_openai::types::responses::{
-    Content, CreateResponse, OutputContent, OutputMessage, Response as OpenAIResponse,
-    ResponseCompleted, ResponseEvent, ResponseIncomplete, ResponseStream,
+    CreateResponse, OutputItem, OutputMessageContent, Response as OpenAIResponse,
+    ResponseCompletedEvent, ResponseIncompleteEvent, ResponseStream, ResponseStreamEvent,
 };
 use axum::{
     Extension, Json,
@@ -28,12 +28,12 @@ fn extract_text(resp: &OpenAIResponse) -> String {
     resp.output
         .iter()
         .filter_map(|out| {
-            let OutputContent::Message(OutputMessage { content, .. }) = out else {
+            let OutputItem::Message(msg) = out else {
                 return None;
             };
-            match content.first()? {
-                Content::OutputText(output_text) => Some(output_text.text.clone()),
-                Content::Refusal(_) => None,
+            match msg.content.first()? {
+                OutputMessageContent::OutputText(output_text) => Some(output_text.text.clone()),
+                OutputMessageContent::Refusal(_) => None,
             }
         })
         .join("\n")
@@ -42,10 +42,10 @@ fn extract_text(resp: &OpenAIResponse) -> String {
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/responses",
-    operation_id = "post_chat_responses",
+    operation_id = "post_responses",
     tag = "AI",
     request_body(
-        description = "Create an Open AI Responses API request using a language model.",
+        description = "Create a response using the OpenAI Responses API format. This endpoint provides a more flexible conversation interface compared to Chat Completions.",
         content((
             CreateResponse = "application/json",
             example = json!({
@@ -112,10 +112,10 @@ fn extract_text(resp: &OpenAIResponse) -> String {
             })
         ))),
         (status = 404, description = "The specified model was not found"),
-        (status = 500, description = "An internal server error occurred while processing the chat completion", content((
+        (status = 500, description = "An internal server error occurred while processing the response", content((
             serde_json::Value = "application/json",
             example = json!({
-                "error": "An internal server error occurred while processing the chat completion."
+                "error": "An internal server error occurred while processing the response."
             })
         )))
     )
@@ -132,8 +132,12 @@ pub(crate) async fn post(
         "ai_chat",
         input = %serde_json::to_string(&req).unwrap_or_default()
     );
+
+    let Some(model_id) = req.model.clone() else {
+        return (StatusCode::BAD_REQUEST, "model is required").into_response();
+    };
     span.in_scope(
-        || tracing::info!(target: "task_history", model = %req.model, api = "responses", "labels"),
+        || tracing::info!(target: "task_history", model = %model_id, api = "responses", "labels"),
     );
 
     if let Some(traceparent) = context.trace_parent() {
@@ -142,7 +146,7 @@ pub(crate) async fn post(
 
     let span_clone = span.clone();
     async move {
-        let model_id = req.model.clone();
+        let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
@@ -206,24 +210,26 @@ async fn create_response_sse_response(
                     match msg {
                         Ok(response_event) => {
                             let should_break = match &response_event {
-                                ResponseEvent::ResponseOutputTextDelta(delta) => {
+                                ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                                     captured_output.push_str(&delta.delta);
                                     false
                                 }
-                                ResponseEvent::ResponseIncomplete(ResponseIncomplete {
-                                    sequence_number,
-                                    ..
-                                })
-                                | ResponseEvent::ResponseCompleted(ResponseCompleted {
-                                    sequence_number,
-                                    ..
-                                }) => {
+                                ResponseStreamEvent::ResponseIncomplete(
+                                    ResponseIncompleteEvent {
+                                        sequence_number, ..
+                                    },
+                                )
+                                | ResponseStreamEvent::ResponseCompleted(
+                                    ResponseCompletedEvent {
+                                        sequence_number, ..
+                                    },
+                                ) => {
                                     if id.is_none() {
                                         id = Some(*sequence_number);
                                     }
                                     true
                                 }
-                                ResponseEvent::ResponseFailed(_) => true,
+                                ResponseStreamEvent::ResponseFailed(_) => true,
                                 _ => false,
                             };
 

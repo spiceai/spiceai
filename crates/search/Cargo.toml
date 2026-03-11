@@ -20,17 +20,19 @@ data_components = { path = "../data_components", optional = true }
 datafusion.workspace = true
 datafusion-expr.workspace = true
 datafusion-functions-json = { workspace = true }
+datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
 futures.workspace = true
 itertools.workspace = true
-llms = { path = "../llms", optional = true }
+llms = { path = "../llms", default-features = false, optional = true }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-table-partition = { path = "../runtime-table-partition" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
 [features]
 default = ["text_search", "s3_vectors"]

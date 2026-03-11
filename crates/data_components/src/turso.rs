@@ -111,7 +111,7 @@ use std::ops::ControlFlow;
 
 use datafusion::{
     catalog::Session,
-    common::SchemaExt,
+    common::{SchemaExt, utils::quote_identifier},
     datasource::{
         TableProvider,
         sink::{DataSink, DataSinkExec},
@@ -149,6 +149,7 @@ use datafusion_federation::{
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
+use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
@@ -369,7 +370,7 @@ fn is_now_function(func: &Function) -> bool {
 /// Connection pool for Turso databases
 ///
 /// Manages connections to a Turso database (file-based or in-memory).
-/// Supports MVCC (Multi-Version Concurrency Control) for concurrent transactions.
+/// Supports concurrent transactions using MVCC mode with `BEGIN CONCURRENT`.
 ///
 /// # Architecture
 ///
@@ -385,18 +386,21 @@ fn is_now_function(func: &Function) -> bool {
 ///
 /// ```rust,ignore
 /// // Create pool once and share it
-/// let pool = Arc::new(TursoConnectionPool::new(":memory:", false).await?);
+/// let pool = Arc::new(TursoConnectionPool::new(":memory:").await?);
 ///
 /// // Use pool.connect() for each operation
 /// let conn = pool.connect().await?;
 /// ```
+///
+/// Note: Concurrent transactions are enabled by configuring
+/// `PRAGMA journal_mode = 'mvcc'` during pool creation.
+/// This enables BEGIN CONCURRENT transactions for better concurrency.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
 /// caches pool instances per database file for even better performance.
 #[derive(Debug)]
 pub struct TursoConnectionPool {
     database: Arc<Database>,
-    mvcc_enabled: bool,
     db_path: String,
     timestamp_format: TimestampFormat,
 }
@@ -406,31 +410,34 @@ impl TursoConnectionPool {
     ///
     /// # Arguments
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
-    /// * `mvcc_enabled` - Whether to enable Multi-Version Concurrency Control
-    pub async fn new(path: &str, mvcc_enabled: bool) -> Result<Self> {
-        Self::new_with_timestamp_format(path, mvcc_enabled, TimestampFormat::default()).await
+    pub async fn new(path: &str) -> Result<Self> {
+        Self::new_with_timestamp_format(path, TimestampFormat::default()).await
     }
 
     /// Creates a new connection pool with specified timestamp format.
     ///
     /// # Arguments
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
-    /// * `mvcc_enabled` - Whether to enable Multi-Version Concurrency Control
     /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
+    ///
+    /// Note: BEGIN CONCURRENT requires MVCC journal mode, which is configured during pool creation.
     pub async fn new_with_timestamp_format(
         path: &str,
-        mvcc_enabled: bool,
         timestamp_format: TimestampFormat,
     ) -> Result<Self> {
         let database = Builder::new_local(path)
-            .with_mvcc(mvcc_enabled)
             .build()
+            .await
+            .context(TursoDatabaseSnafu)?;
+
+        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
+        let conn = database.connect().context(TursoDatabaseSnafu)?;
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
             .await
             .context(TursoDatabaseSnafu)?;
 
         Ok(Self {
             database: Arc::new(database),
-            mvcc_enabled,
             db_path: path.to_string(),
             timestamp_format,
         })
@@ -441,15 +448,9 @@ impl TursoConnectionPool {
     /// This method is lightweight and can be called frequently. Each connection
     /// shares the underlying database instance, making it efficient for high-frequency
     /// operations.
-    #[allow(clippy::unused_async)]
+    #[expect(clippy::unused_async)]
     pub async fn connect(&self) -> Result<Connection> {
         self.database.connect().context(TursoDatabaseSnafu)
-    }
-
-    /// Returns true if MVCC (Multi-Version Concurrency Control) is enabled
-    #[must_use]
-    pub fn is_mvcc_enabled(&self) -> bool {
-        self.mvcc_enabled
     }
 
     /// Returns true if this is an in-memory database
@@ -533,7 +534,7 @@ impl TursoTableProvider {
     /// - Time: Time32, Time64
     /// - Duration, Interval, Decimal128, Decimal256
     /// - Complex types: List, Map (serialized as JSON)
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
         clippy::cast_precision_loss,
@@ -1004,7 +1005,7 @@ impl TursoTableProvider {
                                     for (key, value) in map {
                                         map_builder.keys().append_value(&key);
                                         if let Some(int_val) = value.as_i64() {
-                                            #[allow(clippy::cast_possible_truncation)]
+                                            #[expect(clippy::cast_possible_truncation)]
                                             let val = int_val as i32;
                                             map_builder.values().append_value(val);
                                         } else {
@@ -1046,14 +1047,14 @@ impl TursoTableProvider {
                     // Decimal128 stored as REAL in database
                     // Convert back to i128 scaled value
                     const DECIMAL_BASE: i128 = 10;
-                    #[allow(clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_sign_loss)]
                     let scale_factor = DECIMAL_BASE.pow(*scale as u32);
                     let values: Vec<Option<i128>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Real(f) => {
                                 // Convert float to scaled integer
-                                #[allow(
+                                #[expect(
                                     clippy::cast_possible_truncation,
                                     clippy::cast_precision_loss
                                 )]
@@ -1083,14 +1084,14 @@ impl TursoTableProvider {
                     // Decimal256 stored as REAL in database
                     // Convert back to i256 scaled value
                     const DECIMAL_BASE: i128 = 10;
-                    #[allow(clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_sign_loss)]
                     let scale_factor = DECIMAL_BASE.pow(*scale as u32);
                     let values: Vec<Option<i256>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Real(f) => {
                                 // Convert float to scaled integer
-                                #[allow(
+                                #[expect(
                                     clippy::cast_possible_truncation,
                                     clippy::cast_precision_loss
                                 )]
@@ -1218,7 +1219,7 @@ impl TableProvider for TursoTableProvider {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _overwrite: InsertOp,
+        overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Check that the input schema matches the table schema
         if let Err(e) = self
@@ -1235,6 +1236,7 @@ impl TableProvider for TursoTableProvider {
             Arc::clone(&self.pool),
             self.table_name.clone(),
             Arc::clone(&self.schema),
+            overwrite,
         ));
 
         // Wrap in DataSinkExec to execute the insertion
@@ -1371,8 +1373,8 @@ impl SQLExecutor for TursoTableProvider {
                 DataFusionError::Execution(format!("Failed to connect to Turso: {e}"))
             })?;
 
-        // Query the table schema using SQLite's pragma
-        let query = format!("PRAGMA table_info({table_name})");
+        // Query the table schema using SQLite's pragma with quoted identifier
+        let query = format!("PRAGMA table_info({})", quote_identifier(table_name));
         let mut rows = conn
             .query(&query, ())
             .await
@@ -1473,12 +1475,12 @@ impl TursoExec {
     /// Note: Projection pushdown is handled by the schema parameter,
     /// which is already the projected schema from `scan()`.
     fn sql(&self) -> datafusion::error::Result<String> {
-        // Build column list from projected schema
+        // Build column list from projected schema, quoting identifiers to prevent injection and handle special characters.
         let columns = self
             .schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()).into_owned())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1502,7 +1504,10 @@ impl TursoExec {
 
         Ok(format!(
             "SELECT {} FROM {}{}{}",
-            columns, self.table_name, where_expr, limit_expr
+            columns,
+            quote_identifier(&self.table_name),
+            where_expr,
+            limit_expr
         ))
     }
 }
@@ -1512,7 +1517,7 @@ impl DisplayAs for TursoExec {
         let table_name = &self.table_name;
         let sql = self
             .sql()
-            .unwrap_or_else(|_| format!("SELECT * FROM {table_name}"));
+            .unwrap_or_else(|_| format!("SELECT * FROM {}", quote_identifier(table_name)));
         write!(f, "TursoExec sql={sql}")
     }
 }
@@ -1641,7 +1646,11 @@ impl DeletionSink for TursoDeletionSink {
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
 
-        let delete_sql = format!("DELETE FROM {}{}", self.table_name, where_clause);
+        let delete_sql = format!(
+            "DELETE FROM {}{}",
+            quote_identifier(&self.table_name),
+            where_clause
+        );
 
         let conn = self.pool.connect().await?;
         let rows_affected = conn
@@ -1659,23 +1668,125 @@ pub struct TursoDataSink {
     pool: Arc<TursoConnectionPool>,
     table_name: String,
     schema: SchemaRef,
+    overwrite: InsertOp,
 }
 
 impl DisplayAs for TursoDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "TursoDataSink(table={})", self.table_name)
+        write!(
+            f,
+            "TursoDataSink(table={}, mode={:?})",
+            self.table_name, self.overwrite
+        )
     }
 }
 
 impl TursoDataSink {
     /// Creates a new data sink for INSERT operations
     #[must_use]
-    pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef) -> Self {
+    pub fn new(
+        pool: Arc<TursoConnectionPool>,
+        table_name: String,
+        schema: SchemaRef,
+        overwrite: InsertOp,
+    ) -> Self {
         Self {
             pool,
             table_name,
             schema,
+            overwrite,
         }
+    }
+
+    fn insert_sql(&self) -> String {
+        let columns: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| quote_identifier(f.name()).into_owned())
+            .collect();
+
+        let placeholders = (1..=columns.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quote_identifier(&self.table_name),
+            columns.join(", "),
+            placeholders
+        )
+    }
+
+    async fn rollback_write(conn: &Connection) {
+        if let Err(error) = conn.execute("ROLLBACK", ()).await {
+            tracing::debug!("Failed to rollback Turso write transaction: {error}");
+        }
+    }
+
+    async fn overwrite_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+    ) -> datafusion::error::Result<u64> {
+        let conn = self
+            .pool
+            .connect()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let delete_sql = format!("DELETE FROM {}", quote_identifier(&self.table_name));
+        let insert_sql = self.insert_sql();
+
+        let write_result = async {
+            conn.execute(BEGIN_CONCURRENT_SQL, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            conn.execute(&delete_sql, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let mut stmt = conn
+                .prepare(&insert_sql)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let mut total_rows = 0u64;
+
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                total_rows += batch.num_rows() as u64;
+
+                for row_idx in 0..batch.num_rows() {
+                    let mut values = Vec::with_capacity(batch.num_columns());
+                    for col_idx in 0..batch.num_columns() {
+                        let column = batch.column(col_idx);
+                        let value = ScalarValue::try_from_array(column, row_idx)?;
+                        let turso_value =
+                            scalar_value_to_turso(value, self.pool.timestamp_format())
+                                .map_err(DataFusionError::External)?;
+                        values.push(turso_value);
+                    }
+
+                    stmt.execute(values)
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                }
+            }
+
+            conn.execute(COMMIT_SQL, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            Ok(total_rows)
+        }
+        .await;
+
+        if write_result.is_err() {
+            Self::rollback_write(&conn).await;
+        }
+
+        write_result
     }
 
     /// Inserts a batch of records into the Turso database
@@ -1688,35 +1799,11 @@ impl TursoDataSink {
         }
 
         let conn = self.pool.connect().await?;
-
-        // Build column list and placeholders for prepared statement
-        let columns: Vec<String> = self
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-
-        let placeholders = (1..=columns.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            self.table_name,
-            columns.join(", "),
-            placeholders
-        );
+        let insert_sql = self.insert_sql();
 
         // Use a transaction to batch all inserts
-        // If MVCC is enabled, use BEGIN CONCURRENT for better concurrency
-        let begin_stmt = if self.pool.is_mvcc_enabled() {
-            "BEGIN CONCURRENT"
-        } else {
-            "BEGIN"
-        };
-        conn.execute(begin_stmt, ()).await?;
+        // BEGIN CONCURRENT improves write concurrency on Turso in MVCC mode.
+        conn.execute(BEGIN_CONCURRENT_SQL, ()).await?;
 
         // Prepare the statement once
         let mut stmt = conn.prepare(&insert_sql).await?;
@@ -1738,7 +1825,7 @@ impl TursoDataSink {
         }
 
         // Commit the transaction
-        conn.execute("COMMIT", ()).await?;
+        conn.execute(COMMIT_SQL, ()).await?;
 
         Ok(())
     }
@@ -1763,6 +1850,10 @@ impl DataSink for TursoDataSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::error::Result<u64> {
+        if self.overwrite == InsertOp::Overwrite {
+            return self.overwrite_all(data).await;
+        }
+
         let mut total_rows = 0u64;
 
         while let Some(batch) = data.next().await {
@@ -1818,7 +1909,7 @@ fn convert_timestamp_to_turso(
 
             // Split into seconds and subsecond nanos
             let secs = nanos / timestamp_conversion::NANOS_PER_SECOND;
-            #[allow(clippy::cast_sign_loss)]
+            #[expect(clippy::cast_sign_loss)]
             let nsecs = (nanos % timestamp_conversion::NANOS_PER_SECOND) as u32;
 
             // Create NaiveDateTime using the new DateTime::from_timestamp API
@@ -1891,7 +1982,7 @@ fn convert_timestamp_to_turso(
 /// - `Timestamp*(_, Some(_))` → ERROR
 ///
 /// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
-#[allow(clippy::too_many_lines, clippy::match_same_arms)]
+#[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
     timestamp_format: TimestampFormat,
@@ -1964,15 +2055,15 @@ fn scalar_value_to_turso(
         }
         ScalarValue::Decimal128(Some(v), _, scale) => {
             // Convert decimal to float for storage as REAL
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let scale_factor = (DECIMAL_BASE as f64).powi(i32::from(scale));
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let v_f64 = v as f64;
             TursoValue::Real(v_f64 / scale_factor)
         }
         ScalarValue::Decimal256(Some(v), _, scale) => {
             // Convert decimal256 to float for storage as REAL
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let scale_factor = (DECIMAL_BASE as f64).powi(i32::from(scale));
             let v_str = format!("{v}");
             let v_f64 = v_str

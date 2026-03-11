@@ -9,18 +9,32 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow.workspace = true
 arrow-json.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-dynamodb.workspace = true
+bollard = "0.18.1"
 clap.workspace = true
+duckdb = { workspace = true, features = ["bundled"] }
+futures.workspace = true
+itertools.workspace = true
 hf-hub = { workspace = true }
+insta.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../../crates/yaml" }
 spiceai.workspace = true
+spicepod = { path = "../../crates/spicepod" }
 test-framework = { path = "../../crates/test-framework" }
+rand.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 
 [features]
+default = ["append"]
 anonymous_telemetry = []
 aws-secrets-manager = []
 clickhouse = []

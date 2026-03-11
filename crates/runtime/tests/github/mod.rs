@@ -27,7 +27,7 @@ use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{
     configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 enum GithubDatasetType {
@@ -86,9 +86,9 @@ fn make_github_dataset(
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_github_issues() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -208,6 +208,7 @@ async fn test_github_issues() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_commits() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -269,6 +270,7 @@ async fn test_github_commits() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_stargazers() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -330,6 +332,7 @@ async fn test_github_stargazers() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_org_members() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -383,6 +386,7 @@ async fn test_github_org_members() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -440,6 +444,7 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
 #[tokio::test]
 async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -519,6 +524,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -575,6 +581,7 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_pull_requests_schema_review_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -634,6 +641,7 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
 #[tokio::test]
 async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -696,6 +704,7 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
 #[tokio::test]
 async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -743,6 +752,134 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 22);
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_workflows() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "workflows".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_workflows_list",
+                "select name, path from spiceai_workflows_auto ORDER BY created_at ASC limit 10;",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let pretty_batches = batches_to_string(&result_batches);
+                    insta::assert_snapshot!("workflows_list_data", pretty_batches);
+
+                    let total_rows = result_batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum::<usize>();
+                    assert_eq!(total_rows, 10);
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_workflow_runs() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let mut workflow_runs_dataset = make_github_dataset(
+                &GithubDatasetType::RepoSpecific {
+                    owner: "spiceai".to_string(),
+                    repo: "spiceai".to_string(),
+                    query_type: "workflows/testoperator_run_bench.yml/runs".to_string(),
+                },
+                "auto",
+                None,
+            );
+
+            workflow_runs_dataset.name = "spiceai_workflow_runs_auto".to_string();
+            if let Some(params) = workflow_runs_dataset.params.as_mut() {
+                let mut params_map = params.as_string_map();
+                params_map.insert("github_workflow_logs".to_string(), "enabled".to_string());
+                *params = spicepod::param::Params::from_string_map(params_map);
+            } else {
+                let mut params_map = HashMap::new();
+                params_map.insert("github_workflow_logs".to_string(), "enabled".to_string());
+                workflow_runs_dataset.params =
+                    Some(spicepod::param::Params::from_string_map(params_map));
+            }
+
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(workflow_runs_dataset)
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_workflow_runs",
+                "describe spiceai_workflow_runs_auto;",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    insta::assert_snapshot!(
+                        "workflow_runs_schema",
+                        batches_to_string(&result_batches)
+                    );
+
+                    let total_rows = result_batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum::<usize>();
+                    assert_eq!(total_rows, 13);
                 })),
             )
             .await?;

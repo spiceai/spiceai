@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -107,6 +108,7 @@ impl DataConnectorFactory for AdbcFactory {
                 .parameters
                 .get("adbc_driver")
                 .expose()
+                .ok()
                 .context(MissingAdbcDriverSnafu)
                 .map_err(|e| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "adbc".to_string(),
@@ -115,10 +117,11 @@ impl DataConnectorFactory for AdbcFactory {
                 })?;
 
             let driver_path = params.parameters.get("adbc_driver_path").expose().ok();
+            let driver_location = driver_path.unwrap_or(driver_name);
 
             let mut driver = ManagedDriver::load_from_name(
-                driver_name,
-                driver_path,
+                driver_location,
+                None,
                 AdbcVersion::V110,
                 LOAD_FLAG_DEFAULT,
                 None,
@@ -191,6 +194,8 @@ impl DataConnectorFactory for AdbcFactory {
         PARAMETERS
     }
 }
+
+register_data_connector!("adbc", AdbcFactory);
 
 #[async_trait]
 impl DataConnector for Adbc {

@@ -34,7 +34,7 @@ pub trait ComputeQueryVector: std::fmt::Debug + Send + Sync {
 /// Importantly, the `query` payload must be known at construction.
 ///
 /// Useful for when the same embedding call is performed several times in a query (e.g. Spilling or partitioned vector indexes).
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 #[derive(Clone, Debug)]
 pub struct CachedQueryVector {
     inner: Arc<dyn ComputeQueryVector>,

@@ -32,6 +32,9 @@ on:
       - 'Dockerfile*'
       - 'bin/spice/**'
 
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight UTC
+
   workflow_dispatch:
     inputs:
       run_all_tests:
@@ -57,25 +60,31 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
 
 jobs:
   build:
-    name: Build Test Binary
+    name: Build Test Binary (macOS)
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
         with:
-          os: 'darwin'
-      
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -83,9 +92,12 @@ jobs:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else
@@ -96,7 +108,7 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
@@ -107,16 +119,18 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -127,7 +141,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -138,7 +152,7 @@ jobs:
 
       - name: Run Beta functionality embeddings test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -148,26 +162,28 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-  
+
   test-ai-udf:
-    name: Test AI UDF
+    name: Test AI UDFs
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -180,7 +196,7 @@ jobs:
 
       - name: Run AI UDF basic test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
         run: |
@@ -196,7 +212,7 @@ jobs:
 
       - name: Run AI UDF with dataset test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
@@ -217,7 +233,7 @@ jobs:
 
       - name: Run AI UDF LEFT truncate test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
@@ -237,34 +253,36 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   test-hf:
-    name: Test Huggingface Models
+    name: Test Hugging Face Models
     needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -275,7 +293,7 @@ jobs:
 
       - name: Run Beta functionality embedding tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -285,7 +303,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -295,29 +313,31 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
 
       - name: Run Beta functionality embedding tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -327,7 +347,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -335,33 +355,35 @@ jobs:
   test-bedrock:
     name: Test Bedrock Models
     needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
 
       - name: Run Beta functionality embedding tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -371,16 +393,18 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -391,7 +415,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -401,26 +425,73 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-extended:
+    name: Build Test Binary (Extended)
+    runs-on: 'spiceai-macos'
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      # Build the test binary without running tests
+      - name: Build AI integration test binary
+        env:
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+            FEATURES="${FEATURES},bedrock,extended_tests"
+            echo "Including extended_tests"
+          else
+            echo "Excluding extended_tests"
+          fi
+
+          cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration-extended.tar.zst
+
+      # Upload the test archive as an artifact
+      - name: Upload test archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: ai-integration-test-archive-extended
+          path: ./integration-extended.tar.zst
+          retention-days: 1
 
   test-search:
     name: Test Search
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -431,7 +502,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
@@ -443,7 +514,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

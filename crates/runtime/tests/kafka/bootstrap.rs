@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bollard::secret::HealthConfig;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::{FutureProducer, Producer};
 use rdkafka::{config::ClientConfig, producer::FutureRecord};
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
@@ -96,14 +96,20 @@ pub async fn start_kafka_docker_container(
         );
     }
 
-    Ok((
-        running_container,
-        create_kafka_producer(
-            &format!("localhost:{port}"),
-            Some(KAFKA_SASL_USERNAME),
-            Some(KAFKA_SASL_PASSWORD),
-        )?,
-    ))
+    let producer = create_kafka_producer(
+        &format!("localhost:{port}"),
+        Some(KAFKA_SASL_USERNAME),
+        Some(KAFKA_SASL_PASSWORD),
+    )?;
+
+    // Verify broker is ready to accept connections by fetching metadata
+    verify_broker_ready(&producer, topics).await?;
+
+    // Additional stabilization delay to ensure broker is fully ready for message production
+    // This helps avoid race conditions in CI environments with resource contention
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    Ok((running_container, producer))
 }
 
 pub fn create_kafka_producer(
@@ -114,7 +120,7 @@ pub fn create_kafka_producer(
     let mut config = ClientConfig::new();
     config
         .set("bootstrap.servers", broker)
-        .set("message.timeout.ms", "5000");
+        .set("message.timeout.ms", "30000");
 
     if let (Some(user), Some(pass)) = (username, password) {
         config
@@ -130,6 +136,68 @@ pub fn create_kafka_producer(
     Ok(producer)
 }
 
+/// Verify that the Kafka broker is ready to accept connections by fetching metadata.
+/// This helps avoid race conditions where the container is "healthy" but SASL auth
+/// isn't fully initialized yet.
+async fn verify_broker_ready(
+    producer: &FutureProducer,
+    topics: &[&str],
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for attempt in 1..=MAX_RETRIES {
+        match producer.client().fetch_metadata(None, METADATA_TIMEOUT) {
+            Ok(metadata) => {
+                // Verify that all expected topics exist
+                let available_topics: Vec<&str> = metadata
+                    .topics()
+                    .iter()
+                    .map(rdkafka::metadata::MetadataTopic::name)
+                    .collect();
+                let missing_topics: Vec<&str> = topics
+                    .iter()
+                    .filter(|t| !available_topics.contains(t))
+                    .copied()
+                    .collect();
+
+                if missing_topics.is_empty() {
+                    tracing::debug!(
+                        "Broker ready: found {} brokers and {} topics",
+                        metadata.brokers().len(),
+                        metadata.topics().len()
+                    );
+                    return Ok(());
+                }
+
+                tracing::debug!(
+                    "Broker metadata fetched but missing topics {:?} (attempt {}/{})",
+                    missing_topics,
+                    attempt,
+                    MAX_RETRIES
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to fetch broker metadata (attempt {}/{}): {}",
+                    attempt,
+                    MAX_RETRIES,
+                    e
+                );
+            }
+        }
+
+        if attempt < MAX_RETRIES {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to verify broker readiness after {MAX_RETRIES} attempts"
+    ))
+}
+
 pub async fn send_messages_to_kafka<T>(
     producer: &FutureProducer,
     topic: &str,
@@ -139,8 +207,8 @@ where
     T: serde::Serialize,
 {
     const MAX_RETRIES: u32 = 5;
-    const DELAY_S: u64 = 1;
-    const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+    const DELAY_S: u64 = 2;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
     for message in messages {
         let message_str = serde_json::to_string(message)?;

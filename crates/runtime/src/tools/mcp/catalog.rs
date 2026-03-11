@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
+use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
@@ -41,7 +41,7 @@ use tokio::{
 
 use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 
-use super::{MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
+use super::{Error, MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
@@ -107,7 +107,14 @@ impl McpToolCatalog {
             loop {
                 interval.tick().await;
 
-                let heartbeat_result = client_clone.read().await.ping().await;
+                // Perform the heartbeat ping. The read lock is held during the ping call.
+                // Note: The underlying McpClient wraps a RunningService which is not Clone,
+                // so we cannot clone the client to release the lock before the network call.
+                // This is acceptable because the ping timeout is bounded.
+                let heartbeat_result = {
+                    let client_guard = client_clone.read().await;
+                    client_guard.ping().await
+                };
                 if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
                     tracing::debug!("MCP client heartbeat failed with error: {e}");
@@ -136,7 +143,7 @@ impl McpToolCatalog {
 
                 // Security: Validate command path to prevent command injection
                 if DANGEROUS_PATH_GLOB_SET.is_match(command) {
-                    return Err(super::Error::CouldNotConstructTool {
+                    return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
                             "Invalid command path '{command}'. Path contains dangerous components"
@@ -146,7 +153,7 @@ impl McpToolCatalog {
 
                 // Security: Limit number of arguments to prevent resource exhaustion
                 if args.len() > MAX_ARGS {
-                    return Err(super::Error::CouldNotConstructTool {
+                    return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
                             "Too many arguments ({}). Maximum allowed: {MAX_ARGS}",
@@ -158,7 +165,7 @@ impl McpToolCatalog {
                 // Security: Validate argument lengths to prevent buffer overflow attacks
                 for (i, arg) in args.iter().enumerate() {
                     if arg.len() > MAX_ARG_LENGTH {
-                        return Err(super::Error::CouldNotConstructTool {
+                        return Err(Error::CouldNotConstructTool {
                             name: "mcp_stdio".to_string(),
                             e: format!(
                                 "Argument {i} too long ({} bytes). Maximum allowed: {MAX_ARG_LENGTH} bytes",
@@ -185,7 +192,7 @@ impl McpToolCatalog {
             MCPConfig::Https { url } => {
                 // Security: Validate URL scheme (only https allowed, http for localhost testing)
                 if url.scheme() != "https" && url.scheme() != "http" {
-                    return Err(super::Error::CouldNotConstructTool {
+                    return Err(Error::CouldNotConstructTool {
                         name: "mcp_https".to_string(),
                         e: format!(
                             "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
@@ -357,6 +364,9 @@ impl SpiceToolCatalog for McpToolCatalog {
     fn name(&self) -> &str {
         self.name.as_str()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let tools = self.list_tools().await.unwrap_or_default();
         tools
@@ -376,7 +386,6 @@ impl SpiceToolCatalog for McpToolCatalog {
         tools
             .into_iter()
             .map(|t| ChatCompletionTool {
-                r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: None,
                     name: t.name.to_string(),
@@ -403,5 +412,104 @@ impl SpiceToolCatalog for McpToolCatalog {
             tool,
             self.name.clone(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dangerous_patterns_reject_parent_traversal() {
+        // Unix-style parent directory traversal
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match(".."));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("../etc/passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("subdir/../../etc/passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("foo/../bar"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_reject_windows_parent_traversal() {
+        // Windows-style parent directory traversal
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("..\\etc\\passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("subdir\\..\\..\\etc\\passwd"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_reject_absolute_paths() {
+        // Unix absolute paths
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/etc/passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/var/log/secrets"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_reject_windows_absolute_paths() {
+        // Windows drive letters
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("C:\\Windows\\System32"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("D:\\secrets"));
+
+        // Windows UNC paths
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("\\\\server\\share"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("\\\\192.168.1.1\\admin"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_allow_legitimate_hidden_files() {
+        // Legitimate hidden files and directories should NOT match
+        // These start with . but are not path traversal attempts
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".config"),
+            ".config should be allowed (legitimate hidden directory)"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".cache"),
+            ".cache should be allowed (legitimate hidden directory)"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".bashrc"),
+            ".bashrc should be allowed (legitimate hidden file)"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".ssh/id_rsa"),
+            ".ssh/id_rsa should be allowed (legitimate path in hidden directory)"
+        );
+    }
+
+    #[test]
+    fn test_dangerous_patterns_allow_safe_relative_paths() {
+        // Safe relative paths should NOT match
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("myfile.txt"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("subdir/myfile.txt"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("a/b/c/file.txt"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_allow_current_directory_simple() {
+        // Simple current directory references are safe and should NOT match
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match("."),
+            ". (current dir) should be allowed"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match("./script.sh"),
+            "./script.sh should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_is_localhost_ipv4() {
+        assert!(is_localhost("127.0.0.1"));
+        assert!(is_localhost("localhost"));
+        assert!(is_localhost("0.0.0.0"));
+        assert!(!is_localhost("192.168.1.1"));
+        assert!(!is_localhost("example.com"));
+    }
+
+    #[test]
+    fn test_is_localhost_ipv6() {
+        assert!(is_localhost("::1"));
+        assert!(is_localhost("[::1]"));
+        assert!(!is_localhost("::2"));
+        assert!(!is_localhost("2001:db8::1"));
     }
 }

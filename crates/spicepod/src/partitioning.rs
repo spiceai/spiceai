@@ -16,6 +16,7 @@ limitations under the License.
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
+use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -57,13 +58,36 @@ where
     Ok(result)
 }
 
+pub fn serialize_partition_by<S>(
+    partition_by: &[PartitionedBy],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(partition_by.len()))?;
+
+    for (idx, item) in partition_by.iter().enumerate() {
+        // If the name is auto-generated for this position (matches "expr{idx}"), serialize as just the expression string
+        if item.name == format!("expr{idx}") {
+            seq.serialize_element(&item.expression)?;
+        } else {
+            // Otherwise, serialize as an object with the custom name
+            let mut map = std::collections::HashMap::new();
+            map.insert(&item.name, &item.expression);
+            seq.serialize_element(&map)?;
+        }
+    }
+
+    seq.end()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use serde_yaml::from_str;
+    use yaml::from_str;
 
-    #[allow(clippy::struct_excessive_bools)]
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(deny_unknown_fields)]
@@ -76,7 +100,7 @@ mod tests {
         pub partition_by: Vec<PartitionedBy>,
     }
     #[test]
-    fn deserialize_partition_by_unnamed() -> Result<(), serde_yaml::Error> {
+    fn deserialize_partition_by_unnamed() -> Result<(), yaml::Error> {
         let yaml = r#"
 partition_by:
   - "YEAR(created_at)"
@@ -96,7 +120,7 @@ partition_by:
     }
 
     #[test]
-    fn deserialize_partition_by_named() -> Result<(), serde_yaml::Error> {
+    fn deserialize_partition_by_named() -> Result<(), yaml::Error> {
         let yaml = r#"
 partition_by:
   - year: "YEAR(created_at)"

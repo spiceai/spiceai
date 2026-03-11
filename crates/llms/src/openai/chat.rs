@@ -20,7 +20,7 @@ use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{SqlGeneration, json::JsonSchemaSqlGeneration};
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
     CreateChatCompletionRequest, CreateChatCompletionResponse,
@@ -54,7 +54,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         let stream = self.client.chat().create_stream(inner_req).await?;
 
@@ -68,7 +68,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
     }
 
     // Custom healthcheck for OpenAI because Azure dosn't support `max_completion_tokens`.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn health(&self) -> Result<(), crate::chat::Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -85,7 +85,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
         };
 
         if self.supports_reasoning_effort() {
-            req.reasoning_effort = Some(async_openai::types::ReasoningEffort::Low);
+            req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::Low);
         }
 
         if self.supports_max_completion_tokens() {
@@ -117,7 +117,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         let mut resp = self.client.chat().create(inner_req).await?;
 

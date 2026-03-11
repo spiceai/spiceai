@@ -21,16 +21,20 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Array, Int64Array, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
+
 use cayenne::CayenneTableProvider;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
 test_with_backends!(test_partitioned_table_with_chunking_impl);
 
-#[allow(clippy::too_many_lines)]
 async fn test_partitioned_table_with_chunking_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -50,6 +54,7 @@ async fn test_partitioned_table_with_chunking_impl(
         table_name: "partitioned_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("category".to_string()),
         vortex_config: VortexConfig {
@@ -59,15 +64,16 @@ async fn test_partitioned_table_with_chunking_impl(
     };
 
     // Create Cayenne table provider
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Partitioned table created");
 
     // Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("partitioned_table", Arc::new(table))?;
 
     // Insert data into multiple partitions
@@ -271,6 +277,7 @@ async fn test_partitioned_table_with_large_chunks_impl(
         table_name: "large_chunk_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("region".to_string()),
         vortex_config: VortexConfig {
@@ -279,13 +286,14 @@ async fn test_partitioned_table_with_large_chunks_impl(
         },
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
 
-    let ctx = SessionContext::new();
     ctx.register_table("large_chunk_table", Arc::new(table))?;
 
     // Insert small amount of data (should all fit in one chunk per partition)
@@ -316,7 +324,6 @@ async fn test_partitioned_table_with_large_chunks_impl(
 // Generate test variants for timestamp partitioning test
 test_with_backends!(test_timestamp_partition_with_date_part_impl);
 
-#[allow(clippy::too_many_lines)]
 async fn test_timestamp_partition_with_date_part_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -343,6 +350,7 @@ async fn test_timestamp_partition_with_date_part_impl(
         table_name: "timestamp_partitioned_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("month".to_string()), // Simple column partitioning
         vortex_config: VortexConfig {
@@ -351,14 +359,15 @@ async fn test_timestamp_partition_with_date_part_impl(
         },
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Timestamp-partitioned table created");
 
-    let ctx = SessionContext::new();
     ctx.register_table("timestamp_partitioned_table", Arc::new(table))?;
 
     // Insert data across multiple months (Jan, Feb, Mar 2024)

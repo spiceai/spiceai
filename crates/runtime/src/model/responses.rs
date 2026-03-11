@@ -21,7 +21,7 @@ use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
 use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
-use crate::tools::utils::get_tools;
+use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
 use llms::responses::Responses;
@@ -43,7 +43,7 @@ macro_rules! extract_secret {
 }
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn try_to_responses_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
@@ -103,11 +103,14 @@ pub async fn try_to_responses_model(
         .transpose()
         .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
+    // Create table allowlist from model's datasets if specified
+    let table_allowlist = create_table_allowlist(&component.datasets);
+
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingResponses::new(
             model,
             openai_responses_tools.unwrap_or_default(),
-            get_tools(Arc::clone(&rt), &opts).await,
+            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
             spice_recursion_limit,
         )),
         Some(_) | None => model,
@@ -128,6 +131,8 @@ fn construct_model(
     let model = match prefix {
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
+
+        ModelSource::Xai => xai(model_id.as_deref(), params),
         _ => Err(LlmError::ResponsesNotSupported {
             from: component.get_source().ok_or(LlmError::UnknownModelSource {
                 from: component.from.clone(),
@@ -250,4 +255,13 @@ fn azure(
         entra_token,
         api_key,
     )) as Arc<dyn Responses>)
+}
+
+fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
+    let Some(api_key) = params.get("api_key").expose().ok() else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `xai_api_key` provided for xAI model.".into(),
+        });
+    };
+    Ok(Arc::new(llms::xai::Xai::new(model_id, api_key)) as Arc<dyn Responses>)
 }

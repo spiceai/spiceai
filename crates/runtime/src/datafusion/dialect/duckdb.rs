@@ -58,7 +58,7 @@ pub(crate) fn cosine_distance_to_sql(
                 Ok(ast::Expr::Cast {
                     expr: Box::new(array),
                     data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-                        Box::new(ast::DataType::Float(None)),
+                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
@@ -75,7 +75,7 @@ pub(crate) fn cosine_distance_to_sql(
                 Ok(ast::Expr::Cast {
                     expr: Box::new(array),
                     data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-                        Box::new(ast::DataType::Float(None)),
+                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
@@ -110,7 +110,7 @@ pub(crate) fn cosine_distance_to_sql(
     Ok(Some(ast_fn))
 }
 
-#[allow(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
+#[expect(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
 pub(crate) fn rand_to_random(
     _unparser: &datafusion::sql::unparser::Unparser,
     _args: &[Expr],

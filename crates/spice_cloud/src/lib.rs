@@ -113,15 +113,15 @@ impl SpiceExtension {
         self.manifest
             .params
             .get("metrics")
-            .map_or_else(|| false, |v| v.eq_ignore_ascii_case("true"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     fn spice_http_url(&self) -> String {
         self.manifest
             .params
             .get("endpoint")
-            .unwrap_or(&"https://data.spiceai.io".to_string())
-            .to_string()
+            .cloned()
+            .unwrap_or_else(|| "https://data.spiceai.io".to_string())
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
@@ -229,7 +229,7 @@ impl SpiceExtension {
             connection.org_name, connection.app_name, connection.metrics_dataset_name
         );
 
-        let from = spiceai_metrics_dataset_path.to_string();
+        let from = spiceai_metrics_dataset_path;
         self.register_runtime_metrics_table(runtime, from.clone())
             .await?;
         tracing::info!("Enabled metrics sync from runtime.metrics to {from}");
@@ -345,7 +345,7 @@ async fn get_spiceai_table_provider(
 /// # Errors
 ///
 /// This function will return an error if the accelerated table provider cannot be created
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn create_synced_internal_accelerated_table(
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     runtime_status: Arc<status::RuntimeStatus>,
@@ -389,7 +389,7 @@ pub async fn create_synced_internal_accelerated_table(
         refresh,
         runtime.tokio_io_runtime(),
     );
-    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
+    builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
 
@@ -402,7 +402,7 @@ pub async fn create_synced_internal_accelerated_table(
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 struct SpiceCloudConnectResponse {
     org_name: String,
     app_name: String,

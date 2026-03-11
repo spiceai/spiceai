@@ -18,17 +18,11 @@ use std::sync::Arc;
 
 use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::try_construct_worker};
 use opentelemetry::KeyValue;
-use snafu::prelude::*;
-
-#[derive(Debug, Snafu)]
-#[allow(dead_code)]
-pub enum Error {}
 
 impl Runtime {
+    #[cfg(feature = "models")]
     pub(crate) async fn load_workers(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-
-        if let Some(app) = app_lock.as_ref() {
+        if let Some(app) = self.read_app().await {
             for worker in &app.workers {
                 let runtime = Arc::clone(&self);
                 runtime
@@ -51,8 +45,10 @@ impl Runtime {
             Ok(worker) => worker,
             Err(e) => {
                 tracing::error!("Failed to load worker [{}]: {e}", cfg.name);
-                self.status
-                    .update_worker(&cfg.name, status::ComponentStatus::Error);
+                self.status.update_worker(
+                    &cfg.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
                 return;
             }
         };
@@ -78,8 +74,10 @@ impl Runtime {
             .await
         {
             tracing::error!("Failed to create scheduler for worker [{}]: {e}", cfg.name);
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            self.status.update_worker(
+                &cfg.name,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            );
         } else {
             tracing::info!("Scheduler for worker [{}] created successfully", cfg.name);
         }
@@ -94,8 +92,10 @@ impl Runtime {
             .await
         {
             tracing::error!("Failed to remove scheduler for worker [{}]: {e}", cfg.name);
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            self.status.update_worker(
+                &cfg.name,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            );
             return;
         }
 

@@ -25,18 +25,25 @@ use std::{
 
 use async_trait::async_trait;
 use datafusion::{
-    arrow::datatypes::Schema,
+    arrow::datatypes::{Schema, SchemaRef},
     common::{
-        DFSchemaRef,
+        DFSchemaRef, Statistics,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
+    config::ConfigOptions,
     datasource::DefaultTableSource,
     error::{DataFusionError, Result},
     execution::{SendableRecordBatchStream, SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, execution_plan::CardinalityEffect,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr,
+        execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
+        filter_pushdown::{
+            ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+        },
+        metrics::MetricsSet,
+        projection::ProjectionExec,
         stream::RecordBatchStreamAdapter,
     },
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
@@ -143,15 +150,24 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
 }
 
 #[derive(Debug)]
-pub(crate) struct IndexTableScanNode {
+pub struct IndexTableScanNode {
     input: LogicalPlan,
     indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl IndexTableScanNode {
     #[must_use]
-    pub(crate) fn new(input: LogicalPlan, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
+    pub fn new(input: LogicalPlan, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
         Self { input, indexes }
+    }
+
+    #[must_use]
+    pub fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
+        &self.indexes
+    }
+    #[must_use]
+    pub fn input(&self) -> &LogicalPlan {
+        &self.input
     }
 }
 
@@ -346,9 +362,16 @@ impl DisplayAs for IndexerExec {
         Ok(())
     }
 }
-
+#[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for IndexerExec {
     fn name(&self) -> &'static str {
+        "IndexerExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
         "IndexerExec"
     }
 
@@ -356,16 +379,55 @@ impl ExecutionPlan for IndexerExec {
         self
     }
 
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(self.properties().eq_properties.schema())
+    }
+
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         self.input_exec.properties()
+    }
+
+    fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
+        check_default_invariants(self, check)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input_exec]
     }
 
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
+        vec![None; self.children().len()]
+    }
+
+    /// Require single partition input to ensure limit is correctly applied before indexing.
+    /// This also allows the indexer to manage its own thread pool/batching optimally
+    /// and avoid thread contention and overhead when processing small batches in parallel.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
+    }
+
+    /// Prevents the introduction of additional `RepartitionExec` that does not support limit pushdown
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
     }
 
     fn with_new_children(
@@ -388,12 +450,20 @@ impl ExecutionPlan for IndexerExec {
         }))
     }
 
+    // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[datafusion::physical_expr::PhysicalSortExpr],
+    ) -> Result<datafusion::physical_plan::SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(datafusion::physical_plan::SortOrderPushdownResult::Unsupported)
     }
 
     fn execute(
@@ -460,6 +530,59 @@ impl ExecutionPlan for IndexerExec {
             })
             .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.input_exec.metrics()
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        #[expect(deprecated)]
+        self.input_exec.statistics()
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.input_exec.partition_statistics(partition)
+    }
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // Propagate the fetch limit to the child input if it supports it
+        if let Some(child_with_fetch) = self.input_exec.with_fetch(limit) {
+            return Some(Arc::new(Self::new(child_with_fetch, self.indexes.clone())));
+        }
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.input_exec.fetch()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
     }
 }
 
@@ -541,13 +664,13 @@ mod test {
 
     pub struct TestIndex {
         required_cols: Vec<String>,
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         compute_index_cb: Option<fn(Vec<RecordBatch>) -> Result<Vec<RecordBatch>, DataFusionError>>,
         calls: AtomicUsize,
     }
 
     impl TestIndex {
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         fn new(
             required_cols: Vec<String>,
             compute_index_cb: Option<
@@ -618,7 +741,6 @@ mod test {
         ]))
     }
 
-    #[allow(clippy::expect_used)]
     fn test_empty_batch() -> RecordBatch {
         let empty_columns: Vec<ArrayRef> = test_schema()
             .fields()
@@ -629,7 +751,6 @@ mod test {
         RecordBatch::try_new(test_schema(), empty_columns).expect("valid batch")
     }
 
-    #[allow(clippy::expect_used)]
     fn mem_table() -> Arc<dyn TableProvider> {
         let empty_batch = test_empty_batch();
         let mem_table = Arc::new(
@@ -645,7 +766,6 @@ mod test {
         Arc::new(IndexedTableProvider::new(table).add_index(index)) as Arc<dyn TableProvider>
     }
 
-    #[allow(clippy::expect_used)]
     fn test_one_row_batch() -> RecordBatch {
         use datafusion::arrow::array::{Int64Array, StringArray};
         let schema = test_schema();
@@ -655,14 +775,12 @@ mod test {
         RecordBatch::try_new(schema, vec![id, region, value]).expect("valid batch")
     }
 
-    #[allow(clippy::expect_used)]
     fn mem_table_from_batches(batches: Vec<RecordBatch>) -> Arc<dyn TableProvider> {
         let schema = batches[0].schema();
         Arc::new(MemTable::try_new(schema, vec![batches]).expect("valid table"))
             as Arc<dyn TableProvider>
     }
 
-    #[allow(clippy::expect_used)]
     fn one_row_batch() -> RecordBatch {
         let schema = test_schema();
         let id: ArrayRef = Arc::new(Int64Array::from(vec![1]));

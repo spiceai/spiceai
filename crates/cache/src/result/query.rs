@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -61,18 +61,16 @@ pub struct CachedQueryResult {
 
 impl CachedQueryResult {
     /// Create a new cached query result with raw `RecordBatches`.
+    ///
+    /// The `schema` parameter must be provided explicitly to ensure the correct
+    /// schema is preserved even when `batches` is empty (e.g., 0-row query results).
     #[must_use]
     pub fn new_raw(
         batches: Vec<RecordBatch>,
+        schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
     ) -> Self {
-        let schema = if batches.is_empty() {
-            Arc::new(Schema::empty())
-        } else {
-            batches[0].schema()
-        };
-
         Self {
             data: CachedData::Raw(Arc::new(batches)),
             schema,
@@ -103,21 +101,19 @@ impl CachedQueryResult {
     /// Create a cached query result from record batches.
     /// Only store encoded data if an encoder is provided.
     ///
+    /// The `schema` parameter must be provided explicitly to ensure the correct
+    /// schema is preserved even when `records` is empty (e.g., 0-row query results).
+    ///
     /// # Errors
     ///
     /// Returns an error if encoding fails.
     pub async fn from_batches(
         records: &[RecordBatch],
+        schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
-        let schema = if records.is_empty() {
-            Arc::new(Schema::empty())
-        } else {
-            records[0].schema()
-        };
-
         // Only store encoded data if an encoder is provided
         let data = if let Some(encoder) = encoder.as_ref() {
             let encoded_data = encoder.encode(records).await?;
@@ -190,8 +186,18 @@ impl CachedQueryResult {
 
 impl Sizeable for CachedQueryResult {
     fn get_memory_size(&self) -> usize {
-        // Delegate to accurate memory_size() method, cap at usize::MAX
-        self.memory_size().try_into().unwrap_or(usize::MAX)
+        // Delegate to accurate memory_size() method, cap at usize::MAX.
+        // If the value does not fit into usize (e.g., on 32-bit platforms), log and saturate.
+        let total_size = self.memory_size();
+        if let Ok(size) = usize::try_from(total_size) {
+            size
+        } else {
+            tracing::warn!(
+                actual_size = total_size,
+                "CachedQueryResult::memory_size exceeds usize::MAX; saturating to usize::MAX"
+            );
+            usize::MAX
+        }
     }
 }
 
@@ -313,7 +319,8 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new_raw(batches, input_tables, cached_at);
+        let cached_result =
+            CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
 
         // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
@@ -366,11 +373,12 @@ mod tests {
 
     #[test]
     fn test_memory_size_empty_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
         let batches = Vec::new();
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new_raw(batches, input_tables, cached_at);
+        let cached_result = CachedQueryResult::new_raw(batches, schema, input_tables, cached_at);
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64;
         let actual_size = cached_result.memory_size();
@@ -392,8 +400,12 @@ mod tests {
         )
         .expect("should create batch");
 
-        let cached_result =
-            CachedQueryResult::new_raw(vec![batch], Arc::new(HashSet::new()), Instant::now());
+        let cached_result = CachedQueryResult::new_raw(
+            vec![batch],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            Instant::now(),
+        );
 
         let memory_size = cached_result.memory_size();
         let sizeable_size = cached_result.get_memory_size();
@@ -402,6 +414,69 @@ mod tests {
         assert_eq!(
             sizeable_size as u64, memory_size,
             "Sizeable trait should delegate to memory_size()"
+        );
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
+    /// Empty query results must preserve the correct schema, not `Schema::empty()`.
+    #[test]
+    fn test_empty_batches_preserve_schema_new_raw() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let cached_result = CachedQueryResult::new_raw(
+            Vec::new(),
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            Instant::now(),
+        );
+
+        assert_eq!(
+            cached_result.schema.fields().len(),
+            3,
+            "Cached empty result must preserve the original 3-field schema"
+        );
+        assert_eq!(cached_result.schema, schema);
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
+    #[tokio::test]
+    async fn test_empty_batches_preserve_schema_from_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let cached_result = CachedQueryResult::from_batches(
+            &[],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("should create cached result");
+
+        assert_eq!(
+            cached_result.schema.fields().len(),
+            3,
+            "Cached empty result must preserve the original 3-field schema"
+        );
+        assert_eq!(cached_result.schema, schema);
+
+        // Verify the CachedStream also reports the correct schema
+        let records = cached_result.records().await.expect("should decode");
+        assert!(records.is_empty(), "Should have no record batches");
+
+        let stream = CachedStream::new(Arc::new(records), Arc::clone(&cached_result.schema));
+        assert_eq!(
+            stream.schema().fields().len(),
+            3,
+            "CachedStream schema must match the original schema"
         );
     }
 }

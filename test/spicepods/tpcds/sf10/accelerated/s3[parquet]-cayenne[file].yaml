@@ -1,0 +1,109 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]
+datasets:
+  - from: s3://benchmarks/tpcds_sf10/catalog_sales/
+    name: catalog_sales
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration
+      enabled: true
+      engine: cayenne
+      mode: file
+  - from: s3://benchmarks/tpcds_sf10/catalog_returns/
+    name: catalog_returns
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/inventory/
+    name: inventory
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/store_sales/
+    name: store_sales
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/store_returns/
+    name: store_returns
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/web_sales/
+    name: web_sales
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/web_returns/
+    name: web_returns
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/customer/
+    name: customer
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/customer_address/
+    name: customer_address
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/customer_demographics/
+    name: customer_demographics
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/date_dim/
+    name: date_dim
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/household_demographics/
+    name: household_demographics
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/item/
+    name: item
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/promotion/
+    name: promotion
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/ship_mode/
+    name: ship_mode
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/store/
+    name: store
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/time_dim/
+    name: time_dim
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/warehouse/
+    name: warehouse
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/web_page/
+    name: web_page
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/web_site/
+    name: web_site
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/reason/
+    name: reason
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/call_center/
+    name: call_center
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/income_band/
+    name: income_band
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpcds_sf10/catalog_page/
+    name: catalog_page
+    params: *s3_params
+    acceleration: *acceleration

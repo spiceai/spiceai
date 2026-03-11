@@ -14,6 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Spicepod JSON Schema Generator
+//!
+//! This tool generates a JSON Schema for the Spicepod specification, enriched with
+//! connector-specific parameter schemas for data connectors, accelerators, and
+//! catalog connectors.
+
+mod collector;
+mod enricher;
+mod transform;
+
+use collector::{
+    collect_catalog_connectors, collect_data_accelerators, collect_data_connectors,
+    collect_model_sources,
+};
+use enricher::enrich_params_schema;
 use schemars::schema_for;
 use spicepod::spec::SpicepodDefinition;
 use std::env;
@@ -30,13 +45,40 @@ fn main() {
 
     let output_filename = &args[1];
 
-    let schema = schema_for!(SpicepodDefinition);
+    // Generate base schema from SpicepodDefinition
+    let mut schema = schema_for!(SpicepodDefinition);
 
+    // Collect parameter specs from all registered connectors, accelerators, and model sources
+    let data_connectors = collect_data_connectors();
+    let data_accelerators = collect_data_accelerators();
+    let catalog_connectors = collect_catalog_connectors();
+    let model_sources = collect_model_sources();
+
+    // Log what we collected
+    eprintln!(
+        "Collected {} data connectors, {} data accelerators, {} catalog connectors, {} model sources",
+        data_connectors.len(),
+        data_accelerators.len(),
+        catalog_connectors.len(),
+        model_sources.len()
+    );
+
+    // Enrich the schema with connector-specific parameter definitions
+    enrich_params_schema(
+        &mut schema,
+        &data_connectors,
+        &data_accelerators,
+        &catalog_connectors,
+        &model_sources,
+    );
+
+    // Serialize to JSON
     let Ok(json_schema) = serde_json::to_string_pretty(&schema) else {
         eprintln!("Unable to serialize schema");
         std::process::exit(1);
     };
 
+    // Write to file
     let Ok(mut file) = File::create(output_filename) else {
         eprintln!("Unable to create file {output_filename}");
         std::process::exit(1);
@@ -46,4 +88,6 @@ fn main() {
         eprintln!("Unable to write to file {output_filename}");
         std::process::exit(1);
     }
+
+    eprintln!("Schema written to {output_filename}");
 }

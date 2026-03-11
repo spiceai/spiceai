@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -98,6 +98,22 @@ impl GraphQLContext for PullRequestTableArgs {
 
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
+    }
+
+    fn query_cost(&self) -> Option<u32> {
+        // first 100 pull requests could retrieve up to 100 PRs
+        // each query returns labels, commits and assignees which are each additional requests
+        // if review threads are enabled, 1 PR retrieves 20 review threads, which could each have comments that are also retrieved
+        // if discussion comments are enabled, each PR also retrieves discussion comments
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        match self.include_comments {
+            PullRequestCommentType::None => Some(301),
+            PullRequestCommentType::Review => Some(301 + (20 * self.max_comments_fetched)), // 1 + 100 (labels) + 100 (commits) + 100 (assignees) + (20 review threads * comments_to_fetch) = n
+            PullRequestCommentType::Discussion => Some(301 + self.max_comments_fetched), // 1 + 100 (labels) + 100 (commits) + 100 (assignees) + comments_to_fetch (discussion comments) = n
+            PullRequestCommentType::All => {
+                Some(301 + (20 * self.max_comments_fetched) + self.max_comments_fetched)
+            }
+        }
     }
 }
 

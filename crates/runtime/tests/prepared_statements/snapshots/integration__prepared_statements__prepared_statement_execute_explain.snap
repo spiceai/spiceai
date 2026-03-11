@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/prepared_statements/mod.rs
+description: EXPLAIN EXECUTE my_query(5)
+---
++---------------------+-------------------------------------------------------------------------------+
+| plan_type           | plan                                                                          |
++---------------------+-------------------------------------------------------------------------------+
+| logical_plan        | Execute: my_query params=[Int64(5)]                                           |
+| physical_plan_error | This feature is not implemented: Unsupported logical plan: Statement(Execute) |
++---------------------+-------------------------------------------------------------------------------+

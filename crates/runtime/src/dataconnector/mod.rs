@@ -43,7 +43,8 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
-use parameters::ConnectorParams;
+use linkme::distributed_slice;
+pub use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -54,68 +55,123 @@ use tokio::sync::Mutex;
 use tracing::Level;
 
 use std::future::Future;
+use std::time::Duration;
 
 pub mod listing;
+
+/// Creates a default reqwest client with standard Spice settings.
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built.
+pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
+
+    reqwest::Client::builder()
+        .user_agent("spice")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+}
+
+#[derive(Clone, Copy)]
+pub struct DataConnectorRegistration {
+    pub name: &'static str,
+    pub constructor: fn() -> Arc<dyn DataConnectorFactory>,
+}
+
+impl DataConnectorRegistration {
+    pub const fn new(
+        name: &'static str,
+        constructor: fn() -> Arc<dyn DataConnectorFactory>,
+    ) -> Self {
+        Self { name, constructor }
+    }
+}
+
+/// Distributed slice that automatically collects all data connector registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_connector!`] macro.
+#[distributed_slice]
+pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
+
+/// Registers a data connector factory by name.
+///
+/// This macro creates a constructor function for the specified connector factory type and
+/// registers it in the global distributed slice of data connectors. This allows
+/// the runtime to discover and instantiate connectors without updating a central registry.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_connector!("file", FileFactory);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_connector!(
+///     register_file_connector,
+///     FILE_CONNECTOR_REGISTRATION,
+///     "file",
+///     FileFactory
+/// );
+/// ```
+///
+/// Using this macro automatically adds the connector to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_connector {
+    ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory> {
+            <$factory>::new_arc()
+        }
+
+        #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataconnector::DataConnectorRegistration =
+            $crate::dataconnector::DataConnectorRegistration::new($name, $fn_name);
+    };
+
+    ($name:expr, $factory:ident) => {
+        ::paste::paste! {
+            $crate::register_data_connector!(
+                [<__register_data_connector_fn_ $factory:snake>],
+                [<__REGISTER_DATA_CONNECTOR_ $factory:upper>],
+                $name,
+                $factory
+            );
+        }
+    };
+}
 
 pub mod abfs;
 #[cfg(feature = "adbc")]
 pub mod adbc;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
-#[cfg(feature = "databricks")]
-pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "delta_lake")]
-pub mod delta_lake;
-#[cfg(feature = "dremio")]
-pub mod dremio;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
-#[cfg(feature = "flightsql")]
-pub mod flightsql;
-#[cfg(feature = "ftp")]
-pub mod ftp;
+
 pub mod git;
 pub mod github;
-pub mod graphql;
 pub mod https;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
-#[cfg(feature = "mssql")]
-pub mod mssql;
-#[cfg(feature = "mysql")]
-pub mod mysql;
-#[cfg(feature = "odbc")]
-pub mod odbc;
-#[cfg(feature = "oracle")]
-pub mod oracle;
+
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
+pub mod gcs;
 pub mod glue;
 pub mod iceberg;
-#[cfg(feature = "imap")]
-pub mod imap;
 pub mod parameters;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod s3;
-#[cfg(feature = "ftp")]
-pub mod sftp;
-#[cfg(feature = "sharepoint")]
-pub mod sharepoint;
 pub mod sink;
-#[cfg(feature = "snowflake")]
-pub mod snowflake;
-#[cfg(feature = "spark")]
-pub mod spark;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -379,64 +435,9 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
-    #[cfg(feature = "adbc")]
-    register_connector_factory("adbc", adbc::AdbcFactory::new_arc()).await;
-    #[cfg(feature = "databricks")]
-    register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory("delta_lake", delta_lake::DeltaLakeFactory::new_arc()).await;
-    #[cfg(feature = "dremio")]
-    register_connector_factory("dremio", dremio::DremioFactory::new_arc()).await;
-    register_connector_factory("file", file::FileFactory::new_arc()).await;
-    #[cfg(feature = "flightsql")]
-    register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
-    register_connector_factory("s3", s3::S3Factory::new_arc()).await;
-    register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
-    #[cfg(feature = "imap")]
-    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
-    register_connector_factory("http", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("https", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("git", git::GitFactory::new_arc()).await;
-    register_connector_factory("github", github::GithubFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
-    register_connector_factory("spice.ai", spiceai::SpiceAIFactory::new_arc()).await;
-    register_connector_factory("memory", memory::MemoryConnectorFactory::new_arc()).await;
-    #[cfg(feature = "mongodb")]
-    register_connector_factory("mongodb", mongodb::MongoDBFactory::new_arc()).await;
-    #[cfg(feature = "mssql")]
-    register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
-    #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
-    #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::PostgresFactory::new_arc()).await;
-    #[cfg(feature = "duckdb")]
-    register_connector_factory("duckdb", duckdb::DuckDBFactory::new_arc()).await;
-    #[cfg(feature = "clickhouse")]
-    register_connector_factory("clickhouse", clickhouse::ClickhouseFactory::new_arc()).await;
-    register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
-    #[cfg(feature = "odbc")]
-    register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
-    #[cfg(feature = "oracle")]
-    register_connector_factory("oracle", oracle::OracleFactory::new_arc()).await;
-    #[cfg(feature = "sharepoint")]
-    register_connector_factory("sharepoint", sharepoint::SharepointFactory::new_arc()).await;
-    #[cfg(feature = "spark")]
-    register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
-    #[cfg(feature = "snowflake")]
-    register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
-    #[cfg(feature = "debezium")]
-    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
-    #[cfg(feature = "kafka")]
-    register_connector_factory("kafka", kafka::KafkaFactory::new_arc()).await;
-    register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
-    #[cfg(feature = "dynamodb")]
-    register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
-    register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
-    register_connector_factory("glue", glue::GlueDataConnectorFactory::new_arc()).await;
+    for registration in DATA_CONNECTOR_REGISTRATIONS {
+        register_connector_factory(registration.name, (registration.constructor)()).await;
+    }
 }
 
 pub async fn unregister_all() {
@@ -507,7 +508,13 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> Option<ChangesStream> {
         None
     }
 
@@ -549,7 +556,16 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
+    }
+
+    /// Returns whether the data connector should be initialized on startup or on trigger,
+    /// with dataset-specific logic.
+    ///
+    /// This method allows connectors to make initialization decisions based on the specific
+    /// dataset configuration. The default implementation delegates to `initialization()`.
+    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+        self.initialization()
     }
 }
 
@@ -604,11 +620,11 @@ pub async fn get_data(
         df = df.filter(filter).map_err(find_datafusion_root)?;
     }
 
-    if tracing::enabled!(Level::DEBUG)
+    if tracing::enabled!(Level::TRACE)
         && let Ok(explained) = df.clone().explain(false, false)
         && let Ok(explained) = explained.to_string().await
     {
-        tracing::debug!("Data refresh plan for {}:\n{}", table_name, explained);
+        tracing::trace!("Data refresh plan for {}:\n{}", table_name, explained);
     }
 
     let sql = Unparser::default()
@@ -676,7 +692,7 @@ fn include_computed_columns(
                                 {
                                     proj.expr.push(Expr::Column(Column::new(
                                         proj.schema.qualified_field(idx).0.cloned(),
-                                        computed_column.name().to_string(),
+                                        computed_column.name().clone(),
                                     )));
                                 }
                             }
@@ -718,7 +734,10 @@ mod tests {
                 &self,
                 _params: ConnectorParams,
             ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
-                Box::pin(async { Ok(Arc::new(TestConnector) as Arc<dyn DataConnector>) })
+                Box::pin(async {
+                    let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
+                    Ok(connector)
+                })
             }
 
             fn prefix(&self) -> &'static str {

@@ -32,7 +32,7 @@ use crate::embeddings::{
     Embed, Error as EmbedError, FailedToCreateEmbeddingSnafu, FailedToPrepareInputSnafu,
     Result as EmbedResult,
 };
-use async_openai::types::{
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
     EmbeddingVector,
 };
@@ -318,7 +318,7 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, emb)| Embedding {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     index: i as u32,
                     object: "embedding".to_string(),
                     embedding: EmbeddingVector::Float(emb),

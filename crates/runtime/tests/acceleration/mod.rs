@@ -20,9 +20,10 @@ use runtime::{
 };
 use spicepod::{acceleration::Mode, param::Params};
 
+mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
@@ -32,16 +33,24 @@ mod checkpoint_turso;
 mod cron;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
-#[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
+mod hash_index;
+#[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(not(target_os = "windows"))]
+mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
+mod partition_by_arrow;
 #[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
 mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
+#[cfg(feature = "snapshots")]
+mod snapshot_lock_contention;
+#[cfg(feature = "snapshots")]
+mod snapshot_mutex;
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);

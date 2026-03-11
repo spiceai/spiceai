@@ -36,7 +36,7 @@ pub async fn query_to_batches(
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
-    let mut stream = spice_client.query_with_params(sql, params).await?;
+    let mut stream = spice_client.sql_with_params(sql, params).await?;
 
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
@@ -88,7 +88,7 @@ impl PreparedStatementParamColumn {
 
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// create_param_batch(vec![
 ///   PreparedStatementParamColumn::new(
 ///     "$1",
@@ -100,7 +100,7 @@ impl PreparedStatementParamColumn {
 ///     "$2",
 ///     arrow::datatypes::DataType::Utf8,
 ///     true,
-///     Arc::new(StringArray::from(vec![Some(41), 42])) as Arc<dyn arrow::array::Array>
+///     Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as Arc<dyn arrow::array::Array>
 ///   )
 /// ])?;
 /// ```

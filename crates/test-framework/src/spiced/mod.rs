@@ -49,7 +49,14 @@ impl Display for SpicedVersion {
 }
 
 pub enum SpicedInstance {
+    /// Connect to an existing local spiced instance at default ports
     Existing,
+    /// Connect to an external spiced instance at custom URLs
+    External {
+        flight_url: String,
+        http_base_url: String,
+        api_key: Option<String>,
+    },
     Owned {
         child: Child,
         tempdir: TempDir,
@@ -97,9 +104,9 @@ impl StartRequest {
 
     pub fn prepare(&mut self) -> Result<()> {
         // Serialize spicepod to `spicepod.yaml` in the tempdir
-        let spicepod_yaml = serde_yaml::to_string(&self.spicepod)?;
+        let spicepod_yaml = yaml::to_string(&self.spicepod)?;
         let spicepod_yaml_path = self.tempdir.path().join("spicepod.yaml");
-        std::fs::write(spicepod_yaml_path.clone(), spicepod_yaml)?;
+        std::fs::write(spicepod_yaml_path, spicepod_yaml)?;
 
         // Create a symlink to the data directory if one is set
         if let Some(data_dir) = &self.data_dir {
@@ -127,6 +134,58 @@ impl SpicedInstance {
     #[must_use]
     pub fn empty() -> Self {
         Self::Existing
+    }
+
+    /// Create an instance that connects to an external spiced at the given Flight URL.
+    ///
+    /// The HTTP base URL is derived from the Flight URL by replacing the port with 8090,
+    /// or can be explicitly provided.
+    #[must_use]
+    pub fn external(flight_url: impl Into<String>) -> Self {
+        let flight_url = flight_url.into();
+
+        // Spice Cloud has a dedicated HTTP endpoint
+        let http_base_url = if flight_url.contains("flight.spiceai.io") {
+            "https://data.spiceai.io".to_string()
+        } else if let Some(last_colon) = flight_url.rfind(':') {
+            // Derive HTTP URL from Flight URL by replacing port
+            // e.g., "http://localhost:50051" -> "http://localhost:8090"
+            format!("{}:8090", &flight_url[..last_colon])
+        } else {
+            format!("{flight_url}:8090")
+        };
+
+        Self::External {
+            flight_url,
+            http_base_url,
+            api_key: None,
+        }
+    }
+
+    /// Create an instance with explicit Flight and HTTP URLs.
+    #[must_use]
+    pub fn external_with_http(
+        flight_url: impl Into<String>,
+        http_base_url: impl Into<String>,
+    ) -> Self {
+        Self::External {
+            flight_url: flight_url.into(),
+            http_base_url: http_base_url.into(),
+            api_key: None,
+        }
+    }
+
+    /// Set the API key for an external instance.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        if let Self::External {
+            api_key: ref mut key,
+            ..
+        } = self
+        {
+            *key = api_key;
+        }
+        self
     }
 
     /// Start a spiced instance
@@ -227,8 +286,13 @@ impl SpicedInstance {
             spice_client = spice_client.cache_control("no-cache");
         }
 
+        let flight_url = match self {
+            Self::External { flight_url, .. } => flight_url.as_str(),
+            Self::Existing | Self::Owned { .. } => FLIGHT_URL,
+        };
+
         let spice_client = spice_client
-            .flight_url(FLIGHT_URL)
+            .flight_url(flight_url)
             .user_agent("spice-test-framework/1.0")
             .build()
             .await
@@ -243,9 +307,31 @@ impl SpicedInstance {
     ///
     /// - If the http client fails to be created
     pub fn http_client(&self) -> Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
-            .user_agent("spice-test-framework/1.0")
-            .build()?)
+        let mut builder = reqwest::Client::builder().user_agent("spice-test-framework/1.0");
+
+        if let Self::External {
+            api_key: Some(key), ..
+        } = self
+        {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "X-API-Key",
+                reqwest::header::HeaderValue::from_str(key)
+                    .map_err(|e| anyhow!("Invalid API key header value: {e}"))?,
+            );
+            builder = builder.default_headers(headers);
+        }
+
+        Ok(builder.build()?)
+    }
+
+    /// Get the HTTP base URL for this instance
+    #[must_use]
+    pub fn http_base_url(&self) -> &str {
+        match self {
+            Self::External { http_base_url, .. } => http_base_url.as_str(),
+            Self::Existing | Self::Owned { .. } => HTTP_BASE_URL,
+        }
     }
 
     /// Wait for the spiced instance to be ready
@@ -256,7 +342,8 @@ impl SpicedInstance {
     pub async fn wait_for_ready(&mut self, timeout: Duration) -> Result<()> {
         // Wait for the spiced instance to be ready by polling the `/v1/ready` endpoint
         let client = self.http_client()?;
-        let ready_url = format!("{HTTP_BASE_URL}{READY_ENDPOINT}");
+        let http_base = self.http_base_url().to_string();
+        let ready_url = format!("{http_base}{READY_ENDPOINT}");
         if !wait_until_true(timeout, || async {
             let response = client.get(&ready_url).send().await;
             match response {
@@ -280,7 +367,7 @@ impl SpicedInstance {
         let Ok(client) = self.http_client() else {
             return false;
         };
-        let ready_url = format!("{HTTP_BASE_URL}{READY_ENDPOINT}");
+        let ready_url = format!("{}{READY_ENDPOINT}", self.http_base_url());
         let response = client.get(&ready_url).send().await;
         match response {
             Ok(response) => response.status().is_success(),

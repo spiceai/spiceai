@@ -15,15 +15,17 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
+use datafusion::catalog::Session;
+use datafusion::common::{Constraints, DFSchema, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::file_format::{
@@ -35,11 +37,20 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::{PartitionedFile, TableSchema, metadata::MetadataColumn};
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
+#[cfg(not(windows))]
+use {
+    datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
+};
 
 use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
@@ -52,11 +63,349 @@ use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
 use super::DelimitedFormat;
+use crate::dataconnector::DataConnectorError::SchemaMismatch;
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
+
+#[derive(Clone, Debug)]
+/// Wraps a `ListingTable` to short-circuit broad object-store listings when
+/// queries include `location` predicates. Instead of listing a large prefix, it
+/// directly fetches the specific objects referenced in the predicate, which
+/// significantly reduces LIST calls on large buckets.
+struct LocationPruningListingTable {
+    inner: Arc<ListingTable>,
+    object_store: Arc<dyn ObjectStore>,
+    table_path: ListingTableUrl,
+    /// The original file schema from the `ListingTable`, containing only columns
+    /// physically stored in data files. This must be stored separately because
+    /// `ListingTable` doesn't expose its `file_schema` field publicly, and we cannot
+    /// reliably reconstruct it from `table_schema` when partition columns also
+    /// appear in the file (causing duplicates in `table_schema`).
+    file_schema: SchemaRef,
+}
+
+impl LocationPruningListingTable {
+    fn new(
+        inner: Arc<ListingTable>,
+        object_store: Arc<dyn ObjectStore>,
+        table_path: ListingTableUrl,
+        file_schema: SchemaRef,
+    ) -> Self {
+        Self {
+            inner,
+            object_store,
+            table_path,
+            file_schema,
+        }
+    }
+
+    fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
+        &self.inner.options().table_partition_cols
+    }
+
+    fn object_store_url(&self) -> ObjectStoreUrl {
+        // Safe: Listing tables share object store across paths. Should always have at least one path.
+        self.inner.table_paths().first().map_or_else(
+            || unreachable!("ListingTable should always contain at least one path"),
+            ListingTableUrl::object_store,
+        )
+    }
+
+    fn file_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.file_schema)
+    }
+
+    fn collect_partition_values(&self, meta: &ObjectMeta) -> Option<Vec<ScalarValue>> {
+        let parts = parse_partition_values(
+            &self.table_path,
+            &meta.location,
+            self.partition_column_types(),
+        )?;
+
+        let mut values = Vec::with_capacity(self.partition_column_types().len());
+        for (value, (_, dtype)) in parts.into_iter().zip(self.partition_column_types()) {
+            let scalar = ScalarValue::try_from_string(value.clone(), dtype).ok()?;
+            values.push(scalar);
+        }
+        Some(values)
+    }
+}
+
+fn parse_partition_values(
+    table_path: &ListingTableUrl,
+    file_path: &Path,
+    table_partition_cols: &[(String, datafusion::arrow::datatypes::DataType)],
+) -> Option<Vec<String>> {
+    // Extract hive-style partition values (e.g., year=2023/month=2) from the
+    // file path relative to the table path, validating the expected partition
+    // column names.
+    let subpath = table_path.strip_prefix(file_path)?;
+
+    let mut part_values = Vec::with_capacity(table_partition_cols.len());
+    for (part, (expected_partition, _)) in subpath.zip(table_partition_cols) {
+        match part.split_once('=') {
+            Some((name, val)) if name == expected_partition => part_values.push(val.to_string()),
+            _ => return None,
+        }
+    }
+    Some(part_values)
+}
+
+#[async_trait]
+impl TableProvider for LocationPruningListingTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        self.inner.table_type()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion_expr::Expr],
+    ) -> DFResult<Vec<datafusion_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion_expr::Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let Some(locations) = extract_location_predicates(filters) else {
+            return self.inner.scan(state, projection, filters, limit).await;
+        };
+
+        // Ensure the query runtime uses the same object store configuration (endpoint/region)
+        // as the listing table, even when we bypass listing.
+        state.runtime_env().register_object_store(
+            self.object_store_url().as_ref(),
+            Arc::clone(&self.object_store),
+        );
+
+        let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
+
+        for loc in locations {
+            let Ok(url) = Url::parse(&loc) else {
+                tracing::warn!(location = loc, "Ignoring invalid location predicate URL");
+                continue;
+            };
+
+            // Enforce that the requested location stays within the configured object store/prefix.
+            let location_listing = match ListingTableUrl::parse(&loc) {
+                Ok(l) => l,
+                Err(err) => {
+                    tracing::warn!(%err, location = loc, "Ignoring location predicate outside table prefix");
+                    continue;
+                }
+            };
+            if location_listing.object_store() != self.object_store_url()
+                || !self.table_path.contains(location_listing.prefix(), false)
+            {
+                tracing::warn!(
+                    location = loc,
+                    "Ignoring location predicate outside table prefix/object store"
+                );
+                continue;
+            }
+
+            let path = Path::from(url.path().trim_start_matches('/'));
+
+            let meta = match self.object_store.head(&path).await {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(%err, location = loc, "Failed to head object for location predicate");
+                    continue;
+                }
+            };
+
+            let Some(partition_values) = self.collect_partition_values(&meta) else {
+                tracing::warn!(
+                    location = loc,
+                    "Unable to parse partition values for location predicate; skipping file"
+                );
+                continue;
+            };
+
+            files.push(PartitionedFile {
+                object_meta: meta,
+                partition_values,
+                range: None,
+                statistics: None,
+                extensions: None,
+                metadata_size_hint: None,
+            });
+        }
+
+        if files.is_empty() {
+            // Apply the projection to the schema so that the EmptyExec output
+            // schema matches what the physical planner expects from the scan.
+            let schema = if let Some(proj) = projection {
+                Arc::new(self.schema().project(proj)?)
+            } else {
+                self.schema()
+            };
+            return Ok(Arc::new(EmptyExec::new(schema)));
+        }
+
+        let file_groups = vec![FileGroup::new(files)];
+        let partition_fields: Vec<Field> = self
+            .partition_column_types()
+            .iter()
+            .map(|(name, dtype)| Field::new(name, dtype.clone(), true))
+            .collect();
+
+        let table_schema = TableSchema::new(
+            self.file_schema(),
+            partition_fields
+                .iter()
+                .map(|f| Arc::new(f.clone()))
+                .collect(),
+        );
+        let file_source = self.inner.options().format.file_source(table_schema);
+
+        let mut builder = FileScanConfigBuilder::new(self.object_store_url(), file_source)
+            .with_file_groups(file_groups)
+            .with_limit(limit)
+            .with_metadata_cols(self.inner.options().metadata_cols.clone())
+            .with_projection_indices(projection.cloned())
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to apply projection indices: {e}"
+                ))
+            })?
+            .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
+
+        if let Some(constraints) = self.inner.constraints() {
+            builder = builder.with_constraints(constraints.clone());
+        }
+
+        let config = builder.build();
+
+        self.inner
+            .options()
+            .format
+            .create_physical_plan(state, config)
+            .await
+    }
+}
+
+/// Extracts literal locations from `location = 'literal'` and `location IN (...)`
+/// predicates when they appear in a purely conjunctive context. If a location
+/// predicate appears under `NOT` or `OR`, return `None` to force the caller to
+/// fall back to full listing (to avoid incorrect pruning).
+fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<String>> {
+    use datafusion_expr::{Expr, Operator};
+
+    // Recursively walks filter expressions to collect string literals from:
+    // - location = 'literal' and 'literal' = location
+    // - location IN ('a', 'b', ...)
+    // Only safe when predicates are in a purely conjunctive form (no OR/NOT).
+    fn literal_str(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => {
+                Some(s.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_locations(expr: &Expr) -> (Vec<String>, bool) {
+        match expr {
+            Expr::BinaryExpr(binary) => match binary.op {
+                Operator::Eq => {
+                    let left_is_location =
+                        matches!(*binary.left, Expr::Column(ref c) if c.name == "_location");
+                    let right_is_location =
+                        matches!(*binary.right, Expr::Column(ref c) if c.name == "_location");
+
+                    let mut values = Vec::new();
+                    if left_is_location && let Some(value) = literal_str(&binary.right) {
+                        values.push(value);
+                    }
+                    if right_is_location && let Some(value) = literal_str(&binary.left) {
+                        values.push(value);
+                    }
+                    (values, true)
+                }
+                Operator::And => {
+                    let (mut lvals, lsafe) = collect_locations(&binary.left);
+                    let (rvals, rsafe) = collect_locations(&binary.right);
+                    lvals.extend(rvals);
+                    (lvals, lsafe && rsafe)
+                }
+                Operator::Or => {
+                    let (lvals, lsafe) = collect_locations(&binary.left);
+                    let (rvals, rsafe) = collect_locations(&binary.right);
+                    if !lvals.is_empty() || !rvals.is_empty() {
+                        (Vec::new(), false)
+                    } else {
+                        (Vec::new(), lsafe && rsafe)
+                    }
+                }
+                _ => (Vec::new(), true),
+            },
+            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "_location") => {
+                if in_list.negated {
+                    (Vec::new(), false)
+                } else {
+                    let mut values = Vec::new();
+                    for v in &in_list.list {
+                        if let Some(s) = literal_str(v) {
+                            values.push(s);
+                        }
+                    }
+                    (values, true)
+                }
+            }
+            Expr::Not(inner) => {
+                let (vals, _safe_inner) = collect_locations(inner);
+                if vals.is_empty() {
+                    (Vec::new(), true)
+                } else {
+                    (Vec::new(), false)
+                }
+            }
+            _ => (Vec::new(), true),
+        }
+    }
+
+    let mut values = Vec::new();
+    let mut safe = true;
+    for filter in filters {
+        let (vals, is_safe) = collect_locations(filter);
+        values.extend(vals);
+        safe &= is_safe;
+    }
+
+    if !safe {
+        return None;
+    }
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
 
 #[async_trait]
 pub trait ListingTableConnector: DataConnector {
@@ -104,7 +453,7 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let store_url = self.get_object_store_url(dataset, None)?;
-        let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
+        let listing_store_url = ListingTableUrl::parse(store_url).boxed().context(
             crate::dataconnector::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
@@ -197,6 +546,11 @@ pub trait ListingTableConnector: DataConnector {
             (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
+            )),
+            #[cfg(not(windows))]
+            (Some("vortex"), _) | (None, Some("vortex")) => Ok((
+                Some(VortexFormatFactory::new().default()),
+                extension.unwrap_or(".vortex".to_string()),
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(
@@ -419,18 +773,8 @@ pub trait ListingTableConnector: DataConnector {
                     },
                 )?;
 
-            table_parquet_options
-                .set(
-                    "tolerate_missing_page_index",
-                    &page_index_options.tolerate_missing_page_index.to_string(),
-                )
-                .map_err(
-                    |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("{self}"),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(e),
-                    },
-                )?;
+            // Note: tolerate_missing_page_index was removed in DataFusion v51.
+            // Page index reading now handles missing indexes gracefully by default.
         }
 
         Ok(table_parquet_options)
@@ -506,7 +850,6 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn create_listing_table(
         &self,
         dataset: &Dataset,
@@ -633,9 +976,24 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
+        let final_schema = if dataset.get_param("hive_partitioning_enabled", false)
+            && table_path.is_collection()
+        {
+            self.deduplicate_partition_columns_expressed_in_file(
+                dataset,
+                expanded_schema,
+                &options.table_partition_cols,
+            )?
+        } else {
+            expanded_schema
+        };
+
+        // Keep a reference to the file schema for LocationPruningListingTable
+        let file_schema = Arc::clone(&final_schema);
+
         let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
-            .with_schema(expanded_schema);
+            .with_schema(final_schema);
 
         // This shouldn't error because we're passing the schema and options correctly.
         let table =
@@ -671,7 +1029,72 @@ pub trait ListingTableConnector: DataConnector {
             return Ok(Arc::new(cached_table));
         }
 
-        Ok(table_arc)
+        let has_location_metadata = table_arc
+            .options()
+            .metadata_cols
+            .iter()
+            .any(|c| matches!(c, MetadataColumn::Location(_)));
+
+        if has_location_metadata {
+            let wrapped = LocationPruningListingTable::new(
+                table_arc,
+                Arc::clone(&object_store),
+                table_path,
+                file_schema,
+            );
+            Ok(Arc::new(wrapped))
+        } else {
+            Ok(table_arc)
+        }
+    }
+
+    fn deduplicate_partition_columns_expressed_in_file(
+        &self,
+        dataset: &Dataset,
+        schema: SchemaRef,
+        partition_cols: &[(String, DataType)],
+    ) -> DataConnectorResult<SchemaRef> {
+        if partition_cols.is_empty() {
+            return Ok(schema);
+        }
+
+        let mut idents = schema
+            .fields
+            .iter()
+            .map(|f| (f.name().clone(), f.as_ref().clone()))
+            .collect::<HashMap<_, _>>();
+
+        for (name, partition_type) in partition_cols {
+            if let Some(field) = idents.remove(name) {
+                let types_match = match (partition_type, field.data_type()) {
+                    (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View) => true,
+                    (pt, ft) => DFSchema::datatype_is_semantically_equal(pt, ft),
+                };
+
+                if !types_match {
+                    return Err(SchemaMismatch {
+                        dataset_name: dataset.name.to_string(),
+                        differences: format!(
+                            "Field {name} cannot be deduplicated as its field types differ:\
+                            (partition column): {}, (file column): {}",
+                            partition_type,
+                            field.data_type()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let new_schema = Schema::new(
+            schema
+                .fields
+                .iter()
+                .filter_map(|f| idents.remove(f.name()))
+                .collect::<Vec<_>>(),
+        )
+        .with_metadata(schema.metadata.clone());
+
+        Ok(Arc::new(new_schema))
     }
 }
 
@@ -744,7 +1167,7 @@ fn refresh_skip_enabled(dataset: &Dataset) -> bool {
 }
 
 fn add_metadata_columns_if_required(
-    mut options: ListingOptions,
+    options: ListingOptions,
     table_url: &Url,
     schema: &Schema,
     dataset: &Dataset,
@@ -756,7 +1179,7 @@ fn add_metadata_columns_if_required(
             dataset.name,
             columns
         );
-        options = options.with_metadata_cols(columns);
+        return options.with_metadata_cols(columns);
     }
 
     options
@@ -816,7 +1239,7 @@ async fn get_last_modified(
         file_count += 1;
         total_size += file.size;
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         if file_count % 1_000_000 == 0 {
             tracing::debug!(
                 "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
@@ -981,14 +1404,12 @@ impl SensitiveListingTableUrl {
 
 struct ParquetPageIndexOptions {
     enable_page_index: bool,
-    tolerate_missing_page_index: bool,
 }
 
 impl Default for ParquetPageIndexOptions {
     fn default() -> Self {
         Self {
             enable_page_index: true,
-            tolerate_missing_page_index: false,
         }
     }
 }
@@ -1009,15 +1430,13 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
         app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
-        "auto" => ParquetPageIndexOptions {
-            enable_page_index: true,
-            tolerate_missing_page_index: true,
-        },
+        // Note: "auto" and "required" both enable page index now. The difference was that "auto"
+        // set tolerate_missing_page_index=true, but that option was removed in DataFusion v51.
+        // Page index reading now handles missing indexes gracefully by default.
+        "auto" | "required" => ParquetPageIndexOptions::default(),
         "skip" => ParquetPageIndexOptions {
             enable_page_index: false,
-            tolerate_missing_page_index: false,
         },
-        "required" => ParquetPageIndexOptions::default(),
         _ => {
             tracing::warn!(
                 "Invalid value '{}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
@@ -1030,6 +1449,7 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::RecordBatch;
     use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;
     use futures::StreamExt;
@@ -1362,6 +1782,380 @@ mod tests {
         assert_eq!(last_modified.location.as_ref(), "file_new.parquet");
     }
 
+    #[derive(Debug)]
+    struct NoListObjectStore {
+        meta: ObjectMeta,
+        list_called: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for NoListObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "NoListObjectStore")
+        }
+    }
+
+    impl NoListObjectStore {
+        fn new(meta: ObjectMeta) -> Self {
+            Self {
+                meta,
+                list_called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for NoListObjectStore {
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.list_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("list should not be called for location-pruned scans");
+        }
+
+        async fn head(&self, _location: &Path) -> object_store::Result<ObjectMeta> {
+            Ok(self.meta.clone())
+        }
+
+        async fn put(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+
+        async fn get_opts(
+            &self,
+            _location: &Path,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.list_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("list_with_delimiter should not be called for location-pruned scans");
+        }
+
+        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_location_pruning_skips_listing() {
+        let ctx = SessionContext::new();
+        let no_list_store = Arc::new(NoListObjectStore::new(create_meta(
+            "prefix/day=2025-01-01/file.parquet",
+            100,
+            128,
+        )));
+        let store_url = Url::parse("s3://bucket").expect("store url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::clone(&no_list_store) as Arc<dyn ObjectStore>,
+        );
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
+        let file_format = Arc::new(ParquetFormat::default());
+        let mut options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))]);
+        options = options.with_table_partition_cols(vec![]);
+
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path.clone(),
+            file_schema,
+        );
+
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register table");
+
+        let df = ctx
+            .sql("SELECT value FROM test_table WHERE _location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
+            .await
+            .expect("execute query");
+
+        // Use create_physical_plan instead of collect — this triggers
+        // the scan/listing logic without actually reading parquet data
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("create physical plan");
+
+        assert_eq!(
+            plan.schema().fields().len(),
+            1,
+            "should project only the 'value' column"
+        );
+        assert_eq!(
+            plan.schema().field(0).name(),
+            "value",
+            "column should be 'value'"
+        );
+
+        assert!(
+            !no_list_store
+                .list_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "Listing should not be invoked when location predicates are present"
+        );
+    }
+
+    /// Regression test for issue where SELECT with metadata columns (like `location`)
+    /// appearing before partition columns in the projection would fail with
+    /// "column types must match schema types" error.
+    ///
+    /// The root cause was in `DataFusion`'s `ExtendedColumnProjector::project()` which
+    /// inserted partition columns first, then metadata columns, without accounting
+    /// for index position shifts when metadata columns had lower schema indices
+    /// than partition columns.
+    ///
+    /// For example, with schema [compression, day, location] where:
+    /// - compression is a file column (index 0)
+    /// - day is a partition column (index 1)
+    /// - location is a metadata column (index 2)
+    ///
+    /// `SELECT location, day, compression` would request projection [2, 1, 0] which
+    /// maps to output positions [0, 1, 2]. The old code would:
+    /// 1. Insert partition column `day` at position 1 → [compression, day]
+    /// 2. Insert metadata column `location` at position 0 → [location, compression, day]
+    ///
+    /// But the correct output should be [location, day, compression].
+    #[tokio::test]
+    async fn test_location_metadata_column_projection_order() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use tempfile::TempDir;
+
+        // Create temp directory with hive-partitioned parquet files
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let partition_dir = temp_dir.path().join("day=2025-01-01");
+        std::fs::create_dir_all(&partition_dir).expect("create partition dir");
+
+        // Create a simple parquet file with one column (the partition column comes from path)
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "compression",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+
+        let compression_array = arrow::array::StringArray::from(vec!["gzip"]);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&file_schema), vec![Arc::new(compression_array)])
+                .expect("create batch");
+
+        let parquet_path = partition_dir.join("data.parquet");
+        let file = std::fs::File::create(&parquet_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&file_schema), None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        // Set up DataFusion with the listing table
+        let ctx = SessionContext::new();
+        let table_url = format!("file://{}/", temp_dir.path().display());
+        let store_url = Url::parse(&table_url).expect("parse url");
+        let table_path = ListingTableUrl::parse(&table_url).expect("parse listing url");
+
+        // Register the local filesystem object store
+        let object_store = object_store::local::LocalFileSystem::new();
+        ctx.runtime_env()
+            .register_object_store(&store_url, Arc::new(object_store));
+
+        // Create listing options with partition columns and location metadata
+        let file_format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
+            .with_metadata_cols(vec![MetadataColumn::Location(Some(
+                table_url.clone().into(),
+            ))]);
+
+        // Note: We only provide the file schema here. The ListingTable automatically
+        // adds partition columns (day) and metadata columns (location) to form the
+        // full table schema.
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+        );
+
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register table");
+
+        // Test 1: SELECT with location first (this was failing before the fix)
+        let df = ctx
+            .sql("SELECT _location, day, compression FROM test_table")
+            .await
+            .expect("execute query");
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+
+        let result = &batches[0];
+        assert_eq!(result.num_columns(), 3, "should have 3 columns");
+        assert_eq!(result.num_rows(), 1, "should have 1 row");
+
+        // Verify column order is correct
+        assert_eq!(
+            result.schema().field(0).name(),
+            "_location",
+            "first column should be location"
+        );
+        assert_eq!(
+            result.schema().field(1).name(),
+            "day",
+            "second column should be day"
+        );
+        assert_eq!(
+            result.schema().field(2).name(),
+            "compression",
+            "third column should be compression"
+        );
+
+        // Verify data types are correct
+        let location_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("location should be string array");
+        let day_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("day should be string array");
+        let compression_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("compression should be string array");
+
+        // Verify values
+        assert!(
+            location_col
+                .value(0)
+                .contains("day=2025-01-01/data.parquet"),
+            "location should contain file path, got: {}",
+            location_col.value(0)
+        );
+        assert_eq!(day_col.value(0), "2025-01-01", "day should be 2025-01-01");
+        assert_eq!(
+            compression_col.value(0),
+            "gzip",
+            "compression should be gzip"
+        );
+
+        // Test 2: SELECT with just location and day (was causing panic before fix)
+        let df = ctx
+            .sql("SELECT _location, day FROM test_table")
+            .await
+            .expect("execute query");
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "_location",
+            "first column should be location"
+        );
+        assert_eq!(
+            batches[0].schema().field(1).name(),
+            "day",
+            "second column should be day"
+        );
+
+        // Test 3: SELECT with reversed order (day, location) - should also work
+        let df = ctx
+            .sql("SELECT day, _location FROM test_table")
+            .await
+            .expect("execute query");
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "day",
+            "first column should be day"
+        );
+        assert_eq!(
+            batches[0].schema().field(1).name(),
+            "_location",
+            "second column should be location"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_last_modified_no_matching_extension() {
         let url = Url::parse("s3://bucket/").expect("to parse url");
@@ -1393,7 +2187,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        result.expect_err("should error on no matching extension");
     }
 
     #[tokio::test]
@@ -1428,7 +2222,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        result.expect("should succeed with matching files");
     }
 
     #[tokio::test]
@@ -1474,7 +2268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     async fn test_verify_schema_source_path_file_limit() {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
@@ -1556,7 +2350,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -1571,9 +2364,112 @@ mod tests {
             .build()
             .await;
 
+        // "auto" and "required" now behave the same since tolerate_missing_page_index
+        // was removed in DataFusion v51. Page index reading handles missing indexes gracefully.
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(options.tolerate_missing_page_index);
+    }
+
+    #[test]
+    fn test_extract_location_predicates_equality() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![col("_location").eq(lit("s3://bucket/path/file.parquet"))];
+        let values = extract_location_predicates(&filters);
+        assert_eq!(
+            values,
+            Some(vec!["s3://bucket/path/file.parquet".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_in_list() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![col("_location").in_list(
+            vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
+            false,
+        )];
+        let mut values = extract_location_predicates(&filters).expect("some values");
+        values.sort();
+        assert_eq!(
+            Some(vec![
+                "s3://bucket/a.parquet".to_string(),
+                "s3://bucket/b.parquet".to_string()
+            ]),
+            Some(values)
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_reversed_equality() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("_location"))];
+        let values = extract_location_predicates(&filters);
+        assert_eq!(
+            values,
+            Some(vec!["s3://bucket/reversed.parquet".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_nested_and_or() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![
+            col("_location")
+                .eq(lit("s3://bucket/a.parquet"))
+                .and(col("id").gt(lit(1)))
+                .or(col("_location").eq(lit("s3://bucket/b.parquet"))),
+        ];
+        let values = extract_location_predicates(&filters);
+        assert!(values.is_none(), "Location under OR should disable pruning");
+    }
+
+    #[test]
+    fn test_extract_location_predicates_not_wrapped() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![datafusion_expr::not(
+            col("_location").eq(lit("s3://bucket/negated.parquet")),
+        )];
+        let values = extract_location_predicates(&filters);
+        assert!(
+            values.is_none(),
+            "Location under NOT should disable pruning"
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_ignores_non_location() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![
+            col("id")
+                .eq(lit(5))
+                .and(col("_location").eq(lit("s3://bucket/only_location.parquet"))),
+        ];
+        let values = extract_location_predicates(&filters);
+        assert_eq!(
+            values,
+            Some(vec!["s3://bucket/only_location.parquet".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_not_in_list() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![col("_location").in_list(
+            vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
+            true,
+        )];
+        let values = extract_location_predicates(&filters);
+        assert!(
+            values.is_none(),
+            "Negated IN should disable location pruning"
+        );
     }
 
     #[tokio::test]
@@ -1590,7 +2486,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(!options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -1607,7 +2502,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -1625,6 +2519,5 @@ mod tests {
         let options = parquet_page_index_options(&runtime).await;
         // Should fall back to default
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 }

@@ -73,7 +73,7 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
@@ -177,7 +177,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         let table_reference = Dataset::parse_table_reference(&view.name)?;
 
         let sql = if let Some(view_sql) = &view.sql {
-            view_sql.to_string()
+            view_sql.clone()
         } else if let Some(sql_ref) = &view.sql_ref {
             View::load_sql_ref(sql_ref)?
         } else {
@@ -197,22 +197,15 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                 && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
             {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "Only 'refresh_mode: full' is supported".to_string(),
                 });
             }
 
             if acc.refresh_sql.is_some() {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "'refresh_sql' is not supported".to_string(),
-                });
-            }
-
-            if acc.on_zero_results == acceleration::ZeroResultsAction::UseSource {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
-                    reason: "Only 'on_zero_results: return_empty' is supported".to_string(),
                 });
             }
         }
@@ -239,7 +232,11 @@ impl AccelerationSource for View {
             if acceleration.engine == acceleration::Engine::PostgreSQL {
                 return false;
             }
-            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+            return acceleration.enabled
+                && matches!(
+                    acceleration.mode,
+                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                );
         }
         false
     }

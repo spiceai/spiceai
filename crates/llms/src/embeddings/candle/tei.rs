@@ -24,7 +24,7 @@ use crate::embeddings::{
     Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
     candle::util::link_files_into_tmp_dir, encode_embedding,
 };
-use async_openai::types::{
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
 };
 use async_trait::async_trait;
@@ -300,7 +300,7 @@ impl Embed for TeiEmbed {
         Ok(results)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         if let Some(CachedEmbeddingResult::Response(cached)) =
             self.get_cached_embed((&req).into()).await

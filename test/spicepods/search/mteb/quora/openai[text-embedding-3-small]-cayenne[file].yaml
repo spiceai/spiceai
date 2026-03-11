@@ -1,0 +1,36 @@
+version: v1
+kind: Spicepod
+name: openai[text-embedding-3-small]-cayenne[file]
+datasets:
+
+  # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/tree/main
+
+  - from: file:./corpus.parquet
+    name: corpus
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+    columns:
+      - name: text
+        embeddings:
+          - from: openai_embed
+            row_id:
+              - _id
+
+  - from: file:./queries.parquet
+    name: test_queries
+    acceleration:
+      enabled: true
+
+  - from: file:./data.parquet
+    name: relevance_data
+    acceleration:
+      enabled: true
+
+embeddings:
+  - from: openai:text-embedding-3-small
+    name: openai_embed
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }

@@ -45,6 +45,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use data_components::turso::TursoTableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     common::utils::quote_identifier, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
@@ -54,15 +55,15 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
-    component::dataset::acceleration::Engine,
+    component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path,
+    register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -204,6 +205,7 @@ fn sanitize_column_reference(column_ref: &str) -> Result<Vec<String>> {
 }
 // Re-export for use within the runtime crate
 pub use data_components::turso::TursoConnectionPool;
+use runtime_acceleration::snapshot::AccelerationEngine;
 
 pub struct TursoAccelerator {
     // Store connection pools for file-based databases
@@ -221,29 +223,6 @@ impl TursoAccelerator {
     pub fn new() -> Self {
         Self {
             pools: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-
-    /// Parses the `turso_mvcc` parameter from the acceleration configuration
-    /// Returns true if MVCC should be enabled, false otherwise (default: disabled)
-    fn parse_mvcc_enabled(source: &dyn AccelerationSource) -> Result<bool> {
-        if let Some(acceleration) = source.acceleration() {
-            if let Some(mvcc_value) = acceleration.params.get("turso_mvcc") {
-                match mvcc_value.as_str() {
-                    "enabled" => Ok(true),
-                    "disabled" => Ok(false),
-                    _ => Err(Error::InvalidConfiguration {
-                        detail: Arc::from(format!(
-                            "Invalid 'turso_mvcc' value: '{mvcc_value}'. Expected 'enabled' or 'disabled'."
-                        )),
-                    }),
-                }
-            } else {
-                // Default to disabled
-                Ok(false)
-            }
-        } else {
-            Ok(false)
         }
     }
 
@@ -338,7 +317,6 @@ impl TursoAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<Arc<TursoConnectionPool>> {
         let turso_file = self.turso_file_path(source)?;
-        let mvcc_enabled = Self::parse_mvcc_enabled(source)?;
         let timestamp_format = Self::parse_timestamp_format(source)?;
 
         let mut pools = self.pools.lock().await;
@@ -346,20 +324,16 @@ impl TursoAccelerator {
             Ok(Arc::clone(pool))
         } else {
             let pool = Arc::new(
-                TursoConnectionPool::new_with_timestamp_format(
-                    &turso_file,
-                    mvcc_enabled,
-                    timestamp_format,
-                )
-                .await
-                .map_err(|e| match e {
-                    data_components::turso::Error::TursoDatabaseError { source } => {
-                        Error::TursoDatabaseError { source }
-                    }
-                    _ => Error::AccelerationCreationFailed {
-                        source: Box::new(e),
-                    },
-                })?,
+                TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
+                    .await
+                    .map_err(|e| match e {
+                        data_components::turso::Error::TursoDatabaseError { source } => {
+                            Error::TursoDatabaseError { source }
+                        }
+                        _ => Error::AccelerationCreationFailed {
+                            source: Box::new(e),
+                        },
+                    })?,
             );
             pools.insert(turso_file, Arc::clone(&pool));
             Ok(pool)
@@ -370,10 +344,6 @@ impl TursoAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("turso_file")
         .description("Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso"),
-    ParameterSpec::component("turso_mvcc")
-        .description("Enable Multi-Version Concurrency Control (MVCC) for Turso database")
-        .default("disabled")
-        .one_of(&["enabled", "disabled"]),
     ParameterSpec::component("internal_timestamp_format")
         .description("Internal timestamp storage format: 'rfc3339' (default, preserves precision/timezone) or 'integer_millis' (performance, millisecond precision only)")
         .default("rfc3339")
@@ -383,6 +353,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     // Remote database support will be available when Turso is implemented as a data connector,
     // where remote access patterns are the primary use case and locally-cached acceleration
     // is not required.
+    // Note: MVCC is enabled via PRAGMA in TursoConnectionPool::new_with_timestamp_format().
 ];
 
 #[async_trait]
@@ -440,7 +411,7 @@ impl DataAccelerator for TursoAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
         // supported when Turso is used as a data connector.
@@ -458,7 +429,7 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the shared pool to verify connectivity
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         // Handle file mode: validate path and setup file-based database
@@ -483,23 +454,45 @@ impl DataAccelerator for TursoAccelerator {
                 .into());
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "Turso acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
+            let bootstrap_status = download_snapshot_if_needed(
+                acceleration,
+                source,
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
+                AccelerationEngine::Turso,
+            )
+            .await;
 
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    #[allow(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
@@ -521,20 +514,13 @@ impl DataAccelerator for TursoAccelerator {
             ":memory:".to_string()
         };
 
-        // Get MVCC setting
-        let mvcc_enabled = if let Some(source) = source {
-            Self::parse_mvcc_enabled(source)?
-        } else {
-            false // Default to disabled for external tables without source
-        };
-
         // Get or create connection pool
         let pool = {
             let mut pools = self.pools.lock().await;
             if let Some(pool) = pools.get(&db_path) {
                 Arc::clone(pool)
             } else {
-                let new_pool = Arc::new(TursoConnectionPool::new(&db_path, mvcc_enabled).await?);
+                let new_pool = Arc::new(TursoConnectionPool::new(&db_path).await?);
                 pools.insert(db_path.clone(), Arc::clone(&new_pool));
                 new_pool
             }
@@ -548,7 +534,7 @@ impl DataAccelerator for TursoAccelerator {
         // Build CREATE TABLE statement from schema
         let mut columns = Vec::new();
         for field in cmd.schema.fields() {
-            #[allow(clippy::match_same_arms)]
+            #[expect(clippy::match_same_arms)]
             let col_type = match field.data_type() {
                 // Integer types map to SQLite INTEGER
                 DataType::Int64
@@ -603,58 +589,50 @@ impl DataAccelerator for TursoAccelerator {
 
         // Handle indexes if specified
         if let Some(indexes_str) = cmd.options.get("indexes") {
-            if mvcc_enabled {
-                // Indexes are not yet supported in MVCC mode
-                tracing::warn!(
-                    "Indexes are not yet supported in MVCC mode for Turso. Skipping index creation for table '{}'",
-                    table_name
+            // Parse the indexes option string
+            use datafusion_table_providers::util::hashmap_from_option_string;
+            let indexes = hashmap_from_option_string::<String, String>(indexes_str);
+
+            // Create indexes
+            for (column_ref_str, index_type_str) in indexes {
+                let index_type = crate::component::dataset::acceleration::IndexType::from(
+                    index_type_str.as_str(),
                 );
-            } else {
-                // Parse the indexes option string
-                use datafusion_table_providers::util::hashmap_from_option_string;
-                let indexes = hashmap_from_option_string::<String, String>(indexes_str);
+                let index_name = format!(
+                    "idx_{}_{}",
+                    table_name,
+                    column_ref_str.replace(['(', ')', ' ', ','], "_")
+                );
+                let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
+                let unique_clause = match &index_type {
+                    crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
+                    crate::component::dataset::acceleration::IndexType::Enabled => "",
+                };
 
-                // Create indexes
-                for (column_ref_str, index_type_str) in indexes {
-                    let index_type = crate::component::dataset::acceleration::IndexType::from(
-                        index_type_str.as_str(),
-                    );
-                    let index_name = format!(
-                        "idx_{}_{}",
-                        table_name,
-                        column_ref_str.replace(['(', ')', ' ', ','], "_")
-                    );
-                    let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
-                    let unique_clause = match &index_type {
-                        crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
-                        crate::component::dataset::acceleration::IndexType::Enabled => "",
-                    };
+                let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
+                let column_list = format!("({})", sanitized_columns.join(", "));
 
-                    let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
-                    let column_list = format!("({})", sanitized_columns.join(", "));
+                let create_index_sql = format!(
+                    "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
+                );
 
-                    let create_index_sql = format!(
-                        "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
-                    );
+                conn.execute(&create_index_sql, ()).await.map_err(|e| {
+                    Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    }
+                })?;
 
-                    conn.execute(&create_index_sql, ()).await.map_err(|e| {
-                        Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        }
-                    })?;
-
-                    tracing::debug!(
-                        "Created {}index '{}' on table '{}' for columns: {}",
-                        if unique_clause.is_empty() {
-                            ""
-                        } else {
-                            "unique "
-                        },
-                        index_name,
-                        table_name,
-                        column_ref_str
-                    );
-                }
+                tracing::debug!(
+                    "Created {}index '{}' on table '{}' for columns: {}",
+                    if unique_clause.is_empty() {
+                        ""
+                    } else {
+                        "unique "
+                    },
+                    index_name,
+                    table_name,
+                    column_ref_str
+                );
             }
         }
 
@@ -674,13 +652,18 @@ impl DataAccelerator for TursoAccelerator {
 
         // Wrap in PolyTableProvider for proper read/write separation
         // This allows the table to support both reading and writing operations
-        let write_provider = Arc::clone(&turso_provider);
-        let delete_provider = Arc::clone(&turso_provider);
         let fed_provider = Arc::new(
             Arc::clone(&turso_provider)
                 .create_federated_table_provider()
                 .boxed()?,
         ) as Arc<dyn TableProvider>;
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            turso_provider,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
@@ -700,6 +683,8 @@ impl DataAccelerator for TursoAccelerator {
     }
 }
 
+register_data_accelerator!(Engine::Turso, TursoAccelerator);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,7 +695,7 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -720,6 +705,23 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
     use std::collections::HashMap;
+
+    fn cleanup_turso_test_files(path: &str) {
+        let db_path = std::path::Path::new(path);
+        let mut candidates = vec![db_path.to_path_buf()];
+
+        if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name()) {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut sidecar = file_name.to_os_string();
+                sidecar.push(suffix);
+                candidates.push(parent.join(sidecar));
+            }
+        }
+
+        for candidate in candidates {
+            std::fs::remove_file(candidate).ok();
+        }
+    }
 
     #[tokio::test]
     async fn test_turso_file_initialization() {
@@ -743,6 +745,11 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
+        let path = accelerator
+            .file_path(&dataset)
+            .expect("path should be derivable");
+        cleanup_turso_test_files(&path);
+
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
@@ -751,13 +758,11 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
-        let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
 
         // cleanup
-        std::fs::remove_file(&path).ok();
+        cleanup_turso_test_files(&path);
     }
 
     #[tokio::test]
@@ -829,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_turso() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -843,6 +848,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -853,7 +859,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -888,8 +894,7 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -907,8 +912,7 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -943,6 +947,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -954,7 +959,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1072,6 +1077,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1083,7 +1089,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1183,6 +1189,10 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
+        let file_path = accelerator
+            .file_path(&dataset)
+            .expect("should derive default file path");
+        cleanup_turso_test_files(&file_path);
 
         // Initialize the accelerator
         accelerator
@@ -1197,10 +1207,6 @@ mod tests {
         );
 
         // Get the file path
-        let file_path = accelerator
-            .file_path(&dataset)
-            .expect("should have file path");
-
         // Verify the file was created at the default location
         assert!(
             std::path::Path::new(&file_path).exists(),
@@ -1227,6 +1233,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1238,7 +1245,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let table = TursoAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -1276,11 +1283,10 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3, "should have 3 rows");
 
         // Clean up
-        std::fs::remove_file(&file_path).ok();
+        cleanup_turso_test_files(&file_path);
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_timestamp_unit_conversion() {
         // Test that timestamps are correctly converted between different units
         // All timestamps are stored as milliseconds in Turso, but should be
@@ -1317,6 +1323,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1327,7 +1334,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 
@@ -1382,6 +1389,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1392,7 +1400,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 
@@ -1447,6 +1455,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1457,7 +1466,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 
@@ -1512,6 +1521,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1522,7 +1532,7 @@ mod tests {
             };
 
             let table = TursoAccelerator::new()
-                .create_external_table(external_table, None, vec![])
+                .create_external_table(external_table, None, vec![], None)
                 .await
                 .expect("table should be created");
 

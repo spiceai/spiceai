@@ -15,25 +15,33 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
+    DescribeTableSnafu, Error, FailedToBootstrapTableSnafu, FailedToInitializeCheckpointSnafu,
+    FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
+use crate::cdc::ChangeBatch;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
+use crate::dynamodb::json_nest::{JsonNesting, json_nest_except_fields};
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
-use crate::dynamodb::schema::infer_arrow_schema_from_items;
+use crate::dynamodb::schema::infer_arrow_schema_from_rows;
+use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
-use crate::dynamodb::unnest::unnest_dynamodb_items;
+use crate::dynamodb::unnest::unnest_dynamodb_rows;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use aws_sdk_dynamodb::types::KeyType;
+use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
-    Client,
+    Client as DbClient,
     error::SdkError,
-    types::{AttributeValue, TableStatus},
+    types::{AttributeValue, KeyType, TableStatus},
 };
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::common::{Constraint, Constraints, DFSchema};
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::logical_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
+use datafusion::prelude::SessionContext;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -48,22 +56,29 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use dynamodb_streams::{Checkpoint, Client as StreamsClient, Metrics, MetricsCollector};
 use futures::Stream;
 use futures::pin_mut;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
-    client: Arc<Client>,
+    db_client: Arc<DbClient>,
+    streams_client: Arc<StreamsClient>,
     table_schema: DynamoDBTableSchema,
-    request_plan_builder: DynamoDBRequestPlanBuilder,
+    constraints: Option<Constraints>,
+    request_plan_builder: Arc<DynamoDBRequestPlanBuilder>,
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
+    pub ready_lag: Duration,
+    json_nesting: Option<JsonNesting>,
 }
 
 type DynamoDBItemStream =
@@ -72,23 +87,61 @@ type DynamoDBItemStream =
 const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
+    /// Creates a new `DynamoDB` table provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be accessed or metadata cannot be fetched.
+    #[expect(clippy::too_many_arguments)]
     pub async fn try_new(
-        client: Arc<Client>,
+        sdk_config: SdkConfig,
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
+        scan_interval: Duration,
         time_format: String,
+        ready_lag: Duration,
+        metrics_collector: Arc<MetricsCollector>,
+        json_nesting: Option<&JsonNesting>,
     ) -> Result<Self, Error> {
+        let db_client = Arc::new(DbClient::new(&sdk_config));
+        let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
+        let streams_client = Arc::new(
+            StreamsClient::builder(sdk_config, table_name.to_string())
+                .interval(Some(scan_interval))
+                .buffer(buffer_size)
+                .metrics_collector(metrics_collector)
+                .build(),
+        );
+
         let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
             Self::fetch_table_metadata(
-                Arc::clone(&client),
+                Arc::clone(&db_client),
                 &table_name,
                 unnest_depth,
                 schema_infer_max_records,
                 &time_format,
+                json_nesting,
             )
             .await?;
+
+        // Check that all static fields are present in the table schema
+        if let Some(static_fields) =
+            json_nesting.map(|json_nesting| json_nesting.static_fields.clone())
+        {
+            let missing_fields: Vec<String> = static_fields
+                .iter()
+                .filter(|field_name| table_schema.index_of(field_name).is_err())
+                .cloned()
+                .collect();
+
+            if !missing_fields.is_empty() {
+                return Err(Error::ColumnsNotFound {
+                    field_names: missing_fields.join(", "),
+                });
+            }
+        }
 
         let table_schema = DynamoDBTableSchema::new(
             table_name,
@@ -98,22 +151,47 @@ impl DynamoDBTableProvider {
             flattened_fields,
             &time_format,
         );
+
+        // Create constraints with the primary key indices
+        let Ok(df_schema) = DFSchema::try_from(Arc::clone(table_schema.schema())) else {
+            unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
+        };
+
+        let pk_indices: Vec<usize> = table_schema
+            .primary_keys()
+            .iter()
+            .filter_map(|pk| df_schema.index_of_column_by_name(None, pk))
+            .collect();
+
+        let constraints = if pk_indices.is_empty() {
+            None
+        } else {
+            Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                pk_indices,
+            )]))
+        };
+
         Ok(Self {
-            client,
+            db_client,
+            streams_client,
             table_schema: table_schema.clone(),
-            request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
+            constraints,
+            request_plan_builder: Arc::new(DynamoDBRequestPlanBuilder::new(table_schema)),
             unnest_depth,
             config_partitions,
             table_total_item_count,
+            ready_lag,
+            json_nesting: json_nesting.cloned(),
         })
     }
 
     async fn fetch_table_metadata(
-        client: Arc<Client>,
+        db_client: Arc<DbClient>,
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         time_format: &str,
+        json_nesting: Option<&JsonNesting>,
     ) -> Result<(
         SchemaRef,
         String,
@@ -121,7 +199,7 @@ impl DynamoDBTableProvider {
         HashSet<String>,
         Option<i64>,
     )> {
-        let response = client
+        let response = db_client
             .describe_table()
             .table_name(table_name)
             .send()
@@ -161,11 +239,11 @@ impl DynamoDBTableProvider {
             return Err(Error::MissingPartitionKey);
         };
 
-        let mut request = client.scan().table_name(table_name);
+        let mut request = db_client.scan().table_name(table_name);
 
         request = request.limit(schema_infer_max_records);
 
-        let items: Vec<_> = request
+        let rows: Vec<_> = request
             .send()
             .await
             .map_err(map_sdk_error)
@@ -173,18 +251,29 @@ impl DynamoDBTableProvider {
             .items()
             .to_vec();
 
-        let (unnested_items, flattened_fields) = match unnest_depth {
-            None => (items, HashSet::new()),
-            Some(depth) => unnest_dynamodb_items(items, depth)?,
+        if rows.is_empty() {
+            return Err(Error::EmptyTable {
+                table_name: table_name.to_string(),
+            });
+        }
+
+        let (unnested_rows, flattened_fields) = match unnest_depth {
+            None => (rows, HashSet::new()),
+            Some(depth) => unnest_dynamodb_rows(rows, depth)?,
+        };
+
+        let final_rows = match json_nesting {
+            None => unnested_rows,
+            Some(json_nesting) => json_nest_except_fields(unnested_rows, json_nesting)?,
         };
 
         tracing::debug!(
             "DynamoDB items for schema inference: table_name={:?}, items={:?}",
             table_name,
-            &unnested_items[..unnested_items.len().min(2)]
+            &final_rows[..final_rows.len().min(2)]
         );
 
-        let schema = infer_arrow_schema_from_items(&unnested_items, time_format)?;
+        let schema = infer_arrow_schema_from_rows(&final_rows, time_format)?;
 
         tracing::debug!(
             "DynamoDB inferred schema: table_name={:?}, schema={:?}",
@@ -214,6 +303,105 @@ impl DynamoDBTableProvider {
             },
         }
     }
+
+    pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
+        self.streams_client
+            .latest_global_checkpoint()
+            .await
+            .context(FailedToInitializeStreamSnafu)
+    }
+
+    pub async fn stream_from_checkpoint(
+        &self,
+        checkpoint: Checkpoint,
+    ) -> Result<
+        BoxStream<
+            'static,
+            Result<(ChangeBatch, Checkpoint, Option<SystemTime>), crate::cdc::StreamError>,
+        >,
+    > {
+        let table_schema = Arc::clone(self.table_schema.schema());
+        let primary_keys = self.table_schema.primary_keys().clone();
+        let unnest_depth = self.unnest_depth;
+        let time_format = Arc::clone(&self.table_schema.time_format());
+        let json_nesting = self.json_nesting.clone();
+
+        let stream = self
+            .streams_client
+            .stream_from_checkpoint(checkpoint)
+            .await
+            .context(FailedToInitializeCheckpointSnafu)?
+            .map(move |batch| {
+                process_batch(
+                    batch,
+                    &table_schema,
+                    &primary_keys,
+                    unnest_depth,
+                    &time_format,
+                    json_nesting.as_ref(),
+                )
+                .map_err(crate::cdc::StreamError::DynamoDB)
+            });
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Creates a bootstrap stream for the `DynamoDB` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Logical plan construction fails
+    /// - Stream execution fails
+    pub async fn bootstrap_stream(
+        self: Arc<Self>,
+    ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
+        let schema = Arc::clone(self.table_schema.schema());
+        let table_name = self.table_schema.table_name();
+        let primary_keys = self.table_schema.primary_keys();
+
+        let table_source = Arc::new(DefaultTableSource::new(
+            Arc::clone(&self) as Arc<dyn TableProvider>
+        ));
+
+        let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
+
+        let logical_plan = LogicalPlanBuilder::scan(table_name, table_source, None)
+            .and_then(|b| b.project(columns))
+            .and_then(datafusion::logical_expr::LogicalPlanBuilder::build)
+            .context(FailedToBootstrapTableSnafu)?;
+
+        let ctx = SessionContext::new();
+        let df = DataFrame::new(ctx.state(), logical_plan);
+
+        let record_batch_stream = df
+            .execute_stream()
+            .await
+            .context(FailedToBootstrapTableSnafu)?;
+
+        let stream =
+            record_batch_stream.map(move |record_batch_result| match record_batch_result {
+                Ok(record_batch) => {
+                    tracing::debug!(
+                        "DynamoDB bootstrapping records: table_name={}, records={}",
+                        self.table_schema.table_name(),
+                        record_batch.num_rows()
+                    );
+                    record_batch_to_change_batch(record_batch, &schema, &primary_keys)
+                        .map_err(crate::cdc::StreamError::DynamoDB)
+                }
+                Err(e) => Err(crate::cdc::StreamError::DynamoDB(
+                    StreamError::FailedToReadRecordBatch { source: e },
+                )),
+            });
+
+        Ok(stream.boxed())
+    }
+
+    #[must_use]
+    pub fn stream_metrics(&self) -> Metrics {
+        self.streams_client.metrics()
+    }
 }
 
 #[async_trait]
@@ -224,6 +412,10 @@ impl TableProvider for DynamoDBTableProvider {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.table_schema.schema())
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints.as_ref()
     }
 
     fn table_type(&self) -> TableType {
@@ -256,9 +448,17 @@ impl TableProvider for DynamoDBTableProvider {
             projected_schema = SchemaRef::from(self.table_schema.schema().project(&[idx])?);
         }
 
-        let request_plan =
-            self.request_plan_builder
-                .build_request_plan(filters, &projected_schema, limit)?;
+        let json_nesting_static_fields = self
+            .json_nesting
+            .as_ref()
+            .map(|json_nesting| json_nesting.static_fields.clone());
+
+        let request_plan = self.request_plan_builder.build_request_plan(
+            filters,
+            &projected_schema,
+            limit,
+            json_nesting_static_fields.as_ref(),
+        )?;
 
         tracing::debug!(
             "Table {:?}, request_plan: {:?}",
@@ -266,10 +466,15 @@ impl TableProvider for DynamoDBTableProvider {
             request_plan
         );
 
-        // If `config_partitions` is empty (i.e. it was set to 'auto' in the config), use table size as a heuristic.
-        let total_partitions = self
-            .config_partitions
-            .unwrap_or_else(|| self.get_partitions_from_table_size());
+        let total_partitions = match request_plan {
+            // For Query request, always use 1 partition.
+            DynamoDBRequestPlan::Query(_) => 1,
+            DynamoDBRequestPlan::Scan(_) => {
+                self.config_partitions
+                    // If `config_partitions` is empty (i.e. it was set to 'auto' in the config), use table size as a heuristic.
+                    .unwrap_or_else(|| self.get_partitions_from_table_size())
+            }
+        };
 
         tracing::debug!(
             "Table {:?}, total_partitions: {:?}",
@@ -278,12 +483,13 @@ impl TableProvider for DynamoDBTableProvider {
         );
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
-            Arc::clone(&self.client),
+            Arc::clone(&self.db_client),
             request_plan,
             self.unnest_depth,
             projected_schema,
             total_partitions,
             self.table_schema.time_format(),
+            self.json_nesting.clone(),
         )))
     }
 
@@ -305,23 +511,25 @@ impl TableProvider for DynamoDBTableProvider {
 }
 
 pub struct DynamoDBTableProviderExec {
-    client: Arc<Client>,
+    client: Arc<DbClient>,
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
     time_format: Arc<String>,
     properties: PlanProperties,
+    json_nesting: Option<JsonNesting>,
 }
 
 impl DynamoDBTableProviderExec {
     #[must_use]
     pub fn new(
-        client: Arc<Client>,
+        client: Arc<DbClient>,
         request_plan: DynamoDBRequestPlan,
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
         partitions: usize,
         time_format: Arc<String>,
+        json_nesting: Option<JsonNesting>,
     ) -> Self {
         Self {
             client,
@@ -329,6 +537,7 @@ impl DynamoDBTableProviderExec {
             projected_schema: Arc::clone(&projected_schema),
             unnest_depth,
             time_format,
+            json_nesting,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
@@ -396,6 +605,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
         let time_format = Arc::clone(&self.time_format);
+        let json_nesting = self.json_nesting.clone();
 
         let total_partitions = match self.properties.partitioning {
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
@@ -403,14 +613,16 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         };
 
         let segment: i32 = i32::try_from(partition).map_err(|_| {
-            DataFusionError::Execution(
-                format!("Partition number too large for DynamoDB segment: {partition}").to_string(),
-            )
+            DataFusionError::Execution(format!(
+                "Partition number too large for DynamoDB segment: {partition}"
+            ))
         })?;
 
-        let total_segments: i32 = i32::try_from(total_partitions).map_err(|_| DataFusionError::Execution(
-            format!("Total partitions number too large for DynamoDB total_segments: {total_partitions}").to_string()
-        ))?;
+        let total_segments: i32 = i32::try_from(total_partitions).map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Total partitions number too large for DynamoDB total_segments: {total_partitions}"
+            ))
+        })?;
 
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
@@ -421,19 +633,22 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
             pin_mut!(chunked_stream);
 
             while let Some(chunk) = chunked_stream.next().await {
-                let items: Result<Vec<_>, _> = chunk.into_iter().collect();
-                let items = items?;
+                let rows: Result<Vec<_>, _> = chunk.into_iter().collect();
+                let rows = rows?;
 
-                let (unnested_items, _) = match unnest_depth {
-                    None => (items, HashSet::new()),
-                    Some(depth) => {
-                        unnest_dynamodb_items(items, depth).map_err(to_execution_error)?
-                    }
+                let (unnested_rows, _) = match unnest_depth {
+                    None => (rows, HashSet::new()),
+                    Some(depth) => unnest_dynamodb_rows(rows, depth).map_err(to_execution_error)?,
                 };
 
-                let batch =
-                    dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema), &time_format)
-                        .map_err(to_execution_error)?;
+                let final_rows = match json_nesting.clone() {
+                    None => unnested_rows,
+                    Some(ref json_nesting) => json_nest_except_fields(unnested_rows, json_nesting)
+                        .map_err(to_execution_error)?,
+                };
+
+                let batch = dynamodb_items_to_arrow(&final_rows, Arc::clone(&schema), &time_format)
+                    .map_err(to_execution_error)?;
 
                 tx.send(Ok(batch)).await.map_err(to_execution_error)?;
             }
@@ -447,7 +662,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
 #[deny(unused_variables)]
 fn build_stream_from_plan(
-    client: &Arc<Client>,
+    client: &Arc<DbClient>,
     request: DynamoDBRequestPlan,
     segment: i32,
     total_segments: i32,
@@ -520,11 +735,10 @@ fn build_stream_from_plan(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 fn map_sdk_error<E>(err: SdkError<E>) -> Box<dyn std::error::Error + Send + Sync>

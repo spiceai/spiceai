@@ -14,43 +14,49 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use prost::Message;
-use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{Service, flightsql::prepared_statement_query, metrics, to_tonic_err},
+    flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
     timing::TimedStream,
 };
 
-use crate::datafusion::app_context_extension::AppContextExtension;
-use crate::datafusion::request_context_extension::DataFusionContextExtension;
-use crate::datafusion::secrets_context_extension::SecretsContextExtension;
 use arrow_flight::{
     Action, ActionType as FlightActionType,
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
-use runtime_proto::{ExecutorExpandSecretRequest, ExecutorExpandSecretResponse};
-use runtime_request_context::{AsyncMarker, RequestContext};
-use secrecy::ExposeSecret;
 
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
-    GetAppDefinition,
-    ExpandSecret,
+    // Async query actions
+    SubmitAsyncQuery,
+    GetAsyncQueryStatus,
+    GetAsyncQueryResult,
+    CancelAsyncQuery,
     Unknown,
 }
 
 impl ActionType {
     fn from_str(s: &str) -> Self {
+        if let Some(async_action) = async_actions::AsyncActionType::from_str(s) {
+            return match async_action {
+                async_actions::AsyncActionType::SubmitAsyncQuery => ActionType::SubmitAsyncQuery,
+                async_actions::AsyncActionType::GetAsyncQueryStatus => {
+                    ActionType::GetAsyncQueryStatus
+                }
+                async_actions::AsyncActionType::GetAsyncQueryResult => {
+                    ActionType::GetAsyncQueryResult
+                }
+                async_actions::AsyncActionType::CancelAsyncQuery => ActionType::CancelAsyncQuery,
+            };
+        }
+
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
-            "GetAppDefinition" => ActionType::GetAppDefinition,
-            "ExpandSecret" => ActionType::ExpandSecret,
             _ => ActionType::Unknown,
         }
     }
@@ -59,8 +65,10 @@ impl ActionType {
         match self {
             ActionType::CreatePreparedStatement => "CreatePreparedStatement",
             ActionType::ClosePreparedStatement => "ClosePreparedStatement",
-            ActionType::GetAppDefinition => "GetAppDefinition",
-            ActionType::ExpandSecret => "ExpandSecret",
+            ActionType::SubmitAsyncQuery => async_actions::action_types::SUBMIT_ASYNC_QUERY,
+            ActionType::GetAsyncQueryStatus => async_actions::action_types::GET_ASYNC_QUERY_STATUS,
+            ActionType::GetAsyncQueryResult => async_actions::action_types::GET_ASYNC_QUERY_RESULT,
+            ActionType::CancelAsyncQuery => async_actions::action_types::CANCEL_ASYNC_QUERY,
             ActionType::Unknown => "Unknown",
         }
     }
@@ -89,26 +97,44 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: N/A"
             .into(),
     };
-    let get_app_definition_action_type = FlightActionType {
-        r#type: ActionType::GetAppDefinition.to_string(),
-        description:
-            "Used in cluster mode to ask Spice for its App declaration for runtime dependencies.\n
-            Request Message: N/A
-            Response Message: app::App serialized as JSON bytes"
-                .into(),
-    };
-    let expand_secret_action_type = FlightActionType {
-        r#type: ActionType::ExpandSecret.to_string(),
-        description: "Used in cluster mode to ask the scheduler for the value of a secret\n
-            Request Message: ExecutorExpandSecretRequest
-            Response Message: ExecutorExpandSecretResponse"
+
+    // Async query actions
+    let submit_async_query_action_type = FlightActionType {
+        r#type: async_actions::action_types::SUBMIT_ASYNC_QUERY.to_string(),
+        description: "Submits a SQL query for async execution.\n
+            Request Message: JSON {sql: string, parameters?: object}\n
+            Response Message: JSON {query_id: string, status: string}"
             .into(),
     };
+    let get_async_query_status_action_type = FlightActionType {
+        r#type: async_actions::action_types::GET_ASYNC_QUERY_STATUS.to_string(),
+        description: "Gets the status of an async query.\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, status: string, error?: object, result?: object}"
+            .into(),
+    };
+    let get_async_query_result_action_type = FlightActionType {
+        r#type: async_actions::action_types::GET_ASYNC_QUERY_RESULT.to_string(),
+        description: "Gets the result of a completed async query as Arrow IPC.\n
+            Request Message: JSON {query_id: string, chunk_index?: number}\n
+            Response Message: Arrow IPC stream"
+            .into(),
+    };
+    let cancel_async_query_action_type = FlightActionType {
+        r#type: async_actions::action_types::CANCEL_ASYNC_QUERY.to_string(),
+        description: "Cancels a running async query.\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, cancelled: boolean, status: string}"
+            .into(),
+    };
+
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
-        Ok(get_app_definition_action_type),
-        Ok(expand_secret_action_type),
+        Ok(submit_async_query_action_type),
+        Ok(get_async_query_status_action_type),
+        Ok(get_async_query_result_action_type),
+        Ok(cancel_async_query_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);
@@ -116,7 +142,6 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
     Response::new(Box::pin(output) as <Service as FlightService>::ListActionsStream)
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn do_action(
     request: Request<Action>,
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
@@ -145,107 +170,27 @@ pub(crate) async fn do_action(
             tracing::trace!("do_action: ClosePreparedStatement");
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
         }
-        ActionType::GetAppDefinition => {
-            tracing::trace!("do_action: GetAppDefinition");
-            let context = RequestContext::current(AsyncMarker::new().await);
-            let Some(app) = context
-                .extension::<AppContextExtension>()
-                .and_then(|a| a.app())
-            else {
-                return Err(Status::internal("App context not available"));
-            };
-
-            let bs = serde_json::to_vec(&app).map_err(to_tonic_err)?;
-            let result = arrow_flight::Result::new(bs);
-            futures::stream::iter(vec![Ok(result)])
+        ActionType::SubmitAsyncQuery => {
+            tracing::trace!("do_action: SubmitAsyncQuery");
+            let body = async_actions::handle_submit_async_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
         }
-        ActionType::ExpandSecret => {
-            tracing::trace!("do_action: ExpandSecret");
-
-            let request = ExecutorExpandSecretRequest::decode(&*request.get_ref().body)
-                .map_err(to_tonic_err)?;
-
-            let span = tracing::span!(
-                target: "task_history",
-                tracing::Level::INFO,
-                "cluster::expand_secret",
-                executor_id = %request.executor_id,
-                key = %request.key
-            );
-            let _guard = span.enter();
-
-            let context = RequestContext::current(AsyncMarker::new().await);
-            let Some(df) = context
-                .extension::<DataFusionContextExtension>()
-                .map(|df| df.datafusion())
-            else {
-                return Err(Status::internal("DataFusion context not available"));
-            };
-
-            let scheduler = {
-                let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
-                    return Err(Status::internal("Cluster scheduler context cannot be read"));
-                };
-
-                let Some(ref scheduler) = *maybe_scheduler else {
-                    return Err(Status::internal("Cluster scheduler context not available"));
-                };
-
-                Arc::clone(scheduler)
-            };
-
-            let executor_state = scheduler
-                .state
-                .executor_manager
-                .get_executor_state()
-                .await
-                .map_err(to_tonic_err)?;
-            let executors = executor_state
-                .into_iter()
-                .map(|(e, _)| e.id)
-                .collect::<HashSet<_>>();
-
-            if !executors.contains(&request.executor_id) {
-                return Err(Status::invalid_argument(format!(
-                    "Executor {} is not a part of the cluster",
-                    request.executor_id
-                )));
-            }
-
-            tracing::debug!(
-                "ExpandSecret: expanding secret {} for executor {}",
-                request.key,
-                request.executor_id
-            );
-
-            let Some(sctx) = context.extension::<SecretsContextExtension>() else {
-                return Err(Status::internal("Secrets context not available"));
-            };
-
-            let secrets = sctx.secrets();
-            let secrets = secrets.read().await;
-            let Some(value) = secrets
-                .get_secret(&request.key)
-                .await
-                .map_err(to_tonic_err)?
-            else {
-                tracing::error!(target: "task_history", "Secret not found");
-                return Err(Status::invalid_argument(format!(
-                    "Unable to read secret {}",
-                    request.key
-                )));
-            };
-
-            let exposed = value.expose_secret();
-            let response = ExecutorExpandSecretResponse {
-                key: request.key,
-                value: exposed.to_string(),
-            };
-
-            tracing::debug!(target: "task_history", "Secret expanded successfully");
-
-            let result = arrow_flight::Result::new(response.encode_to_vec());
-            futures::stream::iter(vec![Ok(result)])
+        ActionType::GetAsyncQueryStatus => {
+            tracing::trace!("do_action: GetAsyncQueryStatus");
+            let body =
+                async_actions::handle_get_async_query_status(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::GetAsyncQueryResult => {
+            tracing::trace!("do_action: GetAsyncQueryResult");
+            let body =
+                async_actions::handle_get_async_query_result(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::CancelAsyncQuery => {
+            tracing::trace!("do_action: CancelAsyncQuery");
+            let body = async_actions::handle_cancel_async_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
         }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };

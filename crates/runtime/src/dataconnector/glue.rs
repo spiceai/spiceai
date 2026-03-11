@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_glue::{Client, types::Table};
-use aws_sdk_sts::config::ProvideCredentials;
+use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
@@ -289,6 +289,8 @@ impl DataConnector for GlueDataConnector {
     }
 }
 
+register_data_connector!("glue", GlueDataConnectorFactory);
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {
     // Avro,
@@ -424,9 +426,14 @@ async fn create_iceberg_provider(
         props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
     }
 
+    // Disable OpenDAL's automatic credential loading from environment variables and config files.
+    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
+    // or other credentials from the environment that may not be valid for this specific connection.
+    props.insert("s3.disable-config-load".to_string(), "true".to_string());
+
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
-        metadata_location.to_string(),
+        metadata_location.clone(),
     );
 
     if let Some(catalog_id) = table.catalog_id.clone() {
@@ -447,14 +454,18 @@ async fn create_iceberg_provider(
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
 
-    let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
-        .await
-        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
-            source: e.into(),
-        })?;
+    let table_provider = IcebergTableProvider::try_new(
+        Arc::new(catalog),
+        identifier.namespace().clone(),
+        identifier.name().to_string(),
+    )
+    .await
+    .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+        dataconnector: PREFIX.to_string(),
+        connector_component: dataset.into(),
+        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+        source: e.into(),
+    })?;
 
     Ok(Arc::new(table_provider))
 }
@@ -549,7 +560,7 @@ fn get_metadata_location(table: &Table) -> Result<String, Error> {
     const METADATA_LOCATION: &str = "metadata_location";
     match &table.parameters {
         Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.to_string()),
+            Some(location) => Ok(location.clone()),
             None => Err(Error::MissingMetadataLocation {
                 table: table.name().to_string(),
                 message: format!("No property '{METADATA_LOCATION}' found"),

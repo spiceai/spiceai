@@ -24,7 +24,7 @@ use tracing::instrument;
 
 use crate::{
     RecordBatch, init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ use spicepod::acceleration::RefreshMode;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 // This method is only used in tests
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
     let databricks_odbc_host =
@@ -43,9 +43,12 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
         std::env::var("databricks_warehouse_id").expect("databricks warehouse id exists");
     let databricks_access_token =
         std::env::var("databricks_access_token").expect("databricks access token exists");
-    let params = HashMap::from([
-        ("odbc_connection_string".to_string(), format!("Host={databricks_odbc_host};Port=443;transportMode=http;ssl=1;AuthMech=3;httpPath=/sql/1.0/warehouses/{databricks_warehouse_id};Driver={{Simba Spark ODBC Driver}};UID=token;PWD={databricks_access_token};ThriftTransport=2").to_string()),
-    ]);
+    let params = HashMap::from([(
+        "odbc_connection_string".to_string(),
+        format!(
+            "Host={databricks_odbc_host};Port=443;transportMode=http;ssl=1;AuthMech=3;httpPath=/sql/1.0/warehouses/{databricks_warehouse_id};Driver={{Simba Spark ODBC Driver}};UID=token;PWD={databricks_access_token};ThriftTransport=2"
+        ),
+    )]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset.acceleration = Some(Acceleration {
         enabled: acceleration,
@@ -70,6 +73,7 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 )]
 async fn databricks_odbc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -124,6 +128,7 @@ async fn databricks_odbc() -> Result<(), String> {
 )]
 async fn databricks_odbc_with_acceleration() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

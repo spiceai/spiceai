@@ -17,17 +17,17 @@ limitations under the License.
 use super::types::{MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
+        ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
+        FinishReason, FunctionCallStream, FunctionType, Role,
     },
 };
 use futures::{Stream, StreamExt};
 use reqwest_eventsource::Error as SseError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use tokio::sync::Mutex;
 
@@ -74,6 +74,10 @@ pub enum ContentBlock {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse(ContentBlockToolUse),
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 impl ContentBlock {
@@ -93,12 +97,21 @@ impl ContentBlock {
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                         index: 0,
                         id: Some(id),
-                        r#type: Some(ChatCompletionToolType::Function),
+                        r#type: Some(FunctionType::Function),
                         function: Some(FunctionCallStream {
                             name: Some(name),
                             arguments: None,
                         }),
                     }]),
+                    refusal: None,
+                    role: None,
+                }
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
                     refusal: None,
                     role: None,
                 }
@@ -152,7 +165,7 @@ impl Delta {
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                     index: 0,
                     id: Some(id.clone()),
-                    r#type: Some(ChatCompletionToolType::Function),
+                    r#type: Some(FunctionType::Function),
                     function: Some(FunctionCallStream {
                         name: None, // Intentially leave empty to match OpenAI's format.
                         arguments: Some(partial_json),
@@ -185,60 +198,6 @@ impl Delta {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct AnthropicStreamError {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub error: ErrorPayload,
-}
-
-impl fmt::Display for AnthropicStreamError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "AnthropicStreamError: {:?}", self.error)
-    }
-}
-
-impl From<reqwest_eventsource::Error> for AnthropicStreamError {
-    fn from(e: reqwest_eventsource::Error) -> Self {
-        let message = if let reqwest_eventsource::Error::InvalidStatusCode(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            _,
-        ) = &e
-        {
-            "Anthropic API limit exceeded. Check limits: https://console.anthropic.com/settings/limits.".to_string()
-        } else {
-            e.to_string()
-        };
-
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "reqwest_eventsource_error".to_string(),
-                message,
-            },
-        }
-    }
-}
-
-impl From<serde_json::Error> for AnthropicStreamError {
-    fn from(e: serde_json::Error) -> Self {
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "serde_json_error".to_string(),
-                message: e.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorPayload {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
     pub stop_sequence: Option<String>,
@@ -259,11 +218,8 @@ pub struct MessageDelta {
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
-#[allow(clippy::too_many_lines)]
 pub fn transform_stream(
-    stream: Pin<
-        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
-    >,
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
@@ -374,11 +330,17 @@ pub fn transform_stream(
                                 index: 0,
                                 logprobs: None,
                                 finish_reason: match stop_reason {
-                                    Some(StopReason::EndTurn | StopReason::StopSequence) => {
-                                        Some(FinishReason::Stop)
-                                    }
-                                    Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                                    Some(
+                                        StopReason::EndTurn
+                                        | StopReason::StopSequence
+                                        | StopReason::PauseTurn,
+                                    ) => Some(FinishReason::Stop),
+                                    Some(
+                                        StopReason::MaxTokens
+                                        | StopReason::ModelContextWindowExceeded,
+                                    ) => Some(FinishReason::Length),
                                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                    Some(StopReason::Refusal) => Some(FinishReason::ContentFilter),
                                     None => None,
                                 },
                                 delta: ChatCompletionStreamResponseDelta {
@@ -397,13 +359,12 @@ pub fn transform_stream(
                         | MessageCreateStreamResponse::MessageStop,
                     ) => None,
                     Err(e) => {
-                        tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(OpenAIError::ApiError(ApiError {
-                            message: e.error.message,
-                            r#type: Some("AnthropicStreamError".to_string()),
-                            param: None,
-                            code: None,
-                        })))
+                        let formatted_error = format_anthropic_stream_error(e);
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
                     }
                 }
             }
@@ -415,6 +376,44 @@ pub fn transform_stream(
         });
 
     Box::pin(transformed_stream)
+}
+
+fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::ApiError(api_error) = error else {
+        return error;
+    };
+
+    let lowered = api_error.message.to_lowercase();
+
+    if lowered.contains("too many requests") || lowered.contains("429") {
+        return OpenAIError::ApiError(ApiError {
+            message: "Anthropic API rate limit exceeded. Check your limits at https://console.anthropic.com/settings/limits and retry shortly.".to_string(),
+            r#type: Some("AnthropicRateLimitError".to_string()),
+            param: api_error.param,
+            code: api_error.code,
+        });
+    }
+
+    if lowered.contains("401")
+        || lowered.contains("403")
+        || lowered.contains("authentication")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+    {
+        return OpenAIError::ApiError(ApiError {
+            message: "Anthropic authentication failed. Verify your Anthropic API key and workspace permissions.".to_string(),
+            r#type: Some("AnthropicAuthenticationError".to_string()),
+            param: api_error.param,
+            code: api_error.code,
+        });
+    }
+
+    OpenAIError::ApiError(ApiError {
+        message: format!("Anthropic streaming error: {}", api_error.message),
+        r#type: Some("AnthropicStreamError".to_string()),
+        param: api_error.param,
+        code: api_error.code,
+    })
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.

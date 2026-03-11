@@ -40,7 +40,7 @@ jobs:
     name: Build testoperator
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -53,44 +53,31 @@ jobs:
     name: Build spiced
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        if: matrix.target.target_os != 'darwin'
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
-
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v5
+        uses: ./.github/actions/build-spiced
         with:
-          name: spiced
-          path: spiced
+          features: 'models'
+          upload_artifact: 'true'
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -156,15 +143,15 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Download testoperator
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
         with:
           name: spiced
 

@@ -1,0 +1,33 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q7"
+---
++---------------+-----------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                    |
++---------------+-----------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                        |
+|               |   Projection: orders.o_orderkey AS key                                                  |
+|               |     Limit: skip=0, fetch=10                                                             |
+|               |       TableScan: orders projection=[o_orderkey], fetch=10                               |
+| physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                                              |
+|               |   GlobalLimitExec: skip=0, fetch=10                                                     |
+|               |     SchemaCastScanExec                                                                  |
+|               |       CoalescePartitionsExec                                                            |
+|               |         PartitionedUnionExec                                                            |
+|               |           CooperativeExec                                                               |
+|               |             BytesProcessedExec                                                          |
+|               |               DuckSqlExec sql= SELECT "o_orderkey" FROM "expression=0/orders"  LIMIT 10 |
+|               |           CooperativeExec                                                               |
+|               |             BytesProcessedExec                                                          |
+|               |               DuckSqlExec sql= SELECT "o_orderkey" FROM "expression=1/orders"  LIMIT 10 |
+|               |           CooperativeExec                                                               |
+|               |             BytesProcessedExec                                                          |
+|               |               DuckSqlExec sql= SELECT "o_orderkey" FROM "expression=2/orders"  LIMIT 10 |
+|               |           CooperativeExec                                                               |
+|               |             BytesProcessedExec                                                          |
+|               |               DuckSqlExec sql= SELECT "o_orderkey" FROM "expression=3/orders"  LIMIT 10 |
+|               |           CooperativeExec                                                               |
+|               |             BytesProcessedExec                                                          |
+|               |               DuckSqlExec sql= SELECT "o_orderkey" FROM "expression=4/orders"  LIMIT 10 |
+|               |                                                                                         |
++---------------+-----------------------------------------------------------------------------------------+

@@ -15,9 +15,19 @@ limitations under the License.
 */
 
 mod credential_provider;
-use std::{sync::Arc, time::Duration};
+pub mod object_store_builder;
 
-use aws_config::{BehaviorVersion, SdkConfig};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+use aws_config::Region;
+use aws_config::ecs::EcsCredentialsProvider;
+use aws_config::environment::EnvironmentVariableCredentialsProvider;
+use aws_config::imds::credentials::ImdsCredentialsProvider;
+use aws_config::meta::credentials::CredentialsProviderChain;
+use aws_config::provider_config::ProviderConfig;
+use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
+use aws_config::{AppName, BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_s3::{config::ProvideCredentials, error::ConnectorError};
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
@@ -26,6 +36,27 @@ use object_store::{ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConn
 use tokio::{runtime::Handle, sync::OnceCell, time::sleep};
 use url::Url;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+
+/// The APN user-agent string for Spice.
+///
+/// This is set on all AWS SDK configurations to identify Spice as an AWS Partner Network (APN)
+/// application in the user-agent header of AWS API requests.
+///
+/// The `AppName::new` call is infallible for this input: the name contains only alphanumeric
+/// characters plus `.` and `-`, all of which are permitted.
+static APN_APP_NAME: LazyLock<AppName> = LazyLock::new(|| {
+    let version = env!("CARGO_PKG_VERSION");
+    match AppName::new(format!("Spice-{version}")) {
+        Ok(name) => name,
+        Err(_) => unreachable!("Spice version string should always be a valid AppName"),
+    }
+});
+
+/// Returns the APN [`AppName`] for Spice, suitable for use in AWS SDK configurations.
+#[must_use]
+pub fn apn_app_name() -> &'static AppName {
+    &APN_APP_NAME
+}
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
@@ -63,13 +94,14 @@ pub enum LoadError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Returns a default AWS SDK configuration with the latest behavior version.
+/// Returns a default AWS SDK configuration with the latest behavior version and
+/// the Spice APN user-agent.
 ///
 /// This is a convenience function to ensure all AWS SDK configuration uses
-/// the same behavior version consistently across the codebase.
+/// the same behavior version and APN identification consistently across the codebase.
 #[must_use]
 pub fn default_aws_config() -> aws_config::ConfigLoader {
-    aws_config::defaults(BehaviorVersion::v2025_08_07())
+    aws_config::defaults(BehaviorVersion::v2026_01_12()).app_name(APN_APP_NAME.clone())
 }
 
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
@@ -400,6 +432,122 @@ pub async fn initiate_config_with_credentials(
     }
 }
 
+/// Initiates an AWS SDK configuration using the default credential provider chain.
+///
+/// This uses the standard AWS credential resolution order:
+/// - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
+/// - Shared config (`~/.aws/config`, `~/.aws/credentials`)
+/// - Web Identity Token (EKS/IRSA)
+/// - ECS Container Credentials
+/// - EC2 Instance Metadata (IMDS)
+///
+/// # Parameters
+/// - `region`: AWS region
+///
+/// # Returns
+/// A [`ConfigLoader`] that can be further customized before loading.
+#[must_use]
+pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigLoader {
+    if let Err(err) = get_or_init_sdk_config().await {
+        tracing::warn!("Unable to initialize AWS credentials: {err}");
+    }
+    default_aws_config().region(Region::new(region))
+}
+
+/// Initiates an AWS SDK configuration using only IAM role authentication.
+///
+/// This bypasses environment variables (`AWS_ACCESS_KEY_ID`, etc.) and profile credentials,
+/// only using:
+/// - Web Identity Token (EKS/IRSA)
+/// - ECS Container Credentials
+/// - EC2 Instance Metadata (IMDS)
+///
+/// # Parameters
+/// - `region`: AWS region
+///
+/// # Returns
+/// A [`ConfigLoader`] that can be further customized before loading.
+#[must_use]
+pub fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLoader {
+    let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
+
+    let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
+        .configure(&provider_config)
+        .build();
+    let ecs_provider = EcsCredentialsProvider::builder()
+        .configure(&provider_config)
+        .build();
+    let imds_provider = ImdsCredentialsProvider::builder()
+        .configure(&provider_config)
+        .build();
+
+    let iam_only_chain =
+        CredentialsProviderChain::first_try("WebIdentityToken", web_identity_provider)
+            .or_else("EcsContainer", ecs_provider)
+            .or_else("Ec2InstanceMetadata", imds_provider);
+
+    default_aws_config()
+        .region(Region::new(region))
+        .credentials_provider(iam_only_chain)
+}
+
+/// Initiates an AWS SDK configuration using only environment variable credentials.
+///
+/// This exclusively uses credentials from environment variables:
+/// - `AWS_ACCESS_KEY_ID`
+/// - `AWS_SECRET_ACCESS_KEY`
+/// - `AWS_SESSION_TOKEN` (optional)
+///
+/// # Parameters
+/// - `region`: AWS region
+///
+/// # Returns
+/// A [`ConfigLoader`] that can be further customized before loading.
+#[must_use]
+pub fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader {
+    let env_provider = EnvironmentVariableCredentialsProvider::new();
+
+    default_aws_config()
+        .region(Region::new(region))
+        .credentials_provider(env_provider)
+}
+
+/// Initiates an AWS SDK configuration using explicit access key credentials.
+///
+/// This uses the provided credentials directly, bypassing all other credential sources.
+///
+/// # Parameters
+/// - `provider_name`: Name of the credential provider
+/// - `region`: AWS region
+/// - `access_key_id`: AWS access key ID
+/// - `secret_access_key`: AWS secret access key
+/// - `session_token`: Optional AWS session token (for temporary credentials)
+///
+/// # Returns
+/// A [`ConfigLoader`] that can be further customized before loading.
+#[must_use]
+pub fn initiate_config_auth_key(
+    provider_name: &'static str,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+) -> aws_config::ConfigLoader {
+    use aws_credential_types::Credentials;
+
+    let credentials = Credentials::new(
+        access_key_id,
+        secret_access_key,
+        session_token,
+        None,
+        provider_name,
+    );
+
+    default_aws_config()
+        .region(Region::new(region))
+        .credentials_provider(credentials)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +628,7 @@ mod tests {
     #[test]
     fn test_get_bucket_name_invalid() {
         let url = Url::parse("s3:///path/to/file").expect("Failed to parse URL");
-        assert!(get_bucket_name(&url).is_err());
+        get_bucket_name(&url).expect_err("Should fail to get bucket name");
     }
 
     // Tests for determine_s3_credential_config
@@ -666,6 +814,28 @@ mod tests {
         assert_eq!(
             config.region().map(std::convert::AsRef::as_ref),
             Some("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn test_apn_app_name_is_valid() {
+        let name: &AppName = &APN_APP_NAME;
+        let name_str: &str = name.as_ref();
+        assert!(
+            name_str.starts_with("Spice-"),
+            "APN app name should start with 'Spice-', got: {name_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_aws_config_includes_app_name() {
+        let config = default_aws_config().load().await;
+        let app_name = config.app_name();
+        assert!(app_name.is_some(), "default_aws_config should set app_name");
+        let name_str: &str = app_name.expect("already asserted").as_ref();
+        assert!(
+            name_str.starts_with("Spice-"),
+            "APN app name should start with 'Spice-', got: {name_str}"
         );
     }
 }

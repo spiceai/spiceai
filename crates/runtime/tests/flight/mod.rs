@@ -42,7 +42,7 @@ use tonic::transport::Channel;
 
 use crate::{
     configure_test_datafusion,
-    utils::{runtime_ready_check, wait_until_true},
+    utils::{register_test_connectors, runtime_ready_check, wait_until_true},
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -59,17 +59,15 @@ async fn start_spice_test_app(
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
-    tracing::debug!(
-        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+    tracing::debug!("Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}");
+
+    register_test_connectors().await;
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
     let registry = prometheus::Registry::new();
 
@@ -244,6 +242,9 @@ async fn write_record_batches(
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<PutResult>, FlightError> {
     let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+
+    // collecting avoids a lifetime issue with the stream sending between threads
+    #[expect(clippy::needless_collect)]
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
         .build(futures::stream::iter(

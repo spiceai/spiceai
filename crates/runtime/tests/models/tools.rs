@@ -14,14 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[allow(clippy::expect_used)]
 mod mcp {
-
-    use crate::models::{http_get, sort_json_keys};
-
     use crate::models::create_api_bindings_config;
+    use crate::models::{http_get, sort_json_keys};
     use crate::utils::init_tracing_with_task_history;
-
     use crate::utils::runtime_ready_check;
     use app::AppBuilder;
     use http::{
@@ -29,13 +25,12 @@ mod mcp {
         header::{ACCEPT, CONTENT_TYPE},
     };
     use insta::{assert_json_snapshot, assert_snapshot};
-    use runtime::auth::EndpointAuth;
-
     use runtime::Runtime;
+    use runtime::auth::EndpointAuth;
     use serde_json::Value;
     use spicepod::component::tool::Tool;
     use std::sync::Arc;
-    use test_framework::serde_yaml;
+    use test_framework::yaml;
 
     /// Test that spiced can run a stdio MCP server.
     #[tokio::test]
@@ -47,8 +42,7 @@ params:
   mcp_args: run -i --rm mcp/fetch
 ";
         let http_base_url = start_spiced_with_tools(vec![
-            serde_yaml::from_str(tool_yaml)
-                .expect("Tool spicepod component is not in expected format"),
+            yaml::from_str(tool_yaml).expect("Tool spicepod component is not in expected format"),
         ])
         .await
         .expect("Failed to start spiced with tools");
@@ -74,7 +68,7 @@ params:
 
         let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp/sse");
         let http_client_url = start_spiced_with_tools(vec![
-            serde_yaml::from_str(tool_yaml.as_str())
+            yaml::from_str(tool_yaml.as_str())
                 .expect("Tool spicepod component is not in expected format"),
         ])
         .await

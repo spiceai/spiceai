@@ -48,7 +48,7 @@ struct MockCreator {
 impl PartitionCreator for MockCreator {
     async fn create_partition(
         &self,
-        _partition_value: ScalarValue,
+        _partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, runtime_table_partition::creator::Error> {
         unreachable!("create_partition not needed for benchmarks")
     }
@@ -59,10 +59,7 @@ impl PartitionCreator for MockCreator {
         let data = self.partitions_data.read().await;
         Ok(data
             .iter()
-            .map(|(val, provider)| Partition {
-                partition_value: val.clone(),
-                table_provider: Arc::clone(provider),
-            })
+            .map(|(val, provider)| Partition::new_single(val.clone(), Arc::clone(provider)))
             .collect())
     }
 
@@ -80,7 +77,7 @@ fn create_test_batch(region: &str, size: usize) -> RecordBatch {
         Field::new("region", DataType::Utf8, false),
     ]));
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let ids: Vec<i32> = (0..size as i32).collect();
     let id_array = Arc::new(Int32Array::from(ids));
     let region_array = Arc::new(StringArray::from(vec![region; size]));
