@@ -69,7 +69,7 @@ jobs:
         shell: bash
         run: |
           chmod +x test/scripts/install-scripts-test.sh
-          ${{ matrix.shell }} test/scripts/install-scripts-test.sh --live
+          ./test/scripts/install-scripts-test.sh --live
 
   # Test shell detection and PATH configuration
   test-shell-detection:

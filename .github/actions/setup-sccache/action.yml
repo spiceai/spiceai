@@ -145,7 +145,6 @@ runs:
 
         probe_cache_dir() {
           local candidate="$1"
-          local probe_file
           local mount_line
 
           [ -n "$candidate" ] || return 1
@@ -159,12 +158,10 @@ runs:
             return 1
           fi
 
-          probe_file="$candidate/.sccache-probe-$$"
-          if ! touch "$probe_file"; then
+          if [ ! -w "$candidate" ]; then
             return 1
           fi
 
-          rm -f "$probe_file"
           printf '%s\n' "$candidate"
           return 0
         }
