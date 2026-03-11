@@ -88,7 +88,7 @@ jobs:
               old_mount="${existing#* on }"
               old_mount="${old_mount%% (*}"
               echo "Share already mounted at $old_mount — unmounting to remount at $mount_point"
-              umount "$old_mount"
+              diskutil unmount "$old_mount" || umount "$old_mount"
             fi
 
             mkdir -p "$mount_point"
