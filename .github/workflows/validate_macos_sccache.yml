@@ -44,25 +44,28 @@ jobs:
         id: setup-sccache
         uses: ./.github/actions/setup-sccache
 
-      - name: Mount SMB share
-        id: mount-smb
+      - name: Mount NFS share
+        id: mount-nfs
         shell: bash
         env:
-          SMB_HOST: ${{ secrets.SMB_HOST }}
-          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
+          NFS_HOST: ${{ secrets.SMB_HOST }}
         run: |
           set -euo pipefail
 
-          SMB_SHARE="ai_platform_dev"
-          SMB_USERNAME="runner"
+          NFS_EXPORT="/ai_platform_dev"
 
           echo "=== Runner identity ==="
           id
           echo "Runner: ${RUNNER_NAME:-unknown}"
 
+          if [ -z "${NFS_HOST:-}" ]; then
+            echo "Missing secret: SMB_HOST (used as NFS host)"
+            exit 1
+          fi
+
           # Sanitize runner name for use as a mount-point directory name
           runner_label="$(echo "${RUNNER_NAME:-runner}" | tr -cs 'A-Za-z0-9_-' '_' | sed 's/_$//')"
-          mount_point="$HOME/sccache_smb/${runner_label}"
+          mount_point="$HOME/sccache_nfs/${runner_label}"
           echo "Mount point: $mount_point"
 
           # Check if already mounted at our preferred path
@@ -70,34 +73,13 @@ jobs:
             echo "Already mounted at $mount_point"
             mount | grep -F " on $mount_point "
           else
-            if [ -z "${SMB_HOST:-}" ] || [ -z "${SMB_PASSWORD:-}" ]; then
-              echo "Missing secrets: SMB_HOST and/or SMB_PASSWORD"
-              exit 1
-            fi
-
-            smb_url="//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}"
-            # Redact password for display
-            smb_display="//${SMB_USERNAME}@${SMB_HOST}/${SMB_SHARE}"
-
-            # macOS refuses to mount the same SMB share at two locations.
-            # If it's already mounted elsewhere (e.g. /Volumes/ai_platform_dev),
-            # unmount it first, then remount at our user-owned path so the
-            # workflow process has TCC-compatible access.
-            existing="$(mount | grep -F "@${SMB_HOST}/${SMB_SHARE} " | head -1 || true)"
-            if [ -n "$existing" ]; then
-              old_mount="${existing#* on }"
-              old_mount="${old_mount%% (*}"
-              echo "Share already mounted at $old_mount — unmounting to remount at $mount_point"
-              diskutil unmount "$old_mount" || umount "$old_mount"
-            fi
-
             mkdir -p "$mount_point"
-            mount_smbfs "$smb_url" "$mount_point"
-            echo "Mounted $smb_display at $mount_point"
+            mount -t nfs -o resvport "${NFS_HOST}:${NFS_EXPORT}" "$mount_point"
+            echo "Mounted ${NFS_HOST}:${NFS_EXPORT} at $mount_point"
           fi
 
           # Verify write access
-          probe="$mount_point/.smb-probe-${runner_label}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          probe="$mount_point/.nfs-probe-${runner_label}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           touch "$probe"
           rm -f "$probe"
           echo "Write access verified"
@@ -108,8 +90,8 @@ jobs:
       - name: Configure sccache environment
         shell: bash
         env:
-          SMB_MOUNT: ${{ steps.mount-smb.outputs.mount_point }}
-          RUNNER_LABEL: ${{ steps.mount-smb.outputs.runner_label }}
+          NFS_MOUNT: ${{ steps.mount-nfs.outputs.mount_point }}
+          RUNNER_LABEL: ${{ steps.mount-nfs.outputs.runner_label }}
         run: |
           set -euo pipefail
 
@@ -130,8 +112,8 @@ jobs:
             echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           fi
 
-          # Per-runner sccache directory on the shared SMB volume
-          sccache_dir="$SMB_MOUNT/sccache/$RUNNER_LABEL"
+          # Per-runner sccache directory on the shared NFS volume
+          sccache_dir="$NFS_MOUNT/sccache/$RUNNER_LABEL"
           mkdir -p "$sccache_dir"
           echo "SCCACHE_DIR=$sccache_dir" >> "$GITHUB_ENV"
           echo "Using SMB sccache dir: $sccache_dir"
@@ -167,7 +149,7 @@ jobs:
           rm -f "$probe_file"
           echo "SCCACHE_DIR=$SCCACHE_DIR (writable)"
 
-      - name: Validate SCCACHE_DIR is on smbfs
+      - name: Validate SCCACHE_DIR is on NFS
         shell: bash
         run: |
           set -euo pipefail
@@ -189,11 +171,11 @@ jobs:
           fi
           echo "Mount line: $mount_line"
 
-          printf '%s\n' "$mount_line" | grep -q 'smbfs' || {
-            echo "Expected SCCACHE_DIR to be on an smbfs mount"
+          printf '%s\n' "$mount_line" | grep -q 'nfs' || {
+            echo "Expected SCCACHE_DIR to be on an NFS mount"
             exit 1
           }
-          echo "Confirmed: SCCACHE_DIR is on smbfs"
+          echo "Confirmed: SCCACHE_DIR is on NFS"
 
       - name: Measure sccache performance
         id: measure-sccache
