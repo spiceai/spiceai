@@ -14,19 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use app::AppBuilder;
-use datafusion::assert_batches_eq;
-use futures::StreamExt;
-use futures::TryStreamExt;
-
-use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
-
-use crate::{
-    init_tracing,
-    utils::{register_test_connectors, test_request_context},
-};
-
 #[cfg(feature = "postgres-accel")]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {

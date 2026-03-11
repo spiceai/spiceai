@@ -181,6 +181,7 @@ impl Default for PartitionManagementConfig {
 /// 2. Adding new partitions to the partition metadata (initially unassigned).
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
+/// 5. Unassigning partitions from executors that are no longer in the registry (so they can be reassigned).
 pub struct PartitionManagementTask {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
@@ -345,6 +346,8 @@ impl PartitionManagementTask {
             self.remove_stale_partitions(discovery_result.removed_partitions)
                 .await?;
         }
+
+        self.unassign_stale_executors(&state).await?;
 
         let unassigned = self.find_unassigned_partitions(&state);
         tracing::debug!(
@@ -1132,6 +1135,56 @@ impl PartitionManagementTask {
                 failure_count,
                 "Notified executors of partition assignments"
             );
+        }
+
+        Ok(())
+    }
+
+    /// Unassign partitions from executors that are no longer in the executor registry.
+    ///
+    /// When an executor disconnects, its assigned partitions remain in the metadata as assigned.
+    /// This method detects those stale assignments and clears them so the partitions become
+    /// unassigned and eligible for reassignment to live executors in the same cycle.
+    async fn unassign_stale_executors(&self, state: &CycleState) -> Result<()> {
+        let live_executors: HashSet<&String> = state.executor_ids.iter().collect();
+
+        // Collect executor IDs that appear in partition assignments but are no longer live.
+        let mut stale_executors: HashSet<String> = HashSet::new();
+        for table_name in &state.tables {
+            let table_ref = TableReference::parse_str(table_name);
+            if let Some(metadata) = self.partition_manager.get_cached_table_metadata(&table_ref) {
+                for partition in &metadata.partitions {
+                    for executor_id in &partition.assigned_executors {
+                        if !live_executors.contains(executor_id) {
+                            stale_executors.insert(executor_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if stale_executors.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            stale_executor_count = stale_executors.len(),
+            "Detected stale executor assignments; unassigning partitions"
+        );
+
+        for executor_id in &stale_executors {
+            tracing::debug!(executor_id = %executor_id, "Unassigning all partitions from stale executor");
+            if let Err(e) = self
+                .partition_manager
+                .unassign_all_from_executor(executor_id)
+                .await
+            {
+                tracing::warn!(
+                    executor_id = %executor_id,
+                    error = %e,
+                    "Failed to unassign partitions from stale executor"
+                );
+            }
         }
 
         Ok(())

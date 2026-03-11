@@ -199,11 +199,25 @@ impl ExecutorRegistry {
     }
 
     /// Unregisters an executor connection.
-    pub async fn unregister(&self, executor_id: &str) {
+    pub async fn unregister(&self, executor_id: &str) -> Result<()> {
         let mut connections = self.connections.write().await;
         if connections.remove(executor_id).is_some() {
             tracing::debug!("Executor {executor_id} disconnected");
         }
+
+        // Optimisation: unassign partitions from this executor immediately on disconnect to free them up for reassignment. On failure, should be handled by partition manager's periodic reconciliation.
+        if let Err(e) = self
+            .partition_manager()
+            .unassign_all_from_executor(executor_id)
+            .await
+        {
+            tracing::warn!(
+                executor_id = %executor_id,
+                error = %e,
+                "Failed to unassign partitions from disconnected executor"
+            );
+        }
+        Ok(())
     }
 
     /// Returns the list of currently connected executor IDs.

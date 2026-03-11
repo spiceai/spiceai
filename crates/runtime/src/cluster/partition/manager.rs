@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use datafusion::sql::TableReference;
 use object_store::ObjectStore;
-use object_store_occ::{InsertResult, ObjectState, WriteResult};
+use object_store_occ::{InsertResult, ObjectState, UpdateResult, WriteResult};
 use snafu::prelude::*;
 
 use crate::cluster::partition::metadata::PartitionValue;
@@ -117,6 +117,33 @@ impl PartitionManager {
     ) -> Option<TablePartitionMetadata> {
         let key = table.to_string();
         self.state.get_cached(&key)
+    }
+
+    /// Unassign all partitions from an executor across all tables.
+    ///
+    /// Attempt to update metadata for each table. Ignore `ConcurrentModification` errors. If an error occurs, will still attempt to unassign from all tables.
+    ///
+    /// This is a best effort to unassign the executor, but may not be perfect in the presence of concurrent updates.
+    pub async fn unassign_all_from_executor(&self, executor_id: &str) -> Result<()> {
+        let mut result: Result<()> = Ok(());
+        for tbl in self.list_tables().await? {
+            if let Some(mut partition) = self.state.get_cached(&tbl) {
+                partition.unassign_executor(executor_id);
+                match self.state.update(&tbl, &partition).await {
+                    Ok(UpdateResult::Ok | UpdateResult::NotFound) => (),
+                    Ok(UpdateResult::Conflict { .. }) => tracing::warn!(
+                        "Unassigning partitions for table {tbl} from {executor_id}, but concurrent modification detected. This may cause partitions to remain assigned to the executor until the next unassignment attempt.",
+                    ),
+                    Err(e) => {
+                        result = Err(Error::MetadataAccess {
+                            table: tbl.clone(),
+                            source: e,
+                        });
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Initialize a blank partition metadata file for a table.

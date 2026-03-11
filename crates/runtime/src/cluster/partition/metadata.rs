@@ -198,4 +198,10 @@ impl TablePartitionMetadata {
         }
         Ok(map)
     }
+
+    pub fn unassign_executor(&mut self, executor_id: &str) {
+        for partition in &mut self.partitions {
+            partition.unassign_from(executor_id);
+        }
+    }
 }
