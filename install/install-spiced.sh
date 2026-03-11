@@ -137,24 +137,6 @@ checkHttpRequestCLI() {
 
 
 
-getLatestRelease() {
-    local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
-    local latest_release=""
-
-    if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -s "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
-    else
-        latest_release=$(wget -q --header="Accept: application/json" -O - "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
-    fi
-
-    if [ -z "$latest_release" ]; then
-        echo "Failed to get latest release information"
-        exit 1
-    fi
-
-    ret_val=$latest_release
-}
-
 downloadWithRetry() {
     local url="$1"
     local output="$2"
@@ -190,7 +172,7 @@ downloadWithRetry() {
 }
 
 downloadFile() {
-    LATEST_RELEASE_TAG=$1
+    local release_tag="$1"
 
     # Build artifact name based on variant and OS
     # Asset naming convention:
@@ -211,8 +193,12 @@ downloadFile() {
     fi
     
     SPICED_ARTIFACT="${artifact_name}_${OS}_${ARCH}.tar.gz"
-    DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
-    DOWNLOAD_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICED_ARTIFACT}"
+    if [ -n "$release_tag" ]; then
+        DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
+        DOWNLOAD_URL="${DOWNLOAD_BASE}/${release_tag}/${SPICED_ARTIFACT}"
+    else
+        DOWNLOAD_URL="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest/download/${SPICED_ARTIFACT}"
+    fi
 
     # Create the temp directory
     SPICE_TMP_ROOT=$(mktemp -dt spice-install-XXXXXX)
@@ -316,16 +302,15 @@ getSystemInfo
 verifySupported
 checkHttpRequestCLI
 
+release_tag=""
 if [ -z "$1" ]; then
-    echo "Getting the latest Spice.ai Runtime..."
-    getLatestRelease
+    echo "Installing latest Spice.ai Runtime ..."
 else
-    ret_val=v$1
+    release_tag="v$1"
+    echo "Installing Spice Runtime $release_tag ..."
 fi
 
-echo "Installing Spice Runtime $ret_val ..."
-
-downloadFile "$ret_val"
+downloadFile "$release_tag"
 installFile
 cleanup
 

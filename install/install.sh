@@ -116,21 +116,8 @@ function gh_wget() {
     fi
 }
 
-getLatestRelease() {
-    local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
-    local latest_release=""
-
-    if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(gh_curl -s $spiceReleaseUrl | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
-    else
-        latest_release=$(gh_wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
-    fi
-
-    ret_val=$latest_release
-}
-
 downloadFile() {
-    LATEST_RELEASE_TAG=$1
+    local release_tag="$1"
 
     # Build artifact name
     # Asset naming convention: spice_{os}_{arch}.tar.gz
@@ -139,8 +126,12 @@ downloadFile() {
     local artifact_name="${SPICE_CLI_FILENAME}"
 
     SPICE_CLI_ARTIFACT="${artifact_name}_${OS}_${ARCH}.tar.gz"
-    DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
-    DOWNLOAD_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICE_CLI_ARTIFACT}"
+    if [ -n "$release_tag" ]; then
+        DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
+        DOWNLOAD_URL="${DOWNLOAD_BASE}/${release_tag}/${SPICE_CLI_ARTIFACT}"
+    else
+        DOWNLOAD_URL="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest/download/${SPICE_CLI_ARTIFACT}"
+    fi
 
     # Create the temp directory
     SPICE_TMP_ROOT=$(mktemp -dt spice-install-XXXXXX)
@@ -353,16 +344,15 @@ fi
 # Re-check sudo requirements after attempting to create directory
 getSystemInfo
 
+release_tag=""
 if [ -z "$1" ]; then
-    echo "Getting the latest Spice.ai CLI..."
-    getLatestRelease
+    echo "Installing latest Spice.ai CLI ..."
 else
-    ret_val=v$1
+    release_tag="v$1"
+    echo "Installing Spice CLI $release_tag ..."
 fi
 
-echo "Installing Spice CLI $ret_val ..."
-
-downloadFile $ret_val
+downloadFile "$release_tag"
 installFile
 cleanup
 

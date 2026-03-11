@@ -10,18 +10,6 @@ $spiceCliFullPath= Join-Path $spiceCliInstallDir $spiceCliFileName
 # Ensure the installation directory exists
 New-Item -Path $spiceCliInstallDir -ItemType Directory -Force > $null
 
-function Get-LatestRelease {
-    $url = "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/latest"
-
-    $headers = @{}
-    if ($env:GITHUB_TOKEN) {
-        $headers["Authorization"] = "token $env:GITHUB_TOKEN"
-    }
-
-    $releaseInfo = Invoke-RestMethod -Uri $url -Headers $headers
-    return $releaseInfo.tag_name
-}
-
 function Verify-Supported {
     $osInfo = Get-CimInstance Win32_OperatingSystem
     $systemInfo = Get-CimInstance CIM_ComputerSystem
@@ -39,15 +27,12 @@ function Verify-Supported {
 
 # Function to download and install Spice CLIv
 function Download-And-Install-Spice {
-    Write-Host "Checking the latest Spice version..."
-
-    $latestReleaseTag = Get-LatestRelease
     $arch = "x86_64"
 
-    Write-Host "Installing Spice $latestReleaseTag"
+    Write-Host "Installing latest Spice CLI"
 
     $artifactName="${spiceCliFileName}_windows_$arch.tar.gz"
-    $downloadUrl = "https://github.com/$spiceOrgName/$spiceRepoName/releases/download/$latestReleaseTag/$artifactName"
+    $downloadUrl = "https://github.com/$spiceOrgName/$spiceRepoName/releases/latest/download/$artifactName"
     $tempPath = [System.IO.Path]::GetTempPath()
     $tempFile = Join-Path $tempPath $artifactName
 

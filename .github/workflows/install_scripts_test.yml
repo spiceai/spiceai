@@ -304,9 +304,17 @@ jobs:
 
       - name: Get a known release version
         id: get_version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Get the latest release tag and strip the 'v' prefix (scripts add it back)
-          VERSION=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "v\?\(.*\)",/\1/')
+          VERSION=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q .tagName)
+          VERSION="${VERSION#v}"
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: failed to determine latest release version"
+            exit 1
+          fi
+
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Testing with version: $VERSION"
 
