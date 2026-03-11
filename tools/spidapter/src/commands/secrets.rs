@@ -107,19 +107,16 @@ fn scheduler_state_location_uses_s3(spicepod_yaml: &str) -> bool {
         Err(_) => return false,
     };
 
-    spicepod
-        .runtime
-        .scheduler
-        .is_some_and(|scheduler| {
-            let state_location = scheduler.state_location.trim();
-            if state_location.is_empty() {
-                return false;
-            }
+    spicepod.runtime.scheduler.is_some_and(|scheduler| {
+        let state_location = scheduler.state_location.trim();
+        if state_location.is_empty() {
+            return false;
+        }
 
-            Url::parse(state_location)
-                .map(|url| url.scheme().eq_ignore_ascii_case("s3"))
-                .unwrap_or(false)
-        })
+        Url::parse(state_location)
+            .map(|url| url.scheme().eq_ignore_ascii_case("s3"))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -141,7 +138,7 @@ runtime:
     state_location: s3://bucket/path
 ";
 
-        const FILE_SCHEDULER_SPICEPOD_YAML: &str = "
+    const FILE_SCHEDULER_SPICEPOD_YAML: &str = "
 name: test
 version: v2
 kind: spicepod
@@ -179,7 +176,10 @@ runtime:
     fn does_not_add_aws_secrets_for_non_s3_scheduler_state_location() {
         let mut secret_refs = std::collections::HashMap::new();
 
-        include_scheduler_state_location_aws_secrets(FILE_SCHEDULER_SPICEPOD_YAML, &mut secret_refs);
+        include_scheduler_state_location_aws_secrets(
+            FILE_SCHEDULER_SPICEPOD_YAML,
+            &mut secret_refs,
+        );
 
         assert!(secret_refs.is_empty());
     }
