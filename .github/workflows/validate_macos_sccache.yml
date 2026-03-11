@@ -68,14 +68,25 @@ jobs:
           echo "SCCACHE_DIRECT=true" >> "$GITHUB_ENV"
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
 
-          # Prefer an SMB-backed cache dir if one exists under /Volumes
+          # Prefer an SMB-backed cache dir on an smbfs mount under /Volumes
           smb_cache_dir=""
-          for candidate in /Volumes/*/sccache; do
-            if [ -d "$candidate" ] && [ -w "$candidate" ]; then
-              smb_cache_dir="$candidate"
-              break
-            fi
-          done
+          while IFS= read -r mount_line; do
+            case "$mount_line" in
+              *" (smbfs,"*|*" (smbfs)"*)
+                smb_mount="${mount_line#* on }"
+                smb_mount="${smb_mount%% (*}"
+                candidate="$smb_mount/sccache"
+                if [ -d "$smb_mount" ]; then
+                  if [ -d "$candidate" ] && [ -w "$candidate" ]; then
+                    smb_cache_dir="$candidate"
+                    break
+                  elif [ -w "$smb_mount" ]; then
+                    mkdir -p "$candidate" 2>/dev/null && smb_cache_dir="$candidate" && break || true
+                  fi
+                fi
+                ;;
+            esac
+          done < <(mount)
 
           if [ -n "$smb_cache_dir" ]; then
             echo "SCCACHE_DIR=$smb_cache_dir" >> "$GITHUB_ENV"
@@ -86,7 +97,7 @@ jobs:
             mkdir -p "$default_dir"
             echo "SCCACHE_DIR=$default_dir" >> "$GITHUB_ENV"
             echo "SCCACHE_BACKEND=local" >> "$GITHUB_ENV"
-            echo "No SMB sccache dir found; using local fallback: $default_dir"
+            echo "No writable SMB sccache dir found; using local fallback: $default_dir"
           fi
 
       - name: Validate macOS sccache configuration
@@ -183,7 +194,7 @@ jobs:
           touch "$probe_file"
           rm -f "$probe_file"
 
-          mount_point="$(stat -f '%m' "$SCCACHE_DIR")"
+          mount_point="$(df -P "$SCCACHE_DIR" | tail -1 | awk '{$1=$2=$3=$4=$5=""; sub(/^ +/, ""); print}')"
           if [ -z "$mount_point" ]; then
             echo "Unable to determine mount point for $SCCACHE_DIR"
             exit 1
@@ -269,7 +280,7 @@ jobs:
           compilations="$(awk '/^Compilations[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           non_cacheable_calls="$(awk '/^Non-cacheable calls[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           cache_dir_size_kib="$(du -sk "$SCCACHE_DIR" | awk '{print $1}')"
-          mount_point="$(stat -f '%m' "$SCCACHE_DIR")"
+          mount_point="$(df -P "$SCCACHE_DIR" | tail -1 | awk '{$1=$2=$3=$4=$5=""; sub(/^ +/, ""); print}')"
 
           speedup_percent="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.0" if cold <= 0 else f"{((cold - warm) / cold) * 100:.1f}")' "$cold_build_ms" "$warm_build_ms")"
 
