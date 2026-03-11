@@ -74,7 +74,7 @@ jobs:
             mount | grep -F " on $mount_point "
           else
             mkdir -p "$mount_point"
-            mount -t nfs -o resvport "${NFS_HOST}:${NFS_EXPORT}" "$mount_point"
+            sudo mount -t nfs -o resvport "${NFS_HOST}:${NFS_EXPORT}" "$mount_point"
             echo "Mounted ${NFS_HOST}:${NFS_EXPORT} at $mount_point"
           fi
 
