@@ -36,209 +36,22 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
-        continue-on-error: true
         uses: ./.github/actions/setup-rust
-
-      - name: Normalize Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          echo "$cargo_home/bin" >> "$GITHUB_PATH"
-          export PATH="$cargo_home/bin:$PATH"
-
-          if [ -f "$cargo_home/env" ]; then
-            source "$cargo_home/env" || true
-          elif [ -f "$HOME/.cargo/env" ]; then
-            source "$HOME/.cargo/env" || true
-          fi
-
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-            if [ -f "$cargo_home/env" ]; then
-              source "$cargo_home/env" || true
-            elif [ -f "$HOME/.cargo/env" ]; then
-              source "$HOME/.cargo/env" || true
-            fi
-          fi
-
-          requested_toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
-          if [ -z "$requested_toolchain" ] && [ -f rust-toolchain.toml ]; then
-            requested_toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
-          fi
-
-          if [ -z "$requested_toolchain" ]; then
-            requested_toolchain='stable'
-          fi
-
-          rustup toolchain install "$requested_toolchain" --profile minimal --no-self-update
-
-          resolved_toolchain="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$requested_toolchain" rustc)")")")"
-          if [ -z "$resolved_toolchain" ]; then
-            echo "Failed to resolve installed Rust toolchain for $requested_toolchain" >&2
-            exit 1
-          fi
-
-          rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
-
-          echo "RUSTUP_TOOLCHAIN=$resolved_toolchain" >> "$GITHUB_ENV"
-
-          export RUSTUP_TOOLCHAIN="$resolved_toolchain"
-
-          rustup run "$resolved_toolchain" cargo --version
-          rustup run "$resolved_toolchain" rustc --version
-          cargo --version
-          rustc --version
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        id: setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT || 'http://localhost:9000' }}
-
-      - name: Configure macOS sccache backend
-        id: configure-sccache
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${RUSTC_WRAPPER:-}" != "sccache" ]; then
-            echo "Expected setup-sccache to export RUSTC_WRAPPER=sccache"
-            exit 1
-          fi
-
-          if ! command -v sccache >/dev/null 2>&1; then
-            echo "Expected sccache to be installed on the spiceai-macos runner"
-            exit 1
-          fi
-
-          list_smb_mounts() {
-            while IFS= read -r mount_line; do
-              case "$mount_line" in
-                *" (smbfs,"*|*" (smbfs)"*)
-                  mount_point="${mount_line#* on }"
-                  mount_point="${mount_point%% (*}"
-                  printf '%s\n' "$mount_point"
-                  ;;
-              esac
-            done < <(mount)
-          }
-
-          probe_cache_dir() {
-            local candidate="$1"
-            local probe_file
-
-            [ -n "$candidate" ] || return 1
-
-            if ! mkdir -p "$candidate" 2>/dev/null; then
-              return 1
-            fi
-
-            if [ ! -w "$candidate" ]; then
-              return 1
-            fi
-
-            probe_file="$candidate/.sccache-probe-$$"
-            if ! touch "$probe_file" 2>/dev/null; then
-              return 1
-            fi
-
-            rm -f "$probe_file"
-            printf '%s\n' "$candidate"
-            return 0
-          }
-
-          resolve_macos_cache_dir() {
-            local candidate
-            local mount_point
-            local cache_candidates=()
-
-            if [ -n "${SCCACHE_DIR:-}" ]; then
-              candidate="$(probe_cache_dir "$SCCACHE_DIR" || true)"
-              if [ -n "$candidate" ]; then
-                printf '%s\n' "$candidate"
-                return 0
-              fi
-            fi
-
-            if [ -d "/Volumes/sccache" ]; then
-              candidate="$(probe_cache_dir "/Volumes/sccache/spiceai-sccache" || true)"
-              if [ -n "$candidate" ]; then
-                printf '%s\n' "$candidate"
-                return 0
-              fi
-            fi
-
-            while IFS= read -r mount_point; do
-              [ -n "$mount_point" ] || continue
-
-              cache_candidates=(
-                "$mount_point/spiceai-sccache"
-                "$mount_point/.cache/spiceai-sccache"
-                "$mount_point/cache/spiceai-sccache"
-                "$mount_point/tmp/spiceai-sccache"
-                "$mount_point/var/tmp/spiceai-sccache"
-                "$mount_point/data/spiceai-sccache"
-                "$mount_point/data/cache/spiceai-sccache"
-              )
-
-              for candidate in "${cache_candidates[@]}"; do
-                candidate="$(probe_cache_dir "$candidate" || true)"
-                if [ -n "$candidate" ]; then
-                  printf '%s\n' "$candidate"
-                  return 0
-                fi
-              done
-            done < <(list_smb_mounts)
-
-            echo "No writable SMB cache directory detected; falling back to local cache." >&2
-            echo "Detected SMB mounts:" >&2
-            list_smb_mounts >&2 || true
-
-            candidate="$(probe_cache_dir "$HOME/.cache/sccache" || true)"
-            if [ -n "$candidate" ]; then
-              printf '%s\n' "$candidate"
-              return 0
-            fi
-
-            printf '%s\n' "$HOME/.cache/sccache"
-          }
-
-          cache_dir="$(resolve_macos_cache_dir)"
-          if ! mkdir -p "$cache_dir" 2>/dev/null; then
-            echo "Error: failed to create sccache directory: $cache_dir"
-            exit 1
-          fi
-
-          if [ ! -w "$cache_dir" ]; then
-            echo "Error: sccache directory is not writable: $cache_dir"
-            exit 1
-          fi
-
-          mount_point="$(df "$cache_dir" | tail -1 | awk '{print $NF}')"
-          mount_line="$(mount | grep -F " on $mount_point (" || true)"
-
-          backend='local'
-          if printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
-            backend='smb'
-          fi
-
-          rm -f ~/.config/sccache/config
-
-          sccache --stop-server || true
-          {
-            echo "SCCACHE_DIR=$cache_dir"
-            echo "SCCACHE_BACKEND=$backend"
-          } >> "$GITHUB_ENV"
-          echo "backend=$backend" >> "$GITHUB_OUTPUT"
-
-          echo "Using macOS sccache directory: $cache_dir"
-          sccache --start-server
+          require_macos_smb: true
 
       - name: Validate macOS sccache configuration
         shell: bash
         run: |
           set -euo pipefail
+
+          expected_smb_mount='/Volumes/ai_platform_dev'
+          expected_sccache_dir='/Volumes/ai_platform_dev/build/sccache'
 
           list_smb_mounts() {
             while IFS= read -r mount_line; do
@@ -251,6 +64,10 @@ jobs:
           }
 
           print_smb_mount_diagnostics() {
+            echo "Expected SMB mount: $expected_smb_mount"
+            echo "Expected sccache directory: $expected_sccache_dir"
+            echo "Mount entry for expected SMB share:"
+            mount | grep -F " on $expected_smb_mount (" || true
             echo "Detected smbfs mounts:"
             if [ -n "$detected_smb_mounts" ]; then
               printf '%s\n' "$detected_smb_mounts"
@@ -268,32 +85,18 @@ jobs:
             ls -la /Volumes || true
           }
 
-          backend='${{ steps.configure-sccache.outputs.backend }}'
-          if [ -z "$backend" ]; then
-            echo "Expected a resolved sccache backend"
+          backend='${{ steps.setup-sccache.outputs.backend }}'
+          if [ "$backend" != 'smb' ]; then
+            echo "Expected setup-sccache to resolve the SMB backend, got: ${backend:-unset}"
             exit 1
           fi
 
           detected_smb_mounts="$(list_smb_mounts || true)"
-
-          case "$backend" in
-            smb)
-              if [ -z "$detected_smb_mounts" ]; then
-                echo "Expected at least one SMB mount when the workflow selects the SMB backend"
-                print_smb_mount_diagnostics
-                exit 1
-              fi
-              ;;
-            local)
-              echo "Expected to validate a live SMB-backed sccache directory, but the workflow selected the local backend."
-              print_smb_mount_diagnostics
-              exit 1
-              ;;
-            *)
-              echo "Unexpected sccache backend: $backend"
-              exit 1
-              ;;
-          esac
+          if [ -z "$detected_smb_mounts" ]; then
+            echo "Expected at least one SMB mount when the workflow selects the SMB backend"
+            print_smb_mount_diagnostics
+            exit 1
+          fi
 
           if [ "${RUSTC_WRAPPER:-}" != "sccache" ]; then
             echo "Expected rustc wrapper to be sccache"
@@ -302,6 +105,11 @@ jobs:
 
           if [ -z "${SCCACHE_DIR:-}" ]; then
             echo "SCCACHE_DIR was not exported"
+            exit 1
+          fi
+
+          if [ "$SCCACHE_DIR" != "$expected_sccache_dir" ]; then
+            echo "Expected SCCACHE_DIR to be $expected_sccache_dir, got: $SCCACHE_DIR"
             exit 1
           fi
 
@@ -325,6 +133,12 @@ jobs:
             exit 1
           fi
 
+          if [ "$mount_point" != "$expected_smb_mount" ]; then
+            echo "Expected SCCACHE_DIR to resolve to mount point $expected_smb_mount, got: $mount_point"
+            print_smb_mount_diagnostics
+            exit 1
+          fi
+
           mount_line="$(mount | grep -F " on $mount_point (" || true)"
           if [ -z "$mount_line" ]; then
             echo "Unable to find mount entry for $mount_point"
@@ -337,15 +151,10 @@ jobs:
           echo "Mount point=$mount_point"
           echo "Mount line=$mount_line"
 
-          if [ "$backend" = 'smb' ]; then
-            printf '%s\n' "$mount_line" | grep -q 'smbfs' || {
-              echo "Expected SCCACHE_DIR to be on an smbfs mount"
-              exit 1
-            }
-          elif printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
-            echo "Expected local fallback backend to use a non-smbfs mount"
+          printf '%s\n' "$mount_line" | grep -q 'smbfs' || {
+            echo "Expected SCCACHE_DIR to be on an smbfs mount"
             exit 1
-          fi
+          }
 
       - name: Measure sccache performance
         id: measure-sccache
@@ -457,7 +266,7 @@ jobs:
         if: always() && steps.measure-sccache.conclusion != 'skipped'
         shell: bash
         env:
-          BACKEND: ${{ steps.configure-sccache.outputs.backend }}
+          BACKEND: ${{ steps.setup-sccache.outputs.backend }}
           COLD_BUILD_MS: ${{ steps.measure-sccache.outputs.cold_build_ms }}
           WARM_BUILD_MS: ${{ steps.measure-sccache.outputs.warm_build_ms }}
           SPEEDUP_PERCENT: ${{ steps.measure-sccache.outputs.speedup_percent }}

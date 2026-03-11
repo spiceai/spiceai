@@ -6,7 +6,10 @@ inputs:
     description: 'MinIO endpoint for self-hosted Linux sccache'
     required: false
   macos_sccache_dir:
-    description: 'Optional cache directory for self-hosted macOS runners; defaults to the detected SMB mount'
+    description: 'Optional override for the self-hosted macOS sccache directory; must be /Volumes/ai_platform_dev/build/sccache'
+    required: false
+  require_macos_smb:
+    description: 'Fail on self-hosted macOS unless /Volumes/ai_platform_dev is mounted as smbfs and /Volumes/ai_platform_dev/build/sccache is writable'
     required: false
 
 outputs:
@@ -86,11 +89,21 @@ runs:
       if: steps.detect.outputs.enabled == 'true' && runner.os == 'macOS' && runner.environment == 'self-hosted'
       shell: bash
       run: |
+        set -euo pipefail
+
+        expected_macos_smb_mount='/Volumes/ai_platform_dev'
+        expected_macos_sccache_dir='/Volumes/ai_platform_dev/build/sccache'
+
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
           exit 1
         fi
         sccache --version
+
+        require_macos_smb='${{ inputs.require_macos_smb }}'
+        if [ "$require_macos_smb" != 'true' ]; then
+          require_macos_smb='false'
+        fi
 
         list_smb_mounts() {
           while IFS= read -r mount_line; do
@@ -104,9 +117,35 @@ runs:
           done < <(mount)
         }
 
+        print_smb_diagnostics() {
+          echo "Expected SMB mount: $expected_macos_smb_mount" >&2
+          echo "Expected sccache directory: $expected_macos_sccache_dir" >&2
+          echo "Detected mount entry for expected SMB share:" >&2
+          expected_smb_mount_line >&2 || true
+          echo "Detected SMB mounts:" >&2
+          list_smb_mounts >&2 || true
+          echo "Contents of /Volumes:" >&2
+          ls -la /Volumes >&2 || true
+        }
+
+        expected_smb_mount_line() {
+          mount | grep -F " on $expected_macos_smb_mount (" || true
+        }
+
+        mount_line_for_path() {
+          local candidate="$1"
+          local mount_point
+
+          mount_point="$(df "$candidate" | tail -1 | awk '{print $NF}')"
+          [ -n "$mount_point" ] || return 1
+
+          mount | grep -F " on $mount_point (" || true
+        }
+
         probe_cache_dir() {
           local candidate="$1"
           local probe_file
+          local mount_line
 
           [ -n "$candidate" ] || return 1
 
@@ -115,6 +154,11 @@ runs:
           fi
 
           if [ ! -w "$candidate" ]; then
+            return 1
+          fi
+
+          mount_line="$(mount_line_for_path "$candidate")"
+          if [ -z "$mount_line" ]; then
             return 1
           fi
 
@@ -129,61 +173,45 @@ runs:
         }
 
         resolve_macos_cache_dir() {
-          local candidate
-          if [ -n "${{ inputs.macos_sccache_dir }}" ]; then
-            candidate="$(probe_cache_dir "${{ inputs.macos_sccache_dir }}" || true)"
+          local candidate mount_line
+
+          candidate='${{ inputs.macos_sccache_dir }}'
+          if [ -z "$candidate" ]; then
+            candidate="$expected_macos_sccache_dir"
+          fi
+
+          if [ "$candidate" != "$expected_macos_sccache_dir" ]; then
+            echo "Expected macOS sccache directory to be $expected_macos_sccache_dir, got: $candidate" >&2
+            return 1
+          fi
+
+          mount_line="$(expected_smb_mount_line)"
+          if [ -n "$mount_line" ]; then
+            if ! printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
+              echo "Expected $expected_macos_smb_mount to be mounted as smbfs." >&2
+              print_smb_diagnostics
+              return 1
+            fi
+
+            candidate="$(probe_cache_dir "$candidate" || true)"
             if [ -n "$candidate" ]; then
               printf '%s\n' "$candidate"
               return 0
             fi
+
+            echo "Expected writable sccache directory at $expected_macos_sccache_dir." >&2
+            print_smb_diagnostics
+            return 1
           fi
 
-          if [ -n "${SCCACHE_DIR:-}" ]; then
-            candidate="$(probe_cache_dir "$SCCACHE_DIR" || true)"
-            if [ -n "$candidate" ]; then
-              printf '%s\n' "$candidate"
-              return 0
-            fi
+          if [ "$require_macos_smb" = 'true' ]; then
+            echo "Expected SMB share to be mounted at $expected_macos_smb_mount." >&2
+            print_smb_diagnostics
+            return 1
           fi
 
-          if [ -d "/Volumes/sccache" ]; then
-            candidate="$(probe_cache_dir "/Volumes/sccache/spiceai-sccache" || true)"
-            if [ -n "$candidate" ]; then
-              printf '%s\n' "$candidate"
-              return 0
-            fi
-          fi
-
-          local smb_mounts=()
-          local mount_point
-          local cache_candidates=()
-          while IFS= read -r mount_point; do
-            [ -n "$mount_point" ] && smb_mounts+=("$mount_point")
-          done < <(list_smb_mounts)
-
-          for mount_point in "${smb_mounts[@]}"; do
-            cache_candidates=(
-              "$mount_point/spiceai-sccache"
-              "$mount_point/.cache/spiceai-sccache"
-              "$mount_point/cache/spiceai-sccache"
-              "$mount_point/tmp/spiceai-sccache"
-              "$mount_point/var/tmp/spiceai-sccache"
-              "$mount_point/data/spiceai-sccache"
-              "$mount_point/data/cache/spiceai-sccache"
-            )
-
-            for candidate in "${cache_candidates[@]}"; do
-              candidate="$(probe_cache_dir "$candidate" || true)"
-              if [ -n "$candidate" ]; then
-                printf '%s\n' "$candidate"
-                return 0
-              fi
-            done
-          done
-
-          echo "No writable SMB cache directory detected; falling back to local cache." >&2
-          echo "Detected SMB mounts:" >&2
-          list_smb_mounts >&2 || true
+          echo "Expected SMB share is not mounted at $expected_macos_smb_mount; falling back to local cache." >&2
+          print_smb_diagnostics
           candidate="$(probe_cache_dir "$HOME/.cache/sccache" || true)"
           if [ -n "$candidate" ]; then
             printf '%s\n' "$candidate"
@@ -204,11 +232,22 @@ runs:
           exit 1
         fi
 
+        if [ "$cache_dir" != "$expected_macos_sccache_dir" ]; then
+          echo "Expected sccache directory to resolve to $expected_macos_sccache_dir, got: $cache_dir" >&2
+          exit 1
+        fi
+
         backend="local"
         mount_point="$(df "$cache_dir" | tail -1 | awk '{print $NF}')"
         mount_line="$(mount | grep -F " on $mount_point (" || true)"
-        if printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
+        if [ "$mount_point" = "$expected_macos_smb_mount" ] && printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
           backend="smb"
+        fi
+
+        if [ "$require_macos_smb" = 'true' ] && [ "$backend" != 'smb' ]; then
+          echo "Expected an SMB-backed sccache directory on self-hosted macOS, but resolved: $cache_dir" >&2
+          print_smb_diagnostics
+          exit 1
         fi
 
         rm -f ~/.config/sccache/config
