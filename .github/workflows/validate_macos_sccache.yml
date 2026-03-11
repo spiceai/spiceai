@@ -71,12 +71,14 @@ jobs:
             mount | grep -F " on $mount_point "
           else
             if [ -z "${SMB_HOST:-}" ] || [ -z "${SMB_PASSWORD:-}" ]; then
-              echo "Missing secrets: SCCACHE_SMB_HOST and/or SCCACHE_SMB_PASSWORD"
+              echo "Missing secrets: SMB_HOST and/or SMB_PASSWORD"
               exit 1
             fi
 
-            sudo mkdir -p "$mount_point"
-            sudo chown "$(id -u):$(id -g)" "$mount_point"
+            if [ ! -d "$mount_point" ]; then
+              sudo mkdir -p "$mount_point"
+              sudo chown "$(id -u):$(id -g)" "$mount_point"
+            fi
 
             # mount_smbfs expects //<user>:<pass>@<host>/<share>
             mount_smbfs "//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}" "$mount_point"
