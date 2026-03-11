@@ -266,12 +266,9 @@ jobs:
               fi
               ;;
             local)
-              if [ -n "$detected_smb_mounts" ]; then
-                echo "The workflow selected the local backend; SMB mounts may exist, but SCCACHE_DIR must not be on an smbfs mount."
-                print_smb_mount_diagnostics
-              else
-                echo "No writable SMB mount detected; validating the local fallback backend."
-              fi
+              echo "Expected to validate a live SMB-backed sccache directory, but the workflow selected the local backend."
+              print_smb_mount_diagnostics
+              exit 1
               ;;
             *)
               echo "Unexpected sccache backend: $backend"
@@ -438,7 +435,7 @@ jobs:
           fi
 
       - name: Report sccache performance
-        if: always()
+        if: always() && steps.measure-sccache.conclusion != 'skipped'
         shell: bash
         env:
           BACKEND: ${{ steps.configure-sccache.outputs.backend }}
@@ -463,10 +460,6 @@ jobs:
             echo '## macOS sccache performance'
             echo
             echo 'Smoke test timing is best used as a trend signal across runs, not as a strict benchmark.'
-            if [ "${BACKEND:-unknown}" = 'local' ]; then
-              echo 'This runner did not expose a writable SMB mount during the run, so the workflow validated the local fallback backend.'
-              echo
-            fi
             echo
             echo '| Metric | Value |'
             echo '| --- | --- |'
@@ -495,7 +488,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Assert sccache hit validation
-        if: always()
+        if: always() && steps.measure-sccache.conclusion != 'skipped'
         shell: bash
         env:
           VALIDATION_FAILED: ${{ steps.measure-sccache.outputs.validation_failed }}
