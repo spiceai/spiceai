@@ -75,6 +75,10 @@ jobs:
               exit 1
             fi
 
+            # mount_smbfs requires a clean (empty) mount point
+            if [ -d "$mount_point" ]; then
+              rmdir "$mount_point" 2>/dev/null || rm -rf "$mount_point"
+            fi
             mkdir -p "$mount_point"
 
             # mount_smbfs expects //<user>:<pass>@<host>/<share>
