@@ -44,6 +44,51 @@ jobs:
         id: setup-sccache
         uses: ./.github/actions/setup-sccache
 
+      - name: Configure sccache for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The setup-sccache action only configures env vars when minio_endpoint
+          # is provided. On the self-hosted spiceai-macos runner sccache is
+          # pre-installed; this step ensures the needed env vars are exported so
+          # subsequent steps can use it.
+          if [ -n "${RUSTC_WRAPPER:-}" ]; then
+            echo "RUSTC_WRAPPER already set to $RUSTC_WRAPPER"
+            exit 0
+          fi
+
+          sccache_path="$(command -v sccache 2>/dev/null || true)"
+          if [ -z "$sccache_path" ]; then
+            echo "sccache is not installed on this runner"
+            exit 1
+          fi
+
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIRECT=true" >> "$GITHUB_ENV"
+          echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+
+          # Prefer an SMB-backed cache dir if one exists under /Volumes
+          smb_cache_dir=""
+          for candidate in /Volumes/*/sccache; do
+            if [ -d "$candidate" ] && [ -w "$candidate" ]; then
+              smb_cache_dir="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$smb_cache_dir" ]; then
+            echo "SCCACHE_DIR=$smb_cache_dir" >> "$GITHUB_ENV"
+            echo "SCCACHE_BACKEND=smb" >> "$GITHUB_ENV"
+            echo "Using SMB sccache dir: $smb_cache_dir"
+          else
+            default_dir="${HOME}/.cache/sccache"
+            mkdir -p "$default_dir"
+            echo "SCCACHE_DIR=$default_dir" >> "$GITHUB_ENV"
+            echo "SCCACHE_BACKEND=local" >> "$GITHUB_ENV"
+            echo "No SMB sccache dir found; using local fallback: $default_dir"
+          fi
+
       - name: Validate macOS sccache configuration
         shell: bash
         run: |
