@@ -380,7 +380,6 @@ datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git
 datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }          # spiceai-52
 datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }         # spiceai-52
 datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }  # spiceai-52
-datafusion-functions-json = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }          # spiceai-52
 datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }                   # spiceai-52
 datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }                # spiceai-52
 datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "96e89d953627baf29e53ba9b1813ab16e0318e75" }       # spiceai-52
