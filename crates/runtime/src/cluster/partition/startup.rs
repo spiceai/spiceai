@@ -153,11 +153,10 @@ pub async fn initialize_partition_metadata(
 /// key configured, which is required for cluster partition management.
 pub fn validate_partition_keys(app: &App) -> Result<()> {
     for ds in &app.datasets {
-        if ds.is_accelerated()
-            && ds
-                .acceleration
-                .as_ref()
-                .is_some_and(|acc| acc.partition_by.is_empty())
+        if ds
+            .acceleration
+            .as_ref()
+            .is_some_and(|acc| acc.partition_by.is_empty())
         {
             return MissingPartitionKeysSnafu {
                 component_type: "dataset",
@@ -167,11 +166,10 @@ pub fn validate_partition_keys(app: &App) -> Result<()> {
         }
     }
     for view in &app.views {
-        if view.is_accelerated()
-            && view
-                .acceleration
-                .as_ref()
-                .is_some_and(|acc| acc.partition_by.is_empty())
+        if view
+            .acceleration
+            .as_ref()
+            .is_some_and(|acc| acc.partition_by.is_empty())
         {
             return MissingPartitionKeysSnafu {
                 component_type: "view",
