@@ -61,6 +61,7 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
+use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
@@ -601,9 +602,23 @@ impl ClusterService for ClusterServiceImpl {
 
         let partition_manager = self.executor_registry().partition_manager();
         let app_guard = self.app.read().await;
+        let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
+            let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
+                runtime::PartitionManagement::default().max_partitions_per_executor,
+                runtime::Scheduler::max_partitions_per_executor,
+            );
+
             // Find accelerated datasets with partitioning
             for table_ref in super::partition::accelerated_tables(app).keys() {
+                if total_assigned >= max_partitions_per_executor {
+                    tracing::debug!(
+                        "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
+                    );
+                    break;
+                }
+                let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
+
                 if partition_manager
                     .get_cached_table_metadata(table_ref)
                     .is_none()
@@ -614,17 +629,23 @@ impl ClusterService for ClusterServiceImpl {
                     continue;
                 }
                 match partition_manager
-                    .allocate_partitions(table_ref, executor_id, 10)
+                    .allocate_partitions(table_ref, executor_id, remaining)
                     .await
                 {
-                    Ok(partitions) => {
+                    Ok(result) => {
+                        let newly_assigned = result.newly_assigned.len();
+                        let partitions = result.all_assigned();
                         if partitions.is_empty() {
                             continue;
                         }
                         let mut items = Vec::with_capacity(partitions.len());
-                        for partition in partitions {
-                            match partition_value_to_bytes(partition, table_ref, &self.datafusion)
-                                .await
+                        for partition in &partitions {
+                            match partition_value_to_bytes(
+                                partition.clone(),
+                                table_ref,
+                                &self.datafusion,
+                            )
+                            .await
                             {
                                 Ok(bytes) => items.push(bytes.to_vec()),
                                 Err(e) => {
@@ -634,6 +655,7 @@ impl ClusterService for ClusterServiceImpl {
                                 }
                             }
                         }
+                        total_assigned += newly_assigned;
                         table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
                     Err(e) => {
