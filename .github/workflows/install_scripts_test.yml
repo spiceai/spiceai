@@ -277,12 +277,12 @@ jobs:
       - name: Test install-spiced.sh with variant '${{ matrix.variant }}'
         env:
           VARIANT: ${{ matrix.variant }}
-          SPICED_INSTALL_DIR: ${{ github.workspace }}/bin
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/.spice/bin
         run: |
-          mkdir -p bin
+          mkdir -p "$SPICED_INSTALL_DIR"
           chmod +x install/install-spiced.sh
           ./install/install-spiced.sh
-          ./bin/spiced --version
+          "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test specific version installation
   test-specific-version:
@@ -363,7 +363,7 @@ jobs:
 
       - name: Test install.sh with ${{ matrix.client }}
         env:
-          SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin
+          SPICE_CLI_INSTALL_DIR: ${{ runner.temp }}/spice-cli-bin
         run: |
           mkdir -p "$SPICE_CLI_INSTALL_DIR"
           chmod +x install/install.sh
@@ -387,7 +387,7 @@ jobs:
       - name: Test invalid version handling
         run: |
           chmod +x install/install-spiced.sh
-          export SPICED_INSTALL_DIR="${{ github.workspace }}/bin"
+          export SPICED_INSTALL_DIR="${{ runner.temp }}/spiced-error-bin"
           mkdir -p "$SPICED_INSTALL_DIR"
 
           # This should fail gracefully with a non-existent version
@@ -402,7 +402,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           chmod +x install/install-spiced.sh
-          export SPICED_INSTALL_DIR="${{ github.workspace }}/bin"
+          export SPICED_INSTALL_DIR="${{ runner.temp }}/spiced-error-bin"
           export VARIANT="cuda"
           export CUDA_VERSION="90"
           mkdir -p "$SPICED_INSTALL_DIR"

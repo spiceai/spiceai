@@ -236,6 +236,11 @@ installFile() {
     if [ "$OS" == "windows" ]; then
         extracted_filename="${SPICED_FILENAME}.exe"
     fi
+
+    local install_target="$SPICED_FILE"
+    if [ "$OS" == "windows" ]; then
+        install_target="${SPICED_FILE}.exe"
+    fi
     
     local tmp_root_spiced="$SPICE_TMP_ROOT/$extracted_filename"
 
@@ -245,6 +250,12 @@ installFile() {
     fi
 
     chmod a+x "$tmp_root_spiced"
+
+    if [ -e "$install_target" ] && [ ! -f "$install_target" ]; then
+        echo "Install target $install_target exists and is not a regular file."
+        echo "Choose a different SPICED_INSTALL_DIR or remove the conflicting path."
+        exit 1
+    fi
     
     # Copy to install directory (use runAsRoot if needed)
     if [ "$USE_SUDO" = "true" ]; then

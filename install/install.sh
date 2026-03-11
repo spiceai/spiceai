@@ -193,6 +193,12 @@ installFile() {
             mkdir -p "$SPICE_CLI_INSTALL_DIR"
         fi
     fi
+
+    if [ -e "$SPICE_CLI_FILE" ] && [ ! -f "$SPICE_CLI_FILE" ]; then
+        echo "Install target $SPICE_CLI_FILE exists and is not a regular file."
+        echo "Choose a different SPICE_CLI_INSTALL_DIR or remove the conflicting path."
+        exit 1
+    fi
     
     # Copy the file with sudo if needed
     if [ "$USE_SUDO" == "true" ]; then
