@@ -1,0 +1,342 @@
+name: Validate macOS sccache runner
+
+on:
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/setup-rust/**'
+      - '.github/actions/setup-sccache/**'
+      - '.github/workflows/validate_macos_sccache.yml'
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/actions/setup-rust/**'
+      - '.github/actions/setup-sccache/**'
+      - '.github/workflows/validate_macos_sccache.yml'
+  schedule:
+    - cron: '15 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate spiceai-macos sccache
+    runs-on: spiceai-macos
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up sccache
+        id: setup-sccache
+        uses: ./.github/actions/setup-sccache
+
+      - name: Validate macOS sccache configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          list_smb_mounts() {
+            while IFS= read -r mount_line; do
+              case "$mount_line" in
+                *" (smbfs,"*|*" (smbfs)"*)
+                  printf '%s\n' "$mount_line"
+                  ;;
+              esac
+            done < <(mount)
+          }
+
+          print_smb_mount_diagnostics() {
+            echo "Detected smbfs mounts:"
+            if [ -n "$detected_smb_mounts" ]; then
+              printf '%s\n' "$detected_smb_mounts"
+              while IFS= read -r mount_line; do
+                [ -n "$mount_line" ] || continue
+                mount_path="${mount_line#* on }"
+                mount_path="${mount_path%% (*}"
+                if [ -n "$mount_path" ] && [ -d "$mount_path" ]; then
+                  echo "Top-level entries for $mount_path:"
+                  ls -la "$mount_path" | head -n 50 || true
+                fi
+              done < <(printf '%s\n' "$detected_smb_mounts")
+            fi
+            echo "Contents of /Volumes:"
+            ls -la /Volumes || true
+          }
+
+          if [ "${{ steps.setup-sccache.outputs.enabled }}" != "true" ]; then
+            echo "Expected sccache to be enabled on spiceai-macos"
+            exit 1
+          fi
+
+          backend="${{ steps.setup-sccache.outputs.backend }}"
+          detected_smb_mounts="$(list_smb_mounts || true)"
+
+          case "$backend" in
+            smb)
+              if [ -z "$detected_smb_mounts" ]; then
+                echo "Expected at least one SMB mount when setup-sccache selects the SMB backend"
+                print_smb_mount_diagnostics
+                exit 1
+              fi
+              ;;
+            local)
+              if [ -n "$detected_smb_mounts" ]; then
+                echo "setup-sccache selected the local backend; SMB mounts may exist, but SCCACHE_DIR must not be on an smbfs mount."
+                print_smb_mount_diagnostics
+              else
+                echo "No writable SMB mount detected; validating the local fallback backend."
+              fi
+              ;;
+            *)
+              echo "Unexpected sccache backend: $backend"
+              exit 1
+              ;;
+          esac
+
+          if [ "${{ steps.setup-sccache.outputs.rustc_wrapper }}" != "sccache" ]; then
+            echo "Expected rustc wrapper to be sccache"
+            exit 1
+          fi
+
+          if [ -z "${SCCACHE_DIR:-}" ]; then
+            echo "SCCACHE_DIR was not exported"
+            exit 1
+          fi
+
+          if [ ! -d "$SCCACHE_DIR" ]; then
+            echo "SCCACHE_DIR does not exist: $SCCACHE_DIR"
+            exit 1
+          fi
+
+          if [ ! -w "$SCCACHE_DIR" ]; then
+            echo "SCCACHE_DIR is not writable: $SCCACHE_DIR"
+            exit 1
+          fi
+
+          probe_file="$SCCACHE_DIR/.sccache-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          touch "$probe_file"
+          rm -f "$probe_file"
+
+          mount_point="$(df "$SCCACHE_DIR" | tail -1 | awk '{print $NF}')"
+          if [ -z "$mount_point" ]; then
+            echo "Unable to determine mount point for $SCCACHE_DIR"
+            exit 1
+          fi
+
+          mount_line="$(mount | grep -F " on $mount_point (" || true)"
+          if [ -z "$mount_line" ]; then
+            echo "Unable to find mount entry for $mount_point"
+            echo "Current mounts:"
+            mount || true
+            exit 1
+          fi
+
+          echo "SCCACHE_DIR=$SCCACHE_DIR"
+          echo "Mount point=$mount_point"
+          echo "Mount line=$mount_line"
+
+          if [ "$backend" = "smb" ]; then
+            printf '%s\n' "$mount_line" | grep -q 'smbfs' || {
+              echo "Expected SCCACHE_DIR to be on an smbfs mount"
+              exit 1
+            }
+          elif printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
+            echo "Expected local fallback backend to use a non-smbfs mount"
+            exit 1
+          fi
+
+      - name: Measure sccache performance
+        id: measure-sccache
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+        run: |
+          set -euo pipefail
+
+          temp_dir="$(mktemp -d)"
+          stats_file="$RUNNER_TEMP/validate-macos-sccache-stats.txt"
+          cleanup() {
+            rm -rf "$temp_dir"
+          }
+          trap cleanup EXIT
+
+          timestamp_ms() {
+            python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+          }
+
+          time_command_ms() {
+            local start_ms end_ms
+
+            start_ms="$(timestamp_ms)"
+            "$@"
+            end_ms="$(timestamp_ms)"
+
+            echo "$((end_ms - start_ms))"
+          }
+
+          cargo init --name sccache-smoke-test --bin --quiet --vcs none "$temp_dir"
+          cat <<'EOF' > "$temp_dir/src/lib.rs"
+          pub fn smoke_test_message() -> &'static str {
+              "sccache smoke test"
+          }
+          EOF
+          cat <<'EOF' > "$temp_dir/src/main.rs"
+          fn main() {
+              println!("{}", sccache_smoke_test::smoke_test_message());
+          }
+          EOF
+
+          sccache --zero-stats
+
+          cold_build_ms="$(time_command_ms cargo build --manifest-path "$temp_dir/Cargo.toml")"
+          cargo clean --manifest-path "$temp_dir/Cargo.toml"
+          warm_build_ms="$(time_command_ms cargo build --manifest-path "$temp_dir/Cargo.toml")"
+
+          sccache --show-stats | tee "$stats_file"
+
+          compile_requests="$(awk '/^Compile requests[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          compile_requests_executed="$(awk '/^Compile requests executed[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          cache_hits="$(awk '/^Cache hits[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          cache_misses="$(awk '/^Cache misses[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          compilations="$(awk '/^Compilations[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          non_cacheable_calls="$(awk '/^Non-cacheable calls[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
+          cache_dir_size_kib="$(du -sk "$SCCACHE_DIR" | awk '{print $1}')"
+          mount_point="$(df "$SCCACHE_DIR" | tail -1 | awk '{print $NF}')"
+
+          speedup_percent="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.0" if cold <= 0 else f"{((cold - warm) / cold) * 100:.1f}")' "$cold_build_ms" "$warm_build_ms")"
+
+          speedup_factor="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.00" if warm <= 0 else f"{cold / warm:.2f}")' "$cold_build_ms" "$warm_build_ms")"
+
+          hit_rate_percent="$(python3 -c 'import sys; compile_requests = int(sys.argv[1]); cache_hits = int(sys.argv[2]); print("0.0" if compile_requests <= 0 else f"{cache_hits / compile_requests * 100:.1f}")' "${compile_requests:-0}" "${cache_hits:-0}")"
+
+          cache_dir_size_mb="$(python3 -c 'import sys; print(f"{int(sys.argv[1]) / 1024:.1f}")' "${cache_dir_size_kib:-0}")"
+
+          validation_failed="false"
+          failure_reason=""
+
+          if [ "${compile_requests:-0}" -le 0 ]; then
+            validation_failed="true"
+            failure_reason="Expected at least one compile request"
+          fi
+
+          if [ "$validation_failed" != "true" ] && [ "${compile_requests_executed:-0}" -le 0 ] && [ "${compilations:-0}" -le 0 ]; then
+            validation_failed="true"
+            failure_reason="Expected at least one cacheable Rust compilation request; sccache reported only non-cacheable calls"
+          fi
+
+          if [ "$validation_failed" != "true" ] && [ "${cache_hits:-0}" -le 0 ]; then
+            validation_failed="true"
+            failure_reason="Expected at least one sccache hit after rebuilding the smoke test"
+          fi
+
+          {
+            echo "cold_build_ms=$cold_build_ms"
+            echo "warm_build_ms=$warm_build_ms"
+            echo "speedup_percent=$speedup_percent"
+            echo "speedup_factor=$speedup_factor"
+            echo "compile_requests=${compile_requests:-0}"
+            echo "compile_requests_executed=${compile_requests_executed:-0}"
+            echo "cache_hits=${cache_hits:-0}"
+            echo "cache_misses=${cache_misses:-0}"
+            echo "compilations=${compilations:-0}"
+            echo "non_cacheable_calls=${non_cacheable_calls:-0}"
+            echo "hit_rate_percent=$hit_rate_percent"
+            echo "cache_dir_size_mb=$cache_dir_size_mb"
+            echo "mount_point=$mount_point"
+            echo "stats_file=$stats_file"
+            echo "validation_failed=$validation_failed"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$failure_reason" ]; then
+            {
+              echo "failure_reason<<EOF"
+              echo "$failure_reason"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report sccache performance
+        if: always()
+        shell: bash
+        env:
+          BACKEND: ${{ steps.setup-sccache.outputs.backend }}
+          COLD_BUILD_MS: ${{ steps.measure-sccache.outputs.cold_build_ms }}
+          WARM_BUILD_MS: ${{ steps.measure-sccache.outputs.warm_build_ms }}
+          SPEEDUP_PERCENT: ${{ steps.measure-sccache.outputs.speedup_percent }}
+          SPEEDUP_FACTOR: ${{ steps.measure-sccache.outputs.speedup_factor }}
+          COMPILE_REQUESTS: ${{ steps.measure-sccache.outputs.compile_requests }}
+          COMPILE_REQUESTS_EXECUTED: ${{ steps.measure-sccache.outputs.compile_requests_executed }}
+          CACHE_HITS: ${{ steps.measure-sccache.outputs.cache_hits }}
+          CACHE_MISSES: ${{ steps.measure-sccache.outputs.cache_misses }}
+          COMPILATIONS: ${{ steps.measure-sccache.outputs.compilations }}
+          NON_CACHEABLE_CALLS: ${{ steps.measure-sccache.outputs.non_cacheable_calls }}
+          HIT_RATE_PERCENT: ${{ steps.measure-sccache.outputs.hit_rate_percent }}
+          CACHE_DIR_SIZE_MB: ${{ steps.measure-sccache.outputs.cache_dir_size_mb }}
+          MOUNT_POINT: ${{ steps.measure-sccache.outputs.mount_point }}
+          STATS_FILE: ${{ steps.measure-sccache.outputs.stats_file }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## macOS sccache performance"
+            echo
+            echo "Smoke test timing is best used as a trend signal across runs, not as a strict benchmark."
+            if [ "${BACKEND:-unknown}" = "local" ]; then
+              echo "This runner did not expose a writable SMB mount during the run, so the workflow validated the local fallback backend."
+              echo
+            fi
+            echo
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Backend | ${BACKEND:-unknown} |"
+            echo "| Cache dir | ${SCCACHE_DIR:-unset} |"
+            echo "| Mount point | ${MOUNT_POINT:-unknown} |"
+            echo "| Cache dir size | ${CACHE_DIR_SIZE_MB:-0} MiB |"
+            echo "| Cold build | ${COLD_BUILD_MS:-0} ms |"
+            echo "| Warm build | ${WARM_BUILD_MS:-0} ms |"
+            echo "| Warm speedup | ${SPEEDUP_FACTOR:-0.00}x (${SPEEDUP_PERCENT:-0.0}%) |"
+            echo "| Compile requests | ${COMPILE_REQUESTS:-0} |"
+            echo "| Compile requests executed | ${COMPILE_REQUESTS_EXECUTED:-0} |"
+            echo "| Compilations | ${COMPILATIONS:-0} |"
+            echo "| Cache hits | ${CACHE_HITS:-0} |"
+            echo "| Cache misses | ${CACHE_MISSES:-0} |"
+            echo "| Non-cacheable calls | ${NON_CACHEABLE_CALLS:-0} |"
+            echo "| Hit rate | ${HIT_RATE_PERCENT:-0.0}% |"
+            echo
+            if [ -n "${STATS_FILE:-}" ] && [ -f "$STATS_FILE" ]; then
+              echo "### Raw sccache stats"
+              echo
+              echo '```text'
+              cat "$STATS_FILE"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assert sccache hit validation
+        if: always()
+        shell: bash
+        env:
+          VALIDATION_FAILED: ${{ steps.measure-sccache.outputs.validation_failed }}
+          FAILURE_REASON: ${{ steps.measure-sccache.outputs.failure_reason }}
+        run: |
+          set -euo pipefail
+
+          if [ "${VALIDATION_FAILED:-false}" = "true" ]; then
+            echo "${FAILURE_REASON:-sccache validation failed}"
+            exit 1
+          fi
