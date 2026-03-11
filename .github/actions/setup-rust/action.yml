@@ -110,6 +110,8 @@ runs:
 
         rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
         rustup default "$resolved_toolchain"
+        echo "RUSTUP_TOOLCHAIN=$resolved_toolchain" >> "$GITHUB_ENV"
+        export RUSTUP_TOOLCHAIN="$resolved_toolchain"
 
         rustup component list --toolchain "$resolved_toolchain" --installed
         cargo --version
@@ -133,6 +135,8 @@ runs:
 
         rustup component add cargo rustc rustfmt clippy --toolchain $resolvedToolchain
         rustup default $resolvedToolchain
+        "RUSTUP_TOOLCHAIN=$resolvedToolchain" >> $env:GITHUB_ENV
+        $env:RUSTUP_TOOLCHAIN = $resolvedToolchain
 
         rustup component list --toolchain $resolvedToolchain --installed
         cargo --version
