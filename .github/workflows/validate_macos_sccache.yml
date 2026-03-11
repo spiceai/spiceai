@@ -79,7 +79,7 @@ jobs:
                 # Use actual I/O to test write access — test -w / [ -w ] uses
                 # access(2) which can be blocked by macOS TCC even when real
                 # write access works.
-                probe="$candidate/.smb-probe-$$"
+                probe="$candidate/.smb-probe-${RUNNER_NAME:-$$}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
                 if touch "$probe" 2>&1; then
                   rm -f "$probe"
                   echo "  Write probe (touch): SUCCESS"
