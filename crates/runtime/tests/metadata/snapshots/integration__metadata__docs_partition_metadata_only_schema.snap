@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: "format!(\"{schema}\")"
+---
+Field { "day": Utf8 }, Field { "location": nullable Utf8 }
