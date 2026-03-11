@@ -75,13 +75,15 @@ jobs:
               exit 1
             fi
 
-            # Ensure parent dir exists; mount_smbfs creates the leaf directory
-            mkdir -p "$(dirname "$mount_point")"
-            # Remove stale mount-point dir if it exists (mount_smbfs needs it absent)
-            [ -d "$mount_point" ] && rmdir "$mount_point" 2>/dev/null || true
+            mkdir -p "$mount_point"
 
-            # mount_smbfs expects //<user>:<pass>@<host>/<share>
-            mount_smbfs "//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}" "$mount_point"
+            smb_url="//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}"
+
+            echo "Attempting mount_smbfs to $mount_point ..."
+            if ! mount_smbfs "$smb_url" "$mount_point" 2>&1; then
+              echo "mount_smbfs failed, trying mount -t smbfs ..."
+              mount -t smbfs "$smb_url" "$mount_point"
+            fi
             echo "Mounted SMB share at $mount_point"
           fi
 
