@@ -68,6 +68,9 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     let cname = resolve_default_cname(cloud).await?;
 
+    let memory_limit =
+        std::env::var("SPIDAPTER_APP_MEMORY_LIMIT").unwrap_or_else(|_| "16Gi".to_string());
+
     let create_result = cloud
         .create_app(&CreateAppRequest {
             name: app_name.to_string(),
@@ -81,7 +84,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             resources: Some(AppResources {
                 limits: AppResourceLimits {
                     cpu: None,
-                    memory: "32Gi".to_string(),
+                    memory: memory_limit,
                     ephemeral_storage: None,
                 },
                 requests: Some(AppResourceRequests {
