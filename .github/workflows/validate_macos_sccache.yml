@@ -65,7 +65,7 @@ jobs:
           mount_point="$HOME/sccache_smb/${runner_label}"
           echo "Mount point: $mount_point"
 
-          # Check if already mounted
+          # Check if already mounted at our preferred path
           if mount | grep -qF " on $mount_point "; then
             echo "Already mounted at $mount_point"
             mount | grep -F " on $mount_point "
@@ -75,16 +75,25 @@ jobs:
               exit 1
             fi
 
-            mkdir -p "$mount_point"
-
             smb_url="//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}"
+            # Redact password for display
+            smb_display="//${SMB_USERNAME}@${SMB_HOST}/${SMB_SHARE}"
 
-            echo "Attempting mount_smbfs to $mount_point ..."
-            if ! mount_smbfs "$smb_url" "$mount_point" 2>&1; then
-              echo "mount_smbfs failed, trying mount -t smbfs ..."
-              mount -t smbfs "$smb_url" "$mount_point"
+            # macOS refuses to mount the same SMB share at two locations.
+            # If it's already mounted elsewhere (e.g. /Volumes/ai_platform_dev),
+            # unmount it first, then remount at our user-owned path so the
+            # workflow process has TCC-compatible access.
+            existing="$(mount | grep -F "@${SMB_HOST}/${SMB_SHARE} " | head -1 || true)"
+            if [ -n "$existing" ]; then
+              old_mount="${existing#* on }"
+              old_mount="${old_mount%% (*}"
+              echo "Share already mounted at $old_mount — unmounting to remount at $mount_point"
+              umount "$old_mount"
             fi
-            echo "Mounted SMB share at $mount_point"
+
+            mkdir -p "$mount_point"
+            mount_smbfs "$smb_url" "$mount_point"
+            echo "Mounted $smb_display at $mount_point"
           fi
 
           # Verify write access
