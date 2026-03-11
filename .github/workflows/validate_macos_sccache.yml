@@ -36,12 +36,32 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
+        continue-on-error: true
         uses: ./.github/actions/setup-rust
 
       - name: Normalize Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
+
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          echo "$cargo_home/bin" >> "$GITHUB_PATH"
+          export PATH="$cargo_home/bin:$PATH"
+
+          if [ -f "$cargo_home/env" ]; then
+            source "$cargo_home/env" || true
+          elif [ -f "$HOME/.cargo/env" ]; then
+            source "$HOME/.cargo/env" || true
+          fi
+
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+            if [ -f "$cargo_home/env" ]; then
+              source "$cargo_home/env" || true
+            elif [ -f "$HOME/.cargo/env" ]; then
+              source "$HOME/.cargo/env" || true
+            fi
+          fi
 
           requested_toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
           if [ -z "$requested_toolchain" ] && [ -f rust-toolchain.toml ]; then
@@ -62,13 +82,12 @@ jobs:
 
           rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
 
-          toolchain_bin_dir="$(dirname "$(rustup which --toolchain "$resolved_toolchain" cargo)")"
           echo "RUSTUP_TOOLCHAIN=$resolved_toolchain" >> "$GITHUB_ENV"
-          echo "$toolchain_bin_dir" >> "$GITHUB_PATH"
 
           export RUSTUP_TOOLCHAIN="$resolved_toolchain"
-          export PATH="$toolchain_bin_dir:$PATH"
 
+          rustup run "$resolved_toolchain" cargo --version
+          rustup run "$resolved_toolchain" rustc --version
           cargo --version
           rustc --version
 
