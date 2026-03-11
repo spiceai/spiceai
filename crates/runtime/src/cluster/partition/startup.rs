@@ -38,7 +38,7 @@ use super::{PartitionManager, Result};
 use crate::{
     cluster::partition::{
         MissingPartitionKeysSnafu, ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
-        PartitionExpressionDeserializationSnafu, PartitionMetadataInitSnafu, discovery,
+        PartitionExpressionDeserializationSnafu, discovery,
     },
     datafusion::DataFusion,
 };
