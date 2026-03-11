@@ -742,7 +742,6 @@ async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
