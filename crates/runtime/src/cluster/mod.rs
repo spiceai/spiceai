@@ -817,6 +817,14 @@ pub(crate) async fn initialize_cluster_scheduler_future(
 
     if let Some(config) = app.runtime.scheduler.clone() {
         if let Some(partition_manager) = rt.partition_manager() {
+            // Validate all accelerated datasets/views have partition keys
+            // for distributed partition management.
+            partition::validate_partition_keys(&app).map_err(|e| {
+                crate::Error::FailedToStartClusterScheduler {
+                    source: Box::new(e),
+                }
+            })?;
+
             // Initialize partition metadata for all accelerated tables
             if let Err(err) = partition::initialize_partition_metadata(
                 rt.datafusion(),

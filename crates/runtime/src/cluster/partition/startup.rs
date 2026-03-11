@@ -37,7 +37,7 @@ use tonic::transport::Channel;
 use super::{PartitionManager, Result};
 use crate::{
     cluster::partition::{
-        ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
+        MissingPartitionKeysSnafu, ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
         PartitionExpressionDeserializationSnafu, PartitionMetadataInitSnafu, discovery,
     },
     datafusion::DataFusion,
@@ -145,11 +145,46 @@ pub async fn initialize_partition_metadata(
     Ok(())
 }
 
+/// Verify that all accelerated datasets and views have at least one `partition_by`
+/// key configured, which is required for cluster partition management.
+pub fn validate_partition_keys(app: &App) -> Result<()> {
+    for ds in &app.datasets {
+        if ds.is_accelerated()
+            && ds
+                .acceleration
+                .as_ref()
+                .is_some_and(|acc| acc.partition_by.is_empty())
+        {
+            return MissingPartitionKeysSnafu {
+                component_type: "dataset",
+                name: ds.name.clone(),
+            }
+            .fail();
+        }
+    }
+    for view in &app.views {
+        if view.is_accelerated()
+            && view
+                .acceleration
+                .as_ref()
+                .is_some_and(|acc| acc.partition_by.is_empty())
+        {
+            return MissingPartitionKeysSnafu {
+                component_type: "view",
+                name: view.name.clone(),
+            }
+            .fail();
+        }
+    }
+    Ok(())
+}
+
 /// Helper to find all tables with acceleration partitioning configured, along with their partitioning columns.
 #[must_use]
 pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<PartitionedBy>> {
     let ds = app.datasets.iter().filter_map(|ds| {
         if let Some(acc) = &ds.acceleration
+            && acc.enabled
             && !acc.partition_by.is_empty()
         {
             return Some((
@@ -162,6 +197,7 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
     });
     let views = app.views.iter().filter_map(|view| {
         if let Some(acc) = &view.acceleration
+            && acc.enabled
             && !acc.partition_by.is_empty()
         {
             return Some((
