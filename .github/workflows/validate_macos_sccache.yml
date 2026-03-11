@@ -44,9 +44,14 @@ jobs:
         id: setup-sccache
         uses: ./.github/actions/setup-sccache
 
-      - name: Detect SMB mount
-        id: detect-smb
+      - name: Mount SMB share
+        id: mount-smb
         shell: bash
+        env:
+          SMB_HOST: ${{ secrets.SCCACHE_SMB_HOST }}
+          SMB_SHARE: ${{ secrets.SCCACHE_SMB_SHARE }}
+          SMB_USERNAME: ${{ secrets.SCCACHE_SMB_USERNAME }}
+          SMB_PASSWORD: ${{ secrets.SCCACHE_SMB_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -54,59 +59,43 @@ jobs:
           id
           echo "Runner: ${RUNNER_NAME:-unknown}"
 
-          echo ""
-          echo "=== All mounts ==="
-          mount
+          # Sanitize runner name for use as a mount-point directory name
+          runner_label="$(echo "${RUNNER_NAME:-runner}" | tr -cs 'A-Za-z0-9_-' '_' | sed 's/_$//')"
+          mount_point="/Volumes/${runner_label}_sccache"
+          echo "Mount point: $mount_point"
 
-          echo ""
-          echo "=== /Volumes contents ==="
-          ls -la /Volumes 2>&1 || true
+          # Check if already mounted
+          if mount | grep -qF " on $mount_point "; then
+            echo "Already mounted at $mount_point"
+            mount | grep -F " on $mount_point "
+          else
+            if [ -z "$SMB_HOST" ] || [ -z "$SMB_SHARE" ] || [ -z "$SMB_USERNAME" ] || [ -z "$SMB_PASSWORD" ]; then
+              echo "Missing SMB secrets (SCCACHE_SMB_HOST, SCCACHE_SMB_SHARE, SCCACHE_SMB_USERNAME, SCCACHE_SMB_PASSWORD)"
+              exit 1
+            fi
 
-          echo ""
-          echo "=== SMB mount detection ==="
-          smb_mount=""
-          while IFS= read -r line; do
-            case "$line" in
-              *" (smbfs,"*|*" (smbfs)"*)
-                echo "Found SMB mount: $line"
-                candidate="${line#* on }"
-                candidate="${candidate%% (*}"
-                echo "  Path: $candidate"
-                echo "  test -d: $([ -d "$candidate" ] 2>&1 && echo yes || echo "no ($?)")"
-                echo "  test -w: $([ -w "$candidate" ] 2>&1 && echo yes || echo "no ($?)")"
-                echo "  ls: $(ls "$candidate" 2>&1 | head -5 || true)"
+            sudo mkdir -p "$mount_point"
+            sudo chown "$(id -u):$(id -g)" "$mount_point"
 
-                # Use actual I/O to test write access — test -w / [ -w ] uses
-                # access(2) which can be blocked by macOS TCC even when real
-                # write access works.
-                probe="$candidate/.smb-probe-${RUNNER_NAME:-$$}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-                if touch "$probe" 2>&1; then
-                  rm -f "$probe"
-                  echo "  Write probe (touch): SUCCESS"
-                  if [ -z "$smb_mount" ]; then
-                    smb_mount="$candidate"
-                  fi
-                else
-                  echo "  Write probe (touch): FAILED"
-                fi
-                ;;
-            esac
-          done < <(mount)
-
-          if [ -z "$smb_mount" ]; then
-            echo ""
-            echo "ERROR: No writable SMB mount found"
-            exit 1
+            # mount_smbfs expects //<user>:<pass>@<host>/<share>
+            mount_smbfs "//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}" "$mount_point"
+            echo "Mounted SMB share at $mount_point"
           fi
 
-          echo ""
-          echo "Selected SMB mount: $smb_mount"
-          echo "smb_mount=$smb_mount" >> "$GITHUB_OUTPUT"
+          # Verify write access
+          probe="$mount_point/.smb-probe-${runner_label}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          touch "$probe"
+          rm -f "$probe"
+          echo "Write access verified"
+
+          echo "mount_point=$mount_point" >> "$GITHUB_OUTPUT"
+          echo "runner_label=$runner_label" >> "$GITHUB_OUTPUT"
 
       - name: Configure sccache environment
         shell: bash
         env:
-          SMB_MOUNT: ${{ steps.detect-smb.outputs.smb_mount }}
+          SMB_MOUNT: ${{ steps.mount-smb.outputs.mount_point }}
+          RUNNER_LABEL: ${{ steps.mount-smb.outputs.runner_label }}
         run: |
           set -euo pipefail
 
@@ -127,7 +116,8 @@ jobs:
             echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           fi
 
-          sccache_dir="$SMB_MOUNT/sccache"
+          # Per-runner sccache directory on the shared SMB volume
+          sccache_dir="$SMB_MOUNT/sccache/$RUNNER_LABEL"
           mkdir -p "$sccache_dir"
           echo "SCCACHE_DIR=$sccache_dir" >> "$GITHUB_ENV"
           echo "Using SMB sccache dir: $sccache_dir"
@@ -365,4 +355,23 @@ jobs:
           if [ "${VALIDATION_FAILED:-false}" = "true" ]; then
             echo "${FAILURE_REASON:-sccache validation failed}"
             exit 1
+          fi
+
+      - name: Unmount SMB share
+        if: always()
+        shell: bash
+        env:
+          MOUNT_POINT: ${{ steps.mount-smb.outputs.mount_point }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MOUNT_POINT:-}" ]; then
+            echo "No mount point to clean up"
+            exit 0
+          fi
+
+          if mount | grep -qF " on $MOUNT_POINT "; then
+            umount "$MOUNT_POINT" && echo "Unmounted $MOUNT_POINT" || echo "Failed to unmount $MOUNT_POINT (may still be in use)"
+          else
+            echo "$MOUNT_POINT is not mounted"
           fi
