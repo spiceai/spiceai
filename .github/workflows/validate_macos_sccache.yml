@@ -77,12 +77,18 @@ jobs:
             ls -la /Volumes || true
           }
 
-          if [ "${{ steps.setup-sccache.outputs.enabled }}" != "true" ]; then
+          if [ -n "${RUSTC_WRAPPER:-}" ] && printf '%s' "$RUSTC_WRAPPER" | grep -q 'sccache'; then
+            sccache_enabled="true"
+          else
+            sccache_enabled="false"
+          fi
+
+          if [ "$sccache_enabled" != "true" ]; then
             echo "Expected sccache to be enabled on spiceai-macos"
             exit 1
           fi
 
-          backend="${{ steps.setup-sccache.outputs.backend }}"
+          backend="${SCCACHE_BACKEND:-local}"
           detected_smb_mounts="$(list_smb_mounts || true)"
 
           case "$backend" in
@@ -107,8 +113,9 @@ jobs:
               ;;
           esac
 
-          if [ "${{ steps.setup-sccache.outputs.rustc_wrapper }}" != "sccache" ]; then
-            echo "Expected rustc wrapper to be sccache"
+          rustc_wrapper="${RUSTC_WRAPPER:-}"
+          if [ "$rustc_wrapper" != "sccache" ] && ! printf '%s' "$rustc_wrapper" | grep -q 'sccache'; then
+            echo "Expected rustc wrapper to be sccache, got: ${rustc_wrapper:-<unset>}"
             exit 1
           fi
 
@@ -131,13 +138,14 @@ jobs:
           touch "$probe_file"
           rm -f "$probe_file"
 
-          mount_point="$(df "$SCCACHE_DIR" | tail -1 | awk '{print $NF}')"
+          mount_point="$(stat -f '%m' "$SCCACHE_DIR")"
           if [ -z "$mount_point" ]; then
             echo "Unable to determine mount point for $SCCACHE_DIR"
             exit 1
           fi
 
-          mount_line="$(mount | grep -F " on $mount_point (" || true)"
+          pattern=" on $mount_point ("
+          mount_line="$(mount | grep -F "$pattern" || true)"
           if [ -z "$mount_line" ]; then
             echo "Unable to find mount entry for $mount_point"
             echo "Current mounts:"
@@ -164,7 +172,7 @@ jobs:
         shell: bash
         env:
           CARGO_INCREMENTAL: 0
-          RUSTC_WRAPPER: ${{ steps.setup-sccache.outputs.rustc_wrapper }}
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: |
           set -euo pipefail
 
@@ -216,7 +224,7 @@ jobs:
           compilations="$(awk '/^Compilations[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           non_cacheable_calls="$(awk '/^Non-cacheable calls[[:space:]]+[0-9]+$/ {print $NF; exit}' "$stats_file")"
           cache_dir_size_kib="$(du -sk "$SCCACHE_DIR" | awk '{print $1}')"
-          mount_point="$(df "$SCCACHE_DIR" | tail -1 | awk '{print $NF}')"
+          mount_point="$(stat -f '%m' "$SCCACHE_DIR")"
 
           speedup_percent="$(python3 -c 'import sys; cold = int(sys.argv[1]); warm = int(sys.argv[2]); print("0.0" if cold <= 0 else f"{((cold - warm) / cold) * 100:.1f}")' "$cold_build_ms" "$warm_build_ms")"
 
@@ -274,7 +282,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          BACKEND: ${{ steps.setup-sccache.outputs.backend }}
+          BACKEND: ${{ env.SCCACHE_BACKEND }}
           COLD_BUILD_MS: ${{ steps.measure-sccache.outputs.cold_build_ms }}
           WARM_BUILD_MS: ${{ steps.measure-sccache.outputs.warm_build_ms }}
           SPEEDUP_PERCENT: ${{ steps.measure-sccache.outputs.speedup_percent }}
