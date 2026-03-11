@@ -92,6 +92,7 @@ pub async fn initialize_partition_metadata(
     let existing_tables: HashSet<String> = partition_manager
         .list_tables()
         .await
+        .boxed()
         .context(PartitionMetadataInitSnafu {
             table: "<list>".to_string(),
         })?
