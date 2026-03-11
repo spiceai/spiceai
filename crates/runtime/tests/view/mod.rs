@@ -22,7 +22,7 @@ use runtime::{
     component::view::ViewBuilder,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
 use spicepod::component::{dataset::Dataset, view::View};
 use std::sync::Arc;
 
@@ -738,6 +738,92 @@ async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
 
             // Clean up test file
             std::fs::remove_file("./test_validation.csv").ok();
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let test_csv = "id,name,value\n1,Alice,100\n2,Bob,200\n3,Charlie,300";
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let csv_path = temp_dir.path().join("test_view_zero_results.csv");
+            std::fs::write(&csv_path, test_csv).expect("write file");
+
+            let dataset = Dataset::new(
+                format!("file:{}", csv_path.to_string_lossy()),
+                "zero_results_data",
+            );
+
+            let mut view = View::new("zero_results_view".to_string());
+            view.sql =
+                Some("SELECT id, name, value FROM zero_results_data WHERE id > 0".to_string());
+            view.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Full),
+                on_zero_results: ZeroResultsAction::UseSource,
+                ..Acceleration::default()
+            });
+
+            let app = app::AppBuilder::new("test_view_zero_results")
+                .with_dataset(dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // Verify the view is ready and queryable with on_zero_results: use_source
+            let status = rt.status();
+            let view_statuses = status.get_view_statuses();
+            let view_ref = TableReference::bare("zero_results_view");
+            let view_status = view_statuses
+                .get(&view_ref)
+                .expect("zero_results_view should exist");
+            assert_eq!(
+                *view_status,
+                runtime::status::ComponentStatus::Ready,
+                "zero_results_view should be ready, got {view_status:?}"
+            );
+
+            // Query the accelerated view - data should be available
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM zero_results_view ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+
+            let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            let result_str = pretty.to_string();
+            assert!(
+                result_str.contains("Alice"),
+                "Expected results to contain data, got: {result_str}"
+            );
+
+            rt.shutdown().await;
 
             Ok(())
         })

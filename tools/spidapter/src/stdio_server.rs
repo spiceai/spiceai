@@ -117,12 +117,16 @@ impl BackendMode {
 }
 
 fn parse_backend_mode(raw_value: &str) -> Result<BackendMode, String> {
-    match raw_value.trim().to_ascii_lowercase().as_str() {
-        "" | "scp" => Ok(BackendMode::Scp),
-        "local" => Ok(BackendMode::Local),
-        value => Err(format!(
+    let value = raw_value.trim();
+
+    if value.is_empty() || value.eq_ignore_ascii_case("scp") {
+        Ok(BackendMode::Scp)
+    } else if value.eq_ignore_ascii_case("local") {
+        Ok(BackendMode::Local)
+    } else {
+        Err(format!(
             "Invalid {SPIDAPTER_BACKEND_ENV} value '{value}'. Supported values: scp, local"
-        )),
+        ))
     }
 }
 
@@ -597,7 +601,8 @@ async fn provision_spice_cloud_app(
     let cloud = commands::build_cloud_client(api_url_override)?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
+    let flight_url = std::env::var("SPIDAPTER_FLIGHT_URL")
+        .unwrap_or_else(|_| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));

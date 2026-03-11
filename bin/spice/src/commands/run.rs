@@ -63,6 +63,8 @@ pub struct RunArgs {
 
 /// Execute the run command.
 pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+
     // Auto-install runtime if not present
     if !ctx.is_runtime_installed() {
         tracing::info!("Spice.ai runtime is not installed. Installing now...");

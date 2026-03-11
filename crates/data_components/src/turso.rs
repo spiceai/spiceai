@@ -149,6 +149,7 @@ use datafusion_federation::{
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
+use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
@@ -369,7 +370,7 @@ fn is_now_function(func: &Function) -> bool {
 /// Connection pool for Turso databases
 ///
 /// Manages connections to a Turso database (file-based or in-memory).
-/// Supports MVCC (Multi-Version Concurrency Control) for concurrent transactions.
+/// Supports concurrent transactions using MVCC mode with `BEGIN CONCURRENT`.
 ///
 /// # Architecture
 ///
@@ -391,7 +392,8 @@ fn is_now_function(func: &Function) -> bool {
 /// let conn = pool.connect().await?;
 /// ```
 ///
-/// Note: MVCC is enabled via PRAGMA journal_mode = 'experimental_mvcc' during pool creation.
+/// Note: Concurrent transactions are enabled by configuring
+/// `PRAGMA journal_mode = 'mvcc'` during pool creation.
 /// This enables BEGIN CONCURRENT transactions for better concurrency.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
@@ -418,7 +420,7 @@ impl TursoConnectionPool {
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
     /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
     ///
-    /// Note: MVCC is enabled via PRAGMA journal_mode = 'experimental_mvcc' in turso 0.4.x.
+    /// Note: BEGIN CONCURRENT requires MVCC journal mode, which is configured during pool creation.
     pub async fn new_with_timestamp_format(
         path: &str,
         timestamp_format: TimestampFormat,
@@ -428,11 +430,9 @@ impl TursoConnectionPool {
             .await
             .context(TursoDatabaseSnafu)?;
 
-        // Enable MVCC mode via PRAGMA - this is required for BEGIN CONCURRENT transactions
-        // In turso 0.4.x, the Builder.with_mvcc() method was removed, so we must enable
-        // MVCC via this pragma after database creation
+        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
         let conn = database.connect().context(TursoDatabaseSnafu)?;
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
             .await
             .context(TursoDatabaseSnafu)?;
 
@@ -1219,7 +1219,7 @@ impl TableProvider for TursoTableProvider {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _overwrite: InsertOp,
+        overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Check that the input schema matches the table schema
         if let Err(e) = self
@@ -1236,6 +1236,7 @@ impl TableProvider for TursoTableProvider {
             Arc::clone(&self.pool),
             self.table_name.clone(),
             Arc::clone(&self.schema),
+            overwrite,
         ));
 
         // Wrap in DataSinkExec to execute the insertion
@@ -1667,37 +1668,37 @@ pub struct TursoDataSink {
     pool: Arc<TursoConnectionPool>,
     table_name: String,
     schema: SchemaRef,
+    overwrite: InsertOp,
 }
 
 impl DisplayAs for TursoDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "TursoDataSink(table={})", self.table_name)
+        write!(
+            f,
+            "TursoDataSink(table={}, mode={:?})",
+            self.table_name, self.overwrite
+        )
     }
 }
 
 impl TursoDataSink {
     /// Creates a new data sink for INSERT operations
     #[must_use]
-    pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef) -> Self {
+    pub fn new(
+        pool: Arc<TursoConnectionPool>,
+        table_name: String,
+        schema: SchemaRef,
+        overwrite: InsertOp,
+    ) -> Self {
         Self {
             pool,
             table_name,
             schema,
+            overwrite,
         }
     }
 
-    /// Inserts a batch of records into the Turso database
-    async fn insert_batch(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        let conn = self.pool.connect().await?;
-
-        // Build column list and placeholders for prepared statement
+    fn insert_sql(&self) -> String {
         let columns: Vec<String> = self
             .schema
             .fields()
@@ -1710,16 +1711,99 @@ impl TursoDataSink {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let insert_sql = format!(
+        format!(
             "INSERT INTO {} ({}) VALUES ({})",
             quote_identifier(&self.table_name),
             columns.join(", "),
             placeholders
-        );
+        )
+    }
+
+    async fn rollback_write(conn: &Connection) {
+        if let Err(error) = conn.execute("ROLLBACK", ()).await {
+            tracing::debug!("Failed to rollback Turso write transaction: {error}");
+        }
+    }
+
+    async fn overwrite_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+    ) -> datafusion::error::Result<u64> {
+        let conn = self
+            .pool
+            .connect()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let delete_sql = format!("DELETE FROM {}", quote_identifier(&self.table_name));
+        let insert_sql = self.insert_sql();
+
+        let write_result = async {
+            conn.execute(BEGIN_CONCURRENT_SQL, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            conn.execute(&delete_sql, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let mut stmt = conn
+                .prepare(&insert_sql)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let mut total_rows = 0u64;
+
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                total_rows += batch.num_rows() as u64;
+
+                for row_idx in 0..batch.num_rows() {
+                    let mut values = Vec::with_capacity(batch.num_columns());
+                    for col_idx in 0..batch.num_columns() {
+                        let column = batch.column(col_idx);
+                        let value = ScalarValue::try_from_array(column, row_idx)?;
+                        let turso_value =
+                            scalar_value_to_turso(value, self.pool.timestamp_format())
+                                .map_err(DataFusionError::External)?;
+                        values.push(turso_value);
+                    }
+
+                    stmt.execute(values)
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                }
+            }
+
+            conn.execute(COMMIT_SQL, ())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            Ok(total_rows)
+        }
+        .await;
+
+        if write_result.is_err() {
+            Self::rollback_write(&conn).await;
+        }
+
+        write_result
+    }
+
+    /// Inserts a batch of records into the Turso database
+    async fn insert_batch(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let conn = self.pool.connect().await?;
+        let insert_sql = self.insert_sql();
 
         // Use a transaction to batch all inserts
-        // MVCC is always enabled in turso 0.4.x, so use BEGIN CONCURRENT for better concurrency
-        conn.execute("BEGIN CONCURRENT", ()).await?;
+        // BEGIN CONCURRENT improves write concurrency on Turso in MVCC mode.
+        conn.execute(BEGIN_CONCURRENT_SQL, ()).await?;
 
         // Prepare the statement once
         let mut stmt = conn.prepare(&insert_sql).await?;
@@ -1741,7 +1825,7 @@ impl TursoDataSink {
         }
 
         // Commit the transaction
-        conn.execute("COMMIT", ()).await?;
+        conn.execute(COMMIT_SQL, ()).await?;
 
         Ok(())
     }
@@ -1766,6 +1850,10 @@ impl DataSink for TursoDataSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::error::Result<u64> {
+        if self.overwrite == InsertOp::Overwrite {
+            return self.overwrite_all(data).await;
+        }
+
         let mut total_rows = 0u64;
 
         while let Some(batch) = data.next().await {

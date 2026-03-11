@@ -30,6 +30,12 @@ pub enum Error {
     #[snafu(display("The Spice runtime is not installed. Run 'spice install' to install it."))]
     RuntimeNotInstalled,
 
+    /// Native Windows runtime execution is unsupported
+    #[snafu(display(
+        "Native Windows local runtime install and run are not supported. Open WSL and run the Linux Spice CLI there instead."
+    ))]
+    WindowsNativeRuntimeUnsupported,
+
     /// Runtime is not running
     #[snafu(display("The Spice runtime is unavailable at {endpoint}. Is it running?"))]
     RuntimeUnavailable { endpoint: String },

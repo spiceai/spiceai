@@ -118,10 +118,7 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
         data_type,
-        DataType::Interval(_)
-            | DataType::Duration(_)
-            | DataType::Map(_, _)
-            | DataType::FixedSizeBinary(_)
+        DataType::Interval(_) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
     )
 }
 
@@ -757,7 +754,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .default("sqlite"),
         ParameterSpec::runtime("file_watcher"),
         ParameterSpec::component("unsupported_type_action")
-            .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
+            .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("footer_cache_mb")
@@ -1332,7 +1329,7 @@ struct CayennePartitionCreator {
     partition_by: Vec<PartitionedBy>,
     schema: SchemaRef,
     catalog: Arc<dyn cayenne::MetadataCatalog>,
-    table_id: i64,
+    table_id: String,
     unsupported_type_action: UnsupportedTypeAction,
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
@@ -1376,7 +1373,7 @@ impl CayennePartitionCreator {
         partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
         catalog: Arc<dyn cayenne::MetadataCatalog>,
-        table_id: i64,
+        table_id: String,
         unsupported_type_action: UnsupportedTypeAction,
         retention_filters: Vec<Expr>,
         time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
@@ -1510,7 +1507,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
         // Create partition metadata with composite key support
         let partition_metadata = cayenne::PartitionMetadata::new_composite(
-            self.table_id,
+            self.table_id.clone(),
             partition_column_names,
             partition_value_strings.clone(),
             partition_path.clone(),
@@ -1568,7 +1565,7 @@ impl PartitionCreator for CayennePartitionCreator {
         // Query catalog for existing partitions
         let partitions = self
             .catalog
-            .get_partitions(self.table_id)
+            .get_partitions(&self.table_id)
             .await
             .boxed()
             .context(creator::InferringPartitionsSnafu)?;
@@ -1689,7 +1686,27 @@ mod tests {
     use crate::component::dataset::acceleration::{Acceleration, Mode};
     use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion_table_providers::UnsupportedTypeAction;
     use std::sync::Arc;
+
+    fn http_response_headers_field() -> Field {
+        Field::new(
+            "response_headers",
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", DataType::Utf8, false)),
+                        Arc::new(Field::new("values", DataType::Utf8, true)),
+                    ],
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )
+    }
 
     #[tokio::test]
     async fn test_cayenne_file_path_generation() {
@@ -1757,6 +1774,48 @@ mod tests {
             "Expected first zone to be primary path, got: {primary_data_dir}"
         );
         assert!(primary_data_dir.ends_with("/orders_dataset/"));
+    }
+
+    #[test]
+    fn test_transform_schema_for_vortex_preserves_http_response_headers_map() {
+        let schema = Schema::new(vec![
+            Field::new("response_status", DataType::UInt16, false),
+            http_response_headers_field(),
+        ]);
+
+        let transformed = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("HTTP response headers map should be supported by Cayenne/Vortex");
+
+        assert_eq!(transformed, schema);
+    }
+
+    #[test]
+    fn test_transform_schema_for_vortex_only_flags_truly_unsupported_types() {
+        let schema = Schema::new(vec![
+            http_response_headers_field(),
+            Field::new(
+                "duration_col",
+                DataType::Duration(TimeUnit::Millisecond),
+                true,
+            ),
+        ]);
+
+        let error = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("duration should remain unsupported in error mode");
+
+        match error {
+            Error::UnsupportedDataTypes { details } => {
+                assert!(
+                    details.contains("duration_col"),
+                    "expected duration column in unsupported type error, got: {details}"
+                );
+                assert!(
+                    !details.contains("response_headers"),
+                    "response_headers map should not be reported as unsupported: {details}"
+                );
+            }
+            other => panic!("expected UnsupportedDataTypes error, got: {other}"),
+        }
     }
 
     #[test]

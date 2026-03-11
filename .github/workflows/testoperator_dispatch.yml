@@ -80,38 +80,42 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Build spicepod validator
+        id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
       - name: Validate spicepods - TPCH - SF1
         run: |
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
             echo "Validating $file"
-            ./target/release/spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Validate spicepods - TPCDS - SF1
         run: |
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
             echo "Validating $file"
-            ./target/release/spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Validate spicepods - ClickBench - SF1
         run: |
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
             echo "Validating $file"
-            ./target/release/spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Validate spicepods - TPCH - SF100
         run: |
           for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
             echo "Validating $file"
-            ./target/release/spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
@@ -189,38 +193,42 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Build spicepod validator
+        id: build-spicepod-validator
         uses: ./.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
       - name: Validate spicepods - TPCH - SF1
         run: |
           for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
             echo "Validating $file"
-            spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Validate spicepods - TPCDS - SF1
         run: |
           for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
             echo "Validating $file"
-            spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Validate spicepods - ClickBench - SF1
         run: |
           for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
             echo "Validating $file"
-            spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Validate spicepods - TPCH - SF100
         run: |
           for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
             echo "Validating $file"
-            spicepod-validator "$file"
+            "$SPICEPOD_VALIDATOR" "$file"
           done
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF1
