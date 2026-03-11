@@ -32,6 +32,7 @@ runs:
       run: |
         if [ "$RUNNER_OS" = "macOS" ] && [ "${{ runner.environment }}" = "self-hosted" ]; then
           echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "backend=auto" >> "$GITHUB_OUTPUT"
           echo "rustc_wrapper=sccache" >> "$GITHUB_OUTPUT"
         elif [ "$RUNNER_OS" = "Linux" ] && [ "${{ runner.environment }}" = "self-hosted" ] && [ -n "${{ inputs.minio_endpoint }}" ]; then
           echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -223,7 +224,7 @@ runs:
           exit 1
         fi
 
-        if [ "$cache_dir" != "$expected_macos_sccache_dir" ]; then
+        if [ "$require_macos_smb" = 'true' ] && [ "$cache_dir" != "$expected_macos_sccache_dir" ]; then
           echo "Expected sccache directory to resolve to $expected_macos_sccache_dir, got: $cache_dir" >&2
           exit 1
         fi
