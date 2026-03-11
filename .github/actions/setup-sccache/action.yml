@@ -153,17 +153,13 @@ runs:
             return 1
           fi
 
-          if [ ! -w "$candidate" ]; then
-            return 1
-          fi
-
           mount_line="$(mount_line_for_path "$candidate")"
           if [ -z "$mount_line" ]; then
             return 1
           fi
 
           probe_file="$candidate/.sccache-probe-$$"
-          if ! touch "$probe_file" 2>/dev/null; then
+          if ! touch "$probe_file"; then
             return 1
           fi
 
@@ -224,11 +220,6 @@ runs:
         cache_dir="$(resolve_macos_cache_dir)"
         if ! mkdir -p "$cache_dir" 2>/dev/null; then
           echo "Error: failed to create sccache directory: $cache_dir"
-          exit 1
-        fi
-
-        if [ ! -w "$cache_dir" ]; then
-          echo "Error: sccache directory is not writable: $cache_dir"
           exit 1
         fi
 

@@ -118,11 +118,6 @@ jobs:
             exit 1
           fi
 
-          if [ ! -w "$SCCACHE_DIR" ]; then
-            echo "SCCACHE_DIR is not writable: $SCCACHE_DIR"
-            exit 1
-          fi
-
           probe_file="$SCCACHE_DIR/.sccache-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           touch "$probe_file"
           rm -f "$probe_file"
