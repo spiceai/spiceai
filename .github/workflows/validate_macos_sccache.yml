@@ -357,22 +357,3 @@ jobs:
             echo "${FAILURE_REASON:-sccache validation failed}"
             exit 1
           fi
-
-      - name: Unmount SMB share
-        if: always()
-        shell: bash
-        env:
-          MOUNT_POINT: ${{ steps.mount-smb.outputs.mount_point }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${MOUNT_POINT:-}" ]; then
-            echo "No mount point to clean up"
-            exit 0
-          fi
-
-          if mount | grep -qF " on $MOUNT_POINT "; then
-            umount "$MOUNT_POINT" && echo "Unmounted $MOUNT_POINT" || echo "Failed to unmount $MOUNT_POINT (may still be in use)"
-          else
-            echo "$MOUNT_POINT is not mounted"
-          fi
