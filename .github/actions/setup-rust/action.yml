@@ -44,7 +44,11 @@ runs:
 
         # Install toolchain with all components in a single atomic operation
         # so concurrent runners sharing the same RUSTUP_HOME don't race.
-        rustup toolchain install "$toolchain" --component cargo,rustc,rustfmt,clippy
+        rustup toolchain install "$toolchain" \
+          --component cargo \
+          --component rustc \
+          --component rustfmt \
+          --component clippy
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
@@ -88,7 +92,7 @@ runs:
           $toolchain = "stable"
         }
 
-        rustup toolchain install $toolchain --component cargo,rustc,rustfmt,clippy
+        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
