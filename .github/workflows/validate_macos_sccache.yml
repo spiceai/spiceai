@@ -75,11 +75,10 @@ jobs:
               exit 1
             fi
 
-            # mount_smbfs requires a clean (empty) mount point
-            if [ -d "$mount_point" ]; then
-              rmdir "$mount_point" 2>/dev/null || rm -rf "$mount_point"
-            fi
-            mkdir -p "$mount_point"
+            # Ensure parent dir exists; mount_smbfs creates the leaf directory
+            mkdir -p "$(dirname "$mount_point")"
+            # Remove stale mount-point dir if it exists (mount_smbfs needs it absent)
+            [ -d "$mount_point" ] && rmdir "$mount_point" 2>/dev/null || true
 
             # mount_smbfs expects //<user>:<pass>@<host>/<share>
             mount_smbfs "//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}" "$mount_point"
