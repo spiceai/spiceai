@@ -68,7 +68,7 @@ jobs:
           echo "SCCACHE_DIRECT=true" >> "$GITHUB_ENV"
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
 
-          # Prefer an SMB-backed cache dir on an smbfs mount under /Volumes
+          # Find a writable SMB-backed cache dir under /Volumes
           smb_cache_dir=""
           while IFS= read -r mount_line; do
             case "$mount_line" in
@@ -88,17 +88,16 @@ jobs:
             esac
           done < <(mount)
 
-          if [ -n "$smb_cache_dir" ]; then
-            echo "SCCACHE_DIR=$smb_cache_dir" >> "$GITHUB_ENV"
-            echo "SCCACHE_BACKEND=smb" >> "$GITHUB_ENV"
-            echo "Using SMB sccache dir: $smb_cache_dir"
-          else
-            default_dir="${HOME}/.cache/sccache"
-            mkdir -p "$default_dir"
-            echo "SCCACHE_DIR=$default_dir" >> "$GITHUB_ENV"
-            echo "SCCACHE_BACKEND=local" >> "$GITHUB_ENV"
-            echo "No writable SMB sccache dir found; using local fallback: $default_dir"
+          if [ -z "$smb_cache_dir" ]; then
+            echo "No writable SMB sccache directory found. Current mounts:"
+            mount || true
+            echo "Contents of /Volumes:"
+            ls -la /Volumes || true
+            exit 1
           fi
+
+          echo "SCCACHE_DIR=$smb_cache_dir" >> "$GITHUB_ENV"
+          echo "Using SMB sccache dir: $smb_cache_dir"
 
       - name: Validate macOS sccache configuration
         shell: bash
@@ -144,30 +143,12 @@ jobs:
             exit 1
           fi
 
-          backend="${SCCACHE_BACKEND:-local}"
           detected_smb_mounts="$(list_smb_mounts || true)"
-
-          case "$backend" in
-            smb)
-              if [ -z "$detected_smb_mounts" ]; then
-                echo "Expected at least one SMB mount when setup-sccache selects the SMB backend"
-                print_smb_mount_diagnostics
-                exit 1
-              fi
-              ;;
-            local)
-              if [ -n "$detected_smb_mounts" ]; then
-                echo "setup-sccache selected the local backend; SMB mounts may exist, but SCCACHE_DIR must not be on an smbfs mount."
-                print_smb_mount_diagnostics
-              else
-                echo "No writable SMB mount detected; validating the local fallback backend."
-              fi
-              ;;
-            *)
-              echo "Unexpected sccache backend: $backend"
-              exit 1
-              ;;
-          esac
+          if [ -z "$detected_smb_mounts" ]; then
+            echo "Expected at least one SMB mount on spiceai-macos"
+            print_smb_mount_diagnostics
+            exit 1
+          fi
 
           rustc_wrapper="${RUSTC_WRAPPER:-}"
           if [ "$rustc_wrapper" != "sccache" ] && ! printf '%s' "$rustc_wrapper" | grep -q 'sccache'; then
@@ -213,15 +194,10 @@ jobs:
           echo "Mount point=$mount_point"
           echo "Mount line=$mount_line"
 
-          if [ "$backend" = "smb" ]; then
-            printf '%s\n' "$mount_line" | grep -q 'smbfs' || {
-              echo "Expected SCCACHE_DIR to be on an smbfs mount"
-              exit 1
-            }
-          elif printf '%s\n' "$mount_line" | grep -q 'smbfs'; then
-            echo "Expected local fallback backend to use a non-smbfs mount"
+          printf '%s\n' "$mount_line" | grep -q 'smbfs' || {
+            echo "Expected SCCACHE_DIR to be on an smbfs mount"
             exit 1
-          fi
+          }
 
       - name: Measure sccache performance
         id: measure-sccache
@@ -338,7 +314,6 @@ jobs:
         if: always()
         shell: bash
         env:
-          BACKEND: ${{ env.SCCACHE_BACKEND }}
           COLD_BUILD_MS: ${{ steps.measure-sccache.outputs.cold_build_ms }}
           WARM_BUILD_MS: ${{ steps.measure-sccache.outputs.warm_build_ms }}
           SPEEDUP_PERCENT: ${{ steps.measure-sccache.outputs.speedup_percent }}
@@ -360,14 +335,9 @@ jobs:
             echo "## macOS sccache performance"
             echo
             echo "Smoke test timing is best used as a trend signal across runs, not as a strict benchmark."
-            if [ "${BACKEND:-unknown}" = "local" ]; then
-              echo "This runner did not expose a writable SMB mount during the run, so the workflow validated the local fallback backend."
-              echo
-            fi
             echo
             echo "| Metric | Value |"
             echo "| --- | --- |"
-            echo "| Backend | ${BACKEND:-unknown} |"
             echo "| Cache dir | ${SCCACHE_DIR:-unset} |"
             echo "| Mount point | ${MOUNT_POINT:-unknown} |"
             echo "| Cache dir size | ${CACHE_DIR_SIZE_MB:-0} MiB |"
