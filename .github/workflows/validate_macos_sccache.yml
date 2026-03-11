@@ -48,12 +48,13 @@ jobs:
         id: mount-smb
         shell: bash
         env:
-          SMB_HOST: ${{ secrets.SCCACHE_SMB_HOST }}
-          SMB_SHARE: ${{ secrets.SCCACHE_SMB_SHARE }}
-          SMB_USERNAME: ${{ secrets.SCCACHE_SMB_USERNAME }}
           SMB_PASSWORD: ${{ secrets.SCCACHE_SMB_PASSWORD }}
         run: |
           set -euo pipefail
+
+          SMB_HOST="192.168.3.148"
+          SMB_SHARE="ai_platform_dev"
+          SMB_USERNAME="runner"
 
           echo "=== Runner identity ==="
           id
@@ -69,8 +70,8 @@ jobs:
             echo "Already mounted at $mount_point"
             mount | grep -F " on $mount_point "
           else
-            if [ -z "$SMB_HOST" ] || [ -z "$SMB_SHARE" ] || [ -z "$SMB_USERNAME" ] || [ -z "$SMB_PASSWORD" ]; then
-              echo "Missing SMB secrets (SCCACHE_SMB_HOST, SCCACHE_SMB_SHARE, SCCACHE_SMB_USERNAME, SCCACHE_SMB_PASSWORD)"
+            if [ -z "${SMB_PASSWORD:-}" ]; then
+              echo "Missing secret: SCCACHE_SMB_PASSWORD"
               exit 1
             fi
 
