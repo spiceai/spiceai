@@ -45,7 +45,7 @@ pub enum Error {
     #[snafu(display("Failed to initialize partition metadata for table {table}: {source}"))]
     PartitionMetadataInit {
         table: String,
-        source: Box<manager::Error + Send + Sync>,
+        source: Box<manager::Error>,
     },
 
     #[snafu(display("Failed to discover partitions for table {table}: {source}"))]

@@ -38,7 +38,7 @@ use super::{PartitionManager, Result};
 use crate::{
     cluster::partition::{
         MissingPartitionKeysSnafu, ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
-        PartitionExpressionDeserializationSnafu, PartitionMetadataInitSnafu, discovery,
+        PartitionExpressionDeserializationSnafu, discovery,
     },
     datafusion::DataFusion,
 };
@@ -92,9 +92,9 @@ pub async fn initialize_partition_metadata(
     let existing_tables: HashSet<String> = partition_manager
         .list_tables()
         .await
-        .boxed()
-        .context(PartitionMetadataInitSnafu {
+        .map_err(|e| super::Error::PartitionMetadataInit {
             table: "<list>".to_string(),
+            source: Box::new(e),
         })?
         .into_iter()
         .collect();
