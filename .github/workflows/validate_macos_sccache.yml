@@ -62,7 +62,7 @@ jobs:
 
           # Sanitize runner name for use as a mount-point directory name
           runner_label="$(echo "${RUNNER_NAME:-runner}" | tr -cs 'A-Za-z0-9_-' '_' | sed 's/_$//')"
-          mount_point="/Volumes/${runner_label}_sccache"
+          mount_point="$HOME/sccache_smb/${runner_label}"
           echo "Mount point: $mount_point"
 
           # Check if already mounted
@@ -75,10 +75,7 @@ jobs:
               exit 1
             fi
 
-            if [ ! -d "$mount_point" ]; then
-              sudo mkdir -p "$mount_point"
-              sudo chown "$(id -u):$(id -g)" "$mount_point"
-            fi
+            mkdir -p "$mount_point"
 
             # mount_smbfs expects //<user>:<pass>@<host>/<share>
             mount_smbfs "//${SMB_USERNAME}:${SMB_PASSWORD}@${SMB_HOST}/${SMB_SHARE}" "$mount_point"
