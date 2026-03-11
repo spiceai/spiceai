@@ -48,8 +48,8 @@ jobs:
         id: mount-smb
         shell: bash
         env:
-          SMB_HOST: ${{ secrets.SCCACHE_SMB_HOST }}
-          SMB_PASSWORD: ${{ secrets.SCCACHE_SMB_PASSWORD }}
+          SMB_HOST: ${{ secrets.SMB_HOST }}
+          SMB_PASSWORD: ${{ secrets.SMB_PASSWORD }}
         run: |
           set -euo pipefail
 
