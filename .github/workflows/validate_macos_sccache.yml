@@ -50,8 +50,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          expected_smb_mount='/Volumes/ai_platform_dev'
-          expected_sccache_dir='/Volumes/ai_platform_dev/build/sccache'
+          expected_smb_mount='/opt/ai_platform'
+          expected_sccache_dir='/opt/ai_platform/build/sccache'
 
           list_smb_mounts() {
             while IFS= read -r mount_line; do

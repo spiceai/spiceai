@@ -6,10 +6,10 @@ inputs:
     description: 'MinIO endpoint for self-hosted Linux sccache'
     required: false
   macos_sccache_dir:
-    description: 'Optional override for the self-hosted macOS sccache directory; must be /Volumes/ai_platform_dev/build/sccache'
+    description: 'Optional override for the self-hosted macOS sccache directory; must be /opt/ai_platform/build/sccache'
     required: false
   require_macos_smb:
-    description: 'Fail on self-hosted macOS unless /Volumes/ai_platform_dev is mounted as smbfs and /Volumes/ai_platform_dev/build/sccache is writable'
+    description: 'Fail on self-hosted macOS unless /opt/ai_platform is mounted as smbfs and /opt/ai_platform/build/sccache is writable'
     required: false
 
 outputs:
@@ -92,8 +92,8 @@ runs:
       run: |
         set -euo pipefail
 
-        expected_macos_smb_mount='/Volumes/ai_platform_dev'
-        expected_macos_sccache_dir='/Volumes/ai_platform_dev/build/sccache'
+        expected_macos_smb_mount='/opt/ai_platform'
+        expected_macos_sccache_dir='/opt/ai_platform/build/sccache'
 
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
