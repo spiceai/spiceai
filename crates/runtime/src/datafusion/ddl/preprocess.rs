@@ -153,15 +153,11 @@ pub fn preprocess_create_table_with_options(
             ));
         }
 
-        if recognized_opts.is_empty() {
+        if recognized_opts.is_empty() && other_opts.is_empty() {
             // Only PARTITION BY, no recognized WITH options — but has unrecognized WITH options
-            if !other_opts.is_empty() {
-                // WITH has only non-recognized options, nothing for us to extract.
-                // Only proceed if we have PARTITION BY.
-                CreateTableStatementExtension::default()
-            } else {
-                CreateTableStatementExtension::default()
-            }
+            // WITH has only non-recognized options, nothing for us to extract.
+            // Only proceed if we have PARTITION BY.
+            CreateTableStatementExtension::default()
         } else {
             let cleaned_opts = clean_option_values(recognized_opts);
             parse_ddl_table_options(&cleaned_opts)?
@@ -216,10 +212,10 @@ pub fn preprocess_create_table_with_options(
     })
 }
 
+pub type OptionsClassification = (Vec<(String, String)>, Vec<SqlOption>);
+
 /// Classify `WITH` options into recognized (`acceleration.*`/`dataset.*`) and other options.
-fn classify_with_options(
-    options: &[SqlOption],
-) -> DFResult<(Vec<(String, String)>, Vec<SqlOption>)> {
+fn classify_with_options(options: &[SqlOption]) -> OptionsClassification {
     let mut recognized_opts = Vec::new();
     let mut other_opts = Vec::new();
 
@@ -245,7 +241,7 @@ fn classify_with_options(
         }
     }
 
-    Ok((recognized_opts, other_opts))
+    (recognized_opts, other_opts)
 }
 
 /// Strip surrounding quotes from option values (sqlparser includes them for string literals).

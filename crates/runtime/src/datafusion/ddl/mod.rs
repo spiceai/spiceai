@@ -23,7 +23,7 @@ limitations under the License.
 //! - [`DdlExtensionStore`]: Thread-safe store keyed by table name, consumed by
 //!   catalog-specific analyzer rules.
 //! - [`preprocess`]: SQL pre-processing to extract `WITH (...)` options and
-//!   `PARTITION BY` clauses before DataFusion planning.
+//!   `PARTITION BY` clauses before `DataFusion` planning.
 
 pub mod acceleration_options;
 pub mod preprocess;
