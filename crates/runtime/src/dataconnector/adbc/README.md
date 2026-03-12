@@ -2,13 +2,9 @@
 
 This directory contains the implementation of the ADBC (Arrow Database Connectivity) data connector for Spice.
 
-## Status
-
-🚧 **Work in Progress** - The connector is implemented but currently commented out pending an upstream dependency update.
-
 ## Implementation
 
-The ADBC connector has been fully implemented in `/Users/lukim/dev/spice2/crates/runtime/src/dataconnector/adbc.rs` with the following features:
+The ADBC connector is implemented in `../adbc.rs` with the following features:
 
 - Full DataConnector trait implementation
 - Support for read-only and read-write table providers
@@ -18,7 +14,7 @@ The ADBC connector has been fully implemented in `/Users/lukim/dev/spice2/crates
 
 ## Configuration
 
-Once enabled, the connector can be used with the following spicepod configuration:
+The connector can be used with the following spicepod configuration:
 
 ```yaml
 datasets:
@@ -41,33 +37,7 @@ datasets:
 - `connection_pool_size` (optional, default: 5): Maximum connections in the pool
 - `connection_pool_min_idle` (optional, default: 1): Minimum idle connections
 - Any other parameters are passed through to the database as options
-
-## Pending Work
-
-The connector is currently disabled with `// TODO` comments because:
-
-1. The `datafusion-table-providers` crate revision currently used by Spice (`9fa10f280175667a54ca18b55aa1320e82737840`) does not include the ADBC feature
-2. The ADBC feature was merged in [PR #481](https://github.com/datafusion-contrib/datafusion-table-providers/pull/481) but hasn't been included in the Spice workspace revision yet
-
-### To Enable the Connector
-
-1. Update the `datafusion-table-providers` revision in `/Users/lukim/dev/spice2/Cargo.toml` to a version that includes the ADBC feature (post-PR #481)
-2. Uncomment the feature flags in:
-   - `/Users/lukim/dev/spice2/crates/data_components/Cargo.toml`
-   - `/Users/lukim/dev/spice2/crates/runtime/Cargo.toml`
-   - `/Users/lukim/dev/spice2/bin/spiced/Cargo.toml`
-3. Uncomment the module declarations in `/Users/lukim/dev/spice2/crates/runtime/src/dataconnector/mod.rs`
-4. Uncomment the Makefile check in `/Users/lukim/dev/spice2/Makefile`
-5. Run `cargo check --features adbc` to verify compilation
-
-## Files Modified
-
-- ✅ `/Users/lukim/dev/spice2/crates/runtime/src/dataconnector/adbc.rs` - Main connector implementation
-- ✅ `/Users/lukim/dev/spice2/crates/runtime/src/dataconnector/mod.rs` - Module registration (commented out)
-- ✅ `/Users/lukim/dev/spice2/crates/data_components/Cargo.toml` - Feature flag (commented out)
-- ✅ `/Users/lukim/dev/spice2/crates/runtime/Cargo.toml` - Feature flag (commented out)
-- ✅ `/Users/lukim/dev/spice2/bin/spiced/Cargo.toml` - Feature flag (commented out)
-- ✅ `/Users/lukim/dev/spice2/Makefile` - Build check (commented out)
+- Parameters prefixed with `conn_` are passed as connection options (with the prefix stripped)
 
 ## Architecture
 

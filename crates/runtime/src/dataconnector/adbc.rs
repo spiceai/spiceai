@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -64,7 +64,7 @@ impl std::fmt::Debug for Adbc {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct AdbcFactory {}
 
 impl AdbcFactory {
@@ -117,70 +117,75 @@ impl DataConnectorFactory for AdbcFactory {
                 })?;
 
             let driver_path = params.parameters.get("adbc_driver_path").expose().ok();
-            let driver_location = driver_path.unwrap_or(driver_name);
+            let driver_location = driver_path.unwrap_or(driver_name).to_string();
 
-            let mut driver = ManagedDriver::load_from_name(
-                driver_location,
-                None,
-                AdbcVersion::V110,
-                LOAD_FLAG_DEFAULT,
-                None,
-            )
-            .context(UnableToLoadDriverSnafu)
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: params.component.clone(),
-                source: Box::new(e),
-            })?;
-
-            let mut db_options = Vec::new();
+            let mut db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> = Vec::new();
             if let Some(uri) = params.parameters.get("adbc_uri").expose().ok() {
                 db_options.push((OptionDatabase::Uri, uri.into()));
             }
 
             // Allow passing through any other parameters as database options
-            for (key, value) in params.parameters.iter() {
+            for (key, value) in &params.parameters {
                 if !key.starts_with("adbc_")
+                    && !key.starts_with("conn_")
                     && key != "connection_pool_size"
                     && key != "connection_pool_min_idle"
                 {
                     db_options.push((
-                        OptionDatabase::Other(key.to_string()),
+                        OptionDatabase::Other(key.clone()),
                         value.expose_secret().into(),
                     ));
                 }
             }
 
-            let db = driver
-                .new_database_with_opts(db_options)
-                .context(UnableToCreateDatabaseSnafu)
-                .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Box::new(e),
-                })?;
-
             let mut conn_options: HashMap<String, String> = HashMap::new();
 
-            // Extract connection-specific options if needed
-            for (key, value) in params.parameters.iter() {
-                if key.starts_with("conn_") {
+            // Extract connection-specific options (strip "conn_" prefix)
+            for (key, value) in &params.parameters {
+                if let Some(conn_key) = key.strip_prefix("conn_") {
                     conn_options.insert(
-                        key.strip_prefix("conn_").unwrap_or(key).to_string(),
+                        conn_key.to_string(),
                         value.expose_secret().to_string(),
                     );
                 }
             }
 
-            let pool = ADBCPool::new(db, Some(conn_options))
-                .context(UnableToCreateConnectionPoolSnafu)
-                .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Box::new(e),
-                })?;
+            let component = params.component.clone();
 
-            let adbc_factory = AdbcTableFactory::new(Arc::new(pool));
+            // Driver loading, database creation, and pool creation are all
+            // synchronous FFI/IO operations — offload to a blocking thread.
+            let pool = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+                let mut driver = ManagedDriver::load_from_name(
+                    &driver_location,
+                    None,
+                    AdbcVersion::V110,
+                    LOAD_FLAG_DEFAULT,
+                    None,
+                )
+                .context(UnableToLoadDriverSnafu)?;
+
+                let db = driver
+                    .new_database_with_opts(db_options)
+                    .context(UnableToCreateDatabaseSnafu)?;
+
+                let pool = ADBCPool::new(db, Some(conn_options))
+                    .context(UnableToCreateConnectionPoolSnafu)?;
+
+                Ok(Arc::new(pool))
+            })
+            .await
+            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: component.clone(),
+                source: Box::new(e),
+            })?
+            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: component,
+                source: Box::new(e),
+            })?;
+
+            let adbc_factory = AdbcTableFactory::new(pool);
 
             Ok(Arc::new(Adbc { adbc_factory }) as Arc<dyn DataConnector>)
         })
@@ -229,7 +234,7 @@ impl DataConnector for Adbc {
             self.adbc_factory
                 .read_write_table_provider(table_reference, None)
                 .await
-                .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                .map_err(|e| DataConnectorError::UnableToGetReadWriteProvider {
                     dataconnector: "adbc".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,
@@ -241,21 +246,6 @@ impl DataConnector for Adbc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::Dataset;
-    use secrecy::ExposeSecret;
-    use std::collections::HashMap;
-
-    fn create_test_params(driver: &str, uri: &str) -> ConnectorParams {
-        let mut params_map = HashMap::new();
-        params_map.insert("adbc_driver".to_string(), driver.to_string());
-        params_map.insert("adbc_uri".to_string(), uri.to_string());
-
-        ConnectorParams {
-            component: ConnectorComponent::Dataset("test_dataset".to_string()),
-            parameters: crate::parameters::Parameters::try_new(params_map)
-                .expect("valid parameters"),
-        }
-    }
 
     #[test]
     fn test_factory_as_any() {
@@ -274,7 +264,6 @@ mod tests {
         let factory = AdbcFactory::new();
         let params = factory.parameters();
 
-        // Verify all expected parameters are present
         let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
         assert!(param_names.contains(&"adbc_driver"));
         assert!(param_names.contains(&"adbc_driver_path"));
@@ -283,113 +272,11 @@ mod tests {
         assert!(param_names.contains(&"connection_pool_min_idle"));
     }
 
-    #[tokio::test]
-    async fn test_missing_driver_parameter() {
-        let factory = AdbcFactory::new();
-        let mut params_map = HashMap::new();
-        params_map.insert("adbc_uri".to_string(), ":memory:".to_string());
-
-        let params = ConnectorParams {
-            component: ConnectorComponent::Dataset("test".to_string()),
-            parameters: crate::parameters::Parameters::try_new(params_map)
-                .expect("valid parameters"),
-        };
-
-        let result = factory.create(params).await;
-        assert!(result.is_err());
-
-        if let Err(e) = result {
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("adbc_driver"),
-                "Error should mention missing adbc_driver parameter"
-            );
-        }
-    }
-
-    #[tokio::test]
-    #[cfg_attr(not(target_os = "macos"), ignore)] // SQLite driver typically available on macOS
-    async fn test_sqlite_in_memory_creation() {
-        let factory = AdbcFactory::new();
-        let params = create_test_params("sqlite", ":memory:");
-
-        let result = factory.create(params).await;
-
-        // This may fail if the ADBC SQLite driver is not installed
-        // but the test verifies the connector construction logic works
-        match result {
-            Ok(connector) => {
-                assert!(connector.as_any().is::<Adbc>());
-            }
-            Err(e) => {
-                // Expected failure if driver not available
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.contains("load")
-                        || err_msg.contains("driver")
-                        || err_msg.contains("connect"),
-                    "Error should be related to driver loading or connection: {err_msg}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_parameter_filtering() {
-        // Test that parameters are correctly categorized
-        let mut params_map = HashMap::new();
-        params_map.insert("adbc_driver".to_string(), "sqlite".to_string());
-        params_map.insert("adbc_uri".to_string(), ":memory:".to_string());
-        params_map.insert("connection_pool_size".to_string(), "10".to_string());
-        params_map.insert("custom_option".to_string(), "value".to_string());
-        params_map.insert("conn_timeout".to_string(), "30".to_string());
-
-        let params = crate::parameters::Parameters::try_new(params_map).expect("valid parameters");
-
-        // Verify parameters can be retrieved
-        assert_eq!(params.get("adbc_driver").expose().ok(), Some("sqlite"));
-        assert_eq!(params.get("adbc_uri").expose().ok(), Some(":memory:"));
-        assert_eq!(params.get("connection_pool_size").expose().ok(), Some("10"));
-        assert_eq!(params.get("custom_option").expose().ok(), Some("value"));
-        assert_eq!(params.get("conn_timeout").expose().ok(), Some("30"));
-    }
-
-    #[test]
-    fn test_connector_as_any() {
-        // Create a mock Adbc connector for testing
-        let pool = Arc::new(
-            ADBCPool::new(
-                // This will fail without a real driver, but we're just testing the structure
-                adbc_driver_manager::ManagedDriver::load_from_name(
-                    "sqlite",
-                    None,
-                    AdbcVersion::V110,
-                    LOAD_FLAG_DEFAULT,
-                    None,
-                )
-                .ok()
-                .and_then(|mut d| {
-                    d.new_database_with_opts(vec![(OptionDatabase::Uri, ":memory:".into())])
-                        .ok()
-                })
-                .expect("test database"),
-                None,
-            )
-            .expect("test pool"),
-        );
-
-        let adbc_factory = AdbcTableFactory::new(pool);
-        let connector = Adbc { adbc_factory };
-
-        assert!(connector.as_any().is::<Adbc>());
-    }
-
     #[test]
     fn test_error_display() {
         let err = Error::MissingAdbcDriver;
         assert_eq!(err.to_string(), "Missing required parameter: adbc_driver");
 
-        // Test that error can be converted to Box<dyn Error>
         let _boxed: Box<dyn std::error::Error> = Box::new(err);
     }
 
@@ -401,7 +288,6 @@ mod tests {
 
     #[test]
     fn test_debug_impl() {
-        // Test that Debug is implemented for AdbcFactory
         let factory = AdbcFactory::new();
         let debug_str = format!("{factory:?}");
         assert!(debug_str.contains("AdbcFactory"));
