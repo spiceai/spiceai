@@ -339,7 +339,7 @@ fn get_partitions_from_manager(
     flight_sql_clients: &HashMap<String, FlightSqlClient>,
     table: &TableReference,
     schema: &SchemaRef,
-) -> Vec<(Arc<dyn TableProvider>, Vec<HashMap<String, String>>)> {
+) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
     let Some(table_metadata) = partition_manager.get_cached_table_metadata(table) else {
         // No partition metadata — route to a single live executor to avoid duplicate results.
         let Some((executor_id, client)) = flight_sql_clients
@@ -443,7 +443,7 @@ impl TablePartitionProvider for ExecutorRegistry {
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<HashMap<String, String>>)> {
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
         let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
             tracing::warn!("Failed to acquire read lock on flight_sql_clients");
             return Vec::new();
@@ -510,7 +510,7 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<HashMap<String, String>>)> {
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
         let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
             tracing::warn!("Failed to acquire read lock on flight_sql_clients");
             return Vec::new();

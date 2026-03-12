@@ -91,6 +91,7 @@ impl PartitionManager {
         }
     }
 
+    #[must_use]
     pub fn with_prefix(mut self, prefix: &str) -> Self {
         self.state = self.state.with_prefix(prefix);
         self
