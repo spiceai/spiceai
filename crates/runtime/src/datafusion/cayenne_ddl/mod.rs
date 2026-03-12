@@ -18,8 +18,7 @@ limitations under the License.
 //! and physical execution plans for `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` on
 //! Cayenne-backed DDL-enabled catalogs.
 //!
-//! Reuses the shared DDL options infrastructure from [`super::iceberg_ddl::acceleration_options`]
-//! and [`super::iceberg_ddl::preprocess`].
+//! Reuses the shared DDL infrastructure from [`super::ddl`].
 
 pub mod analyzer_rule;
 pub mod logical_nodes;
