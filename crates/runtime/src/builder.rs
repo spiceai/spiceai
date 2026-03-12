@@ -254,7 +254,7 @@ impl RuntimeBuilder {
                                 // Initialized later when scheduler registry starts
                                 job_executor: Arc::new(RwLock::new(None)),
                                 executor_registry: Arc::new(ExecutorRegistry::new(
-                                    Arc::new(PartitionManager::new(Arc::clone(&store))),
+                                    Arc::clone(&partition_manager),
                                     Arc::new(
                                         PartitionManager::new(Arc::clone(&store))
                                             .with_prefix("catalog/partitions/"),

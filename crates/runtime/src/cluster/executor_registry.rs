@@ -148,7 +148,6 @@ pub struct ExecutorRegistry {
     /// and optimize executor selection. If None, fallback to legacy behavior.
     accelerations_partition_manager: Arc<PartitionManager>,
 
-    // Manager for
     federated_partition_manager: Arc<PartitionManager>,
 }
 
