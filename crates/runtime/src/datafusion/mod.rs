@@ -2653,10 +2653,8 @@ impl DataFusion {
 
         // Pre-process CREATE TABLE statements to extract DDL extensions
         // (WITH options, PARTITION BY) before planning.
-        let preprocessed = ddl::preprocess::preprocess_create_table_with_options(
-            sql,
-            &self.ddl_extension_store,
-        )?;
+        let preprocessed =
+            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
         let (effective_sql, store_key) = match &preprocessed {
             ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,

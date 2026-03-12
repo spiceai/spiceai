@@ -955,9 +955,7 @@ impl Query {
                         sql: modified,
                         store_key,
                     } => (modified.as_str(), Some(store_key.as_str())),
-                    super::ddl::preprocess::PreprocessResult::Unchanged => {
-                        (sql.as_ref(), None)
-                    }
+                    super::ddl::preprocess::PreprocessResult::Unchanged => (sql.as_ref(), None),
                 };
 
                 match session.create_logical_plan(effective_sql).await {
