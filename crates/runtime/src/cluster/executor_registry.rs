@@ -37,7 +37,10 @@ use uuid::Uuid;
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    cluster::{PartitionManager, partition::executor_selection},
+    cluster::{
+        PartitionManager,
+        partition::{PartitionValue, executor_selection},
+    },
 };
 #[cfg(not(windows))]
 use cayenne::CayenneTableProvider;
@@ -141,9 +144,12 @@ pub struct ExecutorRegistry {
     /// Map of `executor_id` -> table partitions for that executor
     pub partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
 
-    /// Manager for partition metadata. Used to validate partition completeness
+    /// Manager for accelerated partition metadata. Used to validate partition completeness
     /// and optimize executor selection. If None, fallback to legacy behavior.
-    partition_manager: Arc<PartitionManager>,
+    accelerations_partition_manager: Arc<PartitionManager>,
+
+    // Manager for
+    federated_partition_manager: Arc<PartitionManager>,
 }
 
 impl ExecutorRegistry {
@@ -154,13 +160,13 @@ impl ExecutorRegistry {
             connections: Arc::new(RwLock::new(HashMap::new())),
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
             partitions: Arc::new(RwLock::new(HashMap::new())),
-            partition_manager,
+            accelerations_partition_manager: partition_manager,
         }
     }
 
     #[must_use]
     pub fn partition_manager(&self) -> Arc<PartitionManager> {
-        Arc::clone(&self.partition_manager)
+        Arc::clone(&self.accelerations_partition_manager)
     }
 
     /// Registers an executor connection.
@@ -352,7 +358,7 @@ impl TablePartitionProvider for ExecutorRegistry {
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<HashMap<String, String>>)> {
         let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
             tracing::warn!("Failed to acquire read lock on flight_sql_clients");
             return Vec::new();
@@ -364,8 +370,11 @@ impl TablePartitionProvider for ExecutorRegistry {
             return Vec::new();
         };
 
-        // Get partition metadata from manager (async call, requires runtime)
-        let Some(table_metadata) = self.partition_manager.get_cached_table_metadata(table) else {
+        // Get partition metadata from partition_manager (source of truth for assignments)
+        let Some(table_metadata) = self
+            .accelerations_partition_manager
+            .get_cached_table_metadata(table)
+        else {
             // Non-partitioned accelerated tables don't register partition assignments.
             // Route to a single executor to avoid duplicate results in multi-executor clusters.
             let Some((executor_id, client)) = flight_sql_clients
@@ -402,15 +411,8 @@ impl TablePartitionProvider for ExecutorRegistry {
             return Vec::new();
         }
 
-        // Get live connections to filter out dead executors
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-
         // Build map of executor -> partitions from metadata, excluding dead executors
-        let mut executor_partition_map: std::collections::HashMap<String, Vec<_>> =
-            std::collections::HashMap::new();
+        let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
 
         for partition_meta in &table_metadata.partitions {
             for executor_id in &partition_meta.assigned_executors {
@@ -455,32 +457,22 @@ impl TablePartitionProvider for ExecutorRegistry {
             required_partitions.len()
         );
 
-        // Build result using only selected executors
-        let Ok(executor_partitions) = self.partitions.try_read() else {
-            tracing::warn!("Failed to acquire read lock on partitions");
-            return Vec::new();
-        };
-
+        // Build result: each selected executor paired with its partition values (as string maps).
+        // The analyzer rule converts these to filter Exprs.
         selected_executors
             .into_iter()
             .filter_map(|executor_id| {
-                // Get partition expressions for this executor
-                let table_map = executor_partitions.get(&executor_id)?;
-                let parts = table_map.get(table)?;
-
-                // Get FlightSQL client for this executor
                 let client = flight_sql_clients.get(&executor_id)?;
+                let partition_values = executor_partition_map.remove(&executor_id)?;
 
-                let table_provider = Arc::new(FlightSQLTable::create_with_schema(
-                    "flightsql",
+                let table_provider = flight_sql_table_provider(
                     &executor_id,
                     client.clone(),
-                    table.clone(),
+                    table,
                     Arc::clone(schema),
-                    Arc::new(CookieStore::new()),
-                )) as Arc<dyn TableProvider>;
+                );
 
-                Some((table_provider, parts.clone()))
+                Some((table_provider, partition_values))
             })
             .collect()
     }

@@ -38,8 +38,6 @@ use crate::{
     tracers,
 };
 use app::App;
-use datafusion::optimizer::AnalyzerRule;
-use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
@@ -307,13 +305,7 @@ impl RuntimeBuilder {
             executor_registry, ..
         }) = distributed.as_ref()
         {
-            df_builder = df_builder
-                .with_executor_registry(Arc::clone(executor_registry))
-                .with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(Arc::clone(
-                    executor_registry,
-                )
-                    as Arc<dyn TablePartitionProvider>))
-                    as Arc<dyn AnalyzerRule + Send + Sync>]);
+            df_builder = df_builder.with_executor_registry(Arc::clone(executor_registry));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {

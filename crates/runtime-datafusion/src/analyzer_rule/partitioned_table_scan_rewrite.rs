@@ -14,33 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
-        Result,
+        Result, ToDFSchema,
         tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
-    logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, Union},
+    logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, Union, lit},
     optimizer::AnalyzerRule,
+    prelude::SessionContext,
     sql::TableReference,
 };
+
+/// A partition value is a map of partition expression string (e.g. `"bucket(3, org_id)"`) to its
+/// literal value (e.g. `"42"`).
+pub type PartitionValue = HashMap<String, String>;
 
 /// Define how to get partitions for a given table, and how they are partitioned.
 pub trait TablePartitionProvider: Send + Sync + Debug {
     /// Get partitions for a given [`TableReference`].
     ///
     /// `schema`: The schema of the table locally. Expect all returned [`TableProvider`] to conform to this schema.
-    /// Return pairs of [`TableProvider`] and the partition [`Expr`] that they represent/contain.
+    /// Returns pairs of [`TableProvider`] and the partition values (as string key-value maps) that
+    /// they are responsible for. The analyzer rule converts these into filter [`Expr`]s.
     fn get_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)>;
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)>;
 
     /// Whether partitioning should be applied to the given table.
     fn should_partition(&self, tbl: &TableScan) -> bool;
@@ -72,11 +78,18 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
 /// ```
 pub struct PartitionedTableScanRewrite {
     partition_provider: Arc<dyn TablePartitionProvider>,
+    session_ctx: SessionContext,
 }
 
 impl PartitionedTableScanRewrite {
-    pub fn new(partition_provider: Arc<dyn TablePartitionProvider>) -> Self {
-        Self { partition_provider }
+    pub fn new(
+        partition_provider: Arc<dyn TablePartitionProvider>,
+        session_ctx: SessionContext,
+    ) -> Self {
+        Self {
+            partition_provider,
+            session_ctx,
+        }
     }
 }
 
@@ -102,9 +115,10 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 return Ok(Transformed::no(plan));
             }
 
+            let schema = scan.source.schema();
             let providers = self
                 .partition_provider
-                .get_partitions(&scan.table_name, &scan.source.schema());
+                .get_partitions(&scan.table_name, &schema);
 
             tracing::debug!(
                 "PartitionedTableScanRewrite: {} partitions for '{}' table.",
@@ -112,13 +126,23 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 scan.table_name
             );
 
+            // Pre-compute DFSchema for partition expression parsing
+            let df_schema = schema.to_dfschema()?;
+
             let mut sub_scans = Vec::with_capacity(providers.len());
-            for (provider, partition_filters) in providers {
+            for (provider, partition_values) in providers {
                 let source = DefaultTableSource::new(Arc::clone(&provider));
                 let mut filters = scan.filters.clone();
 
-                // Combine partitions with OR.
-                if let Some(partition_filter) = partition_filters.into_iter().reduce(Expr::or) {
+                // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
+                let partition_exprs: Vec<Expr> = partition_values
+                    .iter()
+                    .filter_map(|pv| {
+                        partition_value_to_expr(pv, &df_schema, &self.session_ctx).transpose()
+                    })
+                    .collect()?;
+
+                if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
                     filters.push(partition_filter);
                 }
                 let plan = LogicalPlanBuilder::scan_with_filters(
@@ -152,4 +176,24 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
     fn name(&self) -> &'static str {
         "PartitionedTableScanRewrite"
     }
+}
+
+/// Converts a [`PartitionValue`] (e.g. `{"bucket(3, org_id)": "42"}`) into a filter [`Expr`]
+/// (e.g. `bucket(3, org_id) = '42'`). Multiple keys are ANDed together.
+fn partition_value_to_expr(
+    pv: &PartitionValue,
+    df_schema: &datafusion::common::DFSchema,
+    ctx: &SessionContext,
+) -> Result<Option<Expr>, DataFusionError> {
+    let mut expr: Option<Expr> = None;
+    for (partition_expr_str, val) in pv {
+        let new_expr = ctx
+            .parse_sql_expr(partition_expr_str, df_schema)?
+            .eq(lit(val.clone()));
+        expr = match expr {
+            Some(existing) => Some(existing.and(new_expr)),
+            None => Some(new_expr),
+        };
+    }
+    Ok(expr)
 }

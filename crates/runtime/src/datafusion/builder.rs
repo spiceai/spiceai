@@ -47,6 +47,7 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
 use {
@@ -423,6 +424,16 @@ impl DataFusionBuilder {
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
         let ddl_options_store = super::iceberg_ddl::acceleration_options::new_shared_store();
+
+        // Add the partitioned table scan rewrite rule for distributed query execution.
+        // Must be added after context creation so the SessionContext (with UDFs) is
+        // available for parsing partition expression strings into Exprs.
+        if let Some(executor_registry) = &self.executor_registry {
+            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                ctx.clone(),
+            )));
+        }
 
         // Add the Iceberg DDL analyzer rule after context creation so it can
         // reference the catalog list and DDL-enabled catalogs.
