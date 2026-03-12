@@ -246,15 +246,20 @@ impl RuntimeBuilder {
                     .await
                     {
                         Ok(store) => {
-                            let partition_manager = Arc::new(PartitionManager::new(store));
+                            let partition_manager =
+                                Arc::new(PartitionManager::new(Arc::clone(&store)));
 
                             Some(DistributedNode::Scheduler {
                                 peers: Arc::new(RwLock::new(HashMap::new())),
                                 // Initialized later when scheduler registry starts
                                 job_executor: Arc::new(RwLock::new(None)),
-                                executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
-                                    &partition_manager,
-                                ))),
+                                executor_registry: Arc::new(ExecutorRegistry::new(
+                                    Arc::new(PartitionManager::new(Arc::clone(&store))),
+                                    Arc::new(
+                                        PartitionManager::new(Arc::clone(&store))
+                                            .with_prefix("catalog/partitions/"),
+                                    ),
+                                )),
                                 partition_manager,
                             })
                         }
@@ -269,15 +274,18 @@ impl RuntimeBuilder {
                     tracing::warn!(
                         "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory partition store."
                     );
-                    let partition_manager = Arc::new(PartitionManager::new(Arc::new(
-                        object_store::memory::InMemory::new(),
-                    )));
+                    let store = Arc::new(object_store::memory::InMemory::new());
+                    let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
                     Some(DistributedNode::Scheduler {
                         peers: Arc::new(RwLock::new(HashMap::new())),
                         job_executor: Arc::new(RwLock::new(None)),
-                        executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
-                            &partition_manager,
-                        ))),
+                        executor_registry: Arc::new(ExecutorRegistry::new(
+                            Arc::new(PartitionManager::new(Arc::clone(&store))),
+                            Arc::new(
+                                PartitionManager::new(Arc::clone(&store))
+                                    .with_prefix("catalog/partitions/"),
+                            ),
+                        )),
                         partition_manager,
                     })
                 }

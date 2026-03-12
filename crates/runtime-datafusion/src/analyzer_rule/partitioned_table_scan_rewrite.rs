@@ -140,7 +140,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     .filter_map(|pv| {
                         partition_value_to_expr(pv, &df_schema, &self.session_ctx).transpose()
                     })
-                    .collect()?;
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
                     filters.push(partition_filter);
