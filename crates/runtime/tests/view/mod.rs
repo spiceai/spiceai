@@ -751,7 +751,7 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
 
     test_request_context()
         .scope(async {
-            let test_csv = "id,name,value\n1,Alice,100\n2,Bob,200\n3,Charlie,300";
+            let test_csv = "id,name,value\n1,Alice,100\n2,Bob,200";
             let temp_dir = tempfile::tempdir().expect("create temp dir");
             let csv_path = temp_dir.path().join("test_view_zero_results.csv");
             std::fs::write(&csv_path, test_csv).expect("write file");
@@ -802,10 +802,33 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
                 "zero_results_view should be ready, got {view_status:?}"
             );
 
-            // Query the accelerated view - data should be available
+            // Simulate data source update: now contains new row Charlie (id=3) that does NOT exist in accelerated view
+            let test_csv = "id,name,value\n1,Alice,100\n2,Bob,200\n3,Charlie,300";
+            std::fs::write(&csv_path, test_csv).expect("write file");
+
+            // Confirm the accelerated view has exactly the 2 rows from the initial load
+            let all_rows = rt
+                .datafusion()
+                .query_builder("SELECT * FROM zero_results_view")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+            let total_rows: usize = all_rows.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(
+                total_rows, 2,
+                "Expected 2 rows (Alice, Bob) in accelerated view, got {total_rows}"
+            );
+
+            // Query data that does NOT exist in the accelerated view and should trigger on_zero_results: use_source
+            // to return data from the source (including new row Charlie)
             let query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM zero_results_view ORDER BY id")
+                .query_builder("SELECT * FROM zero_results_view WHERE id = 3")
                 .build()
                 .run()
                 .await
@@ -819,7 +842,7 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             let result_str = pretty.to_string();
             assert!(
-                result_str.contains("Alice"),
+                result_str.contains("Charlie"),
                 "Expected results to contain data, got: {result_str}"
             );
 
