@@ -106,9 +106,9 @@ mod tests {
 
     #[test]
     fn test_metadata_column_names() {
-        assert_eq!(MetadataColumn::LastModified.name(), "last_modified");
-        assert_eq!(MetadataColumn::Location(None).name(), "location");
-        assert_eq!(MetadataColumn::Size.name(), "size");
+        assert_eq!(MetadataColumn::LastModified.name(), "_last_modified");
+        assert_eq!(MetadataColumn::Location(None).name(), "_location");
+        assert_eq!(MetadataColumn::Size.name(), "_size");
     }
 
     #[tokio::test]
@@ -129,7 +129,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
@@ -155,7 +155,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_partition_column("last_modified".to_string())
+            .with_time_partition_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
@@ -240,7 +240,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
@@ -416,7 +416,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .with_metadata(HashMap::from([
                 (
                     MetadataColumn::Location(None).name().to_string(),
@@ -475,7 +475,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .with_metadata(HashMap::from([(
                 MetadataColumn::LastModified.name().to_string(),
                 "disabled".to_string(),
@@ -496,7 +496,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![
