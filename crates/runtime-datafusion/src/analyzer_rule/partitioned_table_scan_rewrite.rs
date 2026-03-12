@@ -97,7 +97,7 @@ impl Debug for PartitionedTableScanRewrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartitionedTableScanRewrite")
             .field("partition_provider", &self.partition_provider)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -179,7 +179,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 }
 
 /// Converts a [`PartitionValue`] (e.g. `{"bucket(3, org_id)": "42"}`) into a filter [`Expr`]
-/// (e.g. `bucket(3, org_id) = '42'`). Multiple keys are ANDed together.
+/// (e.g. `bucket(3, org_id) = '42'`). Multiple keys are `AND`ed together.
 fn partition_value_to_expr(
     pv: &PartitionValue,
     df_schema: &datafusion::common::DFSchema,

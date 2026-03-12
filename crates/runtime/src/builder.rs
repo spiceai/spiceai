@@ -274,7 +274,8 @@ impl RuntimeBuilder {
                     tracing::warn!(
                         "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory partition store."
                     );
-                    let store = Arc::new(object_store::memory::InMemory::new());
+                    let store: Arc<dyn object_store::ObjectStore> =
+                        Arc::new(object_store::memory::InMemory::new());
                     let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
                     Some(DistributedNode::Scheduler {
                         peers: Arc::new(RwLock::new(HashMap::new())),
