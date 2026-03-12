@@ -139,7 +139,7 @@ pub fn preprocess_create_table_with_options(
 
     // Process WITH options
     let mut extension = if let Some(ref options) = with_options {
-        let (recognized_opts, other_opts) = classify_with_options(options)?;
+        let (recognized_opts, other_opts) = classify_with_options(options);
 
         if recognized_opts.is_empty() && !has_partition_by {
             return Ok(PreprocessResult::Unchanged);
