@@ -434,14 +434,14 @@ impl DataFusionBuilder {
             // Accelerated tables
             ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
                 Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
-                ctx.clone(),
+                &ctx,
             )));
 
             // Federated tables (e.g. Cayenne)
             ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
                 Arc::new(FederatedPartitionProvider::from_registry(executor_registry))
                     as Arc<dyn TablePartitionProvider>,
-                ctx.clone(),
+                &ctx,
             )));
         }
 

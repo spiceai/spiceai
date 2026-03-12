@@ -28,6 +28,7 @@ use crate::datafusion::DataFusion;
 /// For example, if a table is partitioned by:
 ///  - "date"
 ///  - "region"
+///
 /// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
 /// ```json
 /// {"date": "2024-01-01", "region": "us-east"}

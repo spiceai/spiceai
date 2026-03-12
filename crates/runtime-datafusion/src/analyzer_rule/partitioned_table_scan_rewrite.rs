@@ -13,8 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, Weak},
+};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -25,16 +28,19 @@ use datafusion::{
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
+    execution::SessionState,
     logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, Union, lit},
     optimizer::AnalyzerRule,
     prelude::SessionContext,
     sql::TableReference,
 };
+use parking_lot::RwLock;
 
 /// A specific value for partitioning keys.
 /// For example, if a table is partitioned by:
 ///  - "date"
 ///  - "region"
+///
 /// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
 /// ```json
 /// {"date": "2024-01-01", "region": "us-east"}
@@ -86,17 +92,18 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
 /// ```
 pub struct PartitionedTableScanRewrite {
     partition_provider: Arc<dyn TablePartitionProvider>,
-    session_ctx: SessionContext,
+    // Avoid holding a strong reference to SessionState to prevent circular references (SessionState -> AnalyzerRule -> SessionState). We only need it to parse partition expressions.
+    session_state: Weak<RwLock<SessionState>>,
 }
 
 impl PartitionedTableScanRewrite {
     pub fn new(
         partition_provider: Arc<dyn TablePartitionProvider>,
-        session_ctx: SessionContext,
+        session_ctx: &SessionContext,
     ) -> Self {
         Self {
             partition_provider,
-            session_ctx,
+            session_state: session_ctx.state_weak_ref(),
         }
     }
 }
@@ -146,7 +153,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 let partition_exprs: Vec<Expr> = partition_values
                     .iter()
                     .filter_map(|pv| {
-                        partition_value_to_expr(pv, &df_schema, &self.session_ctx).transpose()
+                        partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
@@ -191,12 +198,19 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 fn partition_value_to_expr(
     pv: &PartitionValue,
     df_schema: &datafusion::common::DFSchema,
-    ctx: &SessionContext,
+    state: &Weak<RwLock<SessionState>>,
 ) -> Result<Option<Expr>, DataFusionError> {
     let mut expr: Option<Expr> = None;
     for (partition_expr_str, val) in pv {
-        let new_expr = ctx
-            .parse_sql_expr(partition_expr_str, df_schema)?
+        let new_expr = state
+            .upgrade()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "SessionState has been dropped, cannot parse partition expression".to_string(),
+                )
+            })?
+            .read()
+            .create_logical_expr(partition_expr_str, df_schema)?
             .eq(lit(val.clone()));
         expr = match expr {
             Some(existing) => Some(existing.and(new_expr)),
