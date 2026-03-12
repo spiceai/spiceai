@@ -1440,8 +1440,7 @@ impl CayenneTableProvider {
 
             stream.map(move |batch_result| {
                 if let Ok(batch) = &batch_result {
-                    total_bytes_written
-                        .fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                    total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
                     #[expect(clippy::cast_possible_truncation)]
                     total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
 
@@ -1474,10 +1473,7 @@ impl CayenneTableProvider {
         };
 
         let tracked_stream = RecordBatchStreamAdapter::new(tracked_schema.clone(), tracked_stream);
-        let stream_exec = Arc::new(StreamingExec::new(
-            tracked_schema,
-            Box::pin(tracked_stream),
-        ));
+        let stream_exec = Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
 
         let insert_plan = snapshot_listing_table
             .insert_into(session_state.as_ref(), stream_exec, InsertOp::Append)
