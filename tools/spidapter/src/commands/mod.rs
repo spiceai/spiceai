@@ -57,6 +57,66 @@ pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Resu
         .with_timeout(Duration::from_secs(600))?)
 }
 
+/// Parse an optional non-negative integer from an environment variable.
+///
+/// Returns `Ok(None)` when the variable is unset, and an error when it is set
+/// but cannot be parsed as a non-negative integer.
+fn env_var_replicas(name: &str) -> anyhow::Result<Option<i32>> {
+    match std::env::var(name) {
+        Err(_) => Ok(None),
+        Ok(val) => val
+            .trim()
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{name} must be a non-negative integer, got '{val}'")),
+    }
+}
+
+/// Default resource allocation shared by scheduler and executor when no env vars override them.
+fn default_resources() -> AppResources {
+    AppResources {
+        limits: AppResourceLimits {
+            cpu: None,
+            memory: "16Gi".to_string(),
+            ephemeral_storage: None,
+        },
+        requests: Some(AppResourceRequests {
+            cpu: Some("0.1".to_string()),
+            memory: Some("256Mi".to_string()),
+        }),
+    }
+}
+
+/// Build an [`AppResources`] from environment variables.
+///
+/// The memory limit variable is the anchor: if it is unset, `None` is returned.
+/// CPU limit/request and memory request are all optional on top of that.
+fn env_var_resources(
+    memory_limit_var: &str,
+    cpu_limit_var: &str,
+    cpu_request_var: &str,
+    memory_request_var: &str,
+) -> Option<AppResources> {
+    let memory_limit = std::env::var(memory_limit_var).ok()?;
+    let cpu_request = std::env::var(cpu_request_var).ok();
+    let memory_request = std::env::var(memory_request_var).ok();
+    Some(AppResources {
+        limits: AppResourceLimits {
+            cpu: std::env::var(cpu_limit_var).ok(),
+            memory: memory_limit,
+            ephemeral_storage: None,
+        },
+        requests: if cpu_request.is_some() || memory_request.is_some() {
+            Some(AppResourceRequests {
+                cpu: cpu_request,
+                memory: memory_request,
+            })
+        } else {
+            None
+        },
+    })
+}
+
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
@@ -68,8 +128,26 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     let cname = resolve_default_cname(cloud).await?;
 
-    let memory_limit =
-        std::env::var("SPIDAPTER_APP_MEMORY_LIMIT").unwrap_or_else(|_| "16Gi".to_string());
+    // App (scheduler) resources — default to 16Gi memory / 0.1 cpu request when unset.
+    let resources = env_var_resources(
+        "SPIDAPTER_APP_MEMORY_LIMIT",
+        "SPIDAPTER_APP_CPU_LIMIT",
+        "SPIDAPTER_APP_CPU_REQUEST",
+        "SPIDAPTER_APP_MEMORY_REQUEST",
+    )
+    .unwrap_or_else(default_resources);
+
+    let replicas = env_var_replicas("SPIDAPTER_APP_REPLICAS")?;
+
+    // Executor resources — same defaults as scheduler; override via env vars.
+    let executor_resources = env_var_resources(
+        "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
+        "SPIDAPTER_EXECUTOR_CPU_LIMIT",
+        "SPIDAPTER_EXECUTOR_CPU_REQUEST",
+        "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
+    )
+    .unwrap_or_else(default_resources);
+    let executor_replicas = env_var_replicas("SPIDAPTER_EXECUTOR_REPLICAS")?.unwrap_or(1);
 
     let create_result = cloud
         .create_app(&CreateAppRequest {
@@ -81,17 +159,10 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
-            resources: Some(AppResources {
-                limits: AppResourceLimits {
-                    cpu: None,
-                    memory: memory_limit,
-                    ephemeral_storage: None,
-                },
-                requests: Some(AppResourceRequests {
-                    cpu: Some("0.1".to_string()),
-                    memory: Some("256Mi".to_string()),
-                }),
-            }),
+            replicas,
+            resources: Some(resources),
+            executor_replicas: Some(executor_replicas),
+            executor_resources: Some(executor_resources),
         })
         .await;
 
@@ -168,6 +239,8 @@ pub(crate) async fn apply_spicepod_to_app(
                 region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
                 resources: None,
+                executor_replicas: None,
+                executor_resources: None,
             },
         )
         .await?;

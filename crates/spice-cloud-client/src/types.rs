@@ -61,6 +61,8 @@ pub struct AppConfig {
     pub update_channel: Option<String>,
     pub replicas: Option<i32>,
     pub resources: Option<AppResources>,
+    pub executor_replicas: Option<i32>,
+    pub executor_resources: Option<AppResources>,
     pub region: Option<String>,
     pub node_group: Option<String>,
     pub storage_claim_size_gb: Option<f64>,
@@ -101,7 +103,13 @@ pub struct CreateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_replicas: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_resources: Option<AppResources>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +128,10 @@ pub struct UpdateAppRequest {
     pub spicepod: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_replicas: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_resources: Option<AppResources>,
 }
 
 // ============================================================================
