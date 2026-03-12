@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "4cf8c54fd069",
+  "session_id": "4e60a20b-cf83-4cac-a269-280171ad1a5e",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-10T07:41:38.15138Z",
+  "branch": "jeadie/26-03-10/9702",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/llms/src/bedrock/chat/mod.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "65e467b63309",
+  "token_usage": {
+    "input_tokens": 49,
+    "cache_creation_tokens": 36577,
+    "cache_read_tokens": 994542,
+    "output_tokens": 14104,
+    "api_call_count": 33
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-10T07:41:38.050527Z",
+    "agent_lines": 0,
+    "human_added": 39,
+    "human_modified": 24,
+    "human_removed": 0,
+    "total_committed": 39,
+    "agent_percentage": 0
+  }
+}
