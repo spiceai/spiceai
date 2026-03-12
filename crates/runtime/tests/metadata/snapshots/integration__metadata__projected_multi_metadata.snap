@@ -3,7 +3,7 @@ source: crates/runtime/tests/metadata/mod.rs
 expression: projected_multi_metadata
 ---
 +----+-------------------------------------------------------------------------------------------+-------+
-| id | _location                                                                                 | _size |
+| id | location                                                                                 | size |
 +----+-------------------------------------------------------------------------------------------+-------+
 | 10 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
 | 11 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |

@@ -333,9 +333,9 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
             Expr::BinaryExpr(binary) => match binary.op {
                 Operator::Eq => {
                     let left_is_location =
-                        matches!(*binary.left, Expr::Column(ref c) if c.name == "_location");
+                        matches!(*binary.left, Expr::Column(ref c) if c.name == "location");
                     let right_is_location =
-                        matches!(*binary.right, Expr::Column(ref c) if c.name == "_location");
+                        matches!(*binary.right, Expr::Column(ref c) if c.name == "location");
 
                     let mut values = Vec::new();
                     if left_is_location && let Some(value) = literal_str(&binary.right) {
@@ -363,7 +363,7 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
                 }
                 _ => (Vec::new(), true),
             },
-            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "_location") => {
+            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") => {
                 if in_list.negated {
                     (Vec::new(), false)
                 } else {
@@ -1932,7 +1932,7 @@ mod tests {
             .expect("register table");
 
         let df = ctx
-            .sql("SELECT value FROM test_table WHERE _location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
+            .sql("SELECT value FROM test_table WHERE location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
             .await
             .expect("execute query");
 
@@ -2055,7 +2055,7 @@ mod tests {
 
         // Test 1: SELECT with location first (this was failing before the fix)
         let df = ctx
-            .sql("SELECT _location, day, compression FROM test_table")
+            .sql("SELECT location, day, compression FROM test_table")
             .await
             .expect("execute query");
 
@@ -2069,7 +2069,7 @@ mod tests {
         // Verify column order is correct
         assert_eq!(
             result.schema().field(0).name(),
-            "_location",
+            "location",
             "first column should be location"
         );
         assert_eq!(
@@ -2117,7 +2117,7 @@ mod tests {
 
         // Test 2: SELECT with just location and day (was causing panic before fix)
         let df = ctx
-            .sql("SELECT _location, day FROM test_table")
+            .sql("SELECT location, day FROM test_table")
             .await
             .expect("execute query");
 
@@ -2126,7 +2126,7 @@ mod tests {
         assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
         assert_eq!(
             batches[0].schema().field(0).name(),
-            "_location",
+            "location",
             "first column should be location"
         );
         assert_eq!(
@@ -2137,7 +2137,7 @@ mod tests {
 
         // Test 3: SELECT with reversed order (day, location) - should also work
         let df = ctx
-            .sql("SELECT day, _location FROM test_table")
+            .sql("SELECT day, location FROM test_table")
             .await
             .expect("execute query");
 
@@ -2151,7 +2151,7 @@ mod tests {
         );
         assert_eq!(
             batches[0].schema().field(1).name(),
-            "_location",
+            "location",
             "second column should be location"
         );
     }
@@ -2374,7 +2374,7 @@ mod tests {
     fn test_extract_location_predicates_equality() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![col("_location").eq(lit("s3://bucket/path/file.parquet"))];
+        let filters = vec![col("location").eq(lit("s3://bucket/path/file.parquet"))];
         let values = extract_location_predicates(&filters);
         assert_eq!(
             values,
@@ -2386,7 +2386,7 @@ mod tests {
     fn test_extract_location_predicates_in_list() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![col("_location").in_list(
+        let filters = vec![col("location").in_list(
             vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
             false,
         )];
@@ -2405,7 +2405,7 @@ mod tests {
     fn test_extract_location_predicates_reversed_equality() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("_location"))];
+        let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("location"))];
         let values = extract_location_predicates(&filters);
         assert_eq!(
             values,
@@ -2418,10 +2418,10 @@ mod tests {
         use datafusion_expr::{col, lit};
 
         let filters = vec![
-            col("_location")
+            col("location")
                 .eq(lit("s3://bucket/a.parquet"))
                 .and(col("id").gt(lit(1)))
-                .or(col("_location").eq(lit("s3://bucket/b.parquet"))),
+                .or(col("location").eq(lit("s3://bucket/b.parquet"))),
         ];
         let values = extract_location_predicates(&filters);
         assert!(values.is_none(), "Location under OR should disable pruning");
@@ -2432,7 +2432,7 @@ mod tests {
         use datafusion_expr::{col, lit};
 
         let filters = vec![datafusion_expr::not(
-            col("_location").eq(lit("s3://bucket/negated.parquet")),
+            col("location").eq(lit("s3://bucket/negated.parquet")),
         )];
         let values = extract_location_predicates(&filters);
         assert!(
@@ -2448,7 +2448,7 @@ mod tests {
         let filters = vec![
             col("id")
                 .eq(lit(5))
-                .and(col("_location").eq(lit("s3://bucket/only_location.parquet"))),
+                .and(col("location").eq(lit("s3://bucket/only_location.parquet"))),
         ];
         let values = extract_location_predicates(&filters);
         assert_eq!(
@@ -2461,7 +2461,7 @@ mod tests {
     fn test_extract_location_predicates_not_in_list() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![col("_location").in_list(
+        let filters = vec![col("location").in_list(
             vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
             true,
         )];

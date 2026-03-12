@@ -3,7 +3,7 @@ source: crates/runtime/tests/metadata/mod.rs
 expression: met_all
 ---
 +----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+-------+
-| id | value   | year | month | day | _last_modified       | _location                                                                                 | _size |
+| id | value   | year | month | day | last_modified       | location                                                                                 | size |
 +----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+-------+
 | 0  | value_0 | 2022 | 1     | 1   | 2024-10-10T05:36:59Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet | 2317  |
 | 1  | value_1 | 2022 | 1     | 1   | 2024-10-10T05:36:59Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet | 2317  |

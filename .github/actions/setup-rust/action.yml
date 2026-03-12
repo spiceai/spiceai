@@ -42,12 +42,19 @@ runs:
           toolchain='stable'
         fi
 
+        # Physically remove stale toolchain directories and update hashes
+        # to guarantee a clean install. `rustup toolchain uninstall` can fail
+        # silently on corrupted toolchains (e.g. cargo binary "not applicable"
+        # after a --profile minimal install), leaving the broken state intact.
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+        rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
+        rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
+        rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
+        rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
+
         # Install toolchain with all components in a single atomic operation
         # so concurrent runners sharing the same RUSTUP_HOME don't race.
-        # --force ensures a clean reinstall when self-hosted runners have
-        # stale or partially-installed toolchains from previous configurations.
         rustup toolchain install "$toolchain" \
-          --force \
           --component cargo \
           --component rustc \
           --component rustfmt \
@@ -95,7 +102,10 @@ runs:
           $toolchain = "stable"
         }
 
-        rustup toolchain install $toolchain --force --component cargo --component rustc --component rustfmt --component clippy
+        $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+        Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
+        Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
+        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
