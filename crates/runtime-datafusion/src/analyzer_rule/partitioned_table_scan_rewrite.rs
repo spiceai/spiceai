@@ -31,8 +31,16 @@ use datafusion::{
     sql::TableReference,
 };
 
-/// A partition value is a map of partition expression string (e.g. `"bucket(3, org_id)"`) to its
-/// literal value (e.g. `"42"`).
+/// A specific value for partitioning keys.
+/// For example, if a table is partitioned by:
+///  - "date"
+///  - "region"
+/// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
+/// ```json
+/// {"date": "2024-01-01", "region": "us-east"}
+/// {"date": "2024-01-01", "region": "us-west"}
+/// {"date": "2024-01-02", "region": "us-east"}
+/// ```
 pub type PartitionValue = HashMap<String, String>;
 
 /// Define how to get partitions for a given table, and how they are partitioned.

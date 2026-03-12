@@ -24,8 +24,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::datafusion::DataFusion;
 
-/// A specific set of values for partitioning keys.
-/// For example, if a table is partitioned by "date" and "region", a `PartitionValue` might be {"date": "2024-01-01", "region": "us-east"}.
+/// A specific value for partitioning keys.
+/// For example, if a table is partitioned by:
+///  - "date"
+///  - "region"
+/// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
+/// ```json
+/// {"date": "2024-01-01", "region": "us-east"}
+/// {"date": "2024-01-01", "region": "us-west"}
+/// {"date": "2024-01-02", "region": "us-east"}
+/// ```
 pub type PartitionValue = HashMap<String, String>;
 
 /// Metadata for a single partition of an accelerated table
