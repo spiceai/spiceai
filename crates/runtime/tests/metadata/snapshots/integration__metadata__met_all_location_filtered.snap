@@ -3,7 +3,7 @@ source: crates/runtime/tests/metadata/mod.rs
 expression: met_all_location_filtered
 ---
 +----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+-------+
-| id | value   | year | month | day | last_modified       | location                                                                                 | size |
+| id | value   | year | month | day | _last_modified       | _location                                                                                 | _size |
 +----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+-------+
 | 10 | value_0 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
 | 11 | value_1 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
