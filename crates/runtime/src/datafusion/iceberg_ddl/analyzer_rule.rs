@@ -32,7 +32,7 @@ use datafusion::optimizer::AnalyzerRule;
 
 use data_components::iceberg::provider::IcebergCatalogProvider;
 
-use super::acceleration_options::{DatasetOptions, SharedDdlOptionsStore};
+use super::acceleration_options::{DatasetOptions, SharedDdlExtensionStore};
 use super::composed_catalog_to_iceberg;
 use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -49,8 +49,8 @@ pub struct IcebergDdlAnalyzerRule {
     catalog_list: Weak<dyn CatalogProviderList>,
     /// Weak reference to the set of DDL-enabled catalog names.
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
-    /// Shared store for DDL table options extracted from `WITH` clauses.
-    ddl_options: SharedDdlOptionsStore,
+    /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
+    ddl_options: SharedDdlExtensionStore,
 }
 
 impl fmt::Debug for IcebergDdlAnalyzerRule {
@@ -65,7 +65,7 @@ impl IcebergDdlAnalyzerRule {
     pub fn new(
         catalog_list: &Arc<dyn CatalogProviderList>,
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
-        ddl_options: SharedDdlOptionsStore,
+        ddl_options: SharedDdlExtensionStore,
     ) -> Self {
         Self {
             catalog_list: Arc::downgrade(catalog_list),
@@ -134,15 +134,15 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
 
                 let namespace = iceberg::NamespaceIdent::new(schema_name.clone());
 
-                // Look up DDL table options from the store (consumed on use)
+                // Look up DDL extensions from the store (consumed on use)
                 let (acceleration, dataset_options) = {
                     let mut store = self.ddl_options.write().map_err(|e| {
                         DataFusionError::Execution(format!(
-                            "Failed to acquire DDL options store lock: {e}"
+                            "Failed to acquire DDL extension store lock: {e}"
                         ))
                     })?;
                     match store.remove(&acceleration_key) {
-                        Some(opts) => (opts.acceleration, opts.dataset),
+                        Some(ext) => (ext.acceleration, ext.dataset),
                         None => (None, DatasetOptions::default()),
                     }
                 };

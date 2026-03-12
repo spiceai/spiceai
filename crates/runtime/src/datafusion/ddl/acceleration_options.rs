@@ -14,16 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Store and parse DDL table options extracted from `CREATE TABLE ... WITH (...)` statements.
+//! Store and parse DDL table options extracted from `CREATE TABLE` statements.
 //!
-//! Supports two option prefixes:
-//! - `acceleration.*` — acceleration engine, mode, refresh settings, etc.
-//! - `dataset.*` — dataset-level settings like `time_column` and `time_format`.
+//! Supports:
+//! - `WITH (...)` clauses with two option prefixes:
+//!   - `acceleration.*` — acceleration engine, mode, refresh settings, etc.
+//!   - `dataset.*` — dataset-level settings like `time_column` and `time_format`.
+//! - `PARTITION BY` clauses with partitioning expressions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
 
@@ -36,48 +39,52 @@ pub struct DatasetOptions {
     pub time_format: Option<SpicepodTimeFormat>,
 }
 
-/// Combined DDL table options extracted from `CREATE TABLE ... WITH (...)` clauses.
+/// Extensions extracted from a `CREATE TABLE` statement.
 ///
-/// Bundles both `acceleration.*` and `dataset.*` options.
+/// Bundles `WITH (...)` options (`acceleration.*` and `dataset.*`) and
+/// `PARTITION BY` expressions extracted during SQL pre-processing.
 #[derive(Debug, Clone, Default)]
-pub struct DdlTableOptions {
-    /// Acceleration options, if any `acceleration.*` keys were present.
+pub struct CreateTableStatementExtension {
+    /// Acceleration options, if any `acceleration.*` keys were present in `WITH (...)`.
     pub acceleration: Option<Acceleration>,
-    /// Dataset-level options, if any `dataset.*` keys were present.
+    /// Dataset-level options, if any `dataset.*` keys were present in `WITH (...)`.
     pub dataset: DatasetOptions,
+    /// Partitioning expression from a `PARTITION BY` clause.
+    /// The raw SQL expression as parsed by sqlparser.
+    pub partition_by: Option<Box<SqlParserExpr>>,
 }
 
-/// Stores DDL table options extracted from `CREATE TABLE ... WITH (...)` clauses.
+/// Stores DDL extensions extracted from `CREATE TABLE` statements.
 ///
 /// Keyed by the table name as it appeared in the SQL statement. The analyzer rule
-/// retrieves (and removes) the options when rewriting the DDL plan.
+/// retrieves (and removes) the extensions when rewriting the DDL plan.
 #[derive(Debug, Clone, Default)]
-pub struct DdlOptionsStore {
-    options: HashMap<String, DdlTableOptions>,
+pub struct DdlExtensionStore {
+    extensions: HashMap<String, CreateTableStatementExtension>,
 }
 
-impl DdlOptionsStore {
-    /// Insert DDL table options for a table.
-    pub fn insert(&mut self, table_name: String, options: DdlTableOptions) {
-        self.options.insert(table_name, options);
+impl DdlExtensionStore {
+    /// Insert DDL extensions for a table.
+    pub fn insert(&mut self, table_name: String, extension: CreateTableStatementExtension) {
+        self.extensions.insert(table_name, extension);
     }
 
-    /// Remove and return DDL table options for a table (consume on use).
-    pub fn remove(&mut self, table_name: &str) -> Option<DdlTableOptions> {
-        self.options.remove(table_name)
+    /// Remove and return DDL extensions for a table (consume on use).
+    pub fn remove(&mut self, table_name: &str) -> Option<CreateTableStatementExtension> {
+        self.extensions.remove(table_name)
     }
 }
 
-/// Thread-safe, shared DDL options store.
-pub type SharedDdlOptionsStore = Arc<RwLock<DdlOptionsStore>>;
+/// Thread-safe, shared DDL extension store.
+pub type SharedDdlExtensionStore = Arc<RwLock<DdlExtensionStore>>;
 
 /// Create a new shared store.
 #[must_use]
-pub fn new_shared_store() -> SharedDdlOptionsStore {
-    Arc::new(RwLock::new(DdlOptionsStore::default()))
+pub fn new_shared_store() -> SharedDdlExtensionStore {
+    Arc::new(RwLock::new(DdlExtensionStore::default()))
 }
 
-/// Parse `acceleration.*` and `dataset.*` key-value pairs into a [`DdlTableOptions`].
+/// Parse `acceleration.*` and `dataset.*` key-value pairs into a [`CreateTableStatementExtension`].
 ///
 /// Keys use dot-prefix format: `acceleration.engine`, `dataset.time_column`, etc.
 /// In SQL `WITH (...)` clauses, these must be double-quoted since dots are not
@@ -91,10 +98,15 @@ pub fn new_shared_store() -> SharedDdlOptionsStore {
 /// )
 /// ```
 ///
+/// The returned extension will have an empty `partition_by` — partitioning
+/// expressions are handled separately during pre-processing.
+///
 /// # Errors
 ///
 /// Returns an error if an unknown key is encountered or a value cannot be parsed.
-pub fn parse_ddl_table_options(options: &[(String, String)]) -> DFResult<DdlTableOptions> {
+pub fn parse_ddl_table_options(
+    options: &[(String, String)],
+) -> DFResult<CreateTableStatementExtension> {
     let mut accel_opts = Vec::new();
     let mut dataset_opts = Vec::new();
 
@@ -118,9 +130,10 @@ pub fn parse_ddl_table_options(options: &[(String, String)]) -> DFResult<DdlTabl
 
     let dataset = parse_dataset_options(&dataset_opts)?;
 
-    Ok(DdlTableOptions {
+    Ok(CreateTableStatementExtension {
         acceleration,
         dataset,
+        partition_by: None,
     })
 }
 
@@ -356,8 +369,11 @@ mod tests {
 
     #[test]
     fn test_store_insert_and_remove() {
-        let mut store = DdlOptionsStore::default();
-        store.insert("my_table".to_string(), DdlTableOptions::default());
+        let mut store = DdlExtensionStore::default();
+        store.insert(
+            "my_table".to_string(),
+            CreateTableStatementExtension::default(),
+        );
 
         assert!(store.remove("my_table").is_some());
         assert!(store.remove("my_table").is_none()); // consumed
@@ -436,6 +452,7 @@ mod tests {
             ddl_opts.dataset.time_format,
             Some(SpicepodTimeFormat::Timestamptz)
         );
+        assert!(ddl_opts.partition_by.is_none());
     }
 
     #[test]
@@ -453,5 +470,6 @@ mod tests {
         let ddl_opts = parse_ddl_table_options(&options).expect("should parse");
         assert!(ddl_opts.acceleration.is_none());
         assert_eq!(ddl_opts.dataset.time_column.as_deref(), Some("created_at"));
+        assert!(ddl_opts.partition_by.is_none());
     }
 }
