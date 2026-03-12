@@ -126,13 +126,13 @@ mod tests {
     const BASIC_SPICEPOD_YAML: &str = "
 name: test
 version: v2
-kind: spicepod
+kind: Spicepod
 ";
 
     const SCHEDULER_SPICEPOD_YAML: &str = "
 name: test
 version: v2
-kind: spicepod
+kind: Spicepod
 runtime:
   scheduler:
     state_location: s3://bucket/path
@@ -141,7 +141,7 @@ runtime:
     const FILE_SCHEDULER_SPICEPOD_YAML: &str = "
 name: test
 version: v2
-kind: spicepod
+kind: Spicepod
 runtime:
     scheduler:
         state_location: file:///tmp/state

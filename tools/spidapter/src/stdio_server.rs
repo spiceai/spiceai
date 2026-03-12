@@ -535,7 +535,7 @@ fn generate_adbc_create_table_statement(
     }
 
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
         table_elements.join(", ")
     ))
 }
@@ -1408,7 +1408,7 @@ mod tests {
         )
         .expect("statement should generate");
 
-        assert!(statement.contains("CREATE TABLE spicebench.bench.\"orders\""));
+        assert!(statement.contains("CREATE TABLE IF NOT EXISTS spicebench.bench.\"orders\""));
         assert!(statement.contains("\"id\" BIGINT NOT NULL"));
         assert!(statement.contains("\"name\" TEXT"));
         assert!(statement.contains("\"price\" DECIMAL(10, 2)"));
