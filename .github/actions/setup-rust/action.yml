@@ -44,7 +44,10 @@ runs:
 
         # Install toolchain with all components in a single atomic operation
         # so concurrent runners sharing the same RUSTUP_HOME don't race.
+        # --force ensures a clean reinstall when self-hosted runners have
+        # stale or partially-installed toolchains from previous configurations.
         rustup toolchain install "$toolchain" \
+          --force \
           --component cargo \
           --component rustc \
           --component rustfmt \
@@ -92,7 +95,7 @@ runs:
           $toolchain = "stable"
         }
 
-        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        rustup toolchain install $toolchain --force --component cargo --component rustc --component rustfmt --component clippy
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
