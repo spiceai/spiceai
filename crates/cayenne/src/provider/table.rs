@@ -1297,7 +1297,7 @@ impl CayenneTableProvider {
 
         // Write data to the new snapshot
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .write_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
             .await?;
 
         tracing::debug!(
@@ -1370,13 +1370,13 @@ impl CayenneTableProvider {
 
     /// Write a stream of record batches to a specific snapshot directory.
     ///
-    /// This is used during compaction operations where data needs to be written to a
-    /// new snapshot.
+    /// This is used during compaction operations where data needs to be persisted
+    /// to a new snapshot.
     ///
     /// # Arguments
     ///
     /// * `stream` - The stream of record batches to write
-    /// * `target_size_bytes` - Target size for each output file in bytes
+    /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
     ///
     /// # Returns
@@ -1386,7 +1386,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
-    pub(crate) async fn chunk_and_write_parallel_to_snapshot(
+    pub(crate) async fn write_to_snapshot(
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
@@ -1441,7 +1441,6 @@ impl CayenneTableProvider {
             stream.map(move |batch_result| {
                 if let Ok(batch) = &batch_result {
                     total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
-                    #[expect(clippy::cast_possible_truncation)]
                     total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
 
                     if is_s3_storage {
@@ -1472,7 +1471,8 @@ impl CayenneTableProvider {
             })
         };
 
-        let tracked_stream = RecordBatchStreamAdapter::new(tracked_schema.clone(), tracked_stream);
+        let tracked_stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&tracked_schema), tracked_stream);
         let stream_exec = Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
 
         let insert_plan = snapshot_listing_table
@@ -1482,7 +1482,7 @@ impl CayenneTableProvider {
         collect(insert_plan, session_state.task_ctx()).await?;
 
         let total_rows = total_rows_written.load(Ordering::Relaxed);
-        let writer_ops = if total_rows > 0 { 1 } else { 0 };
+        let writer_ops = usize::from(total_rows > 0); // 1 writer op if we wrote any rows, otherwise 0
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -2553,11 +2553,7 @@ impl CayenneTableProvider {
         }
 
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel_to_snapshot(
-                sorted_stream,
-                target_size_bytes,
-                &new_snapshot_id,
-            )
+            .write_to_snapshot(sorted_stream, target_size_bytes, &new_snapshot_id)
             .await?;
 
         if total_rows == 0 {

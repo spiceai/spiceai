@@ -267,11 +267,7 @@ impl CayenneDataSink {
             // Step 2: Write to _staging/ directory
             let (rows, writer_ops) = match self
                 .table
-                .chunk_and_write_parallel_to_snapshot(
-                    prepared_stream,
-                    target_size_bytes,
-                    STAGING_DIR_NAME,
-                )
+                .write_to_snapshot(prepared_stream, target_size_bytes, STAGING_DIR_NAME)
                 .await
             {
                 Ok(result) => result,
@@ -385,11 +381,11 @@ impl CayenneDataSink {
             CayenneTableProvider::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        // Write data to the new snapshot with memory-bounded parallel writes
+        // Write data to the new snapshot.
         let target_size = self.context.target_file_size_bytes();
         let (total_rows, _files_written) = self
             .table
-            .chunk_and_write_parallel_to_snapshot(data, target_size, &new_snapshot_id)
+            .write_to_snapshot(data, target_size, &new_snapshot_id)
             .await?;
 
         // Sync the snapshot directory to ensure all data is durably written.
