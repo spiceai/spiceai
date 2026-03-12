@@ -111,8 +111,16 @@ pub fn preprocess_create_table_with_options(
     }
 
     let dialect = PostgreSqlDialect {};
-    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
-        // If sqlparser can't parse it, let `DataFusion` handle the error
+    let statements = if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
+        statements
+    } else if let Some(normalized_sql) = normalize_create_table_clause_order(sql) {
+        let Ok(statements) = Parser::parse_sql(&dialect, &normalized_sql) else {
+            // If sqlparser still can't parse it, let `DataFusion` handle the error.
+            return Ok(PreprocessResult::Unchanged);
+        };
+        statements
+    } else {
+        // If sqlparser can't parse it, let `DataFusion` handle the error.
         return Ok(PreprocessResult::Unchanged);
     };
 
@@ -210,6 +218,36 @@ pub fn preprocess_create_table_with_options(
         sql: modified_sql,
         store_key,
     })
+}
+
+/// Normalize CREATE TABLE extension clause order for parser compatibility.
+///
+/// Some statements place `PARTITION BY ...` before `WITH (...)`. If parsing fails,
+/// this rewrites to `WITH (...) PARTITION BY ...` and returns the rewritten SQL.
+fn normalize_create_table_clause_order(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    let partition_by_index = upper.find("PARTITION BY")?;
+
+    // Only normalize the specific unsupported order where WITH appears after PARTITION BY.
+    let with_index = upper[partition_by_index..]
+        .find("WITH (")
+        .map(|i| partition_by_index + i)?;
+
+    if with_index <= partition_by_index {
+        return None;
+    }
+
+    let before_partition = sql[..partition_by_index].trim_end();
+    let partition_clause = sql[partition_by_index..with_index].trim();
+    let with_clause = sql[with_index..].trim_start();
+
+    if before_partition.is_empty() || partition_clause.is_empty() || with_clause.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{before_partition} {with_clause} {partition_clause}"
+    ))
 }
 
 pub type OptionsClassification = (Vec<(String, String)>, Vec<SqlOption>);
