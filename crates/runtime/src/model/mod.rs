@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 mod chat;
 mod embed;
-pub(crate) mod eval;
 mod metrics;
 mod model_context;
 pub mod params;
@@ -37,18 +36,6 @@ mod wrapper;
 
 pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
-pub use eval::{
-    dataset::{DatasetInput, DatasetOutput},
-    handle_eval_run,
-    result::{
-        EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA, EVAL_RESULTS_TABLE_TIME_COLUMN,
-    },
-    runs::{
-        EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
-        EVAL_RUNS_TABLE_TIME_COLUMN, EvalRunResponse, sql_query_for, start_tracing_eval_run,
-    },
-    scorer::{EvalScorerRegistry, Scorer, builtin_scorer},
-};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };

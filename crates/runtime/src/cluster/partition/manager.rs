@@ -60,6 +60,26 @@ pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AllocationResult {
+    pub previously_assigned: Vec<PartitionValue>,
+    pub newly_assigned: Vec<PartitionValue>,
+}
+
+impl AllocationResult {
+    #[must_use]
+    pub fn all_assigned(self) -> Vec<PartitionValue> {
+        let mut all = self.previously_assigned;
+        all.extend(self.newly_assigned);
+        all
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.previously_assigned.len() + self.newly_assigned.len()
+    }
+}
+
 impl PartitionManager {
     /// Creates a new partition manager with the given object store.
     ///
@@ -69,6 +89,12 @@ impl PartitionManager {
         Self {
             state: ObjectState::new(store).with_prefix(PARTITION_PREFIX),
         }
+    }
+
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.state = self.state.with_prefix(prefix);
+        self
     }
 
     /// Get partition metadata for a table from object store.
@@ -140,14 +166,13 @@ impl PartitionManager {
 
     /// Allocates unassigned partitions to an executor.
     ///
-    /// Returns the list of allocated partitions.
     /// Uses OCC to atomically update metadata.
     pub async fn allocate_partitions(
         &self,
         table: &TableReference,
         executor_id: &str,
         limit: usize,
-    ) -> Result<Vec<PartitionValue>> {
+    ) -> Result<AllocationResult> {
         let key = table.to_string();
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
@@ -160,39 +185,44 @@ impl PartitionManager {
                 .await?
                 .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
-            let mut allocated: Vec<_> = metadata
-                .partitions
-                .iter()
-                .filter_map(|p| {
-                    if p.is_assigned_to(executor_id) {
-                        Some(p.partition_value.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut result = AllocationResult {
+                newly_assigned: vec![],
+                previously_assigned: metadata
+                    .partitions
+                    .iter()
+                    .filter_map(|p| {
+                        if p.is_assigned_to(executor_id) {
+                            Some(p.partition_value.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            };
             let mut changes = false;
 
             for partition in &mut metadata.partitions {
-                if allocated.len() >= limit {
+                if result.count() >= limit {
                     break;
                 }
 
                 if !partition.is_assigned() {
                     partition.assign_to(executor_id.to_string(), now_ms);
-                    allocated.push(partition.partition_value.clone());
+                    result
+                        .newly_assigned
+                        .push(partition.partition_value.clone());
                     changes = true;
                 }
             }
 
             if !changes {
-                return Ok(allocated);
+                return Ok(result);
             }
 
             metadata.updated_at = now_ms;
 
             match self.write_metadata(&key, metadata).await {
-                Ok(()) => return Ok(allocated),
+                Ok(()) => return Ok(result),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
                         tokio::time::sleep(delay).await;

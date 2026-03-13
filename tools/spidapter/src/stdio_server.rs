@@ -535,7 +535,7 @@ fn generate_adbc_create_table_statement(
     }
 
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
         table_elements.join(", ")
     ))
 }
@@ -601,7 +601,8 @@ async fn provision_spice_cloud_app(
     let cloud = commands::build_cloud_client(api_url_override)?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
+    let flight_url = std::env::var("SPIDAPTER_FLIGHT_URL")
+        .unwrap_or_else(|_| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
@@ -1407,7 +1408,7 @@ mod tests {
         )
         .expect("statement should generate");
 
-        assert!(statement.contains("CREATE TABLE spicebench.bench.\"orders\""));
+        assert!(statement.contains("CREATE TABLE IF NOT EXISTS spicebench.bench.\"orders\""));
         assert!(statement.contains("\"id\" BIGINT NOT NULL"));
         assert!(statement.contains("\"name\" TEXT"));
         assert!(statement.contains("\"price\" DECIMAL(10, 2)"));

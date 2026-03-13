@@ -73,6 +73,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 create.if_not_exists,
                 create.df_catalog_name.clone(),
                 create.df_schema_name.clone(),
+                create.primary_key.clone(),
                 catalog_list,
                 self.executor_registry.clone(),
             ))));
