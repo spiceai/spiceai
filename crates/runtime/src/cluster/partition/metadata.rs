@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
-use datafusion::{error::DataFusionError, sql::TableReference};
+use datafusion::{error::DataFusionError, prelude::SessionContext, sql::TableReference};
 use datafusion_expr::{Expr, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
@@ -141,5 +141,32 @@ impl TablePartitionMetadata {
             .iter()
             .filter(|p| !p.is_assigned())
             .collect()
+    }
+
+    pub fn all_executor_partitions(
+        &self,
+        ctx: Arc<SessionContext>,
+    ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
+        let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
+        for PartitionMetadata {
+            partition_value,
+            assigned_executors,
+            ..
+        } in &self.partitions
+        {
+            let exprs = partition_value
+                .iter()
+                .map(|(proj, lit)| {
+                    Ok(Expr::from_bytes_with_registry(proj.as_bytes(), ctx.as_ref())?
+                        .eq(Expr::from_bytes_with_registry(lit.as_bytes(), ctx.as_ref())?))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for executor in assigned_executors {
+                map.entry(executor.clone())
+                    .or_default()
+                    .append(&mut exprs.clone());
+            }
+        }
+        Ok(map)
     }
 }

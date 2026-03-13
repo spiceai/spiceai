@@ -30,6 +30,8 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use datafusion_expr::Expr;
+use futures::TryStreamExt as _;
 use opentelemetry::KeyValue;
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
@@ -41,7 +43,10 @@ use async_stream::stream;
 
 use crate::{
     config::ClusterRole,
-    datafusion::{DataFusion, request_context_extension::get_current_datafusion},
+    datafusion::{
+        DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
+        request_context_extension::get_current_datafusion,
+    },
     dataupdate::{StreamingDataUpdate, UpdateType},
     timing::TimedStream,
 };
@@ -203,19 +208,13 @@ pub(crate) async fn handle(
     // Fast path: for scheduler -> executor Cayenne writes, forward raw FlightData
     // directly to executor to avoid decode/re-encode overhead on scheduler.
     if should_forward_raw_cayenne_write(&datafusion, &path).await {
-        use futures::stream;
-
-        let inbound = futures::StreamExt::chain(
-            stream::once(async move { Ok(first_message.clone()) }),
+        return forward_raw_cayenne_write(
+            Arc::clone(&datafusion),
+            &path,
+            first_message,
             streaming_flight,
-        );
-        datafusion
-            .forward_flight_data_stream_to_executor(&path, inbound)
-            .await
-            .map_err(|e| Status::internal(format!("Write operation failed: {e}")))?;
-
-        let output = futures::stream::iter(vec![Ok(PutResult::default())]);
-        return Ok(Response::new(Box::pin(output)));
+        )
+        .await;
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
@@ -253,6 +252,253 @@ fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
         && datafusion.cluster_config.tls_config().is_some()
 }
 
+/// Forwards a Cayenne write to executors, splitting record batches by partition
+/// expression so each executor only receives the rows it is responsible for.
+async fn forward_raw_cayenne_write(
+    datafusion: Arc<DataFusion>,
+    path: &TableReference,
+    first_message: FlightData,
+    mut streaming_flight: Peekable<Streaming<FlightData>>,
+) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    let Some(ref executor_registry) = datafusion.executor_registry else {
+        return Err(Status::not_found("executor registry not found"));
+    };
+
+    let Some(table_partitions) = executor_registry
+        .partition_manager()
+        .get_cached_table_metadata(path)
+    else {
+        return Err(Status::not_found(format!(
+            "No metadata found for table {path} in executor registry, cannot forward raw Cayenne write"
+        )));
+    };
+    let partitions_by_executor =
+        table_partitions.all_executor_partitions(Arc::clone(&datafusion.ctx))?;
+
+    // Decode schema from the first message.
+    let schema = Arc::new(
+        try_schema_from_flatbuffer_bytes(&first_message.data_header)
+            .map_err(|e| Status::internal(format!("Failed to get schema: {e}")))?,
+    );
+
+    // Build a physical filter per executor by OR-ing its partition expressions.
+    let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone())
+        .map_err(|e| Status::internal(format!("Failed to create DFSchema: {e}")))?;
+    let execution_props = datafusion::execution::context::ExecutionProps::new();
+    let mut executor_filters: Vec<(String, Arc<dyn datafusion::physical_plan::PhysicalExpr>)> =
+        Vec::with_capacity(partitions_by_executor.len());
+    for (executor_id, exprs) in &partitions_by_executor {
+        let combined = exprs.iter().cloned().reduce(Expr::or).ok_or_else(|| {
+            Status::internal(format!(
+                "Empty partition expressions for executor {executor_id}"
+            ))
+        })?;
+        let physical = datafusion::physical_expr::create_physical_expr(
+            &combined,
+            &df_schema,
+            &execution_props,
+        )
+        .map_err(|e| {
+            Status::internal(format!(
+                "Failed to create physical filter for executor {executor_id}: {e}"
+            ))
+        })?;
+        executor_filters.push((executor_id.clone(), physical));
+    }
+
+    // Resolve the table reference for the descriptor path sent to executors.
+    let resolved = path
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let descriptor_path = vec![
+        resolved.catalog.to_string(),
+        resolved.schema.to_string(),
+        resolved.table.to_string(),
+    ];
+
+    // Open a per-executor channel and spawn a forwarding task for each.
+    let clients = executor_registry.flight_sql_clients.read().await;
+    let mut senders: HashMap<String, Sender<RecordBatch>> = HashMap::new();
+    let mut join_handles: Vec<tokio::task::JoinHandle<Result<(), Status>>> = Vec::new();
+
+    let auth_header = RequestContext::current(AsyncMarker::new().await)
+        .authorization_header()
+        .map(str::to_string);
+
+    for (executor_id, _) in &executor_filters {
+        let client = clients.get(executor_id).cloned().ok_or_else(|| {
+            Status::not_found(format!("No FlightSQL client for executor {executor_id}"))
+        })?;
+
+        let (tx, rx) = mpsc::channel::<RecordBatch>(64);
+        senders.insert(executor_id.clone(), tx);
+
+        let schema = Arc::clone(&schema);
+        let descriptor_path = descriptor_path.clone();
+        let auth_header = auth_header.clone();
+        let io_runtime = datafusion.io_runtime.clone();
+
+        join_handles.push(tokio::spawn(forward_batches_to_executor(
+            client,
+            rx,
+            schema,
+            descriptor_path,
+            auth_header,
+            io_runtime,
+        )));
+    }
+    drop(clients);
+
+    // Decode the first message and route it.
+    let dictionaries_by_id = Arc::new(HashMap::new());
+    if let Ok(batch) =
+        flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)
+    {
+        if batch.num_rows() > 0 {
+            route_batch_to_executors(&batch, &executor_filters, &senders).await?;
+        }
+    }
+
+    // Decode and route the rest of the stream.
+    while let Some(result) = streaming_flight.next().await {
+        let fd = result.map_err(|e| Status::internal(format!("Stream error: {e}")))?;
+        let batch = flight_data_to_arrow_batch(&fd, Arc::clone(&schema), &dictionaries_by_id)
+            .map_err(|e| Status::internal(format!("Failed to decode flight data: {e}")))?;
+        if batch.num_rows() > 0 {
+            route_batch_to_executors(&batch, &executor_filters, &senders).await?;
+        }
+    }
+
+    // Signal completion by dropping senders, then await all forwarding tasks.
+    drop(senders);
+    for handle in join_handles {
+        handle
+            .await
+            .map_err(|e| Status::internal(format!("Executor forwarding task panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("Write operation failed: {e}")))?;
+    }
+
+    let output = futures::stream::iter(vec![Ok(PutResult::default())]);
+    Ok(Response::new(Box::pin(output)))
+}
+
+/// Filters `batch` by each executor's partition expression and sends matching rows.
+async fn route_batch_to_executors(
+    batch: &RecordBatch,
+    executor_filters: &[(String, Arc<dyn datafusion::physical_plan::PhysicalExpr>)],
+    senders: &HashMap<String, Sender<RecordBatch>>,
+) -> Result<(), Status> {
+    for (executor_id, filter_expr) in executor_filters {
+        let result = filter_expr
+            .evaluate(batch)
+            .map_err(|e| Status::internal(format!("Filter eval failed for {executor_id}: {e}")))?;
+        let mask = result
+            .into_array(batch.num_rows())
+            .map_err(|e| Status::internal(format!("Failed to get filter mask: {e}")))?;
+        let mask = mask
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| Status::internal("Filter did not produce boolean array"))?;
+
+        let filtered = arrow::compute::filter_record_batch(batch, mask)
+            .map_err(|e| Status::internal(format!("Failed to filter batch: {e}")))?;
+
+        if filtered.num_rows() > 0 {
+            if let Some(tx) = senders.get(executor_id) {
+                tx.send(filtered).await.map_err(|e| {
+                    Status::internal(format!(
+                        "Failed to send batch to executor {executor_id}: {e}"
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encodes `RecordBatch`es from `rx` as `FlightData` and sends them via `DoPut`
+/// to a specific executor.
+async fn forward_batches_to_executor(
+    client: data_components::flightsql::FlightSqlClient,
+    rx: mpsc::Receiver<RecordBatch>,
+    schema: SchemaRef,
+    descriptor_path: Vec<String>,
+    auth_header: Option<String>,
+    io_runtime: tokio::runtime::Handle,
+) -> Result<(), Status> {
+    let (tx, flight_rx) = mpsc::channel::<arrow_flight::FlightData>(64);
+    let (encode_result_tx, encode_result_rx) =
+        tokio::sync::oneshot::channel::<Result<(), String>>();
+
+    // Spawn encoding task: RecordBatch -> FlightData via FlightDataEncoder.
+    let encoder_schema = Arc::clone(&schema);
+    io_runtime.spawn(async move {
+        let batch_stream = ReceiverStream::new(rx)
+            .map(|b| -> Result<RecordBatch, arrow_flight::error::FlightError> { Ok(b) });
+        let flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_schema(encoder_schema)
+            .build(batch_stream);
+
+        let mut flight_data_encoder = Box::pin(flight_data_encoder);
+        let mut is_first = true;
+        loop {
+            match flight_data_encoder.next().await {
+                Some(Ok(mut fd)) => {
+                    if is_first {
+                        fd.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_path(
+                            descriptor_path.clone(),
+                        ));
+                        is_first = false;
+                    }
+                    if tx.send(fd).await.is_err() {
+                        let _ = encode_result_tx.send(Ok(()));
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = encode_result_tx.send(Err(e.to_string()));
+                    break;
+                }
+                None => {
+                    let _ = encode_result_tx.send(Ok(()));
+                    break;
+                }
+            }
+        }
+    });
+
+    // Send the encoded FlightData stream via DoPut.
+    let mut request = tonic::Request::new(ReceiverStream::new(flight_rx));
+    if let Some(auth_value) = auth_header
+        && let Ok(val) = auth_value.parse()
+    {
+        request.metadata_mut().insert("authorization", val);
+    }
+
+    let mut inner_client = client.into_inner();
+    let response = inner_client
+        .do_put(request)
+        .await
+        .map_err(|e| Status::internal(format!("DoPut to executor failed: {e}")))?;
+
+    response
+        .into_inner()
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| Status::internal(format!("Executor DoPut acknowledgement failed: {e}")))?;
+
+    match encode_result_rx.await {
+        Ok(Ok(())) | Err(_) => {}
+        Ok(Err(e)) => {
+            return Err(Status::internal(format!(
+                "Failed to encode forwarded Flight stream: {e}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableReference) -> bool {
     if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
         return false;
@@ -262,13 +508,14 @@ async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableR
         return false;
     };
 
-    let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+    if executor_registry
+        .flight_sql_clients
+        .try_read()
+        .ok()
+        .is_none_or(|c| c.is_empty())
+    {
         return false;
     };
-    if clients.is_empty() {
-        return false;
-    }
-    drop(clients);
 
     let Some(table_provider) = datafusion.get_table(path).await else {
         return false;
