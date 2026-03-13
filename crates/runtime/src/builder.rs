@@ -281,7 +281,7 @@ impl RuntimeBuilder {
                         peers: Arc::new(RwLock::new(HashMap::new())),
                         job_executor: Arc::new(RwLock::new(None)),
                         executor_registry: Arc::new(ExecutorRegistry::new(
-                            partition_manager,
+                            Arc::clone(&partition_manager),
                             Arc::new(
                                 PartitionManager::new(Arc::clone(&store))
                                     .with_prefix("catalog/partitions/"),
