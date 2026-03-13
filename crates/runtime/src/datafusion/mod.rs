@@ -119,6 +119,7 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
+pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -462,8 +463,8 @@ pub struct DataFusion {
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
-    /// Shared store for DDL table options from `CREATE TABLE ... WITH (acceleration.*, dataset.*)`.
-    ddl_options_store: iceberg_ddl::acceleration_options::SharedDdlOptionsStore,
+    /// Shared store for DDL extensions from `CREATE TABLE` statements.
+    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -820,14 +821,14 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns a reference to the shared DDL options store.
+    /// Returns a reference to the shared DDL extension store.
     ///
-    /// Used by the query execution path to insert options extracted from
-    /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
-    /// are then consumed by the `IcebergDdlAnalyzerRule`.
+    /// Used by the query execution path to insert extensions extracted from
+    /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
+    /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_options_store(&self) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
-        &self.ddl_options_store
+    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+        &self.ddl_extension_store
     }
 
     /// Returns the shared weak self-reference holder.
@@ -2650,27 +2651,24 @@ impl DataFusion {
             return Ok(plan);
         }
 
-        // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning.
-        // This extracts DDL table options, stores them for the analyzer rule,
-        // and returns modified SQL without the WITH clause.
-        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_with_options(
-            sql,
-            &self.ddl_options_store,
-        )?;
+        // Pre-process CREATE TABLE statements to extract DDL extensions
+        // (WITH options, PARTITION BY) before planning.
+        let preprocessed =
+            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
         let (effective_sql, store_key) = match &preprocessed {
-            iceberg_ddl::preprocess::PreprocessResult::Modified {
+            ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,
                 store_key,
             } => (modified.as_str(), Some(store_key.as_str())),
-            iceberg_ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
+            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
         let plan = match session.create_logical_plan(effective_sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 if let Some(store_key) = store_key {
-                    iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_options_store,
+                    ddl::preprocess::cleanup_preprocessed_ddl_options(
+                        &self.ddl_extension_store,
                         store_key,
                     )?;
                 }
