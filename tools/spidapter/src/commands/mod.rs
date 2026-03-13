@@ -20,7 +20,7 @@ use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
     types::{
-        AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
+        AppExecutor, AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
         CreateDeploymentRequest, UpdateAppRequest,
     },
 };
@@ -139,15 +139,19 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     let replicas = env_var_replicas("SPIDAPTER_APP_REPLICAS")?;
 
-    // Executor resources — same defaults as scheduler; override via env vars.
-    let executor_resources = env_var_resources(
-        "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
-        "SPIDAPTER_EXECUTOR_CPU_LIMIT",
-        "SPIDAPTER_EXECUTOR_CPU_REQUEST",
-        "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
-    )
-    .unwrap_or_else(default_resources);
-    let executor_replicas = env_var_replicas("SPIDAPTER_EXECUTOR_REPLICAS")?.unwrap_or(1);
+    // Executor — same resource defaults as scheduler; override via env vars.
+    let executor = Some(AppExecutor {
+        replicas: Some(env_var_replicas("SPIDAPTER_EXECUTOR_REPLICAS")?.unwrap_or(1)),
+        resources: Some(
+            env_var_resources(
+                "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
+                "SPIDAPTER_EXECUTOR_CPU_LIMIT",
+                "SPIDAPTER_EXECUTOR_CPU_REQUEST",
+                "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
+            )
+            .unwrap_or_else(default_resources),
+        ),
+    });
 
     let create_result = cloud
         .create_app(&CreateAppRequest {
@@ -161,8 +165,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             )])),
             replicas,
             resources: Some(resources),
-            executor_replicas: Some(executor_replicas),
-            executor_resources: Some(executor_resources),
+            executor,
         })
         .await;
 
@@ -239,8 +242,7 @@ pub(crate) async fn apply_spicepod_to_app(
                 region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
                 resources: None,
-                executor_replicas: None,
-                executor_resources: None,
+                executor: None,
             },
         )
         .await?;
