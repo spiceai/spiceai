@@ -659,14 +659,23 @@ impl SodaReader {
                 )
             })?;
 
-        // Build a mapping: for each user-visible column, store its index in the full columns array
+        // Build a mapping: for each user-visible column, store its index in the
+        // full columns array. Use the same filter as soda_schema_from_meta (both
+        // dataTypeName and fieldName must be present and non-meta) so that
+        // visible_indices stays in sync with schema.fields().
         let visible_indices: Vec<usize> = all_columns
             .iter()
             .enumerate()
             .filter(|(_, col)| {
-                col.get("dataTypeName")
+                let is_visible = col
+                    .get("dataTypeName")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|t| t != "meta_data")
+                    .is_some_and(|t| t != "meta_data");
+                let has_field_name = col
+                    .get("fieldName")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some();
+                is_visible && has_field_name
             })
             .map(|(i, _)| i)
             .collect();
@@ -2230,8 +2239,8 @@ mod tests {
         #[test]
         fn test_json_pointer_empty_returns_whole_doc() {
             let input = br#"{"a":1,"b":2}"#;
-            let mut reader = JsonPointerReader::from_vec(input, "")
-                .expect("empty pointer should succeed");
+            let mut reader =
+                JsonPointerReader::from_vec(input, "").expect("empty pointer should succeed");
             let mut out = String::new();
             reader
                 .read_to_string(&mut out)
@@ -2244,8 +2253,8 @@ mod tests {
         fn test_json_pointer_bom_stripped() {
             let mut input = vec![0xEF, 0xBB, 0xBF];
             input.extend_from_slice(br#"{"data":[1,2]}"#);
-            let mut reader = JsonPointerReader::from_vec(&input, "/data")
-                .expect("BOM input should parse");
+            let mut reader =
+                JsonPointerReader::from_vec(&input, "/data").expect("BOM input should parse");
             let mut out = String::new();
             reader
                 .read_to_string(&mut out)
@@ -2663,8 +2672,7 @@ mod tests {
             let json = r#"{"meta":{"view":{"columns":[{"fieldName":"name","dataTypeName":"text"}]}},"data":[["Alice"]]}"#;
             let mut input = vec![0xEF, 0xBB, 0xBF];
             input.extend_from_slice(json.as_bytes());
-            let mut reader =
-                SodaReader::from_vec(&input).expect("BOM input should parse");
+            let mut reader = SodaReader::from_vec(&input).expect("BOM input should parse");
             let mut out = String::new();
             reader
                 .read_to_string(&mut out)

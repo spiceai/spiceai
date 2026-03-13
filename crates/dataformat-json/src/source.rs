@@ -325,9 +325,7 @@ impl FileOpener for SpiceJsonOpener {
                     // because they must parse the entire JSON document.
                     // Auto needs buffering to peek the first byte then decode.
                     // Object and JSONL/Array can stream directly.
-                    if json_pointer.is_some()
-                        || matches!(format, Format::Auto | Format::Soda)
-                    {
+                    if json_pointer.is_some() || matches!(format, Format::Auto | Format::Soda) {
                         let s = s.map_err(DataFusionError::from);
                         let decompressed = file_compression_type.convert_stream(s.boxed())?;
                         let chunks: Vec<bytes::Bytes> = decompressed.try_collect().await?;
@@ -340,8 +338,8 @@ impl FileOpener for SpiceJsonOpener {
 
                         // SODA format: convert to NDJSON via SodaReader (use from_vec to avoid double alloc)
                         if format == Format::Soda {
-                            let soda = SodaReader::from_vec(&all_bytes)
-                                .map_err(DataFusionError::from)?;
+                            let soda =
+                                SodaReader::from_vec(&all_bytes).map_err(DataFusionError::from)?;
                             let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                                 .with_batch_size(batch_size)
                                 .build(BufReader::new(soda))?;

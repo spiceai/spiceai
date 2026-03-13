@@ -554,15 +554,20 @@ pub trait ListingTableConnector: DataConnector {
                     params.get("json_path").expose(),
                     ExposedParamLookup::Present(v) if !v.is_empty()
                 );
+                let default_ext = file_extension.as_deref().map_or(".jsonl", |e| match e {
+                    "ndjson" => ".ndjson",
+                    "ldjson" => ".ldjson",
+                    _ => ".jsonl",
+                });
                 if has_pointer {
                     Ok((
                         Some(self.get_json_format(dataset, params, Format::Jsonl)?),
-                        extension.unwrap_or(".jsonl".to_string()),
+                        extension.unwrap_or_else(|| default_ext.to_string()),
                     ))
                 } else {
                     Ok((
                         Some(self.get_jsonl_format(dataset, params)?),
-                        extension.unwrap_or(".jsonl".to_string()),
+                        extension.unwrap_or_else(|| default_ext.to_string()),
                     ))
                 }
             },
@@ -593,7 +598,11 @@ pub trait ListingTableConnector: DataConnector {
                     )),
                     Some("jsonl" | "ndjson" | "ldjson") => Ok((
                         Some(self.get_jsonl_format(dataset, params)?),
-                        extension.unwrap_or(".jsonl".to_string()),
+                        extension.unwrap_or_else(|| match ext {
+                            Some("ndjson") => ".ndjson".to_string(),
+                            Some("ldjson") => ".ldjson".to_string(),
+                            _ => ".jsonl".to_string(),
+                        }),
                     )),
                     Some("parquet") => Ok((
                         Some(Arc::new(
