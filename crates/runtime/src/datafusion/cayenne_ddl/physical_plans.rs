@@ -82,12 +82,8 @@ fn partition_label_for_expr(partition_expr: &Expr) -> String {
         })
         .collect();
 
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+    if sanitized.is_empty() {
         return "expr0".to_string();
-    }
-
-    if sanitized.starts_with('.') {
-        sanitized.insert(0, '_');
     }
 
     sanitized
