@@ -53,6 +53,14 @@ pub struct AppsResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppExecutor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<AppResources>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub spicepod: Option<serde_json::Value>,
     pub registry: Option<String>,
@@ -61,6 +69,7 @@ pub struct AppConfig {
     pub update_channel: Option<String>,
     pub replicas: Option<i32>,
     pub resources: Option<AppResources>,
+    pub executor: Option<AppExecutor>,
     pub region: Option<String>,
     pub node_group: Option<String>,
     pub storage_claim_size_gb: Option<f64>,
@@ -101,7 +110,11 @@ pub struct CreateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor: Option<AppExecutor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +133,8 @@ pub struct UpdateAppRequest {
     pub spicepod: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor: Option<AppExecutor>,
 }
 
 // ============================================================================
