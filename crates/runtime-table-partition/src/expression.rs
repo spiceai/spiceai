@@ -89,7 +89,7 @@ pub fn partition_by_expressions(
 /// Validates that a single [`Expr`] meets the partition expression criteria.
 ///
 /// This is useful for DDL paths where the expression is already parsed as a
-/// DataFusion `Expr` (e.g. from a `PARTITION BY` clause).
+/// `DataFusion` `Expr` (e.g. from a `PARTITION BY` clause).
 ///
 /// # Errors
 /// Returns an error if the expression does not meet the partition criteria.

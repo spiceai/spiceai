@@ -205,18 +205,57 @@ impl fmt::Debug for CayenneCreateTableExec {
     }
 }
 
-impl CayenneCreateTableExec {
-    #[must_use]
+pub struct CayenneCreateTableExecBuilder {
+    table_name: String,
+    arrow_schema: Arc<Schema>,
+    if_not_exists: bool,
+    df_catalog_name: String,
+    df_schema_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    partition_expr: Option<String>,
+}
+
+impl CayenneCreateTableExecBuilder {
     pub fn new(
         table_name: String,
         arrow_schema: Arc<Schema>,
-        if_not_exists: bool,
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
-        partition_expr: Option<String>,
     ) -> Self {
+        Self {
+            table_name,
+            arrow_schema,
+            if_not_exists: false,
+            df_catalog_name,
+            df_schema_name,
+            catalog_list,
+            executor_registry: None,
+            partition_expr: None,
+        }
+    }
+
+    #[must_use]
+    pub fn if_not_exists(mut self, if_not_exists: bool) -> Self {
+        self.if_not_exists = if_not_exists;
+        self
+    }
+
+    #[must_use]
+    pub fn executor_registry(mut self, executor_registry: Option<Arc<ExecutorRegistry>>) -> Self {
+        self.executor_registry = executor_registry;
+        self
+    }
+
+    #[must_use]
+    pub fn partition_expr(mut self, partition_expr: Option<String>) -> Self {
+        self.partition_expr = partition_expr;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> CayenneCreateTableExec {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -224,15 +263,15 @@ impl CayenneCreateTableExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
-        Self {
-            table_name,
-            arrow_schema,
-            if_not_exists,
-            df_catalog_name,
-            df_schema_name,
-            catalog_list,
-            executor_registry,
-            partition_expr,
+        CayenneCreateTableExec {
+            table_name: self.table_name,
+            arrow_schema: self.arrow_schema,
+            if_not_exists: self.if_not_exists,
+            df_catalog_name: self.df_catalog_name,
+            df_schema_name: self.df_schema_name,
+            catalog_list: self.catalog_list,
+            executor_registry: self.executor_registry,
+            partition_expr: self.partition_expr,
             properties,
         }
     }

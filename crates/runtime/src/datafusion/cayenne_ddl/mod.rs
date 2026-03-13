@@ -74,14 +74,13 @@ pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn Partiti
     if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
         return Some(cayenne);
     }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>() {
-        if let Some(cayenne) = composed
+    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>()
+        && let Some(cayenne) = composed
             .external()
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>()
-        {
-            return Some(cayenne);
-        }
+    {
+        return Some(cayenne);
     }
     None
 }

@@ -51,7 +51,7 @@ use crate::creator::filename::encode_composite_key;
 use crate::expression::PartitionedBy;
 use crate::provider::CompositePartitionKey;
 
-/// Returns the schema that DataFusion expects from INSERT execution plans:
+/// Returns the schema that `DataFusion` expects from INSERT execution plans:
 /// a single non-null `count: UInt64` field.
 fn count_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(

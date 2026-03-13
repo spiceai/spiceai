@@ -867,7 +867,7 @@ impl DataFusion {
     /// Returns the partition expression for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
-    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's SQLite).
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
