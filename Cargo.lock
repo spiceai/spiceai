@@ -20449,7 +20449,7 @@ dependencies = [
 
 [[package]]
 name = "turso-shared"
-version = "2.0.0-unstable"
+version = "2.0.0-enterprise-beta"
 
 [[package]]
 name = "turso_core"
