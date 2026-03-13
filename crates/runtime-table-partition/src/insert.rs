@@ -73,6 +73,7 @@ pub struct PartitionerExec {
     /// The table's data schema, used internally for evaluating partition expressions.
     data_schema: SchemaRef,
     properties: PlanProperties,
+    output_schema: SchemaRef,
 }
 
 impl PartitionerExec {
@@ -99,6 +100,7 @@ impl PartitionerExec {
             insert_op,
             data_schema,
             properties,
+            output_schema,
         }
     }
 }
@@ -130,7 +132,7 @@ impl ExecutionPlan for PartitionerExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(self.properties().schema())
+        Arc::clone(&self.output_schema)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
