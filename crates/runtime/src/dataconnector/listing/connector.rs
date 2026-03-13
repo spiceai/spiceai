@@ -540,12 +540,16 @@ pub trait ListingTableConnector: DataConnector {
                 extension.unwrap_or(".tsv".to_string()),
             )),
             (Some("json"), _) | (None, Some("json")) => Ok((
-                Some(self.get_json_format(dataset, params)?),
+                Some(self.get_json_format(dataset, params, Format::Jsonl)?),
                 extension.unwrap_or(".json".to_string()),
             )),
-            (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
+            (Some("jsonl"), _) | (None, Some("jsonl")) | (None, Some("ndjson")) | (None, Some("ldjson")) => Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
+            )),
+            (Some("soda"), _) | (Some("socrata"), _) => Ok((
+                Some(self.get_json_format(dataset, params, Format::Soda)?),
+                extension.unwrap_or(".json".to_string()),
             )),
             #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
@@ -558,6 +562,33 @@ pub trait ListingTableConnector: DataConnector {
                 )),
                 extension.unwrap_or(".parquet".to_string()),
             )),
+            (Some("auto"), ext) => {
+                match ext {
+                    Some("csv") => Ok((
+                        Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Csv)?),
+                        extension.unwrap_or(".csv".to_string()),
+                    )),
+                    Some("tsv") => Ok((
+                        Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
+                        extension.unwrap_or(".tsv".to_string()),
+                    )),
+                    Some("jsonl") | Some("ndjson") | Some("ldjson") => Ok((
+                        Some(self.get_jsonl_format(dataset, params)?),
+                        extension.unwrap_or(".jsonl".to_string()),
+                    )),
+                    Some("parquet") => Ok((
+                        Some(Arc::new(
+                            ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
+                        )),
+                        extension.unwrap_or(".parquet".to_string()),
+                    )),
+                    // For .json or unknown/no extension, use JSON with auto sub-format detection
+                    _ => Ok((
+                        Some(self.get_json_format(dataset, params, Format::Auto)?),
+                        extension.unwrap_or_else(|| ext.map_or(".json".to_string(), |e| format!(".{e}"))),
+                    )),
+                }
+            },
             (Some(format), _) => Ok((None, format!(".{format}"))),
             (_, _) => Err(
                     crate::dataconnector::DataConnectorError::InvalidConfiguration {
@@ -617,11 +648,12 @@ pub trait ListingTableConnector: DataConnector {
         &self,
         dataset: &Dataset,
         params: &Parameters,
+        default_format: Format,
     ) -> DataConnectorResult<Arc<SpiceJsonFormat>>
     where
         Self: Display,
     {
-        let mut format = SpiceJsonFormat::default();
+        let mut format = SpiceJsonFormat::default().with_format(default_format);
 
         if let ExposedParamLookup::Present(comp_as_str) =
             params.get("file_compression_type").expose()
@@ -651,10 +683,16 @@ pub trait ListingTableConnector: DataConnector {
             let json_format = json_format_str.parse::<Format>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "Invalid JSON format: {json_format_str}, supported formats are: 'jsonl', 'ndjson', 'array'"),
+                        "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_format(json_format);
+        }
+
+        if let ExposedParamLookup::Present(json_pointer) = params.get("json_pointer").expose() {
+            format = format.with_json_pointer(json_pointer.to_string());
+        } else if let ExposedParamLookup::Present(json_path) = params.get("json_path").expose() {
+            format = format.with_json_pointer(json_path.to_string());
         }
 
         if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose()

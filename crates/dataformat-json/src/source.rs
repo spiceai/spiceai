@@ -22,8 +22,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::file_format::SpiceJsonDecoder;
-use crate::{ArrayToNdjson, nest_struct_schema};
+use crate::file_format::{Format, SpiceJsonDecoder};
+use crate::{ArrayToNdjson, JsonPointerReader, SodaReader, nest_struct_schema, peek_first_non_ws_byte};
 use crate::{extract_flattened_from_nested, project_nested_schema};
 
 use datafusion::error::{DataFusionError, Result};
@@ -50,7 +50,8 @@ pub struct SpiceJsonOpener {
     projected_schema: SchemaRef,
     file_compression_type: FileCompressionType,
     object_store: Arc<dyn ObjectStore>,
-    array_to_ndjson: bool,
+    format: Format,
+    json_pointer: Option<String>,
     unnest_struct: Option<String>,
 }
 
@@ -62,7 +63,8 @@ impl SpiceJsonOpener {
         projected_schema: SchemaRef,
         file_compression_type: FileCompressionType,
         object_store: Arc<dyn ObjectStore>,
-        array_to_ndjson: bool,
+        format: Format,
+        json_pointer: Option<String>,
         unnest_struct: Option<String>,
     ) -> Self {
         Self {
@@ -71,7 +73,8 @@ impl SpiceJsonOpener {
             projected_schema,
             file_compression_type,
             object_store,
-            array_to_ndjson,
+            format,
+            json_pointer,
             unnest_struct,
         }
     }
@@ -82,7 +85,8 @@ impl SpiceJsonOpener {
 pub struct SpiceJsonSource {
     batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
-    array_to_ndjson: bool,
+    format: Format,
+    json_pointer: Option<String>,
     unnest_struct: Option<String>,
     table_schema: TableSchema,
     projection: SplitProjection,
@@ -96,7 +100,8 @@ impl SpiceJsonSource {
         Self {
             batch_size: None,
             metrics: ExecutionPlanMetricsSet::new(),
-            array_to_ndjson: false,
+            format: Format::Jsonl,
+            json_pointer: None,
             unnest_struct: None,
             table_schema,
             projection,
@@ -104,8 +109,14 @@ impl SpiceJsonSource {
     }
 
     #[must_use]
-    pub fn with_array_to_ndjson(mut self, array_to_ndjson: bool) -> Self {
-        self.array_to_ndjson = array_to_ndjson;
+    pub fn with_format(mut self, format: Format) -> Self {
+        self.format = format;
+        self
+    }
+
+    #[must_use]
+    pub fn with_json_pointer(mut self, json_pointer: Option<String>) -> Self {
+        self.json_pointer = json_pointer;
         self
     }
 
@@ -139,7 +150,8 @@ impl FileSource for SpiceJsonSource {
             projected_schema,
             file_compression_type: base_config.file_compression_type,
             object_store,
-            array_to_ndjson: self.array_to_ndjson,
+            format: self.format,
+            json_pointer: self.json_pointer.clone(),
             unnest_struct: self.unnest_struct.clone(),
         });
 
@@ -186,7 +198,10 @@ impl FileSource for SpiceJsonSource {
 }
 
 impl FileOpener for SpiceJsonOpener {
-    /// Open a partitioned NDJSON file. If `array_to_ndjson` is true, the file is converted to NDJSON from an array.
+    /// Open a partitioned JSON file.
+    ///
+    /// Supports multiple JSON formats (JSONL, Array, Auto-detect) and optional
+    /// `json_pointer` extraction from JSON objects.
     ///
     /// If `unnest_struct` is set, the struct is unnested with the given separator.
     ///
@@ -220,7 +235,8 @@ impl FileOpener for SpiceJsonOpener {
             projected_nested_schema.unwrap_or(Arc::clone(&projected_flattened_schema));
         let batch_size = self.batch_size;
         let file_compression_type = self.file_compression_type;
-        let array_to_ndjson = self.array_to_ndjson;
+        let format = self.format;
+        let json_pointer = self.json_pointer.clone();
         let unnest_struct_separator = self.unnest_struct.clone();
         let file_range = partitioned_file.range.clone();
 
@@ -263,8 +279,35 @@ impl FileOpener for SpiceJsonOpener {
                         file_compression_type.convert_read(file.take(limit as u64))?
                     };
 
-                    let buf_reader = BufReader::new(bytes);
-                    let stream = if array_to_ndjson {
+                    // SODA format: convert to NDJSON via SodaReader
+                    if format == Format::Soda {
+                        let soda = SodaReader::new(bytes).map_err(DataFusionError::from)?;
+                        let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
+                            .with_batch_size(batch_size)
+                            .build(BufReader::new(soda))?;
+                        let stream = futures::stream::iter(reader).boxed();
+                        return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
+                    }
+
+                    // Apply json_pointer extraction if configured
+                    let reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
+                        Box::new(JsonPointerReader::new(bytes, path).map_err(DataFusionError::from)?)
+                    } else {
+                        bytes
+                    };
+                    let mut buf_reader = BufReader::new(reader);
+
+                    // Determine if the content is a JSON array
+                    let is_array = match format {
+                        Format::Array => true,
+                        Format::Jsonl | Format::Object => false,
+                        Format::Soda => unreachable!("handled above"),
+                        Format::Auto => {
+                            peek_first_non_ws_byte(&mut buf_reader).is_ok_and(|b| b == b'[')
+                        }
+                    };
+
+                    let stream = if is_array {
                         let adapter = ArrayToNdjson::try_new(buf_reader)?;
                         let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                             .with_batch_size(batch_size)
@@ -298,24 +341,107 @@ impl FileOpener for SpiceJsonOpener {
                     }
                 }
                 GetResultPayload::Stream(s) => {
-                    let s = s.map_err(DataFusionError::from);
+                    // SODA, json_pointer, Auto, Object all require buffering the full response
+                    if json_pointer.is_some() || matches!(format, Format::Auto | Format::Object | Format::Soda) {
+                        let s = s.map_err(DataFusionError::from);
+                        let decompressed =
+                            file_compression_type.convert_stream(s.boxed())?;
+                        let chunks: Vec<bytes::Bytes> = decompressed
+                            .try_collect()
+                            .await?;
 
-                    let decoder = ReaderBuilder::new(Arc::clone(&projected_schema))
-                        .with_batch_size(batch_size)
-                        .build_decoder()?;
-                    let input = file_compression_type.convert_stream(s.boxed())?.fuse();
+                        let total_len: usize = chunks.iter().map(bytes::Bytes::len).sum();
+                        let mut all_bytes = Vec::with_capacity(total_len);
+                        for chunk in &chunks {
+                            all_bytes.extend_from_slice(chunk);
+                        }
 
-                    Ok(deserialize_stream(
-                        input,
-                        DecoderDeserializer::new(SpiceJsonDecoder::new(
-                            decoder,
-                            array_to_ndjson,
-                            unnest_struct_separator,
-                            projected_flattened_schema,
-                        )),
-                    )
-                    .map(|b| b.map_err(DataFusionError::from))
-                    .boxed())
+                        // SODA format: convert to NDJSON via SodaReader
+                        if format == Format::Soda {
+                            let soda = SodaReader::new(std::io::Cursor::new(all_bytes))
+                                .map_err(DataFusionError::from)?;
+                            let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
+                                .with_batch_size(batch_size)
+                                .build(BufReader::new(soda))?;
+                            let stream = futures::stream::iter(reader).boxed();
+                            return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
+                        }
+
+                        let reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
+                            Box::new(
+                                JsonPointerReader::new(std::io::Cursor::new(all_bytes), path)
+                                    .map_err(DataFusionError::from)?,
+                            )
+                        } else {
+                            Box::new(std::io::Cursor::new(all_bytes))
+                        };
+                        let mut buf_reader = BufReader::new(reader);
+
+                        let is_array = match format {
+                            Format::Array => true,
+                            Format::Jsonl | Format::Object => false,
+                            Format::Soda => unreachable!("handled above"),
+                            Format::Auto => {
+                                peek_first_non_ws_byte(&mut buf_reader)
+                                    .is_ok_and(|b| b == b'[')
+                            }
+                        };
+
+                        let stream = if is_array {
+                            let adapter = ArrayToNdjson::try_new(buf_reader)?;
+                            let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
+                                .with_batch_size(batch_size)
+                                .build(adapter)?;
+                            futures::stream::iter(reader).boxed()
+                        } else {
+                            let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
+                                .with_batch_size(batch_size)
+                                .build(buf_reader)?;
+                            futures::stream::iter(reader).boxed()
+                        };
+
+                        if let Some(separator) = &unnest_struct_separator {
+                            let separator = separator.clone();
+                            Ok(stream
+                                .map(move |batch| {
+                                    batch
+                                        .map(|batch| {
+                                            extract_flattened_from_nested(
+                                                &batch,
+                                                &projected_flattened_schema,
+                                                &separator,
+                                            )
+                                            .unwrap_or(batch)
+                                        })
+                                        .map_err(DataFusionError::from)
+                                })
+                                .boxed())
+                        } else {
+                            Ok(stream
+                                .map(|b| b.map_err(DataFusionError::from))
+                                .boxed())
+                        }
+                    } else {
+                        let s = s.map_err(DataFusionError::from);
+
+                        let decoder = ReaderBuilder::new(Arc::clone(&projected_schema))
+                            .with_batch_size(batch_size)
+                            .build_decoder()?;
+                        let input =
+                            file_compression_type.convert_stream(s.boxed())?.fuse();
+
+                        Ok(deserialize_stream(
+                            input,
+                            DecoderDeserializer::new(SpiceJsonDecoder::new(
+                                decoder,
+                                matches!(format, Format::Array),
+                                unnest_struct_separator,
+                                projected_flattened_schema,
+                            )),
+                        )
+                        .map(|b| b.map_err(DataFusionError::from))
+                        .boxed())
+                    }
                 }
             }
         }))
