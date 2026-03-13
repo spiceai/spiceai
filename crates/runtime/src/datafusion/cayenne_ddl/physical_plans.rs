@@ -61,6 +61,38 @@ use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
 
+/// Builds a filesystem-safe partition label for persisted metadata and Hive-style paths.
+///
+/// Column expressions keep their column name when safe; non-column expressions use
+/// a stable generated label (`expr0`).
+fn partition_label_for_expr(partition_expr: &Expr) -> String {
+    let candidate = match partition_expr {
+        Expr::Column(col) => col.name.as_str(),
+        _ => "expr0",
+    };
+
+    let mut sanitized: String = candidate
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return "expr0".to_string();
+    }
+
+    if sanitized.starts_with('.') {
+        sanitized.insert(0, '_');
+    }
+
+    sanitized
+}
+
 /// Maps an Arrow [`DataType`] to a SQL type string suitable for DDL forwarding.
 ///
 /// Returns a SQL type that `DataFusion`'s SQL parser can understand in a
@@ -350,6 +382,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let executor_registry = self.executor_registry.clone();
         let partition_expr = self.partition_expr.clone();
         let partition_expr_sql = self.partition_expr_sql.clone();
+        let partition_label = partition_expr.as_ref().map(partition_label_for_expr);
         let result_schema = ddl_result_schema();
         let runtime_env = context.runtime_env();
 
@@ -462,10 +495,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 primary_key: primary_key.clone(),
                 on_conflict: on_conflict.clone(),
                 base_path: table_data_path.clone(),
-                partition_column: partition_expr
-                    .as_ref()
-                    .and_then(|expr| expr.column_refs().into_iter().next())
-                    .map(|col| col.name().to_string()),
+                partition_column: partition_label.clone(),
                 vortex_config: vortex_config.clone(),
             };
 
@@ -482,7 +512,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
             // Build the table provider: partitioned or non-partitioned
             let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
                 if let Some(ref partition_expr) = partition_expr {
-                    let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
+                    let df_schema = vortex_schema.as_ref().clone().to_dfschema()?;
                     let partition_expr_for_error = partition_expr_sql
                         .clone()
                         .unwrap_or_else(|| partition_expr.to_string());
@@ -492,9 +522,9 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         ))
                     })?;
 
-                    let partition_name = partition_expr_sql
+                    let partition_name = partition_label
                         .clone()
-                        .unwrap_or_else(|| partition_expr.to_string());
+                        .unwrap_or_else(|| partition_label_for_expr(partition_expr));
 
                     let partition_by = vec![PartitionedBy {
                         name: partition_name,
@@ -521,7 +551,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     let partition_provider = PartitionTableProvider::new(
                         creator,
                         partition_by,
-                        Arc::clone(&arrow_schema),
+                        Arc::clone(&vortex_schema),
                     )
                     .await
                     .map_err(|e| {
@@ -623,6 +653,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         )))
     }
 }
+
 
 /// Physical plan for creating a Cayenne schema.
 pub struct CayenneCreateSchemaExec {
@@ -942,5 +973,30 @@ impl ExecutionPlan for CayenneDropTableExec {
             ddl_result_schema(),
             stream,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::logical_expr::col;
+
+    use super::partition_label_for_expr;
+
+    #[test]
+    fn partition_label_for_expr_uses_column_name_when_safe() {
+        let expr = col("order_date");
+        assert_eq!(partition_label_for_expr(&expr), "order_date");
+    }
+
+    #[test]
+    fn partition_label_for_expr_uses_generated_label_for_non_column_expr() {
+        let expr = col("id").eq(datafusion::logical_expr::lit(1_i64));
+        assert_eq!(partition_label_for_expr(&expr), "expr0");
+    }
+
+    #[test]
+    fn partition_label_for_expr_sanitizes_unsafe_column_names() {
+        let expr = col("tenant/../id");
+        assert_eq!(partition_label_for_expr(&expr), "tenant____id");
     }
 }
