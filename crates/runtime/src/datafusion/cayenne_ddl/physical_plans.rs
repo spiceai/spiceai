@@ -71,7 +71,7 @@ fn partition_label_for_expr(partition_expr: &Expr) -> String {
         _ => "expr0",
     };
 
-    let mut sanitized: String = candidate
+    let sanitized: String = candidate
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
