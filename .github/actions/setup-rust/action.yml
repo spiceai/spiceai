@@ -71,8 +71,13 @@ runs:
         # runners share the same RUSTUP_HOME on one machine).
         echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
 
-        rustup run "$resolved" cargo --version
-        rustup run "$resolved" rustc --version
+        # Also add the toolchain's bin dir directly to PATH so that
+        # cargo/rustc are found even when the rustup proxy binaries
+        # in $CARGO_HOME/bin are missing or broken on self-hosted runners.
+        echo "${rustup_home}/toolchains/${resolved}/bin" >> "$GITHUB_PATH"
+
+        cargo --version
+        rustc --version
 
     - name: Install Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -117,5 +122,8 @@ runs:
 
         "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
 
-        rustup run $resolved cargo --version
-        rustup run $resolved rustc --version
+        $toolchainBin = "$rustupHome\toolchains\$resolved\bin"
+        $toolchainBin >> $env:GITHUB_PATH
+
+        cargo --version
+        rustc --version
