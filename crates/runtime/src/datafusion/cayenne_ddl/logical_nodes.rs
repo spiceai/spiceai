@@ -56,6 +56,8 @@ pub struct CayenneCreateTableNode {
     pub partition_expr: Option<Expr>,
     /// Original SQL text for the partition expression, preserved for forwarding.
     pub partition_expr_sql: Option<String>,
+    /// Primary key column names extracted from SQL constraints.
+    pub primary_key: Vec<String>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
@@ -77,6 +79,7 @@ impl CayenneCreateTableNode {
             or_replace: false,
             partition_expr: None,
             partition_expr_sql: None,
+            primary_key: Vec::new(),
         }
     }
 }
@@ -90,6 +93,7 @@ pub struct CayenneCreateTableNodeBuilder {
     df_schema_name: String,
     partition_expr: Option<Expr>,
     partition_expr_sql: Option<String>,
+    primary_key: Vec<String>,
 }
 
 impl CayenneCreateTableNodeBuilder {
@@ -118,6 +122,12 @@ impl CayenneCreateTableNodeBuilder {
     }
 
     #[must_use]
+    pub fn primary_key(mut self, primary_key: Vec<String>) -> Self {
+        self.primary_key = primary_key;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> CayenneCreateTableNode {
         CayenneCreateTableNode {
             table_name: self.table_name,
@@ -128,6 +138,7 @@ impl CayenneCreateTableNodeBuilder {
             df_schema_name: self.df_schema_name,
             partition_expr: self.partition_expr,
             partition_expr_sql: self.partition_expr_sql,
+            primary_key: self.primary_key,
             output_schema: ddl_output_schema(),
         }
     }
@@ -139,6 +150,7 @@ impl Hash for CayenneCreateTableNode {
         self.df_catalog_name.hash(state);
         self.df_schema_name.hash(state);
         self.partition_expr_sql.hash(state);
+        self.primary_key.hash(state);
     }
 }
 
@@ -148,6 +160,7 @@ impl PartialEq for CayenneCreateTableNode {
             && self.df_catalog_name == other.df_catalog_name
             && self.df_schema_name == other.df_schema_name
             && self.partition_expr_sql == other.partition_expr_sql
+            && self.primary_key == other.primary_key
     }
 }
 
@@ -208,6 +221,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             df_schema_name: self.df_schema_name.clone(),
             partition_expr,
             partition_expr_sql: self.partition_expr_sql.clone(),
+            primary_key: self.primary_key.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }

@@ -45,6 +45,8 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_table_providers::UnsupportedTypeAction;
+use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
@@ -189,6 +191,7 @@ pub struct CayenneCreateTableExec {
     if_not_exists: bool,
     df_catalog_name: String,
     df_schema_name: String,
+    primary_key: Vec<String>,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
     partition_expr: Option<Expr>,
@@ -203,6 +206,7 @@ impl fmt::Debug for CayenneCreateTableExec {
             .field("df_catalog_name", &self.df_catalog_name)
             .field("df_schema_name", &self.df_schema_name)
             .field("if_not_exists", &self.if_not_exists)
+            .field("primary_key", &self.primary_key)
             .finish_non_exhaustive()
     }
 }
@@ -213,6 +217,7 @@ pub struct CayenneCreateTableExecBuilder {
     if_not_exists: bool,
     df_catalog_name: String,
     df_schema_name: String,
+    primary_key: Vec<String>,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
     partition_expr: Option<Expr>,
@@ -225,6 +230,7 @@ impl CayenneCreateTableExecBuilder {
         arrow_schema: Arc<Schema>,
         df_catalog_name: String,
         df_schema_name: String,
+        primary_key: Vec<String>,
         catalog_list: Arc<dyn CatalogProviderList>,
     ) -> Self {
         Self {
@@ -233,6 +239,7 @@ impl CayenneCreateTableExecBuilder {
             if_not_exists: false,
             df_catalog_name,
             df_schema_name,
+            primary_key,
             catalog_list,
             executor_registry: None,
             partition_expr: None,
@@ -279,6 +286,7 @@ impl CayenneCreateTableExecBuilder {
             if_not_exists: self.if_not_exists,
             df_catalog_name: self.df_catalog_name,
             df_schema_name: self.df_schema_name,
+            primary_key: self.primary_key,
             catalog_list: self.catalog_list,
             executor_registry: self.executor_registry,
             partition_expr: self.partition_expr,
@@ -332,6 +340,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let if_not_exists = self.if_not_exists;
         let df_catalog_name = self.df_catalog_name.clone();
         let df_schema_name = self.df_schema_name.clone();
+        let primary_key = self.primary_key.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let executor_registry = self.executor_registry.clone();
         let partition_expr = self.partition_expr.clone();
@@ -433,13 +442,20 @@ impl ExecutionPlan for CayenneCreateTableExec {
             );
 
             let vortex_schema = Arc::new(vortex_schema);
+            let on_conflict = if primary_key.is_empty() {
+                None
+            } else {
+                Some(OnConflict::Upsert(ColumnReference::new(
+                    primary_key.clone(),
+                )))
+            };
 
             // Create table options with namespace-prefixed name
             let create_options = CreateTableOptions {
                 table_name: metadata_table_name.clone(),
                 schema: Arc::clone(&vortex_schema),
-                primary_key: Vec::new(),
-                on_conflict: None,
+                primary_key: primary_key.clone(),
+                on_conflict: on_conflict.clone(),
                 base_path: table_data_path.clone(),
                 partition_column: partition_expr
                     .as_ref()
@@ -490,10 +506,10 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         UnsupportedTypeAction::Error,
                         Vec::new(), // retention_filters
                         None,       // time_retention_filter_builder
-                        vortex_config,
+                        vortex_config.clone(),
                         None,       // object_store_config (local filesystem)
-                        Vec::new(), // primary_key
-                        None,       // on_conflict
+                        primary_key.clone(),
+                        on_conflict.clone(),
                         Arc::clone(&runtime_env),
                     ));
 
@@ -560,6 +576,17 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         Ok(format!("\"{}\" {sql_type}{null_str}", f.name()))
                     })
                     .collect::<DFResult<Vec<_>>>()?;
+
+                let mut table_elements = columns_sql;
+                if !primary_key.is_empty() {
+                    let pk_cols = primary_key
+                        .iter()
+                        .map(|c| format!("\"{c}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
+                }
+
                 let partition_clause = partition_expr
                     .as_ref()
                     .map(|expr| {
@@ -571,7 +598,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     .unwrap_or_default();
                 let ddl_sql = format!(
                     "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({}){partition_clause}",
-                    columns_sql.join(", ")
+                    table_elements.join(", ")
                 );
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
             }

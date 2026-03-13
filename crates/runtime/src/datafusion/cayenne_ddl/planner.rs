@@ -73,6 +73,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                     Arc::clone(&create.arrow_schema),
                     create.df_catalog_name.clone(),
                     create.df_schema_name.clone(),
+                    create.primary_key.clone(),
                     catalog_list,
                 )
                 .if_not_exists(create.if_not_exists)
