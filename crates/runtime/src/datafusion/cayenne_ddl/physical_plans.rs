@@ -16,14 +16,19 @@ limitations under the License.
 
 //! Physical execution plans for Cayenne DDL operations.
 //!
-//! `CayenneCreateTableExec` creates a new table in the Cayenne metadata catalog
-//! with data stored in S3 Express One Zone via Vortex columnar format.
+//! `CayenneCreateTableExec` registers a new table definition in the Cayenne
+//! metadata catalog via `metadata_catalog.create_table(...)`, then opens and
+//! registers the corresponding `TableProvider` in the `DataFusion` catalog.
+//! Depending on the presence of a `PARTITION BY` expression, it constructs
+//! either a partitioned `PartitionTableProvider` wrapped in
+//! `DeletionTableProviderAdapter` or a non-partitioned provider, with data
+//! stored in Vortex columnar format (typically in S3 Express One Zone).
 //!
-//! `CayenneCreateSchemaExec` registers a schema namespace in the `DataFusion` catalog
-//! for Cayenne-backed DDL catalogs.
+//! `CayenneCreateSchemaExec` registers a schema namespace in the `DataFusion`
+//! catalog for Cayenne-backed DDL catalogs.
 //!
-//! `CayenneDropTableExec` removes a table from both the Cayenne metadata catalog
-//! and the `DataFusion` catalog.
+//! `CayenneDropTableExec` removes a table from both the Cayenne metadata
+//! catalog and the `DataFusion` catalog.
 
 use std::any::Any;
 use std::fmt;

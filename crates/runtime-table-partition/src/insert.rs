@@ -130,7 +130,7 @@ impl ExecutionPlan for PartitionerExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        count_schema()
+        Arc::clone(self.properties().schema())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

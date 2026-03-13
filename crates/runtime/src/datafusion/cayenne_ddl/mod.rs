@@ -67,9 +67,12 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
     None
 }
 
-/// If the catalog provider implements [`PartitionAwareCatalog`], return a trait reference.
+/// If the catalog provider is Cayenne-backed and implements [`PartitionAwareCatalog`],
+/// return a trait reference.
 ///
-/// Handles both direct providers and `ComposedCatalogProvider` wrappers.
+/// Handles both direct [`CayenneCatalogProvider`] providers and
+/// [`ComposedCatalogProvider`] wrappers whose external provider is a
+/// [`CayenneCatalogProvider`].
 pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
     if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
         return Some(cayenne);
