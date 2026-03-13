@@ -155,7 +155,9 @@ impl TablePartitionMetadata {
             ..
         } in &self.partitions
         {
-            let exprs = partition_value
+            // Build a single AND-combined predicate for this partition:
+            //   key1 = val1 AND key2 = val2 AND ...
+            let partition_predicate = partition_value
                 .iter()
                 .map(|(proj, lit)| {
                     Ok(
@@ -164,11 +166,18 @@ impl TablePartitionMetadata {
                         ),
                     )
                 })
-                .collect::<Result<Vec<Expr>, DataFusionError>>()?;
+                .collect::<Result<Vec<Expr>, DataFusionError>>()?
+                .into_iter()
+                .reduce(Expr::and);
+
+            let Some(partition_predicate) = partition_predicate else {
+                continue;
+            };
+
             for executor in assigned_executors {
                 map.entry(executor.clone())
                     .or_default()
-                    .append(&mut exprs.clone());
+                    .push(partition_predicate.clone());
             }
         }
         Ok(map)

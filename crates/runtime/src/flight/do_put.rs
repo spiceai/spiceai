@@ -30,7 +30,6 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
-use futures::TryStreamExt as _;
 use opentelemetry::KeyValue;
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
@@ -203,22 +202,22 @@ pub(crate) async fn handle(
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
-    if let Some(executor_registry) = datafusion.executor_registry.as_ref() {
-        if should_forward_raw_cayenne_write(&datafusion, &path).await {
-            // TODO: resolve partition_by from table configuration
-            let partition_by: Vec<spicepod::partitioning::PartitionedBy> = vec![];
-            return crate::cluster::partition::write_through::forward_federated_partitioned_write(
-                executor_registry,
-                Arc::clone(&datafusion.ctx),
-                datafusion.io_runtime.clone(),
-                &path,
-                first_message,
-                streaming_flight,
-                &partition_by,
-            )
-            .await
-            .map_err(Into::into);
-        }
+    if let Some(executor_registry) = datafusion.executor_registry.as_ref()
+        && should_forward_raw_cayenne_write(&datafusion, &path).await
+    {
+        // TODO: resolve partition_by from table configuration
+        let partition_by: Vec<spicepod::partitioning::PartitionedBy> = vec![];
+        return crate::cluster::partition::write_through::forward_federated_partitioned_write(
+            executor_registry,
+            Arc::clone(&datafusion.ctx),
+            datafusion.io_runtime.clone(),
+            &path,
+            first_message,
+            streaming_flight,
+            &partition_by,
+        )
+        .await
+        .map_err(Into::into);
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)

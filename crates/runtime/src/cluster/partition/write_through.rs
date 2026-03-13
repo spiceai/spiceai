@@ -48,10 +48,10 @@ use spicepod::partitioning::PartitionedBy;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Cannot create partition metadata found for table {table}"))]
+    #[snafu(display("Failed to create partition metadata for table {table}"))]
     CreateMetadata {
         table: String,
-        source: super::manager::Error,
+        source: Box<super::manager::Error>,
     },
 
     #[snafu(display("Cannot find partition metadata for table {table}"))]
@@ -131,7 +131,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to persist partition assignment: {source}"))]
-    PersistAssignment { source: super::manager::Error },
+    PersistAssignment { source: Box<super::manager::Error> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -171,8 +171,9 @@ pub(crate) async fn forward_federated_partitioned_write(
             partition_manager
                 .initialize_blank_metadata(path)
                 .await
-                .context(CreateMetadataSnafu {
+                .map_err(|source| Error::CreateMetadata {
                     table: path.to_string(),
+                    source: Box::new(source),
                 })?;
             partition_manager
                 .get_cached_table_metadata(path)
@@ -336,7 +337,9 @@ async fn route_batch_and_assign_unseen(
         partition_manager
             .add_and_assign_partition(path, &partition_value, &executor_id)
             .await
-            .context(PersistAssignmentSnafu)?;
+            .map_err(|source| Error::PersistAssignment {
+                source: Box::new(source),
+            })?;
 
         tracing::debug!(
             table = %path,
@@ -483,26 +486,32 @@ async fn spawn_executor_forwarding_tasks(
     HashMap<String, Sender<RecordBatch>>,
     Vec<tokio::task::JoinHandle<Result<()>>>,
 )> {
-    let clients = executor_registry.flight_sql_clients.read().await;
-    let mut senders: HashMap<String, Sender<RecordBatch>> = HashMap::new();
-    let mut join_handles = Vec::new();
-
+    // Resolve auth header and clone clients before holding the lock across spawns.
     let auth_header = RequestContext::current(AsyncMarker::new().await)
         .authorization_header()
         .map(str::to_string);
 
-    for executor_id in executors {
-        let client = clients
-            .get(executor_id)
-            .cloned()
-            .ok_or_else(|| Error::NoClient {
-                executor_id: executor_id.clone(),
-            })?;
+    let executor_clients: Vec<(ExecutorId, data_components::flightsql::FlightSqlClient)> = {
+        let clients = executor_registry.flight_sql_clients.read().await;
+        executors
+            .iter()
+            .map(|id| {
+                let client = clients.get(id).cloned().ok_or_else(|| Error::NoClient {
+                    executor_id: id.clone(),
+                })?;
+                Ok((id.clone(), client))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
+    let mut senders: HashMap<String, Sender<RecordBatch>> = HashMap::new();
+    let mut join_handles = Vec::new();
+
+    for (executor_id, client) in executor_clients {
         let (tx, rx) = mpsc::channel::<RecordBatch>(64);
-        senders.insert(executor_id.clone(), tx);
+        senders.insert(executor_id, tx);
 
-        join_handles.push(tokio::spawn(forward_batches_to_executor(
+        join_handles.push(io_runtime.spawn(forward_batches_to_executor(
             client,
             rx,
             Arc::clone(schema),
