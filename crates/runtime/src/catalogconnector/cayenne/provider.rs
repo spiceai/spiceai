@@ -41,6 +41,8 @@ use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
 use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 
+use crate::catalogconnector::PartitionAwareCatalog;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to initialize Cayenne catalog: {source}"))]
@@ -273,6 +275,18 @@ impl CatalogProvider for CayenneCatalogProvider {
         schema: Arc<dyn SchemaProvider>,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
         self.register_schema_provider(name, schema)
+    }
+}
+
+#[async_trait]
+impl PartitionAwareCatalog for CayenneCatalogProvider {
+    async fn table_partition_expr(&self, schema_name: &str, table_name: &str) -> Option<String> {
+        let metadata_table_name = format!("{schema_name}/{table_name}");
+        self.catalog
+            .get_table(&metadata_table_name)
+            .await
+            .ok()?
+            .partition_column
     }
 }
 

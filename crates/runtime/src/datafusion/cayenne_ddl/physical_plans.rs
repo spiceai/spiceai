@@ -27,6 +27,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
@@ -37,15 +38,19 @@ use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapte
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::col;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_table_providers::UnsupportedTypeAction;
+use runtime_table_partition::expression::PartitionedBy;
+use runtime_table_partition::provider::PartitionTableProvider;
 
 use super::get_cayenne_provider;
 use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
 
 /// Maps an Arrow [`DataType`] to a SQL type string suitable for DDL forwarding.
@@ -98,44 +103,58 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
         return Ok(());
     }
 
-    let mut success_count = 0usize;
-    for (executor_id, client) in clients.iter() {
-        let mut client = client.clone();
-        let result: Result<(), String> = async {
-            use futures::StreamExt;
+    let futures: Vec<_> = clients
+        .iter()
+        .map(|(executor_id, client)| {
+            let mut client = client.clone();
+            let sql = sql.to_string();
+            let executor_id = executor_id.clone();
+            async move {
+                use futures::StreamExt;
 
-            let flight_info = client
-                .execute(sql.to_string(), None)
-                .await
-                .map_err(|e| e.to_string())?;
+                let result: Result<(), String> = async {
+                    let flight_info = client
+                        .execute(sql.clone(), None)
+                        .await
+                        .map_err(|e| e.to_string())?;
 
-            for endpoint in flight_info.endpoint {
-                let Some(ticket) = endpoint.ticket else {
-                    continue;
-                };
+                    for endpoint in flight_info.endpoint {
+                        let Some(ticket) = endpoint.ticket else {
+                            continue;
+                        };
 
-                let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
-                while let Some(batch) = stream.next().await {
-                    batch.map_err(|e| e.to_string())?;
+                        let mut stream =
+                            client.do_get(ticket).await.map_err(|e| e.to_string())?;
+                        while let Some(batch) = stream.next().await {
+                            batch.map_err(|e| e.to_string())?;
+                        }
+                    }
+
+                    Ok(())
                 }
-            }
+                .await;
 
-            Ok(())
-        }
-        .await;
+                match &result {
+                    Ok(()) => {
+                        tracing::debug!(executor_id, sql, "Forwarded Cayenne DDL to executor");
+                    }
+                    Err(e) => {
+                        tracing::warn!(executor_id, sql, error = %e, "Failed to forward Cayenne DDL to executor");
+                    }
+                }
 
-        match result {
-            Ok(()) => {
-                success_count += 1;
-                tracing::debug!(executor_id, sql, "Forwarded Cayenne DDL to executor");
+                result.is_ok()
             }
-            Err(e) => {
-                tracing::warn!(executor_id, sql, error = %e, "Failed to forward Cayenne DDL to executor");
-            }
-        }
-    }
+        })
+        .collect();
 
-    if success_count == 0 {
+    // Release the read lock before awaiting the futures.
+    drop(clients);
+
+    let results = futures::future::join_all(futures).await;
+    let success_count = results.iter().filter(|&&ok| ok).count();
+
+    if success_count == 0 && !results.is_empty() {
         return Err(DataFusionError::Execution(format!(
             "Failed to forward Cayenne DDL to any executor: {sql}"
         )));
@@ -171,6 +190,7 @@ pub struct CayenneCreateTableExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    partition_expr: Option<String>,
     properties: PlanProperties,
 }
 
@@ -195,6 +215,7 @@ impl CayenneCreateTableExec {
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
         executor_registry: Option<Arc<ExecutorRegistry>>,
+        partition_expr: Option<String>,
     ) -> Self {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -211,6 +232,7 @@ impl CayenneCreateTableExec {
             df_schema_name,
             catalog_list,
             executor_registry,
+            partition_expr,
             properties,
         }
     }
@@ -262,6 +284,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let df_schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let executor_registry = self.executor_registry.clone();
+        let partition_expr = self.partition_expr.clone();
         let result_schema = ddl_result_schema();
         let runtime_env = context.runtime_env();
 
@@ -358,33 +381,90 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 data_base_path.trim_end_matches('/').to_string() + "/"
             );
 
+            let vortex_schema = Arc::new(vortex_schema);
+
             // Create table options with namespace-prefixed name
             let create_options = CreateTableOptions {
                 table_name: metadata_table_name.clone(),
-                schema: Arc::new(vortex_schema),
+                schema: Arc::clone(&vortex_schema),
                 primary_key: Vec::new(),
                 on_conflict: None,
-                base_path: table_data_path,
-                partition_column: None,
-                vortex_config,
+                base_path: table_data_path.clone(),
+                partition_column: partition_expr.clone(),
+                vortex_config: vortex_config.clone(),
             };
 
-            // Create the table via Cayenne
-            let builder = CayenneTableProviderBuilder::new(
-                Arc::clone(&metadata_catalog),
-                Arc::clone(&runtime_env),
-            );
+            // Register the table in the Cayenne metadata catalog
+            let table_id = metadata_catalog
+                .create_table(create_options)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to create Cayenne table '{table_name}': {e}"
+                    ))
+                })?;
 
-            let provider = builder.create(create_options).await.map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to create Cayenne table '{table_name}': {e}"
-                ))
-            })?;
-
-            let provider = Arc::new(provider);
-            let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
+            // Build the table provider: partitioned or non-partitioned
             let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
-                Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
+                if let Some(ref partition_col) = partition_expr {
+                    // Resolve the partition column from the schema
+                    if vortex_schema.field_with_name(partition_col).is_err() {
+                        return Err(DataFusionError::Execution(format!(
+                            "Partition column '{partition_col}' not found in table schema"
+                        )));
+                    }
+
+                    let partition_by = vec![PartitionedBy {
+                        name: partition_col.clone(),
+                        expression: col(partition_col),
+                    }];
+
+                    let creator = Arc::new(CayennePartitionCreator::new(
+                        metadata_table_name.clone(),
+                        PathBuf::from(&table_data_path),
+                        partition_by.clone(),
+                        Arc::clone(&vortex_schema),
+                        Arc::clone(&metadata_catalog),
+                        table_id,
+                        UnsupportedTypeAction::Error,
+                        Vec::new(), // retention_filters
+                        None,       // time_retention_filter_builder
+                        vortex_config,
+                        None,       // object_store_config (local filesystem)
+                        Vec::new(), // primary_key
+                        None,       // on_conflict
+                        Arc::clone(&runtime_env),
+                    ));
+
+                    let partition_provider = PartitionTableProvider::new(
+                        creator,
+                        partition_by,
+                        Arc::clone(&arrow_schema),
+                    )
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to create partitioned table '{table_name}': {e}"
+                        ))
+                    })?;
+
+                    Arc::new(partition_provider) as Arc<dyn datafusion::catalog::TableProvider>
+                } else {
+                    // Non-partitioned: open the table we just created
+                    let builder = CayenneTableProviderBuilder::new(
+                        Arc::clone(&metadata_catalog),
+                        Arc::clone(&runtime_env),
+                    );
+                    let provider = builder.open(&metadata_table_name).await.map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to open Cayenne table '{table_name}': {e}"
+                        ))
+                    })?;
+                    let provider = Arc::new(provider);
+                    let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
+                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
+                        as Arc<dyn datafusion::catalog::TableProvider>
+                };
 
             // Ensure the schema exists, creating it on demand if needed
             let schema_provider = if let Some(s) = cayenne_provider.schema_provider(&df_schema_name)
@@ -416,8 +496,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         Ok(format!("\"{}\" {sql_type}{null_str}", f.name()))
                     })
                     .collect::<DFResult<Vec<_>>>()?;
+                let partition_clause = partition_expr
+                    .as_deref()
+                    .map_or(String::new(), |col| format!(" PARTITION BY (\"{col}\")"));
                 let ddl_sql = format!(
-                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
+                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({}){partition_clause}",
                     columns_sql.join(", ")
                 );
                 forward_ddl_to_executors(registry, &ddl_sql).await?;

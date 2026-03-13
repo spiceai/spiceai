@@ -440,8 +440,10 @@ impl DataFusionBuilder {
         #[cfg(not(windows))]
         ctx.add_analyzer_rule(Arc::new(
             super::cayenne_ddl::analyzer_rule::CayenneDdlAnalyzerRule::new(
+                ctx.state_weak_ref(),
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
             ),
         ));
 

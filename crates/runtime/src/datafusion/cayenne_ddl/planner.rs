@@ -75,6 +75,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 create.df_schema_name.clone(),
                 catalog_list,
                 self.executor_registry.clone(),
+                create.partition_expr.clone(),
             ))));
         }
 

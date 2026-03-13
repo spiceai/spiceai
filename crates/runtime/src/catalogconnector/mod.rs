@@ -307,6 +307,19 @@ pub trait CatalogConnector: Send + Sync {
     }
 }
 
+/// Trait for catalog providers that can report partition expressions for their tables.
+///
+/// Implementations read partition metadata from the catalog's own persistent storage,
+/// ensuring partition information survives runtime restarts.
+#[async_trait]
+pub trait PartitionAwareCatalog: Send + Sync {
+    /// Returns the partition expression for a table, if one was defined at creation time.
+    ///
+    /// The returned string is the partition column name as stored in the catalog metadata
+    /// (e.g. `"region"` for `PARTITION BY region`).
+    async fn table_partition_expr(&self, schema_name: &str, table_name: &str) -> Option<String>;
+}
+
 pub async fn get_catalog_provider(
     connector: Arc<dyn CatalogConnector>,
     runtime: Arc<Runtime>,
