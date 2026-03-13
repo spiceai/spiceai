@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::file_format::{Format, SpiceJsonDecoder};
-use crate::{ArrayToNdjson, JsonPointerReader, SodaReader, nest_struct_schema, peek_first_non_ws_byte};
+use crate::{
+    ArrayToNdjson, JsonPointerReader, SodaReader, nest_struct_schema, peek_first_non_ws_byte,
+};
 use crate::{extract_flattened_from_nested, project_nested_schema};
 
 use datafusion::error::{DataFusionError, Result};
@@ -55,30 +57,7 @@ pub struct SpiceJsonOpener {
     unnest_struct: Option<String>,
 }
 
-impl SpiceJsonOpener {
-    /// Returns a  [`SpiceJsonOpener`]
-    pub fn new(
-        batch_size: usize,
-        base_flattened_schema: SchemaRef,
-        projected_schema: SchemaRef,
-        file_compression_type: FileCompressionType,
-        object_store: Arc<dyn ObjectStore>,
-        format: Format,
-        json_pointer: Option<String>,
-        unnest_struct: Option<String>,
-    ) -> Self {
-        Self {
-            batch_size,
-            base_flattened_schema,
-            projected_schema,
-            file_compression_type,
-            object_store,
-            format,
-            json_pointer,
-            unnest_struct,
-        }
-    }
-}
+impl SpiceJsonOpener {}
 
 /// `SpiceJsonSource` holds the extra configuration that is necessary for [`SpiceJsonOpener`]
 #[derive(Clone)]
@@ -291,7 +270,9 @@ impl FileOpener for SpiceJsonOpener {
 
                     // Apply json_pointer extraction if configured
                     let reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
-                        Box::new(JsonPointerReader::new(bytes, path).map_err(DataFusionError::from)?)
+                        Box::new(
+                            JsonPointerReader::new(bytes, path).map_err(DataFusionError::from)?,
+                        )
                     } else {
                         bytes
                     };
@@ -342,13 +323,12 @@ impl FileOpener for SpiceJsonOpener {
                 }
                 GetResultPayload::Stream(s) => {
                     // SODA, json_pointer, Auto, Object all require buffering the full response
-                    if json_pointer.is_some() || matches!(format, Format::Auto | Format::Object | Format::Soda) {
+                    if json_pointer.is_some()
+                        || matches!(format, Format::Auto | Format::Object | Format::Soda)
+                    {
                         let s = s.map_err(DataFusionError::from);
-                        let decompressed =
-                            file_compression_type.convert_stream(s.boxed())?;
-                        let chunks: Vec<bytes::Bytes> = decompressed
-                            .try_collect()
-                            .await?;
+                        let decompressed = file_compression_type.convert_stream(s.boxed())?;
+                        let chunks: Vec<bytes::Bytes> = decompressed.try_collect().await?;
 
                         let total_len: usize = chunks.iter().map(bytes::Bytes::len).sum();
                         let mut all_bytes = Vec::with_capacity(total_len);
@@ -382,8 +362,7 @@ impl FileOpener for SpiceJsonOpener {
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
                             Format::Auto => {
-                                peek_first_non_ws_byte(&mut buf_reader)
-                                    .is_ok_and(|b| b == b'[')
+                                peek_first_non_ws_byte(&mut buf_reader).is_ok_and(|b| b == b'[')
                             }
                         };
 
@@ -417,9 +396,7 @@ impl FileOpener for SpiceJsonOpener {
                                 })
                                 .boxed())
                         } else {
-                            Ok(stream
-                                .map(|b| b.map_err(DataFusionError::from))
-                                .boxed())
+                            Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed())
                         }
                     } else {
                         let s = s.map_err(DataFusionError::from);
@@ -427,8 +404,7 @@ impl FileOpener for SpiceJsonOpener {
                         let decoder = ReaderBuilder::new(Arc::clone(&projected_schema))
                             .with_batch_size(batch_size)
                             .build_decoder()?;
-                        let input =
-                            file_compression_type.convert_stream(s.boxed())?.fuse();
+                        let input = file_compression_type.convert_stream(s.boxed())?.fuse();
 
                         Ok(deserialize_stream(
                             input,

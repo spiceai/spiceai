@@ -260,8 +260,7 @@ impl FileFormat for SpiceJsonFormat {
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
                             Format::Auto => {
-                                peek_first_non_ws_byte(&mut reader)
-                                    .is_ok_and(|b| b == b'[')
+                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
                             }
                         };
 
@@ -302,8 +301,7 @@ impl FileFormat for SpiceJsonFormat {
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
                             Format::Auto => {
-                                peek_first_non_ws_byte(&mut reader)
-                                    .is_ok_and(|b| b == b'[')
+                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
                             }
                         };
 

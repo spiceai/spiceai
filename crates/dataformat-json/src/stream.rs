@@ -351,9 +351,18 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
         // Try to match a leading UTF-8 BOM before anything else.
         if bom < 3 {
             match (bom, byte[0]) {
-                (0, 0xEF) => { bom = 1; continue; }
-                (1, 0xBB) => { bom = 2; continue; }
-                (2, 0xBF) => { bom = 3; continue; }
+                (0, 0xEF) => {
+                    bom = 1;
+                    continue;
+                }
+                (1, 0xBB) => {
+                    bom = 2;
+                    continue;
+                }
+                (2, 0xBF) => {
+                    bom = 3;
+                    continue;
+                }
                 // Incomplete BOM prefix — the bytes read so far aren't
                 // whitespace or the expected character, so the input is
                 // invalid.
@@ -366,7 +375,9 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
                         ),
                     ));
                 }
-                _ => { bom = 3; } // No BOM; fall through to normal check
+                _ => {
+                    bom = 3;
+                } // No BOM; fall through to normal check
             }
         }
         match byte[0] {
@@ -514,14 +525,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 /// Maps a Socrata `dataTypeName` string to an Arrow [`DataType`].
 fn soda_type_to_arrow(data_type_name: &str) -> DataType {
     match data_type_name {
-        "text" | "url" | "html" | "email" | "phone" | "photo" | "document" | "drop_down_list"
-        | "dataset_link" | "flag" => DataType::Utf8,
         "number" | "money" | "percent" => DataType::Float64,
-        "calendar_date" | "date" => DataType::Utf8,
         "checkbox" => DataType::Boolean,
-        "point" | "multipoint" | "location" | "line" | "multiline" | "polygon" | "multipolygon" => {
-            DataType::Utf8
-        }
         _ => DataType::Utf8,
     }
 }
@@ -653,7 +658,10 @@ impl SodaReader {
             let mut obj = serde_json::Map::with_capacity(visible_indices.len());
             for (field_idx, &col_idx) in visible_indices.iter().enumerate() {
                 let field = &schema.fields()[field_idx];
-                let val = row_arr.get(col_idx).cloned().unwrap_or(serde_json::Value::Null);
+                let val = row_arr
+                    .get(col_idx)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 obj.insert(field.name().clone(), val);
             }
 
@@ -1814,8 +1822,7 @@ mod tests {
         #[test]
         fn test_peek_array() {
             let mut reader = BufReader::new(Cursor::new(b"  [ {\"a\": 1} ]"));
-            let byte =
-                peek_first_non_ws_byte(&mut reader).expect("should peek");
+            let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             assert_eq!(byte, b'[');
             // The reader should still contain the '[' for downstream consumers
             let mut rest = String::new();
@@ -1826,33 +1833,29 @@ mod tests {
         #[test]
         fn test_peek_object() {
             let mut reader = BufReader::new(Cursor::new(b"\n\t {\"key\": 1}"));
-            let byte =
-                peek_first_non_ws_byte(&mut reader).expect("should peek");
+            let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             assert_eq!(byte, b'{');
         }
 
         #[test]
         fn test_peek_jsonl() {
-            let mut reader =
-                BufReader::new(Cursor::new(b"{\"a\":1}\n{\"a\":2}"));
-            let byte =
-                peek_first_non_ws_byte(&mut reader).expect("should peek");
+            let mut reader = BufReader::new(Cursor::new(b"{\"a\":1}\n{\"a\":2}"));
+            let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             assert_eq!(byte, b'{');
         }
 
         #[test]
         fn test_peek_empty() {
             let mut reader = BufReader::new(Cursor::new(b""));
-            let err = peek_first_non_ws_byte(&mut reader)
-                .expect_err("should fail on empty");
+            let err = peek_first_non_ws_byte(&mut reader).expect_err("should fail on empty");
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         }
 
         #[test]
         fn test_peek_whitespace_only() {
             let mut reader = BufReader::new(Cursor::new(b"   \n\t  "));
-            let err = peek_first_non_ws_byte(&mut reader)
-                .expect_err("should fail on whitespace-only");
+            let err =
+                peek_first_non_ws_byte(&mut reader).expect_err("should fail on whitespace-only");
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         }
     }
@@ -1997,8 +2000,7 @@ mod tests {
         #[test]
         fn test_array_nested_complex() {
             let input = Cursor::new(
-                br#"[{"tags":["rust","json"],"meta":{"v":1}},{"tags":[],"meta":{"v":2}}]"#
-                    .to_vec(),
+                br#"[{"tags":["rust","json"],"meta":{"v":1}},{"tags":[],"meta":{"v":2}}]"#.to_vec(),
             );
             let mut adapter = ArrayToNdjson::try_new(input).expect("should parse");
             let lines = read_all_lines(&mut adapter).expect("should read lines");
@@ -2019,9 +2021,7 @@ mod tests {
         /// JSON array with deeply nested structures
         #[test]
         fn test_array_deeply_nested() {
-            let input = Cursor::new(
-                br#"[{"l1":{"l2":{"l3":{"l4":"deep"}}}}]"#.to_vec(),
-            );
+            let input = Cursor::new(br#"[{"l1":{"l2":{"l3":{"l4":"deep"}}}}]"#.to_vec());
             let mut adapter = ArrayToNdjson::try_new(input).expect("should parse");
             let lines = read_all_lines(&mut adapter).expect("should read lines");
             assert_eq!(lines.len(), 1);
@@ -2035,8 +2035,8 @@ mod tests {
         fn test_object_single() {
             let input = br#"{"name":"Alice","age":30,"active":true}"#;
             // A single object is valid NDJSON (one line)
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains("Alice"));
         }
@@ -2063,8 +2063,8 @@ mod tests {
         #[test]
         fn test_object_with_nulls() {
             let input = br#"{"name":"Alice","middle_name":null,"scores":[null,95,null]}"#;
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains("null"));
         }
@@ -2073,8 +2073,8 @@ mod tests {
         #[test]
         fn test_object_mixed_types() {
             let input = br#"{"string":"hello","int":42,"float":3.14,"bool":true,"null_val":null,"array":[1,2],"nested":{"key":"val"}}"#;
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains("3.14"));
             assert!(lines[0].contains("\"key\":\"val\""));
@@ -2084,8 +2084,8 @@ mod tests {
         #[test]
         fn test_object_empty() {
             let input = b"{}";
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0], "{}");
         }
@@ -2234,8 +2234,8 @@ mod tests {
         #[test]
         fn test_unicode_content() {
             let input = r#"{"emoji":"🚀","jp":"日本語","name":"Ñoño"}"#;
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_bytes())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_bytes()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains("🚀"));
             assert!(lines[0].contains("日本語"));
@@ -2245,8 +2245,8 @@ mod tests {
         #[test]
         fn test_escaped_content() {
             let input = br#"{"path":"C:\\Users\\test","quote":"He said \"hello\""}"#;
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains(r#"C:\\Users\\test"#));
         }
@@ -2273,9 +2273,10 @@ mod tests {
         /// JSON with numeric precision edge cases
         #[test]
         fn test_numeric_precision() {
-            let input = br#"{"big":9007199254740993,"tiny":0.000000001,"neg":-1.5e10,"sci":1.23e-4}"#;
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let input =
+                br#"{"big":9007199254740993,"tiny":0.000000001,"neg":-1.5e10,"sci":1.23e-4}"#;
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].contains("9007199254740993"));
         }
@@ -2284,8 +2285,8 @@ mod tests {
         #[test]
         fn test_jsonl_trailing_newline() {
             let input = b"{\"a\":1}\n{\"b\":2}\n";
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 2);
         }
 
@@ -2293,8 +2294,8 @@ mod tests {
         #[test]
         fn test_jsonl_no_trailing_newline() {
             let input = b"{\"a\":1}\n{\"b\":2}";
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 2);
         }
 
@@ -2320,8 +2321,8 @@ mod tests {
         fn test_long_string_values() {
             let long_val: String = "x".repeat(10_000);
             let input = format!(r#"{{"data":"{long_val}"}}"#);
-            let lines = read_all_lines(BufReader::new(Cursor::new(input.as_bytes())))
-                .expect("should read");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(input.as_bytes()))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert!(lines[0].len() > 10_000);
         }
@@ -2332,8 +2333,7 @@ mod tests {
             let input = br#"{"data":[{"id":1},{"id":2},{"id":3}]}"#;
             let reader = JsonPointerReader::new(Cursor::new(input.to_vec()), "/data")
                 .expect("should extract");
-            let mut adapter =
-                ArrayToNdjson::try_new(reader).expect("should parse extracted array");
+            let mut adapter = ArrayToNdjson::try_new(reader).expect("should parse extracted array");
             let lines = read_all_lines(&mut adapter).expect("should read");
             assert_eq!(lines.len(), 3);
             assert_eq!(lines[0], r#"{"id":1}"#);
@@ -2369,7 +2369,10 @@ mod tests {
         use std::io::Cursor;
 
         /// Helper: build a minimal SODA response JSON string.
-        fn soda_response(columns: &[(&str, &str, &str)], data: &[Vec<serde_json::Value>]) -> String {
+        fn soda_response(
+            columns: &[(&str, &str, &str)],
+            data: &[Vec<serde_json::Value>],
+        ) -> String {
             let cols: Vec<serde_json::Value> = columns
                 .iter()
                 .enumerate()
@@ -2415,10 +2418,7 @@ mod tests {
         #[test]
         fn test_soda_schema_all_meta_data_filtered() {
             let input = soda_response(
-                &[
-                    (":sid", "meta_data", "SID"),
-                    (":id", "meta_data", "ID"),
-                ],
+                &[(":sid", "meta_data", "SID"), (":id", "meta_data", "ID")],
                 &[],
             );
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
@@ -2449,10 +2449,8 @@ mod tests {
                 ("f_html", "html", DataType::Utf8),
                 ("f_unknown", "some_new_type", DataType::Utf8),
             ];
-            let columns: Vec<(&str, &str, &str)> = types
-                .iter()
-                .map(|(f, t, _)| (*f, *t, *f))
-                .collect();
+            let columns: Vec<(&str, &str, &str)> =
+                types.iter().map(|(f, t, _)| (*f, *t, *f)).collect();
             let input = soda_response(&columns, &[]);
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
             let schema = soda_schema_from_meta(&val).expect("should extract schema");
@@ -2537,8 +2535,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let row: serde_json::Value =
-                serde_json::from_str(output.trim()).expect("parse row");
+            let row: serde_json::Value = serde_json::from_str(output.trim()).expect("parse row");
             assert!(row["name"].is_null());
             assert!(row["age"].is_null());
         }
@@ -2570,8 +2567,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let row: serde_json::Value =
-                serde_json::from_str(output.trim()).expect("parse row");
+            let row: serde_json::Value = serde_json::from_str(output.trim()).expect("parse row");
             assert_eq!(row["city"], "Seattle");
             assert_eq!(row["population"], 750_000);
             // Meta columns should not appear in output
@@ -2582,7 +2578,8 @@ mod tests {
 
         #[test]
         fn test_soda_reader_missing_data_field() {
-            let input = r#"{"meta":{"view":{"columns":[{"fieldName":"name","dataTypeName":"text"}]}}}"#;
+            let input =
+                r#"{"meta":{"view":{"columns":[{"fieldName":"name","dataTypeName":"text"}]}}}"#;
             let err = SodaReader::new(Cursor::new(input.as_bytes()))
                 .expect_err("should fail: no data field");
             assert!(err.to_string().contains("missing 'data' array"));
@@ -2619,8 +2616,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let row: serde_json::Value =
-                serde_json::from_str(output.trim()).expect("parse row");
+            let row: serde_json::Value = serde_json::from_str(output.trim()).expect("parse row");
             assert_eq!(row["name"], "Alice");
             assert!(row["age"].is_null());
         }
@@ -2628,10 +2624,7 @@ mod tests {
         #[test]
         fn test_soda_reader_preserves_nested_json() {
             let input = soda_response(
-                &[
-                    ("name", "text", "Name"),
-                    ("coords", "point", "Coordinates"),
-                ],
+                &[("name", "text", "Name"), ("coords", "point", "Coordinates")],
                 &[vec![
                     serde_json::json!("Central Park"),
                     serde_json::json!({"lat": 40.785, "lon": -73.968}),
@@ -2641,8 +2634,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let row: serde_json::Value =
-                serde_json::from_str(output.trim()).expect("parse row");
+            let row: serde_json::Value = serde_json::from_str(output.trim()).expect("parse row");
             assert_eq!(row["name"], "Central Park");
             assert_eq!(row["coords"]["lat"], 40.785);
         }
@@ -2674,7 +2666,11 @@ mod tests {
             let schema = soda_schema_from_meta(&val).expect("should extract schema");
             // All SODA columns should be nullable
             for field in schema.fields() {
-                assert!(field.is_nullable(), "field '{}' should be nullable", field.name());
+                assert!(
+                    field.is_nullable(),
+                    "field '{}' should be nullable",
+                    field.name()
+                );
             }
         }
     }
@@ -2820,9 +2816,7 @@ mod tests {
         /// Auto detects array with many elements
         #[test]
         fn test_auto_array_many_elements() {
-            let elements: Vec<String> = (0..200)
-                .map(|i| format!(r#"{{"id":{i}}}"#))
-                .collect();
+            let elements: Vec<String> = (0..200).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
             let input = format!("[{}]", elements.join(","));
             let lines = auto_detect_and_read(input.as_bytes()).expect("should read");
             assert_eq!(lines.len(), 200);
@@ -3084,11 +3078,8 @@ mod tests {
         #[test]
         fn test_auto_json_pointer_extracts_array() {
             let input = br#"{"response":{"data":[{"id":1},{"id":2}]}}"#;
-            let extracted = JsonPointerReader::new(
-                Cursor::new(input.to_vec()),
-                "/response/data",
-            )
-            .expect("should extract");
+            let extracted = JsonPointerReader::new(Cursor::new(input.to_vec()), "/response/data")
+                .expect("should extract");
 
             let mut reader = BufReader::new(extracted);
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
@@ -3103,11 +3094,8 @@ mod tests {
         #[test]
         fn test_auto_json_pointer_extracts_object() {
             let input = br#"{"wrapper":{"name":"test","value":99}}"#;
-            let extracted = JsonPointerReader::new(
-                Cursor::new(input.to_vec()),
-                "/wrapper",
-            )
-            .expect("should extract");
+            let extracted = JsonPointerReader::new(Cursor::new(input.to_vec()), "/wrapper")
+                .expect("should extract");
 
             let mut reader = BufReader::new(extracted);
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
@@ -3122,11 +3110,8 @@ mod tests {
         #[test]
         fn test_auto_json_pointer_extracts_scalar() {
             let input = br#"{"meta":{"count":42}}"#;
-            let extracted = JsonPointerReader::new(
-                Cursor::new(input.to_vec()),
-                "/meta/count",
-            )
-            .expect("should extract");
+            let extracted = JsonPointerReader::new(Cursor::new(input.to_vec()), "/meta/count")
+                .expect("should extract");
 
             let mut reader = BufReader::new(extracted);
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
@@ -3210,9 +3195,7 @@ mod tests {
         /// Large payload auto-detected as JSONL
         #[test]
         fn test_auto_jsonl_large_payload() {
-            let lines_input: Vec<String> = (0..500)
-                .map(|i| format!(r#"{{"id":{i}}}"#))
-                .collect();
+            let lines_input: Vec<String> = (0..500).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
             let input = lines_input.join("\n");
             let lines = auto_detect_and_read(input.as_bytes()).expect("should read");
             assert_eq!(lines.len(), 500);
@@ -3260,7 +3243,10 @@ mod tests {
             let input = br#"[null,null,null]"#;
             // ArrayToNdjson uses RawValue which doesn't handle bare scalars
             let result = auto_detect_and_read(input);
-            assert!(result.is_err(), "bare null elements should fail in ArrayToNdjson");
+            assert!(
+                result.is_err(),
+                "bare null elements should fail in ArrayToNdjson"
+            );
         }
 
         /// Array with numeric elements — ArrayToNdjson doesn't handle bare scalars,
@@ -3270,7 +3256,10 @@ mod tests {
             let input = br#"[1,2,3,4,5]"#;
             // ArrayToNdjson uses RawValue which doesn't handle bare scalars
             let result = auto_detect_and_read(input);
-            assert!(result.is_err(), "bare numeric elements should fail in ArrayToNdjson");
+            assert!(
+                result.is_err(),
+                "bare numeric elements should fail in ArrayToNdjson"
+            );
         }
     }
 
@@ -3293,8 +3282,8 @@ mod tests {
         #[test]
         fn test_file_jsonl_standard() {
             let data = load_fixture("jsonl_standard.json");
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read JSONL");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read JSONL");
             assert_eq!(lines.len(), 3);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse row 0");
             assert_eq!(r0["name"], "Alice");
@@ -3312,8 +3301,8 @@ mod tests {
                 data.windows(2).any(|w| w == b"\r\n"),
                 "fixture should contain CRLF"
             );
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read CRLF JSONL");
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read CRLF JSONL");
             assert_eq!(lines.len(), 3);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
             assert_eq!(r0["id"], 1);
@@ -3346,8 +3335,7 @@ mod tests {
         #[test]
         fn test_file_array_standard() {
             let data = load_fixture("array_standard.json");
-            let adapter = ArrayToNdjson::try_new(Cursor::new(data))
-                .expect("should parse array");
+            let adapter = ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse array");
             let lines = read_all_lines(adapter).expect("should read");
             assert_eq!(lines.len(), 3);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
@@ -3358,8 +3346,8 @@ mod tests {
         #[test]
         fn test_file_array_pretty() {
             let data = load_fixture("array_pretty.json");
-            let adapter = ArrayToNdjson::try_new(Cursor::new(data))
-                .expect("should parse pretty array");
+            let adapter =
+                ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse pretty array");
             let lines = read_all_lines(adapter).expect("should read");
             assert_eq!(lines.len(), 3);
             // Pretty-printed elements should be collapsed to single lines
@@ -3374,8 +3362,8 @@ mod tests {
         #[test]
         fn test_file_array_empty() {
             let data = load_fixture("array_empty.json");
-            let adapter = ArrayToNdjson::try_new(Cursor::new(data))
-                .expect("should parse empty array");
+            let adapter =
+                ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse empty array");
             let lines = read_all_lines(adapter).expect("should read");
             assert!(lines.is_empty());
         }
@@ -3395,8 +3383,8 @@ mod tests {
         #[test]
         fn test_file_array_nested() {
             let data = load_fixture("array_nested.json");
-            let adapter = ArrayToNdjson::try_new(Cursor::new(data))
-                .expect("should parse nested array");
+            let adapter =
+                ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse nested array");
             let lines = read_all_lines(adapter).expect("should read");
             assert_eq!(lines.len(), 3);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
@@ -3410,8 +3398,8 @@ mod tests {
         #[test]
         fn test_file_array_mixed_types() {
             let data = load_fixture("array_mixed_types.json");
-            let adapter = ArrayToNdjson::try_new(Cursor::new(data))
-                .expect("should parse mixed types");
+            let adapter =
+                ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse mixed types");
             let lines = read_all_lines(adapter).expect("should read");
             assert_eq!(lines.len(), 1);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
@@ -3445,8 +3433,7 @@ mod tests {
         #[test]
         fn test_file_object_single() {
             let data = load_fixture("object_single.json");
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read");
+            let lines = read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read");
             assert_eq!(lines.len(), 1);
             let r: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
             assert_eq!(r["name"], "Alice");
@@ -3473,8 +3460,7 @@ mod tests {
         #[test]
         fn test_file_object_nulls() {
             let data = load_fixture("object_nulls.json");
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read");
+            let lines = read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read");
             assert_eq!(lines.len(), 1);
             let r: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
             assert_eq!(r["name"], "Alice");
@@ -3486,8 +3472,7 @@ mod tests {
         #[test]
         fn test_file_object_empty() {
             let data = load_fixture("object_empty.json");
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read");
+            let lines = read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read");
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0], "{}");
         }
@@ -3506,8 +3491,8 @@ mod tests {
         #[test]
         fn test_file_pointer_wrapper_extract_data() {
             let data = load_fixture("pointer_wrapper.json");
-            let reader = JsonPointerReader::new(Cursor::new(data), "/data")
-                .expect("should extract /data");
+            let reader =
+                JsonPointerReader::new(Cursor::new(data), "/data").expect("should extract /data");
             let output = read_to_string(reader);
             let parsed: serde_json::Value = serde_json::from_str(&output).expect("parse");
             let arr = parsed.as_array().expect("should be array");
@@ -3520,8 +3505,8 @@ mod tests {
         #[test]
         fn test_file_pointer_wrapper_extract_count() {
             let data = load_fixture("pointer_wrapper.json");
-            let reader = JsonPointerReader::new(Cursor::new(data), "/count")
-                .expect("should extract /count");
+            let reader =
+                JsonPointerReader::new(Cursor::new(data), "/count").expect("should extract /count");
             let output = read_to_string(reader);
             assert_eq!(output, "3");
         }
@@ -3558,9 +3543,8 @@ mod tests {
         #[test]
         fn test_file_pointer_nested_extract_metadata() {
             let data = load_fixture("pointer_nested.json");
-            let reader =
-                JsonPointerReader::new(Cursor::new(data), "/response/metadata/request_id")
-                    .expect("should extract nested");
+            let reader = JsonPointerReader::new(Cursor::new(data), "/response/metadata/request_id")
+                .expect("should extract nested");
             let output = read_to_string(reader);
             assert_eq!(output, r#""abc-123""#);
         }
@@ -3590,10 +3574,9 @@ mod tests {
         #[test]
         fn test_file_pointer_extract_then_array_to_ndjson() {
             let data = load_fixture("pointer_wrapper.json");
-            let extracted = JsonPointerReader::new(Cursor::new(data), "/data")
-                .expect("should extract");
-            let adapter = ArrayToNdjson::try_new(extracted)
-                .expect("should parse extracted array");
+            let extracted =
+                JsonPointerReader::new(Cursor::new(data), "/data").expect("should extract");
+            let adapter = ArrayToNdjson::try_new(extracted).expect("should parse extracted array");
             let lines = read_all_lines(adapter).expect("should read NDJSON");
             assert_eq!(lines.len(), 3);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
@@ -3607,8 +3590,7 @@ mod tests {
             let data = load_fixture("pointer_nested.json");
             let extracted = JsonPointerReader::new(Cursor::new(data), "/response/items")
                 .expect("should extract");
-            let adapter = ArrayToNdjson::try_new(extracted)
-                .expect("should parse extracted array");
+            let adapter = ArrayToNdjson::try_new(extracted).expect("should parse extracted array");
             let lines = read_all_lines(adapter).expect("should read");
             assert_eq!(lines.len(), 3);
             let r2: serde_json::Value = serde_json::from_str(&lines[2]).expect("parse");
@@ -3619,8 +3601,8 @@ mod tests {
         #[test]
         fn test_file_pointer_auto_detect_array() {
             let data = load_fixture("pointer_wrapper.json");
-            let extracted = JsonPointerReader::new(Cursor::new(data), "/data")
-                .expect("should extract");
+            let extracted =
+                JsonPointerReader::new(Cursor::new(data), "/data").expect("should extract");
             let mut reader = BufReader::new(extracted);
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             assert_eq!(byte, b'[');
@@ -3630,8 +3612,8 @@ mod tests {
         #[test]
         fn test_file_pointer_auto_detect_scalar() {
             let data = load_fixture("pointer_scalar.json");
-            let extracted = JsonPointerReader::new(Cursor::new(data), "/meta/status")
-                .expect("should extract");
+            let extracted =
+                JsonPointerReader::new(Cursor::new(data), "/meta/status").expect("should extract");
             let mut reader = BufReader::new(extracted);
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             // "ok" starts with '"'
@@ -3700,7 +3682,10 @@ mod tests {
 
             let mut output = String::new();
             std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
-            assert!(output.trim().is_empty(), "empty data should produce no NDJSON");
+            assert!(
+                output.trim().is_empty(),
+                "empty data should produce no NDJSON"
+            );
         }
 
         #[test]
@@ -3709,7 +3694,11 @@ mod tests {
             let val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
             let schema = soda_schema_from_meta(&val).expect("should extract schema");
             for field in schema.fields() {
-                assert!(field.is_nullable(), "field '{}' should be nullable", field.name());
+                assert!(
+                    field.is_nullable(),
+                    "field '{}' should be nullable",
+                    field.name()
+                );
             }
         }
     }
@@ -3720,8 +3709,7 @@ mod tests {
         #[test]
         fn test_file_unicode() {
             let data = load_fixture("unicode.json");
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read");
+            let lines = read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read");
             assert_eq!(lines.len(), 1);
             let r: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
             assert_eq!(r["emoji"], "🚀");
@@ -3742,8 +3730,7 @@ mod tests {
         #[test]
         fn test_file_escaped() {
             let data = load_fixture("escaped.json");
-            let lines = read_all_lines(BufReader::new(Cursor::new(&data)))
-                .expect("should read");
+            let lines = read_all_lines(BufReader::new(Cursor::new(&data))).expect("should read");
             assert_eq!(lines.len(), 1);
             let r: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
             assert_eq!(r["path"], "C:\\Users\\test\\file.txt");
@@ -3800,8 +3787,8 @@ mod tests {
         fn test_peek_bom_only_returns_eof() {
             let input = vec![0xEF, 0xBB, 0xBF];
             let mut reader = BufReader::new(Cursor::new(input));
-            let err = peek_first_non_ws_byte(&mut reader)
-                .expect_err("should fail on BOM-only input");
+            let err =
+                peek_first_non_ws_byte(&mut reader).expect_err("should fail on BOM-only input");
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         }
 
@@ -3862,7 +3849,11 @@ mod tests {
         fn test_file_bom_array() {
             let data = load_fixture("bom_array.json");
             // Verify BOM is present
-            assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with BOM");
+            assert_eq!(
+                &data[..3],
+                &[0xEF, 0xBB, 0xBF],
+                "fixture should start with BOM"
+            );
 
             let lines = auto_detect_and_read(&data).expect("auto-detect BOM array");
             assert_eq!(lines.len(), 3);
@@ -3874,7 +3865,11 @@ mod tests {
         #[test]
         fn test_file_bom_object() {
             let data = load_fixture("bom_object.json");
-            assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with BOM");
+            assert_eq!(
+                &data[..3],
+                &[0xEF, 0xBB, 0xBF],
+                "fixture should start with BOM"
+            );
 
             let lines = auto_detect_and_read(&data).expect("auto-detect BOM object");
             assert_eq!(lines.len(), 1);
@@ -3886,7 +3881,11 @@ mod tests {
         #[test]
         fn test_file_bom_jsonl() {
             let data = load_fixture("bom_jsonl.json");
-            assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with BOM");
+            assert_eq!(
+                &data[..3],
+                &[0xEF, 0xBB, 0xBF],
+                "fixture should start with BOM"
+            );
 
             let lines = auto_detect_and_read(&data).expect("auto-detect BOM JSONL");
             assert_eq!(lines.len(), 2);
@@ -3899,7 +3898,11 @@ mod tests {
         #[test]
         fn test_file_bom_whitespace_array() {
             let data = load_fixture("bom_whitespace_array.json");
-            assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with BOM");
+            assert_eq!(
+                &data[..3],
+                &[0xEF, 0xBB, 0xBF],
+                "fixture should start with BOM"
+            );
 
             let lines = auto_detect_and_read(&data).expect("auto-detect BOM+ws array");
             assert_eq!(lines.len(), 2);
