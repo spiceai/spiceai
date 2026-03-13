@@ -191,7 +191,11 @@ impl SpiceJsonFormat {
     /// Set the `json_pointer` option for extracting data from a specific path in a JSON object.
     #[must_use]
     pub fn with_json_pointer(mut self, json_pointer: String) -> Self {
-        self.options.json_pointer = Some(json_pointer);
+        self.options.json_pointer = if json_pointer.is_empty() {
+            None
+        } else {
+            Some(json_pointer)
+        };
         self
     }
 }

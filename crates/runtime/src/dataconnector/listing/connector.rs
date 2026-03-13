@@ -549,10 +549,10 @@ pub trait ListingTableConnector: DataConnector {
                 // support json_pointer).
                 let has_pointer = matches!(
                     params.get("json_pointer").expose(),
-                    ExposedParamLookup::Present(_)
+                    ExposedParamLookup::Present(v) if !v.is_empty()
                 ) || matches!(
                     params.get("json_path").expose(),
-                    ExposedParamLookup::Present(_)
+                    ExposedParamLookup::Present(v) if !v.is_empty()
                 );
                 if has_pointer {
                     Ok((
