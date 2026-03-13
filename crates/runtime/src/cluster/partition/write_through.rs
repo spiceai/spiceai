@@ -121,7 +121,7 @@ type ExecutorFilter = (ExecutorId, Arc<dyn datafusion::physical_plan::PhysicalEx
 
 /// Forwards writes to executors, splitting record batches by partition
 /// expression so each executor only receives the rows it is responsible for.
-pub(crate) async fn forward_partitioned_write(
+pub(crate) async fn forward_federated_partitioned_write(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
@@ -130,7 +130,7 @@ pub(crate) async fn forward_partitioned_write(
     mut streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let table_partitions = executor_registry
-        .partition_manager()
+        .federated_partition_manager()
         .get_cached_table_metadata(path)
         .ok_or_else(|| Error::NoPartitionMetadata {
             table: path.to_string(),

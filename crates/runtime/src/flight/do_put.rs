@@ -206,7 +206,7 @@ pub(crate) async fn handle(
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref() {
         if should_forward_raw_cayenne_write(&datafusion, &path).await {
-            return crate::cluster::partition::write_through::forward_partitioned_write(
+            return crate::cluster::partition::write_through::forward_federated_partitioned_write(
                 executor_registry,
                 Arc::clone(&datafusion.ctx),
                 datafusion.io_runtime.clone(),

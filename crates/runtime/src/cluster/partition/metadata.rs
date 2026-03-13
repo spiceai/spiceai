@@ -143,6 +143,7 @@ impl TablePartitionMetadata {
             .collect()
     }
 
+    /// Returns a mapping of executor IDs to the partition expressions they contain.
     pub fn all_executor_partitions(
         &self,
         ctx: Arc<SessionContext>,

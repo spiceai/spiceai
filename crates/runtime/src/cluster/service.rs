@@ -600,7 +600,7 @@ impl ClusterService for ClusterServiceImpl {
 
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
-        let partition_manager = self.executor_registry().partition_manager();
+        let partition_manager = self.executor_registry().accelerations_partition_manager();
         let app_guard = self.app.read().await;
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
