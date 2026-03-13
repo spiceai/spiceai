@@ -282,10 +282,10 @@ fn parse_and_validate_partition_expression(
             ))
         })?;
 
-    // Reject boolean partition expressions (AND/OR) — not supported yet
+    // Reject boolean PARTITION BY expressions that use AND/OR at the top level — not supported yet
     if is_boolean_partition_expr(&partition_expr) {
         return Err(DataFusionError::Plan(format!(
-            "Boolean PARTITION BY expressions are not supported: '{partition_expr_sql}'. Use a single column or scalar function instead"
+            "Boolean PARTITION BY expressions using AND/OR are not supported: '{partition_expr_sql}'. Use a single column or scalar function instead"
         )));
     }
 
