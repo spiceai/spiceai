@@ -157,10 +157,13 @@ impl TablePartitionMetadata {
             let exprs = partition_value
                 .iter()
                 .map(|(proj, lit)| {
-                    Ok(Expr::from_bytes_with_registry(proj.as_bytes(), ctx.as_ref())?
-                        .eq(Expr::from_bytes_with_registry(lit.as_bytes(), ctx.as_ref())?))
+                    Ok(
+                        Expr::from_bytes_with_registry(proj.as_bytes(), ctx.as_ref())?.eq(
+                            Expr::from_bytes_with_registry(lit.as_bytes(), ctx.as_ref())?,
+                        ),
+                    )
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<Expr>, DataFusionError>>()?;
             for executor in assigned_executors {
                 map.entry(executor.clone())
                     .or_default()
