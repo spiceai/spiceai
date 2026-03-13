@@ -30,7 +30,6 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
-use datafusion_expr::Expr;
 use futures::TryStreamExt as _;
 use opentelemetry::KeyValue;
 use prost::Message as _;
@@ -206,6 +205,8 @@ pub(crate) async fn handle(
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref() {
         if should_forward_raw_cayenne_write(&datafusion, &path).await {
+            // TODO: resolve partition_by from table configuration
+            let partition_by: Vec<spicepod::partitioning::PartitionedBy> = vec![];
             return crate::cluster::partition::write_through::forward_federated_partitioned_write(
                 executor_registry,
                 Arc::clone(&datafusion.ctx),
@@ -213,6 +214,7 @@ pub(crate) async fn handle(
                 &path,
                 first_message,
                 streaming_flight,
+                &partition_by,
             )
             .await
             .map_err(Into::into);

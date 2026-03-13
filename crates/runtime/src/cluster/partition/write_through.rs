@@ -28,6 +28,7 @@ use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::{Expr, execution_props::ExecutionProps};
+use datafusion_proto::bytes::Serializeable;
 use futures::TryStreamExt as _;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{ResultExt, Snafu};
@@ -36,15 +37,25 @@ use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream}
 use tonic::{Response, Streaming};
 
 use crate::{
-    cluster::executor_registry::ExecutorRegistry,
+    cluster::{
+        PartitionManager, executor_registry::ExecutorRegistry, partition::metadata::PartitionValue,
+    },
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     flight::Service as FlightSvc,
 };
 
+use spicepod::partitioning::PartitionedBy;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("No partition metadata found for table {table}"))]
-    NoPartitionMetadata { table: String },
+    #[snafu(display("Cannot create partition metadata found for table {table}"))]
+    CreateMetadata {
+        table: String,
+        source: super::manager::Error,
+    },
+
+    #[snafu(display("Cannot find partition metadata for table {table}"))]
+    FindMetadata { table: String },
 
     #[snafu(display("Failed to resolve partition expressions: {source}"))]
     ResolvePartitions {
@@ -100,6 +111,27 @@ pub enum Error {
 
     #[snafu(display("Failed to encode forwarded Flight stream: {message}"))]
     Encode { message: String },
+
+    #[snafu(display("No executors available for new partition assignment"))]
+    NoExecutorsAvailable,
+
+    #[snafu(display("Failed to parse partition expression: {source}"))]
+    ParsePartitionExpr {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Failed to partition batch: {source}"))]
+    PartitionBatch {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Failed to serialize partition expression: {source}"))]
+    SerializeExpr {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Failed to persist partition assignment: {source}"))]
+    PersistAssignment { source: super::manager::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -107,9 +139,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl From<Error> for tonic::Status {
     fn from(err: Error) -> Self {
         match &err {
-            Error::NoPartitionMetadata { .. } | Error::NoClient { .. } => {
-                tonic::Status::not_found(err.to_string())
-            }
+            Error::NoClient { .. } => tonic::Status::not_found(err.to_string()),
             _ => tonic::Status::internal(err.to_string()),
         }
     }
@@ -121,6 +151,10 @@ type ExecutorFilter = (ExecutorId, Arc<dyn datafusion::physical_plan::PhysicalEx
 
 /// Forwards writes to executors, splitting record batches by partition
 /// expression so each executor only receives the rows it is responsible for.
+///
+/// Rows with partition values not yet assigned to any executor are assigned
+/// to the least-loaded executor. The assignment is persisted to the partition
+/// metadata store before the rows are forwarded.
 pub(crate) async fn forward_federated_partitioned_write(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
@@ -128,15 +162,27 @@ pub(crate) async fn forward_federated_partitioned_write(
     path: &TableReference,
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
+    partition_by: &[PartitionedBy],
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
-    let table_partitions = executor_registry
-        .federated_partition_manager()
-        .get_cached_table_metadata(path)
-        .ok_or_else(|| Error::NoPartitionMetadata {
-            table: path.to_string(),
-        })?;
+    let partition_manager = executor_registry.federated_partition_manager();
+    let table_partitions = match partition_manager.get_cached_table_metadata(path) {
+        Some(metadata) => metadata,
+        None => {
+            partition_manager
+                .initialize_blank_metadata(path)
+                .await
+                .context(CreateMetadataSnafu {
+                    table: path.to_string(),
+                })?;
+            partition_manager
+                .get_cached_table_metadata(path)
+                .ok_or_else(|| Error::FindMetadata {
+                    table: path.to_string(),
+                })?
+        }
+    };
     let partitions_by_executor = table_partitions
-        .all_executor_partitions(ctx)
+        .all_executor_partitions(Arc::clone(&ctx))
         .context(ResolvePartitionsSnafu)?;
 
     let schema = Arc::new(
@@ -145,22 +191,40 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     let executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
 
+    // Parse partition_by expressions into physical exprs for splitting unmatched rows.
+    let partition_phys_exprs = build_partition_physical_exprs(partition_by, &schema, &ctx)?;
+
+    // Serialize the partition expressions for use as PartitionValue keys.
+    let partition_expr_keys: Vec<String> = partition_phys_exprs
+        .iter()
+        .map(|(expr, _)| {
+            expr.to_bytes()
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .context(SerializeExprSnafu)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let tbl = path
         .clone()
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
+    // Spawn forwarding tasks for ALL connected executors so we can route
+    // new partitions to any executor, not just those with existing assignments.
+    let all_executor_ids: Vec<ExecutorId> = {
+        let clients = executor_registry.flight_sql_clients.read().await;
+        clients.keys().cloned().collect()
+    };
+
     let (senders, join_handles) = spawn_executor_forwarding_tasks(
         executor_registry,
-        executor_filters
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>()
-            .as_slice(),
+        &all_executor_ids,
         &schema,
         tbl,
         &io_runtime,
     )
     .await?;
+
+    let partition_manager = executor_registry.federated_partition_manager();
 
     // Decode and route the first message.
     let dictionaries_by_id = Arc::new(HashMap::new());
@@ -168,7 +232,17 @@ pub(crate) async fn forward_federated_partitioned_write(
         flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)
         && batch.num_rows() > 0
     {
-        route_batch_to_executors_by_partition(&batch, &executor_filters, &senders).await?;
+        route_batch_and_assign_unseen(
+            &batch,
+            &executor_filters,
+            &senders,
+            &partition_phys_exprs,
+            &partition_expr_keys,
+            &partitions_by_executor,
+            &partition_manager,
+            path,
+        )
+        .await?;
     }
 
     // Decode and route the rest of the stream.
@@ -180,7 +254,17 @@ pub(crate) async fn forward_federated_partitioned_write(
         )
         .context(DecodeBatchSnafu)?;
         if batch.num_rows() > 0 {
-            route_batch_to_executors_by_partition(&batch, &executor_filters, &senders).await?;
+            route_batch_and_assign_unseen(
+                &batch,
+                &executor_filters,
+                &senders,
+                &partition_phys_exprs,
+                &partition_expr_keys,
+                &partitions_by_executor,
+                &partition_manager,
+                path,
+            )
+            .await?;
         }
     }
 
@@ -193,6 +277,168 @@ pub(crate) async fn forward_federated_partitioned_write(
     Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
         PutResult::default(),
     )]))))
+}
+
+/// Routes a [`RecordBatch`] of data to one or more executors' [`Sender<RecordBatch>`], based on the executor filter
+/// predicates, then assigns new partition predicate values to the least-loaded executor and forwards those rows accordingly.
+#[expect(clippy::too_many_arguments)]
+async fn route_batch_and_assign_unseen(
+    batch: &RecordBatch,
+    executor_filters: &[ExecutorFilter],
+    senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+    partition_phys_exprs: &[(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)],
+    partition_expr_keys: &[String],
+    partitions_by_executor: &HashMap<String, Vec<Expr>>,
+    partition_manager: &Arc<PartitionManager>,
+    path: &TableReference,
+) -> Result<()> {
+    // Route matched rows to known executors.
+    let unmatched = route_matched_and_collect_unmatched(batch, executor_filters, senders).await?;
+
+    if unmatched.num_rows() == 0 {
+        return Ok(());
+    }
+
+    // Split unmatched rows by partition value and assign each to an executor.
+    let physical_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>> =
+        partition_phys_exprs
+            .iter()
+            .map(|(_, p)| Arc::clone(p))
+            .collect();
+
+    let partitioned =
+        runtime_table_partition::insert::partition_batch_composite(&unmatched, &physical_exprs)
+            .context(PartitionBatchSnafu)?;
+
+    for (_key, (scalar_values, sub_batch)) in partitioned {
+        if sub_batch.num_rows() == 0 {
+            continue;
+        }
+
+        // Build the PartitionValue (HashMap<serialized_expr_key, serialized_lit_value>).
+        let partition_value: PartitionValue = partition_expr_keys
+            .iter()
+            .zip(scalar_values.iter())
+            .map(|(expr_key, scalar)| {
+                let lit_expr = Expr::Literal(scalar.clone(), None);
+                let lit_bytes = lit_expr.to_bytes().context(SerializeExprSnafu)?;
+                Ok((
+                    expr_key.clone(),
+                    String::from_utf8_lossy(&lit_bytes).to_string(),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        // Select least-loaded executor.
+        let executor_id = select_least_loaded_executor(partitions_by_executor, senders)?;
+
+        // Persist the assignment before forwarding.
+        partition_manager
+            .add_and_assign_partition(path, &partition_value, &executor_id)
+            .await
+            .context(PersistAssignmentSnafu)?;
+
+        tracing::debug!(
+            table = %path,
+            executor = %executor_id,
+            "Assigned new partition and forwarding rows"
+        );
+
+        // Forward the rows.
+        if let Some(tx) = senders.get(&executor_id) {
+            tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
+                executor_id: executor_id.clone(),
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Routes matched rows to known executors and returns the unmatched rows.
+async fn route_matched_and_collect_unmatched(
+    batch: &RecordBatch,
+    executor_filters: &[ExecutorFilter],
+    senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+) -> Result<RecordBatch> {
+    // Track which rows are matched by any executor.
+    let mut any_matched = arrow::array::BooleanArray::from(vec![false; batch.num_rows()]);
+
+    for (executor_id, filter_expr) in executor_filters {
+        let arr = filter_expr
+            .evaluate(batch)
+            .context(FilterEvalSnafu {
+                executor_id: executor_id.clone(),
+            })?
+            .into_array(batch.num_rows())
+            .context(FilterEvalSnafu {
+                executor_id: executor_id.clone(),
+            })?;
+        let mask = arr
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| Error::FilterEval {
+                executor_id: executor_id.clone(),
+                source: datafusion::error::DataFusionError::Internal(
+                    "Filter did not produce boolean array".to_string(),
+                ),
+            })?;
+
+        let filtered =
+            arrow::compute::filter_record_batch(batch, mask).context(FilterBatchSnafu)?;
+
+        if filtered.num_rows() > 0 {
+            if let Some(tx) = senders.get(executor_id) {
+                tx.send(filtered).await.map_err(|_| Error::SendBatch {
+                    executor_id: executor_id.clone(),
+                })?;
+            }
+        }
+
+        // OR into the cumulative matched mask.
+        any_matched = arrow::compute::or(&any_matched, mask).context(FilterBatchSnafu)?;
+    }
+
+    // Negate to get unmatched rows.
+    let unmatched_mask = arrow::compute::not(&any_matched).context(FilterBatchSnafu)?;
+    arrow::compute::filter_record_batch(batch, &unmatched_mask).context(FilterBatchSnafu)
+}
+
+/// Parses `PartitionedBy` expressions into logical + physical expression pairs.
+fn build_partition_physical_exprs(
+    partition_by: &[PartitionedBy],
+    schema: &SchemaRef,
+    ctx: &Arc<datafusion::prelude::SessionContext>,
+) -> Result<Vec<(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)>> {
+    let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone())
+        .context(CreateDFSchemaSnafu)?;
+
+    partition_by
+        .iter()
+        .map(|p| {
+            let expr = Expr::from_bytes_with_registry(p.expression.as_bytes(), ctx.as_ref())
+                .context(ParsePartitionExprSnafu)?;
+            let physical = datafusion::physical_expr::create_physical_expr(
+                &expr,
+                &df_schema,
+                &ExecutionProps::new(),
+            )
+            .context(ParsePartitionExprSnafu)?;
+            Ok((expr, physical))
+        })
+        .collect()
+}
+
+/// Selects the executor with the fewest currently assigned partitions.
+fn select_least_loaded_executor(
+    partitions_by_executor: &HashMap<String, Vec<Expr>>,
+    senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+) -> Result<ExecutorId> {
+    senders
+        .keys()
+        .min_by_key(|id| partitions_by_executor.get(id.as_str()).map_or(0, Vec::len))
+        .cloned()
+        .ok_or(Error::NoExecutorsAvailable)
 }
 
 /// Builds a physical filter expression per executor by OR-ing its partition expressions.
@@ -269,46 +515,6 @@ async fn spawn_executor_forwarding_tasks(
     Ok((senders, join_handles))
 }
 
-/// Filters `batch` by each executor's partition expression and sends matching rows.
-async fn route_batch_to_executors_by_partition(
-    batch: &RecordBatch,
-    executor_filters: &[ExecutorFilter],
-    senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
-) -> Result<()> {
-    for (executor_id, filter_expr) in executor_filters {
-        let arr = filter_expr
-            .evaluate(batch)
-            .context(FilterEvalSnafu {
-                executor_id: executor_id.clone(),
-            })?
-            .into_array(batch.num_rows())
-            .context(FilterEvalSnafu {
-                executor_id: executor_id.clone(),
-            })?;
-        let mask = arr
-            .as_any()
-            .downcast_ref::<arrow::array::BooleanArray>()
-            .ok_or_else(|| Error::FilterEval {
-                executor_id: executor_id.clone(),
-                source: datafusion::error::DataFusionError::Internal(
-                    "Filter did not produce boolean array".to_string(),
-                ),
-            })?;
-
-        let filtered =
-            arrow::compute::filter_record_batch(batch, mask).context(FilterBatchSnafu)?;
-
-        if filtered.num_rows() > 0 {
-            if let Some(tx) = senders.get(executor_id) {
-                tx.send(filtered).await.map_err(|_| Error::SendBatch {
-                    executor_id: executor_id.clone(),
-                })?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Encodes `RecordBatch`es from `rx` as `FlightData` and sends them via `DoPut`
 /// to a specific executor.
 async fn forward_batches_to_executor(
@@ -325,14 +531,16 @@ async fn forward_batches_to_executor(
 
     let encoder_schema = Arc::clone(&schema);
     io_runtime.spawn(async move {
-        let batch_stream = ReceiverStream::new(rx).map(
-            |b| -> std::result::Result<RecordBatch, arrow_flight::error::FlightError> { Ok(b) },
+        let mut flight_data_encoder = Box::pin(
+            arrow_flight::encode::FlightDataEncoderBuilder::new()
+                .with_schema(encoder_schema)
+                .build(ReceiverStream::new(rx).map(
+                    |b| -> std::result::Result<RecordBatch, arrow_flight::error::FlightError> {
+                        Ok(b)
+                    },
+                )),
         );
-        let flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
-            .with_schema(encoder_schema)
-            .build(batch_stream);
 
-        let mut flight_data_encoder = Box::pin(flight_data_encoder);
         let mut is_first = true;
         let fd: FlightDescriptor = arrow_flight::FlightDescriptor::new_path(vec![
             tbl.catalog.to_string(),
@@ -381,6 +589,6 @@ async fn forward_batches_to_executor(
 
     match encode_result_rx.await {
         Ok(Ok(())) | Err(_) => Ok(()),
-        Ok(Err(message)) => return Err(Error::Encode { message }),
+        Ok(Err(message)) => Err(Error::Encode { message }),
     }
 }

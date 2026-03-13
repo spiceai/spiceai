@@ -121,9 +121,14 @@ impl PartitionManager {
 
     /// Initialize a blank partition metadata file for a table.
     ///
-    /// This acts as a temporary lock during scheduler startup. If the file already exists,
-    /// this is a no-op and returns `Ok(false)`.
+    /// For acceleration table partitions this acts as a temporary lock during scheduler startup (other
+    ///  schedulers will not re-initialize, since a file exists, even if blank). If the file already
+    /// exists, this is a no-op and returns `Ok(false)`.
     pub async fn initialize_blank_metadata(&self, table: &TableReference) -> Result<bool> {
+        // If its cached, can avoid insert operation. Optimisation to reduce object store calls.
+        if self.get_cached_table_metadata(table).is_some() {
+            return Ok(false);
+        }
         let key = table.to_string();
         let now_ms = now_ms()?;
         let metadata = TablePartitionMetadata::blank(table.to_string(), now_ms);
@@ -298,6 +303,63 @@ impl PartitionManager {
         self.state.refresh().await.context(MetadataAccessSnafu {
             table: String::from("<refresh>"),
         })
+    }
+
+    /// Adds a new partition to a table's metadata and assigns it to an executor
+    /// in a single OCC write. If the partition already exists, it is assigned
+    /// (or left as-is if already assigned to the same executor).
+    pub async fn add_and_assign_partition(
+        &self,
+        table: &TableReference,
+        partition_value: &PartitionValue,
+        executor_id: &str,
+    ) -> Result<()> {
+        let key = table.to_string();
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(Some(5))
+            .build();
+
+        loop {
+            let now_ms = now_ms()?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
+
+            // Find existing partition or add a new one.
+            let partition = metadata
+                .partitions
+                .iter_mut()
+                .find(|p| p.partition_value == *partition_value);
+
+            match partition {
+                Some(p) => {
+                    if p.is_assigned_to(executor_id) {
+                        return Ok(());
+                    }
+                    p.assign_to(executor_id.to_string(), now_ms);
+                }
+                None => {
+                    let mut new_partition = PartitionMetadata::new(partition_value.clone());
+                    new_partition.assign_to(executor_id.to_string(), now_ms);
+                    metadata.add_partition(new_partition);
+                }
+            }
+
+            metadata.updated_at = now_ms;
+
+            match self.write_metadata(&key, metadata).await {
+                Ok(()) => return Ok(()),
+                Err(Error::ConcurrentModification { .. }) => {
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(Error::ConcurrentModification { table: key.clone() });
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.
