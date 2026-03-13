@@ -543,10 +543,29 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_json_format(dataset, params, Format::Jsonl)?),
                 extension.unwrap_or(".json".to_string()),
             )),
-            (Some("jsonl" | "ndjson" | "ldjson"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => Ok((
-                Some(self.get_jsonl_format(dataset, params)?),
-                extension.unwrap_or(".jsonl".to_string()),
-            )),
+            (Some("jsonl" | "ndjson" | "ldjson"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => {
+                // If json_pointer or json_path is set, route through SpiceJsonFormat
+                // so the pointer extraction is applied (DataFusion's JsonFormat doesn't
+                // support json_pointer).
+                let has_pointer = matches!(
+                    params.get("json_pointer").expose(),
+                    ExposedParamLookup::Present(_)
+                ) || matches!(
+                    params.get("json_path").expose(),
+                    ExposedParamLookup::Present(_)
+                );
+                if has_pointer {
+                    Ok((
+                        Some(self.get_json_format(dataset, params, Format::Jsonl)?),
+                        extension.unwrap_or(".jsonl".to_string()),
+                    ))
+                } else {
+                    Ok((
+                        Some(self.get_jsonl_format(dataset, params)?),
+                        extension.unwrap_or(".jsonl".to_string()),
+                    ))
+                }
+            },
             (Some("soda" | "socrata"), _) => Ok((
                 Some(self.get_json_format(dataset, params, Format::Soda)?),
                 extension.unwrap_or(".json".to_string()),

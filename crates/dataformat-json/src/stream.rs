@@ -446,6 +446,15 @@ impl JsonPointerReader {
     /// Returns an error if the bytes cannot be parsed as valid JSON or the pointer
     /// path does not resolve to a value.
     pub fn from_vec(buf: &[u8], path: &str) -> io::Result<Self> {
+        // Strip leading UTF-8 BOM if present so serde_json can parse the input.
+        let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
+
+        // An empty pointer means "the whole document" per RFC 6901.
+        if path.is_empty() {
+            return Ok(Self {
+                inner: io::Cursor::new(buf.to_vec()),
+            });
+        }
 
         let value: serde_json::Value = serde_json::from_slice(buf).map_err(|e| {
             io::Error::new(
@@ -627,6 +636,9 @@ impl SodaReader {
     /// Returns an error if the bytes cannot be parsed as valid JSON or are not
     /// a valid SODA response.
     pub fn from_vec(buf: &[u8]) -> io::Result<Self> {
+        // Strip leading UTF-8 BOM if present so serde_json can parse the input.
+        let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
+
         let value: serde_json::Value = serde_json::from_slice(buf).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2214,6 +2226,33 @@ mod tests {
             assert!(err.to_string().contains("not found"));
         }
 
+        /// Empty pointer returns the whole document per RFC 6901
+        #[test]
+        fn test_json_pointer_empty_returns_whole_doc() {
+            let input = br#"{"a":1,"b":2}"#;
+            let mut reader = JsonPointerReader::from_vec(input, "")
+                .expect("empty pointer should succeed");
+            let mut out = String::new();
+            reader
+                .read_to_string(&mut out)
+                .expect("should read to string");
+            assert_eq!(out, r#"{"a":1,"b":2}"#);
+        }
+
+        /// `from_vec` strips a leading UTF-8 BOM before parsing
+        #[test]
+        fn test_json_pointer_bom_stripped() {
+            let mut input = vec![0xEF, 0xBB, 0xBF];
+            input.extend_from_slice(br#"{"data":[1,2]}"#);
+            let mut reader = JsonPointerReader::from_vec(&input, "/data")
+                .expect("BOM input should parse");
+            let mut out = String::new();
+            reader
+                .read_to_string(&mut out)
+                .expect("should read to string");
+            assert_eq!(out, "[1,2]");
+        }
+
         // ---- Auto-detect via peek ----
 
         /// Auto-detect: array with significant leading whitespace
@@ -2391,7 +2430,7 @@ mod tests {
     mod soda_tests {
         use crate::{SodaReader, soda_schema_from_meta};
         use arrow::datatypes::DataType;
-        use std::io::Cursor;
+        use std::io::{Cursor, Read};
 
         /// Helper: build a minimal SODA response JSON string.
         fn soda_response(
@@ -2616,6 +2655,21 @@ mod tests {
             let err = SodaReader::new(Cursor::new(input.to_vec()))
                 .expect_err("should fail: invalid JSON");
             assert!(err.to_string().contains("Failed to parse SODA"));
+        }
+
+        /// `from_vec` strips a leading UTF-8 BOM before parsing
+        #[test]
+        fn test_soda_reader_bom_stripped() {
+            let json = r#"{"meta":{"view":{"columns":[{"fieldName":"name","dataTypeName":"text"}]}},"data":[["Alice"]]}"#;
+            let mut input = vec![0xEF, 0xBB, 0xBF];
+            input.extend_from_slice(json.as_bytes());
+            let mut reader =
+                SodaReader::from_vec(&input).expect("BOM input should parse");
+            let mut out = String::new();
+            reader
+                .read_to_string(&mut out)
+                .expect("should read to string");
+            assert!(out.contains("Alice"), "expected Alice in output: {out}");
         }
 
         #[test]

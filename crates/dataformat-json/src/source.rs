@@ -57,8 +57,6 @@ pub struct SpiceJsonOpener {
     unnest_struct: Option<String>,
 }
 
-impl SpiceJsonOpener {}
-
 /// `SpiceJsonSource` holds the extra configuration that is necessary for [`SpiceJsonOpener`]
 #[derive(Clone)]
 pub struct SpiceJsonSource {
