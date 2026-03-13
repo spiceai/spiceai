@@ -507,7 +507,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         Vec::new(), // retention_filters
                         None,       // time_retention_filter_builder
                         vortex_config.clone(),
-                        None,       // object_store_config (local filesystem)
+                        None, // object_store_config (local filesystem)
                         primary_key.clone(),
                         on_conflict.clone(),
                         Arc::clone(&runtime_env),

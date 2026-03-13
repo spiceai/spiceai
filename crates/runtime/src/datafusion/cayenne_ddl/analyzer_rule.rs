@@ -23,8 +23,8 @@ use std::fmt;
 use std::sync::{Arc, RwLock, Weak};
 
 use datafusion::catalog::CatalogProviderList;
-use datafusion::common::{DFSchema, ToDFSchema};
 use datafusion::common::Constraint;
+use datafusion::common::{DFSchema, ToDFSchema};
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::session_state::SessionState;
@@ -315,7 +315,10 @@ mod tests {
     use datafusion::common::{Constraint, Constraints, ToDFSchema};
     use datafusion::execution::context::SessionContext;
 
-    use super::{extract_primary_key_columns, parse_and_validate_partition_expression, parse_qualified_schema_name};
+    use super::{
+        extract_primary_key_columns, parse_and_validate_partition_expression,
+        parse_qualified_schema_name,
+    };
     use crate::datafusion::SPICE_DEFAULT_CATALOG;
 
     #[test]
