@@ -34,7 +34,7 @@ use super::is_cayenne_catalog;
 use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
-/// Extract primary key column names from DataFusion [`Constraints`] using the
+/// Extract primary key column names from `DataFusion` [`Constraints`] using the
 /// Arrow schema to resolve column indices to names.
 fn extract_primary_key_columns(
     constraints: &datafusion::common::Constraints,
@@ -50,9 +50,10 @@ fn extract_primary_key_columns(
             }
         })
         .map(|indices| {
+            let fields = arrow_schema.fields();
             indices
                 .iter()
-                .map(|&idx| arrow_schema.field(idx).name().clone())
+                .filter_map(|&idx| fields.get(idx).map(|field| field.name().clone()))
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default()

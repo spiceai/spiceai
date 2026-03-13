@@ -191,6 +191,7 @@ impl fmt::Debug for CayenneCreateTableExec {
 
 impl CayenneCreateTableExec {
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         table_name: String,
         arrow_schema: Arc<Schema>,
