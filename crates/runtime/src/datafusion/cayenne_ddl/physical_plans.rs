@@ -654,7 +654,6 @@ impl ExecutionPlan for CayenneCreateTableExec {
     }
 }
 
-
 /// Physical plan for creating a Cayenne schema.
 pub struct CayenneCreateSchemaExec {
     schema_name: String,
