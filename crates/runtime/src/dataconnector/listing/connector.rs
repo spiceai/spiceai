@@ -543,7 +543,7 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_json_format(dataset, params, Format::Jsonl)?),
                 extension.unwrap_or(".json".to_string()),
             )),
-            (Some("jsonl"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => Ok((
+            (Some("jsonl" | "ndjson" | "ldjson"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
             )),
@@ -683,7 +683,7 @@ pub trait ListingTableConnector: DataConnector {
             let json_format = json_format_str.parse::<Format>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
+                        "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_format(json_format);

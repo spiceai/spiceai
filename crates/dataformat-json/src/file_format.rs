@@ -70,8 +70,10 @@ pub struct SpiceJsonOptions {
     pub format: Format,
     /// If set, flatten nested structs with the given separator
     pub flatten_json: Option<String>,
-    /// If set, extract data from the specified dotted path within a JSON object.
-    /// E.g. `"data"` for `{"data": [...]}` or `"response.items"` for nested objects.
+    /// If set, extract data at the specified [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)
+    /// path within a JSON object.
+    /// E.g. `"/data"` for `{"data": [...]}` or `"/response/items"` for nested objects.
+    /// A leading `/` is added automatically if missing.
     pub json_pointer: Option<String>,
 }
 

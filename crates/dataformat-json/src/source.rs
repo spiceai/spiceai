@@ -191,6 +191,7 @@ impl FileOpener for SpiceJsonOpener {
     /// are applied to determine which lines to read:
     /// 1. The first line of the partition is the line in which the index of the first character >= `start`.
     /// 2. The last line of the partition is the line in which the byte at position `end - 1` resides.
+    #[allow(clippy::too_many_lines)]
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
         let base_flattened_schema = Arc::clone(&self.base_flattened_schema);
@@ -322,9 +323,12 @@ impl FileOpener for SpiceJsonOpener {
                     }
                 }
                 GetResultPayload::Stream(s) => {
-                    // SODA, json_pointer, Auto, Object all require buffering the full response
+                    // SODA and json_pointer require buffering the full response
+                    // because they must parse the entire JSON document.
+                    // Auto needs buffering to peek the first byte then decode.
+                    // Object and JSONL/Array can stream directly.
                     if json_pointer.is_some()
-                        || matches!(format, Format::Auto | Format::Object | Format::Soda)
+                        || matches!(format, Format::Auto | Format::Soda)
                     {
                         let s = s.map_err(DataFusionError::from);
                         let decompressed = file_compression_type.convert_stream(s.boxed())?;
@@ -336,9 +340,9 @@ impl FileOpener for SpiceJsonOpener {
                             all_bytes.extend_from_slice(chunk);
                         }
 
-                        // SODA format: convert to NDJSON via SodaReader
+                        // SODA format: convert to NDJSON via SodaReader (use from_vec to avoid double alloc)
                         if format == Format::Soda {
-                            let soda = SodaReader::new(std::io::Cursor::new(all_bytes))
+                            let soda = SodaReader::from_vec(&all_bytes)
                                 .map_err(DataFusionError::from)?;
                             let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                                 .with_batch_size(batch_size)
@@ -347,9 +351,10 @@ impl FileOpener for SpiceJsonOpener {
                             return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
                         }
 
+                        // Use from_vec to avoid double allocation
                         let reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
                             Box::new(
-                                JsonPointerReader::new(std::io::Cursor::new(all_bytes), path)
+                                JsonPointerReader::from_vec(&all_bytes, path)
                                     .map_err(DataFusionError::from)?,
                             )
                         } else {
@@ -399,6 +404,7 @@ impl FileOpener for SpiceJsonOpener {
                             Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed())
                         }
                     } else {
+                        // JSONL, Array, and Object can stream without buffering
                         let s = s.map_err(DataFusionError::from);
 
                         let decoder = ReaderBuilder::new(Arc::clone(&projected_schema))

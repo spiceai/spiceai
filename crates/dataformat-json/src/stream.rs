@@ -433,8 +433,21 @@ impl JsonPointerReader {
     pub fn new<R: Read>(mut reader: R, path: &str) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
+        Self::from_vec(&buf, path)
+    }
 
-        let value: serde_json::Value = serde_json::from_slice(&buf).map_err(|e| {
+    /// Create a new `JsonPointerReader` from an already-buffered byte slice,
+    /// extracting the value at the given JSON Pointer `path`.
+    ///
+    /// This avoids an extra allocation when the caller already has the data in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes cannot be parsed as valid JSON or the pointer
+    /// path does not resolve to a value.
+    pub fn from_vec(buf: &[u8], path: &str) -> io::Result<Self> {
+
+        let value: serde_json::Value = serde_json::from_slice(buf).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to parse JSON for json_pointer extraction: {e}"),
@@ -602,8 +615,19 @@ impl SodaReader {
     pub fn new<R: Read>(mut reader: R) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
+        Self::from_vec(&buf)
+    }
 
-        let value: serde_json::Value = serde_json::from_slice(&buf).map_err(|e| {
+    /// Create a new `SodaReader` from an already-buffered byte slice.
+    ///
+    /// This avoids an extra allocation when the caller already has the data in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes cannot be parsed as valid JSON or are not
+    /// a valid SODA response.
+    pub fn from_vec(buf: &[u8]) -> io::Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(buf).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to parse SODA JSON response: {e}"),
