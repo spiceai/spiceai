@@ -612,7 +612,8 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
-    let (app_id, app_api_key) = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
+    let (app_id, app_api_key) =
+        commands::ensure_spice_cloud_app(&cloud, &app_name, channel).await?;
 
     let api_key = app_api_key.ok_or_else(|| {
         anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
@@ -638,7 +639,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] RUNNER secret set");
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, channel).await?;
+    commands::create_deployment(&cloud, app_id).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))

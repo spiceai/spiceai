@@ -148,9 +148,28 @@ fn env_var_resources_over(
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
+    channel: Option<&str>,
 ) -> anyhow::Result<(i64, Option<String>)> {
     let apps = cloud.list_apps().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
+        if channel.is_some() {
+            cloud
+                .update_app(
+                    app.id,
+                    &UpdateAppRequest {
+                        description: None,
+                        visibility: None,
+                        replicas: None,
+                        image_tag: None,
+                        region: None,
+                        spicepod: None,
+                        resources: None,
+                        executor: None,
+                        update_channel: channel.map(String::from),
+                    },
+                )
+                .await?;
+        }
         return Ok((app.id, app.api_key));
     }
 
@@ -192,6 +211,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             replicas,
             resources: Some(resources),
             executor,
+            update_channel: channel.map(String::from),
         })
         .await;
 
@@ -269,17 +289,14 @@ pub(crate) async fn apply_spicepod_to_app(
                 spicepod: Some(spicepod_yaml.to_string()),
                 resources: None,
                 executor: None,
+                update_channel: None,
             },
         )
         .await?;
     Ok(())
 }
 
-pub(crate) async fn create_deployment(
-    cloud: &CloudClient,
-    app_id: i64,
-    channel: Option<&str>,
-) -> anyhow::Result<()> {
+pub(crate) async fn create_deployment(cloud: &CloudClient, app_id: i64) -> anyhow::Result<()> {
     let created = cloud
         .create_deployment(
             app_id,
@@ -290,7 +307,7 @@ pub(crate) async fn create_deployment(
                 branch: None,
                 commit_sha: None,
                 commit_message: None,
-                channel: channel.map(String::from),
+                channel: None,
                 debug: false,
             },
         )

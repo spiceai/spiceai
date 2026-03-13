@@ -115,6 +115,8 @@ pub struct CreateAppRequest {
     pub resources: Option<AppResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<AppExecutor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_channel: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,6 +137,8 @@ pub struct UpdateAppRequest {
     pub resources: Option<AppResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<AppExecutor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_channel: Option<String>,
 }
 
 // ============================================================================
