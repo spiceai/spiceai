@@ -149,6 +149,7 @@ impl Hash for CayenneCreateTableNode {
         self.table_name.hash(state);
         self.df_catalog_name.hash(state);
         self.df_schema_name.hash(state);
+        self.partition_expr.hash(state);
         self.partition_expr_sql.hash(state);
         self.primary_key.hash(state);
     }
@@ -159,6 +160,7 @@ impl PartialEq for CayenneCreateTableNode {
         self.table_name == other.table_name
             && self.df_catalog_name == other.df_catalog_name
             && self.df_schema_name == other.df_schema_name
+            && self.partition_expr == other.partition_expr
             && self.partition_expr_sql == other.partition_expr_sql
             && self.primary_key == other.primary_key
     }

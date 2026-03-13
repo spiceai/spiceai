@@ -371,7 +371,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("Boolean PARTITION BY expressions are not supported"),
+                .contains("Boolean PARTITION BY expressions using AND/OR are not supported"),
             "unexpected error: {err}"
         );
     }
