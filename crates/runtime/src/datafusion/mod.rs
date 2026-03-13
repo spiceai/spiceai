@@ -864,10 +864,13 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns the partition expression for a table by querying the catalog provider.
+    /// Returns the partition column label for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
     /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    ///
+    /// Note: this returns the catalog metadata label (historically named as an expression API),
+    /// not a guaranteed round-trippable SQL expression.
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,

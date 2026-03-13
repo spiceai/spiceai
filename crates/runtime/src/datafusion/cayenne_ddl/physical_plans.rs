@@ -36,9 +36,10 @@ use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
 use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
+use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::col;
+use datafusion::logical_expr::{Expr, ExprSchemable};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -190,7 +191,8 @@ pub struct CayenneCreateTableExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
-    partition_expr: Option<String>,
+    partition_expr: Option<Expr>,
+    partition_expr_sql: Option<String>,
     properties: PlanProperties,
 }
 
@@ -213,7 +215,8 @@ pub struct CayenneCreateTableExecBuilder {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
-    partition_expr: Option<String>,
+    partition_expr: Option<Expr>,
+    partition_expr_sql: Option<String>,
 }
 
 impl CayenneCreateTableExecBuilder {
@@ -233,6 +236,7 @@ impl CayenneCreateTableExecBuilder {
             catalog_list,
             executor_registry: None,
             partition_expr: None,
+            partition_expr_sql: None,
         }
     }
 
@@ -249,8 +253,14 @@ impl CayenneCreateTableExecBuilder {
     }
 
     #[must_use]
-    pub fn partition_expr(mut self, partition_expr: Option<String>) -> Self {
+    pub fn partition_expr(mut self, partition_expr: Option<Expr>) -> Self {
         self.partition_expr = partition_expr;
+        self
+    }
+
+    #[must_use]
+    pub fn partition_expr_sql(mut self, partition_expr_sql: Option<String>) -> Self {
+        self.partition_expr_sql = partition_expr_sql;
         self
     }
 
@@ -272,6 +282,7 @@ impl CayenneCreateTableExecBuilder {
             catalog_list: self.catalog_list,
             executor_registry: self.executor_registry,
             partition_expr: self.partition_expr,
+            partition_expr_sql: self.partition_expr_sql,
             properties,
         }
     }
@@ -324,6 +335,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let catalog_list = Arc::clone(&self.catalog_list);
         let executor_registry = self.executor_registry.clone();
         let partition_expr = self.partition_expr.clone();
+        let partition_expr_sql = self.partition_expr_sql.clone();
         let result_schema = ddl_result_schema();
         let runtime_env = context.runtime_env();
 
@@ -429,7 +441,10 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 primary_key: Vec::new(),
                 on_conflict: None,
                 base_path: table_data_path.clone(),
-                partition_column: partition_expr.clone(),
+                partition_column: partition_expr
+                    .as_ref()
+                    .and_then(|expr| expr.column_refs().into_iter().next())
+                    .map(|col| col.name().to_string()),
                 vortex_config: vortex_config.clone(),
             };
 
@@ -445,17 +460,24 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             // Build the table provider: partitioned or non-partitioned
             let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
-                if let Some(ref partition_col) = partition_expr {
-                    // Resolve the partition column from the schema
-                    if vortex_schema.field_with_name(partition_col).is_err() {
-                        return Err(DataFusionError::Execution(format!(
-                            "Partition column '{partition_col}' not found in table schema"
-                        )));
-                    }
+                if let Some(ref partition_expr) = partition_expr {
+                    let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
+                    let partition_expr_for_error = partition_expr_sql
+                        .clone()
+                        .unwrap_or_else(|| partition_expr.to_string());
+                    partition_expr.to_field(&df_schema).map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Invalid PARTITION BY expression '{partition_expr_for_error}': {e}",
+                        ))
+                    })?;
+
+                    let partition_name = partition_expr_sql
+                        .clone()
+                        .unwrap_or_else(|| partition_expr.to_string());
 
                     let partition_by = vec![PartitionedBy {
-                        name: partition_col.clone(),
-                        expression: col(partition_col),
+                        name: partition_name,
+                        expression: partition_expr.clone(),
                     }];
 
                     let creator = Arc::new(CayennePartitionCreator::new(
@@ -487,7 +509,10 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         ))
                     })?;
 
-                    Arc::new(partition_provider) as Arc<dyn datafusion::catalog::TableProvider>
+                    let partition_provider = Arc::new(partition_provider);
+                    let deletion_provider: Arc<dyn DeletionTableProvider> = partition_provider;
+                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
+                        as Arc<dyn datafusion::catalog::TableProvider>
                 } else {
                     // Non-partitioned: open the table we just created
                     let builder = CayenneTableProviderBuilder::new(
@@ -536,8 +561,14 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     })
                     .collect::<DFResult<Vec<_>>>()?;
                 let partition_clause = partition_expr
-                    .as_deref()
-                    .map_or(String::new(), |col| format!(" PARTITION BY (\"{col}\")"));
+                    .as_ref()
+                    .map(|expr| {
+                        let partition_sql = partition_expr_sql
+                            .clone()
+                            .unwrap_or_else(|| expr.to_string());
+                        format!(" PARTITION BY ({partition_sql})")
+                    })
+                    .unwrap_or_default();
                 let ddl_sql = format!(
                     "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({}){partition_clause}",
                     columns_sql.join(", ")

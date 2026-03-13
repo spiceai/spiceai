@@ -78,6 +78,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 .if_not_exists(create.if_not_exists)
                 .executor_registry(self.executor_registry.clone())
                 .partition_expr(create.partition_expr.clone())
+                .partition_expr_sql(create.partition_expr_sql.clone())
                 .build(),
             )));
         }

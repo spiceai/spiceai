@@ -307,15 +307,15 @@ pub trait CatalogConnector: Send + Sync {
     }
 }
 
-/// Trait for catalog providers that can report partition expressions for their tables.
+/// Trait for catalog providers that can report partition metadata labels for their tables.
 ///
 /// Implementations read partition metadata from the catalog's own persistent storage,
 /// ensuring partition information survives runtime restarts.
 #[async_trait]
 pub trait PartitionAwareCatalog: Send + Sync {
-    /// Returns the partition expression for a table, if one was defined at creation time.
+    /// Returns the partition metadata label for a table, if one was defined at creation time.
     ///
-    /// The returned string is the partition column name as stored in the catalog metadata
+    /// The returned string is the partition column/label value as stored in catalog metadata
     /// (e.g. `"region"` for `PARTITION BY region`).
     async fn table_partition_expr(&self, schema_name: &str, table_name: &str) -> Option<String>;
 }
