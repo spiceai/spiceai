@@ -23,6 +23,7 @@ use std::fmt;
 use std::sync::{Arc, RwLock, Weak};
 
 use datafusion::catalog::CatalogProviderList;
+use datafusion::common::Constraint;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::DdlStatement;
@@ -32,6 +33,30 @@ use datafusion::optimizer::AnalyzerRule;
 use super::is_cayenne_catalog;
 use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
+/// Extract primary key column names from DataFusion [`Constraints`] using the
+/// Arrow schema to resolve column indices to names.
+fn extract_primary_key_columns(
+    constraints: &datafusion::common::Constraints,
+    arrow_schema: &arrow::datatypes::Schema,
+) -> Vec<String> {
+    constraints
+        .iter()
+        .find_map(|c| {
+            if let Constraint::PrimaryKey(indices) = c {
+                Some(indices)
+            } else {
+                None
+            }
+        })
+        .map(|indices| {
+            indices
+                .iter()
+                .map(|&idx| arrow_schema.field(idx).name().clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
+}
 
 fn parse_qualified_schema_name(name: &str) -> (String, String) {
     match name.split_once('.') {
@@ -121,6 +146,8 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 // Extract the Arrow schema from the logical plan's input
                 let arrow_schema = Arc::new(create.input.schema().inner().as_ref().clone());
 
+                let primary_key = extract_primary_key_columns(&create.constraints, &arrow_schema);
+
                 let node = CayenneCreateTableNode::new(
                     table_name,
                     arrow_schema,
@@ -128,6 +155,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     create.or_replace,
                     catalog_name,
                     schema_name,
+                    primary_key,
                 );
 
                 Ok(LogicalPlan::Extension(Extension {
@@ -193,7 +221,10 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_qualified_schema_name;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{Constraint, Constraints};
+
+    use super::{extract_primary_key_columns, parse_qualified_schema_name};
     use crate::datafusion::SPICE_DEFAULT_CATALOG;
 
     #[test]
@@ -208,5 +239,56 @@ mod tests {
         let (catalog, schema) = parse_qualified_schema_name("bench");
         assert_eq!(catalog, SPICE_DEFAULT_CATALOG);
         assert_eq!(schema, "bench");
+    }
+
+    fn test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("email", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn extract_primary_key_single_column() {
+        let schema = test_schema();
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let pk = extract_primary_key_columns(&constraints, &schema);
+        assert_eq!(pk, vec!["id"]);
+    }
+
+    #[test]
+    fn extract_primary_key_composite() {
+        let schema = test_schema();
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 2])]);
+        let pk = extract_primary_key_columns(&constraints, &schema);
+        assert_eq!(pk, vec!["id", "email"]);
+    }
+
+    #[test]
+    fn extract_primary_key_none_when_no_constraints() {
+        let schema = test_schema();
+        let constraints = Constraints::new_unverified(vec![]);
+        let pk = extract_primary_key_columns(&constraints, &schema);
+        assert!(pk.is_empty());
+    }
+
+    #[test]
+    fn extract_primary_key_none_when_only_unique_constraint() {
+        let schema = test_schema();
+        let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![1])]);
+        let pk = extract_primary_key_columns(&constraints, &schema);
+        assert!(pk.is_empty());
+    }
+
+    #[test]
+    fn extract_primary_key_ignores_unique_uses_first_pk() {
+        let schema = test_schema();
+        let constraints = Constraints::new_unverified(vec![
+            Constraint::Unique(vec![2]),
+            Constraint::PrimaryKey(vec![0]),
+        ]);
+        let pk = extract_primary_key_columns(&constraints, &schema);
+        assert_eq!(pk, vec!["id"]);
     }
 }
