@@ -91,6 +91,12 @@ impl PartitionManager {
         }
     }
 
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.state = self.state.with_prefix(prefix);
+        self
+    }
+
     /// Get partition metadata for a table from object store.
     pub async fn get_table_metadata(
         &self,
