@@ -1922,12 +1922,12 @@ mod tests {
         #[test]
         fn test_jsonl_blank_lines() {
             let input = b"{\"a\":1}\n\n{\"b\":2}\n\n";
-            let lines: Vec<String> = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
+            let count = read_all_lines(BufReader::new(Cursor::new(input.as_slice())))
                 .expect("should read lines")
                 .into_iter()
                 .filter(|l| !l.is_empty())
-                .collect();
-            assert_eq!(lines.len(), 2);
+                .count();
+            assert_eq!(count, 2);
         }
 
         /// JSONL with extra whitespace before each line
@@ -2653,8 +2653,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let lines: Vec<&str> = output.lines().collect();
-            assert_eq!(lines.len(), 100);
+            assert_eq!(output.lines().count(), 100);
         }
 
         #[test]
