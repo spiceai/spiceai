@@ -44,8 +44,6 @@ use crate::{
     flight::Service as FlightSvc,
 };
 
-use spicepod::partitioning::PartitionedBy;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to create partition metadata for table {table}"))]
@@ -162,7 +160,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     path: &TableReference,
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
-    partition_by: &[PartitionedBy],
+    partition_by: &[String], // partition expressions as strings (e.g. "country", "date_trunc('day', timestamp)"
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_cached_table_metadata(path) {
@@ -407,9 +405,9 @@ async fn route_matched_and_collect_unmatched(
     arrow::compute::filter_record_batch(batch, &unmatched_mask).context(FilterBatchSnafu)
 }
 
-/// Parses `PartitionedBy` expressions into logical + physical expression pairs.
+/// Parses partition-by SQL expression strings into logical + physical expression pairs.
 fn build_partition_physical_exprs(
-    partition_by: &[PartitionedBy],
+    partition_by: &[String],
     schema: &SchemaRef,
     ctx: &Arc<datafusion::prelude::SessionContext>,
 ) -> Result<Vec<(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)>> {
@@ -418,8 +416,8 @@ fn build_partition_physical_exprs(
 
     partition_by
         .iter()
-        .map(|p| {
-            let expr = Expr::from_bytes_with_registry(p.expression.as_bytes(), ctx.as_ref())
+        .map(|e| {
+            let expr = Expr::from_bytes_with_registry(e.as_bytes(), ctx.as_ref())
                 .context(ParsePartitionExprSnafu)?;
             let physical = datafusion::physical_expr::create_physical_expr(
                 &expr,

@@ -251,6 +251,10 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    pub fn partition_expressions(&self) -> Option<String> {
+        None
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors

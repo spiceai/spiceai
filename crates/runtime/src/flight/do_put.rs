@@ -203,10 +203,13 @@ pub(crate) async fn handle(
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
-        && should_forward_raw_cayenne_write(&datafusion, &path).await
+        && let Some(cayenne_table) = should_forward_raw_cayenne_write(&datafusion, &path).await
     {
-        // TODO: resolve partition_by from table configuration
-        let partition_by: Vec<spicepod::partitioning::PartitionedBy> = vec![];
+        let Some(partition_expressions) = cayenne_table.partition_expressions() else {
+            return Err(Status::internal(format!(
+                "in distributed mode, Cayenne tables must have 'partition_by' expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
+            )));
+        };
         return crate::cluster::partition::write_through::forward_federated_partitioned_write(
             executor_registry,
             Arc::clone(&datafusion.ctx),
@@ -214,7 +217,7 @@ pub(crate) async fn handle(
             &path,
             first_message,
             streaming_flight,
-            &partition_by,
+            partition_expressions,
         )
         .await
         .map_err(Into::into);
@@ -255,13 +258,16 @@ fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
         && datafusion.cluster_config.tls_config().is_some()
 }
 
-async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableReference) -> bool {
+async fn should_forward_raw_cayenne_write(
+    datafusion: &DataFusion,
+    path: &TableReference,
+) -> Option<cayenne::CayenneTableProvider> {
     if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
-        return false;
+        return None;
     }
 
     let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
-        return false;
+        return None;
     };
 
     if executor_registry
@@ -270,17 +276,16 @@ async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableR
         .ok()
         .is_none_or(|c| c.is_empty())
     {
-        return false;
+        return None;
     };
 
     let Some(table_provider) = datafusion.get_table(path).await else {
-        return false;
+        return None;
     };
 
     table_provider
         .as_any()
         .downcast_ref::<cayenne::CayenneTableProvider>()
-        .is_some()
 }
 
 fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
