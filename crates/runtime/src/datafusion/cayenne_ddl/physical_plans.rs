@@ -365,7 +365,6 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 data_base_path.trim_end_matches('/').to_string() + "/"
             );
 
-            // Create table options with namespace-prefixed name
             let on_conflict = if primary_key.is_empty() {
                 None
             } else {
@@ -373,6 +372,8 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     primary_key.clone(),
                 )))
             };
+
+            // Create table options with namespace-prefixed name
             let create_options = CreateTableOptions {
                 table_name: metadata_table_name.clone(),
                 schema: Arc::new(vortex_schema),
