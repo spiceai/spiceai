@@ -200,7 +200,6 @@ secrets:
   #   name: aws
   #   params:
   #     aws_region: us-east-1
-
   # Keyring secret store (feature-gated)
   # - from: keyring:my_service
   #   name: keyring
@@ -1339,25 +1338,6 @@ embeddings:
   # File-based embeddings
   - name: file_embeddings
     from: file:models/embeddings.gguf
-
-# =============================================================================
-# EVALS
-# Evaluation configurations
-# =============================================================================
-evals:
-  - name: model_eval
-    description: Evaluate model quality
-    dataset: eval_dataset
-    scorers:
-      - accuracy
-      - f1_score
-      - bleu
-    dependsOn:
-      - openai_model
-    metrics:
-      metrics:
-        - name: eval.accuracy
-          enabled: true
 
 # =============================================================================
 # TOOLS

@@ -43,7 +43,7 @@ use test_framework::queries::QuerySet;
 ///
 /// This exercises the full Cayenne write pipeline:
 ///   `write_data` → `AcceleratedTable::insert_into` → `CayenneTableProvider::insert_into`
-///   → `CayenneDataSink::write_all_append` → `chunk_and_write_parallel_to_snapshot`
+///   → `CayenneDataSink::write_all_append` → `write_to_snapshot`
 ///
 /// The row schema is derived from the existing table schema so that only the
 /// `VendorID` column is explicitly set; all other columns get NULL values.

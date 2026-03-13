@@ -38,8 +38,6 @@ use crate::{
     tracers,
 };
 use app::App;
-use datafusion::optimizer::AnalyzerRule;
-use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
@@ -248,15 +246,20 @@ impl RuntimeBuilder {
                     .await
                     {
                         Ok(store) => {
-                            let partition_manager = Arc::new(PartitionManager::new(store));
+                            let partition_manager =
+                                Arc::new(PartitionManager::new(Arc::clone(&store)));
 
                             Some(DistributedNode::Scheduler {
                                 peers: Arc::new(RwLock::new(HashMap::new())),
                                 // Initialized later when scheduler registry starts
                                 job_executor: Arc::new(RwLock::new(None)),
-                                executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
-                                    &partition_manager,
-                                ))),
+                                executor_registry: Arc::new(ExecutorRegistry::new(
+                                    Arc::clone(&partition_manager),
+                                    Arc::new(
+                                        PartitionManager::new(Arc::clone(&store))
+                                            .with_prefix("catalog/partitions/"),
+                                    ),
+                                )),
                                 partition_manager,
                             })
                         }
@@ -271,15 +274,19 @@ impl RuntimeBuilder {
                     tracing::warn!(
                         "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory partition store."
                     );
-                    let partition_manager = Arc::new(PartitionManager::new(Arc::new(
-                        object_store::memory::InMemory::new(),
-                    )));
+                    let store: Arc<dyn object_store::ObjectStore> =
+                        Arc::new(object_store::memory::InMemory::new());
+                    let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
                     Some(DistributedNode::Scheduler {
                         peers: Arc::new(RwLock::new(HashMap::new())),
                         job_executor: Arc::new(RwLock::new(None)),
-                        executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
-                            &partition_manager,
-                        ))),
+                        executor_registry: Arc::new(ExecutorRegistry::new(
+                            Arc::clone(&partition_manager),
+                            Arc::new(
+                                PartitionManager::new(Arc::clone(&store))
+                                    .with_prefix("catalog/partitions/"),
+                            ),
+                        )),
                         partition_manager,
                     })
                 }
@@ -307,13 +314,7 @@ impl RuntimeBuilder {
             executor_registry, ..
         }) = distributed.as_ref()
         {
-            df_builder = df_builder
-                .with_executor_registry(Arc::clone(executor_registry))
-                .with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(Arc::clone(
-                    executor_registry,
-                )
-                    as Arc<dyn TablePartitionProvider>))
-                    as Arc<dyn AnalyzerRule + Send + Sync>]);
+            df_builder = df_builder.with_executor_registry(Arc::clone(executor_registry));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
@@ -343,12 +344,6 @@ impl RuntimeBuilder {
             None
         };
 
-        let evals = self
-            .app
-            .as_ref()
-            .map(|a| a.evals.clone())
-            .unwrap_or_default();
-
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
             df,
@@ -357,8 +352,6 @@ impl RuntimeBuilder {
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
-            evals: Arc::new(RwLock::new(evals)),
-            eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),

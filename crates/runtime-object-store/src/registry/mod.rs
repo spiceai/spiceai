@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
 
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use datafusion::{
@@ -40,10 +44,52 @@ use crate::store::sftp::SFTPObjectStore;
 #[cfg(feature = "smb")]
 use crate::store::smb::SMBObjectStore;
 
+/// S3 URL addressing style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3UrlStyle {
+    /// Virtual-hosted style: `<bucket>.endpoint`.
+    VirtualHosted,
+    /// Path style: `endpoint/<bucket>`.
+    Path,
+}
+
+impl S3UrlStyle {
+    /// Returns `true` if this is virtual-hosted style.
+    fn is_virtual_hosted(self) -> bool {
+        matches!(self, Self::VirtualHosted)
+    }
+}
+
+impl std::fmt::Display for S3UrlStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VirtualHosted => f.write_str("vhost"),
+            Self::Path => f.write_str("path"),
+        }
+    }
+}
+
+/// Internal state for S3 URL style auto-detection.
+#[derive(Debug, Default)]
+struct S3StyleState {
+    /// Cache of definitively detected S3 URL styles per endpoint. Only positive
+    /// DNS results ([`S3UrlStyle::VirtualHosted`]) are cached because they are
+    /// conclusive. [`S3UrlStyle::Path`] results (from DNS lookup failure) are
+    /// *not* cached because the failure may be transient (e.g. temporary
+    /// resolver outage) — a later probe may succeed and correctly detect vhost.
+    cache: HashMap<String, S3UrlStyle>,
+
+    /// Endpoints for which auto-detection has already been logged, so repeated
+    /// probes for the same endpoint don't produce duplicate log lines.
+    logged: HashSet<String>,
+}
+
 #[derive(Debug)]
 pub struct SpiceObjectStoreRegistry {
     inner: DefaultObjectStoreRegistry,
     io_runtime: Handle,
+    /// State for S3 URL style auto-detection caching and logging.
+    s3_style_state: Mutex<S3StyleState>,
 }
 
 impl SpiceObjectStoreRegistry {
@@ -52,17 +98,18 @@ impl SpiceObjectStoreRegistry {
         Self {
             inner: DefaultObjectStoreRegistry::new(),
             io_runtime,
+            s3_style_state: Mutex::new(S3StyleState::default()),
         }
     }
 
-    /// Parse `url_style` parameter. Returns `Some(true)` for vhost, `Some(false)` for path,
+    /// Parse `url_style` parameter. Returns `Some(VirtualHosted)` for vhost, `Some(Path)` for path,
     /// `None` when not explicitly set (auto-detect).
     fn parse_s3_url_style(
         params: &HashMap<String, String>,
-    ) -> datafusion::error::Result<Option<bool>> {
+    ) -> datafusion::error::Result<Option<S3UrlStyle>> {
         match params.get("url_style").map(String::as_str) {
-            Some("path") => Ok(Some(false)),
-            Some("vhost") => Ok(Some(true)),
+            Some("path") => Ok(Some(S3UrlStyle::Path)),
+            Some("vhost") => Ok(Some(S3UrlStyle::VirtualHosted)),
             None => Ok(None),
             Some(value) => Err(DataFusionError::Configuration(format!(
                 "{value} is not a valid value for url_style"
@@ -73,9 +120,9 @@ impl SpiceObjectStoreRegistry {
     fn endpoint_for_s3_url_style(
         endpoint: &str,
         bucket_name: &str,
-        virtual_hosted_style_request: bool,
+        url_style: S3UrlStyle,
     ) -> datafusion::error::Result<String> {
-        if !virtual_hosted_style_request {
+        if url_style == S3UrlStyle::Path {
             return Ok(endpoint.to_string());
         }
 
@@ -126,38 +173,85 @@ impl SpiceObjectStoreRegistry {
         let explicit_url_style = Self::parse_s3_url_style(&params)?;
         let endpoint = params.get("endpoint");
 
-        let virtual_hosted = match explicit_url_style {
+        let url_style = match explicit_url_style {
             Some(v) => v,
             None => {
                 // Auto-detect: IP endpoints must use path-style.
                 if endpoint.is_some_and(|e| Self::endpoint_is_ip(e)) {
-                    tracing::info!("s3_url_style not set; using path style for IP endpoint");
-                    false
+                    tracing::debug!("s3_url_style not set; using path style for IP endpoint");
+                    S3UrlStyle::Path
                 } else if let Some(ep) = endpoint {
-                    // Non-IP custom endpoint — DNS probe to detect style.
-                    match Self::detect_s3_url_style(bucket_name, ep) {
-                        Ok(detected) => detected,
-                        Err(e) => {
-                            tracing::warn!(
-                                "s3_url_style detection failed ({e:#}), defaulting to vhost"
-                            );
-                            true
-                        }
-                    }
+                    // Non-IP custom endpoint — cached result or DNS probe.
+                    self.resolve_s3_url_style(bucket_name, ep)
                 } else {
                     // No custom endpoint (standard AWS) — vhost.
-                    true
+                    S3UrlStyle::VirtualHosted
                 }
             }
         };
 
-        self.build_s3_object_store(bucket_name, &params, virtual_hosted)
+        self.build_s3_object_store(bucket_name, &params, url_style)
+    }
+
+    /// Resolve the S3 URL style for a non-IP custom endpoint, using the cache
+    /// when available. Uses a double-checked pattern so the lock is *not* held
+    /// during the (potentially slow) DNS probe.
+    ///
+    /// Only definitive results ([`S3UrlStyle::VirtualHosted`], from a successful
+    /// DNS resolution) are cached. [`S3UrlStyle::Path`] results are not cached
+    /// because a DNS failure may be transient — a later probe could succeed.
+    fn resolve_s3_url_style(&self, bucket_name: &str, endpoint: &str) -> S3UrlStyle {
+        // Fast path: return cached result without doing any I/O.
+        {
+            let state = self
+                .s3_style_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&cached) = state.cache.get(endpoint) {
+                return cached;
+            }
+        }
+        // Lock released — perform DNS probe.
+
+        let detected = match Self::detect_s3_url_style(bucket_name, endpoint) {
+            Ok(style) => style,
+            Err(e) => {
+                tracing::warn!("s3_url_style detection failed ({e:#}), defaulting to vhost");
+                return S3UrlStyle::VirtualHosted;
+            }
+        };
+
+        // Re-acquire lock for double-check and state update.
+        let mut state = self
+            .s3_style_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Another thread may have completed detection while we were probing.
+        if let Some(&cached) = state.cache.get(endpoint) {
+            return cached;
+        }
+
+        // Only cache definitive (VirtualHosted) results. Path results come from
+        // DNS lookup failure, which may be a transient resolver/network issue.
+        if detected == S3UrlStyle::VirtualHosted {
+            state.cache.insert(endpoint.to_string(), detected);
+        }
+
+        if state.logged.insert(endpoint.to_string()) {
+            tracing::info!("Auto-detected s3_url_style={detected} for endpoint '{endpoint}'");
+        }
+
+        detected
     }
 
     /// Detect whether vhost or path style should be used by performing a DNS
     /// lookup on `<bucket>.<endpoint_host>`. If the name resolves the endpoint
     /// supports virtual-hosted style; NXDOMAIN means path style is required.
-    fn detect_s3_url_style(bucket_name: &str, endpoint: &str) -> datafusion::error::Result<bool> {
+    fn detect_s3_url_style(
+        bucket_name: &str,
+        endpoint: &str,
+    ) -> datafusion::error::Result<S3UrlStyle> {
         use std::net::ToSocketAddrs;
 
         let endpoint_url = Url::parse(endpoint).map_err(|e| {
@@ -179,18 +273,14 @@ impl SpiceObjectStoreRegistry {
 
         let vhost_host = format!("{bucket_name}.{host}:{port}");
 
-        tracing::info!(
+        tracing::debug!(
             "s3_url_style not set for endpoint '{endpoint}'; resolving '{vhost_host}' to detect URL style..."
         );
 
         if vhost_host.to_socket_addrs().is_ok() {
-            tracing::info!("s3_url_style auto-detected: vhost (DNS resolved for '{vhost_host}')");
-            Ok(true)
+            Ok(S3UrlStyle::VirtualHosted)
         } else {
-            tracing::info!(
-                "s3_url_style auto-detected: path (DNS lookup failed for '{vhost_host}')"
-            );
-            Ok(false)
+            Ok(S3UrlStyle::Path)
         }
     }
 
@@ -198,7 +288,7 @@ impl SpiceObjectStoreRegistry {
         &self,
         bucket_name: &str,
         params: &HashMap<String, String>,
-        virtual_hosted_style_request: bool,
+        url_style: S3UrlStyle,
     ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let mut s3_builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
@@ -206,17 +296,13 @@ impl SpiceObjectStoreRegistry {
             .with_allow_http(true);
         let mut client_options = ClientOptions::default();
 
-        s3_builder = s3_builder.with_virtual_hosted_style_request(virtual_hosted_style_request);
+        s3_builder = s3_builder.with_virtual_hosted_style_request(url_style.is_virtual_hosted());
 
         if let Some(region) = params.get("region") {
             s3_builder = s3_builder.with_region(region);
         }
         if let Some(endpoint) = params.get("endpoint") {
-            let endpoint = Self::endpoint_for_s3_url_style(
-                endpoint,
-                bucket_name,
-                virtual_hosted_style_request,
-            )?;
+            let endpoint = Self::endpoint_for_s3_url_style(endpoint, bucket_name, url_style)?;
             s3_builder = s3_builder.with_endpoint(endpoint);
         }
         if let Some(timeout) = params.get("client_timeout") {
@@ -920,7 +1006,7 @@ mod tests {
         let params = HashMap::from([("url_style".to_string(), "path".to_string())]);
         assert_eq!(
             SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
-            Some(Some(false))
+            Some(Some(S3UrlStyle::Path))
         );
     }
 
@@ -929,7 +1015,7 @@ mod tests {
         let params = HashMap::from([("url_style".to_string(), "vhost".to_string())]);
         assert_eq!(
             SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
-            Some(Some(true))
+            Some(Some(S3UrlStyle::VirtualHosted))
         );
     }
 
@@ -945,7 +1031,7 @@ mod tests {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://t3.storage.dev",
             "spiceai-public-datasets",
-            false,
+            S3UrlStyle::Path,
         )
         .expect("path-style endpoint should parse");
 
@@ -957,7 +1043,7 @@ mod tests {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://t3.storage.dev",
             "spiceai-public-datasets",
-            true,
+            S3UrlStyle::VirtualHosted,
         )
         .expect("virtual-hosted endpoint should parse");
 
@@ -970,7 +1056,7 @@ mod tests {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://spiceai-public-datasets.t3.storage.dev",
             "spiceai-public-datasets",
-            true,
+            S3UrlStyle::VirtualHosted,
         )
         .expect("virtual-hosted endpoint should parse");
 
@@ -985,7 +1071,7 @@ mod tests {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "http://minio:9000",
             "bucket",
-            true,
+            S3UrlStyle::VirtualHosted,
         )
         .expect("virtual-hosted endpoint with port should parse");
 
@@ -998,7 +1084,7 @@ mod tests {
         let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
             "https://t3.storage.dev",
             "t3",
-            true,
+            S3UrlStyle::VirtualHosted,
         )
         .expect("virtual-hosted endpoint should parse");
 

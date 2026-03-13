@@ -1,53 +1,108 @@
 name: Sets up the Rust toolchain
 description: 'composite action'
 
+inputs:
+  toolchain:
+    description: 'Rust toolchain to install; defaults to the repository rust-toolchain.toml channel'
+    required: false
+
 runs:
   using: 'composite'
   steps:
-    - name: Install Rust if not installed (Linux/macOS)
+    - name: Install Rust toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
-        if [ -d $HOME/.cargo ]; then
-          source $HOME/.cargo/env || true
-        fi
-        if ! command -v rustup &> /dev/null ; then
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-          source $HOME/.cargo/env || true
+        set -euo pipefail
+
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        echo "$cargo_home/bin" >> "$GITHUB_PATH"
+        export PATH="$cargo_home/bin:$PATH"
+
+        if [ -f "$cargo_home/env" ]; then
+          source "$cargo_home/env" || true
         fi
 
-    - name: Install Rust if not installed (Windows)
+        if [ ! -x "$cargo_home/bin/rustup" ]; then
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+          if [ -f "$cargo_home/env" ]; then
+            source "$cargo_home/env" || true
+          fi
+        fi
+
+        # Resolve which toolchain to install.
+        toolchain='${{ inputs.toolchain }}'
+        if [ -z "$toolchain" ]; then
+          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
+        fi
+        if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
+          toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+        fi
+        if [ -z "$toolchain" ]; then
+          toolchain='stable'
+        fi
+
+        # Install toolchain with all components in a single atomic operation
+        # so concurrent runners sharing the same RUSTUP_HOME don't race.
+        rustup toolchain install "$toolchain" \
+          --component cargo \
+          --component rustc \
+          --component rustfmt \
+          --component clippy
+
+        resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
+        if [ -z "$resolved" ]; then
+          echo "Failed to resolve installed Rust toolchain for $toolchain" >&2
+          exit 1
+        fi
+
+        # Export RUSTUP_TOOLCHAIN so subsequent steps use this toolchain
+        # without modifying the global default (which races when multiple
+        # runners share the same RUSTUP_HOME on one machine).
+        echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
+
+        rustup run "$resolved" cargo --version
+        rustup run "$resolved" rustc --version
+
+    - name: Install Rust toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
           Write-Host "Installing Rust..."
           Invoke-WebRequest -Uri "https://win.rustup.rs" -OutFile "rustup-init.exe"
           Start-Process -FilePath "rustup-init.exe" -ArgumentList "-q", "-y", "--default-toolchain", "none", "--profile", "default" -Wait
-          echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         }
 
-    - name: Install Rust 1.93.1 toolchain (Linux/macOS)
-      if: runner.os != 'Windows'
-      shell: bash
-      run: |
-        TOOLCHAIN=1.93.1
+        $toolchain = "${{ inputs.toolchain }}"
+        if (-not $toolchain) {
+          $activeToolchain = rustup show active-toolchain 2>$null
+          if ($activeToolchain) {
+            $toolchain = ($activeToolchain -split '\s+')[0]
+          }
+        }
+        if (-not $toolchain -and (Test-Path "rust-toolchain.toml")) {
+          $match = Select-String -Path "rust-toolchain.toml" -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if ($match) {
+            $toolchain = $match.Matches[0].Groups[1].Value
+          }
+        }
+        if (-not $toolchain) {
+          $toolchain = "stable"
+        }
 
-        rustup toolchain install "${TOOLCHAIN}" --profile minimal
-        rustup component add cargo rustc rustfmt clippy --toolchain "${TOOLCHAIN}"
-        rustup default "${TOOLCHAIN}"
-        rustup run "${TOOLCHAIN}" cargo --version
-        rustup run "${TOOLCHAIN}" rustc --version
+        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
 
-    - name: Install Rust 1.93.1 toolchain (Windows)
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: |
-        $toolchain = "1.93.1"
+        $rustcPath = rustup which --toolchain $toolchain rustc
+        if (-not $rustcPath) {
+          Write-Error "Failed to resolve installed Rust toolchain for $toolchain"
+          exit 1
+        }
 
-        rustup toolchain install $toolchain --profile minimal
-        rustup component add cargo rustc rustfmt clippy --toolchain $toolchain
-        rustup default $toolchain
-        rustup run $toolchain cargo --version
-        rustup run $toolchain rustc --version
+        $resolved = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
+
+        "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
+
+        rustup run $resolved cargo --version
+        rustup run $resolved rustc --version

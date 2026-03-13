@@ -661,3 +661,135 @@ register_data_connector!(
     "https",
     HttpsFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::parameters::Parameters;
+    use crate::secrets::Secrets;
+    use app::AppBuilder;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+
+    async fn test_connector(file_format: Option<&str>) -> Https {
+        let mut params: Vec<(String, SecretString)> = vec![
+            ("client_timeout".to_string(), "1".to_string().into()),
+            ("connect_timeout".to_string(), "1".to_string().into()),
+        ];
+
+        if let Some(file_format) = file_format {
+            params.push(("file_format".to_string(), file_format.to_string().into()));
+        }
+
+        let params = Parameters::try_new(
+            "connector https",
+            params,
+            "http",
+            Arc::new(RwLock::new(Secrets::default())),
+            &PARAMETERS,
+        )
+        .await
+        .expect("test connector parameters should be valid");
+
+        Https { params }
+    }
+
+    async fn test_dataset(
+        from: &str,
+        refresh_mode: RefreshMode,
+        refresh_sql: Option<&str>,
+    ) -> Dataset {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new(from.to_string(), "http_test")
+            .expect("dataset builder should be created")
+            .with_app(app)
+            .with_runtime(runtime)
+            .build()
+            .expect("dataset should build");
+
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(refresh_mode),
+            refresh_sql: refresh_sql.map(std::string::ToString::to_string),
+            ..Default::default()
+        });
+
+        dataset
+    }
+
+    fn assert_invalid_url_error(error: DataConnectorError) {
+        match error {
+            DataConnectorError::InvalidConfiguration { message, .. } => {
+                assert!(
+                    message.contains("not a valid URL"),
+                    "expected invalid URL error, got: {message}"
+                );
+            }
+            other => panic!("expected invalid URL error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_full_refresh_requires_refresh_sql_for_unstructured_endpoints() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("full refresh without refresh_sql should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("requires 'refresh_sql'"),
+                    "expected refresh_sql validation error, got: {message}"
+                );
+            }
+            other => panic!("expected refresh_sql validation error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_append_refresh_without_refresh_sql_reaches_provider_validation() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("not a url", RefreshMode::Append, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("append mode should continue to provider validation");
+
+        assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_http_caching_refresh_without_refresh_sql_reaches_provider_validation() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("not a url", RefreshMode::Caching, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("caching mode should continue to provider validation");
+
+        assert_invalid_url_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_http_structured_full_refresh_without_refresh_sql_bypasses_json_validation() {
+        let connector = test_connector(Some("csv")).await;
+        let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("structured formats should bypass JSON refresh_sql validation");
+
+        assert_invalid_url_error(error);
+    }
+}

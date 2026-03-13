@@ -20,7 +20,7 @@ use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
     types::{
-        AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
+        AppExecutor, AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
         CreateDeploymentRequest, UpdateAppRequest,
     },
 };
@@ -57,6 +57,94 @@ pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Resu
         .with_timeout(Duration::from_secs(600))?)
 }
 
+/// Parse an optional non-negative integer from an environment variable.
+///
+/// Returns `Ok(None)` when the variable is unset, and an error when it is set
+/// but cannot be parsed as a non-negative integer, is negative, or contains
+/// invalid Unicode.
+fn env_var_replicas(name: &str) -> anyhow::Result<Option<i32>> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "Environment variable {name} contains invalid Unicode; expected a non-negative integer"
+        )),
+        Ok(val) => {
+            let trimmed = val.trim();
+            match trimmed.parse::<i32>() {
+                Ok(n) if n >= 0 => Ok(Some(n)),
+                Ok(_) | Err(_) => Err(anyhow::anyhow!(
+                    "{name} must be a non-negative integer, got '{val}'"
+                )),
+            }
+        }
+    }
+}
+
+/// Default resource allocation shared by scheduler and executor when no env vars override them.
+fn default_resources() -> AppResources {
+    AppResources {
+        limits: AppResourceLimits {
+            cpu: None,
+            memory: "16Gi".to_string(),
+            ephemeral_storage: None,
+        },
+        requests: Some(AppResourceRequests {
+            cpu: Some("0.1".to_string()),
+            memory: Some("256Mi".to_string()),
+        }),
+    }
+}
+
+/// Read a string environment variable, returning `None` when unset and an
+/// error when the value contains invalid Unicode.
+fn env_var_str(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(val) => Ok(Some(val)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "Environment variable {name} contains invalid Unicode; expected a UTF-8 string"
+        )),
+    }
+}
+
+/// Build an [`AppResources`] by merging environment variable overrides on top
+/// of a set of base (default) resources.
+///
+/// Each field is overridden independently: only the env vars that are actually
+/// set replace the corresponding field in `base`. This means callers can
+/// override, e.g., only the memory limit without losing the CPU request
+/// default.
+fn env_var_resources_over(
+    base: AppResources,
+    memory_limit_var: &str,
+    cpu_limit_var: &str,
+    cpu_request_var: &str,
+    memory_request_var: &str,
+) -> anyhow::Result<AppResources> {
+    let memory_limit = env_var_str(memory_limit_var)?.unwrap_or(base.limits.memory);
+    let cpu_limit = env_var_str(cpu_limit_var)?.or(base.limits.cpu);
+    let cpu_request =
+        env_var_str(cpu_request_var)?.or(base.requests.as_ref().and_then(|r| r.cpu.clone()));
+    let memory_request =
+        env_var_str(memory_request_var)?.or(base.requests.as_ref().and_then(|r| r.memory.clone()));
+
+    Ok(AppResources {
+        limits: AppResourceLimits {
+            cpu: cpu_limit,
+            memory: memory_limit,
+            ephemeral_storage: None,
+        },
+        requests: if cpu_request.is_some() || memory_request.is_some() {
+            Some(AppResourceRequests {
+                cpu: cpu_request,
+                memory: memory_request,
+            })
+        } else {
+            None
+        },
+    })
+}
+
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
@@ -68,6 +156,29 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     let cname = resolve_default_cname(cloud).await?;
 
+    // App (scheduler) resources — start from defaults, then apply any env var overrides.
+    let resources = env_var_resources_over(
+        default_resources(),
+        "SPIDAPTER_APP_MEMORY_LIMIT",
+        "SPIDAPTER_APP_CPU_LIMIT",
+        "SPIDAPTER_APP_CPU_REQUEST",
+        "SPIDAPTER_APP_MEMORY_REQUEST",
+    )?;
+
+    let replicas = env_var_replicas("SPIDAPTER_APP_REPLICAS")?;
+
+    // Executor — same resource defaults as scheduler; each field overridable independently.
+    let executor = Some(AppExecutor {
+        replicas: Some(env_var_replicas("SPIDAPTER_EXECUTOR_REPLICAS")?.unwrap_or(1)),
+        resources: Some(env_var_resources_over(
+            default_resources(),
+            "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
+            "SPIDAPTER_EXECUTOR_CPU_LIMIT",
+            "SPIDAPTER_EXECUTOR_CPU_REQUEST",
+            "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
+        )?),
+    });
+
     let create_result = cloud
         .create_app(&CreateAppRequest {
             name: app_name.to_string(),
@@ -78,17 +189,9 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
-            resources: Some(AppResources {
-                limits: AppResourceLimits {
-                    cpu: None,
-                    memory: "32Gi".to_string(),
-                    ephemeral_storage: None,
-                },
-                requests: Some(AppResourceRequests {
-                    cpu: Some("0.1".to_string()),
-                    memory: Some("256Mi".to_string()),
-                }),
-            }),
+            replicas,
+            resources: Some(resources),
+            executor,
         })
         .await;
 
@@ -165,6 +268,7 @@ pub(crate) async fn apply_spicepod_to_app(
                 region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
                 resources: None,
+                executor: None,
             },
         )
         .await?;

@@ -2918,13 +2918,6 @@ mod accelerator_compat_tests {
     #[tokio::test]
     async fn test_overwrite_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
-            // Turso/SQLite doesn't support INSERT OVERWRITE in the same way - it appends instead
-            // This is a known limitation of the tokio-rusqlite table implementation
-            if engine == Engine::Turso {
-                println!("  Skipping Turso - INSERT OVERWRITE not fully supported");
-                return;
-            }
-
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
