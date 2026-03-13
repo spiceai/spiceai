@@ -42,23 +42,32 @@ runs:
           toolchain='stable'
         fi
 
-        # Physically remove stale toolchain directories and update hashes
-        # to guarantee a clean install. `rustup toolchain uninstall` can fail
-        # silently on corrupted toolchains (e.g. cargo binary "not applicable"
-        # after a --profile minimal install), leaving the broken state intact.
-        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-        rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
-        rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
-        rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
-        rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if [[ ! "$toolchain" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+          echo "Invalid toolchain name: $toolchain" >&2
+          exit 1
+        fi
 
-        # Install toolchain with all components in a single atomic operation
-        # so concurrent runners sharing the same RUSTUP_HOME don't race.
-        rustup toolchain install "$toolchain" \
-          --component cargo \
-          --component rustc \
-          --component rustfmt \
-          --component clippy
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+
+        # Physically remove stale toolchain directories and update hashes,
+        # then reinstall. Wrapped in flock to prevent races when multiple
+        # jobs on the same self-hosted runner share RUSTUP_HOME.
+        mkdir -p "${rustup_home}"
+        (
+          flock 9
+
+          rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
+          rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
+          rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
+          rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
+
+          rustup toolchain install "$toolchain" \
+            --component cargo \
+            --component rustc \
+            --component rustfmt \
+            --component clippy
+        ) 9>"${rustup_home}/.setup-rust.lock"
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
@@ -107,10 +116,25 @@ runs:
           $toolchain = "stable"
         }
 
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if ($toolchain -notmatch '^[a-zA-Z0-9._-]+$') {
+          Write-Error "Invalid toolchain name: $toolchain"
+          exit 1
+        }
+
         $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
-        Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
-        Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
-        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+
+        # Use a mutex to prevent races when multiple jobs share RUSTUP_HOME.
+        $mutex = New-Object System.Threading.Mutex($false, "Global\setup-rust-$toolchain")
+        try {
+          [void]$mutex.WaitOne()
+          Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
+          Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
+          rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        } finally {
+          $mutex.ReleaseMutex()
+          $mutex.Dispose()
+        }
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
