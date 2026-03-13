@@ -60,15 +60,23 @@ pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Resu
 /// Parse an optional non-negative integer from an environment variable.
 ///
 /// Returns `Ok(None)` when the variable is unset, and an error when it is set
-/// but cannot be parsed as a non-negative integer.
+/// but cannot be parsed as a non-negative integer, is negative, or contains
+/// invalid Unicode.
 fn env_var_replicas(name: &str) -> anyhow::Result<Option<i32>> {
     match std::env::var(name) {
-        Err(_) => Ok(None),
-        Ok(val) => val
-            .trim()
-            .parse::<i32>()
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("{name} must be a non-negative integer, got '{val}'")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "Environment variable {name} contains invalid Unicode; expected a non-negative integer"
+        )),
+        Ok(val) => {
+            let trimmed = val.trim();
+            match trimmed.parse::<i32>() {
+                Ok(n) if n >= 0 => Ok(Some(n)),
+                Ok(_) | Err(_) => Err(anyhow::anyhow!(
+                    "{name} must be a non-negative integer, got '{val}'"
+                )),
+            }
+        }
     }
 }
 
@@ -87,22 +95,42 @@ fn default_resources() -> AppResources {
     }
 }
 
-/// Build an [`AppResources`] from environment variables.
+/// Read a string environment variable, returning `None` when unset and an
+/// error when the value contains invalid Unicode.
+fn env_var_str(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(val) => Ok(Some(val)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "Environment variable {name} contains invalid Unicode; expected a UTF-8 string"
+        )),
+    }
+}
+
+/// Build an [`AppResources`] by merging environment variable overrides on top
+/// of a set of base (default) resources.
 ///
-/// The memory limit variable is the anchor: if it is unset, `None` is returned.
-/// CPU limit/request and memory request are all optional on top of that.
-fn env_var_resources(
+/// Each field is overridden independently: only the env vars that are actually
+/// set replace the corresponding field in `base`. This means callers can
+/// override, e.g., only the memory limit without losing the CPU request
+/// default.
+fn env_var_resources_over(
+    base: AppResources,
     memory_limit_var: &str,
     cpu_limit_var: &str,
     cpu_request_var: &str,
     memory_request_var: &str,
-) -> Option<AppResources> {
-    let memory_limit = std::env::var(memory_limit_var).ok()?;
-    let cpu_request = std::env::var(cpu_request_var).ok();
-    let memory_request = std::env::var(memory_request_var).ok();
-    Some(AppResources {
+) -> anyhow::Result<AppResources> {
+    let memory_limit = env_var_str(memory_limit_var)?.unwrap_or(base.limits.memory);
+    let cpu_limit = env_var_str(cpu_limit_var)?.or(base.limits.cpu);
+    let cpu_request =
+        env_var_str(cpu_request_var)?.or(base.requests.as_ref().and_then(|r| r.cpu.clone()));
+    let memory_request =
+        env_var_str(memory_request_var)?.or(base.requests.as_ref().and_then(|r| r.memory.clone()));
+
+    Ok(AppResources {
         limits: AppResourceLimits {
-            cpu: std::env::var(cpu_limit_var).ok(),
+            cpu: cpu_limit,
             memory: memory_limit,
             ephemeral_storage: None,
         },
@@ -128,29 +156,27 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     let cname = resolve_default_cname(cloud).await?;
 
-    // App (scheduler) resources — default to 16Gi memory / 0.1 cpu request when unset.
-    let resources = env_var_resources(
+    // App (scheduler) resources — start from defaults, then apply any env var overrides.
+    let resources = env_var_resources_over(
+        default_resources(),
         "SPIDAPTER_APP_MEMORY_LIMIT",
         "SPIDAPTER_APP_CPU_LIMIT",
         "SPIDAPTER_APP_CPU_REQUEST",
         "SPIDAPTER_APP_MEMORY_REQUEST",
-    )
-    .unwrap_or_else(default_resources);
+    )?;
 
     let replicas = env_var_replicas("SPIDAPTER_APP_REPLICAS")?;
 
-    // Executor — same resource defaults as scheduler; override via env vars.
+    // Executor — same resource defaults as scheduler; each field overridable independently.
     let executor = Some(AppExecutor {
         replicas: Some(env_var_replicas("SPIDAPTER_EXECUTOR_REPLICAS")?.unwrap_or(1)),
-        resources: Some(
-            env_var_resources(
-                "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
-                "SPIDAPTER_EXECUTOR_CPU_LIMIT",
-                "SPIDAPTER_EXECUTOR_CPU_REQUEST",
-                "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
-            )
-            .unwrap_or_else(default_resources),
-        ),
+        resources: Some(env_var_resources_over(
+            default_resources(),
+            "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
+            "SPIDAPTER_EXECUTOR_CPU_LIMIT",
+            "SPIDAPTER_EXECUTOR_CPU_REQUEST",
+            "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
+        )?),
     });
 
     let create_result = cloud
