@@ -940,6 +940,7 @@ impl Default for ArrayToNdjsonPush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::{BufReader, Cursor, Read};
 
     /// Read all lines from a `BufRead` implementation and return them as a vector.
@@ -2092,7 +2093,7 @@ mod tests {
 
         // ---- json_pointer + different formats ----
 
-        /// json_pointer extracting an array from an object wrapper
+        /// `json_pointer` extracting an array from an object wrapper
         #[test]
         fn test_json_pointer_extracts_array() {
             let input =
@@ -2103,7 +2104,7 @@ mod tests {
             assert_eq!(output, r#"[{"id":1,"val":"a"},{"id":2,"val":"b"}]"#);
         }
 
-        /// json_pointer extracting a nested object
+        /// `json_pointer` extracting a nested object
         #[test]
         fn test_json_pointer_extracts_nested_object() {
             let input = br#"{"meta":{"pagination":{"page":1,"total":100}}}"#;
@@ -2113,7 +2114,7 @@ mod tests {
             assert_eq!(output, r#"{"page":1,"total":100}"#);
         }
 
-        /// json_pointer extracts from pretty-printed JSON
+        /// `json_pointer` extracts from pretty-printed JSON
         #[test]
         fn test_json_pointer_pretty_printed_input() {
             let input = br#"{
@@ -2130,7 +2131,7 @@ mod tests {
             assert_eq!(output, r#"[{"id":1},{"id":2}]"#);
         }
 
-        /// json_pointer with a single-element path
+        /// `json_pointer` with a single-element path
         #[test]
         fn test_json_pointer_single_segment() {
             let input = br#"{"records":[{"x":10}]}"#;
@@ -2140,7 +2141,7 @@ mod tests {
             assert_eq!(output, r#"[{"x":10}]"#);
         }
 
-        /// json_pointer with deeply nested path
+        /// `json_pointer` with deeply nested path
         #[test]
         fn test_json_pointer_three_levels() {
             let input = br#"{"a":{"b":{"c":{"d":[1,2,3]}}}}"#;
@@ -2150,7 +2151,7 @@ mod tests {
             assert_eq!(output, "[1,2,3]");
         }
 
-        /// json_pointer extracts a string value
+        /// `json_pointer` extracts a string value
         #[test]
         fn test_json_pointer_extracts_string() {
             let input = br#"{"message":"hello world","code":200}"#;
@@ -2160,7 +2161,7 @@ mod tests {
             assert_eq!(output, r#""hello world""#);
         }
 
-        /// json_pointer extracts a boolean
+        /// `json_pointer` extracts a boolean
         #[test]
         fn test_json_pointer_extracts_boolean() {
             let input = br#"{"success":true,"data":[]}"#;
@@ -2170,7 +2171,7 @@ mod tests {
             assert_eq!(output, "true");
         }
 
-        /// json_pointer extracts null
+        /// `json_pointer` extracts null
         #[test]
         fn test_json_pointer_extracts_null() {
             let input = br#"{"error":null}"#;
@@ -2180,7 +2181,7 @@ mod tests {
             assert_eq!(output, "null");
         }
 
-        /// json_pointer error on wrong path at second segment
+        /// `json_pointer` error on wrong path at second segment
         #[test]
         fn test_json_pointer_wrong_second_segment() {
             let input = br#"{"a":{"b":1}}"#;
@@ -2248,7 +2249,7 @@ mod tests {
             let lines =
                 read_all_lines(BufReader::new(Cursor::new(input.as_slice()))).expect("should read");
             assert_eq!(lines.len(), 1);
-            assert!(lines[0].contains(r#"C:\\Users\\test"#));
+            assert!(lines[0].contains(r"C:\\Users\\test"));
         }
 
         /// JSON array with very large number of small elements
@@ -2259,7 +2260,7 @@ mod tests {
                 if i > 0 {
                     json.push(',');
                 }
-                json.push_str(&format!(r#"{{"i":{i}}}"#));
+                write!(json, r#"{{"i":{i}}}"#).expect("write");
             }
             json.push(']');
             let input = Cursor::new(json.into_bytes());
@@ -2327,7 +2328,7 @@ mod tests {
             assert!(lines[0].len() > 10_000);
         }
 
-        /// json_pointer extracting from array-wrapped response
+        /// `json_pointer` extracting from array-wrapped response
         #[test]
         fn test_json_pointer_then_array_to_ndjson() {
             let input = br#"{"data":[{"id":1},{"id":2},{"id":3}]}"#;
@@ -2340,7 +2341,7 @@ mod tests {
             assert_eq!(lines[2], r#"{"id":3}"#);
         }
 
-        /// json_pointer then auto-detect as array
+        /// `json_pointer` then auto-detect as array
         #[test]
         fn test_json_pointer_auto_detect_array() {
             let input = br#"{"result":[{"x":1}]}"#;
@@ -2351,7 +2352,7 @@ mod tests {
             assert_eq!(byte, b'[', "extracted value should start with '['");
         }
 
-        /// json_pointer then auto-detect as object
+        /// `json_pointer` then auto-detect as object
         #[test]
         fn test_json_pointer_auto_detect_object() {
             let input = br#"{"result":{"name":"test"}}"#;
@@ -2376,10 +2377,10 @@ mod tests {
             let cols: Vec<serde_json::Value> = columns
                 .iter()
                 .enumerate()
-                .map(|(i, (field, dtype, _name))| {
+                .map(|(i, (field, dtype, name))| {
                     serde_json::json!({
-                        "id": i as i64,
-                        "name": _name,
+                        "id": i,
+                        "name": name,
                         "fieldName": field,
                         "dataTypeName": dtype,
                         "position": i,
@@ -2492,7 +2493,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let lines: Vec<&str> = output.trim().split('\n').collect();
+            let lines: Vec<&str> = output.lines().collect();
             assert_eq!(lines.len(), 2);
 
             let row0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse row0");
@@ -2652,7 +2653,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let lines: Vec<&str> = output.trim().split('\n').collect();
+            let lines: Vec<&str> = output.lines().collect();
             assert_eq!(lines.len(), 100);
         }
 
@@ -2681,7 +2682,7 @@ mod tests {
 
     /// Helper: simulate the full auto-detect flow used by `Format::Auto`.
     /// Peeks at the first non-ws byte, then reads data through the appropriate
-    /// pipeline (ArrayToNdjson for arrays, direct BufRead for objects/JSONL).
+    /// pipeline (`ArrayToNdjson` for arrays, direct `BufRead` for objects/JSONL).
     /// Returns the parsed NDJSON lines.
     fn auto_detect_and_read(input: &[u8]) -> io::Result<Vec<String>> {
         let mut reader = BufReader::new(Cursor::new(input));
@@ -2843,7 +2844,7 @@ mod tests {
             assert_eq!(lines.len(), 1);
         }
 
-        /// Auto detects pretty-printed object — read_all_lines splits on newlines,
+        /// Auto detects pretty-printed object — `read_all_lines` splits on newlines,
         /// so a pretty-printed JSON gets multiple lines. The actual Arrow reader
         /// handles multi-line JSON objects correctly.
         #[test]
@@ -2851,7 +2852,7 @@ mod tests {
             let input = b"{\n  \"name\": \"Alice\",\n  \"age\": 30\n}";
             let lines = auto_detect_and_read(input).expect("should read");
             // Pretty-printed object spans 4 lines; JSONL reader sees each line
-            assert!(lines.len() >= 1, "should produce at least one line");
+            assert!(!lines.is_empty(), "should produce at least one line");
             // The first line starts with '{'
             assert!(lines[0].starts_with('{'));
         }
@@ -2878,8 +2879,7 @@ mod tests {
             let input = b"{\"a\":1}\n\n{\"b\":2}\n\n{\"c\":3}";
             let lines = auto_detect_and_read(input).expect("should read");
             // Blank lines produce empty strings when read via read_line
-            let non_empty: Vec<_> = lines.iter().filter(|l| !l.is_empty()).collect();
-            assert_eq!(non_empty.len(), 3);
+            assert_eq!(lines.iter().filter(|l| !l.is_empty()).count(), 3);
         }
 
         /// Auto detects JSONL with CRLF line endings
@@ -3012,7 +3012,7 @@ mod tests {
         // peek preserves content for downstream reading
         // ==================================================
 
-        /// After peek detects array, full content is available for ArrayToNdjson
+        /// After peek detects array, full content is available for `ArrayToNdjson`
         #[test]
         fn test_auto_peek_preserves_array_content() {
             let input = b"[{\"a\":1},{\"a\":2},{\"a\":3}]";
@@ -3074,7 +3074,7 @@ mod tests {
         // Combined with json_pointer extraction
         // ==================================================
 
-        /// json_pointer extracts array → auto detects as array
+        /// `json_pointer` extracts array → auto detects as array
         #[test]
         fn test_auto_json_pointer_extracts_array() {
             let input = br#"{"response":{"data":[{"id":1},{"id":2}]}}"#;
@@ -3090,7 +3090,7 @@ mod tests {
             assert_eq!(lines.len(), 2);
         }
 
-        /// json_pointer extracts object → auto detects as object
+        /// `json_pointer` extracts object → auto detects as object
         #[test]
         fn test_auto_json_pointer_extracts_object() {
             let input = br#"{"wrapper":{"name":"test","value":99}}"#;
@@ -3106,7 +3106,7 @@ mod tests {
             assert!(lines[0].contains("test"));
         }
 
-        /// json_pointer extracts scalar → auto treats as JSONL
+        /// `json_pointer` extracts scalar → auto treats as JSONL
         #[test]
         fn test_auto_json_pointer_extracts_scalar() {
             let input = br#"{"meta":{"count":42}}"#;
@@ -3139,7 +3139,7 @@ mod tests {
         /// Array of arrays — first `[` triggers array mode
         #[test]
         fn test_auto_array_of_arrays() {
-            let input = br#"[[1,2],[3,4]]"#;
+            let input = br"[[1,2],[3,4]]";
             let lines = auto_detect_and_read(input).expect("should read");
             assert_eq!(lines.len(), 2);
             assert_eq!(lines[0], "[1,2]");
@@ -3221,7 +3221,7 @@ mod tests {
         /// Array with empty objects
         #[test]
         fn test_auto_array_empty_objects() {
-            let input = br#"[{},{},{}]"#;
+            let input = br"[{},{},{}]";
             let lines = auto_detect_and_read(input).expect("should read");
             assert_eq!(lines.len(), 3);
             assert_eq!(lines[0], "{}");
@@ -3236,11 +3236,11 @@ mod tests {
             assert_eq!(lines[0], "{}");
         }
 
-        /// Array with null elements — ArrayToNdjson doesn't handle bare scalars,
+        /// Array with null elements — `ArrayToNdjson` doesn't handle bare scalars,
         /// so this exercises the error path
         #[test]
         fn test_auto_array_null_elements() {
-            let input = br#"[null,null,null]"#;
+            let input = br"[null,null,null]";
             // ArrayToNdjson uses RawValue which doesn't handle bare scalars
             let result = auto_detect_and_read(input);
             assert!(
@@ -3249,11 +3249,11 @@ mod tests {
             );
         }
 
-        /// Array with numeric elements — ArrayToNdjson doesn't handle bare scalars,
+        /// Array with numeric elements — `ArrayToNdjson` doesn't handle bare scalars,
         /// so this exercises the error path
         #[test]
         fn test_auto_array_numeric_elements() {
-            let input = br#"[1,2,3,4,5]"#;
+            let input = br"[1,2,3,4,5]";
             // ArrayToNdjson uses RawValue which doesn't handle bare scalars
             let result = auto_detect_and_read(input);
             assert!(
@@ -3405,7 +3405,7 @@ mod tests {
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
             assert_eq!(r0["str"], "hello");
             assert_eq!(r0["int"], 42);
-            assert!((r0["float"].as_f64().expect("float") - 3.14159).abs() < f64::EPSILON);
+            assert!((r0["float"].as_f64().expect("float") - 1.2345).abs() < f64::EPSILON);
             assert_eq!(r0["bool"], true);
             assert!(r0["null_val"].is_null());
             assert_eq!(r0["nested"]["key"], "val");
@@ -3570,7 +3570,7 @@ mod tests {
             assert_eq!(output, "42");
         }
 
-        /// Extract then pipe through ArrayToNdjson
+        /// Extract then pipe through `ArrayToNdjson`
         #[test]
         fn test_file_pointer_extract_then_array_to_ndjson() {
             let data = load_fixture("pointer_wrapper.json");
@@ -3584,7 +3584,7 @@ mod tests {
             assert_eq!(r0["val"], "alpha");
         }
 
-        /// Extract nested then pipe through ArrayToNdjson
+        /// Extract nested then pipe through `ArrayToNdjson`
         #[test]
         fn test_file_pointer_nested_extract_then_array() {
             let data = load_fixture("pointer_nested.json");
@@ -3652,7 +3652,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            let lines: Vec<&str> = output.trim().split('\n').collect();
+            let lines: Vec<&str> = output.lines().collect();
             assert_eq!(lines.len(), 3);
 
             let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse row 0");

@@ -543,11 +543,11 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_json_format(dataset, params, Format::Jsonl)?),
                 extension.unwrap_or(".json".to_string()),
             )),
-            (Some("jsonl"), _) | (None, Some("jsonl")) | (None, Some("ndjson")) | (None, Some("ldjson")) => Ok((
+            (Some("jsonl"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
             )),
-            (Some("soda"), _) | (Some("socrata"), _) => Ok((
+            (Some("soda" | "socrata"), _) => Ok((
                 Some(self.get_json_format(dataset, params, Format::Soda)?),
                 extension.unwrap_or(".json".to_string()),
             )),
@@ -572,7 +572,7 @@ pub trait ListingTableConnector: DataConnector {
                         Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
                         extension.unwrap_or(".tsv".to_string()),
                     )),
-                    Some("jsonl") | Some("ndjson") | Some("ldjson") => Ok((
+                    Some("jsonl" | "ndjson" | "ldjson") => Ok((
                         Some(self.get_jsonl_format(dataset, params)?),
                         extension.unwrap_or(".jsonl".to_string()),
                     )),
