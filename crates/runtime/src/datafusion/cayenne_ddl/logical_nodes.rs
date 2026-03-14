@@ -52,6 +52,8 @@ pub struct CayenneCreateTableNode {
     pub df_catalog_name: String,
     /// The `DataFusion` schema name (for registering the table provider).
     pub df_schema_name: String,
+    /// Primary key column names extracted from SQL constraints.
+    pub primary_key: Vec<String>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
@@ -65,6 +67,7 @@ impl CayenneCreateTableNode {
         or_replace: bool,
         df_catalog_name: String,
         df_schema_name: String,
+        primary_key: Vec<String>,
     ) -> Self {
         Self {
             table_name,
@@ -73,6 +76,7 @@ impl CayenneCreateTableNode {
             or_replace,
             df_catalog_name,
             df_schema_name,
+            primary_key,
             output_schema: ddl_output_schema(),
         }
     }
@@ -83,6 +87,7 @@ impl Hash for CayenneCreateTableNode {
         self.table_name.hash(state);
         self.df_catalog_name.hash(state);
         self.df_schema_name.hash(state);
+        self.primary_key.hash(state);
     }
 }
 
@@ -91,6 +96,7 @@ impl PartialEq for CayenneCreateTableNode {
         self.table_name == other.table_name
             && self.df_catalog_name == other.df_catalog_name
             && self.df_schema_name == other.df_schema_name
+            && self.primary_key == other.primary_key
     }
 }
 
@@ -139,6 +145,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             or_replace: self.or_replace,
             df_catalog_name: self.df_catalog_name.clone(),
             df_schema_name: self.df_schema_name.clone(),
+            primary_key: self.primary_key.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }
