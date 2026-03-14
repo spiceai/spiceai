@@ -267,6 +267,19 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
+    #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
+    CatalogNotPartitionAware { catalog: String },
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {catalog}.{schema}.{table}: {source}"
+    ))]
+    UnableToReadPartitionMetadata {
+        catalog: String,
+        schema: String,
+        table: String,
+        source: Box<crate::catalogconnector::Error>,
+    },
+
     #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
         schema: String,
@@ -862,6 +875,44 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    /// Returns the partition column label for a table by querying the catalog provider.
+    ///
+    /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    ///
+    /// Note: this returns the catalog metadata label (historically named as an expression API),
+    /// not a guaranteed round-trippable SQL expression.
+    ///
+    /// Returns `Ok(None)` only when no partition metadata is present.
+    pub async fn get_table_partition_expr(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<Option<String>> {
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        let catalog = self
+            .ctx
+            .catalog(catalog_name)
+            .context(CatalogMissingSnafu {
+                catalog: catalog_name.to_string(),
+            })?;
+        let partition_aware = cayenne_ddl::as_partition_aware(catalog.as_ref()).context(
+            CatalogNotPartitionAwareSnafu {
+                catalog: catalog_name.to_string(),
+            },
+        )?;
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+        let table_name = table_reference.table();
+        partition_aware
+            .table_partition_expr(schema_name, table_name)
+            .await
+            .map_err(|source| Error::UnableToReadPartitionMetadata {
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
+                source: Box::new(source),
+            })
     }
 
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {

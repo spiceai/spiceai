@@ -52,27 +52,93 @@ pub struct CayenneCreateTableNode {
     pub df_catalog_name: String,
     /// The `DataFusion` schema name (for registering the table provider).
     pub df_schema_name: String,
+    /// Optional validated partition expression for the new table.
+    pub partition_expr: Option<Expr>,
+    /// Original SQL text for the partition expression, preserved for forwarding.
+    pub partition_expr_sql: Option<String>,
+    /// Primary key column names extracted from SQL constraints.
+    pub primary_key: Vec<String>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
 
 impl CayenneCreateTableNode {
     #[must_use]
-    pub fn new(
+    pub fn builder(
         table_name: String,
         arrow_schema: Arc<Schema>,
-        if_not_exists: bool,
-        or_replace: bool,
         df_catalog_name: String,
         df_schema_name: String,
-    ) -> Self {
-        Self {
+    ) -> CayenneCreateTableNodeBuilder {
+        CayenneCreateTableNodeBuilder {
             table_name,
             arrow_schema,
-            if_not_exists,
-            or_replace,
             df_catalog_name,
             df_schema_name,
+            if_not_exists: false,
+            or_replace: false,
+            partition_expr: None,
+            partition_expr_sql: None,
+            primary_key: Vec::new(),
+        }
+    }
+}
+
+pub struct CayenneCreateTableNodeBuilder {
+    table_name: String,
+    arrow_schema: Arc<Schema>,
+    if_not_exists: bool,
+    or_replace: bool,
+    df_catalog_name: String,
+    df_schema_name: String,
+    partition_expr: Option<Expr>,
+    partition_expr_sql: Option<String>,
+    primary_key: Vec<String>,
+}
+
+impl CayenneCreateTableNodeBuilder {
+    #[must_use]
+    pub fn if_not_exists(mut self, if_not_exists: bool) -> Self {
+        self.if_not_exists = if_not_exists;
+        self
+    }
+
+    #[must_use]
+    pub fn or_replace(mut self, or_replace: bool) -> Self {
+        self.or_replace = or_replace;
+        self
+    }
+
+    #[must_use]
+    pub fn partition_expr(mut self, partition_expr: Option<Expr>) -> Self {
+        self.partition_expr = partition_expr;
+        self
+    }
+
+    #[must_use]
+    pub fn partition_expr_sql(mut self, partition_expr_sql: Option<String>) -> Self {
+        self.partition_expr_sql = partition_expr_sql;
+        self
+    }
+
+    #[must_use]
+    pub fn primary_key(mut self, primary_key: Vec<String>) -> Self {
+        self.primary_key = primary_key;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> CayenneCreateTableNode {
+        CayenneCreateTableNode {
+            table_name: self.table_name,
+            arrow_schema: self.arrow_schema,
+            if_not_exists: self.if_not_exists,
+            or_replace: self.or_replace,
+            df_catalog_name: self.df_catalog_name,
+            df_schema_name: self.df_schema_name,
+            partition_expr: self.partition_expr,
+            partition_expr_sql: self.partition_expr_sql,
+            primary_key: self.primary_key,
             output_schema: ddl_output_schema(),
         }
     }
@@ -83,6 +149,9 @@ impl Hash for CayenneCreateTableNode {
         self.table_name.hash(state);
         self.df_catalog_name.hash(state);
         self.df_schema_name.hash(state);
+        self.partition_expr.hash(state);
+        self.partition_expr_sql.hash(state);
+        self.primary_key.hash(state);
     }
 }
 
@@ -91,6 +160,9 @@ impl PartialEq for CayenneCreateTableNode {
         self.table_name == other.table_name
             && self.df_catalog_name == other.df_catalog_name
             && self.df_schema_name == other.df_schema_name
+            && self.partition_expr == other.partition_expr
+            && self.partition_expr_sql == other.partition_expr_sql
+            && self.primary_key == other.primary_key
     }
 }
 
@@ -116,7 +188,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        vec![]
+        self.partition_expr.iter().cloned().collect()
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -129,9 +201,19 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
 
     fn with_exprs_and_inputs(
         &self,
-        _exprs: Vec<Expr>,
+        exprs: Vec<Expr>,
         _inputs: Vec<LogicalPlan>,
     ) -> datafusion::error::Result<Self> {
+        let partition_expr = match exprs.as_slice() {
+            [] => None,
+            [expr] => Some(expr.clone()),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "CayenneCreateTableNode expects at most one partition expression".to_string(),
+                ));
+            }
+        };
+
         Ok(Self {
             table_name: self.table_name.clone(),
             arrow_schema: Arc::clone(&self.arrow_schema),
@@ -139,6 +221,9 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             or_replace: self.or_replace,
             df_catalog_name: self.df_catalog_name.clone(),
             df_schema_name: self.df_schema_name.clone(),
+            partition_expr,
+            partition_expr_sql: self.partition_expr_sql.clone(),
+            primary_key: self.primary_key.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }
