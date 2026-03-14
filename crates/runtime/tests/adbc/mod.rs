@@ -35,7 +35,6 @@ fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
 }
 
 #[tokio::test]
-#[ignore] // Requires ADBC SQLite driver to be installed
 async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -244,7 +243,6 @@ async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore] // Requires ADBC driver to be installed
 async fn test_adbc_read_write_operations() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -332,7 +330,6 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore] // Requires ADBC driver to be installed
 async fn test_adbc_connection_options() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
