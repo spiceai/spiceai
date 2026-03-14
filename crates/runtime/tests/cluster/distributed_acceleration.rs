@@ -149,7 +149,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                     |
             |               |   CooperativeExec                                                                                                                                                                       |
             |               |     BytesProcessedExec                                                                                                                                                                  |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(3, "id") = '0' OR bucket(3, " id") = '1' OR bucket(3, "id") = '2'                                  |
+            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2'                                   |
             |               |                                                                                                                                                                                         |
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);
