@@ -160,7 +160,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     path: &TableReference,
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
-    partition_by: &[String], // partition expressions as strings (e.g. "country", "date_trunc('day', timestamp)"
+    partition_by: &[Expr], // partition expressions as strings (e.g. "country", "date_trunc('day', timestamp)"
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_cached_table_metadata(path) {
@@ -191,7 +191,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     let executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
-    let partition_phys_exprs = build_partition_physical_exprs(partition_by, &schema, &ctx)?;
+    let partition_phys_exprs = build_partition_physical_exprs(partition_by, &schema)?;
 
     // Serialize the partition expressions for use as PartitionValue keys.
     let partition_expr_keys: Vec<String> = partition_phys_exprs
@@ -407,9 +407,8 @@ async fn route_matched_and_collect_unmatched(
 
 /// Parses partition-by SQL expression strings into logical + physical expression pairs.
 fn build_partition_physical_exprs(
-    partition_by: &[String],
+    partition_by: &[Expr],
     schema: &SchemaRef,
-    ctx: &Arc<datafusion::prelude::SessionContext>,
 ) -> Result<Vec<(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)>> {
     let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone())
         .context(CreateDFSchemaSnafu)?;
@@ -417,15 +416,13 @@ fn build_partition_physical_exprs(
     partition_by
         .iter()
         .map(|e| {
-            let expr = Expr::from_bytes_with_registry(e.as_bytes(), ctx.as_ref())
-                .context(ParsePartitionExprSnafu)?;
             let physical = datafusion::physical_expr::create_physical_expr(
-                &expr,
+                &e,
                 &df_schema,
                 &ExecutionProps::new(),
             )
             .context(ParsePartitionExprSnafu)?;
-            Ok((expr, physical))
+            Ok((e.clone(), physical))
         })
         .collect()
 }

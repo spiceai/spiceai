@@ -488,10 +488,15 @@ fn generate_adbc_create_table_statement(
     dataset_name: &str,
     dataset: &DatasetConfig,
 ) -> anyhow::Result<String> {
+    let DatasetConfig {
+        schema,
+        primary_key_columns,
+        partition_columns,
+        ..
+    } = dataset;
     let quoted_dataset_name = quote_identifier(dataset_name);
 
-    let column_definitions = dataset
-        .schema
+    let column_definitions = schema
         .fields()
         .iter()
         .map(|field| {
@@ -509,15 +514,14 @@ fn generate_adbc_create_table_statement(
     }
 
     let mut table_elements = column_definitions;
-    if !dataset.primary_key_columns.is_empty() {
-        let schema_columns = dataset
-            .schema
+    if !primary_key_columns.is_empty() {
+        let schema_columns = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect::<HashSet<_>>();
 
-        for primary_key_column in &dataset.primary_key_columns {
+        for primary_key_column in primary_key_columns {
             if !schema_columns.contains(primary_key_column) {
                 return Err(anyhow::anyhow!(
                     "Dataset '{dataset_name}' has primary key column '{primary_key_column}' that is not present in the schema"
@@ -525,8 +529,7 @@ fn generate_adbc_create_table_statement(
             }
         }
 
-        let primary_keys = dataset
-            .primary_key_columns
+        let primary_keys = primary_key_columns
             .iter()
             .map(|column| quote_identifier(column))
             .collect::<Vec<_>>()
@@ -534,8 +537,12 @@ fn generate_adbc_create_table_statement(
         table_elements.push(format!("PRIMARY KEY ({primary_keys})"));
     }
 
+    let partition_clause = (!partition_columns.is_empty())
+        .then(|| format!(" PARTITION BY ({})", partition_columns.join(", ")))
+        .unwrap_or_default();
+
     Ok(format!(
-        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}){partition_clause}",
         table_elements.join(", ")
     ))
 }

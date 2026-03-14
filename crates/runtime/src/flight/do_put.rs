@@ -40,6 +40,7 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
+    cluster::partition,
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
@@ -203,21 +204,20 @@ pub(crate) async fn handle(
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
-        && let Some(cayenne_table) = should_forward_raw_cayenne_write(&datafusion, &path).await
+        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|_| Status::internal(format!(
+            "in distributed mode, Cayenne tables must have 'partition_by' expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
+        )))?
+        && datafusion.should_forward_writes_to_executors(&path).await
     {
-        let Some(partition_expressions) = cayenne_table.partition_expressions() else {
-            return Err(Status::internal(format!(
-                "in distributed mode, Cayenne tables must have 'partition_by' expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
-            )));
-        };
-        return crate::cluster::partition::write_through::forward_federated_partitioned_write(
+
+        return partition::write_through::forward_federated_partitioned_write(
             executor_registry,
             Arc::clone(&datafusion.ctx),
             datafusion.io_runtime.clone(),
             &path,
             first_message,
             streaming_flight,
-            partition_expressions,
+            &[partition_expression],
         )
         .await
         .map_err(Into::into);
@@ -256,36 +256,6 @@ pub(crate) async fn handle(
 fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
     datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
         && datafusion.cluster_config.tls_config().is_some()
-}
-
-async fn should_forward_raw_cayenne_write(
-    datafusion: &DataFusion,
-    path: &TableReference,
-) -> Option<cayenne::CayenneTableProvider> {
-    if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
-        return None;
-    }
-
-    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
-        return None;
-    };
-
-    if executor_registry
-        .flight_sql_clients
-        .try_read()
-        .ok()
-        .is_none_or(|c| c.is_empty())
-    {
-        return None;
-    };
-
-    let Some(table_provider) = datafusion.get_table(path).await else {
-        return None;
-    };
-
-    table_provider
-        .as_any()
-        .downcast_ref::<cayenne::CayenneTableProvider>()
 }
 
 fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
