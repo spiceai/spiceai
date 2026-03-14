@@ -28,8 +28,8 @@ pub mod planner;
 use datafusion::catalog::CatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
-use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
+use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
