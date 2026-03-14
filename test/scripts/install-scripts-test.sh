@@ -707,6 +707,10 @@ test_live_spiced_models_linux_downloadable() {
 # Script Function Extraction Tests
 # =============================================================================
 
+test_install_sh_has_getLatestRelease() {
+    grep -q "getLatestRelease()" "$INSTALL_SCRIPT"
+}
+
 test_install_sh_has_downloadFile() {
     grep -q "downloadFile()" "$INSTALL_SCRIPT"
 }
@@ -721,6 +725,10 @@ test_install_sh_has_checkHttpRequestCLI() {
 
 test_install_sh_no_checkJqInstalled() {
     ! grep -q "checkJqInstalled()" "$INSTALL_SCRIPT"
+}
+
+test_install_spiced_sh_has_getLatestRelease() {
+    grep -q "getLatestRelease()" "$INSTALL_SPICED_SCRIPT"
 }
 
 test_install_spiced_sh_has_downloadFile() {
@@ -749,7 +757,7 @@ test_spiced_variant_empty_documented() {
 }
 
 test_spiced_variant_models_documented() {
-    grep -q 'Default.*VARIANT="".*models\|models.*default' "$INSTALL_SPICED_SCRIPT"
+    grep -Eq 'Default.*VARIANT="".*models|models.*default' "$INSTALL_SPICED_SCRIPT"
 }
 
 test_spiced_variant_metal_documented() {
@@ -941,10 +949,12 @@ run_all_tests() {
     
     # Script Functions
     echo "--- Script Functions ---"
+    run_test "install.sh has getLatestRelease" test_install_sh_has_getLatestRelease
     run_test "install.sh has downloadFile" test_install_sh_has_downloadFile
     run_test "install.sh has installFile" test_install_sh_has_installFile
     run_test "install.sh has checkHttpRequestCLI" test_install_sh_has_checkHttpRequestCLI
     run_test "install.sh has no checkJqInstalled" test_install_sh_no_checkJqInstalled
+    run_test "install-spiced.sh has getLatestRelease" test_install_spiced_sh_has_getLatestRelease
     run_test "install-spiced.sh has downloadFile" test_install_spiced_sh_has_downloadFile
     run_test "install-spiced.sh has verifySupported" test_install_spiced_sh_has_verifySupported
     run_test "install-spiced.sh has no checkJqInstalled" test_install_spiced_sh_no_checkJqInstalled

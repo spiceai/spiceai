@@ -28,6 +28,7 @@ fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
     let mut params = HashMap::new();
     params.insert("adbc_driver".to_string(), "sqlite".to_string());
     params.insert("adbc_uri".to_string(), uri.to_string());
+    params.insert("connection_pool_size".to_string(), "1".to_string());
 
     let mut dataset = Dataset::new(format!("adbc:{table}"), ds_name.to_string());
     dataset.params = params;
@@ -52,26 +53,24 @@ async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
             let rt = status.runtime;
 
             // Create test table
-            let create_result = rt
-                .datafusion()
+            rt.datafusion()
                 .query_builder(
                     "CREATE TABLE test_table (id INTEGER, name TEXT, value DOUBLE)",
                 )
                 .build()
                 .run()
-                .await;
-            assert!(create_result.is_ok(), "Failed to create table");
+                .await
+                .map_err(|e| format!("Failed to create table: {e}"))?;
 
             // Insert test data
-            let insert_result = rt
-                .datafusion()
+            rt.datafusion()
                 .query_builder(
                     "INSERT INTO test_table VALUES (1, 'alice', 10.5), (2, 'bob', 20.3), (3, 'charlie', 15.7)",
                 )
                 .build()
                 .run()
-                .await;
-            assert!(insert_result.is_ok(), "Failed to insert data");
+                .await
+                .map_err(|e| format!("Failed to insert data: {e}"))?;
 
             // Query the data
             let result = rt
@@ -182,6 +181,7 @@ async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
             let mut params = HashMap::new();
             params.insert("adbc_driver".to_string(), "duckdb".to_string());
             params.insert("adbc_uri".to_string(), ":memory:".to_string());
+            params.insert("connection_pool_size".to_string(), "1".to_string());
 
             let mut dataset = Dataset::new("adbc:test_table".to_string(), "test_table".to_string());
             dataset.params = params;
@@ -194,26 +194,24 @@ async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
             let rt = status.runtime;
 
             // Create test table
-            let create_result = rt
-                .datafusion()
+            rt.datafusion()
                 .query_builder(
                     "CREATE TABLE test_table (id INTEGER, description VARCHAR, amount DECIMAL(10,2))",
                 )
                 .build()
                 .run()
-                .await;
-            assert!(create_result.is_ok(), "Failed to create table");
+                .await
+                .map_err(|e| format!("Failed to create table: {e}"))?;
 
             // Insert test data
-            let insert_result = rt
-                .datafusion()
+            rt.datafusion()
                 .query_builder(
                     "INSERT INTO test_table VALUES (1, 'first', 100.50), (2, 'second', 200.75), (3, 'third', 150.25)",
                 )
                 .build()
                 .run()
-                .await;
-            assert!(insert_result.is_ok(), "Failed to insert data");
+                .await
+                .map_err(|e| format!("Failed to insert data: {e}"))?;
 
             // Query with aggregation
             let agg_result = rt

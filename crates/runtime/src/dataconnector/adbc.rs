@@ -41,6 +41,9 @@ pub enum Error {
     #[snafu(display("Missing required parameter: adbc_driver"))]
     MissingAdbcDriver,
 
+    #[snafu(display("Missing required parameter: adbc_uri"))]
+    MissingAdbcUri,
+
     #[snafu(display(
         "Invalid value for parameter '{name}': expected a positive integer, got '{value}'"
     ))]
@@ -86,12 +89,13 @@ impl AdbcFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("adbc_driver")
-        .description("The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres')"),
-    ParameterSpec::component("adbc_driver_path")
-        .description("Optional path to the ADBC driver library"),
-    ParameterSpec::component("adbc_uri")
-        .description("Database URI/connection string for the ADBC driver"),
+    ParameterSpec::component("driver")
+        .description("The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres')")
+        .required(),
+    ParameterSpec::component("driver_path").description("Optional path to the ADBC driver library"),
+    ParameterSpec::component("uri")
+        .description("Database URI/connection string for the ADBC driver")
+        .required(),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -112,7 +116,7 @@ impl DataConnectorFactory for AdbcFactory {
         Box::pin(async move {
             let driver_name = params
                 .parameters
-                .get("adbc_driver")
+                .get("driver")
                 .expose()
                 .ok()
                 .context(MissingAdbcDriverSnafu)
@@ -122,13 +126,23 @@ impl DataConnectorFactory for AdbcFactory {
                     source: Box::new(e),
                 })?;
 
-            let driver_path = params.parameters.get("adbc_driver_path").expose().ok();
+            let driver_path = params.parameters.get("driver_path").expose().ok();
             let driver_location = driver_path.unwrap_or(driver_name).to_string();
 
+            let uri = params
+                .parameters
+                .get("uri")
+                .expose()
+                .ok()
+                .context(MissingAdbcUriSnafu)
+                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: params.component.clone(),
+                    source: Box::new(e),
+                })?;
+
             let mut db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> = Vec::new();
-            if let Some(uri) = params.parameters.get("adbc_uri").expose().ok() {
-                db_options.push((OptionDatabase::Uri, uri.into()));
-            }
+            db_options.push((OptionDatabase::Uri, uri.into()));
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -282,9 +296,9 @@ mod tests {
         let params = factory.parameters();
 
         let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
-        assert!(param_names.contains(&"adbc_driver"));
-        assert!(param_names.contains(&"adbc_driver_path"));
-        assert!(param_names.contains(&"adbc_uri"));
+        assert!(param_names.contains(&"driver"));
+        assert!(param_names.contains(&"driver_path"));
+        assert!(param_names.contains(&"uri"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
     }
