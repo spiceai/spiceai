@@ -864,6 +864,27 @@ impl DataFusion {
             .contains(table_reference)
     }
 
+    /// Returns the partition column label for a table by querying the catalog provider.
+    ///
+    /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    ///
+    /// Note: this returns the catalog metadata label (historically named as an expression API),
+    /// not a guaranteed round-trippable SQL expression.
+    pub async fn get_table_partition_expr(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<String> {
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        let catalog = self.ctx.catalog(catalog_name)?;
+        let partition_aware = cayenne_ddl::as_partition_aware(catalog.as_ref())?;
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+        let table_name = table_reference.table();
+        partition_aware
+            .table_partition_expr(schema_name, table_name)
+            .await
+    }
+
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
         if self.cpu_runtime.set(handle).is_err() {
             // Failure to set means this was already set - that shouldn't happen.
