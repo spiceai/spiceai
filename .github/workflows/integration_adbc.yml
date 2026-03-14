@@ -83,12 +83,10 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
-      - name: Install dbc CLI and ADBC SQLite driver
-        run: |
-          curl -fsSL https://dbc.columnar.tech/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-          dbc install sqlite
+      - name: Set up ADBC drivers
+        uses: columnar-tech/setup-dbc@8e45547ef10ad4e8b697c0cce55f7167814006ed # v1.0.1
+        with:
+          drivers: 'sqlite'
 
       - name: Run ADBC integration tests
         env:
