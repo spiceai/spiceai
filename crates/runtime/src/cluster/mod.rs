@@ -407,7 +407,7 @@ mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::ExecutorRegistry;
+pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
 pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};

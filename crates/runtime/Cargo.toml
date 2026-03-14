@@ -43,7 +43,7 @@ chunking = { path = "../chunking" }
 clap.workspace = true
 csv = "1.3.0"
 dashmap = "6.1.0"
-data_components = { path = "../data_components" }
+data_components = { path = "../data_components", features = ["flightsql"] }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
@@ -240,7 +240,6 @@ repl = { path = "../repl" }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
-yaml = { path = "../yaml" }
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tar = "0.4"
@@ -250,6 +249,7 @@ tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+yaml = { path = "../yaml" }
 
 [features]
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc"]
@@ -328,7 +328,11 @@ sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
-snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
+snowflake = [
+    "dep:snowflake-api",
+    "db_connection_pool/snowflake",
+    "data_components/snowflake",
+]
 spark = ["data_components/spark_connect"]
 sqlite = [
     "dep:tokio-rusqlite",

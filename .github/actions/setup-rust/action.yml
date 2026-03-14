@@ -5,14 +5,11 @@ inputs:
   toolchain:
     description: 'Rust toolchain to install; defaults to the repository rust-toolchain.toml channel'
     required: false
-  os:
-    description: 'DEPRECATED: no-op; retained only for backward compatibility. runner.os is used instead.'
-    required: false
 
 runs:
   using: 'composite'
   steps:
-    - name: Install Rust if not installed (Linux/macOS)
+    - name: Install Rust toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
       run: |
@@ -33,7 +30,41 @@ runs:
           fi
         fi
 
-    - name: Install Rust if not installed (Windows)
+        # Resolve which toolchain to install.
+        toolchain='${{ inputs.toolchain }}'
+        if [ -z "$toolchain" ]; then
+          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
+        fi
+        if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
+          toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+        fi
+        if [ -z "$toolchain" ]; then
+          toolchain='stable'
+        fi
+
+        # Install toolchain with all components in a single atomic operation
+        # so concurrent runners sharing the same RUSTUP_HOME don't race.
+        rustup toolchain install "$toolchain" \
+          --component cargo \
+          --component rustc \
+          --component rustfmt \
+          --component clippy
+
+        resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
+        if [ -z "$resolved" ]; then
+          echo "Failed to resolve installed Rust toolchain for $toolchain" >&2
+          exit 1
+        fi
+
+        # Export RUSTUP_TOOLCHAIN so subsequent steps use this toolchain
+        # without modifying the global default (which races when multiple
+        # runners share the same RUSTUP_HOME on one machine).
+        echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
+
+        rustup run "$resolved" cargo --version
+        rustup run "$resolved" rustc --version
+
+    - name: Install Rust toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
@@ -44,33 +75,6 @@ runs:
           Start-Process -FilePath "rustup-init.exe" -ArgumentList "-q", "-y", "--default-toolchain", "none", "--profile", "default" -Wait
         }
 
-    - name: Resolve Rust toolchain (Linux/macOS)
-      if: runner.os != 'Windows'
-      id: resolve-toolchain-unix
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        toolchain='${{ inputs.toolchain }}'
-        if [ -z "$toolchain" ]; then
-          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
-        fi
-
-        if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
-          toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
-        fi
-
-        if [ -z "$toolchain" ]; then
-          toolchain='stable'
-        fi
-
-        echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
-
-    - name: Resolve Rust toolchain (Windows)
-      if: runner.os == 'Windows'
-      id: resolve-toolchain-windows
-      shell: pwsh
-      run: |
         $toolchain = "${{ inputs.toolchain }}"
         if (-not $toolchain) {
           $activeToolchain = rustup show active-toolchain 2>$null
@@ -78,66 +82,27 @@ runs:
             $toolchain = ($activeToolchain -split '\s+')[0]
           }
         }
-
         if (-not $toolchain -and (Test-Path "rust-toolchain.toml")) {
           $match = Select-String -Path "rust-toolchain.toml" -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
           if ($match) {
             $toolchain = $match.Matches[0].Groups[1].Value
           }
         }
-
         if (-not $toolchain) {
           $toolchain = "stable"
         }
 
-        "toolchain=$toolchain" >> $env:GITHUB_OUTPUT
+        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
 
-    - name: Install Rust toolchain (Linux/macOS)
-      if: runner.os != 'Windows'
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        requested_toolchain='${{ steps.resolve-toolchain-unix.outputs.toolchain }}'
-
-        rustup toolchain install "$requested_toolchain" --profile minimal
-
-        resolved_toolchain="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$requested_toolchain" rustc)")")")"
-        if [ -z "$resolved_toolchain" ]; then
-          echo "Failed to resolve installed Rust toolchain for $requested_toolchain" >&2
-          exit 1
-        fi
-
-        rustup component add cargo rustc rustfmt clippy --toolchain "$resolved_toolchain"
-        rustup default "$resolved_toolchain"
-
-        rustup component list --toolchain "$resolved_toolchain" --installed
-        rustup run "$resolved_toolchain" cargo --version
-        rustup run "$resolved_toolchain" rustc --version
-        cargo --version
-        rustc --version
-
-    - name: Install Rust toolchain (Windows)
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: |
-        $requestedToolchain = "${{ steps.resolve-toolchain-windows.outputs.toolchain }}"
-
-        rustup toolchain install $requestedToolchain --profile minimal
-
-        $rustcPath = rustup which --toolchain $requestedToolchain rustc
+        $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
-          Write-Error "Failed to resolve installed Rust toolchain for $requestedToolchain"
+          Write-Error "Failed to resolve installed Rust toolchain for $toolchain"
           exit 1
         }
 
-        $resolvedToolchain = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
+        $resolved = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
 
-        rustup component add cargo rustc rustfmt clippy --toolchain $resolvedToolchain
-        rustup default $resolvedToolchain
+        "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
 
-        rustup component list --toolchain $resolvedToolchain --installed
-        rustup run $resolvedToolchain cargo --version
-        rustup run $resolvedToolchain rustc --version
-        cargo --version
-        rustc --version
+        rustup run $resolved cargo --version
+        rustup run $resolved rustc --version

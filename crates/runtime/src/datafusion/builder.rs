@@ -47,6 +47,7 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
 use {
@@ -422,7 +423,27 @@ impl DataFusionBuilder {
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
-        let ddl_options_store = super::iceberg_ddl::acceleration_options::new_shared_store();
+        let ddl_extension_store = super::ddl::acceleration_options::new_shared_store();
+
+        // Add partitioned table scan rewrite rules for distributed query execution.
+        // Must be added after context creation so the SessionContext (with UDFs) is
+        // available for parsing partition expression strings into Exprs.
+        if let Some(executor_registry) = &self.executor_registry {
+            use crate::cluster::FederatedPartitionProvider;
+
+            // Accelerated tables
+            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                &ctx,
+            )));
+
+            // Federated tables (e.g. Cayenne)
+            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                Arc::new(FederatedPartitionProvider::from_registry(executor_registry))
+                    as Arc<dyn TablePartitionProvider>,
+                &ctx,
+            )));
+        }
 
         // Add the Iceberg DDL analyzer rule after context creation so it can
         // reference the catalog list and DDL-enabled catalogs.
@@ -432,7 +453,7 @@ impl DataFusionBuilder {
             super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
-                Arc::clone(&ddl_options_store),
+                Arc::clone(&ddl_extension_store),
             ),
         ));
 
@@ -440,8 +461,10 @@ impl DataFusionBuilder {
         #[cfg(not(windows))]
         ctx.add_analyzer_rule(Arc::new(
             super::cayenne_ddl::analyzer_rule::CayenneDdlAnalyzerRule::new(
+                ctx.state_weak_ref(),
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
             ),
         ));
 
@@ -451,7 +474,7 @@ impl DataFusionBuilder {
             data_writers: RwLock::new(HashSet::new()),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
-            ddl_options_store,
+            ddl_extension_store,
             datafusion_ref,
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
