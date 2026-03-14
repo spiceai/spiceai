@@ -81,6 +81,15 @@ pub enum Error {
 
     #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
     RefreshTaskAlreadyStarted {},
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {schema_name}.{table_name}: {source}"
+    ))]
+    PartitionMetadataRead {
+        schema_name: String,
+        table_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -317,7 +326,13 @@ pub trait PartitionAwareCatalog: Send + Sync {
     ///
     /// The returned string is the partition column/label value as stored in catalog metadata
     /// (e.g. `"region"` for `PARTITION BY region`).
-    async fn table_partition_expr(&self, schema_name: &str, table_name: &str) -> Option<String>;
+    ///
+    /// Returns `Ok(None)` only when no partition metadata is present.
+    async fn table_partition_expr(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<String>>;
 }
 
 pub async fn get_catalog_provider(
