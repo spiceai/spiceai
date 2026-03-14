@@ -125,7 +125,7 @@ impl PartitionManager {
     ///  schedulers will not re-initialize, since a file exists, even if blank). If the file already
     /// exists, this is a no-op and returns `Ok(false)`.
     pub async fn initialize_blank_metadata(&self, table: &TableReference) -> Result<bool> {
-        // If its cached, can avoid insert operation. Optimisation to reduce object store calls.
+        // If it's cached, can avoid insert operation. Optimization to reduce object store calls.
         if self.get_cached_table_metadata(table).is_some() {
             return Ok(false);
         }

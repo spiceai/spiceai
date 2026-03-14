@@ -203,6 +203,12 @@ pub(crate) async fn handle(
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
+    //
+    // Note: `get_table_partition_expr` currently resolves the partition label
+    // stored in Cayenne metadata (e.g. the column name) and parses it as a SQL
+    // expression. This works for column-based partitions but will fail for
+    // expression-based partitions (where the label is `expr0`). A follow-up
+    // should persist the original SQL expression in Cayenne metadata.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
         && datafusion.should_forward_writes_to_executors(&path).await
     {

@@ -29,7 +29,7 @@ use datafusion::catalog::CatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
-use crate::catalogconnector::{PartitionAwareCatalog, RefreshingCatalogProvider};
+use crate::catalogconnector::PartitionAwareCatalog;
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
@@ -47,15 +47,6 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
     if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>() {
         return composed
             .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>();
-    }
-    if let Some(refreshing) = provider
-        .as_any()
-        .downcast_ref::<RefreshingCatalogProvider>()
-    {
-        return refreshing
-            .inner_catalog()
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>();
     }
@@ -79,12 +70,6 @@ pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn Partiti
             .downcast_ref::<CayenneCatalogProvider>()
     {
         return Some(cayenne);
-    }
-    if let Some(refreshing) = provider
-        .as_any()
-        .downcast_ref::<RefreshingCatalogProvider>()
-    {
-        return as_partition_aware(refreshing.inner_catalog().as_ref());
     }
     None
 }

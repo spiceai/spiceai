@@ -883,6 +883,13 @@ impl DataFusion {
     /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
     /// The returned string is parsed as a SQL expression against the table's schema.
     ///
+    /// **Limitation**: Cayenne currently persists only the partition *label* (column name
+    /// or `expr0` for non-column expressions), not the original SQL expression. For
+    /// column-based partitions this works correctly; for expression-based partitions
+    /// (e.g. `date_trunc(...)`) the label `expr0` will fail to parse and this method
+    /// will return an error. A follow-up should persist `partition_expr_sql` in Cayenne
+    /// metadata to support arbitrary partition expressions.
+    ///
     /// Returns `Ok(None)` when the table has no partition expression defined.
     pub async fn get_table_partition_expr(
         &self,
