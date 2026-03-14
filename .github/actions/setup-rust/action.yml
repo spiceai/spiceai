@@ -50,9 +50,6 @@ runs:
             --component clippy
         fi
 
-        rmdir "$lockdir" 2>/dev/null || true
-        trap - EXIT
-
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
           echo "Failed to resolve installed Rust toolchain for $toolchain" >&2
