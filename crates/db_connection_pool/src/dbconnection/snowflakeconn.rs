@@ -97,14 +97,16 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        let query = format!("SHOW TABLES IN {schema}");
-        let res = self
-            .api
-            .exec(&query)
-            .await
-            .map_err(|e| dbconnection::Error::UnableToGetTables {
-                source: e.to_string().into(),
-            })?;
+        // Quote the identifier to prevent SQL injection and handle special characters
+        let escaped_schema = schema.replace('"', "\"\"");
+        let query = format!("SHOW TABLES IN \"{escaped_schema}\"");
+        let res =
+            self.api
+                .exec(&query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetTables {
+                    source: e.to_string().into(),
+                })?;
 
         match res {
             snowflake_api::QueryResult::Arrow(batches) => Ok(names_from_arrow_batches(batches)),
@@ -126,13 +128,13 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
         let query = "SHOW SCHEMAS";
-        let res = self
-            .api
-            .exec(query)
-            .await
-            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
-                source: e.to_string().into(),
-            })?;
+        let res =
+            self.api
+                .exec(query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                    source: e.to_string().into(),
+                })?;
 
         match res {
             snowflake_api::QueryResult::Arrow(batches) => Ok(names_from_arrow_batches(batches)),

@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use adbc_core::LOAD_FLAG_DEFAULT;
 use adbc_core::options::{AdbcVersion, OptionDatabase};
-use adbc_core::{Driver, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::adbc::AdbcTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
+use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
+    ADBCPool, AdbcConnectionPoolBuilder,
+};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -143,12 +145,22 @@ impl DataConnectorFactory for AdbcFactory {
             // Extract connection-specific options (strip "conn_" prefix)
             for (key, value) in &params.parameters {
                 if let Some(conn_key) = key.strip_prefix("conn_") {
-                    conn_options.insert(
-                        conn_key.to_string(),
-                        value.expose_secret().to_string(),
-                    );
+                    conn_options.insert(conn_key.to_string(), value.expose_secret().to_string());
                 }
             }
+
+            let pool_size: Option<u32> = params
+                .parameters
+                .get("connection_pool_size")
+                .expose()
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let pool_min_idle: Option<u32> = params
+                .parameters
+                .get("connection_pool_min_idle")
+                .expose()
+                .ok()
+                .and_then(|v| v.parse().ok());
 
             let component = params.component.clone();
 
@@ -168,7 +180,10 @@ impl DataConnectorFactory for AdbcFactory {
                     .new_database_with_opts(db_options)
                     .context(UnableToCreateDatabaseSnafu)?;
 
-                let pool = ADBCPool::new(db, Some(conn_options))
+                let pool = AdbcConnectionPoolBuilder::new(db, Some(conn_options))
+                    .with_max_size(pool_size)
+                    .with_min_idle(pool_min_idle)
+                    .build()
                     .context(UnableToCreateConnectionPoolSnafu)?;
 
                 Ok(Arc::new(pool))

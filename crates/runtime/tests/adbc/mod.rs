@@ -252,11 +252,7 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("adbc_rw_test")
-                .with_dataset(make_adbc_sqlite_dataset(
-                    "rw_table",
-                    "rw_table",
-                    ":memory:",
-                ))
+                .with_dataset(make_adbc_sqlite_dataset("rw_table", "rw_table", ":memory:"))
                 .build();
 
             let status = runtime_ready_check(app).await;
@@ -350,7 +346,8 @@ async fn test_adbc_connection_options() -> Result<(), String> {
             params.insert("conn_timeout".to_string(), "30".to_string());
             params.insert("custom_db_option".to_string(), "value".to_string());
 
-            let mut dataset = Dataset::new("adbc:options_test".to_string(), "options_test".to_string());
+            let mut dataset =
+                Dataset::new("adbc:options_test".to_string(), "options_test".to_string());
             dataset.params = params;
 
             let app = AppBuilder::new("adbc_options_test")
@@ -373,13 +370,7 @@ async fn test_adbc_connection_options() -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let expected = [
-                "+------+",
-                "| test |",
-                "+------+",
-                "| 1    |",
-                "+------+",
-            ];
+            let expected = ["+------+", "| test |", "+------+", "| 1    |", "+------+"];
             assert_batches_eq!(expected, &result);
 
             Ok(())

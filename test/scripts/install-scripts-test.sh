@@ -318,7 +318,7 @@ test_artifacts_exist_in_latest_release() {
         "spiced_models_linux_x86_64.tar.gz"
         "spiced_models_linux_aarch64.tar.gz"
         "spiced_models_darwin_aarch64.tar.gz"
-        "spiced_models_metal_darwin_aarch64.tar.gz"
+        "spiced_metal_darwin_aarch64.tar.gz"
         "spiced.exe_windows_x86_64.tar.gz"
         "spiced.exe_models_windows_x86_64.tar.gz"
     )
