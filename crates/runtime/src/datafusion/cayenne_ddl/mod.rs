@@ -80,5 +80,11 @@ pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn Partiti
     {
         return Some(cayenne);
     }
+    if let Some(refreshing) = provider
+        .as_any()
+        .downcast_ref::<RefreshingCatalogProvider>()
+    {
+        return as_partition_aware(refreshing.inner_catalog().as_ref());
+    }
     None
 }

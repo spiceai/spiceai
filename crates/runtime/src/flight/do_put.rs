@@ -204,11 +204,21 @@ pub(crate) async fn handle(
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
-        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
-            "Failed to resolve partition expression for table `{path}`: {e}"
-        )))?
         && datafusion.should_forward_writes_to_executors(&path).await
     {
+        let partition_expression = datafusion
+            .get_table_partition_expr(&path)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to resolve partition expression for table `{path}`: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "In distributed mode, Cayenne tables must have partition expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
+                ))
+            })?;
 
         return partition::write_through::forward_federated_partitioned_write(
             executor_registry,

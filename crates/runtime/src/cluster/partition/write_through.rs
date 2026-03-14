@@ -173,8 +173,16 @@ pub(crate) async fn forward_federated_partitioned_write(
                     table: path.to_string(),
                     source: Box::new(source),
                 })?;
+            // Re-fetch from the object store rather than relying on the local
+            // cache: another scheduler may have raced and created the metadata
+            // first (AlreadyExists), leaving our cache empty.
             partition_manager
-                .get_cached_table_metadata(path)
+                .get_table_metadata(path)
+                .await
+                .map_err(|source| Error::CreateMetadata {
+                    table: path.to_string(),
+                    source: Box::new(source),
+                })?
                 .ok_or_else(|| Error::FindMetadata {
                     table: path.to_string(),
                 })?
