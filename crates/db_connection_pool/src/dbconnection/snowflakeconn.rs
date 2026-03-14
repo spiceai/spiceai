@@ -99,7 +99,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
         // Quote the identifier to prevent SQL injection and handle special characters
         let escaped_schema = schema.replace('"', "\"\"");
-        let query = format!("SHOW TABLES IN \"{escaped_schema}\"");
+        let query = format!("SHOW TABLES IN SCHEMA \"{escaped_schema}\"");
         let res =
             self.api
                 .exec(&query)

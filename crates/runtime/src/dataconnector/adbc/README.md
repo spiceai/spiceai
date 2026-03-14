@@ -26,7 +26,6 @@ datasets:
       # Optional connection pool settings
       connection_pool_size: 5
       connection_pool_min_idle: 1
-      # Additional driver-specific parameters can be passed
 ```
 
 ### Parameters
@@ -36,8 +35,6 @@ datasets:
 - `adbc_uri` (optional): Database URI/connection string
 - `connection_pool_size` (optional, default: 5): Maximum connections in the pool
 - `connection_pool_min_idle` (optional, default: 1): Minimum idle connections
-- Any other parameters are passed through to the database as options
-- Parameters prefixed with `conn_` are passed as connection options (with the prefix stripped)
 
 ## Architecture
 

@@ -27,7 +27,6 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,6 +40,11 @@ use super::{
 pub enum Error {
     #[snafu(display("Missing required parameter: adbc_driver"))]
     MissingAdbcDriver,
+
+    #[snafu(display(
+        "Invalid value for parameter '{name}': expected a positive integer, got '{value}'"
+    ))]
+    InvalidPoolParameter { name: String, value: String },
 
     #[snafu(display("Failed to load ADBC driver: {source}"))]
     UnableToLoadDriver { source: adbc_core::error::Error },
@@ -91,7 +95,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
-    ParameterSpec::component("connection_pool_min_idle")
+    ParameterSpec::runtime("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
         .default("1"),
 ];
@@ -126,41 +130,34 @@ impl DataConnectorFactory for AdbcFactory {
                 db_options.push((OptionDatabase::Uri, uri.into()));
             }
 
-            // Allow passing through any other parameters as database options
-            for (key, value) in &params.parameters {
-                if !key.starts_with("adbc_")
-                    && !key.starts_with("conn_")
-                    && key != "connection_pool_size"
-                    && key != "connection_pool_min_idle"
-                {
-                    db_options.push((
-                        OptionDatabase::Other(key.clone()),
-                        value.expose_secret().into(),
-                    ));
+            let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
+                match params.parameters.get(name).expose().ok() {
+                    Some(v) => {
+                        v.parse::<u32>()
+                            .map(Some)
+                            .map_err(|_| Error::InvalidPoolParameter {
+                                name: name.to_string(),
+                                value: v.to_string(),
+                            })
+                    }
+                    None => Ok(None),
                 }
-            }
+            };
 
-            let mut conn_options: HashMap<String, String> = HashMap::new();
-
-            // Extract connection-specific options (strip "conn_" prefix)
-            for (key, value) in &params.parameters {
-                if let Some(conn_key) = key.strip_prefix("conn_") {
-                    conn_options.insert(conn_key.to_string(), value.expose_secret().to_string());
+            let pool_size = parse_pool_param("connection_pool_size").map_err(|e| {
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: params.component.clone(),
+                    source: Box::new(e),
                 }
-            }
-
-            let pool_size: Option<u32> = params
-                .parameters
-                .get("connection_pool_size")
-                .expose()
-                .ok()
-                .and_then(|v| v.parse().ok());
-            let pool_min_idle: Option<u32> = params
-                .parameters
-                .get("connection_pool_min_idle")
-                .expose()
-                .ok()
-                .and_then(|v| v.parse().ok());
+            })?;
+            let pool_min_idle = parse_pool_param("connection_pool_min_idle").map_err(|e| {
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: params.component.clone(),
+                    source: Box::new(e),
+                }
+            })?;
 
             let component = params.component.clone();
 
@@ -181,7 +178,6 @@ impl DataConnectorFactory for AdbcFactory {
                     .context(UnableToCreateDatabaseSnafu)?;
 
                 let pool = AdbcConnectionPoolBuilder::new(db)
-                    .with_conn_options(conn_options)
                     .with_max_size(pool_size)
                     .with_min_idle(pool_min_idle)
                     .build()

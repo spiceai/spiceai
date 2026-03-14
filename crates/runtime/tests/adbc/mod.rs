@@ -338,12 +338,12 @@ async fn test_adbc_connection_options() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            // Test with custom connection options
+            // Test with only declared/supported connection options
             let mut params = HashMap::new();
             params.insert("adbc_driver".to_string(), "sqlite".to_string());
             params.insert("adbc_uri".to_string(), ":memory:".to_string());
-            params.insert("conn_timeout".to_string(), "30".to_string());
-            params.insert("custom_db_option".to_string(), "value".to_string());
+            params.insert("connection_pool_size".to_string(), "3".to_string());
+            params.insert("connection_pool_min_idle".to_string(), "1".to_string());
 
             let mut dataset =
                 Dataset::new("adbc:options_test".to_string(), "options_test".to_string());
