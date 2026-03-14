@@ -49,25 +49,27 @@ runs:
         fi
 
         rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-
-        # Physically remove stale toolchain directories and update hashes,
-        # then reinstall. Wrapped in flock to prevent races when multiple
-        # jobs on the same self-hosted runner share RUSTUP_HOME.
         mkdir -p "${rustup_home}"
-        (
-          flock 9
 
-          rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
-          rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
-          rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
-          rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
+        # Acquire a cross-process lock before removing/reinstalling.
+        # Uses mkdir (atomic on all POSIX systems including macOS).
+        lockdir="${rustup_home}/.setup-rust.lock.d"
+        while ! mkdir "$lockdir" 2>/dev/null; do sleep 1; done
+        trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
 
-          rustup toolchain install "$toolchain" \
-            --component cargo \
-            --component rustc \
-            --component rustfmt \
-            --component clippy
-        ) 9>"${rustup_home}/.setup-rust.lock"
+        rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
+        rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
+        rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
+        rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
+
+        rustup toolchain install "$toolchain" \
+          --component cargo \
+          --component rustc \
+          --component rustfmt \
+          --component clippy
+
+        rmdir "$lockdir" 2>/dev/null || true
+        trap - EXIT
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
@@ -83,7 +85,9 @@ runs:
         # Also add the toolchain's bin dir directly to PATH so that
         # cargo/rustc are found even when the rustup proxy binaries
         # in $CARGO_HOME/bin are missing or broken on self-hosted runners.
-        echo "${rustup_home}/toolchains/${resolved}/bin" >> "$GITHUB_PATH"
+        toolchain_bin="${rustup_home}/toolchains/${resolved}/bin"
+        echo "$toolchain_bin" >> "$GITHUB_PATH"
+        export PATH="$toolchain_bin:$PATH"
 
         cargo --version
         rustc --version
@@ -148,6 +152,7 @@ runs:
 
         $toolchainBin = "$rustupHome\toolchains\$resolved\bin"
         $toolchainBin >> $env:GITHUB_PATH
+        $env:PATH = "$toolchainBin;$env:PATH"
 
         cargo --version
         rustc --version
