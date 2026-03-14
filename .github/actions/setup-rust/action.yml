@@ -50,6 +50,19 @@ runs:
           --component rustfmt \
           --component clippy
 
+        # Workaround: rustup 1.93.1 on aarch64-apple-darwin can install a
+        # corrupted cargo component when the triple-suffixed toolchain name
+        # is used. Force a clean reinstall without the explicit triple.
+        if ! rustup run "$toolchain" cargo --version >/dev/null 2>&1; then
+          echo "::warning::cargo component appears corrupted; forcing clean reinstall"
+          rustup toolchain uninstall "${toolchain}-aarch64-apple-darwin" 2>/dev/null || true
+          rustup toolchain install "$toolchain" --force \
+            --component cargo \
+            --component rustc \
+            --component rustfmt \
+            --component clippy
+        fi
+
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
           echo "Failed to resolve installed Rust toolchain for $toolchain" >&2
