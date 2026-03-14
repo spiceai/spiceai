@@ -1,0 +1,17 @@
+[
+    {
+        "str": "hello",
+        "int": 42,
+        "float": 1.2345,
+        "bool": true,
+        "null_val": null,
+        "nested": {
+            "key": "val"
+        },
+        "arr": [
+            1,
+            2,
+            3
+        ]
+    }
+]

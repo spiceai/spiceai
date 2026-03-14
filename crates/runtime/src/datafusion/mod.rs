@@ -119,6 +119,7 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
+pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -265,6 +266,19 @@ pub enum Error {
 
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
+
+    #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
+    CatalogNotPartitionAware { catalog: String },
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {catalog}.{schema}.{table}: {source}"
+    ))]
+    UnableToReadPartitionMetadata {
+        catalog: String,
+        schema: String,
+        table: String,
+        source: Box<crate::catalogconnector::Error>,
+    },
 
     #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
@@ -462,8 +476,8 @@ pub struct DataFusion {
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
-    /// Shared store for DDL table options from `CREATE TABLE ... WITH (acceleration.*, dataset.*)`.
-    ddl_options_store: iceberg_ddl::acceleration_options::SharedDdlOptionsStore,
+    /// Shared store for DDL extensions from `CREATE TABLE` statements.
+    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -820,14 +834,14 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns a reference to the shared DDL options store.
+    /// Returns a reference to the shared DDL extension store.
     ///
-    /// Used by the query execution path to insert options extracted from
-    /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
-    /// are then consumed by the `IcebergDdlAnalyzerRule`.
+    /// Used by the query execution path to insert extensions extracted from
+    /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
+    /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_options_store(&self) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
-        &self.ddl_options_store
+    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+        &self.ddl_extension_store
     }
 
     /// Returns the shared weak self-reference holder.
@@ -861,6 +875,44 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    /// Returns the partition column label for a table by querying the catalog provider.
+    ///
+    /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    ///
+    /// Note: this returns the catalog metadata label (historically named as an expression API),
+    /// not a guaranteed round-trippable SQL expression.
+    ///
+    /// Returns `Ok(None)` only when no partition metadata is present.
+    pub async fn get_table_partition_expr(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<Option<String>> {
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        let catalog = self
+            .ctx
+            .catalog(catalog_name)
+            .context(CatalogMissingSnafu {
+                catalog: catalog_name.to_string(),
+            })?;
+        let partition_aware = cayenne_ddl::as_partition_aware(catalog.as_ref()).context(
+            CatalogNotPartitionAwareSnafu {
+                catalog: catalog_name.to_string(),
+            },
+        )?;
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+        let table_name = table_reference.table();
+        partition_aware
+            .table_partition_expr(schema_name, table_name)
+            .await
+            .map_err(|source| Error::UnableToReadPartitionMetadata {
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
+                source: Box::new(source),
+            })
     }
 
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
@@ -2650,27 +2702,24 @@ impl DataFusion {
             return Ok(plan);
         }
 
-        // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning.
-        // This extracts DDL table options, stores them for the analyzer rule,
-        // and returns modified SQL without the WITH clause.
-        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_with_options(
-            sql,
-            &self.ddl_options_store,
-        )?;
+        // Pre-process CREATE TABLE statements to extract DDL extensions
+        // (WITH options, PARTITION BY) before planning.
+        let preprocessed =
+            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
         let (effective_sql, store_key) = match &preprocessed {
-            iceberg_ddl::preprocess::PreprocessResult::Modified {
+            ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,
                 store_key,
             } => (modified.as_str(), Some(store_key.as_str())),
-            iceberg_ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
+            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
         let plan = match session.create_logical_plan(effective_sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 if let Some(store_key) = store_key {
-                    iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_options_store,
+                    ddl::preprocess::cleanup_preprocessed_ddl_options(
+                        &self.ddl_extension_store,
                         store_key,
                     )?;
                 }

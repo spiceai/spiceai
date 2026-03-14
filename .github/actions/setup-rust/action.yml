@@ -9,7 +9,7 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install Rust toolchain (Linux/macOS)
+    - name: Set up Rust toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
       run: |
@@ -23,18 +23,8 @@ runs:
           source "$cargo_home/env" || true
         fi
 
-        if [ ! -x "$cargo_home/bin/rustup" ]; then
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-          if [ -f "$cargo_home/env" ]; then
-            source "$cargo_home/env" || true
-          fi
-        fi
-
-        # Resolve which toolchain to install.
+        # Resolve which toolchain to use.
         toolchain='${{ inputs.toolchain }}'
-        if [ -z "$toolchain" ]; then
-          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
-        fi
         if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
           toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
         fi
@@ -42,13 +32,23 @@ runs:
           toolchain='stable'
         fi
 
-        # Install toolchain with all components in a single atomic operation
-        # so concurrent runners sharing the same RUSTUP_HOME don't race.
-        rustup toolchain install "$toolchain" \
-          --component cargo \
-          --component rustc \
-          --component rustfmt \
-          --component clippy
+        # If the toolchain is already installed (e.g. spiceai-macos self-hosted
+        # runners), just verify it. Otherwise install it.
+        if rustup run "$toolchain" cargo --version >/dev/null 2>&1; then
+          echo "Toolchain $toolchain already available, skipping install"
+        else
+          if [ ! -x "$cargo_home/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+            if [ -f "$cargo_home/env" ]; then
+              source "$cargo_home/env" || true
+            fi
+          fi
+          rustup toolchain install "$toolchain" \
+            --component cargo \
+            --component rustc \
+            --component rustfmt \
+            --component clippy
+        fi
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
@@ -61,10 +61,10 @@ runs:
         # runners share the same RUSTUP_HOME on one machine).
         echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
 
-        rustup run "$resolved" cargo --version
-        rustup run "$resolved" rustc --version
+        cargo --version
+        rustc --version
 
-    - name: Install Rust toolchain (Windows)
+    - name: Set up Rust toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
@@ -92,7 +92,25 @@ runs:
           $toolchain = "stable"
         }
 
-        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if ($toolchain -notmatch '^[a-zA-Z0-9._-]+$') {
+          Write-Error "Invalid toolchain name: $toolchain"
+          exit 1
+        }
+
+        $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+
+        # Use a mutex to prevent races when multiple jobs share RUSTUP_HOME.
+        $mutex = New-Object System.Threading.Mutex($false, "Global\setup-rust-$toolchain")
+        try {
+          [void]$mutex.WaitOne()
+          Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
+          Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
+          rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        } finally {
+          $mutex.ReleaseMutex()
+          $mutex.Dispose()
+        }
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
@@ -104,5 +122,9 @@ runs:
 
         "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
 
-        rustup run $resolved cargo --version
-        rustup run $resolved rustc --version
+        $toolchainBin = "$rustupHome\toolchains\$resolved\bin"
+        $toolchainBin >> $env:GITHUB_PATH
+        $env:PATH = "$toolchainBin;$env:PATH"
+
+        cargo --version
+        rustc --version
