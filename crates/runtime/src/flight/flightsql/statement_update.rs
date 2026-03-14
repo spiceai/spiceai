@@ -77,7 +77,7 @@ pub(crate) async fn do_put(
     }
 
     let sql = &cmd.query;
-    tracing::trace!("do_put_statement_update: {sql}");
+    tracing::debug!("do_put_statement_update: {sql}");
 
     // Parse and validate
     let session = datafusion.ctx.state();

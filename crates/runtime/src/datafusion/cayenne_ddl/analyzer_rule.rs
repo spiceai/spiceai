@@ -32,6 +32,7 @@ use datafusion::logical_expr::DdlStatement;
 use datafusion::logical_expr::{Extension, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::prelude::Expr;
+use datafusion_expr::{CreateExternalTable, CreateMemoryTable};
 use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
@@ -136,7 +137,16 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
         match &plan {
-            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) => {
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
+                name,
+                input,
+                constraints,
+                if_not_exists,
+                or_replace,
+                table_partition_cols: vec![],
+                ..
+            })) => {
+                tracing::warn!("Intercepted CREATE MEMORY TABLE for '{create:?}'");
                 let catalog_name = create
                     .name
                     .catalog()
