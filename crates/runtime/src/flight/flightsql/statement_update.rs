@@ -22,20 +22,19 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow_flight::{
     PutResult,
     flight_service_server::FlightService,
-    sql::{CommandStatementUpdate, DoPutUpdateResult, ProstMessageExt},
+    sql::{CommandStatementUpdate, DoPutUpdateResult},
 };
+use futures::TryStreamExt;
 use prost::Message;
 use tonic::{Response, Status};
 
 use crate::{
     config::ClusterRole,
-    datafusion::request_context_extension::get_current_datafusion,
-    flight::{Service, metrics},
+    datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
+    flight::{Service, handle_query_error, metrics, to_tonic_err, util::set_flightsql_protocol},
 };
-use runtime_request_context::{AsyncMarker, RequestContext};
-
-use crate::datafusion::sql_validator::validate_sql_query_operations;
 use runtime_auth::AuthRequestContext;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Execute a SQL DML statement received via `DoPut` with `CommandStatementUpdate`.
 ///
@@ -45,6 +44,7 @@ pub(crate) async fn do_put(
     cmd: CommandStatementUpdate,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     let _start = metrics::track_flight_request("do_put", Some("statement_update")).await;
+    set_flightsql_protocol().await;
 
     // Authenticate — this handler is dispatched before the generic DoPut auth
     // check, so we must verify credentials here.
@@ -79,28 +79,19 @@ pub(crate) async fn do_put(
     let sql = &cmd.query;
     tracing::trace!("do_put_statement_update: {sql}");
 
-    // Parse and validate
-    let session = datafusion.ctx.state();
-    let plan = session
-        .create_logical_plan(sql)
+    // Execute through the standard query path, which handles DELETE and UPDATE
+    // via the runtime's DML interception in Query::run().
+    let query_result = QueryBuilder::new(sql, datafusion)
+        .build()
+        .run()
         .await
-        .map_err(|e| Status::internal(format!("Failed to create logical plan: {e}")))?;
+        .map_err(handle_query_error)?;
 
-    if let Err(e) = validate_sql_query_operations(&plan, &datafusion) {
-        return Err(Status::permission_denied(format!(
-            "Operation not allowed: {e}"
-        )));
-    }
-
-    // Execute
-    let physical_plan = session
-        .create_physical_plan(&plan)
+    let results: Vec<RecordBatch> = query_result
+        .data
+        .try_collect()
         .await
-        .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?;
-
-    let results = datafusion::physical_plan::collect(physical_plan, datafusion.ctx.task_ctx())
-        .await
-        .map_err(|e| Status::internal(format!("Failed to execute statement: {e}")))?;
+        .map_err(to_tonic_err)?;
 
     // Extract affected rows count
     let affected_rows = extract_affected_rows(&results);
@@ -110,7 +101,7 @@ pub(crate) async fn do_put(
     };
 
     let output = futures::stream::iter(vec![Ok(PutResult {
-        app_metadata: result.as_any().encode_to_vec().into(),
+        app_metadata: result.encode_to_vec().into(),
     })]);
 
     Ok(Response::new(Box::pin(output)))
