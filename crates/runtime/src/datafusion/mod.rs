@@ -894,6 +894,8 @@ impl DataFusion {
             && let Some(expr_string) = aware
                 .table_partition_expr(schema_name, table_reference.table())
                 .await
+                .boxed()
+                .map_err(DataFusionError::External)?
         {
             return Expr::from_bytes_with_registry(expr_string.as_bytes(), self.ctx.as_ref())
                 .map(Some);
