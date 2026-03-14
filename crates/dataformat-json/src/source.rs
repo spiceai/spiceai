@@ -259,11 +259,37 @@ impl FileOpener for SpiceJsonOpener {
 
                     // SODA format: convert to NDJSON via SodaReader
                     if format == Format::Soda {
-                        let soda = SodaReader::new(bytes).map_err(DataFusionError::from)?;
+                        // Apply json_pointer before SODA if both are configured
+                        let soda_reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
+                            let ptr = JsonPointerReader::new(bytes, path)
+                                .map_err(DataFusionError::from)?;
+                            Box::new(ptr)
+                        } else {
+                            bytes
+                        };
+                        let soda = SodaReader::new(soda_reader).map_err(DataFusionError::from)?;
                         let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                             .with_batch_size(batch_size)
                             .build(BufReader::new(soda))?;
                         let stream = futures::stream::iter(reader).boxed();
+                        // Apply flatten if configured (don't early-return to skip it)
+                        if let Some(separator) = &unnest_struct_separator {
+                            let separator = separator.clone();
+                            return Ok(stream
+                                .map(move |batch| {
+                                    batch
+                                        .map(|batch| {
+                                            extract_flattened_from_nested(
+                                                &batch,
+                                                &projected_flattened_schema,
+                                                &separator,
+                                            )
+                                            .unwrap_or(batch)
+                                        })
+                                        .map_err(DataFusionError::from)
+                                })
+                                .boxed());
+                        }
                         return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
                     }
 
@@ -338,12 +364,42 @@ impl FileOpener for SpiceJsonOpener {
 
                         // SODA format: convert to NDJSON via SodaReader (use from_vec to avoid double alloc)
                         if format == Format::Soda {
+                            // Apply json_pointer before SODA if both are configured
+                            let soda_bytes = if let Some(path) = &json_pointer {
+                                let ptr = JsonPointerReader::from_vec(&all_bytes, path)
+                                    .map_err(DataFusionError::from)?;
+                                let mut out = Vec::new();
+                                BufReader::new(ptr)
+                                    .read_to_end(&mut out)
+                                    .map_err(DataFusionError::from)?;
+                                out
+                            } else {
+                                all_bytes
+                            };
                             let soda =
-                                SodaReader::from_vec(&all_bytes).map_err(DataFusionError::from)?;
+                                SodaReader::from_vec(&soda_bytes).map_err(DataFusionError::from)?;
                             let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                                 .with_batch_size(batch_size)
                                 .build(BufReader::new(soda))?;
                             let stream = futures::stream::iter(reader).boxed();
+                            // Apply flatten if configured
+                            if let Some(separator) = &unnest_struct_separator {
+                                let separator = separator.clone();
+                                return Ok(stream
+                                    .map(move |batch| {
+                                        batch
+                                            .map(|batch| {
+                                                extract_flattened_from_nested(
+                                                    &batch,
+                                                    &projected_flattened_schema,
+                                                    &separator,
+                                                )
+                                                .unwrap_or(batch)
+                                            })
+                                            .map_err(DataFusionError::from)
+                                    })
+                                    .boxed());
+                            }
                             return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
                         }
 

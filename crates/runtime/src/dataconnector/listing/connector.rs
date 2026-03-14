@@ -596,14 +596,31 @@ pub trait ListingTableConnector: DataConnector {
                         Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
                         extension.unwrap_or(".tsv".to_string()),
                     )),
-                    Some("jsonl" | "ndjson" | "ldjson") => Ok((
-                        Some(self.get_jsonl_format(dataset, params)?),
-                        extension.unwrap_or_else(|| match ext {
-                            Some("ndjson") => ".ndjson".to_string(),
-                            Some("ldjson") => ".ldjson".to_string(),
-                            _ => ".jsonl".to_string(),
-                        }),
-                    )),
+                    Some("jsonl" | "ndjson" | "ldjson") => {
+                        let has_pointer = matches!(
+                            params.get("json_pointer").expose(),
+                            ExposedParamLookup::Present(v) if !v.is_empty()
+                        ) || matches!(
+                            params.get("json_path").expose(),
+                            ExposedParamLookup::Present(v) if !v.is_empty()
+                        );
+                        let default_ext = match ext {
+                            Some("ndjson") => ".ndjson",
+                            Some("ldjson") => ".ldjson",
+                            _ => ".jsonl",
+                        };
+                        if has_pointer {
+                            Ok((
+                                Some(self.get_json_format(dataset, params, Format::Auto)?),
+                                extension.unwrap_or_else(|| default_ext.to_string()),
+                            ))
+                        } else {
+                            Ok((
+                                Some(self.get_jsonl_format(dataset, params)?),
+                                extension.unwrap_or_else(|| default_ext.to_string()),
+                            ))
+                        }
+                    },
                     Some("parquet") => Ok((
                         Some(Arc::new(
                             ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),

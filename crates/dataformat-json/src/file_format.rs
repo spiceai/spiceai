@@ -250,8 +250,20 @@ impl FileFormat for SpiceJsonFormat {
                     let decoder = file_compression_type.convert_read(file)?;
 
                     if self.options.format == Format::Soda {
+                        // Apply json_pointer before SODA if both are configured
+                        let decoder: Box<dyn std::io::Read + Send> =
+                            if let Some(path) = &self.options.json_pointer {
+                                Box::new(JsonPointerReader::new(decoder, path)?)
+                            } else {
+                                decoder
+                            };
                         let soda = SodaReader::new(decoder)?;
-                        soda.schema().clone()
+                        let schema = soda.schema().clone();
+                        if let Some(separator) = &self.options.flatten_json {
+                            unnest_struct_schema(&schema, separator)
+                        } else {
+                            schema
+                        }
                     } else {
                         let reader: Box<dyn std::io::Read + Send> =
                             if let Some(path) = &self.options.json_pointer {
@@ -295,8 +307,22 @@ impl FileFormat for SpiceJsonFormat {
                     decoder.read_to_end(&mut buf)?;
 
                     if self.options.format == Format::Soda {
+                        // Apply json_pointer before SODA if both are configured
+                        let buf = if let Some(path) = &self.options.json_pointer {
+                            let extracted = JsonPointerReader::from_vec(&buf, path)?;
+                            let mut out = Vec::new();
+                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
+                            out
+                        } else {
+                            buf
+                        };
                         let soda = SodaReader::from_vec(&buf)?;
-                        soda.schema().clone()
+                        let schema = soda.schema().clone();
+                        if let Some(separator) = &self.options.flatten_json {
+                            unnest_struct_schema(&schema, separator)
+                        } else {
+                            schema
+                        }
                     } else {
                         let reader: Box<dyn std::io::Read + Send> =
                             if let Some(path) = &self.options.json_pointer {
