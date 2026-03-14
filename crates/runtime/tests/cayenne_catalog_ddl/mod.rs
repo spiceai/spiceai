@@ -838,6 +838,198 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
 }
 
 // =============================================================================
+// Test: CREATE TABLE with PRIMARY KEY — upsert on conflict via INSERT
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_pk",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_ddl_pk_upsert")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            // -----------------------------------------------------------------
+            // Step 1: CREATE TABLE with PRIMARY KEY
+            // -----------------------------------------------------------------
+            exec(&rt, "CREATE SCHEMA cat_pk.myschema").await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_pk.myschema.users (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    email VARCHAR,
+                    PRIMARY KEY (id)
+                )",
+            )
+            .await?;
+
+            // -----------------------------------------------------------------
+            // Step 2: Initial INSERT
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "INSERT INTO cat_pk.myschema.users VALUES
+                    (1, 'Alice', 'alice@example.com'),
+                    (2, 'Bob',   'bob@example.com'),
+                    (3, 'Charlie', 'charlie@example.com')",
+            )
+            .await?;
+
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_pk.myschema.users").await?;
+            assert_eq!(count, 3, "Expected 3 rows after initial insert");
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, email FROM cat_pk.myschema.users ORDER BY id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+---------+---------------------+",
+                    "| id | name    | email               |",
+                    "+----+---------+---------------------+",
+                    "| 1  | Alice   | alice@example.com   |",
+                    "| 2  | Bob     | bob@example.com     |",
+                    "| 3  | Charlie | charlie@example.com |",
+                    "+----+---------+---------------------+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 3: INSERT with conflicting PKs — should upsert (replace)
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "INSERT INTO cat_pk.myschema.users VALUES
+                    (2, 'Bob Updated', 'bob_new@example.com'),
+                    (4, 'Diana', 'diana@example.com')",
+            )
+            .await?;
+
+            // Should have 4 rows: Alice(1), Bob Updated(2), Charlie(3), Diana(4)
+            // Bob's row should be replaced, not duplicated.
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_pk.myschema.users").await?;
+            assert_eq!(
+                count, 4,
+                "Expected 4 rows after upsert (Bob replaced, Diana added)"
+            );
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, email FROM cat_pk.myschema.users ORDER BY id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+---------------------+",
+                    "| id | name        | email               |",
+                    "+----+-------------+---------------------+",
+                    "| 1  | Alice       | alice@example.com   |",
+                    "| 2  | Bob Updated | bob_new@example.com |",
+                    "| 3  | Charlie     | charlie@example.com |",
+                    "| 4  | Diana       | diana@example.com   |",
+                    "+----+-------------+---------------------+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 4: INSERT all conflicting PKs — pure upsert, no new rows
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "INSERT INTO cat_pk.myschema.users VALUES
+                    (1, 'Alice V2', 'alice_v2@example.com'),
+                    (3, 'Charlie V2', 'charlie_v2@example.com')",
+            )
+            .await?;
+
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_pk.myschema.users").await?;
+            assert_eq!(count, 4, "Row count should remain 4 after pure upsert");
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, email FROM cat_pk.myschema.users ORDER BY id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+------------------------+",
+                    "| id | name        | email                  |",
+                    "+----+-------------+------------------------+",
+                    "| 1  | Alice V2    | alice_v2@example.com   |",
+                    "| 2  | Bob Updated | bob_new@example.com    |",
+                    "| 3  | Charlie V2  | charlie_v2@example.com |",
+                    "| 4  | Diana       | diana@example.com      |",
+                    "+----+-------------+------------------------+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 5: Verify DELETE still works on PK table
+            // -----------------------------------------------------------------
+            exec(&rt, "DELETE FROM cat_pk.myschema.users WHERE id = 2").await?;
+
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_pk.myschema.users").await?;
+            assert_eq!(count, 3, "Expected 3 rows after delete");
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name FROM cat_pk.myschema.users ORDER BY id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+------------+",
+                    "| id | name       |",
+                    "+----+------------+",
+                    "| 1  | Alice V2   |",
+                    "| 3  | Charlie V2 |",
+                    "| 4  | Diana      |",
+                    "+----+------------+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
 // Test: Multiple schemas in the same catalog
 // =============================================================================
 
