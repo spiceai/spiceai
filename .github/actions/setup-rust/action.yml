@@ -9,7 +9,7 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install Rust toolchain (Linux/macOS)
+    - name: Set up Rust toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
       run: |
@@ -23,18 +23,8 @@ runs:
           source "$cargo_home/env" || true
         fi
 
-        if [ ! -x "$cargo_home/bin/rustup" ]; then
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-          if [ -f "$cargo_home/env" ]; then
-            source "$cargo_home/env" || true
-          fi
-        fi
-
-        # Resolve which toolchain to install.
+        # Resolve which toolchain to use.
         toolchain='${{ inputs.toolchain }}'
-        if [ -z "$toolchain" ]; then
-          toolchain="$( (rustup show active-toolchain 2>/dev/null || true) | awk '{ print $1; exit }')"
-        fi
         if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
           toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
         fi
@@ -42,34 +32,23 @@ runs:
           toolchain='stable'
         fi
 
-        # Validate that the resolved toolchain name is safe to use in paths.
-        if [[ ! "$toolchain" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-          echo "Invalid toolchain name: $toolchain" >&2
-          exit 1
+        # If the toolchain is already installed (e.g. spiceai-macos self-hosted
+        # runners), just verify it. Otherwise install it.
+        if rustup run "$toolchain" cargo --version >/dev/null 2>&1; then
+          echo "Toolchain $toolchain already available, skipping install"
+        else
+          if [ ! -x "$cargo_home/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+            if [ -f "$cargo_home/env" ]; then
+              source "$cargo_home/env" || true
+            fi
+          fi
+          rustup toolchain install "$toolchain" \
+            --component cargo \
+            --component rustc \
+            --component rustfmt \
+            --component clippy
         fi
-
-        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
-        mkdir -p "${rustup_home}"
-
-        # Acquire a cross-process lock before removing/reinstalling.
-        # Uses mkdir (atomic on all POSIX systems including macOS).
-        lockdir="${rustup_home}/.setup-rust.lock.d"
-        while ! mkdir "$lockdir" 2>/dev/null; do sleep 1; done
-        trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
-
-        rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
-        rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
-        rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
-        rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
-
-        rustup toolchain install "$toolchain" \
-          --component cargo \
-          --component rustc \
-          --component rustfmt \
-          --component clippy
-
-        rmdir "$lockdir" 2>/dev/null || true
-        trap - EXIT
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
@@ -82,17 +61,10 @@ runs:
         # runners share the same RUSTUP_HOME on one machine).
         echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
 
-        # Also add the toolchain's bin dir directly to PATH so that
-        # cargo/rustc are found even when the rustup proxy binaries
-        # in $CARGO_HOME/bin are missing or broken on self-hosted runners.
-        toolchain_bin="${rustup_home}/toolchains/${resolved}/bin"
-        echo "$toolchain_bin" >> "$GITHUB_PATH"
-        export PATH="$toolchain_bin:$PATH"
-
         cargo --version
         rustc --version
 
-    - name: Install Rust toolchain (Windows)
+    - name: Set up Rust toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
