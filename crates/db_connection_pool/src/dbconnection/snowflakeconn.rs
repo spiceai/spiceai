@@ -109,7 +109,9 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 })?;
 
         match res {
-            snowflake_api::QueryResult::Arrow(batches) => names_from_arrow_batches(batches),
+            snowflake_api::QueryResult::Arrow(batches) => {
+                names_from_arrow_batches(batches, tables_error)
+            }
             snowflake_api::QueryResult::Json(resp) => {
                 let tables: Vec<String> = resp
                     .value
@@ -137,7 +139,9 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 })?;
 
         match res {
-            snowflake_api::QueryResult::Arrow(batches) => names_from_arrow_batches(batches),
+            snowflake_api::QueryResult::Arrow(batches) => {
+                names_from_arrow_batches(batches, schemas_error)
+            }
             snowflake_api::QueryResult::Json(resp) => {
                 let schemas: Vec<String> = resp
                     .value
@@ -245,26 +249,32 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionErr
     DataFusionError::Execution(format!("{}", e.into()))
 }
 
-fn names_from_arrow_batches(batches: Vec<RecordBatch>) -> Result<Vec<String>, dbconnection::Error> {
+fn names_from_arrow_batches(
+    batches: Vec<RecordBatch>,
+    make_error: fn(String) -> dbconnection::Error,
+) -> Result<Vec<String>, dbconnection::Error> {
     let mut names = Vec::new();
 
     for batch in batches {
-        let name_column =
-            batch
-                .column_by_name("name")
-                .ok_or_else(|| dbconnection::Error::UnableToGetTables {
-                    source: "Arrow response missing 'name' column".into(),
-                })?;
+        let name_column = batch
+            .column_by_name("name")
+            .ok_or_else(|| make_error("Arrow response missing 'name' column".to_string()))?;
         let array = name_column
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| dbconnection::Error::UnableToGetTables {
-                source: "'name' column is not a StringArray".into(),
-            })?;
+            .ok_or_else(|| make_error("'name' column is not a StringArray".to_string()))?;
         names.extend(array.iter().flatten().map(ToString::to_string));
     }
 
     Ok(names)
+}
+
+fn tables_error(msg: String) -> dbconnection::Error {
+    dbconnection::Error::UnableToGetTables { source: msg.into() }
+}
+
+fn schemas_error(msg: String) -> dbconnection::Error {
+    dbconnection::Error::UnableToGetSchemas { source: msg.into() }
 }
 
 /// Converts `Snowflake` specific types to standard Arrow types.

@@ -159,12 +159,12 @@ async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
 
             let expected_limit = [
-                "+----+-------+------+",
-                "| id | name  | value|",
-                "+----+-------+------+",
-                "| 1  | alice | 10.5 |",
-                "| 2  | bob   | 20.3 |",
-                "+----+-------+------+",
+                "+----+-------+-------+",
+                "| id | name  | value |",
+                "+----+-------+-------+",
+                "| 1  | alice | 10.5  |",
+                "| 2  | bob   | 20.3  |",
+                "+----+-------+-------+",
             ];
             assert_batches_eq!(expected_limit, &limit_result);
 

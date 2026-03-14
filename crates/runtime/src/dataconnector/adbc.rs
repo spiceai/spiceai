@@ -133,12 +133,17 @@ impl DataConnectorFactory for AdbcFactory {
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
                     Some(v) => {
-                        v.parse::<u32>()
-                            .map(Some)
-                            .map_err(|_| Error::InvalidPoolParameter {
+                        let parsed = v.parse::<u32>().map_err(|_| Error::InvalidPoolParameter {
+                            name: name.to_string(),
+                            value: v.to_string(),
+                        })?;
+                        if parsed == 0 {
+                            return Err(Error::InvalidPoolParameter {
                                 name: name.to_string(),
                                 value: v.to_string(),
-                            })
+                            });
+                        }
+                        Ok(Some(parsed))
                     }
                     None => Ok(None),
                 }
