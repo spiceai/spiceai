@@ -32,7 +32,6 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
-use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -99,7 +98,9 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
     // Keep the tempdirs alive for the duration of the test.
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
-    std::fs::write(&csv_path, TEST_DATA_CSV).expect("write test data file");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data file");
 
     let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
 
@@ -129,8 +130,8 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
 
-            // Give executors time to load and accelerate their assigned partitions.
-            sleep(Duration::from_secs(12)).await;
+            // Wait for executors to load and accelerate their assigned partitions.
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
             // --- Test 1: SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
@@ -216,11 +217,10 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 }
 
 /// Test that 2 executors with `bucket(4, id)` partitioning correctly split data and
-/// that the scheduler generates a scatter-gather plan across both.
+/// that the scheduler generates a plan across both.
 ///
 /// Verifies:
 /// - 4 buckets are distributed across 2 executors (2 buckets each)
-/// - EXPLAIN shows a UNION of 2 `FlightSqlExec` nodes with disjoint bucket filters
 /// - Full SELECT returns all 10 rows without duplicates
 /// - COUNT/AVG aggregations produce correct cross-executor results
 #[tokio::test(flavor = "multi_thread")]
@@ -239,7 +239,9 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
-    std::fs::write(&csv_path, TEST_DATA_CSV).expect("write test data");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
 
     test_request_context()
         .scope(async {
@@ -266,9 +268,9 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            sleep(Duration::from_secs(12)).await;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
-            // --- SELECT all rows: plan must show 2 FlightSql nodes (one per executor) ---
+            // --- SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
 
             let plan = harness.explain(select_all_sql).await?;
@@ -350,7 +352,9 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
-    std::fs::write(&csv_path, TEST_DATA_CSV).expect("write test data");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
 
     test_request_context()
         .scope(async {
@@ -377,7 +381,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            sleep(Duration::from_secs(12)).await;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
             // The user predicate `score > 85` must be visible inside the FlightSqlExec
             // sql string — confirming it was pushed to the executor, not applied above.
@@ -448,7 +452,9 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
-    std::fs::write(&csv_path, TEST_DATA_CSV).expect("write test data");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
 
     test_request_context()
         .scope(async {
@@ -475,7 +481,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            sleep(Duration::from_secs(12)).await;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
             // Baseline: both executors up, all 10 rows visible.
             let select_all = "SELECT id FROM test_data ORDER BY id";
@@ -496,8 +502,8 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .wait_until_executor_count(1, Duration::from_secs(30))
                 .await?;
 
-            // Give the partition manager time to reassign and executor[1] time to refresh.
-            sleep(Duration::from_secs(15)).await;
+            // Wait for the partition manager to reassign and executor[1] to refresh.
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
             // After rebalance executor[1] should hold all 4 buckets and return all rows.
             let rows = harness.query(select_all).await?;
@@ -554,8 +560,12 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let data_path = csv_tempdir.path().join("test_data.csv");
     let cat_path = csv_tempdir.path().join("categories.csv");
-    std::fs::write(&data_path, TEST_DATA_CSV).expect("write test_data");
-    std::fs::write(&cat_path, CATEGORIES_CSV).expect("write categories");
+    tokio::fs::write(&data_path, TEST_DATA_CSV)
+        .await
+        .expect("write test_data");
+    tokio::fs::write(&cat_path, CATEGORIES_CSV)
+        .await
+        .expect("write categories");
 
     test_request_context()
         .scope(async {
@@ -588,7 +598,9 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            sleep(Duration::from_secs(15)).await;
+            // Wait for both tables to be fully accelerated.
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
 
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
@@ -651,6 +663,46 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Poll `SELECT COUNT(*) FROM {table}` until it returns `expected` rows, or time out.
+async fn wait_for_row_count(
+    harness: &ClusterHarness,
+    table: &str,
+    expected: usize,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(batches) = harness
+            .query(&format!("SELECT COUNT(*) AS cnt FROM {table}"))
+            .await
+        {
+            let total: usize = batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            if total > 0 {
+                let arr = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>();
+                if let Some(arr) = arr {
+                    #[allow(clippy::cast_sign_loss)]
+                    let count = arr.value(0) as usize;
+                    if count == expected {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for {table} to have {expected} rows"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
 
 /// Create a dataset configured with Cayenne file-mode acceleration and `bucket()` partitioning.
 ///
