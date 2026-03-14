@@ -42,13 +42,34 @@ runs:
           toolchain='stable'
         fi
 
-        # Install toolchain with all components in a single atomic operation
-        # so concurrent runners sharing the same RUSTUP_HOME don't race.
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if [[ ! "$toolchain" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+          echo "Invalid toolchain name: $toolchain" >&2
+          exit 1
+        fi
+
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+        mkdir -p "${rustup_home}"
+
+        # Acquire a cross-process lock before removing/reinstalling.
+        # Uses mkdir (atomic on all POSIX systems including macOS).
+        lockdir="${rustup_home}/.setup-rust.lock.d"
+        while ! mkdir "$lockdir" 2>/dev/null; do sleep 1; done
+        trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
+
+        rm -rf "${rustup_home}/toolchains/${toolchain}" 2>/dev/null || true
+        rm -rf "${rustup_home}/toolchains/${toolchain}"-* 2>/dev/null || true
+        rm -f "${rustup_home}/update-hashes/${toolchain}" 2>/dev/null || true
+        rm -f "${rustup_home}/update-hashes/${toolchain}"-* 2>/dev/null || true
+
         rustup toolchain install "$toolchain" \
           --component cargo \
           --component rustc \
           --component rustfmt \
           --component clippy
+
+        rmdir "$lockdir" 2>/dev/null || true
+        trap - EXIT
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
@@ -61,8 +82,15 @@ runs:
         # runners share the same RUSTUP_HOME on one machine).
         echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
 
-        rustup run "$resolved" cargo --version
-        rustup run "$resolved" rustc --version
+        # Also add the toolchain's bin dir directly to PATH so that
+        # cargo/rustc are found even when the rustup proxy binaries
+        # in $CARGO_HOME/bin are missing or broken on self-hosted runners.
+        toolchain_bin="${rustup_home}/toolchains/${resolved}/bin"
+        echo "$toolchain_bin" >> "$GITHUB_PATH"
+        export PATH="$toolchain_bin:$PATH"
+
+        cargo --version
+        rustc --version
 
     - name: Install Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -92,7 +120,25 @@ runs:
           $toolchain = "stable"
         }
 
-        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if ($toolchain -notmatch '^[a-zA-Z0-9._-]+$') {
+          Write-Error "Invalid toolchain name: $toolchain"
+          exit 1
+        }
+
+        $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+
+        # Use a mutex to prevent races when multiple jobs share RUSTUP_HOME.
+        $mutex = New-Object System.Threading.Mutex($false, "Global\setup-rust-$toolchain")
+        try {
+          [void]$mutex.WaitOne()
+          Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
+          Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
+          rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        } finally {
+          $mutex.ReleaseMutex()
+          $mutex.Dispose()
+        }
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
@@ -104,5 +150,9 @@ runs:
 
         "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
 
-        rustup run $resolved cargo --version
-        rustup run $resolved rustc --version
+        $toolchainBin = "$rustupHome\toolchains\$resolved\bin"
+        $toolchainBin >> $env:GITHUB_PATH
+        $env:PATH = "$toolchainBin;$env:PATH"
+
+        cargo --version
+        rustc --version
