@@ -24,7 +24,6 @@ use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
