@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::array::{Array, Int64Array, UInt64Array};
+use datafusion::arrow::array::{Array, UInt64Array};
 use datafusion::arrow::compute;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::ExecutionProps;
@@ -51,6 +51,16 @@ use crate::creator::filename::encode_composite_key;
 use crate::expression::PartitionedBy;
 use crate::provider::CompositePartitionKey;
 
+/// Returns the schema that `DataFusion` expects from INSERT execution plans:
+/// a single non-null `count: UInt64` field.
+fn count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
 #[derive(Debug)]
 pub struct PartitionerExec {
     input: Arc<dyn ExecutionPlan>,
@@ -60,8 +70,10 @@ pub struct PartitionerExec {
     /// this contains multiple expressions in order.
     partition_by: Vec<PartitionedBy>,
     insert_op: InsertOp,
-    schema: SchemaRef,
+    /// The table's data schema, used internally for evaluating partition expressions.
+    data_schema: SchemaRef,
     properties: PlanProperties,
+    output_schema: SchemaRef,
 }
 
 impl PartitionerExec {
@@ -71,10 +83,11 @@ impl PartitionerExec {
         creator: Arc<dyn PartitionCreator>,
         partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
         insert_op: InsertOp,
-        schema: SchemaRef,
+        data_schema: SchemaRef,
     ) -> Self {
+        let output_schema = count_schema();
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
+            EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -85,8 +98,9 @@ impl PartitionerExec {
             partitions,
             partition_by,
             insert_op,
-            schema,
+            data_schema,
             properties,
+            output_schema,
         }
     }
 }
@@ -118,7 +132,7 @@ impl ExecutionPlan for PartitionerExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&self.output_schema)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -141,7 +155,7 @@ impl ExecutionPlan for PartitionerExec {
             Arc::clone(&self.creator),
             Arc::clone(&self.partitions),
             self.insert_op,
-            Arc::clone(&self.schema),
+            Arc::clone(&self.data_schema),
         )))
     }
 
@@ -156,15 +170,11 @@ impl ExecutionPlan for PartitionerExec {
             ));
         }
 
-        let row_count_schema = Arc::new(Schema::new(vec![Field::new(
-            "row_count",
-            DataType::Int64,
-            false,
-        )]));
+        let output_schema = count_schema();
 
         let row_count_stream = {
-            let schema = self.schema();
-            let row_count_schema = Arc::clone(&row_count_schema);
+            let schema = Arc::clone(&self.data_schema);
+            let output_schema = Arc::clone(&output_schema);
             let input = Arc::clone(&self.input);
             // Create physical expressions for all partition columns
             let physical_exprs: Vec<Arc<dyn PhysicalExpr>> = self
@@ -269,21 +279,18 @@ impl ExecutionPlan for PartitionerExec {
                 }
 
                 // Return the number of rows inserted
-                let row_count = i64::try_from(row_count).map_err(|e| {
+                let row_count = u64::try_from(row_count).map_err(|e| {
                     DataFusionError::Execution(format!(
-                        "Number of rows inserted exceeded i64::MAX: {e}"
+                        "Number of rows inserted exceeded u64::MAX: {e}"
                     ))
                 })?;
-                let array = Int64Array::from(vec![row_count]);
-                Ok(RecordBatch::try_new(
-                    row_count_schema,
-                    vec![Arc::new(array)],
-                )?)
+                let array = UInt64Array::from(vec![row_count]);
+                Ok(RecordBatch::try_new(output_schema, vec![Arc::new(array)])?)
             })
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            row_count_schema,
+            output_schema,
             row_count_stream,
         )))
     }

@@ -28,7 +28,7 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
 use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
 use super::physical_plans::{
-    CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
+    CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDropTableExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 
@@ -67,16 +67,21 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
         let catalog_list = Arc::<dyn CatalogProviderList>::clone(session_state.catalog_list());
 
         if let Some(create) = node.as_any().downcast_ref::<CayenneCreateTableNode>() {
-            return Ok(Some(Arc::new(CayenneCreateTableExec::new(
-                create.table_name.clone(),
-                Arc::clone(&create.arrow_schema),
-                create.if_not_exists,
-                create.df_catalog_name.clone(),
-                create.df_schema_name.clone(),
-                create.primary_key.clone(),
-                catalog_list,
-                self.executor_registry.clone(),
-            ))));
+            return Ok(Some(Arc::new(
+                CayenneCreateTableExecBuilder::new(
+                    create.table_name.clone(),
+                    Arc::clone(&create.arrow_schema),
+                    create.df_catalog_name.clone(),
+                    create.df_schema_name.clone(),
+                    create.primary_key.clone(),
+                    catalog_list,
+                )
+                .if_not_exists(create.if_not_exists)
+                .executor_registry(self.executor_registry.clone())
+                .partition_expr(create.partition_expr.clone())
+                .partition_expr_sql(create.partition_expr_sql.clone())
+                .build(),
+            )));
         }
 
         if let Some(create_schema) = node.as_any().downcast_ref::<CayenneCreateSchemaNode>() {

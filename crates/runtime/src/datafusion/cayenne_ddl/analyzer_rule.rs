@@ -24,14 +24,19 @@ use std::sync::{Arc, RwLock, Weak};
 
 use datafusion::catalog::CatalogProviderList;
 use datafusion::common::Constraint;
+use datafusion::common::{DFSchema, ToDFSchema};
 use datafusion::config::ConfigOptions;
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::DdlStatement;
-use datafusion::logical_expr::{Extension, LogicalPlan};
+use datafusion::logical_expr::{Extension, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
+use datafusion::prelude::Expr;
+use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
 use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
+use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Extract primary key column names from `DataFusion` [`Constraints`] using the
@@ -69,12 +74,17 @@ fn parse_qualified_schema_name(name: &str) -> (String, String) {
 /// Analyzer rule that rewrites DDL targeting Cayenne catalogs into
 /// custom extension nodes for Cayenne catalog operations.
 ///
-/// Uses `Weak` references to avoid reference cycles.
+/// Uses `Weak` references to avoid reference cycles: the `SessionContext`
+/// owns the analyzer rules, so `Arc` refs back would create a cycle.
 pub struct CayenneDdlAnalyzerRule {
+    /// Weak reference to the session state for SQL expression parsing.
+    session_state: Weak<parking_lot::RwLock<SessionState>>,
     /// Weak reference to the catalog list for catalog resolution.
     catalog_list: Weak<dyn CatalogProviderList>,
     /// Weak reference to the set of DDL-enabled catalog names.
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
+    /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
+    ddl_options: SharedDdlExtensionStore,
 }
 
 impl fmt::Debug for CayenneDdlAnalyzerRule {
@@ -87,12 +97,16 @@ impl fmt::Debug for CayenneDdlAnalyzerRule {
 impl CayenneDdlAnalyzerRule {
     #[must_use]
     pub fn new(
+        session_state: Weak<parking_lot::RwLock<SessionState>>,
         catalog_list: &Arc<dyn CatalogProviderList>,
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
+        ddl_options: SharedDdlExtensionStore,
     ) -> Self {
         Self {
+            session_state,
             catalog_list: Arc::downgrade(catalog_list),
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
+            ddl_options,
         }
     }
 
@@ -143,21 +157,56 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     .unwrap_or(SPICE_DEFAULT_SCHEMA)
                     .to_string();
                 let table_name = create.name.table().to_string();
+                let extension_key = create.name.to_string();
 
                 // Extract the Arrow schema from the logical plan's input
                 let arrow_schema = Arc::new(create.input.schema().inner().as_ref().clone());
-
                 let primary_key = extract_primary_key_columns(&create.constraints, &arrow_schema);
 
-                let node = CayenneCreateTableNode::new(
+                // Consume DDL extensions from the store (consumed on use)
+                let (partition_expr, partition_expr_sql) = {
+                    let mut store = self.ddl_options.write().map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to acquire DDL extension store lock: {e}"
+                        ))
+                    })?;
+                    let ext = store.remove(&extension_key);
+                    if let Some(ext) = ext {
+                        if let Some(partition_by_expr) = ext.partition_by {
+                            let partition_expr_sql = partition_by_expr.to_string();
+                            let state = self.session_state.upgrade().ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "Session state is no longer available".to_string(),
+                                )
+                            })?;
+                            let state_guard = state.read();
+                            let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
+                            let partition_expr = parse_and_validate_partition_expression(
+                                &partition_expr_sql,
+                                &state_guard,
+                                &df_schema,
+                            )?;
+                            (Some(partition_expr), Some(partition_expr_sql))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                };
+
+                let node = CayenneCreateTableNode::builder(
                     table_name,
                     arrow_schema,
-                    create.if_not_exists,
-                    create.or_replace,
                     catalog_name,
                     schema_name,
-                    primary_key,
-                );
+                )
+                .if_not_exists(create.if_not_exists)
+                .or_replace(create.or_replace)
+                .partition_expr(partition_expr)
+                .partition_expr_sql(partition_expr_sql)
+                .primary_key(primary_key)
+                .build();
 
                 Ok(LogicalPlan::Extension(Extension {
                     node: Arc::new(node),
@@ -220,12 +269,56 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
     }
 }
 
+fn parse_and_validate_partition_expression(
+    partition_expr_sql: &str,
+    session_state: &SessionState,
+    df_schema: &DFSchema,
+) -> DFResult<Expr> {
+    let partition_expr = session_state
+        .create_logical_expr(partition_expr_sql, df_schema)
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "Invalid PARTITION BY expression '{partition_expr_sql}': {e}"
+            ))
+        })?;
+
+    // Reject boolean PARTITION BY expressions that use AND/OR at the top level — not supported yet
+    if is_boolean_partition_expr(&partition_expr) {
+        return Err(DataFusionError::Plan(format!(
+            "Boolean PARTITION BY expressions using AND/OR are not supported: '{partition_expr_sql}'. Use a single column or scalar function instead"
+        )));
+    }
+
+    validate_partition_expression(&partition_expr, df_schema).map_err(|e| {
+        DataFusionError::Plan(format!(
+            "Invalid PARTITION BY expression '{partition_expr_sql}': {e}"
+        ))
+    })?;
+
+    Ok(partition_expr)
+}
+
+/// Returns `true` if the expression is a boolean combination (`AND`/`OR`) at the top level,
+/// which is not supported as a partition expression.
+fn is_boolean_partition_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BinaryExpr(bin) if matches!(bin.op, Operator::And | Operator::Or)
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::{Constraint, Constraints};
+    use std::sync::Arc;
 
-    use super::{extract_primary_key_columns, parse_qualified_schema_name};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{Constraint, Constraints, ToDFSchema};
+    use datafusion::execution::context::SessionContext;
+
+    use super::{
+        extract_primary_key_columns, parse_and_validate_partition_expression,
+        parse_qualified_schema_name,
+    };
     use crate::datafusion::SPICE_DEFAULT_CATALOG;
 
     #[test]
@@ -247,7 +340,72 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("email", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
         ])
+    }
+
+    #[test]
+    fn partition_by_accepts_single_column_expression() {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let df_schema = Arc::new(test_schema())
+            .to_dfschema()
+            .expect("test schema should convert to DF schema");
+
+        let expr = parse_and_validate_partition_expression("region", &state, &df_schema)
+            .expect("single column partition expression should be valid");
+
+        assert_eq!(expr.to_string(), "region");
+    }
+
+    #[test]
+    fn partition_by_rejects_boolean_expression() {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let df_schema = Arc::new(test_schema())
+            .to_dfschema()
+            .expect("test schema should convert to DF schema");
+
+        let err = parse_and_validate_partition_expression("id > 1 AND id < 10", &state, &df_schema)
+            .expect_err("boolean partition expressions should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Boolean PARTITION BY expressions using AND/OR are not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn partition_by_rejects_unsupported_expression() {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let df_schema = Arc::new(test_schema())
+            .to_dfschema()
+            .expect("test schema should convert to DF schema");
+
+        let err = parse_and_validate_partition_expression("sum(id)", &state, &df_schema)
+            .expect_err("aggregate partition expressions should be rejected");
+
+        assert!(
+            err.to_string().contains("Invalid PARTITION BY expression"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn partition_by_preserves_scalar_function_expression() {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let df_schema = Arc::new(test_schema())
+            .to_dfschema()
+            .expect("test schema should convert to DF schema");
+
+        let expr = parse_and_validate_partition_expression("abs(id)", &state, &df_schema)
+            .expect("scalar function partition expression should be valid");
+
+        assert!(expr.to_string().contains("abs"));
+        assert!(expr.to_string().contains("id"));
     }
 
     #[test]
@@ -261,9 +419,9 @@ mod tests {
     #[test]
     fn extract_primary_key_composite() {
         let schema = test_schema();
-        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 2])]);
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1])]);
         let pk = extract_primary_key_columns(&constraints, &schema);
-        assert_eq!(pk, vec!["id", "email"]);
+        assert_eq!(pk, vec!["id", "name"]);
     }
 
     #[test]
@@ -286,7 +444,7 @@ mod tests {
     fn extract_primary_key_ignores_unique_uses_first_pk() {
         let schema = test_schema();
         let constraints = Constraints::new_unverified(vec![
-            Constraint::Unique(vec![2]),
+            Constraint::Unique(vec![1]),
             Constraint::PrimaryKey(vec![0]),
         ]);
         let pk = extract_primary_key_columns(&constraints, &schema);

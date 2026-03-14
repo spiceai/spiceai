@@ -50,6 +50,9 @@ runs:
             --component clippy
         fi
 
+        rmdir "$lockdir" 2>/dev/null || true
+        trap - EXIT
+
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then
           echo "Failed to resolve installed Rust toolchain for $toolchain" >&2
@@ -92,7 +95,25 @@ runs:
           $toolchain = "stable"
         }
 
-        rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if ($toolchain -notmatch '^[a-zA-Z0-9._-]+$') {
+          Write-Error "Invalid toolchain name: $toolchain"
+          exit 1
+        }
+
+        $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+
+        # Use a mutex to prevent races when multiple jobs share RUSTUP_HOME.
+        $mutex = New-Object System.Threading.Mutex($false, "Global\setup-rust-$toolchain")
+        try {
+          [void]$mutex.WaitOne()
+          Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
+          Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
+          rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        } finally {
+          $mutex.ReleaseMutex()
+          $mutex.Dispose()
+        }
 
         $rustcPath = rustup which --toolchain $toolchain rustc
         if (-not $rustcPath) {
@@ -104,5 +125,9 @@ runs:
 
         "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
 
-        rustup run $resolved cargo --version
-        rustup run $resolved rustc --version
+        $toolchainBin = "$rustupHome\toolchains\$resolved\bin"
+        $toolchainBin >> $env:GITHUB_PATH
+        $env:PATH = "$toolchainBin;$env:PATH"
+
+        cargo --version
+        rustc --version
