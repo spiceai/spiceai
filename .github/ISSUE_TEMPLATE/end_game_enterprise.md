@@ -105,9 +105,8 @@ assignees: ''
   - [ ] AI Chat
   - [ ] Search
   - spicehq:
-    - https://dev.spice.ai/spicehq/scp-synthetics-test-app
-    - https://dev.spice.ai/spicehq/scp-synthetics-test-app-stateful
-    - https://dev.spice.ai/spicehq/scp-synthetics-test-app-aws
+    - https://dev.spice.ai/spicehq/scp-test-app-us-east-1-dev-aws
+    - https://dev.spice.ai/spicehq/team-app
 - [ ] Ask @lukekim, @phillipleblanc, or @ewgenius to add released tag to the `versions` and `default_tag` in [SCP Config in Vercel](https://vercel.com/spice/~/stores/edge-config/ecfg_pbglo8zol8rij7koia8ijd6t2fwe/items) for **prod**.
 - [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality:
   - [ ] SQL Query
@@ -126,7 +125,6 @@ assignees: ''
     - https://spice.ai/spicehq/scp-synthetics-test-app
     - https://spice.ai/spicehq/scp-synthetics-test-app-stateful
     - https://spice.ai/spicehq/scp-synthetics-test-app-aws
-    - https://spice.ai/spicehq/scp-synthetics-test-app-aws-stateful
   - spiceai:
     - https://spice.ai/spiceai/react
     - https://spice.ai/spiceai/tpch
