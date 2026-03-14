@@ -267,6 +267,19 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
+    #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
+    CatalogNotPartitionAware { catalog: String },
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {catalog}.{schema}.{table}: {source}"
+    ))]
+    UnableToReadPartitionMetadata {
+        catalog: String,
+        schema: String,
+        table: String,
+        source: Box<crate::catalogconnector::Error>,
+    },
+
     #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
         schema: String,

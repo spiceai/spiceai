@@ -280,13 +280,25 @@ impl CatalogProvider for CayenneCatalogProvider {
 
 #[async_trait]
 impl PartitionAwareCatalog for CayenneCatalogProvider {
-    async fn table_partition_expr(&self, schema_name: &str, table_name: &str) -> Option<String> {
+    async fn table_partition_expr(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::catalogconnector::Result<Option<String>> {
         let metadata_table_name = format!("{schema_name}/{table_name}");
-        self.catalog
+        let metadata = self
+            .catalog
             .get_table(&metadata_table_name)
             .await
-            .ok()?
-            .partition_column
+            .map_err(
+                |source| crate::catalogconnector::Error::PartitionMetadataRead {
+                    schema_name: schema_name.to_string(),
+                    table_name: table_name.to_string(),
+                    source: Box::new(source),
+                },
+            )?;
+
+        Ok(metadata.partition_column)
     }
 }
 

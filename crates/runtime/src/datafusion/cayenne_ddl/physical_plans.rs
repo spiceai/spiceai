@@ -22,7 +22,9 @@ limitations under the License.
 //! Depending on the presence of a `PARTITION BY` expression, it constructs
 //! either a partitioned `PartitionTableProvider` wrapped in
 //! `DeletionTableProviderAdapter` or a non-partitioned provider, with data
-//! stored in Vortex columnar format (typically in S3 Express One Zone).
+//! stored in Vortex columnar format on local filesystem paths managed by the
+//! Cayenne catalog provider. S3 Express One Zone applies to the Cayenne
+//! accelerator path, not Cayenne DDL catalog storage.
 //!
 //! `CayenneCreateSchemaExec` registers a schema namespace in the `DataFusion`
 //! catalog for Cayenne-backed DDL catalogs.
