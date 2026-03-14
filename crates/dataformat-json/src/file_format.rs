@@ -20,7 +20,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -288,17 +288,21 @@ impl FileFormat for SpiceJsonFormat {
                 }
                 GetResultPayload::Stream(_) => {
                     let data = r.bytes().await?;
-                    let decoder = file_compression_type.convert_read(data.reader())?;
+                    let mut decoder = file_compression_type.convert_read(data.reader())?;
+                    // Read decompressed bytes once; reuse via from_vec to avoid
+                    // an extra copy through SodaReader::new / JsonPointerReader::new.
+                    let mut buf = Vec::new();
+                    decoder.read_to_end(&mut buf)?;
 
                     if self.options.format == Format::Soda {
-                        let soda = SodaReader::new(decoder)?;
+                        let soda = SodaReader::from_vec(&buf)?;
                         soda.schema().clone()
                     } else {
                         let reader: Box<dyn std::io::Read + Send> =
                             if let Some(path) = &self.options.json_pointer {
-                                Box::new(JsonPointerReader::new(decoder, path)?)
+                                Box::new(JsonPointerReader::from_vec(&buf, path)?)
                             } else {
-                                decoder
+                                Box::new(std::io::Cursor::new(buf))
                             };
                         let mut reader = BufReader::new(reader);
 

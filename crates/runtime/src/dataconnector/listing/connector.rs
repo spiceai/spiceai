@@ -561,7 +561,7 @@ pub trait ListingTableConnector: DataConnector {
                 });
                 if has_pointer {
                     Ok((
-                        Some(self.get_json_format(dataset, params, Format::Jsonl)?),
+                        Some(self.get_json_format(dataset, params, Format::Auto)?),
                         extension.unwrap_or_else(|| default_ext.to_string()),
                     ))
                 } else {

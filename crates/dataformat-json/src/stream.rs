@@ -511,10 +511,34 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// Returns an error if the reader is empty or contains only whitespace.
 pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
     // Skip UTF-8 BOM if present at the start of the stream.
+    // Handle incrementally: the BOM bytes may arrive split across buffers.
     {
         let buf = reader.fill_buf()?;
         if buf.len() >= 3 && buf[..3] == UTF8_BOM {
             reader.consume(3);
+        } else if !buf.is_empty() && buf[0] == UTF8_BOM[0] {
+            // Potential partial BOM — read byte-by-byte to confirm.
+            let mut bom_buf = [0u8; 3];
+            bom_buf[0] = buf[0];
+            reader.consume(1);
+            let b1 = reader.fill_buf()?;
+            if !b1.is_empty() && b1[0] == UTF8_BOM[1] {
+                bom_buf[1] = b1[0];
+                reader.consume(1);
+                let b2 = reader.fill_buf()?;
+                if !b2.is_empty() && b2[0] == UTF8_BOM[2] {
+                    // Full BOM consumed.
+                    reader.consume(1);
+                } else {
+                    // Only 0xEF 0xBB seen — not a BOM, put back by returning 0xEF.
+                    // We can't un-consume, so treat what we read as content.
+                    // 0xEF is not ascii whitespace, so return it.
+                    return Ok(bom_buf[0]);
+                }
+            } else {
+                // Only 0xEF seen — not a BOM. 0xEF is not whitespace.
+                return Ok(bom_buf[0]);
+            }
         }
     }
 
@@ -2271,6 +2295,26 @@ mod tests {
             let mut reader = BufReader::new(Cursor::new(input.as_slice()));
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             assert_eq!(byte, b'[');
+        }
+
+        /// BOM split across tiny buffers (BufReader with capacity=1)
+        #[test]
+        fn test_auto_detect_bom_split_buffers() {
+            let mut input = vec![0xEF, 0xBB, 0xBF];
+            input.extend_from_slice(b"[{\"a\":1}]");
+            // BufReader with capacity=1 forces each fill_buf to return 1 byte
+            let mut reader = BufReader::with_capacity(1, Cursor::new(input));
+            let byte = peek_first_non_ws_byte(&mut reader).expect("should peek through split BOM");
+            assert_eq!(byte, b'[');
+        }
+
+        /// Partial BOM prefix (only 0xEF) — not a real BOM
+        #[test]
+        fn test_auto_detect_partial_bom_single_byte() {
+            let input = vec![0xEF, b'['];
+            let mut reader = BufReader::with_capacity(1, Cursor::new(input));
+            let byte = peek_first_non_ws_byte(&mut reader).expect("should return 0xEF");
+            assert_eq!(byte, 0xEF);
         }
 
         /// Auto-detect: object
