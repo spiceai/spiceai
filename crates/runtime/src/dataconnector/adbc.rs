@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use adbc_core::LOAD_FLAG_DEFAULT;
 use adbc_core::options::{AdbcVersion, OptionDatabase};
+use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -180,7 +180,8 @@ impl DataConnectorFactory for AdbcFactory {
                     .new_database_with_opts(db_options)
                     .context(UnableToCreateDatabaseSnafu)?;
 
-                let pool = AdbcConnectionPoolBuilder::new(db, Some(conn_options))
+                let pool = AdbcConnectionPoolBuilder::new(db)
+                    .with_conn_options(conn_options)
                     .with_max_size(pool_size)
                     .with_min_idle(pool_min_idle)
                     .build()

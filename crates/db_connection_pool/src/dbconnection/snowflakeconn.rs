@@ -109,7 +109,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 })?;
 
         match res {
-            snowflake_api::QueryResult::Arrow(batches) => Ok(names_from_arrow_batches(batches)),
+            snowflake_api::QueryResult::Arrow(batches) => names_from_arrow_batches(batches),
             snowflake_api::QueryResult::Json(resp) => {
                 let tables: Vec<String> = resp
                     .value
@@ -137,7 +137,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 })?;
 
         match res {
-            snowflake_api::QueryResult::Arrow(batches) => Ok(names_from_arrow_batches(batches)),
+            snowflake_api::QueryResult::Arrow(batches) => names_from_arrow_batches(batches),
             snowflake_api::QueryResult::Json(resp) => {
                 let schemas: Vec<String> = resp
                     .value
@@ -245,18 +245,26 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionErr
     DataFusionError::Execution(format!("{}", e.into()))
 }
 
-fn names_from_arrow_batches(batches: Vec<RecordBatch>) -> Vec<String> {
+fn names_from_arrow_batches(batches: Vec<RecordBatch>) -> Result<Vec<String>, dbconnection::Error> {
     let mut names = Vec::new();
 
     for batch in batches {
-        if let Some(name_column) = batch.column_by_name("name")
-            && let Some(array) = name_column.as_any().downcast_ref::<StringArray>()
-        {
-            names.extend(array.iter().flatten().map(ToString::to_string));
-        }
+        let name_column =
+            batch
+                .column_by_name("name")
+                .ok_or_else(|| dbconnection::Error::UnableToGetTables {
+                    source: "Arrow response missing 'name' column".into(),
+                })?;
+        let array = name_column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| dbconnection::Error::UnableToGetTables {
+                source: "'name' column is not a StringArray".into(),
+            })?;
+        names.extend(array.iter().flatten().map(ToString::to_string));
     }
 
-    names
+    Ok(names)
 }
 
 /// Converts `Snowflake` specific types to standard Arrow types.

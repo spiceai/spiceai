@@ -21,7 +21,6 @@ use crate::{
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
-use runtime::Runtime;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 
