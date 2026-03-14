@@ -2297,7 +2297,7 @@ mod tests {
             assert_eq!(byte, b'[');
         }
 
-        /// BOM split across tiny buffers (BufReader with capacity=1)
+        /// BOM split across tiny buffers (`BufReader` with capacity=1)
         #[test]
         fn test_auto_detect_bom_split_buffers() {
             let mut input = vec![0xEF, 0xBB, 0xBF];
