@@ -78,7 +78,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_proto::bytes::Serializeable;
+
 use error::{find_datafusion_root, format_datafusion_error};
 use itertools::Itertools;
 use query::QueryBuilder;
@@ -877,13 +877,13 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns the partition column label for a table by querying the catalog provider.
+    /// Returns the partition expression for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
     /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    /// The returned string is parsed as a SQL expression against the table's schema.
     ///
-    /// Note: this returns the catalog metadata label (historically named as an expression API),
-    /// not a guaranteed round-trippable SQL expression.
+    /// Returns `Ok(None)` when the table has no partition expression defined.
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
@@ -897,7 +897,20 @@ impl DataFusion {
                 .boxed()
                 .map_err(DataFusionError::External)?
         {
-            return Expr::from_bytes_with_registry(expr_string.as_bytes(), self.ctx.as_ref())
+            let table_schema = self
+                .get_table(table_reference)
+                .await
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Table '{table_reference}' not found when resolving partition expression"
+                    ))
+                })?
+                .schema();
+            let df_schema = table_schema.as_ref().clone().to_dfschema()?;
+            return self
+                .ctx
+                .state()
+                .create_logical_expr(&expr_string, &df_schema)
                 .map(Some);
         };
         Ok(None)

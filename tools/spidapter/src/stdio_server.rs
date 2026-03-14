@@ -537,9 +537,32 @@ fn generate_adbc_create_table_statement(
         table_elements.push(format!("PRIMARY KEY ({primary_keys})"));
     }
 
-    let partition_clause = (!partition_columns.is_empty())
-        .then(|| format!(" PARTITION BY ({})", partition_columns.join(", ")))
-        .unwrap_or_default();
+    if !partition_columns.is_empty() {
+        let schema_columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<HashSet<_>>();
+
+        for partition_column in partition_columns {
+            if !schema_columns.contains(partition_column) {
+                return Err(anyhow::anyhow!(
+                    "Dataset '{dataset_name}' has partition column '{partition_column}' that is not present in the schema"
+                ));
+            }
+        }
+    }
+
+    let partition_clause = if partition_columns.is_empty() {
+        String::new()
+    } else {
+        let quoted = partition_columns
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" PARTITION BY ({quoted})")
+    };
 
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}){partition_clause}",

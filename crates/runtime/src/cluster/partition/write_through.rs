@@ -160,7 +160,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     path: &TableReference,
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
-    partition_by: &[Expr], // partition expressions as strings (e.g. "country", "date_trunc('day', timestamp)"
+    partition_by: &[Expr],
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_table_metadata(path).await {
@@ -391,19 +391,21 @@ async fn route_matched_and_collect_unmatched(
                 ),
             })?;
 
-        let filtered =
-            arrow::compute::filter_record_batch(batch, mask).context(FilterBatchSnafu)?;
+        // Only mark rows as matched and forward if this executor has an active sender.
+        // Otherwise rows would be marked matched but never forwarded, silently dropping data.
+        if let Some(tx) = senders.get(executor_id) {
+            let filtered =
+                arrow::compute::filter_record_batch(batch, mask).context(FilterBatchSnafu)?;
 
-        if filtered.num_rows() > 0 {
-            if let Some(tx) = senders.get(executor_id) {
+            if filtered.num_rows() > 0 {
                 tx.send(filtered).await.map_err(|_| Error::SendBatch {
                     executor_id: executor_id.clone(),
                 })?;
             }
-        }
 
-        // OR into the cumulative matched mask.
-        any_matched = arrow::compute::or(&any_matched, mask).context(FilterBatchSnafu)?;
+            // OR into the cumulative matched mask only when we actually forwarded.
+            any_matched = arrow::compute::or(&any_matched, mask).context(FilterBatchSnafu)?;
+        }
     }
 
     // Negate to get unmatched rows.
@@ -411,7 +413,7 @@ async fn route_matched_and_collect_unmatched(
     arrow::compute::filter_record_batch(batch, &unmatched_mask).context(FilterBatchSnafu)
 }
 
-/// Parses partition-by SQL expression strings into logical + physical expression pairs.
+/// Converts partition-by logical expressions into logical + physical expression pairs.
 fn build_partition_physical_exprs(
     partition_by: &[Expr],
     schema: &SchemaRef,
