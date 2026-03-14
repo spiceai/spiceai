@@ -33,21 +33,7 @@ use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
-    if provider
-        .as_any()
-        .downcast_ref::<CayenneCatalogProvider>()
-        .is_some()
-    {
-        return true;
-    }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>() {
-        return composed
-            .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>()
-            .is_some();
-    }
-    false
+    get_cayenne_provider(provider).is_some()
 }
 
 /// Extract the [`CayenneCatalogProvider`] reference from a `CatalogProvider`.

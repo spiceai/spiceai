@@ -40,6 +40,7 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
+    cluster::partition,
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
@@ -200,22 +201,42 @@ pub(crate) async fn handle(
         )));
     }
 
-    // Fast path: for scheduler -> executor Cayenne writes, forward raw FlightData
-    // directly to executor to avoid decode/re-encode overhead on scheduler.
-    if should_forward_raw_cayenne_write(&datafusion, &path).await {
-        use futures::stream;
-
-        let inbound = futures::StreamExt::chain(
-            stream::once(async move { Ok(first_message.clone()) }),
-            streaming_flight,
-        );
-        datafusion
-            .forward_flight_data_stream_to_executor(&path, inbound)
+    // Fast path: for scheduler -> executor Cayenne writes, split by partition
+    // and forward to each executor.
+    //
+    // Note: `get_table_partition_expr` currently resolves the partition label
+    // stored in Cayenne metadata (e.g. the column name) and parses it as a SQL
+    // expression. This works for column-based partitions but will fail for
+    // expression-based partitions (where the label is `expr0`). A follow-up
+    // should persist the original SQL expression in Cayenne metadata.
+    if let Some(executor_registry) = datafusion.executor_registry.as_ref()
+        && datafusion.should_forward_writes_to_executors(&path).await
+    {
+        let partition_expression = datafusion
+            .get_table_partition_expr(&path)
             .await
-            .map_err(|e| Status::internal(format!("Write operation failed: {e}")))?;
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to resolve partition expression for table `{path}`: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "In distributed mode, Cayenne tables must have partition expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
+                ))
+            })?;
 
-        let output = futures::stream::iter(vec![Ok(PutResult::default())]);
-        return Ok(Response::new(Box::pin(output)));
+        return partition::write_through::forward_federated_partitioned_write(
+            executor_registry,
+            Arc::clone(&datafusion.ctx),
+            datafusion.io_runtime.clone(),
+            &path,
+            first_message,
+            streaming_flight,
+            &[partition_expression],
+        )
+        .await
+        .map_err(Into::into);
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
@@ -251,33 +272,6 @@ pub(crate) async fn handle(
 fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
     datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
         && datafusion.cluster_config.tls_config().is_some()
-}
-
-async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableReference) -> bool {
-    if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
-        return false;
-    }
-
-    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
-        return false;
-    };
-
-    let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
-        return false;
-    };
-    if clients.is_empty() {
-        return false;
-    }
-    drop(clients);
-
-    let Some(table_provider) = datafusion.get_table(path).await else {
-        return false;
-    };
-
-    table_provider
-        .as_any()
-        .downcast_ref::<cayenne::CayenneTableProvider>()
-        .is_some()
 }
 
 fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {

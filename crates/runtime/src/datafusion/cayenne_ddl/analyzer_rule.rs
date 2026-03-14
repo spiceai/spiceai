@@ -32,6 +32,7 @@ use datafusion::logical_expr::DdlStatement;
 use datafusion::logical_expr::{Extension, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::prelude::Expr;
+
 use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
