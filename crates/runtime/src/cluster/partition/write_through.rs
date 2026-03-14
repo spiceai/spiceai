@@ -389,7 +389,7 @@ async fn route_matched_and_collect_unmatched(
             .context(FilterEvalSnafu {
                 executor_id: executor_id.clone(),
             })?;
-        let mask = arr
+        let raw_mask = arr
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
             .ok_or_else(|| Error::FilterEval {
@@ -399,11 +399,15 @@ async fn route_matched_and_collect_unmatched(
                 ),
             })?;
 
+        // Coalesce NULLs to false so that rows where the partition predicate evaluates
+        // to NULL (e.g. NULL partition column) are treated as unmatched rather than dropped.
+        let mask = arrow::compute::prep_null_mask_filter(raw_mask);
+
         // Only mark rows as matched and forward if this executor has an active sender.
         // Otherwise rows would be marked matched but never forwarded, silently dropping data.
         if let Some(tx) = senders.get(executor_id) {
             let filtered =
-                arrow::compute::filter_record_batch(batch, mask).context(FilterBatchSnafu)?;
+                arrow::compute::filter_record_batch(batch, &mask).context(FilterBatchSnafu)?;
 
             if filtered.num_rows() > 0 {
                 tx.send(filtered).await.map_err(|_| Error::SendBatch {
@@ -412,7 +416,7 @@ async fn route_matched_and_collect_unmatched(
             }
 
             // OR into the cumulative matched mask only when we actually forwarded.
-            any_matched = arrow::compute::or(&any_matched, mask).context(FilterBatchSnafu)?;
+            any_matched = arrow::compute::or(&any_matched, &mask).context(FilterBatchSnafu)?;
         }
     }
 

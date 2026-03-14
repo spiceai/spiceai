@@ -901,8 +901,7 @@ impl DataFusion {
             && let Some(expr_string) = aware
                 .table_partition_expr(schema_name, table_reference.table())
                 .await
-                .boxed()
-                .map_err(DataFusionError::External)?
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
             let table_schema = self
                 .get_table(table_reference)
@@ -1204,16 +1203,28 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
-    /// meaning the write should be forwarded to an executor.
+    /// Returns `true` if this is a scheduler node, the table is a Cayenne table,
+    /// and at least one executor is connected to receive forwarded writes.
     pub(crate) async fn should_forward_writes_to_executors(
         &self,
         table_reference: &TableReference,
     ) -> bool {
-        matches!(
+        if !matches!(
             self.cluster_config.effective_role(),
             Some(ClusterRole::Scheduler)
-        ) && self.get_table(table_reference).await.is_some_and(|t| {
+        ) {
+            return false;
+        }
+
+        let has_executors = match self.executor_registry.as_ref() {
+            Some(reg) => !reg.flight_sql_clients.read().await.is_empty(),
+            None => false,
+        };
+        if !has_executors {
+            return false;
+        }
+
+        self.get_table(table_reference).await.is_some_and(|t| {
             t.as_any()
                 .downcast_ref::<cayenne::CayenneTableProvider>()
                 .is_some()
