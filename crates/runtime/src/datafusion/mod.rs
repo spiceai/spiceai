@@ -919,7 +919,7 @@ impl DataFusion {
                 .state()
                 .create_logical_expr(&expr_string, &df_schema)
                 .map(Some);
-        };
+        }
         Ok(None)
     }
 

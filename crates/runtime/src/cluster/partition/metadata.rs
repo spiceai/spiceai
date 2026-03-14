@@ -146,7 +146,7 @@ impl TablePartitionMetadata {
     /// Returns a mapping of executor IDs to the partition expressions they contain.
     pub fn all_executor_partitions(
         &self,
-        ctx: Arc<SessionContext>,
+        ctx: &Arc<SessionContext>,
     ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
         let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
         for PartitionMetadata {

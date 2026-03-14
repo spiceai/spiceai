@@ -332,18 +332,15 @@ impl PartitionManager {
                 .iter_mut()
                 .find(|p| p.partition_value == *partition_value);
 
-            match partition {
-                Some(p) => {
-                    if p.is_assigned_to(executor_id) {
-                        return Ok(());
-                    }
-                    p.assign_to(executor_id.to_string(), now_ms);
+            if let Some(p) = partition {
+                if p.is_assigned_to(executor_id) {
+                    return Ok(());
                 }
-                None => {
-                    let mut new_partition = PartitionMetadata::new(partition_value.clone());
-                    new_partition.assign_to(executor_id.to_string(), now_ms);
-                    metadata.add_partition(new_partition);
-                }
+                p.assign_to(executor_id.to_string(), now_ms);
+            } else {
+                let mut new_partition = PartitionMetadata::new(partition_value.clone());
+                new_partition.assign_to(executor_id.to_string(), now_ms);
+                metadata.add_partition(new_partition);
             }
 
             metadata.updated_at = now_ms;

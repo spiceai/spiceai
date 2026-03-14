@@ -195,7 +195,7 @@ pub(crate) async fn forward_federated_partitioned_write(
         }
     };
     let partitions_by_executor = table_partitions
-        .all_executor_partitions(Arc::clone(&ctx))
+        .all_executor_partitions(&ctx)
         .context(ResolvePartitionsSnafu)?;
 
     let schema = Arc::new(
@@ -433,7 +433,7 @@ fn build_partition_physical_exprs(
         .iter()
         .map(|e| {
             let physical = datafusion::physical_expr::create_physical_expr(
-                &e,
+                e,
                 &df_schema,
                 &ExecutionProps::new(),
             )
