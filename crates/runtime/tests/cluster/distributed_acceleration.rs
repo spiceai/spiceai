@@ -216,13 +216,11 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
         .await
 }
 
-/// Test that 2 executors with `bucket(4, id)` partitioning correctly split data and
-/// that the scheduler generates a plan across both.
+/// Test that 2 executors with `bucket(4, id)` partitioning produce correct query results.
 ///
 /// Verifies:
-/// - 4 buckets are distributed across 2 executors (2 buckets each)
 /// - Full SELECT returns all 10 rows without duplicates
-/// - COUNT/AVG aggregations produce correct cross-executor results
+/// - COUNT/AVG aggregations produce correct results
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Error> {
@@ -672,32 +670,36 @@ async fn wait_for_row_count(
     timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     let start = std::time::Instant::now();
+    let mut last_count: Option<usize> = None;
     loop {
-        if let Ok(batches) = harness
+        match harness
             .query(&format!("SELECT COUNT(*) AS cnt FROM {table}"))
             .await
         {
-            let total: usize = batches
-                .iter()
-                .map(arrow::array::RecordBatch::num_rows)
-                .sum();
-            if total > 0 {
-                let arr = batches[0]
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>();
-                if let Some(arr) = arr {
-                    #[allow(clippy::cast_sign_loss)]
-                    let count = arr.value(0) as usize;
-                    if count == expected {
-                        return Ok(());
+            Ok(batches) => {
+                for batch in &batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if let Some(arr) = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                    {
+                        #[allow(clippy::cast_sign_loss)]
+                        let count = arr.value(0) as usize;
+                        last_count = Some(count);
+                        if count == expected {
+                            return Ok(());
+                        }
                     }
                 }
             }
+            Err(_) => {}
         }
         if start.elapsed() > timeout {
             return Err(anyhow::anyhow!(
-                "Timed out waiting for {table} to have {expected} rows"
+                "Timed out waiting for {table} to have {expected} rows (last count: {last_count:?})"
             ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
