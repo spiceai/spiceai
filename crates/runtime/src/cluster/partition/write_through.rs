@@ -163,9 +163,9 @@ pub(crate) async fn forward_federated_partitioned_write(
     partition_by: &[Expr], // partition expressions as strings (e.g. "country", "date_trunc('day', timestamp)"
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let partition_manager = executor_registry.federated_partition_manager();
-    let table_partitions = match partition_manager.get_cached_table_metadata(path) {
-        Some(metadata) => metadata,
-        None => {
+    let table_partitions = match partition_manager.get_table_metadata(path).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
             partition_manager
                 .initialize_blank_metadata(path)
                 .await
@@ -178,6 +178,12 @@ pub(crate) async fn forward_federated_partitioned_write(
                 .ok_or_else(|| Error::FindMetadata {
                     table: path.to_string(),
                 })?
+        }
+        Err(source) => {
+            return Err(Error::CreateMetadata {
+                table: path.to_string(),
+                source: Box::new(source),
+            });
         }
     };
     let partitions_by_executor = table_partitions
