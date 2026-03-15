@@ -27,8 +27,11 @@ use std::sync::{Arc, RwLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
+
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Dataset-level options extracted from `CREATE TABLE ... WITH ("dataset.*")` clauses.
 #[derive(Debug, Clone, Default)]
@@ -60,18 +63,25 @@ pub struct CreateTableStatementExtension {
 /// retrieves (and removes) the extensions when rewriting the DDL plan.
 #[derive(Debug, Clone, Default)]
 pub struct DdlExtensionStore {
-    extensions: HashMap<String, CreateTableStatementExtension>,
+    pub extensions: HashMap<ResolvedTableReference, CreateTableStatementExtension>,
 }
 
 impl DdlExtensionStore {
     /// Insert DDL extensions for a table.
-    pub fn insert(&mut self, table_name: String, extension: CreateTableStatementExtension) {
-        self.extensions.insert(table_name, extension);
+    pub fn insert(&mut self, table_name: TableReference, extension: CreateTableStatementExtension) {
+        self.extensions.insert(
+            table_name.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+            extension,
+        );
     }
 
     /// Remove and return DDL extensions for a table (consume on use).
-    pub fn remove(&mut self, table_name: &str) -> Option<CreateTableStatementExtension> {
-        self.extensions.remove(table_name)
+    pub fn remove(&mut self, table_name: &TableReference) -> Option<CreateTableStatementExtension> {
+        self.extensions.remove(
+            &table_name
+                .clone()
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+        )
     }
 }
 
@@ -371,12 +381,20 @@ mod tests {
     fn test_store_insert_and_remove() {
         let mut store = DdlExtensionStore::default();
         store.insert(
-            "my_table".to_string(),
+            TableReference::parse_str("my_table"),
             CreateTableStatementExtension::default(),
         );
 
-        assert!(store.remove("my_table").is_some());
-        assert!(store.remove("my_table").is_none()); // consumed
+        assert!(
+            store
+                .remove(&TableReference::parse_str("my_table"))
+                .is_some()
+        );
+        assert!(
+            store
+                .remove(&TableReference::parse_str("my_table"))
+                .is_none()
+        ); // consumed
     }
 
     #[test]

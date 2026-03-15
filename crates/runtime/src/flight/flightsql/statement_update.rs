@@ -24,6 +24,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{CommandStatementUpdate, DoPutUpdateResult, ProstMessageExt},
 };
+
 use prost::Message;
 use tonic::{Response, Status};
 
@@ -81,8 +82,8 @@ pub(crate) async fn do_put(
 
     // Parse and validate
     let session = datafusion.ctx.state();
-    let plan = session
-        .create_logical_plan(sql)
+    let plan = datafusion
+        .get_or_create_logical_plan(&session, None, sql)
         .await
         .map_err(|e| Status::internal(format!("Failed to create logical plan: {e}")))?;
 

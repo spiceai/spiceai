@@ -114,8 +114,8 @@ pub(crate) async fn do_get(
     // Execute the update statement
     // For UPDATE/INSERT/DELETE statements, we need to execute the full logical plan
     let session = datafusion.ctx.state();
-    let plan = session
-        .create_logical_plan(&sql)
+    let plan = datafusion
+        .get_or_create_logical_plan(&session, None, &sql)
         .await
         .map_err(|e| Status::internal(format!("Failed to create logical plan: {e}")))?;
 

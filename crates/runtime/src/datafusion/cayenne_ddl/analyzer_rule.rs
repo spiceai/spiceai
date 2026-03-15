@@ -32,7 +32,8 @@ use datafusion::logical_expr::DdlStatement;
 use datafusion::logical_expr::{Extension, LogicalPlan, Operator};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::prelude::Expr;
-use datafusion_expr::{CreateExternalTable, CreateMemoryTable};
+
+use datafusion::sql::TableReference;
 use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
@@ -137,16 +138,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
         match &plan {
-            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
-                name,
-                input,
-                constraints,
-                if_not_exists,
-                or_replace,
-                table_partition_cols: vec![],
-                ..
-            })) => {
-                tracing::warn!("Intercepted CREATE MEMORY TABLE for '{create:?}'");
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(create)) => {
                 let catalog_name = create
                     .name
                     .catalog()
@@ -180,7 +172,8 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                             "Failed to acquire DDL extension store lock: {e}"
                         ))
                     })?;
-                    let ext = store.remove(&extension_key);
+                    let ext = store.remove(&TableReference::parse_str(&extension_key));
+
                     if let Some(ext) = ext {
                         if let Some(partition_by_expr) = ext.partition_by {
                             let partition_expr_sql = partition_by_expr.to_string();

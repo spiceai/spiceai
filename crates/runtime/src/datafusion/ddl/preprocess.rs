@@ -42,6 +42,7 @@ limitations under the License.
 //! ```
 
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{CreateTableOptions, SqlOption, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -61,7 +62,7 @@ pub enum PreprocessResult {
         /// The rewritten SQL string without the extracted clauses.
         sql: String,
         /// The store key used for the inserted extensions.
-        store_key: String,
+        store_key: TableReference,
     },
 }
 
@@ -75,7 +76,7 @@ pub enum PreprocessResult {
 /// Returns an error if the store lock cannot be acquired.
 pub fn cleanup_preprocessed_ddl_options(
     store: &SharedDdlExtensionStore,
-    store_key: &str,
+    store_key: &TableReference,
 ) -> DFResult<()> {
     let mut guard = store.write().map_err(|e| {
         DataFusionError::Execution(format!("Failed to acquire DDL extension store lock: {e}"))
@@ -189,14 +190,14 @@ pub fn preprocess_create_table_with_options(
 
     // Extract the table name for the store key
     let table_name = create_table.name.to_string();
-    let store_key = table_name.clone();
+    let store_key = TableReference::parse_str(&table_name);
 
     // Store the DDL extensions
     {
         let mut guard = ddl_store.write().map_err(|e| {
             DataFusionError::Execution(format!("Failed to acquire DDL extension store lock: {e}"))
         })?;
-        guard.insert(table_name, extension);
+        guard.insert(store_key.clone(), extension);
     }
 
     // Reconstruct the CREATE TABLE without the extracted clauses
@@ -335,7 +336,7 @@ mod tests {
                     "Modified SQL should not contain acceleration options: {modified_sql}"
                 );
                 assert!(modified_sql.to_uppercase().contains("CREATE TABLE"));
-                assert_eq!(store_key, "foo");
+                assert_eq!(store_key.to_string(), "foo");
             }
             PreprocessResult::Unchanged => panic!("Expected Modified result"),
         }
@@ -343,7 +344,7 @@ mod tests {
         let ddl_ext = store
             .write()
             .expect("store lock should be available")
-            .remove("foo")
+            .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         let accel = ddl_ext.acceleration.expect("acceleration should be Some");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
@@ -367,7 +368,7 @@ mod tests {
                     !modified_sql.contains("dataset."),
                     "Modified SQL should not contain dataset options: {modified_sql}"
                 );
-                assert_eq!(store_key, "foo");
+                assert_eq!(store_key.to_string(), "foo");
             }
             PreprocessResult::Unchanged => panic!("Expected Modified result"),
         }
@@ -375,7 +376,7 @@ mod tests {
         let ddl_ext = store
             .write()
             .expect("store lock should be available")
-            .remove("foo")
+            .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         assert!(ddl_ext.acceleration.is_none());
         assert_eq!(ddl_ext.dataset.time_column.as_deref(), Some("ts"));
@@ -397,7 +398,7 @@ mod tests {
         let ddl_ext = store
             .write()
             .expect("store lock should be available")
-            .remove("foo")
+            .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         let accel = ddl_ext.acceleration.expect("acceleration should be Some");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
@@ -457,7 +458,7 @@ mod tests {
                     !modified_sql.to_uppercase().contains("PARTITION BY"),
                     "Modified SQL should not contain PARTITION BY: {modified_sql}"
                 );
-                assert_eq!(store_key, "foo");
+                assert_eq!(store_key.to_string(), "foo");
             }
             PreprocessResult::Unchanged => panic!("Expected Modified result"),
         }
@@ -465,7 +466,7 @@ mod tests {
         let ddl_ext = store
             .write()
             .expect("store lock should be available")
-            .remove("foo")
+            .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         assert!(ddl_ext.acceleration.is_none());
         assert!(ddl_ext.partition_by.is_some());
@@ -491,7 +492,7 @@ mod tests {
                     !modified_sql.to_uppercase().contains("PARTITION BY"),
                     "Modified SQL should not contain PARTITION BY: {modified_sql}"
                 );
-                assert_eq!(store_key, "foo");
+                assert_eq!(store_key.to_string(), "foo");
             }
             PreprocessResult::Unchanged => panic!("Expected Modified result"),
         }
@@ -499,7 +500,7 @@ mod tests {
         let ddl_ext = store
             .write()
             .expect("store lock should be available")
-            .remove("foo")
+            .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         assert!(ddl_ext.acceleration.is_some());
         assert!(ddl_ext.partition_by.is_some());

@@ -207,7 +207,10 @@ pub(crate) async fn handle(
         && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|_| Status::internal(format!(
             "in distributed mode, Cayenne tables must have 'partition_by' expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
         )))?
-        && datafusion.should_forward_writes_to_executors(&path).await
+        && matches!(
+            datafusion.cluster_config.effective_role(),
+            Some(ClusterRole::Scheduler)
+        )
     {
 
         return partition::write_through::forward_federated_partitioned_write(

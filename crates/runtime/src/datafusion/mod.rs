@@ -28,7 +28,6 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
-use crate::config::ClusterRole;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
@@ -897,10 +896,27 @@ impl DataFusion {
                 .boxed()
                 .map_err(DataFusionError::External)?
         {
-            return Expr::from_bytes_with_registry(expr_string.as_bytes(), self.ctx.as_ref())
-                .map(Some);
+            return self.sql_expr(table_reference, &expr_string).await.map(Some);
         };
         Ok(None)
+    }
+
+    /// Parses a SQL expression string into a DataFusion `Expr`, using the schema of the given table reference for resolution.
+    pub async fn sql_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        let df_schema = self
+            .get_table(tbl)
+            .await
+            .ok_or(DataFusionError::Plan(format!(
+                "Table not found for SQL expression: {tbl}"
+            )))?
+            .schema()
+            .try_into()?;
+
+        self.ctx.parse_sql_expr(expr, &df_schema)
     }
 
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
@@ -1186,19 +1202,18 @@ impl DataFusion {
 
     /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
     /// meaning the write should be forwarded to an executor.
-    pub(crate) async fn should_forward_writes_to_executors(
-        &self,
-        table_reference: &TableReference,
-    ) -> bool {
-        matches!(
-            self.cluster_config.effective_role(),
-            Some(ClusterRole::Scheduler)
-        ) && self.get_table(table_reference).await.is_some_and(|t| {
-            t.as_any()
-                .downcast_ref::<cayenne::CayenneTableProvider>()
-                .is_some()
-        })
-    }
+    // pub(crate) async fn should_forward_writes_to_executors(
+    //     &self,
+    //     table_reference: &TableReference,
+    // ) -> bool {
+    //     matches!(
+    //         self.cluster_config.effective_role(),
+    //         Some(ClusterRole::Scheduler)
+    //     ) && self
+    //         .get_table(table_reference)
+    //         .await
+    //         .is_some_and(|t| is_cayenne_table(t.as_ref()))
+    // }
 
     pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
         let table_reference = dataset.into();
@@ -2321,20 +2336,25 @@ impl DataFusion {
     }
 
     /// Create or get a logical plan from the query
-    async fn get_or_create_logical_plan(
+    pub(crate) async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
-        key: &RawCacheKey,
+        cache_key_opt: Option<&RawCacheKey>,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let plans_cache = self.plans_cache_provider();
+        let plans_cache = if let Some(cache_key) = cache_key_opt {
+            let plans_cache = self.plans_cache_provider();
 
-        if let Some(cache) = plans_cache.as_ref()
-            && let Some(plan) = cache.get_raw_key(&key.as_u64()).await
-        {
-            tracing::trace!("using cached plan for {sql}");
-            return Ok(plan);
-        }
+            if let Some(cache) = plans_cache.as_ref()
+                && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
+            {
+                tracing::trace!("using cached plan for {sql}");
+                return Ok(plan);
+            }
+            plans_cache
+        } else {
+            None
+        };
 
         // Pre-process CREATE TABLE statements to extract DDL extensions
         // (WITH options, PARTITION BY) before planning.
@@ -2344,9 +2364,12 @@ impl DataFusion {
             ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,
                 store_key,
-            } => (modified.as_str(), Some(store_key.as_str())),
+            } => (modified.as_str(), Some(store_key)),
             ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
+        tracing::warn!(
+            "Preprocessed SQL: {sql}. (effective_sql={effective_sql}, store_key={store_key:?})"
+        );
 
         let plan = match session.create_logical_plan(effective_sql).await {
             Ok(plan) => plan,
@@ -2361,9 +2384,11 @@ impl DataFusion {
             }
         };
 
-        if let Some(cache) = plans_cache {
+        if let Some(cache) = plans_cache
+            && let Some(cache_key) = cache_key_opt
+        {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
         }
 
         Ok(plan)
@@ -2713,7 +2738,7 @@ mod tests {
 
         let session = df.ctx.state();
 
-        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
             .await
             .expect("logical plan");
 
@@ -2726,7 +2751,7 @@ mod tests {
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
-        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
             .await
             .expect("logical plan");
 

@@ -211,6 +211,9 @@ impl PartitionTableProvider {
             .flat_map(|p| p.expression.column_refs())
             .collect()
     }
+    pub fn creator(&self) -> &Arc<dyn PartitionCreator> {
+        &self.creator
+    }
 }
 
 #[async_trait]

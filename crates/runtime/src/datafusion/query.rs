@@ -954,7 +954,7 @@ impl Query {
                     super::ddl::preprocess::PreprocessResult::Modified {
                         sql: modified,
                         store_key,
-                    } => (modified.as_str(), Some(store_key.as_str())),
+                    } => (modified.as_str(), Some(store_key.clone())),
                     super::ddl::preprocess::PreprocessResult::Unchanged => (sql.as_ref(), None),
                 };
 
@@ -965,7 +965,7 @@ impl Query {
                             && let Err(cleanup_err) =
                                 super::ddl::preprocess::cleanup_preprocessed_ddl_options(
                                     self.df.ddl_extension_store(),
-                                    store_key,
+                                    &store_key,
                                 )
                         {
                             let cleanup_err = find_datafusion_root(cleanup_err);

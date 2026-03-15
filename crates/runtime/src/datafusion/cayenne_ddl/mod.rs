@@ -25,11 +25,16 @@ pub mod logical_nodes;
 pub mod physical_plans;
 pub mod planner;
 
-use datafusion::catalog::CatalogProvider;
+use ::data_components::delete::DeletionTableProviderAdapter;
+use cayenne::CayenneTableProvider;
+use datafusion::catalog::{CatalogProvider, TableProvider};
+use runtime_table_partition::provider::PartitionTableProvider;
+use vortex::session::SessionVar;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use crate::catalogconnector::{PartitionAwareCatalog, RefreshingCatalogProvider};
+use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
@@ -69,16 +74,30 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
 /// [`ComposedCatalogProvider`] wrappers whose external provider is a
 /// [`CayenneCatalogProvider`].
 pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
-    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
-        return Some(cayenne);
-    }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>()
-        && let Some(cayenne) = composed
-            .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>()
+    let cayenne_catalog = get_cayenne_provider(provider)?;
+    Some(cayenne_catalog as &dyn PartitionAwareCatalog)
+}
+
+#[expect(dead_code)]
+pub fn is_cayenne_table(provider: &dyn TableProvider) -> bool {
+    if provider.as_any().is::<CayenneTableProvider>() {
+        return true;
+    };
+    if let Some(deletion_adapter) = provider
+        .as_any()
+        .downcast_ref::<DeletionTableProviderAdapter>()
     {
-        return Some(cayenne);
+        let source = deletion_adapter.source();
+        return is_cayenne_table(source.as_ref());
     }
-    None
+    let Some(partition_table_provider) = provider.as_any().downcast_ref::<PartitionTableProvider>()
+    else {
+        return false;
+    };
+    // This isn't working.
+    partition_table_provider
+        .creator()
+        .as_any()
+        .downcast_ref::<CayennePartitionCreator>()
+        .is_some()
 }
