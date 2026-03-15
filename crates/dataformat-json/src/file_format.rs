@@ -20,14 +20,14 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::source::SpiceJsonSource;
 use crate::{
-    ArrayToNdjson, ArrayToNdjsonPush, ReadResult, extract_flattened_from_nested,
-    unnest_struct_schema,
+    ArrayToNdjson, ArrayToNdjsonPush, JsonPointerReader, ReadResult, SodaReader,
+    extract_flattened_from_nested, peek_first_non_ws_byte, unnest_struct_schema,
 };
 
 use arrow::array::RecordBatch;
@@ -70,17 +70,22 @@ pub struct SpiceJsonOptions {
     pub format: Format,
     /// If set, flatten nested structs with the given separator
     pub flatten_json: Option<String>,
+    /// If set, extract data at the specified [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)
+    /// path within a JSON object.
+    /// E.g. `"/data"` for `{"data": [...]}` or `"/response/items"` for nested objects.
+    /// A leading `/` is added automatically if missing.
+    pub json_pointer: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
 pub enum FormatParseError {
     #[snafu(display(
-        "Invalid JSON format '{s}'. Valid formats are: 'jsonl', 'ndjson', 'ldjson', 'array'",
+        "Invalid JSON format '{s}'. Valid formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'",
     ))]
     InvalidFormat { s: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     /// Line-delimited JSON format (JSONL/NDJSON/LDJSON).
     /// Each line contains a valid JSON value separated by newlines.
@@ -88,6 +93,17 @@ pub enum Format {
     Jsonl,
     /// JSON array format where the entire file is a single JSON array.
     Array,
+    /// Single JSON object format. The file contains exactly one JSON object
+    /// (e.g. `{"name": "Alice", "age": 30}`) which produces a single row.
+    Object,
+    /// Auto-detect format by peeking at the first non-whitespace byte.
+    /// `[` → Array, `{` → Object, otherwise → Jsonl.
+    Auto,
+    /// SODA (Socrata Open Data API) format.
+    /// The response is a JSON object with `meta.view.columns` for schema
+    /// and `data` for the row data (array of arrays).
+    /// Schema is derived from `meta.view.columns` instead of row-based inference.
+    Soda,
 }
 
 impl FromStr for Format {
@@ -99,6 +115,9 @@ impl FromStr for Format {
             // are all essentially the same format - one JSON value per line.
             "jsonl" | "ndjson" | "ldjson" => Ok(Format::Jsonl),
             "array" => Ok(Format::Array),
+            "object" => Ok(Format::Object),
+            "json" | "auto" => Ok(Format::Auto),
+            "soda" | "socrata" => Ok(Format::Soda),
             _ => InvalidFormatSnafu { s: s.to_string() }.fail(),
         }
     }
@@ -111,6 +130,7 @@ impl Default for SpiceJsonOptions {
             schema_infer_max_rec: None,
             format: Format::Jsonl,
             flatten_json: None,
+            json_pointer: None,
         }
     }
 }
@@ -167,6 +187,17 @@ impl SpiceJsonFormat {
         self.options.flatten_json = Some(flatten_json_separator);
         self
     }
+
+    /// Set the `json_pointer` option for extracting data from a specific path in a JSON object.
+    #[must_use]
+    pub fn with_json_pointer(mut self, json_pointer: String) -> Self {
+        self.options.json_pointer = if json_pointer.is_empty() {
+            None
+        } else {
+            Some(json_pointer)
+        };
+        self
+    }
 }
 
 #[async_trait]
@@ -217,41 +248,113 @@ impl FileFormat for SpiceJsonFormat {
             let schema = match r.payload {
                 GetResultPayload::File(file, _) => {
                     let decoder = file_compression_type.convert_read(file)?;
-                    let mut reader = BufReader::new(decoder);
 
-                    let schema = if matches!(self.options.format, Format::Array) {
-                        let mut adapter = ArrayToNdjson::try_new(reader)?;
-                        let iter = ValueIter::new(&mut adapter, None);
-                        infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
+                    if self.options.format == Format::Soda {
+                        // Apply json_pointer before SODA if both are configured
+                        let decoder: Box<dyn std::io::Read + Send> =
+                            if let Some(path) = &self.options.json_pointer {
+                                Box::new(JsonPointerReader::new(decoder, path)?)
+                            } else {
+                                decoder
+                            };
+                        let soda = SodaReader::new(decoder)?;
+                        let schema = soda.schema().clone();
+                        if let Some(separator) = &self.options.flatten_json {
+                            unnest_struct_schema(&schema, separator)
+                        } else {
+                            schema
+                        }
                     } else {
-                        let iter = ValueIter::new(&mut reader, None);
-                        infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                    };
+                        let reader: Box<dyn std::io::Read + Send> =
+                            if let Some(path) = &self.options.json_pointer {
+                                Box::new(JsonPointerReader::new(decoder, path)?)
+                            } else {
+                                decoder
+                            };
+                        let mut reader = BufReader::new(reader);
 
-                    if let Some(separator) = &self.options.flatten_json {
-                        unnest_struct_schema(&schema, separator)
-                    } else {
-                        schema
+                        let is_array = match self.options.format {
+                            Format::Array => true,
+                            Format::Jsonl | Format::Object => false,
+                            Format::Soda => unreachable!("handled above"),
+                            Format::Auto => {
+                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
+                            }
+                        };
+
+                        let schema = if is_array {
+                            let mut adapter = ArrayToNdjson::try_new(reader)?;
+                            let iter = ValueIter::new(&mut adapter, None);
+                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
+                        } else {
+                            let iter = ValueIter::new(&mut reader, None);
+                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
+                        };
+
+                        if let Some(separator) = &self.options.flatten_json {
+                            unnest_struct_schema(&schema, separator)
+                        } else {
+                            schema
+                        }
                     }
                 }
                 GetResultPayload::Stream(_) => {
                     let data = r.bytes().await?;
-                    let decoder = file_compression_type.convert_read(data.reader())?;
-                    let mut reader = BufReader::new(decoder);
+                    let mut decoder = file_compression_type.convert_read(data.reader())?;
+                    // Read decompressed bytes once; reuse via from_vec to avoid
+                    // an extra copy through SodaReader::new / JsonPointerReader::new.
+                    let mut buf = Vec::new();
+                    decoder.read_to_end(&mut buf)?;
 
-                    let schema = if matches!(self.options.format, Format::Array) {
-                        let mut adapter = ArrayToNdjson::try_new(reader)?;
-                        let iter = ValueIter::new(&mut adapter, None);
-                        infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
+                    if self.options.format == Format::Soda {
+                        // Apply json_pointer before SODA if both are configured
+                        let buf = if let Some(path) = &self.options.json_pointer {
+                            let extracted = JsonPointerReader::from_vec(&buf, path)?;
+                            let mut out = Vec::new();
+                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
+                            out
+                        } else {
+                            buf
+                        };
+                        let soda = SodaReader::from_vec(&buf)?;
+                        let schema = soda.schema().clone();
+                        if let Some(separator) = &self.options.flatten_json {
+                            unnest_struct_schema(&schema, separator)
+                        } else {
+                            schema
+                        }
                     } else {
-                        let iter = ValueIter::new(&mut reader, None);
-                        infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                    };
+                        let reader: Box<dyn std::io::Read + Send> =
+                            if let Some(path) = &self.options.json_pointer {
+                                Box::new(JsonPointerReader::from_vec(&buf, path)?)
+                            } else {
+                                Box::new(std::io::Cursor::new(buf))
+                            };
+                        let mut reader = BufReader::new(reader);
 
-                    if let Some(separator) = &self.options.flatten_json {
-                        unnest_struct_schema(&schema, separator)
-                    } else {
-                        schema
+                        let is_array = match self.options.format {
+                            Format::Array => true,
+                            Format::Jsonl | Format::Object => false,
+                            Format::Soda => unreachable!("handled above"),
+                            Format::Auto => {
+                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
+                            }
+                        };
+
+                        let schema = if is_array {
+                            let mut adapter = ArrayToNdjson::try_new(reader)?;
+                            let iter = ValueIter::new(&mut adapter, None);
+                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
+                        } else {
+                            let iter = ValueIter::new(&mut reader, None);
+                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
+                        };
+
+                        if let Some(separator) = &self.options.flatten_json {
+                            unnest_struct_schema(&schema, separator)
+                        } else {
+                            schema
+                        }
                     }
                 }
             };
@@ -284,16 +387,22 @@ impl FileFormat for SpiceJsonFormat {
         let table_schema = conf.file_source().table_schema().clone();
         let source = Arc::new(
             SpiceJsonSource::new(table_schema)
-                .with_array_to_ndjson(matches!(self.options.format, Format::Array))
+                .with_format(self.options.format)
+                .with_json_pointer(self.options.json_pointer.clone())
                 .with_unnest_struct(self.options.flatten_json.clone()),
         );
 
-        if matches!(self.options.format, Format::Array) {
+        let needs_non_repartitioned = matches!(
+            self.options.format,
+            Format::Array | Format::Object | Format::Auto | Format::Soda
+        ) || self.options.json_pointer.is_some();
+
+        if needs_non_repartitioned {
             tracing::debug!(
-                "Creating non-repartitioned DataSource for JSON arrays for url: {}",
+                "Creating non-repartitioned DataSource for JSON for url: {}",
                 conf.object_store_url
             );
-            // Use NonRepartitionedFileScanConfig to prevent repartitioning for JSON array files,
+            // Use NonRepartitionedFileScanConfig to prevent repartitioning for JSON array/auto/json_pointer files,
             // as splitting would break parsing due to incomplete JSON fragments.
             // In order to still allow parallel read for individual files, we wrap them into separate files groups
             let individual_file_groups: Vec<_> = conf
@@ -338,7 +447,8 @@ impl FileFormat for SpiceJsonFormat {
     fn file_source(&self, table_schema: datafusion_datasource::TableSchema) -> Arc<dyn FileSource> {
         Arc::new(
             SpiceJsonSource::new(table_schema.clone())
-                .with_array_to_ndjson(matches!(self.options.format, Format::Array))
+                .with_format(self.options.format)
+                .with_json_pointer(self.options.json_pointer.clone())
                 .with_unnest_struct(self.options.flatten_json.clone())
                 .with_table_schema(table_schema),
         )
@@ -524,10 +634,44 @@ mod tests {
     }
 
     #[test]
+    fn test_format_parse_auto() {
+        assert!(matches!("auto".parse::<Format>(), Ok(Format::Auto)));
+        assert!(matches!("AUTO".parse::<Format>(), Ok(Format::Auto)));
+        assert!(matches!("Auto".parse::<Format>(), Ok(Format::Auto)));
+    }
+
+    #[test]
+    fn test_format_parse_object() {
+        assert!(matches!("object".parse::<Format>(), Ok(Format::Object)));
+        assert!(matches!("OBJECT".parse::<Format>(), Ok(Format::Object)));
+        assert!(matches!("Object".parse::<Format>(), Ok(Format::Object)));
+    }
+
+    #[test]
+    fn test_format_parse_json() {
+        // "json" maps to Auto (auto-detect sub-format)
+        assert!(matches!("json".parse::<Format>(), Ok(Format::Auto)));
+        assert!(matches!("JSON".parse::<Format>(), Ok(Format::Auto)));
+        assert!(matches!("Json".parse::<Format>(), Ok(Format::Auto)));
+    }
+
+    #[test]
+    fn test_format_parse_soda() {
+        assert!(matches!("soda".parse::<Format>(), Ok(Format::Soda)));
+        assert!(matches!("SODA".parse::<Format>(), Ok(Format::Soda)));
+        assert!(matches!("Soda".parse::<Format>(), Ok(Format::Soda)));
+    }
+
+    #[test]
+    fn test_format_parse_socrata() {
+        // "socrata" is an alias for Soda
+        assert!(matches!("socrata".parse::<Format>(), Ok(Format::Soda)));
+        assert!(matches!("SOCRATA".parse::<Format>(), Ok(Format::Soda)));
+        assert!(matches!("Socrata".parse::<Format>(), Ok(Format::Soda)));
+    }
+
+    #[test]
     fn test_format_parse_invalid() {
-        let _ = "json"
-            .parse::<Format>()
-            .expect_err("json should not parse as a valid format");
         let _ = ""
             .parse::<Format>()
             .expect_err("empty format should be rejected");

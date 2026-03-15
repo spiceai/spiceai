@@ -40,7 +40,6 @@ use crate::{
         parameters::aws::initiate_config_with_credentials,
     },
     parameters::{ParameterSpec, Parameters},
-    register_data_connector,
 };
 
 #[derive(Default, Debug, Copy, Clone)]

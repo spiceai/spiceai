@@ -42,6 +42,7 @@ snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
+turso-shared = { workspace = true }
 url = { workspace = true }
 util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v7"] }

@@ -18,8 +18,7 @@ limitations under the License.
 //! and physical execution plans for `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` on
 //! Cayenne-backed DDL-enabled catalogs.
 //!
-//! Reuses the shared DDL options infrastructure from [`super::iceberg_ddl::acceleration_options`]
-//! and [`super::iceberg_ddl::preprocess`].
+//! Reuses the shared DDL infrastructure from [`super::ddl`].
 
 pub mod analyzer_rule;
 pub mod logical_nodes;
@@ -29,25 +28,12 @@ pub mod planner;
 use datafusion::catalog::CatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
+use crate::catalogconnector::PartitionAwareCatalog;
 use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
-    if provider
-        .as_any()
-        .downcast_ref::<CayenneCatalogProvider>()
-        .is_some()
-    {
-        return true;
-    }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>() {
-        return composed
-            .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>()
-            .is_some();
-    }
-    false
+    get_cayenne_provider(provider).is_some()
 }
 
 /// Extract the [`CayenneCatalogProvider`] reference from a `CatalogProvider`.
@@ -63,6 +49,27 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
             .external()
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>();
+    }
+    None
+}
+
+/// If the catalog provider is Cayenne-backed and implements [`PartitionAwareCatalog`],
+/// return a trait reference.
+///
+/// Handles both direct [`CayenneCatalogProvider`] providers and
+/// [`ComposedCatalogProvider`] wrappers whose external provider is a
+/// [`CayenneCatalogProvider`].
+pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
+        return Some(cayenne);
+    }
+    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>()
+        && let Some(cayenne) = composed
+            .external()
+            .as_any()
+            .downcast_ref::<CayenneCatalogProvider>()
+    {
+        return Some(cayenne);
     }
     None
 }

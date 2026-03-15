@@ -170,6 +170,205 @@ jobs:
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
+  setup-model-matrix:
+    name: Setup model strategy matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "spiceai-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              },
+              {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "spiceai-macos",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64"
+              }
+            ];
+
+            const isPrEvent = context.eventName === 'pull_request';
+            return isPrEvent ? matrix.slice(0, 1) : matrix;
+
+  test_openai_model:
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 5
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-model-matrix
+    if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
+
+  test_hf_model:
+    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 10
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-model-matrix
+    if: ${{ github.event_name != 'pull_request' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 5
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
+
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
@@ -323,6 +522,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration: [{}, { engine: arrow, mode: memory }]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -415,6 +615,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration:
           [
@@ -1008,8 +1209,8 @@ jobs:
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            # { engine: turso, mode: memory },
-            # { engine: turso, mode: file },
+            { engine: turso, mode: memory },
+            { engine: turso, mode: file },
             # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}

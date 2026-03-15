@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: projected_location_only
+---
++-------------------------------------------------------------------------------------------+
+| _location                                                                                 |
++-------------------------------------------------------------------------------------------+
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
+| s3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
++-------------------------------------------------------------------------------------------+

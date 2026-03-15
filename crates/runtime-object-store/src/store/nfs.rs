@@ -50,7 +50,6 @@ struct NFSClientConfig {
     // Note: The libnfs Rust bindings (v0.1.1) do not expose timeout configuration.
     // The underlying C library (libnfs) supports nfs_set_timeout(), but this is not
     // wrapped in the Rust bindings. This field is kept for API consistency and future use.
-    #[expect(dead_code)]
     timeout: Option<Duration>,
 }
 
@@ -64,6 +63,12 @@ impl NFSClientConfig {
     }
 
     fn connect(&self) -> object_store::Result<Nfs> {
+        if let Some(timeout) = self.timeout {
+            tracing::debug!(
+                "NFS timeout configured as {:?}, but libnfs Rust bindings do not expose timeout configuration yet",
+                timeout
+            );
+        }
         let nfs = Nfs::new().map_err(handle_error)?;
         nfs.mount(&self.server, &self.export_path)
             .map_err(handle_error)?;

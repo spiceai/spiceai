@@ -17,15 +17,24 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
-use datafusion::{error::DataFusionError, sql::TableReference};
+use datafusion::{error::DataFusionError, prelude::SessionContext, sql::TableReference};
 use datafusion_expr::{Expr, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 
 use crate::datafusion::DataFusion;
 
-/// A specific set of values for partitioning keys.
-/// For example, if a table is partitioned by "date" and "region", a `PartitionValue` might be {"date": "2024-01-01", "region": "us-east"}.
+/// A specific value for partitioning keys.
+/// For example, if a table is partitioned by:
+///  - "date"
+///  - "region"
+///
+/// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
+/// ```json
+/// {"date": "2024-01-01", "region": "us-east"}
+/// {"date": "2024-01-01", "region": "us-west"}
+/// {"date": "2024-01-02", "region": "us-east"}
+/// ```
 pub type PartitionValue = HashMap<String, String>;
 
 /// Metadata for a single partition of an accelerated table
@@ -132,5 +141,45 @@ impl TablePartitionMetadata {
             .iter()
             .filter(|p| !p.is_assigned())
             .collect()
+    }
+
+    /// Returns a mapping of executor IDs to the partition expressions they contain.
+    pub fn all_executor_partitions(
+        &self,
+        ctx: &Arc<SessionContext>,
+    ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
+        let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
+        for PartitionMetadata {
+            partition_value,
+            assigned_executors,
+            ..
+        } in &self.partitions
+        {
+            // Build a single AND-combined predicate for this partition:
+            //   key1 = val1 AND key2 = val2 AND ...
+            let partition_predicate = partition_value
+                .iter()
+                .map(|(proj, lit)| {
+                    Ok(
+                        Expr::from_bytes_with_registry(proj.as_bytes(), ctx.as_ref())?.eq(
+                            Expr::from_bytes_with_registry(lit.as_bytes(), ctx.as_ref())?,
+                        ),
+                    )
+                })
+                .collect::<Result<Vec<Expr>, DataFusionError>>()?
+                .into_iter()
+                .reduce(Expr::and);
+
+            let Some(partition_predicate) = partition_predicate else {
+                continue;
+            };
+
+            for executor in assigned_executors {
+                map.entry(executor.clone())
+                    .or_default()
+                    .push(partition_predicate.clone());
+            }
+        }
+        Ok(map)
     }
 }

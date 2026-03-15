@@ -53,7 +53,6 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         name: "cayenne_table",
         columns: &[
             "table_id",
-            "table_uuid",
             "table_name",
             "path",
             "path_is_relative",
@@ -155,6 +154,15 @@ where
     }
 
     Ok(())
+}
+
+pub(crate) fn duplicate_delete_file_index_error_message(
+    engine: &str,
+    error: impl Display,
+) -> String {
+    format!(
+        "Failed to enforce unique delete-file paths for cayenne_delete_file; existing metadata may contain duplicate (table_id, path) rows. To diagnose, run: SELECT table_id, path, COUNT(*) AS cnt FROM cayenne_delete_file GROUP BY table_id, path HAVING cnt > 1; after reviewing and backing up the duplicates, you can deduplicate with: DELETE FROM cayenne_delete_file WHERE rowid NOT IN (SELECT MIN(rowid) FROM cayenne_delete_file GROUP BY table_id, path); underlying {engine} error: {error}"
+    )
 }
 
 /// Parameters for querying a single row from the database.

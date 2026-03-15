@@ -28,7 +28,9 @@ use spicepod::component::ComponentOrReference;
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth, Flight, Runtime, TelemetryConfig};
+use spicepod::component::runtime::{
+    ApiKey, ApiKeyAuth, Auth, Flight, Runtime, Scheduler, TelemetryConfig,
+};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
@@ -115,12 +117,16 @@ impl BackendMode {
 }
 
 fn parse_backend_mode(raw_value: &str) -> Result<BackendMode, String> {
-    match raw_value.trim().to_ascii_lowercase().as_str() {
-        "" | "scp" => Ok(BackendMode::Scp),
-        "local" => Ok(BackendMode::Local),
-        value => Err(format!(
+    let value = raw_value.trim();
+
+    if value.is_empty() || value.eq_ignore_ascii_case("scp") {
+        Ok(BackendMode::Scp)
+    } else if value.eq_ignore_ascii_case("local") {
+        Ok(BackendMode::Local)
+    } else {
+        Err(format!(
             "Invalid {SPIDAPTER_BACKEND_ENV} value '{value}'. Supported values: scp, local"
-        )),
+        ))
     }
 }
 
@@ -130,6 +136,7 @@ struct SetupConfig {
     region: Option<String>,
     endpoint: Option<String>,
     sink_type: Option<EtlSinkType>,
+    state_location: Option<String>,
 }
 
 impl SetupConfig {
@@ -138,6 +145,7 @@ impl SetupConfig {
             region: metadata_string(metadata, "etl_region"),
             endpoint: metadata_string(metadata, "etl_endpoint"),
             sink_type: None,
+            state_location: metadata_string(metadata, "scheduler_state_location"),
         }
     }
 
@@ -154,6 +162,22 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+/// Average non-`None` `f64` values extracted from pods.
+#[expect(clippy::cast_precision_loss)]
+fn avg_opt(
+    pods: &[&spice_cloud_client::types::PodMetrics],
+    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
+) -> Option<f64> {
+    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
+        if let Some(v) = f(p) {
+            (s + v, c + 1)
+        } else {
+            (s, c)
+        }
+    });
+    (count > 0).then_some(sum / (count as f64))
 }
 
 /// Sum non-`None` `u64` values extracted from pods.
@@ -309,30 +333,12 @@ impl Handler for SpidapterHandler {
                     ResourceMetrics::default()
                 } else {
                     ResourceMetrics {
-                        // Sum cumulative CPU seconds across all pods
-                        cpu_usage_percent: Some(
-                            pods.iter()
-                                .filter_map(|pod| pod.cpu_usage_percent)
-                                .sum::<f64>()
-                                .max(0.0),
-                        ),
-                        memory_usage_bytes: sum_opt_u64(&pods, |pod| pod.memory_usage_bytes),
-                        disk_read_bytes: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_read_bytes)
-                                .unwrap_or_default(),
-                        ),
-                        disk_write_bytes: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_write_bytes)
-                                .unwrap_or_default(),
-                        ),
-                        disk_read_iops: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_read_operations)
-                                .unwrap_or_default(),
-                        ),
-                        disk_write_iops: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_write_operations)
-                                .unwrap_or_default(),
-                        ),
+                        cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                        memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
+                        disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
+                        disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
+                        disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations),
+                        disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations),
                     }
                 };
 
@@ -415,9 +421,10 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
-        let mut attempts = 0; // global attempt counter, not per-table, to avoid compounding retries
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
+
+            let mut attempts = 0;
 
             loop {
                 let mut request = sql_client.post(sql_url).body(statement.clone());
@@ -434,7 +441,10 @@ async fn post_setup_sink_action(
 
                 if attempts >= 3 {
                     let status = response.status();
-                    let body = response.text().await?;
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read error response body: {e}>"));
                     return Err(anyhow::anyhow!(
                         "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
                     ));
@@ -478,10 +488,15 @@ fn generate_adbc_create_table_statement(
     dataset_name: &str,
     dataset: &DatasetConfig,
 ) -> anyhow::Result<String> {
+    let DatasetConfig {
+        schema,
+        primary_key_columns,
+        partition_columns,
+        ..
+    } = dataset;
     let quoted_dataset_name = quote_identifier(dataset_name);
 
-    let column_definitions = dataset
-        .schema
+    let column_definitions = schema
         .fields()
         .iter()
         .map(|field| {
@@ -499,15 +514,14 @@ fn generate_adbc_create_table_statement(
     }
 
     let mut table_elements = column_definitions;
-    if !dataset.primary_key_columns.is_empty() {
-        let schema_columns = dataset
-            .schema
+    if !primary_key_columns.is_empty() {
+        let schema_columns = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect::<HashSet<_>>();
 
-        for primary_key_column in &dataset.primary_key_columns {
+        for primary_key_column in primary_key_columns {
             if !schema_columns.contains(primary_key_column) {
                 return Err(anyhow::anyhow!(
                     "Dataset '{dataset_name}' has primary key column '{primary_key_column}' that is not present in the schema"
@@ -515,8 +529,7 @@ fn generate_adbc_create_table_statement(
             }
         }
 
-        let primary_keys = dataset
-            .primary_key_columns
+        let primary_keys = primary_key_columns
             .iter()
             .map(|column| quote_identifier(column))
             .collect::<Vec<_>>()
@@ -524,8 +537,42 @@ fn generate_adbc_create_table_statement(
         table_elements.push(format!("PRIMARY KEY ({primary_keys})"));
     }
 
+    if partition_columns.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "Dataset '{dataset_name}' specifies {} partition columns, but only a single partition column is supported",
+            partition_columns.len()
+        ));
+    }
+
+    if !partition_columns.is_empty() {
+        let schema_columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<HashSet<_>>();
+
+        for partition_column in partition_columns {
+            if !schema_columns.contains(partition_column) {
+                return Err(anyhow::anyhow!(
+                    "Dataset '{dataset_name}' has partition column '{partition_column}' that is not present in the schema"
+                ));
+            }
+        }
+    }
+
+    let partition_clause = if partition_columns.is_empty() {
+        String::new()
+    } else {
+        let quoted = partition_columns
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" PARTITION BY ({quoted})")
+    };
+
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}){partition_clause}",
         table_elements.join(", ")
     ))
 }
@@ -591,7 +638,8 @@ async fn provision_spice_cloud_app(
     let cloud = commands::build_cloud_client(api_url_override)?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
+    let flight_url = std::env::var("SPIDAPTER_FLIGHT_URL")
+        .unwrap_or_else(|_| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
@@ -609,7 +657,8 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config, datasets, None)?;
+    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None)?;
+    let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -689,13 +738,13 @@ async fn provision_local_spiced_cluster(
         tokio::fs::create_dir_all(&scheduler_dir).await?;
         tokio::fs::create_dir_all(&executor_dir).await?;
 
-        let spicepod_yaml = generate_initial_spicepod(
+        let spicepod = generate_initial_spicepod(
             &run_id,
             setup_config,
             datasets,
             local_flight_api_key.as_deref(),
         )?;
-        let spicepod_path = write_local_spicepod(&spicepod_yaml, &working_dir).await?;
+        let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;
 
         let run_id_str = run_id.to_string();
         let short_run_id = run_id_str.split('-').next().unwrap_or_default();
@@ -828,10 +877,18 @@ async fn create_local_working_dir(run_id: Uuid) -> anyhow::Result<PathBuf> {
     Ok(run_dir)
 }
 
-async fn write_local_spicepod(spicepod_yaml: &str, working_dir: &Path) -> anyhow::Result<PathBuf> {
+async fn write_local_spicepod(
+    spicepod: &SpicepodDefinition,
+    working_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let spicepod_yaml = serialize_spicepod(spicepod)?;
     let spicepod_path = working_dir.join("spicepod.yaml");
     tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
     Ok(spicepod_path)
+}
+
+fn serialize_spicepod(spicepod: &SpicepodDefinition) -> anyhow::Result<String> {
+    yaml::to_string(spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
 fn allocate_local_ports(host: &str) -> anyhow::Result<LocalPorts> {
@@ -1134,7 +1191,7 @@ fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SpicepodDefinition> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
@@ -1175,7 +1232,6 @@ fn generate_hive_spicepod(
             engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
-            refresh_check_interval: Some("1s".to_string()),
             ..Acceleration::default()
         });
 
@@ -1184,10 +1240,10 @@ fn generate_hive_spicepod(
             .push(ComponentOrReference::Component(dataset));
     }
 
-    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+    Ok(spicepod)
 }
 
-fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> anyhow::Result<String> {
+fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -1216,20 +1272,33 @@ fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> anyhow
         Catalog::new("cayenne".to_string(), "spicebench".to_string())
             .with_access(AccessMode::ReadWriteCreate),
     ));
-    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+    spicepod
 }
 
-/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
+/// Generate the initial [`SpicepodDefinition`] for the benchmark run.
 fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
-) -> anyhow::Result<String> {
-    match setup_config.sink_type {
-        Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id, flight_api_key),
+) -> anyhow::Result<SpicepodDefinition> {
+    let mut spicepod = match setup_config.sink_type {
+        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key)),
         _ => generate_hive_spicepod(run_id, setup_config, datasets),
+    }?;
+
+    if let Some(ref loc) = setup_config.state_location {
+        spicepod.runtime.scheduler = Some(Scheduler {
+            state_location: loc.clone(),
+            params: Some(Params::from_string_map(HashMap::from([(
+                "s3_auth".to_string(),
+                "key".to_string(),
+            )]))),
+            partition_management: None,
+        });
     }
+
+    Ok(spicepod)
 }
 
 #[cfg(test)]
@@ -1240,13 +1309,23 @@ mod tests {
 
     #[test]
     fn setup_config_parses_metadata() {
-        let metadata = HashMap::from([(
-            "etl_region".to_string(),
-            serde_json::Value::String("us-west-2".to_string()),
-        )]);
+        let metadata = HashMap::from([
+            (
+                "etl_region".to_string(),
+                serde_json::Value::String("us-west-2".to_string()),
+            ),
+            (
+                "scheduler_state_location".to_string(),
+                serde_json::Value::String("s3://my-bucket/state".to_string()),
+            ),
+        ]);
 
         let config = SetupConfig::from_metadata(&metadata);
         assert_eq!(config.region.as_deref(), Some("us-west-2"));
+        assert_eq!(
+            config.state_location.as_deref(),
+            Some("s3://my-bucket/state")
+        );
     }
 
     #[test]
@@ -1278,6 +1357,7 @@ mod tests {
             region: Some("us-west-2".to_string()),
             endpoint: Some("http://localhost:9000".to_string()),
             sink_type: None,
+            state_location: Some("s3://bucket/state".to_string()),
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1294,18 +1374,21 @@ mod tests {
 
         let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None)
             .expect("spicepod should generate");
+        let spicepod_yaml =
+            serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
 
-        assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
-        assert!(spicepod.contains("name: my_table"));
-        assert!(spicepod.contains("file_format: parquet"));
-        assert!(spicepod.contains("s3_region: us-west-2"));
-        assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
-        assert!(spicepod.contains("engine: cayenne"));
-        assert!(spicepod.contains("mode: file"));
-        assert!(spicepod.contains("refresh_mode: full"));
-        assert!(spicepod.contains("refresh_check_interval: 1s"));
-        assert!(spicepod.contains("telemetry:"));
-        assert!(spicepod.contains("enabled: false"));
+        assert!(spicepod_yaml.contains("from: \"s3://bucket/path/my_table/\""));
+        assert!(spicepod_yaml.contains("name: my_table"));
+        assert!(spicepod_yaml.contains("file_format: parquet"));
+        assert!(spicepod_yaml.contains("s3_region: us-west-2"));
+        assert!(spicepod_yaml.contains("s3_endpoint: \"http://localhost:9000\""));
+        assert!(spicepod_yaml.contains("engine: cayenne"));
+        assert!(spicepod_yaml.contains("mode: file"));
+        assert!(spicepod_yaml.contains("refresh_mode: full"));
+        assert!(spicepod_yaml.contains("telemetry:"));
+        assert!(spicepod_yaml.contains("enabled: false"));
+        assert!(spicepod_yaml.contains("state_location: \"s3://bucket/state\""));
+        assert!(spicepod_yaml.contains("s3_auth: key"));
     }
 
     #[test]
@@ -1314,6 +1397,7 @@ mod tests {
             region: None,
             endpoint: None,
             sink_type: None,
+            state_location: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1361,7 +1445,7 @@ mod tests {
         )
         .expect("statement should generate");
 
-        assert!(statement.contains("CREATE TABLE spicebench.bench.\"orders\""));
+        assert!(statement.contains("CREATE TABLE IF NOT EXISTS spicebench.bench.\"orders\""));
         assert!(statement.contains("\"id\" BIGINT NOT NULL"));
         assert!(statement.contains("\"name\" TEXT"));
         assert!(statement.contains("\"price\" DECIMAL(10, 2)"));
@@ -1413,6 +1497,80 @@ mod tests {
 
         assert!(
             err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_includes_partition_by() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string()],
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(
+            statement.contains("PARTITION BY (\"region\")"),
+            "expected PARTITION BY clause in: {statement}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_when_partition_column_missing() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["missing_col".to_string()],
+            },
+        )
+        .expect_err("partition column not in schema should fail");
+
+        assert!(
+            err.to_string().contains("is not present in the schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_for_multiple_partition_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("country", DataType::Utf8, true),
+        ]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string(), "country".to_string()],
+            },
+        )
+        .expect_err("multiple partition columns should fail");
+
+        assert!(
+            err.to_string()
+                .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
     }

@@ -5,3 +5,7 @@ tests:
     query_overrides: iceberg-sf1
     runner_type: spiceai-dev-runners
     validate_results: true
+  schema:
+    spicepod_path: federated/iceberg[catalog].yaml
+    runner_type: spiceai-dev-runners
+    min_tables: 1

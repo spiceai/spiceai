@@ -28,6 +28,7 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
@@ -77,8 +78,8 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
+
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use query::QueryBuilder;
 #[cfg(any(
@@ -108,7 +109,6 @@ use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
-use tokio_stream::wrappers::ReceiverStream;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -119,6 +119,7 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
+pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -266,6 +267,19 @@ pub enum Error {
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
 
+    #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
+    CatalogNotPartitionAware { catalog: String },
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {catalog}.{schema}.{table}: {source}"
+    ))]
+    UnableToReadPartitionMetadata {
+        catalog: String,
+        schema: String,
+        table: String,
+        source: Box<crate::catalogconnector::Error>,
+    },
+
     #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
         schema: String,
@@ -344,6 +358,14 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+    ))]
+    UnsupportedDistributedAccelerationEngine {
+        dataset_name: String,
+        engine: String,
+    },
+
+    #[snafu(display(
         "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {}",
         format_datafusion_error(source)
     ))]
@@ -392,6 +414,30 @@ pub enum Error {
     UnsupportedAccelerationEngineForSnapshots,
 }
 
+/// Validates that the acceleration engine is supported in distributed mode.
+///
+/// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
+/// Returns an error if a distributed role is active and the engine is unsupported.
+fn validate_distributed_engine(
+    cluster_config: &ResolvedClusterConfig,
+    engine: Engine,
+    dataset_name: &str,
+) -> Result<()> {
+    if cluster_config.effective_role().is_some()
+        && !matches!(
+            engine,
+            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+        )
+    {
+        return UnsupportedDistributedAccelerationEngineSnafu {
+            dataset_name: dataset_name.to_string(),
+            engine: engine.to_string(),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
@@ -430,8 +476,8 @@ pub struct DataFusion {
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
-    /// Shared store for DDL table options from `CREATE TABLE ... WITH (acceleration.*, dataset.*)`.
-    ddl_options_store: iceberg_ddl::acceleration_options::SharedDdlOptionsStore,
+    /// Shared store for DDL extensions from `CREATE TABLE` statements.
+    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -788,14 +834,14 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns a reference to the shared DDL options store.
+    /// Returns a reference to the shared DDL extension store.
     ///
-    /// Used by the query execution path to insert options extracted from
-    /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
-    /// are then consumed by the `IcebergDdlAnalyzerRule`.
+    /// Used by the query execution path to insert extensions extracted from
+    /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
+    /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_options_store(&self) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
-        &self.ddl_options_store
+    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+        &self.ddl_extension_store
     }
 
     /// Returns the shared weak self-reference holder.
@@ -829,6 +875,51 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    /// Returns the partition expression for a table by querying the catalog provider.
+    ///
+    /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    /// The returned string is parsed as a SQL expression against the table's schema.
+    ///
+    /// **Limitation**: Cayenne currently persists only the partition *label* (column name
+    /// or `expr0` for non-column expressions), not the original SQL expression. For
+    /// column-based partitions this works correctly; for expression-based partitions
+    /// (e.g. `date_trunc(...)`) the label `expr0` will fail to parse and this method
+    /// will return an error. A follow-up should persist `partition_expr_sql` in Cayenne
+    /// metadata to support arbitrary partition expressions.
+    ///
+    /// Returns `Ok(None)` when the table has no partition expression defined.
+    pub async fn get_table_partition_expr(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<Option<Expr>, DataFusionError> {
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+        if let Some(catalog) = self.resolve_catalog_provider(table_reference)
+            && let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref())
+            && let Some(expr_string) = aware
+                .table_partition_expr(schema_name, table_reference.table())
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
+            let table_schema = self
+                .get_table(table_reference)
+                .await
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Table '{table_reference}' not found when resolving partition expression"
+                    ))
+                })?
+                .schema();
+            let df_schema = table_schema.as_ref().clone().to_dfschema()?;
+            return self
+                .ctx
+                .state()
+                .create_logical_expr(&expr_string, &df_schema)
+                .map(Some);
+        }
+        Ok(None)
     }
 
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
@@ -1027,16 +1118,6 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        // In distributed scheduler mode, forward Cayenne table writes to an executor
-        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
-            let streaming_update = StreamingDataUpdate::try_from(data_update)
-                .map_err(find_datafusion_root)
-                .context(UnableToCreateStreamingUpdateSnafu)?;
-            return self
-                .forward_write_to_executor(table_reference, streaming_update)
-                .await;
-        }
-
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1094,13 +1175,6 @@ impl DataFusion {
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
 
-        // In distributed scheduler mode, forward Cayenne table writes to an executor
-        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
-            return self
-                .forward_write_to_executor(table_reference, streaming_update)
-                .await;
-        }
-
         let overwrite = match streaming_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1129,357 +1203,32 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
-    /// meaning the write should be forwarded to an executor.
-    fn should_forward_cayenne_write(
+    /// Returns `true` if this is a scheduler node, the table is a Cayenne table,
+    /// and at least one executor is connected to receive forwarded writes.
+    pub(crate) async fn should_forward_writes_to_executors(
         &self,
-        _table_reference: &TableReference,
-        table_provider: &dyn TableProvider,
+        table_reference: &TableReference,
     ) -> bool {
-        // Only forward if we have an executor registry (i.e., we are a scheduler)
-        let Some(executor_registry) = &self.executor_registry else {
-            return false;
-        };
-
-        // Check if the table provider is a CayenneTableProvider
-        if table_provider
-            .as_any()
-            .downcast_ref::<cayenne::CayenneTableProvider>()
-            .is_none()
-        {
+        if !matches!(
+            self.cluster_config.effective_role(),
+            Some(ClusterRole::Scheduler)
+        ) {
             return false;
         }
 
-        // Check if there are any connected executors with flight clients
-        let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
+        let has_executors = match self.executor_registry.as_ref() {
+            Some(reg) => !reg.flight_sql_clients.read().await.is_empty(),
+            None => false,
+        };
+        if !has_executors {
             return false;
-        };
-        !clients.is_empty()
-    }
-
-    /// Forwards a streaming write to an executor node via Flight `DoPut`.
-    async fn forward_write_to_executor(
-        &self,
-        table_reference: &TableReference,
-        streaming_update: StreamingDataUpdate,
-    ) -> Result<()> {
-        let Some(executor_registry) = self.executor_registry.as_ref() else {
-            return NoExecutorsAvailableSnafu {
-                table_name: table_reference.to_string(),
-            }
-            .fail();
-        };
-
-        // Get an executor's FlightSqlClient
-        let (executor_id, client) = {
-            let clients = executor_registry.flight_sql_clients.read().await;
-            let Some((executor_id, client)) = clients.iter().next() else {
-                tracing::error!(
-                    "No executors available to forward Cayenne write for table {table_reference}"
-                );
-                return NoExecutorsAvailableSnafu {
-                    table_name: table_reference.to_string(),
-                }
-                .fail();
-            };
-            (executor_id.clone(), client.clone())
-        };
-
-        tracing::debug!("Forwarding Cayenne write for table {table_reference} to executor");
-
-        // Resolve the table reference to a fully qualified form so the executor
-        // can locate it regardless of its default catalog/schema settings.
-        let resolved = table_reference
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-        let descriptor_path = vec![
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        ];
-        let resolved_table = TableReference::full(
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        );
-
-        // Register before the write to minimize post-write routing races.
-        self.register_forwarded_table_partition(executor_registry, &executor_id, resolved_table)
-            .await;
-
-        let schema = streaming_update.data.schema();
-        let stream = streaming_update.data;
-
-        // Build a flight data stream from the record batches.
-        let flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::unfold(stream, |mut s| async move {
-                match s.next().await {
-                    Some(Ok(batch)) => Some((Ok(batch), s)),
-                    Some(Err(e)) => Some((
-                        Err(arrow_flight::error::FlightError::Arrow(
-                            arrow_schema::ArrowError::ExternalError(Box::new(e)),
-                        )),
-                        s,
-                    )),
-                    None => None,
-                }
-            }));
-
-        // Stream directly into the executor's `DoPut` without buffering.
-        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
-        let (encode_result_tx, encode_result_rx) =
-            tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-        let io_runtime = self.io_runtime.clone();
-
-        io_runtime.spawn(async move {
-            let mut first = true;
-            let mut flight_data_encoder = Box::pin(flight_data_encoder);
-            loop {
-                match flight_data_encoder.next().await {
-                    Some(Ok(mut fd)) => {
-                        if first {
-                            fd.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_path(
-                                descriptor_path.clone(),
-                            ));
-                            first = false;
-                        }
-
-                        if tx.send(fd).await.is_err() {
-                            let _ = encode_result_tx.send(Ok(()));
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        let _ = encode_result_tx.send(Err(e.to_string()));
-                        break;
-                    }
-                    None => {
-                        let _ = encode_result_tx.send(Ok(()));
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Forward the authorization header from the original request so the
-        // executor can validate the caller's credentials.
-        let auth_header = runtime_request_context::RequestContext::current(
-            runtime_request_context::AsyncMarker::new().await,
-        )
-        .authorization_header()
-        .map(str::to_string);
-
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
-        if let Some(auth_value) = auth_header
-            && let Ok(val) = auth_value.parse()
-        {
-            request.metadata_mut().insert("authorization", val);
         }
 
-        let table_name = table_reference.to_string();
-        let mut inner_client = client.into_inner();
-        let response =
-            inner_client
-                .do_put(request)
-                .await
-                .map_err(|e| Error::UnableToExecuteTableInsert {
-                    table_name: table_name.clone(),
-                    source: DataFusionError::External(Box::new(e)),
-                })?;
-
-        // Wait for the server to acknowledge.
-        response
-            .into_inner()
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_name.clone(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
-
-        match encode_result_rx.await {
-            Ok(Ok(())) | Err(_) => {}
-            Ok(Err(e)) => {
-                return Err(Error::UnableToExecuteTableInsert {
-                    table_name,
-                    source: DataFusionError::Execution(format!(
-                        "Failed to encode forwarded Flight stream: {e}"
-                    )),
-                });
-            }
-        }
-
-        tracing::debug!(
-            "Successfully forwarded Cayenne write for table {table_reference} to executor"
-        );
-
-        Ok(())
-    }
-
-    async fn register_forwarded_table_partition(
-        &self,
-        executor_registry: &ExecutorRegistry,
-        executor_id: &str,
-        resolved_table: TableReference,
-    ) {
-        let mut partitions = executor_registry.partitions.write().await;
-        partitions
-            .entry(executor_id.to_string())
-            .or_default()
-            .entry(resolved_table)
-            .or_default();
-    }
-
-    /// Forwards a raw `FlightData` stream to an executor via Flight `DoPut`.
-    ///
-    /// This avoids scheduler-side decode/re-encode overhead and is used as a fast path
-    /// for scheduler -> executor Cayenne write-through ingestion.
-    pub(crate) async fn forward_flight_data_stream_to_executor<S>(
-        &self,
-        table_reference: &TableReference,
-        inbound_stream: S,
-    ) -> Result<()>
-    where
-        S: futures::Stream<Item = std::result::Result<arrow_flight::FlightData, tonic::Status>>
-            + Send
-            + 'static,
-    {
-        let Some(executor_registry) = self.executor_registry.as_ref() else {
-            return NoExecutorsAvailableSnafu {
-                table_name: table_reference.to_string(),
-            }
-            .fail();
-        };
-
-        // Get an executor's FlightSqlClient
-        let (executor_id, client) = {
-            let clients = executor_registry.flight_sql_clients.read().await;
-            let Some((executor_id, client)) = clients.iter().next() else {
-                tracing::error!(
-                    "No executors available to forward Cayenne write for table {table_reference}"
-                );
-                return NoExecutorsAvailableSnafu {
-                    table_name: table_reference.to_string(),
-                }
-                .fail();
-            };
-            (executor_id.clone(), client.clone())
-        };
-
-        tracing::debug!(
-            "Forwarding raw Cayenne DoPut stream for table {table_reference} to executor"
-        );
-
-        let resolved = table_reference
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-        let descriptor_path = vec![
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        ];
-        let resolved_table = TableReference::full(
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        );
-
-        // Register before the write to minimize post-write routing races.
-        self.register_forwarded_table_partition(executor_registry, &executor_id, resolved_table)
-            .await;
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
-        let (copy_result_tx, copy_result_rx) =
-            tokio::sync::oneshot::channel::<std::result::Result<(), tonic::Status>>();
-
-        let io_runtime = self.io_runtime.clone();
-        io_runtime.spawn(async move {
-            let mut inbound_stream = Box::pin(inbound_stream);
-            let mut is_first = true;
-            loop {
-                match inbound_stream.next().await {
-                    Some(Ok(mut fd)) => {
-                        if is_first {
-                            if let Some(descriptor) = fd.flight_descriptor.as_mut() {
-                                descriptor.path.clone_from(&descriptor_path);
-                            } else {
-                                fd.flight_descriptor =
-                                    Some(arrow_flight::FlightDescriptor::new_path(
-                                        descriptor_path.clone(),
-                                    ));
-                            }
-                            is_first = false;
-                        }
-
-                        if tx.send(fd).await.is_err() {
-                            let _ = copy_result_tx.send(Ok(()));
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        let _ = copy_result_tx.send(Err(e));
-                        break;
-                    }
-                    None => {
-                        let _ = copy_result_tx.send(Ok(()));
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Forward the authorization header from the original request so the
-        // executor can validate the caller's credentials when configured.
-        let auth_header = runtime_request_context::RequestContext::current(
-            runtime_request_context::AsyncMarker::new().await,
-        )
-        .authorization_header()
-        .map(str::to_string);
-
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
-        if let Some(auth_value) = auth_header
-            && let Ok(val) = auth_value.parse()
-        {
-            request.metadata_mut().insert("authorization", val);
-        }
-
-        let table_name = table_reference.to_string();
-        let mut inner_client = client.into_inner();
-        let response =
-            inner_client
-                .do_put(request)
-                .await
-                .map_err(|e| Error::UnableToExecuteTableInsert {
-                    table_name: table_name.clone(),
-                    source: DataFusionError::External(Box::new(e)),
-                })?;
-
-        // Wait for the server to acknowledge.
-        response
-            .into_inner()
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_name.clone(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
-
-        match copy_result_rx.await {
-            Ok(Ok(())) | Err(_) => {}
-            Ok(Err(e)) => {
-                return Err(Error::UnableToExecuteTableInsert {
-                    table_name,
-                    source: DataFusionError::External(Box::new(e)),
-                });
-            }
-        }
-
-        tracing::debug!(
-            "Successfully forwarded raw Cayenne DoPut stream for table {table_reference} to executor"
-        );
-
-        Ok(())
+        self.get_table(table_reference).await.is_some_and(|t| {
+            t.as_any()
+                .downcast_ref::<cayenne::CayenneTableProvider>()
+                .is_some()
+        })
     }
 
     pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
@@ -1633,6 +1382,13 @@ impl DataFusion {
         } else {
             None
         };
+
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration_settings.engine,
+            &dataset.name.to_string(),
+        )?;
 
         let accelerated_table_provider = self
             .accelerator_engine_registry
@@ -2394,6 +2150,13 @@ impl DataFusion {
 
         let schema = view_table.schema();
 
+        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
+        validate_distributed_engine(
+            &self.cluster_config,
+            acceleration.engine,
+            &table.to_string(),
+        )?;
+
         let accelerated_table_provider = self
             .accelerator_engine_registry()
             .create_accelerator_table(
@@ -2455,6 +2218,7 @@ impl DataFusion {
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
+        builder.zero_results_action(acceleration.on_zero_results.clone());
         if acceleration.disable_federation {
             builder.disable_federation();
         }
@@ -2603,27 +2367,24 @@ impl DataFusion {
             return Ok(plan);
         }
 
-        // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning.
-        // This extracts DDL table options, stores them for the analyzer rule,
-        // and returns modified SQL without the WITH clause.
-        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_with_options(
-            sql,
-            &self.ddl_options_store,
-        )?;
+        // Pre-process CREATE TABLE statements to extract DDL extensions
+        // (WITH options, PARTITION BY) before planning.
+        let preprocessed =
+            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
         let (effective_sql, store_key) = match &preprocessed {
-            iceberg_ddl::preprocess::PreprocessResult::Modified {
+            ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,
                 store_key,
             } => (modified.as_str(), Some(store_key.as_str())),
-            iceberg_ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
+            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
         let plan = match session.create_logical_plan(effective_sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 if let Some(store_key) = store_key {
-                    iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_options_store,
+                    ddl::preprocess::cleanup_preprocessed_ddl_options(
+                        &self.ddl_extension_store,
                         store_key,
                     )?;
                 }
@@ -3387,6 +3148,152 @@ mod tests {
                 ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
+        }
+    }
+
+    mod validate_distributed_engine_tests {
+        use super::super::*;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+            let config = ClusterConfig {
+                role: Some(role),
+                allow_insecure_connections: true,
+                node_advertise_address: Some("127.0.0.1".to_string()),
+                ..ClusterConfig::default()
+            };
+            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
+        }
+
+        fn make_non_distributed_config() -> ResolvedClusterConfig {
+            ResolvedClusterConfig::try_new(ClusterConfig::default())
+                .expect("valid default cluster config")
+        }
+
+        #[test]
+        fn arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn partitioned_arrow_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
+                .expect("partitioned_arrow engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn cayenne_allowed_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne engine should be allowed in distributed mode");
+        }
+
+        #[test]
+        fn duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn sqlite_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Executor);
+            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn postgresql_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn turso_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result =
+                validate_distributed_engine(&config, Engine::PartitionedDuckDB, "my_dataset");
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn table_mode_partitioned_duckdb_rejected_in_distributed_mode() {
+            let config = make_cluster_config(ClusterRole::Scheduler);
+            let result = validate_distributed_engine(
+                &config,
+                Engine::TableModePartitionedDuckDB,
+                "my_dataset",
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
+                ),
+                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+        }
+
+        #[test]
+        fn any_engine_allowed_in_non_distributed_mode() {
+            let config = make_non_distributed_config();
+            validate_distributed_engine(&config, Engine::DuckDB, "ds")
+                .expect("duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Sqlite, "ds")
+                .expect("sqlite should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
+                .expect("postgresql should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Turso, "ds")
+                .expect("turso should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::PartitionedDuckDB, "ds")
+                .expect("partitioned_duckdb should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::TableModePartitionedDuckDB, "ds").expect(
+                "table_mode_partitioned_duckdb should be allowed when not in distributed mode",
+            );
+            validate_distributed_engine(&config, Engine::Arrow, "ds")
+                .expect("arrow should be allowed when not in distributed mode");
+            validate_distributed_engine(&config, Engine::Cayenne, "ds")
+                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 }

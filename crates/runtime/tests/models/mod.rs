@@ -648,7 +648,7 @@ pub(crate) fn get_local_model(
         .insert("model_type".to_string(), model_type.into().into());
     model
         .params
-        .insert("hf_max_completion_tokens".to_string(), 10.into());
+        .insert("hf_max_completion_tokens".to_string(), 4.into());
     // Local models don't require HF token for public models like Phi
     model
 }

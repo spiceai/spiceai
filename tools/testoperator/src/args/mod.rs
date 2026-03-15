@@ -29,14 +29,14 @@ pub use append::AppendTestArgs;
 pub mod dispatch;
 use dispatch::DispatchArgs;
 
-mod evals;
-pub use evals::EvalsTestArgs;
-
 mod search;
 pub use search::SearchTestArgs;
 
 mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
+
+mod schema;
+pub use schema::SchemaTestArgs;
 
 mod streaming;
 pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
@@ -63,8 +63,6 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    /// Run a models evaluations test
-    Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(AppendTestArgs),
     Search(SearchTestArgs),
@@ -76,6 +74,8 @@ pub enum TestCommands {
     StreamingDynamodb(StreamingDynamodbArgs),
     /// Run a streaming `DynamoDB` data correctness test (multi-round CDC verification)
     StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
+    /// Validate catalog connector schema discovery via `information_schema`
+    Schema(SchemaTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

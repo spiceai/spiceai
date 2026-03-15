@@ -24,7 +24,7 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
+    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs, TestCommands,
     TextToSqlArgs,
 };
 
@@ -52,9 +52,9 @@ async fn main() -> anyhow::Result<()> {
                 test_args: DatasetTestArgs { common, .. },
                 ..
             })
-            | TestCommands::Evals(EvalsTestArgs { common, .. })
             | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::TextToSql(TextToSqlArgs { common, .. })
+            | TestCommands::Schema(SchemaTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -75,9 +75,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Dispatch(args) => {
             commands::dispatch::dispatch(args).await?;
-        }
-        Commands::Run(TestCommands::Evals(args)) => {
-            commands::evals::run(&args).await?;
         }
         #[cfg(feature = "append")]
         Commands::Run(TestCommands::Append(args)) => {
@@ -103,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::StreamingDynamodbCorrectness(args)) => {
             commands::streaming::run_correctness(&args).await?;
+        }
+        Commands::Run(TestCommands::Schema(args)) => {
+            commands::schema::run(&args).await?;
         }
         Commands::Export(TestCommands::StreamingDynamodbCorrectness(_)) => {
             return Err(anyhow::anyhow!(

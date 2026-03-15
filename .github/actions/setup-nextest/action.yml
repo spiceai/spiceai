@@ -18,6 +18,23 @@ description: 'Installs cargo-nextest for running Rust tests with caching'
 runs:
   using: 'composite'
   steps:
+    - name: Ensure cargo bin on PATH (Linux/macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        mkdir -p "$cargo_home/bin"
+        echo "$cargo_home/bin" >> "$GITHUB_PATH"
+
+    - name: Ensure cargo bin on PATH (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+        $cargoBin = Join-Path $cargoHome "bin"
+        New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null
+        $cargoBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
     - name: Cache Nextest binary (Linux)
       if: runner.os == 'Linux'
       id: cache-nextest-linux
