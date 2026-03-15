@@ -1,18 +1,82 @@
-# ============================================================================
-# DISABLED: This workflow comes from upstream (spiceai/spiceai).
-# The enterprise version is ent_testoperator_run_load.yml
-# This file is kept only to prevent merge conflicts with upstream.
-# ============================================================================
-name: "load tests (upstream - disabled)"
-run-name: load - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+name: throughput tests
+run-name: throughput - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
-on: [workflow_dispatch]
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      query_set:
+        description: 'Query set'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+          - 'tpch[parameterized]'
+          - 'tpcds'
+          - 'clickbench'
+          - 'saffron[parameterized]'
+      query_overrides:
+        description: 'Query overrides'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'sqlite'
+          - 'postgresql'
+          - 'mysql'
+          - 'dremio'
+          - 'odbc-athena'
+          - 'odbc-databricks'
+          - 'duckdb'
+          - 'duckdb-zero-results'
+          - 'duckdb-partitioned'
+          - 'snowflake'
+          - 'spark'
+          - 'iceberg-sf1'
+          - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
+          - 'spicecloud'
+          - 'iceberg-hadoop'
+          - 'saffron-views'
+          - 'dynamodb'
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
+      concurrency_count:
+        description: 'How many concurrent client connections to use?'
+        required: true
+        default: '10'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spicehq-dev-runners'
+        type: choice
+        options:
+          - 'spicehq-dev-runners'
+          - 'spicehq-dev-large-runners'
+      scale_factor:
+        description: 'Scale factor for the benchmark'
+        required: false
+        type: string
+        default: '1'
 
 jobs:
-  run-load:
-    name: Run load test
+  run-throughput:
+    name: Run throughput test
     runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 600
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -21,7 +85,7 @@ jobs:
         run: |
           query_set="${{ github.event.inputs.query_set }}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
@@ -75,39 +139,36 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
-      - name: Install OpenMP runtime library
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgomp1
-
-      - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
+      - name: Run the throughput test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
-          testoperator run load \
+          testoperator run throughput \
             -s /usr/local/bin/spiced \
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait 900 \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
-            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
-            --metrics
+            --concurrency ${{ github.event.inputs.concurrency_count }}
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -115,8 +176,9 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
@@ -124,42 +186,48 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
 
-      - name: Run the load test (with overrides) - ${{ github.event.inputs.spicepod_path }}
+      - name: Run the throughput test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
-          testoperator run load \
+          testoperator run throughput \
             -s /usr/local/bin/spiced \
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait 900 \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
-            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
-            --metrics
+            --concurrency ${{ github.event.inputs.concurrency_count }}
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -167,8 +235,9 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
@@ -176,9 +245,13 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

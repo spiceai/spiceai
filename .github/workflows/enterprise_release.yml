@@ -126,11 +126,11 @@ jobs:
       matrix:
         test:
           - name: Integration Tests
-            workflow: integration.yml
+            workflow: ent_integration.yml
             params: '-f run_all_tests=true'
             required: true
           - name: E2E Tests (Core)
-            workflow: e2e_test_ci.yml
+            workflow: ent_e2e_test_ci.yml
             params: ''
             required: true
           - name: E2E Tests (Models)
@@ -138,11 +138,11 @@ jobs:
             params: ''
             required: true
           - name: TestOperator Benchmarks
-            workflow: testoperator_dispatch.yml
+            workflow: ent_testoperator_dispatch.yml
             params: '-f workflow_type=bench'
             required: false
           - name: TestOperator Throughput
-            workflow: testoperator_dispatch.yml
+            workflow: ent_testoperator_dispatch.yml
             params: '-f workflow_type=throughput'
             required: false
           - name: Customer Dataset Benchmarks
@@ -330,9 +330,9 @@ jobs:
       matrix:
         build:
           - name: Release Binaries
-            workflow: build_and_release.yml
+            workflow: ent_build_and_release.yml
           - name: CUDA Release Binaries
-            workflow: build_and_release_cuda.yml
+            workflow: ent_build_and_release_cuda.yml
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5

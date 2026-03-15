@@ -1,11 +1,39 @@
-# ============================================================================
-# DISABLED: This workflow comes from upstream (spiceai/spiceai).
-# The enterprise version is ent_spiced_docker.yml
-# This file is kept only to prevent merge conflicts with upstream.
-# ============================================================================
-name: "spiced_docker (upstream - disabled)"
+name: spiced_docker
 
-on: [workflow_dispatch]
+on:
+  release:
+    types:
+      - edited
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag to source binaries from (for example v1.4.0)
+        required: false
+        type: string
+      publish:
+        description: Publish the Docker images to registries
+        required: false
+        type: boolean
+        default: false
+      tag_latest:
+        description: Tag as 'latest' (auto = detect from version, skips rc/beta/alpha)
+        required: false
+        type: choice
+        options:
+          - auto
+          - 'true'
+          - 'false'
+        default: auto
+      target:
+        description: Build docker images for specific target(s)
+        required: false
+        type: choice
+        options:
+          - all
+          - amd64
+          - arm64
+          - cuda
+        default: all
 
 jobs:
   setup:

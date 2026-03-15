@@ -1,11 +1,29 @@
-# ============================================================================
-# DISABLED: This workflow comes from upstream (spiceai/spiceai).
-# The enterprise version is ent_spiced_docker_dev.yml
-# This file is kept only to prevent merge conflicts with upstream.
-# ============================================================================
-name: "spiced_docker_dev (upstream - disabled)"
+name: spiced_docker_dev
 
-on: [workflow_dispatch]
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g., my-feature). Will be published as ghcr.io/spiceai/spiceai-dev:<tag>'
+        required: true
+        type: string
+      variant:
+        description: 'Which image variant to build'
+        required: false
+        type: choice
+        options:
+          - 'models'
+          - 'default'
+        default: 'models'
+      target:
+        description: 'Build for specific architecture(s)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'amd64'
+          - 'arm64'
+        default: 'all'
 
 jobs:
   setup:

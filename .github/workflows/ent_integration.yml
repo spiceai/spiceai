@@ -1,12 +1,35 @@
-# ============================================================================
-# DISABLED: This workflow comes from upstream (spiceai/spiceai).
-# The enterprise version is ent_integration.yml
-# This file is kept only to prevent merge conflicts with upstream.
-# ============================================================================
 ---
-name: "integration tests (upstream - disabled)"
+name: integration tests
 
-on: [workflow_dispatch]
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - trunk
+      - release/*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+
+  workflow_dispatch:
+    inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
