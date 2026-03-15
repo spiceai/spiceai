@@ -150,7 +150,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${{ github.repository }}/${BRANCH}/install/install.sh" | /bin/bash
 
       - name: install Spice (Windows)
         if: matrix.target.target_os == 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
@@ -171,7 +171,7 @@ jobs:
               $branch = "${{ github.ref_name }}"
             }
           }
-          $url = "https://raw.githubusercontent.com/spiceai/spiceai/$branch/install/Install.ps1"
+          $url = "https://raw.githubusercontent.com/${{ github.repository }}/$branch/install/Install.ps1"
           curl -L $url -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
       - name: add Spice bin to PATH
