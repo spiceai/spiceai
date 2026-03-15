@@ -70,7 +70,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${{ github.repository }}/${BRANCH}/install/install.sh" | /bin/bash
+          curl -sSL -H "Cache-Control: no-cache" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" | /bin/bash
 
       - name: add Spice bin to PATH
         run: |
@@ -150,7 +150,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${{ github.repository }}/${BRANCH}/install/install.sh" | /bin/bash
+          curl -sSL -H "Cache-Control: no-cache" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" | /bin/bash
 
       - name: check installation
         shell: wsl-bash {0}

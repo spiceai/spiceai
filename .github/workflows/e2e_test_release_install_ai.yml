@@ -150,7 +150,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${{ github.repository }}/${BRANCH}/install/install.sh" | /bin/bash
+          curl -sSL -H "Cache-Control: no-cache" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" | /bin/bash
 
       - name: install Spice (Windows)
         if: matrix.target.target_os == 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
@@ -171,8 +171,13 @@ jobs:
               $branch = "${{ github.ref_name }}"
             }
           }
-          $url = "https://raw.githubusercontent.com/${{ github.repository }}/$branch/install/Install.ps1"
-          curl -L $url -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+          $headers = @{
+            "Authorization" = "token $env:GITHUB_TOKEN"
+            "Accept" = "application/vnd.github.v3.raw"
+          }
+          $url = "https://api.github.com/repos/${{ github.repository }}/contents/install/Install.ps1?ref=$branch"
+          Invoke-WebRequest -Uri $url -Headers $headers -OutFile Install.ps1
+          PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
       - name: add Spice bin to PATH
         if: matrix.target.target_os != 'windows'
