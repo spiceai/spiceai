@@ -203,16 +203,10 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
     let partition_phys_exprs = build_partition_physical_exprs(partition_by, &schema)?;
-
-    // Serialize the partition expressions for use as PartitionValue keys.
-    let partition_expr_keys: Vec<String> = partition_phys_exprs
+    let partition_expr_keys = partition_phys_exprs
         .iter()
-        .map(|(expr, _)| {
-            expr.to_bytes()
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-                .context(SerializeExprSnafu)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|(e, _)| e.to_string())
+        .collect::<Vec<String>>();
 
     let tbl = path
         .clone()
@@ -332,10 +326,7 @@ async fn route_batch_and_assign_unseen(
             .map(|(expr_key, scalar)| {
                 let lit_expr = Expr::Literal(scalar.clone(), None);
                 let lit_bytes = lit_expr.to_bytes().context(SerializeExprSnafu)?;
-                Ok((
-                    expr_key.clone(),
-                    String::from_utf8_lossy(&lit_bytes).to_string(),
-                ))
+                Ok((expr_key.clone(), scalar.to_string()))
             })
             .collect::<Result<HashMap<_, _>>>()?;
 

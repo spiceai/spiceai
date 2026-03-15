@@ -537,6 +537,9 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             table,
             schema,
         )
+        .into_iter()
+        .map(|(provider, _)| (provider, vec![])) // For now, do not need partition values. Executors only have required data.
+        .collect()
     }
 }
 
