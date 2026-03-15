@@ -156,7 +156,7 @@ jobs:
         if: matrix.target.target_os != 'darwin'
         uses: ./.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel'
+          features: 'tpc-extension,models,postgres-accel,turso'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -165,7 +165,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         uses: ./.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel,metal'
+          features: 'tpc-extension,models,postgres-accel,metal,turso'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
