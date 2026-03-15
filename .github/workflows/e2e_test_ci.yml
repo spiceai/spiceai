@@ -3,7 +3,7 @@
 # The enterprise version is ent_e2e_test_ci.yml
 # This file is kept only to prevent merge conflicts with upstream.
 # ============================================================================
-name: "E2E Test CI (upstream - disabled)"
+name: 'E2E Test CI (upstream - disabled)'
 
 on: [workflow_dispatch]
 
