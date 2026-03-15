@@ -1321,7 +1321,7 @@ impl DataAccelerator for CayenneAccelerator {
 ///
 /// Supports single and composite partition keys (e.g., `partition_by: [year, month, day]`).
 /// For composite partitions, data is stored in nested Hive-style directories.
-struct CayennePartitionCreator {
+pub(crate) struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
     /// Partition expressions. For hierarchical partitions like `partition_by: [year, month]`,
@@ -1367,7 +1367,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
 
 impl CayennePartitionCreator {
     #[expect(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         table_name: String,
         base_path: PathBuf,
         partition_by: Vec<PartitionedBy>,

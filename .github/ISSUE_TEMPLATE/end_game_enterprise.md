@@ -40,22 +40,22 @@ assignees: ''
 - [ ] Ensure all pre-release and post-release testing and verification is complete without non-acceptable failures.
 
 1. **Build Validations**
-   - [ ] Ensure [builds pass](https://github.com/spicehq/spiceai/actions/workflows/build_and_release.yml) on **Linux and Windows**.
+   - [ ] Ensure [builds pass](https://github.com/spicehq/spiceai/actions/workflows/ent_build_and_release.yml) on **Linux and Windows**.
    - [ ] Verify all CI workflows complete without warnings or errors.
 
 1. **Unit/Integration Tests**
    - [ ] Confirm local and CI tests pass without major failures.
-     - [ ] Verify [integration](https://github.com/spicehq/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
+     - [ ] Verify [integration](https://github.com/spicehq/spiceai/actions/workflows/ent_integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
 1. **E2E Tests**
-   - [ ] Verify [E2E Test CI (core)](https://github.com/spicehq/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and the release branch.
+   - [ ] Verify [E2E Test CI (core)](https://github.com/spicehq/spiceai/actions/workflows/ent_e2e_test_ci.yml) is green on `trunk` and the release branch.
    - [ ] Verify [E2E Test CI (models)](https://github.com/spicehq/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and the release branch.
    - [ ] Verify [Test Operator Benchmarks](https://github.com/spicehq/spiceai/actions/workflows/testoperator_run_bench.yml) is green on `trunk` and the release branch.
-     - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
+     - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/ent_testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `bench`
        - All other values left empty.
-   - [ ] Verify [Throughput Tests](https://github.com/spicehq/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
-     - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
+   - [ ] Verify [Throughput Tests](https://github.com/spicehq/spiceai/actions/workflows/ent_testoperator_run_throughput.yml) is green on `trunk` and the release branch.
+     - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/ent_testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `throughput`
        - All other values left empty.
    - [ ] Verify [Customer Datasets Benchmarks](https://github.com/spicehq/spiceai/actions/workflows/testoperator_customers.yml) are green on the release branch.
@@ -94,7 +94,7 @@ assignees: ''
 
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spicehq/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1-enterprise`). Leave the body empty so automation can populate it from the checked-in notes.
-- [ ] After both [build_and_release](https://github.com/spicehq/spiceai/actions/workflows/build_and_release.yml) and [build_and_release_cuda](https://github.com/spicehq/spiceai/actions/workflows/build_and_release_cuda.yml) workflows complete successfully, trigger the [spiced_docker_enterprise](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker_enterprise.yml) workflow.
+- [ ] After both [build_and_release](https://github.com/spicehq/spiceai/actions/workflows/ent_build_and_release.yml) and [build_and_release_cuda](https://github.com/spicehq/spiceai/actions/workflows/ent_build_and_release_cuda.yml) workflows complete successfully, trigger the [spiced_docker_enterprise](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker_enterprise.yml) workflow.
 
 ### Post-Docker Build Steps
 

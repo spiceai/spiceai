@@ -86,6 +86,17 @@ pub fn partition_by_expressions(
     Ok(partitioned_by)
 }
 
+/// Validates that a single [`Expr`] meets the partition expression criteria.
+///
+/// This is useful for DDL paths where the expression is already parsed as a
+/// `DataFusion` `Expr` (e.g. from a `PARTITION BY` clause).
+///
+/// # Errors
+/// Returns an error if the expression does not meet the partition criteria.
+pub fn validate_partition_expression(expr: &Expr, schema: &DFSchema) -> ValidationResult {
+    PartitionCriteria.validate(expr, schema)
+}
+
 /// Validates whether a [`ScalarValue`] can be produced by the given [`Expr`].
 ///
 /// # Errors
@@ -167,6 +178,7 @@ impl Criterion for DataTypeCriterion {
                 data_type,
                 DataType::Utf8
                     | DataType::LargeUtf8
+                    | DataType::Utf8View
                     | DataType::Int8
                     | DataType::Int16
                     | DataType::Int32

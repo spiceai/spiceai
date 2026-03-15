@@ -1,34 +1,12 @@
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_pr.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
 ---
-name: pr
+name: "pr (upstream - disabled)"
 
-on:
-  merge_group:
-    types: [checks_requested]
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-  workflow_dispatch:
-    inputs:
-      profile_option:
-        description: 'Which Rust build profile to use? (Default is lint)'
-        required: false
-        type: choice
-        options:
-          - 'lint'
-          - 'release'
-          - 'release-lto'
-        default: 'lint'
-      update_snapshots:
-        description: 'Update the snapshots?'
-        required: false
-        default: 'no'
-        type: choice
-        options:
-          - 'always'
-          - 'no'
+on: [workflow_dispatch]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}

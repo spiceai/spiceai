@@ -168,8 +168,13 @@ impl ExecutorRegistry {
     }
 
     #[must_use]
-    pub fn partition_manager(&self) -> Arc<PartitionManager> {
+    pub fn accelerations_partition_manager(&self) -> Arc<PartitionManager> {
         Arc::clone(&self.accelerations_partition_manager)
+    }
+
+    #[must_use]
+    pub fn federated_partition_manager(&self) -> Arc<PartitionManager> {
+        Arc::clone(&self.federated_partition_manager)
     }
 
     /// Registers an executor connection.

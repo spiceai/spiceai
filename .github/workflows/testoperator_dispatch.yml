@@ -1,37 +1,11 @@
-name: testoperator dispatch
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_testoperator_dispatch.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: "testoperator dispatch (upstream - disabled)"
 
-on:
-  workflow_dispatch:
-    inputs:
-      spiced_commit:
-        description: 'An optional commit hash to use for spiced'
-        required: false
-        type: string
-      workflow_type:
-        description: 'the workflow to execute (bench, throughput, load, etc)'
-        required: true
-        default: 'bench'
-        type: choice
-        options:
-          - 'bench'
-          - 'load'
-          - 'throughput'
-          - 'append'
-          - 'http-consistency'
-          - 'nas'
-          - 'text-to-sql'
-          - 'streaming-bench'
-          - 'streaming-correctness'
-      update_snapshots:
-        description: 'Update snapshots?'
-        required: false
-        type: boolean
-        default: false
-      scheduled:
-        description: 'Run schedule?'
-        required: false
-        type: boolean
-        default: false
+on: [workflow_dispatch]
 
 jobs:
   dispatch-scheduled:
