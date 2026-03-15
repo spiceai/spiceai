@@ -71,7 +71,7 @@ fn get_docs_dataset() -> Dataset {
     dataset.time_column = Some("day".to_string());
     dataset.time_format = Some(TimeFormat::Date);
     dataset.metadata.insert(
-        "location".to_string(),
+        "_location".to_string(),
         serde_json::Value::String("enabled".to_string()),
     );
     dataset
@@ -469,9 +469,9 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
             // file + metadata select with location predicate
             run_query_and_snapshot(
                 &rt,
-                "SELECT doc_content, location, day, size FROM docs \
+                "SELECT doc_content, _location, day, size FROM docs \
                  WHERE document_id = 'doc_1' \
-                 AND location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
+                 AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
                  AND doc_content IS NOT NULL",
                 "docs_file_metadata_with_location_pred",
             ).await;
@@ -479,9 +479,9 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
             // Same as above but with alias on file column
             run_query_and_snapshot(
                 &rt,
-                "SELECT doc_content AS content, location, day, size FROM docs \
+                "SELECT doc_content AS content, _location, day, size FROM docs \
                  WHERE document_id = 'doc_1' \
-                 AND location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
+                 AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
                  AND doc_content IS NOT NULL",
                 "docs_file_metadata_with_location_pred_alias",
             ).await;
@@ -514,14 +514,14 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT location FROM docs ORDER BY location, document_id LIMIT 5",
+                "SELECT _location FROM docs ORDER BY _location, document_id LIMIT 5",
                 "docs_metadata_only",
             ).await;
 
             // Metadata + partition only (no file columns)
             run_query_and_snapshot(
                 &rt,
-                "SELECT day, location FROM docs ORDER BY day, location, document_id LIMIT 5",
+                "SELECT day, _location FROM docs ORDER BY day, _location, document_id LIMIT 5",
                 "docs_partition_metadata_only",
             ).await;
 
@@ -529,20 +529,20 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, location FROM docs ORDER BY document_id LIMIT 5",
+                "SELECT document_id, _location FROM docs ORDER BY document_id LIMIT 5",
                 "docs_file_metadata",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, filename, size, location FROM docs ORDER BY document_id LIMIT 5",
+                "SELECT document_id, filename, size, _location FROM docs ORDER BY document_id LIMIT 5",
                 "docs_multi_file_metadata",
             ).await;
 
             // All column types: file + partition + metadata
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, day, location FROM docs ORDER BY document_id LIMIT 5",
+                "SELECT document_id, day, _location FROM docs ORDER BY document_id LIMIT 5",
                 "docs_file_partition_metadata",
             ).await;
 
@@ -550,21 +550,21 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT * FROM docs WHERE location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
+                "SELECT * FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
                 "docs_location_eq_star",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, filename FROM docs WHERE location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
+                "SELECT document_id, filename FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
                 "docs_location_eq_projected",
             ).await;
 
             // Location IN with multiple files
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, location FROM docs \
-                 WHERE location IN (\
+                "SELECT document_id, _location FROM docs \
+                 WHERE _location IN (\
                  's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet', \
                  's3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet') \
                  ORDER BY document_id",
@@ -575,20 +575,20 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT location FROM docs WHERE compression_level > 3 ORDER BY document_id LIMIT 5",
+                "SELECT _location FROM docs WHERE compression_level > 3 ORDER BY document_id LIMIT 5",
                 "docs_file_filter_metadata_select",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT filename, location FROM docs WHERE method = 'api' ORDER BY filename, document_id",
+                "SELECT filename, _location FROM docs WHERE method = 'api' ORDER BY filename, document_id",
                 "docs_file_filter_file_metadata_select",
             ).await;
 
             // Filter on nullable column (NULL doc_content)
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, location FROM docs WHERE doc_content IS NOT NULL ORDER BY document_id",
+                "SELECT document_id, _location FROM docs WHERE doc_content IS NOT NULL ORDER BY document_id",
                 "docs_not_null_filter",
             ).await;
 
@@ -596,13 +596,13 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT location FROM docs WHERE day = '2022-03-15' ORDER BY location",
+                "SELECT _location FROM docs WHERE day = '2022-03-15' ORDER BY _location",
                 "docs_partition_filter_metadata",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, filename, location FROM docs WHERE day = '2022-01-01' ORDER BY document_id",
+                "SELECT document_id, filename, _location FROM docs WHERE day = '2022-01-01' ORDER BY document_id",
                 "docs_partition_filter_file_metadata",
             ).await;
 
@@ -611,15 +611,15 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
             // File + location filter
             run_query_and_snapshot(
                 &rt,
-                "SELECT filename, location FROM docs \
-                 WHERE document_id = 'doc_1' AND location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
+                "SELECT filename, _location FROM docs \
+                 WHERE document_id = 'doc_1' AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
                 "docs_file_location_filter",
             ).await;
 
             // File + partition filter, metadata in select
             run_query_and_snapshot(
                 &rt,
-                "SELECT filename, location FROM docs WHERE compression = 'gzip' AND day = '2022-01-01' ORDER BY document_id",
+                "SELECT filename, _location FROM docs WHERE compression = 'gzip' AND day = '2022-01-01' ORDER BY document_id",
                 "docs_file_partition_filter",
             ).await;
 
@@ -627,13 +627,13 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT COUNT(*) AS cnt FROM docs WHERE location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
+                "SELECT COUNT(*) AS cnt FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
                 "docs_count_with_location",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT location, COUNT(*) AS cnt FROM docs GROUP BY location ORDER BY cnt DESC, location",
+                "SELECT _location, COUNT(*) AS cnt FROM docs GROUP BY _location ORDER BY cnt DESC, _location",
                 "docs_group_by_location",
             ).await;
 
@@ -641,19 +641,19 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT location AS loc FROM docs ORDER BY loc, document_id LIMIT 5",
+                "SELECT _location AS loc FROM docs ORDER BY loc, document_id LIMIT 5",
                 "docs_alias_metadata",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id AS doc_id, location FROM docs ORDER BY doc_id LIMIT 5",
+                "SELECT document_id AS doc_id, _location FROM docs ORDER BY doc_id LIMIT 5",
                 "docs_alias_file_metadata",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT upper(location) AS loc_upper FROM docs ORDER BY document_id LIMIT 3",
+                "SELECT upper(_location) AS loc_upper FROM docs ORDER BY document_id LIMIT 3",
                 "docs_scalar_fn_metadata",
             ).await;
 
@@ -661,13 +661,13 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT DISTINCT location FROM docs ORDER BY location",
+                "SELECT DISTINCT _location FROM docs ORDER BY _location",
                 "docs_distinct_location",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT DISTINCT day, location FROM docs ORDER BY day, location",
+                "SELECT DISTINCT day, _location FROM docs ORDER BY day, _location",
                 "docs_distinct_partition_metadata",
             ).await;
 
@@ -675,13 +675,13 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, location FROM docs ORDER BY location, document_id",
+                "SELECT document_id, _location FROM docs ORDER BY _location, document_id",
                 "docs_order_by_location",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, location FROM docs ORDER BY location DESC, document_id LIMIT 3",
+                "SELECT document_id, _location FROM docs ORDER BY _location DESC, document_id LIMIT 3",
                 "docs_order_by_location_desc",
             ).await;
 

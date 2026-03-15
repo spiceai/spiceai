@@ -2,4 +2,4 @@
 source: crates/runtime/tests/metadata/mod.rs
 expression: "format!(\"{schema}\")"
 ---
-Field { "location": nullable Utf8 }, Field { "cnt": Int64 }
+Field { "_location": nullable Utf8 }, Field { "cnt": Int64 }

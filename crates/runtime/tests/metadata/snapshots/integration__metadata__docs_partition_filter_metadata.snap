@@ -3,7 +3,7 @@ source: crates/runtime/tests/metadata/mod.rs
 expression: formatted
 ---
 +---------------------------------------------------------------------------------------+
-| location                                                                              |
+| _location                                                                             |
 +---------------------------------------------------------------------------------------+
 | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-15/data_0.parquet |
 | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-15/data_0.parquet |

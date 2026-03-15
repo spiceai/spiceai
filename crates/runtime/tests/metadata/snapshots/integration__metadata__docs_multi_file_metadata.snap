@@ -3,7 +3,7 @@ source: crates/runtime/tests/metadata/mod.rs
 expression: formatted
 ---
 +-------------+-----------------------+--------+---------------------------------------------------------------------------------------+
-| document_id | filename              | size   | location                                                                              |
+| document_id | filename              | size   | _location                                                                             |
 +-------------+-----------------------+--------+---------------------------------------------------------------------------------------+
 | doc_1       | requirements.pdf      | 1234.5 | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet |
 | doc_10      | postmortem_feb.md     | 6543.7 | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-15/data_0.parquet |
