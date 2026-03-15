@@ -16,8 +16,11 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use arrow_schema::Schema;
 use bytes::Bytes;
-use datafusion::{error::DataFusionError, prelude::SessionContext, sql::TableReference};
+use datafusion::{
+    common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
+};
 use datafusion_expr::{Expr, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
@@ -147,7 +150,9 @@ impl TablePartitionMetadata {
     pub fn all_executor_partitions(
         &self,
         ctx: &Arc<SessionContext>,
+        table_schema: Arc<Schema>,
     ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
+        let df_schema = DFSchema::try_from(Arc::clone(&table_schema))?;
         let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
         for PartitionMetadata {
             partition_value,
@@ -160,11 +165,9 @@ impl TablePartitionMetadata {
             let partition_predicate = partition_value
                 .iter()
                 .map(|(proj, lit)| {
-                    Ok(
-                        Expr::from_bytes_with_registry(proj.as_bytes(), ctx.as_ref())?.eq(
-                            Expr::from_bytes_with_registry(lit.as_bytes(), ctx.as_ref())?,
-                        ),
-                    )
+                    Ok(ctx
+                        .parse_sql_expr(proj, &df_schema)?
+                        .eq(ctx.parse_sql_expr(lit, &df_schema)?))
                 })
                 .collect::<Result<Vec<Expr>, DataFusionError>>()?
                 .into_iter()

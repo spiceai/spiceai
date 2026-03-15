@@ -186,8 +186,13 @@ pub(crate) async fn forward_federated_partitioned_write(
             });
         }
     };
+    let schema = ctx
+        .table_provider(path.clone())
+        .await
+        .context(CreateDFSchemaSnafu)?
+        .schema();
     let partitions_by_executor = table_partitions
-        .all_executor_partitions(Arc::clone(&ctx))
+        .all_executor_partitions(&ctx, schema)
         .context(ResolvePartitionsSnafu)?;
 
     let schema = Arc::new(

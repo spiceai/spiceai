@@ -493,22 +493,27 @@ impl FederatedPartitionProvider {
 
 impl TablePartitionProvider for FederatedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
-        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
-            return false;
-        };
-
-        #[cfg(not(windows))]
-        if default
-            .table_provider
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        self.partition_manager
+            .get_cached_table_metadata(&tbl.table_name)
             .is_some()
-        {
-            return true;
-        }
+        //     &&
+        // let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
+        //     return false;
+        // };
 
-        let _ = default; // suppress unused warning on windows
-        false
+        // #[cfg(not(windows))]
+        // if default
+        //     .table_provider
+        //     .as_any()
+        //     .downcast_ref::<CayenneTableProvider>()
+        //     .is_some()
+        // {
+        //     // TODO: this is the bug. Most likely this bad boy is wrapped like crazy.
+        //     return true;
+        // }
+
+        // let _ = default; // suppress unused warning on windows
+        // false
     }
 
     fn get_partitions(
