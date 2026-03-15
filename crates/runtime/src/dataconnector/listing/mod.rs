@@ -55,8 +55,12 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_source_path")
         .description("Specify a path to use for schema inference."),
     ParameterSpec::runtime("json_format")
-        .description("jsonl | ndjson | ldjson | array. Defaults to jsonl.")
-        .one_of(&["jsonl", "ndjson", "ldjson", "array"]),
+        .description("json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. Defaults to jsonl.")
+        .one_of(&["json", "jsonl", "ndjson", "ldjson", "array", "object", "soda", "socrata", "auto"]),
+    ParameterSpec::runtime("json_pointer")
+        .description("An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing."),
+    ParameterSpec::runtime("json_path")
+        .description("Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value."),
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
         .is_boolean(),

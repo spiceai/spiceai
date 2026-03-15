@@ -160,7 +160,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     path: &TableReference,
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
-    partition_by: &[Expr], // partition expressions as strings (e.g. "country", "date_trunc('day', timestamp)"
+    partition_by: &[Expr],
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_table_metadata(path).await {

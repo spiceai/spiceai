@@ -4,7 +4,7 @@
 
 Spice.ai has released 1.0-stable 🎉
 
-In the latest major version, the last 2 minor versions are supported for security updates.
+In the latest major version, the last 2 minor version series are supported for security updates.
 
 | Version | Supported          |
 |---------|--------------------|

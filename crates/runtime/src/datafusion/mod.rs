@@ -28,6 +28,7 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
@@ -876,10 +877,11 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns the partition column label for a table by querying the catalog provider.
+    /// Returns the partition expression for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
     /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
+    /// The returned string is parsed as a SQL expression against the table's schema.
     ///
     /// Note: this returns the catalog metadata label (historically named as an expression API),
     /// not a guaranteed round-trippable SQL expression.

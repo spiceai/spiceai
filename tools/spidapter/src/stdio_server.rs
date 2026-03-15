@@ -537,6 +537,29 @@ fn generate_adbc_create_table_statement(
         table_elements.push(format!("PRIMARY KEY ({primary_keys})"));
     }
 
+    if partition_columns.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "Dataset '{dataset_name}' specifies {} partition columns, but only a single partition column is supported",
+            partition_columns.len()
+        ));
+    }
+
+    if !partition_columns.is_empty() {
+        let schema_columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<HashSet<_>>();
+
+        for partition_column in partition_columns {
+            if !schema_columns.contains(partition_column) {
+                return Err(anyhow::anyhow!(
+                    "Dataset '{dataset_name}' has partition column '{partition_column}' that is not present in the schema"
+                ));
+            }
+        }
+    }
+
     let partition_clause = (!partition_columns.is_empty())
         .then(|| format!(" PARTITION BY ({})", partition_columns.join(", ")))
         .unwrap_or_default();
@@ -1467,6 +1490,80 @@ mod tests {
 
         assert!(
             err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_includes_partition_by() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string()],
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(
+            statement.contains("PARTITION BY (\"region\")"),
+            "expected PARTITION BY clause in: {statement}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_when_partition_column_missing() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["missing_col".to_string()],
+            },
+        )
+        .expect_err("partition column not in schema should fail");
+
+        assert!(
+            err.to_string().contains("is not present in the schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_for_multiple_partition_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("country", DataType::Utf8, true),
+        ]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string(), "country".to_string()],
+            },
+        )
+        .expect_err("multiple partition columns should fail");
+
+        assert!(
+            err.to_string()
+                .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
     }
