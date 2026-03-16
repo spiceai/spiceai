@@ -194,11 +194,13 @@ impl DataConnectorFactory for AdbcFactory {
             let component = params.component.clone();
 
             if uri_str == ":memory:" || uri_str.contains("mode=memory") {
-                return Err(DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: component,
-                    source: Box::new(Error::InMemoryUriNotSupported),
-                });
+                let err: Box<dyn std::error::Error + Send + Sync> =
+                    Box::new(DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "adbc".to_string(),
+                        connector_component: component,
+                        source: Box::new(Error::InMemoryUriNotSupported),
+                    });
+                return Err(err);
             }
 
             // Driver loading, database creation, and pool creation are all
