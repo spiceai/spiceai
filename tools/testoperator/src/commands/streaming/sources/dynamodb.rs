@@ -36,6 +36,7 @@ use aws_sdk_dynamodb::types::{
     ScalarAttributeType, StreamSpecification, StreamViewType, Tag, WriteRequest,
 };
 use futures::stream::{self, StreamExt};
+use rand::Rng;
 use test_framework::anyhow::{self, Context, Result};
 use tokio::time::sleep;
 
@@ -43,7 +44,7 @@ use tokio::time::sleep;
 const BATCH_SIZE: usize = 25;
 
 /// Number of concurrent batch write requests.
-const CONCURRENT_BATCHES: usize = 20;
+const CONCURRENT_BATCHES: usize = 2;
 
 /// Tag key for creation timestamp (Unix seconds).
 const TAG_CREATED_AT: &str = "testoperator:created_at";
@@ -606,9 +607,16 @@ impl DynamoDbStreamsSource {
                             && !remaining.is_empty()
                         {
                             retry_count += 1;
-                            let backoff = Duration::from_millis(100 * (1 << retry_count));
-                            sleep(backoff).await;
+                            let backoff_ms = 100 * (1u64 << retry_count);
+                            let jitter = rand::rng().random_range(0..=(backoff_ms / 2));
+                            let backoff = Duration::from_millis(backoff_ms + jitter);
                             items_to_write.clone_from(remaining);
+                            eprintln!(
+                                "  batch_write[batch {batch_idx}]: {}/{batch_len} items unprocessed, retry {retry_count}/{MAX_RETRIES}, backing off {}ms",
+                                items_to_write.len(),
+                                backoff.as_millis()
+                            );
+                            sleep(backoff).await;
                             continue;
                         }
 
@@ -617,6 +625,10 @@ impl DynamoDbStreamsSource {
                     }
 
                     if !items_to_write.is_empty() {
+                        eprintln!(
+                            "  batch_write[batch {batch_idx}]: giving up on {} items after {MAX_RETRIES} retries",
+                            items_to_write.len()
+                        );
                         return Err(anyhow::anyhow!(
                             "Failed to write {} items after {MAX_RETRIES} retries",
                             items_to_write.len()
@@ -718,9 +730,16 @@ impl DynamoDbStreamsSource {
                             && !remaining.is_empty()
                         {
                             retry_count += 1;
-                            let backoff = Duration::from_millis(100 * (1 << retry_count));
-                            sleep(backoff).await;
+                            let backoff_ms = 100 * (1u64 << retry_count);
+                            let jitter = rand::rng().random_range(0..=(backoff_ms / 2));
+                            let backoff = Duration::from_millis(backoff_ms + jitter);
                             items_to_delete.clone_from(remaining);
+                            eprintln!(
+                                "  batch_delete[batch {batch_idx}]: {}/{batch_len} items unprocessed, retry {retry_count}/{MAX_RETRIES}, backing off {}ms",
+                                items_to_delete.len(),
+                                backoff.as_millis()
+                            );
+                            sleep(backoff).await;
                             continue;
                         }
 
@@ -729,6 +748,10 @@ impl DynamoDbStreamsSource {
                     }
 
                     if !items_to_delete.is_empty() {
+                        eprintln!(
+                            "  batch_delete[batch {batch_idx}]: giving up on {} items after {MAX_RETRIES} retries",
+                            items_to_delete.len()
+                        );
                         return Err(anyhow::anyhow!(
                             "Failed to delete {} items after {MAX_RETRIES} retries",
                             items_to_delete.len()
