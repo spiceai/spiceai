@@ -23,6 +23,7 @@ use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::component::dataset::Dataset;
+use spicepod::param::Params;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
     params.insert("connection_pool_size".to_string(), "1".to_string());
 
     let mut dataset = Dataset::new(format!("adbc:{table}"), ds_name.to_string());
-    dataset.params = params;
+    dataset.params = Some(Params::from_string_map(params));
     dataset
 }
 
@@ -203,7 +204,7 @@ async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
             params.insert("connection_pool_size".to_string(), "1".to_string());
 
             let mut dataset = Dataset::new("adbc:test_table".to_string(), "test_table".to_string());
-            dataset.params = params;
+            dataset.params = Some(Params::from_string_map(params));
 
             let app = AppBuilder::new("adbc_duckdb_test")
                 .with_dataset(dataset)
@@ -380,7 +381,7 @@ async fn test_adbc_connection_options() -> Result<(), String> {
 
             let mut dataset =
                 Dataset::new("adbc:options_test".to_string(), "options_test".to_string());
-            dataset.params = params;
+            dataset.params = Some(Params::from_string_map(params));
 
             let app = AppBuilder::new("adbc_options_test")
                 .with_dataset(dataset)
@@ -416,7 +417,5 @@ async fn test_adbc_connection_options() -> Result<(), String> {
 
             Ok(())
         })
-        .await
-}
         .await
 }
