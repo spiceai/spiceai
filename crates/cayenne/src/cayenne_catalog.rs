@@ -766,39 +766,79 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(());
         }
 
-        // Build a batch insert with all PKs
-        // Using INSERT OR REPLACE to update sequence if PK already exists
-        let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
-        let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
-        let table_id = table_id.to_string();
+        // SQLite has a hard limit of 32,766 bind parameters per statement.
+        // Each row uses 4 params, so we chunk to stay within the limit.
+        const PARAMS_PER_ROW: usize = 4;
+        const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+        const MAX_ROWS_PER_BATCH: usize = SQLITE_MAX_VARIABLE_NUMBER / PARAMS_PER_ROW;
 
-        for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
-            let base = i * 4 + 1; // SQLite params are 1-indexed
-            values_parts.push(format!(
-                "(?{}, ?{}, ?{}, ?{})",
-                base,
-                base + 1,
-                base + 2,
-                base + 3
-            ));
-            params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
-            params.push(MetastoreValue::Text(table_id.clone()));
-            params.push(MetastoreValue::Blob(pk_bytes));
-            params.push(MetastoreValue::Integer(sequence_number));
+        let table_id = table_id.to_string();
+        let needs_transaction = pk_bytes_list.len() > MAX_ROWS_PER_BATCH;
+
+        if needs_transaction {
+            let begin = if self.metastore.is_turso() {
+                BEGIN_CONCURRENT_SQL
+            } else {
+                BEGIN_TRANSACTION_SQL
+            };
+            self.metastore
+                .execute_batch_helper(begin)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to begin transaction for insert records batch".to_string(),
+                    source: Box::new(e),
+                })?;
         }
 
-        let sql = format!(
-            "INSERT OR REPLACE INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
-            values_parts.join(", ")
-        );
+        for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_BATCH) {
+            let mut values_parts = Vec::with_capacity(chunk.len());
+            let mut params = Vec::with_capacity(chunk.len() * PARAMS_PER_ROW);
 
-        self.metastore
-            .execute_helper(ExecuteParams { sql: &sql, params })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to add insert record entries in batch".to_string(),
-                source: Box::new(e),
-            })?;
+            for (i, pk_bytes) in chunk.iter().enumerate() {
+                let base = i * PARAMS_PER_ROW + 1; // SQLite params are 1-indexed
+                values_parts.push(format!(
+                    "(?{}, ?{}, ?{}, ?{})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3
+                ));
+                params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
+                params.push(MetastoreValue::Text(table_id.clone()));
+                params.push(MetastoreValue::Blob(pk_bytes.clone()));
+                params.push(MetastoreValue::Integer(sequence_number));
+            }
+
+            let sql = format!(
+                "INSERT OR REPLACE INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
+                values_parts.join(", ")
+            );
+
+            if let Err(e) = self
+                .metastore
+                .execute_helper(ExecuteParams { sql: &sql, params })
+                .await
+            {
+                if needs_transaction {
+                    rollback_failed_compaction_transaction(&self.metastore).await;
+                }
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to add insert record entries in batch".to_string(),
+                    source: Box::new(e),
+                });
+            }
+        }
+
+        if needs_transaction {
+            if let Err(e) = self.metastore.execute_batch_helper(COMMIT_SQL).await {
+                rollback_failed_compaction_transaction(&self.metastore).await;
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to commit transaction for insert records batch".to_string(),
+                    source: Box::new(e),
+                });
+            }
+        }
+
         Ok(())
     }
 

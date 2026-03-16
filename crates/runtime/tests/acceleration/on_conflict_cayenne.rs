@@ -1987,3 +1987,148 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+/// Test that upserting >8191 rows doesn't hit the SQLite bind parameter limit.
+///
+/// SQLite has a hard limit of 32,766 bind parameters per statement.
+/// `add_insert_records_batch` uses 4 params per row, so >8191 rows
+/// (8192 × 4 = 32,768 > 32,766) will fail without chunking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(target_os = "windows"))]
+async fn test_cayenne_large_upsert_batch_sqlite_bind_limit() -> Result<(), anyhow::Error> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use cayenne::metadata::CreateTableOptions;
+    use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, on_conflict::OnConflict,
+    };
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let cayenne_dir = temp_dir.path().join("cayenne_bind_limit");
+            let metadata_db = temp_dir.path().join("metadata_bind_limit.db");
+            std::fs::create_dir_all(&cayenne_dir)?;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+
+            let table_options = CreateTableOptions {
+                table_name: "bind_limit_test".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: cayenne_dir.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            };
+
+            let connection_string = format!("sqlite://{}", metadata_db.to_string_lossy());
+            let catalog = Arc::new(CayenneCatalog::new(connection_string)?);
+            catalog.init().await?;
+            let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
+
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
+            let table = Arc::new(table);
+
+            ctx.register_table(
+                "bind_limit_test",
+                Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+            )?;
+
+            let num_rows: i64 = 10_000;
+
+            // Insert initial rows in batches of 1000 (to avoid huge SQL strings)
+            for batch_start in (1..=num_rows).step_by(1000) {
+                let batch_end = (batch_start + 999).min(num_rows);
+                let mut values = String::new();
+                for id in batch_start..=batch_end {
+                    if id > batch_start {
+                        values.push_str(", ");
+                    }
+                    let _ = write!(values, "({id}, 'original_{id}')");
+                }
+                ctx.sql(&format!(
+                    "INSERT INTO bind_limit_test (id, value) VALUES {values}"
+                ))
+                .await?
+                .collect()
+                .await?;
+            }
+
+            // Verify initial count
+            let result = ctx
+                .sql("SELECT COUNT(*) as cnt FROM bind_limit_test")
+                .await?
+                .collect()
+                .await?;
+            let expected = [
+                "+-------+",
+                "| cnt   |",
+                "+-------+",
+                "| 10000 |",
+                "+-------+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            // Upsert all 10,000 rows in a SINGLE write operation to trigger
+            // add_insert_records_batch with 10,000 PKs × 4 params = 40,000 bind params
+            // (exceeds SQLite's 32,766 limit). We build one large SQL INSERT so all
+            // conflicting PKs are collected in a single write_all_append call.
+            let mut values = String::new();
+            for id in 1..=num_rows {
+                if id > 1 {
+                    values.push_str(", ");
+                }
+                let _ = write!(values, "({id}, 'updated_{id}')");
+            }
+            ctx.sql(&format!(
+                "INSERT INTO bind_limit_test (id, value) VALUES {values}"
+            ))
+            .await?
+            .collect()
+            .await?;
+
+            // Verify count is still 10,000 (upsert, not duplicate insert)
+            let result = ctx
+                .sql("SELECT COUNT(*) as cnt FROM bind_limit_test")
+                .await?
+                .collect()
+                .await?;
+            let expected = [
+                "+-------+",
+                "| cnt   |",
+                "+-------+",
+                "| 10000 |",
+                "+-------+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            // Verify values were actually updated
+            let result = ctx
+                .sql("SELECT value FROM bind_limit_test WHERE id = 1")
+                .await?
+                .collect()
+                .await?;
+            let expected = [
+                "+-----------+",
+                "| value     |",
+                "+-----------+",
+                "| updated_1 |",
+                "+-----------+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            Ok(())
+        })
+        .await
+}
