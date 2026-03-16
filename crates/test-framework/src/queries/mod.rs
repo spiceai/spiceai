@@ -498,7 +498,7 @@ impl QuerySet {
     #[must_use]
     pub fn get_row_count_validation_skip_queries(
         &self,
-        _overrides: Option<QueryOverrides>,
+        overrides: Option<QueryOverrides>,
         scale_factor: f64,
     ) -> Vec<&'static str> {
         match self {
@@ -513,7 +513,7 @@ impl QuerySet {
             }
             QuerySet::Tpcds => {
                 // TPCDS queries that return 0 rows and should skip row count validation
-                vec![
+                let mut skip = vec![
                     "tpcds_q8",
                     "tpcds_q29",
                     "tpcds_q37",
@@ -522,7 +522,31 @@ impl QuerySet {
                     "tpcds_q54",
                     "tpcds_q58",
                     "tpcds_q76",
-                ]
+                ];
+                if matches!(overrides, Some(QueryOverrides::SQLite)) {
+                    // SQLite uses SF 0.01 as test data and many queries return 0 rows at that scale, so skip additional queries for SQLite
+                    skip.extend_from_slice(&[
+                        "tpcds_q4",
+                        "tpcds_q10",
+                        "tpcds_q15",
+                        "tpcds_q19",
+                        "tpcds_q20",
+                        "tpcds_q25",
+                        "tpcds_q30",
+                        "tpcds_q31",
+                        "tpcds_q40",
+                        "tpcds_q64",
+                        "tpcds_q65",
+                        "tpcds_q71",
+                        "tpcds_q73",
+                        "tpcds_q82",
+                        "tpcds_q84",
+                        "tpcds_q85",
+                        "tpcds_q91",
+                        "tpcds_q93",
+                    ]);
+                }
+                skip
             }
             QuerySet::Clickbench => {
                 // ClickBench queries that currently return 0 rows and should skip row count validation
