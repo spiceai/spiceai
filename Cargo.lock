@@ -473,7 +473,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -493,7 +493,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -506,7 +506,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "ahash 0.8.12",
  "arrow-buffer",
@@ -524,7 +524,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "bytes",
  "half",
@@ -535,7 +535,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -556,7 +556,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -570,7 +570,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -624,7 +624,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -660,7 +660,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -672,7 +672,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -684,7 +684,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "bitflags 2.10.0",
  "serde",
@@ -695,7 +695,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -708,7 +708,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5642,7 +5642,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=43c04eb#43c04ebdf80eafc199ebe9262c50fd4b2ac6f048"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=09379a9#09379a9818b9e3fc10c0a52c7f6cb3fa99c1eaf8"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -6075,7 +6075,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=eeaa4085e7238736abe8166f2afb795e6d99c08c#eeaa4085e7238736abe8166f2afb795e6d99c08c"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=9748420cbbd92d40369bce45d9e3227ca7cd261a#9748420cbbd92d40369bce45d9e3227ca7cd261a"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -13322,7 +13322,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=ca671dd37d73b730938f77f7a7ad76545280a4a8#ca671dd37d73b730938f77f7a7ad76545280a4a8"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",

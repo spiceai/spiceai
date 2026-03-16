@@ -340,6 +340,7 @@ impl SQLExecutor for MockSQLExecutor {
         &self,
         _query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Create test data
         let data = RecordBatch::try_new(
