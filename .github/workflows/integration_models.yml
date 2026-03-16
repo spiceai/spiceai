@@ -6,7 +6,7 @@ on:
     branches:
       - trunk
       - release/*
-  pull_request_target:
+  pull_request:
     branches:
       - trunk
       - release-*
@@ -72,7 +72,6 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
@@ -120,8 +119,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -173,8 +170,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -265,8 +260,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -314,8 +307,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -359,8 +350,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -394,8 +383,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -436,7 +423,6 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
@@ -481,8 +467,6 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
