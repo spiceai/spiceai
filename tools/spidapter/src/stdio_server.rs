@@ -488,10 +488,15 @@ fn generate_adbc_create_table_statement(
     dataset_name: &str,
     dataset: &DatasetConfig,
 ) -> anyhow::Result<String> {
+    let DatasetConfig {
+        schema,
+        primary_key_columns,
+        partition_columns,
+        ..
+    } = dataset;
     let quoted_dataset_name = quote_identifier(dataset_name);
 
-    let column_definitions = dataset
-        .schema
+    let column_definitions = schema
         .fields()
         .iter()
         .map(|field| {
@@ -509,15 +514,14 @@ fn generate_adbc_create_table_statement(
     }
 
     let mut table_elements = column_definitions;
-    if !dataset.primary_key_columns.is_empty() {
-        let schema_columns = dataset
-            .schema
+    if !primary_key_columns.is_empty() {
+        let schema_columns = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect::<HashSet<_>>();
 
-        for primary_key_column in &dataset.primary_key_columns {
+        for primary_key_column in primary_key_columns {
             if !schema_columns.contains(primary_key_column) {
                 return Err(anyhow::anyhow!(
                     "Dataset '{dataset_name}' has primary key column '{primary_key_column}' that is not present in the schema"
@@ -525,8 +529,7 @@ fn generate_adbc_create_table_statement(
             }
         }
 
-        let primary_keys = dataset
-            .primary_key_columns
+        let primary_keys = primary_key_columns
             .iter()
             .map(|column| quote_identifier(column))
             .collect::<Vec<_>>()
@@ -534,8 +537,42 @@ fn generate_adbc_create_table_statement(
         table_elements.push(format!("PRIMARY KEY ({primary_keys})"));
     }
 
+    if partition_columns.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "Dataset '{dataset_name}' specifies {} partition columns, but only a single partition column is supported",
+            partition_columns.len()
+        ));
+    }
+
+    if !partition_columns.is_empty() {
+        let schema_columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<HashSet<_>>();
+
+        for partition_column in partition_columns {
+            if !schema_columns.contains(partition_column) {
+                return Err(anyhow::anyhow!(
+                    "Dataset '{dataset_name}' has partition column '{partition_column}' that is not present in the schema"
+                ));
+            }
+        }
+    }
+
+    let partition_clause = if partition_columns.is_empty() {
+        String::new()
+    } else {
+        let quoted = partition_columns
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" PARTITION BY ({quoted})")
+    };
+
     Ok(format!(
-        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}){partition_clause}",
         table_elements.join(", ")
     ))
 }
@@ -612,9 +649,15 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
-    let (app_id, app_api_key) = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
+    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
 
-    let api_key = app_api_key.ok_or_else(|| {
+    // Fetch API key from the dedicated api-keys endpoint
+    let api_keys = cloud
+        .get_api_keys(app_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch API keys for app '{app_name}': {e}"))?;
+
+    let api_key = api_keys.api_key.ok_or_else(|| {
         anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
     })?;
 
@@ -1460,6 +1503,80 @@ mod tests {
 
         assert!(
             err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_includes_partition_by() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string()],
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(
+            statement.contains("PARTITION BY (\"region\")"),
+            "expected PARTITION BY clause in: {statement}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_when_partition_column_missing() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["missing_col".to_string()],
+            },
+        )
+        .expect_err("partition column not in schema should fail");
+
+        assert!(
+            err.to_string().contains("is not present in the schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_for_multiple_partition_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("country", DataType::Utf8, true),
+        ]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string(), "country".to_string()],
+            },
+        )
+        .expect_err("multiple partition columns should fail");
+
+        assert!(
+            err.to_string()
+                .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
     }

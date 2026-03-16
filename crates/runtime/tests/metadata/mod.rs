@@ -17,10 +17,14 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
+use arrow::record_batch::RecordBatch;
 use datafusion_datasource::metadata::MetadataColumn;
 use futures::StreamExt;
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::{
+    component::dataset::{Dataset, TimeFormat},
+    param::Params,
+};
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -47,6 +51,29 @@ pub fn get_s3_hive_partitioned_dataset(
             serde_json::Value::String("enabled".to_string()),
         );
     }
+    dataset
+}
+
+fn get_docs_dataset() -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-public-datasets/test_documents_partitioned/",
+        "docs",
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+            ("hive_partitioning_enabled".to_string(), "true".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.time_column = Some("day".to_string());
+    dataset.time_format = Some(TimeFormat::Date);
+    dataset.metadata.insert(
+        "_location".to_string(),
+        serde_json::Value::String("enabled".to_string()),
+    );
     dataset
 }
 
@@ -414,4 +441,275 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             Ok(())
         })
         .await
+}
+
+/// Extended metadata test using the `docs` dataset (10 file columns + 1 partition + 1 metadata).
+#[tokio::test]
+async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("s3_metadata_columns_extended")
+                .with_dataset(get_docs_dataset())
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            // ── Ad-hoc tests for previously known issues ──
+
+            // file + metadata select with location predicate
+            run_query_and_snapshot(
+                &rt,
+                "SELECT doc_content, _location, day, size FROM docs \
+                 WHERE document_id = 'doc_1' \
+                 AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
+                 AND doc_content IS NOT NULL",
+                "docs_file_metadata_with_location_pred",
+            ).await;
+
+            // Same as above but with alias on file column
+            run_query_and_snapshot(
+                &rt,
+                "SELECT doc_content AS content, _location, day, size FROM docs \
+                 WHERE document_id = 'doc_1' \
+                 AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
+                 AND doc_content IS NOT NULL",
+                "docs_file_metadata_with_location_pred_alias",
+            ).await;
+
+            // ── Baseline: SELECT * ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT * FROM docs ORDER BY document_id LIMIT 5",
+                "docs_select_star",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT * FROM docs WHERE day = '2022-01-01' ORDER BY document_id",
+                "docs_select_star_partition_filter",
+            ).await;
+
+            // ── File-only projection (metadata enabled but not referenced) ──
+            // Validates the conditional guard allows the swap optimization
+            // when the projection doesn't reference any metadata column.
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, filename FROM docs ORDER BY document_id LIMIT 5",
+                "docs_file_only_no_metadata",
+            ).await;
+
+            // ── Metadata-only projections ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT _location FROM docs ORDER BY _location, document_id LIMIT 5",
+                "docs_metadata_only",
+            ).await;
+
+            // Metadata + partition only (no file columns)
+            run_query_and_snapshot(
+                &rt,
+                "SELECT day, _location FROM docs ORDER BY day, _location, document_id LIMIT 5",
+                "docs_partition_metadata_only",
+            ).await;
+
+            // ── File + metadata projections ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, _location FROM docs ORDER BY document_id LIMIT 5",
+                "docs_file_metadata",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, filename, size, _location FROM docs ORDER BY document_id LIMIT 5",
+                "docs_multi_file_metadata",
+            ).await;
+
+            // All column types: file + partition + metadata
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, day, _location FROM docs ORDER BY document_id LIMIT 5",
+                "docs_file_partition_metadata",
+            ).await;
+
+            // ── Location pruning ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT * FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
+                "docs_location_eq_star",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, filename FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
+                "docs_location_eq_projected",
+            ).await;
+
+            // Location IN with multiple files
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, _location FROM docs \
+                 WHERE _location IN (\
+                 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet', \
+                 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet') \
+                 ORDER BY document_id",
+                "docs_location_in",
+            ).await;
+
+            // ── File column filter + metadata in select ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT _location FROM docs WHERE compression_level > 3 ORDER BY document_id LIMIT 5",
+                "docs_file_filter_metadata_select",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT filename, _location FROM docs WHERE method = 'api' ORDER BY filename, document_id",
+                "docs_file_filter_file_metadata_select",
+            ).await;
+
+            // Filter on nullable column (NULL doc_content)
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, _location FROM docs WHERE doc_content IS NOT NULL ORDER BY document_id",
+                "docs_not_null_filter",
+            ).await;
+
+            // ── Partition filter + metadata ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT _location FROM docs WHERE day = '2022-03-15' ORDER BY _location",
+                "docs_partition_filter_metadata",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, filename, _location FROM docs WHERE day = '2022-01-01' ORDER BY document_id",
+                "docs_partition_filter_file_metadata",
+            ).await;
+
+            // ── Combined filters ──
+
+            // File + location filter
+            run_query_and_snapshot(
+                &rt,
+                "SELECT filename, _location FROM docs \
+                 WHERE document_id = 'doc_1' AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
+                "docs_file_location_filter",
+            ).await;
+
+            // File + partition filter, metadata in select
+            run_query_and_snapshot(
+                &rt,
+                "SELECT filename, _location FROM docs WHERE compression = 'gzip' AND day = '2022-01-01' ORDER BY document_id",
+                "docs_file_partition_filter",
+            ).await;
+
+            // ── Aggregations ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT COUNT(*) AS cnt FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
+                "docs_count_with_location",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT _location, COUNT(*) AS cnt FROM docs GROUP BY _location ORDER BY cnt DESC, _location",
+                "docs_group_by_location",
+            ).await;
+
+            // ── Aliases and expressions ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT _location AS loc FROM docs ORDER BY loc, document_id LIMIT 5",
+                "docs_alias_metadata",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id AS doc_id, _location FROM docs ORDER BY doc_id LIMIT 5",
+                "docs_alias_file_metadata",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT upper(_location) AS loc_upper FROM docs ORDER BY document_id LIMIT 3",
+                "docs_scalar_fn_metadata",
+            ).await;
+
+            // ── DISTINCT ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT DISTINCT _location FROM docs ORDER BY _location",
+                "docs_distinct_location",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT DISTINCT day, _location FROM docs ORDER BY day, _location",
+                "docs_distinct_partition_metadata",
+            ).await;
+
+            // ── ORDER BY on metadata ──
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, _location FROM docs ORDER BY _location, document_id",
+                "docs_order_by_location",
+            ).await;
+
+            run_query_and_snapshot(
+                &rt,
+                "SELECT document_id, _location FROM docs ORDER BY _location DESC, document_id LIMIT 3",
+                "docs_order_by_location_desc",
+            ).await;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Executes a query against the runtime, snapshots both the schema and the
+/// formatted result rows under `{snapshot_name}_schema` and `{snapshot_name}`.
+async fn run_query_and_snapshot(rt: &Runtime, query: &str, snapshot_name: &str) {
+    let mut query_result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .expect("query should succeed");
+
+    let schema = query_result.data.schema();
+    insta::assert_snapshot!(format!("{snapshot_name}_schema"), format!("{schema}"));
+
+    let mut batches: Vec<RecordBatch> = vec![];
+    while let Some(batch) = query_result.data.next().await {
+        batches.push(batch.expect("batch should be valid"));
+    }
+
+    let formatted =
+        arrow::util::pretty::pretty_format_batches(&batches).expect("formatting should succeed");
+    insta::assert_snapshot!(snapshot_name.to_string(), formatted);
 }
