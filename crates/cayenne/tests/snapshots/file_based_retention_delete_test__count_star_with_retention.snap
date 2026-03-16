@@ -1,0 +1,6 @@
+---
+source: crates/cayenne/tests/file_based_retention_delete_test.rs
+expression: explain_plan
+---
+ProjectionExec: expr=[3 as count(*)]
+  PlaceholderRowExec

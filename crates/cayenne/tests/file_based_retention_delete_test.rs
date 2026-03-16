@@ -69,6 +69,9 @@ test_with_backends!(test_pk_file_based_retention_multiple_protected_snapshots_im
 test_with_backends!(test_cache_invalidated_after_append_impl);
 test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 
+// Query plan optimization tests
+test_with_backends!(test_count_star_uses_placeholder_with_retention_impl);
+
 /// Test: File-based retention physically deletes files that are fully expired.
 ///
 /// Setup (3-second retention, position-based / no PK):
@@ -932,6 +935,54 @@ async fn test_pk_file_based_retention_multiple_protected_snapshots_impl(
         "Expired rows removed, fresh rows preserved across snapshots",
     )
     .await?;
+
+    Ok(())
+}
+
+/// Test: `count(*)` resolves via `PlaceholderRowExec` (`AggregateStatistics`
+/// optimization) even when time-based retention is configured.
+///
+/// Without the metadata-only scan optimization, injecting the time-based retention
+/// filter forces the time column into the projection, which defeats
+/// `AggregateStatistics` and causes a full table scan.
+///
+/// Setup (60-second retention, position-based / no PK):
+///   - 3 files inserted with fresh timestamps (all within retention).
+///
+/// Verify: the physical plan for `SELECT count(*)` contains
+/// `PlaceholderRowExec` and does NOT contain `DataSourceExec`.
+async fn test_count_star_uses_placeholder_with_retention_impl(fixture: TestFixture) -> TestResult {
+    let retention_seconds = 60;
+    let table_name = "count_star_plan";
+    let ctx = SessionContext::new();
+    let table =
+        create_retention_table(&fixture, table_name, retention_seconds, ctx.runtime_env()).await?;
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    insert_row(&table, 1, now_us).await?;
+    insert_row(&table, 2, now_us - 1_000_000).await?;
+    insert_row(&table, 3, now_us - 2_000_000).await?;
+
+    ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    let df = ctx
+        .sql(&format!("SELECT count(*) FROM {table_name}"))
+        .await?;
+    let physical_plan = df.clone().create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+
+    insta::assert_snapshot!("count_star_with_retention", explain_plan);
+
+    // Verify correctness: count should equal the number of inserted rows.
+    let batches = df.collect().await?;
+    let count = batches
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .and_then(|a| a.values().first().copied())
+        .unwrap_or(0);
+    assert_eq!(count, 3, "count(*) should return 3");
 
     Ok(())
 }

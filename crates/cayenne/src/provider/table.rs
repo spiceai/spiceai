@@ -3789,12 +3789,28 @@ impl TableProvider for CayenneTableProvider {
             };
 
         // Time-based retention: build a keep filter at scan time.
+        // Retention deletes run concurrently with queries and may physically remove
+        // data files at any moment. The keep filter (`time_col >= cutoff`) ensures
+        // the scan never attempts to open a file that the retention task has already
+        // deleted, preventing I/O errors from concurrent file removal.
+        //
         // Prefer the builder (produces correctly-typed timestamps matching the
         // column's timezone) over the legacy Expr+simplify path.
         // Injected at two layers:
         // 1. Appended to scan filters for file-level statistics pruning (Vortex should_prune)
         // 2. Wrapped as a physical FilterExec for row-level filtering
-        let retention_keep_filter = if let Some(ref builder) = self.time_retention_filter_builder {
+        //
+        // Skip the retention filter when the projection is empty (e.g. `count(*)`).
+        // An empty projection means no column data is needed — only row counts from
+        // file-level statistics. Injecting the retention filter would force reading
+        // the time column for every row, turning a cheap metadata-only operation into
+        // a full table scan. This is safe because `count(*)` is resolved from cached
+        // ListingTable statistics via DataFusion's AggregateStatistics optimization
+        // (PlaceholderRowExec), without opening individual data files.
+        let is_metadata_only_scan = projection.is_some_and(Vec::is_empty);
+        let retention_keep_filter = if is_metadata_only_scan {
+            None
+        } else if let Some(ref builder) = self.time_retention_filter_builder {
             let filter = builder.keep_filter();
             let filter = util::expr::simplify_expr(filter, &self.table_metadata.schema)?;
             Some(filter)
