@@ -524,7 +524,21 @@ impl QuerySet {
                     "tpcds_q76",
                 ]
             }
-            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Clickbench => {
+                // ClickBench queries that currently return 0 rows and should skip row count validation
+                // https://github.com/spiceai/spiceai/issues/8802
+                vec![
+                    "clickbench_q20",
+                    "clickbench_q37",
+                    "clickbench_q38",
+                    "clickbench_q39",
+                    "clickbench_q40",
+                    "clickbench_q41",
+                    "clickbench_q42",
+                    "clickbench_q43",
+                ]
+            }
+            QuerySet::Scenario { .. } => vec![],
         }
     }
 }
