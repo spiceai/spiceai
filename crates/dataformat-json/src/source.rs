@@ -272,7 +272,9 @@ impl FileOpener for SpiceJsonOpener {
                     // Buffer the content for SODA auto-detection when Auto
                     let mut raw_buf = Vec::new();
                     let mut bytes = bytes;
-                    bytes.read_to_end(&mut raw_buf).map_err(DataFusionError::from)?;
+                    bytes
+                        .read_to_end(&mut raw_buf)
+                        .map_err(DataFusionError::from)?;
 
                     // Check SODA on raw data before json_pointer extraction.
                     let is_soda = format == Format::Soda
@@ -290,7 +292,8 @@ impl FileOpener for SpiceJsonOpener {
 
                     // SODA format: convert to NDJSON via SodaReader
                     if is_soda {
-                        let soda = SodaReader::from_vec(&raw_buf, soda_metadata).map_err(DataFusionError::from)?;
+                        let soda = SodaReader::from_vec(&raw_buf, soda_metadata)
+                            .map_err(DataFusionError::from)?;
                         let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                             .with_batch_size(batch_size)
                             .build(BufReader::new(soda))?;
@@ -379,7 +382,9 @@ impl FileOpener for SpiceJsonOpener {
                     // because they must parse the entire JSON document.
                     // Auto needs buffering to peek the first byte then decode.
                     // Object and JSONL/Array can stream directly.
-                    if json_pointer.is_some() || matches!(format, Format::Auto | Format::Json | Format::Soda) {
+                    if json_pointer.is_some()
+                        || matches!(format, Format::Auto | Format::Json | Format::Soda)
+                    {
                         let s = s.map_err(DataFusionError::from);
                         let decompressed = file_compression_type.convert_stream(s.boxed())?;
                         let chunks: Vec<bytes::Bytes> = decompressed.try_collect().await?;
@@ -405,8 +410,8 @@ impl FileOpener for SpiceJsonOpener {
                         }
 
                         if is_soda {
-                            let soda =
-                                SodaReader::from_vec(&all_bytes, soda_metadata).map_err(DataFusionError::from)?;
+                            let soda = SodaReader::from_vec(&all_bytes, soda_metadata)
+                                .map_err(DataFusionError::from)?;
                             let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                                 .with_batch_size(batch_size)
                                 .build(BufReader::new(soda))?;

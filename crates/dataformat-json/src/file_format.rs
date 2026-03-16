@@ -272,8 +272,7 @@ impl FileFormat for SpiceJsonFormat {
 
                     // Check SODA on raw data before json_pointer extraction.
                     let is_soda = self.options.format == Format::Soda
-                        || (self.options.format == Format::Auto
-                            && is_soda_response(&raw_buf));
+                        || (self.options.format == Format::Auto && is_soda_response(&raw_buf));
 
                     if is_soda && self.options.json_pointer.is_some() {
                         return Err(DataFusionError::Configuration(
@@ -337,8 +336,7 @@ impl FileFormat for SpiceJsonFormat {
                     decoder.read_to_end(&mut raw_buf)?;
 
                     let is_soda = self.options.format == Format::Soda
-                        || (self.options.format == Format::Auto
-                            && is_soda_response(&raw_buf));
+                        || (self.options.format == Format::Auto && is_soda_response(&raw_buf));
 
                     if is_soda && self.options.json_pointer.is_some() {
                         return Err(DataFusionError::Configuration(

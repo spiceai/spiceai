@@ -626,12 +626,13 @@ fn soda_field(field_name: &str, data_type_name: &str) -> Field {
     match data_type_name {
         "number" | "money" | "percent" => Field::new(field_name, DataType::Float64, true),
         "checkbox" => Field::new(field_name, DataType::Boolean, true),
-        "calendar_date" => {
-            Field::new(field_name, DataType::Timestamp(TimeUnit::Second, None), true)
-        }
-        "uuid" => {
-            Field::new(field_name, DataType::FixedSizeBinary(16), true).with_extension_type(ArrowUuid)
-        }
+        "calendar_date" => Field::new(
+            field_name,
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        ),
+        "uuid" => Field::new(field_name, DataType::FixedSizeBinary(16), true)
+            .with_extension_type(ArrowUuid),
         "meta_data" => soda_meta_data_field(field_name),
         _ => Field::new(field_name, DataType::Utf8, true),
     }
@@ -646,10 +647,11 @@ fn soda_field(field_name: &str, data_type_name: &str) -> Field {
 /// - `:sid`, `:created_meta`, `:updated_meta`, `:meta` — string/JSON metadata
 fn soda_meta_data_field(field_name: &str) -> Field {
     match field_name {
-        ":id" => Field::new(field_name, DataType::Utf8, true),
-        ":position" => Field::new(field_name, DataType::Int64, true),
-        ":created_at" | ":updated_at" => Field::new(field_name, DataType::Int64, true),
-        // :sid, :created_meta, :updated_meta, :meta, and any unknown meta fields
+        // :position — integer row position; :created_at / :updated_at — epoch timestamps
+        ":position" | ":created_at" | ":updated_at" => {
+            Field::new(field_name, DataType::Int64, true)
+        }
+        // :id, :sid, :created_meta, :updated_meta, :meta, and any unknown meta fields → Utf8
         _ => Field::new(field_name, DataType::Utf8, true),
     }
 }
@@ -663,7 +665,10 @@ fn soda_meta_data_field(field_name: &str) -> Field {
 ///
 /// Returns an error if the JSON is not a valid SODA response (missing `meta.view.columns`
 /// or if the columns array cannot be read).
-pub fn soda_schema_from_meta(value: &serde_json::Value, include_metadata: bool) -> io::Result<Schema> {
+pub fn soda_schema_from_meta(
+    value: &serde_json::Value,
+    include_metadata: bool,
+) -> io::Result<Schema> {
     let columns = value
         .pointer("/meta/view/columns")
         .and_then(serde_json::Value::as_array)
@@ -2632,7 +2637,8 @@ mod tests {
                 &[],
             );
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
-            let err = soda_schema_from_meta(&val, false).expect_err("should fail: no visible columns");
+            let err =
+                soda_schema_from_meta(&val, false).expect_err("should fail: no visible columns");
             assert!(err.to_string().contains("no user-visible columns"));
         }
 
@@ -2664,11 +2670,11 @@ mod tests {
         #[test]
         fn test_soda_reader_include_metadata() {
             let input = soda_response(
-                &[
-                    (":sid", "meta_data", "SID"),
-                    ("name", "text", "Name"),
-                ],
-                &[vec![serde_json::json!("row-abc"), serde_json::json!("Alice")]],
+                &[(":sid", "meta_data", "SID"), ("name", "text", "Name")],
+                &[vec![
+                    serde_json::json!("row-abc"),
+                    serde_json::json!("Alice"),
+                ]],
             );
 
             // Without metadata
@@ -2677,7 +2683,8 @@ mod tests {
             assert_eq!(soda.schema().field(0).name(), "name");
 
             // With metadata
-            let mut soda = SodaReader::new(Cursor::new(input.as_bytes()), true).expect("should parse");
+            let mut soda =
+                SodaReader::new(Cursor::new(input.as_bytes()), true).expect("should parse");
             assert_eq!(soda.schema().fields().len(), 2);
             assert_eq!(soda.schema().field(0).name(), ":sid");
             assert_eq!(soda.schema().field(1).name(), "name");
@@ -2704,7 +2711,11 @@ mod tests {
                 ("f_money", "money", DataType::Float64),
                 ("f_percent", "percent", DataType::Float64),
                 ("f_checkbox", "checkbox", DataType::Boolean),
-                ("f_date", "calendar_date", DataType::Timestamp(TimeUnit::Second, None)),
+                (
+                    "f_date",
+                    "calendar_date",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                ),
                 ("f_uuid", "uuid", DataType::FixedSizeBinary(16)),
                 ("f_url", "url", DataType::Utf8),
                 ("f_location", "location", DataType::Utf8),
@@ -3438,8 +3449,7 @@ mod tests {
             let lines = auto_detect_and_read(input).expect("should read");
             assert_eq!(lines.len(), 2);
             // Inner arrays become {"0":1,"1":2} etc.
-            let parsed: serde_json::Value =
-                serde_json::from_str(&lines[0]).expect("valid JSON");
+            let parsed: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid JSON");
             assert_eq!(parsed["0"], 1);
             assert_eq!(parsed["1"], 2);
         }
@@ -4133,8 +4143,7 @@ mod tests {
             assert!(r0.get(":created_at").is_none());
             assert!(r0.get(":meta").is_none());
 
-            let last: serde_json::Value =
-                serde_json::from_str(lines[202]).expect("parse last row");
+            let last: serde_json::Value = serde_json::from_str(lines[202]).expect("parse last row");
             assert_eq!(last["observation_date"], "2025-07-01T00:00:00");
             assert_eq!(last["ctsthpi"], "708.94");
         }
@@ -4320,7 +4329,10 @@ mod tests {
             // Meta columns present with correct types
             assert!(r0.get(":sid").is_some());
             assert!(r0[":position"].is_number(), ":position should be a number");
-            assert!(r0[":created_at"].is_number(), ":created_at should be a number");
+            assert!(
+                r0[":created_at"].is_number(),
+                ":created_at should be a number"
+            );
             // User columns present
             assert_eq!(r0["date"], "2001-01-01T00:00:00");
             assert_eq!(r0["county"], "Fairfield");
@@ -4336,8 +4348,8 @@ mod tests {
             std::io::Read::read_to_end(&mut std::io::BufReader::new(extracted), &mut buf)
                 .expect("read");
             // Should be an array of arrays — use ArrayToNdjson
-            let adapter = ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf)))
-                .expect("ArrayToNdjson");
+            let adapter =
+                ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf))).expect("ArrayToNdjson");
             let lines = read_all_lines(adapter).expect("read lines");
             assert_eq!(lines.len(), 203);
             // Each inner array → positional object with keys "0", "1", ...
@@ -4355,8 +4367,8 @@ mod tests {
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut std::io::BufReader::new(extracted), &mut buf)
                 .expect("read");
-            let adapter = ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf)))
-                .expect("ArrayToNdjson");
+            let adapter =
+                ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf))).expect("ArrayToNdjson");
             let lines = read_all_lines(adapter).expect("read lines");
             assert_eq!(lines.len(), 2358);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse row 0");
@@ -4437,7 +4449,8 @@ mod tests {
 
         #[test]
         fn test_auto_detect_rejects_object_with_meta_but_no_data() {
-            let data = br#"{"meta":{"view":{"columns":[{"fieldName":"x","dataTypeName":"text"}]}}}"#;
+            let data =
+                br#"{"meta":{"view":{"columns":[{"fieldName":"x","dataTypeName":"text"}]}}}"#;
             assert!(
                 !is_soda_response(data),
                 "object with meta but no data should not be detected as SODA"
@@ -4751,8 +4764,8 @@ mod tests {
         fn test_file_bom_whitespace_array_native() {
             let data = load_fixture("bom_whitespace_array.json");
             // Native: read as array via ArrayToNdjson
-            let adapter = ArrayToNdjson::try_new(Cursor::new(data))
-                .expect("should parse BOM+ws array file");
+            let adapter =
+                ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse BOM+ws array file");
             let lines = read_all_lines(adapter).expect("should read");
             assert_eq!(lines.len(), 2);
             let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
