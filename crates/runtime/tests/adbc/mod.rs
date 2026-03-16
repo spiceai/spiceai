@@ -35,9 +35,16 @@ fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
     dataset
 }
 
+fn temp_sqlite_uri(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("spice_adbc_test_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("test.db").to_string_lossy().to_string()
+}
+
 #[tokio::test]
 async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let db_path = temp_sqlite_uri("basic");
 
     test_request_context()
         .scope(async {
@@ -45,7 +52,7 @@ async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
                 .with_dataset(make_adbc_sqlite_dataset(
                     "test_table",
                     "test_table",
-                    ":memory:",
+                    &db_path,
                 ))
                 .build();
 
@@ -180,7 +187,7 @@ async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
         .scope(async {
             let mut params = HashMap::new();
             params.insert("adbc_driver".to_string(), "duckdb".to_string());
-            params.insert("adbc_uri".to_string(), ":memory:".to_string());
+            params.insert("adbc_uri".to_string(), temp_sqlite_uri("duckdb"));
             params.insert("connection_pool_size".to_string(), "1".to_string());
 
             let mut dataset = Dataset::new("adbc:test_table".to_string(), "test_table".to_string());
@@ -243,11 +250,12 @@ async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
 #[tokio::test]
 async fn test_adbc_read_write_operations() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let db_path = temp_sqlite_uri("rw");
 
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("adbc_rw_test")
-                .with_dataset(make_adbc_sqlite_dataset("rw_table", "rw_table", ":memory:"))
+                .with_dataset(make_adbc_sqlite_dataset("rw_table", "rw_table", &db_path))
                 .build();
 
             let status = runtime_ready_check(app).await;
@@ -330,13 +338,14 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
 #[tokio::test]
 async fn test_adbc_connection_options() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let db_path = temp_sqlite_uri("options");
 
     test_request_context()
         .scope(async {
             // Test with only declared/supported connection options
             let mut params = HashMap::new();
             params.insert("adbc_driver".to_string(), "sqlite".to_string());
-            params.insert("adbc_uri".to_string(), ":memory:".to_string());
+            params.insert("adbc_uri".to_string(), db_path.clone());
             params.insert("connection_pool_size".to_string(), "3".to_string());
             params.insert("connection_pool_min_idle".to_string(), "1".to_string());
 

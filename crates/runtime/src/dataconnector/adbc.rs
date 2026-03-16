@@ -43,6 +43,9 @@ pub enum Error {
     #[snafu(display("Missing required parameter: adbc_uri"))]
     MissingAdbcUri,
 
+    #[snafu(display("In-memory database URIs (e.g., ':memory:') are not supported by the ADBC connector. Use specific data connectors (e.g., 'duckdb', 'sqlite') instead."))]
+    InMemoryUriNotSupported,
+
     #[snafu(display(
         "Invalid value for parameter '{name}': expected a positive integer, got '{value}'"
     ))]
@@ -190,19 +193,13 @@ impl DataConnectorFactory for AdbcFactory {
 
             let component = params.component.clone();
 
-            // In-memory URIs (e.g., `:memory:`) create isolated databases per
-            // connection, so pooling more than one connection leads to data
-            // inconsistency. Force pool_size=1 and warn when the user asked
-            // for more.
-            let is_memory_uri = uri_str == ":memory:" || uri_str.contains("mode=memory");
-            let (pool_size, pool_min_idle) = if is_memory_uri {
-                if pool_size.is_some_and(|s| s > 1) || pool_min_idle.is_some_and(|s| s > 1) {
-                    tracing::warn!("In-memory URI detected — overriding connection_pool_size and connection_pool_min_idle to 1 to prevent data inconsistency");
-                }
-                (Some(1), Some(1))
-            } else {
-                (pool_size, pool_min_idle)
-            };
+            if uri_str == ":memory:" || uri_str.contains("mode=memory") {
+                return Err(DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: component,
+                    source: Box::new(Error::InMemoryUriNotSupported),
+                });
+            }
 
             // Driver loading, database creation, and pool creation are all
             // synchronous FFI/IO operations — offload to a blocking thread.
