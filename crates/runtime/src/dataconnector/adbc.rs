@@ -174,18 +174,16 @@ impl DataConnectorFactory for AdbcFactory {
             };
 
             let pool_size = parse_pool_param("connection_pool_size").map_err(|e| {
-                DataConnectorError::InvalidConfiguration {
+                DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
-                    message: String::new(),
                     source: Box::new(e),
                 }
             })?;
             let pool_min_idle = parse_pool_param("connection_pool_min_idle").map_err(|e| {
-                DataConnectorError::InvalidConfiguration {
+                DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
-                    message: String::new(),
                     source: Box::new(e),
                 }
             })?;
