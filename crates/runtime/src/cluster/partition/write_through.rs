@@ -26,8 +26,12 @@ use arrow_flight::{
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
-use datafusion::sql::{ResolvedTableReference, TableReference};
-use datafusion_expr::{Expr, execution_props::ExecutionProps};
+use datafusion::{
+    common::DFSchema,
+    scalar::ScalarValue,
+    sql::{ResolvedTableReference, TableReference},
+};
+use datafusion_expr::{Expr, execution_props::ExecutionProps, expr::ScalarFunction};
 use datafusion_proto::bytes::Serializeable;
 use futures::TryStreamExt as _;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -160,7 +164,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     path: &TableReference,
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
-    partition_by: &[Expr],
+    raw_partition_by: &[String],
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_table_metadata(path).await {
@@ -191,6 +195,13 @@ pub(crate) async fn forward_federated_partitioned_write(
         .await
         .context(CreateDFSchemaSnafu)?
         .schema();
+
+    let partition_by = raw_partition_by
+        .iter()
+        .map(|p| ctx.parse_sql_expr(p, &DFSchema::try_from(Arc::clone(&schema))?))
+        .collect::<Result<Vec<Expr>, _>>()
+        .context(CreateDFSchemaSnafu)?;
+
     let partitions_by_executor = table_partitions
         .all_executor_partitions(&ctx, schema)
         .context(ResolvePartitionsSnafu)?;
@@ -202,11 +213,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     let executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
-    let partition_phys_exprs = build_partition_physical_exprs(partition_by, &schema)?;
-    let partition_expr_keys = partition_phys_exprs
-        .iter()
-        .map(|(e, _)| e.to_string())
-        .collect::<Vec<String>>();
+    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, &schema)?; //i changed
 
     let tbl = path
         .clone()
@@ -241,7 +248,7 @@ pub(crate) async fn forward_federated_partitioned_write(
             &executor_filters,
             &senders,
             &partition_phys_exprs,
-            &partition_expr_keys,
+            &raw_partition_by,
             &partitions_by_executor,
             &partition_manager,
             path,
@@ -263,7 +270,7 @@ pub(crate) async fn forward_federated_partitioned_write(
                 &executor_filters,
                 &senders,
                 &partition_phys_exprs,
-                &partition_expr_keys,
+                &raw_partition_by,
                 &partitions_by_executor,
                 &partition_manager,
                 path,
@@ -323,11 +330,7 @@ async fn route_batch_and_assign_unseen(
         let partition_value: PartitionValue = partition_expr_keys
             .iter()
             .zip(scalar_values.iter())
-            .map(|(expr_key, scalar)| {
-                let lit_expr = Expr::Literal(scalar.clone(), None);
-                let lit_bytes = lit_expr.to_bytes().context(SerializeExprSnafu)?;
-                Ok((expr_key.clone(), scalar.to_string()))
-            })
+            .map(|(expr_key, scalar)| Ok((expr_key.clone(), scalar.to_string())))
             .collect::<Result<HashMap<_, _>>>()?;
 
         // Select least-loaded executor.
@@ -368,6 +371,7 @@ async fn route_matched_and_collect_unmatched(
     let mut any_matched = arrow::array::BooleanArray::from(vec![false; batch.num_rows()]);
 
     for (executor_id, filter_expr) in executor_filters {
+        tracing::warn!("[route_matched_and_collect_unmatched] on {filter_expr:?}");
         let arr = filter_expr
             .evaluate(batch)
             .context(FilterEvalSnafu {

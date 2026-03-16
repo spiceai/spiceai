@@ -358,7 +358,7 @@ fn get_partitions_from_manager(
             return Vec::new();
         };
 
-        tracing::debug!(
+        tracing::warn!(
             "No partition assignments for table {table:?}; routing query to executor '{executor_id}'"
         );
 

@@ -1412,7 +1412,7 @@ impl CayennePartitionCreator {
             .iter()
             .map(|p| match &p.expression {
                 Expr::Column(col) => col.name.clone(),
-                _ => p.name.clone(),
+                _ => p.name.clone(), // Nope
             })
             .collect()
     }

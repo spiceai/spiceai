@@ -204,8 +204,8 @@ pub(crate) async fn handle(
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
-        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|_| Status::internal(format!(
-            "in distributed mode, Cayenne tables must have 'partition_by' expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
+        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
+            "in distributed mode, Cayenne tables must have 'partition_by' expressions defined to be written to via Flight. Table `{path}` does not have partition expressions. Error: {e}"
         )))?
         && matches!(
             datafusion.cluster_config.effective_role(),

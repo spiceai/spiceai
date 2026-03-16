@@ -125,13 +125,25 @@ impl PartitionManager {
     ///  schedulers will not re-initialize, since a file exists, even if blank). If the file already
     /// exists, this is a no-op and returns `Ok(false)`.
     pub async fn initialize_blank_metadata(&self, table: &TableReference) -> Result<bool> {
+        self.initialize_metadata(table, Vec::new()).await
+    }
+
+    /// Initialize partition metadata for a table with the given partition expression SQL strings.
+    ///
+    /// If the file already exists, this is a no-op and returns `Ok(false)`.
+    pub async fn initialize_metadata(
+        &self,
+        table: &TableReference,
+        partition_expressions: Vec<String>,
+    ) -> Result<bool> {
         // If its cached, can avoid insert operation. Optimisation to reduce object store calls.
         if self.get_cached_table_metadata(table).is_some() {
             return Ok(false);
         }
         let key = table.to_string();
         let now_ms = now_ms()?;
-        let metadata = TablePartitionMetadata::blank(table.to_string(), now_ms);
+        let mut metadata = TablePartitionMetadata::blank(table.to_string(), now_ms);
+        metadata.partition_expressions = partition_expressions;
 
         match self
             .state
@@ -147,10 +159,13 @@ impl PartitionManager {
     /// Update partition metadata with discovered partitions, all marked as unassigned.
     ///
     /// This replaces the partitions list with the provided partition values.
+    /// If `partition_expressions` is non-empty, it also sets the SQL expression strings
+    /// (only when currently empty, to avoid overwriting values set during table creation).
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
         partition_values: Vec<HashMap<String, String>>,
+        partition_expressions: Vec<String>,
     ) -> Result<()> {
         let key = table.to_string();
         let now_ms = now_ms()?;
@@ -165,6 +180,9 @@ impl PartitionManager {
             .map(PartitionMetadata::new)
             .collect();
         metadata.updated_at = now_ms;
+        if metadata.partition_expressions.is_empty() {
+            metadata.partition_expressions = partition_expressions;
+        }
 
         self.write_metadata(&key, metadata).await
     }

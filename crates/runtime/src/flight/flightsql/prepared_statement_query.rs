@@ -192,7 +192,7 @@ pub(crate) struct PreparedStatement {
 pub(crate) async fn do_action_create_prepared_statement(
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
-    tracing::trace!("do_action_create_prepared_statement: {statement:?}");
+    tracing::warn!("do_action_create_prepared_statement: {statement:#?}");
     set_flightsql_protocol().await;
 
     let query = convert_jdbc_parameter_placeholders(&statement.query).map_err(error_to_status)?;
@@ -1429,10 +1429,10 @@ mod tests {
     fn test_rewrite_sql_table_alias_q7_pattern() {
         // This is the exact pattern that was failing in TPC-H Q7 parameterized queries
         let sql = r"
-            SELECT n1.n_name, n2.n_name 
-            FROM nation n1, nation n2 
+            SELECT n1.n_name, n2.n_name
+            FROM nation n1, nation n2
             WHERE (
-                (n1.n_name = $1 AND n2.n_name = $2) 
+                (n1.n_name = $1 AND n2.n_name = $2)
                 OR (n1.n_name = $3 AND n2.n_name = $4)
             )";
 
@@ -1510,12 +1510,12 @@ mod tests {
     fn test_rewrite_sql_cte_workaround_pattern() {
         // CTE pattern
         let sql = r"
-            WITH n1 AS (SELECT * FROM nation), 
-                 n2 AS (SELECT * FROM nation) 
-            SELECT n1.n_name, n2.n_name 
-            FROM n1, n2 
+            WITH n1 AS (SELECT * FROM nation),
+                 n2 AS (SELECT * FROM nation)
+            SELECT n1.n_name, n2.n_name
+            FROM n1, n2
             WHERE (
-                (n1.n_name = $1 AND n2.n_name = $2) 
+                (n1.n_name = $1 AND n2.n_name = $2)
                 OR (n1.n_name = $3 AND n2.n_name = $4)
             )";
 
@@ -1571,10 +1571,10 @@ mod tests {
     fn test_rewrite_sql_table_alias_no_params() {
         // Query with table aliases but no parameters - should pass through unchanged
         let sql = r"
-            SELECT n1.n_name, n2.n_name 
-            FROM nation n1, nation n2 
+            SELECT n1.n_name, n2.n_name
+            FROM nation n1, nation n2
             WHERE (
-                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
                 OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
             )";
 
@@ -1614,12 +1614,12 @@ mod tests {
     #[test]
     fn test_rewrite_sql_cte_no_params() {
         let sql = r"
-            WITH n1 AS (SELECT * FROM nation), 
-                 n2 AS (SELECT * FROM nation) 
-            SELECT n1.n_name, n2.n_name 
-            FROM n1, n2 
+            WITH n1 AS (SELECT * FROM nation),
+                 n2 AS (SELECT * FROM nation)
+            SELECT n1.n_name, n2.n_name
+            FROM n1, n2
             WHERE (
-                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
                 OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
             )";
 

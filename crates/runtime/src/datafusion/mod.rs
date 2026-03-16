@@ -883,12 +883,13 @@ impl DataFusion {
     /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
     /// The returned string is parsed as a SQL expression against the table's schema.
     ///
-    /// Note: this returns the catalog metadata label (historically named as an expression API),
-    /// not a guaranteed round-trippable SQL expression.
+    /// When the catalog returns an auto-generated label like `"expr0"` (used for function
+    /// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
+    /// is resolved from [`TablePartitionMetadata`] stored in the partition manager.
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
-    ) -> Result<Option<Expr>, DataFusionError> {
+    ) -> Result<Option<String>, DataFusionError> {
         let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
         if let Some(catalog) = self.resolve_catalog_provider(table_reference)
             && let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref())
@@ -898,9 +899,28 @@ impl DataFusion {
                 .boxed()
                 .map_err(DataFusionError::External)?
         {
-            return self.sql_expr(table_reference, &expr_string).await.map(Some);
+            let resolved = self
+                .resolve_partition_label(&expr_string, table_reference)
+                .unwrap_or(expr_string);
+            return Ok(Some(resolved));
         };
         Ok(None)
+    }
+
+    /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
+    /// the original SQL expression string from the partition manager metadata.
+    fn resolve_partition_label(
+        &self,
+        label: &str,
+        table_reference: &TableReference,
+    ) -> Option<String> {
+        let idx: usize = label.strip_prefix("expr")?.parse().ok()?;
+        let metadata = self
+            .executor_registry
+            .as_ref()?
+            .federated_partition_manager()
+            .get_cached_table_metadata(table_reference)?;
+        metadata.partition_expressions.get(idx).cloned()
     }
 
     /// Parses a SQL expression string into a DataFusion `Expr`, using the schema of the given table reference for resolution.

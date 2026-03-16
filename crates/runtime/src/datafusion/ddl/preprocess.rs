@@ -138,6 +138,7 @@ pub fn preprocess_create_table_with_options(
 
     // Extract PARTITION BY expression if present
     let partition_by_expr = create_table.partition_by.clone();
+    tracing::warn!("Extracted PARTITION BY expression: {partition_by_expr:?}");
 
     let has_with_options = with_options.is_some();
     let has_partition_by = partition_by_expr.is_some();

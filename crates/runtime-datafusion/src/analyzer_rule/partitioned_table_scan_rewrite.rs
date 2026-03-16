@@ -146,7 +146,6 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 
             let mut sub_scans = Vec::with_capacity(providers.len());
             for (provider, partition_values) in providers {
-                let source = DefaultTableSource::new(Arc::clone(&provider));
                 let mut filters = scan.filters.clone();
 
                 // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
@@ -162,7 +161,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 }
                 let plan = LogicalPlanBuilder::scan_with_filters(
                     scan.table_name.clone(),
-                    Arc::new(source),
+                    Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
                     scan.projection.clone(),
                     filters,
                 )?

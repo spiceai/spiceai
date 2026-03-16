@@ -777,6 +777,7 @@ impl Query {
                     };
                     (stream, update_plan)
                 } else {
+                    tracing::error!("plan={}", plan.display_indent());
                     // For regular plans, use the standard physical plan execution
                     let physical_plan = match session.create_physical_plan(&plan).await {
                         Ok(stream) => stream,
@@ -792,6 +793,10 @@ impl Query {
                             )
                         }
                     };
+                    tracing::error!(
+                        "physical_plan={}",
+                        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+                    );
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
 

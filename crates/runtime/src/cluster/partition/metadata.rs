@@ -116,6 +116,11 @@ pub struct TablePartitionMetadata {
     pub schema_version: u32,
     /// Last updated timestamp (milliseconds since UNIX epoch)
     pub updated_at: u128,
+    /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
+    /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
+    /// original SQL expression for query routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_expressions: Vec<String>,
 }
 
 impl TablePartitionMetadata {
@@ -126,6 +131,7 @@ impl TablePartitionMetadata {
             partitions: Vec::new(),
             schema_version,
             updated_at,
+            partition_expressions: Vec::new(),
         }
     }
 

@@ -118,7 +118,7 @@ impl ScalarUDFImpl for Bucket {
             }
             .into());
         }
-        Ok(DataType::Int32)
+        Ok(arg_types[0].clone())
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
@@ -129,13 +129,17 @@ impl ScalarUDFImpl for Bucket {
             return Err(BucketError::InvalidArgumentCount { count: args.len() }.into());
         }
 
-        let num_buckets = match &args[0] {
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(n))) => {
-                if *n <= 0 || *n > MAX_NUM_BUCKETS {
-                    return Err(BucketError::InvalidNumBuckets { num_buckets: *n }.into());
+        let (num_buckets, output_type) = match &args[0] {
+            ColumnarValue::Scalar(scalar) => match scalar_to_i64(scalar) {
+                Some(n) if n > 0 && n <= MAX_NUM_BUCKETS => (n, scalar.data_type()),
+                Some(n) => return Err(BucketError::InvalidNumBuckets { num_buckets: n }.into()),
+                None => {
+                    return Err(BucketError::InvalidFirstArgType {
+                        description: describe_columnar_value(&args[0]),
+                    }
+                    .into());
                 }
-                *n
-            }
+            },
             arg => {
                 return Err(BucketError::InvalidFirstArgType {
                     description: describe_columnar_value(arg),
@@ -147,15 +151,61 @@ impl ScalarUDFImpl for Bucket {
         tracing::trace!("Computing bucket with num_buckets: {num_buckets}");
 
         match &args[1] {
-            ColumnarValue::Scalar(scalar) => {
-                let bucket = compute_bucket(scalar, num_buckets)?;
+            ColumnarValue::Scalar(value) => {
+                let bucket = compute_bucket(value, num_buckets, &output_type)?;
                 Ok(ColumnarValue::Scalar(bucket))
             }
             ColumnarValue::Array(array) => {
-                let buckets = compute_bucket_array(array, num_buckets)?;
-                Ok(ColumnarValue::Array(Arc::new(buckets)))
+                let buckets = compute_bucket_array(array, num_buckets, &output_type)?;
+                Ok(ColumnarValue::Array(buckets))
             }
         }
+    }
+}
+
+/// Wraps a bucket value (u64) into the appropriate `ScalarValue` for the given output type.
+fn wrap_bucket(bucket: u64, output_type: &DataType) -> Result<ScalarValue, DataFusionError> {
+    match output_type {
+        DataType::Int8 => Ok(ScalarValue::Int8(Some(
+            i8::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::Int16 => Ok(ScalarValue::Int16(Some(
+            i16::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::Int32 => Ok(ScalarValue::Int32(Some(
+            i32::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::Int64 => Ok(ScalarValue::Int64(Some(
+            i64::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::UInt8 => Ok(ScalarValue::UInt8(Some(
+            u8::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::UInt16 => Ok(ScalarValue::UInt16(Some(
+            u16::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::UInt32 => Ok(ScalarValue::UInt32(Some(
+            u32::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+        DataType::UInt64 => Ok(ScalarValue::UInt64(Some(bucket))),
+        _ => Ok(ScalarValue::Int32(Some(
+            i32::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
+        ))),
+    }
+}
+
+/// Attempts to extract an `i64` value from any integer-typed `ScalarValue`.
+fn scalar_to_i64(scalar: &ScalarValue) -> Option<i64> {
+    match scalar {
+        ScalarValue::Int8(Some(n)) => Some(i64::from(*n)),
+        ScalarValue::Int16(Some(n)) => Some(i64::from(*n)),
+        ScalarValue::Int32(Some(n)) => Some(i64::from(*n)),
+        ScalarValue::Int64(Some(n)) => Some(*n),
+        ScalarValue::UInt8(Some(n)) => Some(i64::from(*n)),
+        ScalarValue::UInt16(Some(n)) => Some(i64::from(*n)),
+        ScalarValue::UInt32(Some(n)) => Some(i64::from(*n)),
+        ScalarValue::UInt64(Some(n)) => i64::try_from(*n).ok(),
+        _ => None,
     }
 }
 
@@ -172,21 +222,28 @@ fn describe_columnar_value(value: &ColumnarValue) -> String {
     }
 }
 
-fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue, DataFusionError> {
+fn compute_bucket(
+    scalar: &ScalarValue,
+    num_buckets: i64,
+    output_type: &DataType,
+) -> Result<ScalarValue, DataFusionError> {
     if scalar.is_null() {
-        return Ok(ScalarValue::Int32(None));
+        return Ok(ScalarValue::try_from(output_type).context(DataFusionSnafu)?);
     }
     let array = scalar.to_array()?;
     let mut hashes = vec![0; 1];
     create_hashes(&[array], &RANDOM_STATE, &mut hashes)?;
-    Ok(ScalarValue::Int32(Some(
-        u64::try_from(num_buckets)
-            .and_then(|n| i32::try_from(hashes[0] % n))
-            .context(BucketLargerThanTypeSnafu)?,
-    )))
+    let bucket = u64::try_from(num_buckets)
+        .map(|n| hashes[0] % n)
+        .context(BucketLargerThanTypeSnafu)?;
+    wrap_bucket(bucket, output_type)
 }
 
-fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
+fn compute_bucket_array(
+    array: &ArrayRef,
+    num_buckets: i64,
+    output_type: &DataType,
+) -> Result<ArrayRef, DataFusionError> {
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
     let mut hashes = vec![0u64; array.len()];
@@ -209,7 +266,7 @@ fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array
 
     let result = Int32Array::new(bucket_array.values().clone(), array.nulls().cloned());
 
-    Ok(result)
+    Ok(arrow::compute::cast(&result, output_type)?)
 }
 
 #[cfg(test)]
@@ -277,19 +334,19 @@ mod tests {
             .collect();
 
         // Verify all results are identical to the first
-        if let ColumnarValue::Scalar(ScalarValue::Int32(Some(first_bucket))) = results[0] {
+        if let ColumnarValue::Scalar(ScalarValue::Int64(Some(first_bucket))) = results[0] {
             for (i, result) in results.iter().enumerate().skip(1) {
-                if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
+                if let ColumnarValue::Scalar(ScalarValue::Int64(Some(bucket))) = result {
                     assert_eq!(
                         first_bucket, *bucket,
                         "Non-deterministic bucket for scalar at invocation {i}"
                     );
                 } else {
-                    panic!("Expected Int32 scalar at invocation {i}");
+                    panic!("Expected Int64 scalar at invocation {i}");
                 }
             }
         } else {
-            panic!("Expected Int32 scalar for first invocation");
+            panic!("Expected Int64 scalar for first invocation");
         }
     }
 
@@ -319,16 +376,16 @@ mod tests {
         if let ColumnarValue::Array(first_array) = &results[0] {
             let first_int_array = first_array
                 .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("downcast to Int32Array for first invocation");
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("downcast to Int64Array for first invocation");
             assert_eq!(first_int_array.len(), 3);
 
             for (i, result) in results.iter().enumerate().skip(1) {
                 if let ColumnarValue::Array(array) = result {
                     let int_array = array
                         .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap_or_else(|| panic!("downcast to Int32Array for invocation {i}"));
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap_or_else(|| panic!("downcast to Int64Array for invocation {i}"));
                     assert_eq!(int_array.len(), 3);
                     for j in 0..3 {
                         let bucket = int_array.value(j);
@@ -339,11 +396,11 @@ mod tests {
                         );
                     }
                 } else {
-                    panic!("Expected Int32 array for invocation {i}");
+                    panic!("Expected Int64 array for invocation {i}");
                 }
             }
         } else {
-            panic!("Expected Int32 array for first invocation");
+            panic!("Expected Int64 array for first invocation");
         }
     }
 
