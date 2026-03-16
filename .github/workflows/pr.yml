@@ -70,7 +70,7 @@ jobs:
   # Run Rust linting
   lint-rust:
     name: Rust Lint
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     needs: check_changes
 
     steps:
