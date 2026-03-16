@@ -498,7 +498,7 @@ impl QuerySet {
     #[must_use]
     pub fn get_row_count_validation_skip_queries(
         &self,
-        _overrides: Option<QueryOverrides>,
+        overrides: Option<QueryOverrides>,
         scale_factor: f64,
     ) -> Vec<&'static str> {
         match self {
@@ -513,7 +513,7 @@ impl QuerySet {
             }
             QuerySet::Tpcds => {
                 // TPCDS queries that return 0 rows and should skip row count validation
-                vec![
+                let mut skip = vec![
                     "tpcds_q8",
                     "tpcds_q29",
                     "tpcds_q37",
@@ -522,9 +522,47 @@ impl QuerySet {
                     "tpcds_q54",
                     "tpcds_q58",
                     "tpcds_q76",
+                ];
+                if matches!(overrides, Some(QueryOverrides::SQLite)) {
+                    // SQLite uses SF 0.01 as test data and many queries return 0 rows at that scale, so skip additional queries for SQLite
+                    skip.extend_from_slice(&[
+                        "tpcds_q4",
+                        "tpcds_q10",
+                        "tpcds_q15",
+                        "tpcds_q19",
+                        "tpcds_q20",
+                        "tpcds_q25",
+                        "tpcds_q30",
+                        "tpcds_q31",
+                        "tpcds_q40",
+                        "tpcds_q64",
+                        "tpcds_q65",
+                        "tpcds_q71",
+                        "tpcds_q73",
+                        "tpcds_q82",
+                        "tpcds_q84",
+                        "tpcds_q85",
+                        "tpcds_q91",
+                        "tpcds_q93",
+                    ]);
+                }
+                skip
+            }
+            QuerySet::Clickbench => {
+                // ClickBench queries that currently return 0 rows and should skip row count validation
+                // https://github.com/spiceai/spiceai/issues/8802
+                vec![
+                    "clickbench_q20",
+                    "clickbench_q37",
+                    "clickbench_q38",
+                    "clickbench_q39",
+                    "clickbench_q40",
+                    "clickbench_q41",
+                    "clickbench_q42",
+                    "clickbench_q43",
                 ]
             }
-            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Scenario { .. } => vec![],
         }
     }
 }
@@ -570,6 +608,7 @@ pub enum QueryOverrides {
     MSSqlCatalog,
     Spicecloud,
     DynamoDB,
+    Arrow,
 }
 
 impl QueryOverrides {
@@ -584,6 +623,7 @@ impl QueryOverrides {
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
             "dynamodb" => Some(Self::DynamoDB),
+            "arrow" => Some(Self::Arrow),
             _ => None,
         }
     }
@@ -949,6 +989,9 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
             queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
             64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
+        ),
+        Some(QueryOverrides::Arrow) => remove_tpcds_query!(
+            queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),
         Some(_) | None => queries,
     }
