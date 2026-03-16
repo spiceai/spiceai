@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::source::SpiceJsonSource;
 use crate::{
     ArrayToNdjson, ArrayToNdjsonPush, JsonPointerReader, ReadResult, SodaReader,
-    extract_flattened_from_nested, peek_first_non_ws_byte, unnest_struct_schema,
+    extract_flattened_from_nested, is_soda_response, peek_first_non_ws_byte, unnest_struct_schema,
 };
 
 use arrow::array::RecordBatch;
@@ -39,6 +39,7 @@ use arrow::json::reader::{ValueIter, infer_json_schema_from_iterator};
 use async_trait::async_trait;
 use bytes::Buf;
 use datafusion::common::parsers::CompressionTypeVariant;
+use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -75,12 +76,15 @@ pub struct SpiceJsonOptions {
     /// E.g. `"/data"` for `{"data": [...]}` or `"/response/items"` for nested objects.
     /// A leading `/` is added automatically if missing.
     pub json_pointer: Option<String>,
+    /// When `true`, include Socrata `meta_data` columns (sid, id, position, etc.)
+    /// in the schema for SODA format responses. Disabled by default.
+    pub soda_metadata: bool,
 }
 
 #[derive(Debug, Snafu)]
 pub enum FormatParseError {
     #[snafu(display(
-        "Invalid JSON format '{s}'. Valid formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'",
+        "Invalid JSON format '{s}'. Valid formats are: 'auto', 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata'",
     ))]
     InvalidFormat { s: String },
 }
@@ -96,8 +100,12 @@ pub enum Format {
     /// Single JSON object format. The file contains exactly one JSON object
     /// (e.g. `{"name": "Alice", "age": 30}`) which produces a single row.
     Object,
-    /// Auto-detect format by peeking at the first non-whitespace byte.
-    /// `[` → Array, `{` → Object, otherwise → Jsonl.
+    /// Plain JSON: auto-detect array vs JSONL by peeking at the first byte,
+    /// but do NOT perform SODA auto-detection.
+    /// Use this when the user explicitly sets `file_format: json`.
+    Json,
+    /// Auto-detect format including SODA. Peeks at the first non-whitespace byte
+    /// (`[` → Array, `{` → check for SODA, otherwise → Jsonl).
     Auto,
     /// SODA (Socrata Open Data API) format.
     /// The response is a JSON object with `meta.view.columns` for schema
@@ -116,7 +124,8 @@ impl FromStr for Format {
             "jsonl" | "ndjson" | "ldjson" => Ok(Format::Jsonl),
             "array" => Ok(Format::Array),
             "object" => Ok(Format::Object),
-            "json" | "auto" => Ok(Format::Auto),
+            "json" => Ok(Format::Json),
+            "auto" => Ok(Format::Auto),
             "soda" | "socrata" => Ok(Format::Soda),
             _ => InvalidFormatSnafu { s: s.to_string() }.fail(),
         }
@@ -128,9 +137,10 @@ impl Default for SpiceJsonOptions {
         Self {
             compression: CompressionTypeVariant::UNCOMPRESSED,
             schema_infer_max_rec: None,
-            format: Format::Jsonl,
+            format: Format::Auto,
             flatten_json: None,
             json_pointer: None,
+            soda_metadata: false,
         }
     }
 }
@@ -198,6 +208,13 @@ impl SpiceJsonFormat {
         };
         self
     }
+
+    /// When `true`, include Socrata `meta_data` columns in the SODA schema.
+    #[must_use]
+    pub fn with_soda_metadata(mut self, enabled: bool) -> Self {
+        self.options.soda_metadata = enabled;
+        self
+    }
 }
 
 #[async_trait]
@@ -247,17 +264,29 @@ impl FileFormat for SpiceJsonFormat {
             let r = store.as_ref().get(&object.location).await?;
             let schema = match r.payload {
                 GetResultPayload::File(file, _) => {
-                    let decoder = file_compression_type.convert_read(file)?;
+                    let mut decoder = file_compression_type.convert_read(file)?;
 
-                    if self.options.format == Format::Soda {
-                        // Apply json_pointer before SODA if both are configured
-                        let decoder: Box<dyn std::io::Read + Send> =
-                            if let Some(path) = &self.options.json_pointer {
-                                Box::new(JsonPointerReader::new(decoder, path)?)
-                            } else {
-                                decoder
-                            };
-                        let soda = SodaReader::new(decoder)?;
+                    // Buffer everything so we can probe for SODA when Auto.
+                    let mut raw_buf = Vec::new();
+                    decoder.read_to_end(&mut raw_buf)?;
+
+                    // Check SODA on raw data before json_pointer extraction.
+                    let is_soda = self.options.format == Format::Soda
+                        || (self.options.format == Format::Auto
+                            && is_soda_response(&raw_buf));
+
+                    if is_soda && self.options.json_pointer.is_some() {
+                        return Err(DataFusionError::Configuration(
+                            "'json_pointer' cannot be used with SODA format data. \
+                             SODA responses contain their own schema in 'meta.view.columns' \
+                             and data is extracted automatically. \
+                             Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
+                                .to_string(),
+                        ));
+                    }
+
+                    if is_soda {
+                        let soda = SodaReader::from_vec(&raw_buf, self.options.soda_metadata)?;
                         let schema = soda.schema().clone();
                         if let Some(separator) = &self.options.flatten_json {
                             unnest_struct_schema(&schema, separator)
@@ -265,19 +294,22 @@ impl FileFormat for SpiceJsonFormat {
                             schema
                         }
                     } else {
-                        let reader: Box<dyn std::io::Read + Send> =
-                            if let Some(path) = &self.options.json_pointer {
-                                Box::new(JsonPointerReader::new(decoder, path)?)
-                            } else {
-                                decoder
-                            };
-                        let mut reader = BufReader::new(reader);
+                        let buf = if let Some(path) = &self.options.json_pointer {
+                            let extracted = JsonPointerReader::from_vec(&raw_buf, path)?;
+                            let mut out = Vec::new();
+                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
+                            out
+                        } else {
+                            raw_buf
+                        };
+
+                        let mut reader = BufReader::new(std::io::Cursor::new(buf));
 
                         let is_array = match self.options.format {
                             Format::Array => true,
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
-                            Format::Auto => {
+                            Format::Auto | Format::Json => {
                                 peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
                             }
                         };
@@ -301,22 +333,25 @@ impl FileFormat for SpiceJsonFormat {
                 GetResultPayload::Stream(_) => {
                     let data = r.bytes().await?;
                     let mut decoder = file_compression_type.convert_read(data.reader())?;
-                    // Read decompressed bytes once; reuse via from_vec to avoid
-                    // an extra copy through SodaReader::new / JsonPointerReader::new.
-                    let mut buf = Vec::new();
-                    decoder.read_to_end(&mut buf)?;
+                    let mut raw_buf = Vec::new();
+                    decoder.read_to_end(&mut raw_buf)?;
 
-                    if self.options.format == Format::Soda {
-                        // Apply json_pointer before SODA if both are configured
-                        let buf = if let Some(path) = &self.options.json_pointer {
-                            let extracted = JsonPointerReader::from_vec(&buf, path)?;
-                            let mut out = Vec::new();
-                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
-                            out
-                        } else {
-                            buf
-                        };
-                        let soda = SodaReader::from_vec(&buf)?;
+                    let is_soda = self.options.format == Format::Soda
+                        || (self.options.format == Format::Auto
+                            && is_soda_response(&raw_buf));
+
+                    if is_soda && self.options.json_pointer.is_some() {
+                        return Err(DataFusionError::Configuration(
+                            "'json_pointer' cannot be used with SODA format data. \
+                             SODA responses contain their own schema in 'meta.view.columns' \
+                             and data is extracted automatically. \
+                             Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
+                                .to_string(),
+                        ));
+                    }
+
+                    if is_soda {
+                        let soda = SodaReader::from_vec(&raw_buf, self.options.soda_metadata)?;
                         let schema = soda.schema().clone();
                         if let Some(separator) = &self.options.flatten_json {
                             unnest_struct_schema(&schema, separator)
@@ -324,19 +359,22 @@ impl FileFormat for SpiceJsonFormat {
                             schema
                         }
                     } else {
-                        let reader: Box<dyn std::io::Read + Send> =
-                            if let Some(path) = &self.options.json_pointer {
-                                Box::new(JsonPointerReader::from_vec(&buf, path)?)
-                            } else {
-                                Box::new(std::io::Cursor::new(buf))
-                            };
-                        let mut reader = BufReader::new(reader);
+                        let buf = if let Some(path) = &self.options.json_pointer {
+                            let extracted = JsonPointerReader::from_vec(&raw_buf, path)?;
+                            let mut out = Vec::new();
+                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
+                            out
+                        } else {
+                            raw_buf
+                        };
+
+                        let mut reader = BufReader::new(std::io::Cursor::new(buf));
 
                         let is_array = match self.options.format {
                             Format::Array => true,
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
-                            Format::Auto => {
+                            Format::Auto | Format::Json => {
                                 peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
                             }
                         };
@@ -389,12 +427,13 @@ impl FileFormat for SpiceJsonFormat {
             SpiceJsonSource::new(table_schema)
                 .with_format(self.options.format)
                 .with_json_pointer(self.options.json_pointer.clone())
-                .with_unnest_struct(self.options.flatten_json.clone()),
+                .with_unnest_struct(self.options.flatten_json.clone())
+                .with_soda_metadata(self.options.soda_metadata),
         );
 
         let needs_non_repartitioned = matches!(
             self.options.format,
-            Format::Array | Format::Object | Format::Auto | Format::Soda
+            Format::Array | Format::Object | Format::Auto | Format::Json | Format::Soda
         ) || self.options.json_pointer.is_some();
 
         if needs_non_repartitioned {
@@ -650,9 +689,9 @@ mod tests {
     #[test]
     fn test_format_parse_json() {
         // "json" maps to Auto (auto-detect sub-format)
-        assert!(matches!("json".parse::<Format>(), Ok(Format::Auto)));
-        assert!(matches!("JSON".parse::<Format>(), Ok(Format::Auto)));
-        assert!(matches!("Json".parse::<Format>(), Ok(Format::Auto)));
+        assert!(matches!("json".parse::<Format>(), Ok(Format::Json)));
+        assert!(matches!("JSON".parse::<Format>(), Ok(Format::Json)));
+        assert!(matches!("Json".parse::<Format>(), Ok(Format::Json)));
     }
 
     #[test]
