@@ -165,7 +165,7 @@ pub enum QueryOverridesArg {
     #[serde(rename = "mysql-catalog")]
     MysqlCatalog,
     #[serde(rename = "mssql-catalog")]
-    MSSqlCatalog,
+    MsSqlCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
     #[serde(rename = "dynamodb")]
@@ -284,7 +284,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Arrow => QueryOverrides::Arrow,
             QueryOverridesArg::PostgresCatalog => QueryOverrides::PostgresCatalog,
             QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
-            QueryOverridesArg::MSSqlCatalog => QueryOverrides::MSSqlCatalog,
+            QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
         }
     }
 }
