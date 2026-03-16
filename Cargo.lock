@@ -5302,7 +5302,6 @@ name = "dataformat-json"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "arrow-schema",
  "async-trait",
  "bytes",
  "datafusion",

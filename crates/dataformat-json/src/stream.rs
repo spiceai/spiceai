@@ -589,16 +589,14 @@ SODA (Socrata Open Data API) format support
 -------------------------------------------------------------*/
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow_schema::extension::Uuid as ArrowUuid;
-
 /// Returns `true` if the given bytes look like a SODA (Socrata Open Data API) response.
 ///
 /// A SODA response is a JSON object containing:
 /// - `meta`: an object containing at least one child object (e.g. `view`)
 /// - `data`: an array of row arrays
 ///
-/// This performs a lightweight structural check without fully validating the schema,
-/// so it is suitable for auto-detection on already-buffered data.
+/// This fully parses the JSON via `serde_json::from_slice` to inspect its structure,
+/// so it should only be called on already-buffered data.
 pub fn is_soda_response(buf: &[u8]) -> bool {
     let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf) else {
@@ -617,8 +615,10 @@ pub fn is_soda_response(buf: &[u8]) -> bool {
 
 /// Build an Arrow [`Field`] for a Socrata column.
 ///
-/// Most types map to a simple [`DataType`], but `"uuid"` uses the canonical
-/// `arrow.uuid` extension type (`FixedSizeBinary(16)` with extension metadata).
+/// Maps Socrata `dataTypeName` values to Arrow [`DataType`]s.
+///
+/// Numeric types map to `Float64`, `calendar_date` maps to `Timestamp(Second)`,
+/// and most other types (including `uuid`) map to `Utf8`.
 ///
 /// For `"meta_data"` columns, the type is inferred from the well-known Socrata
 /// system field names (`:id`, `:position`, `:created_at`, `:updated_at`, etc.).
@@ -631,9 +631,9 @@ fn soda_field(field_name: &str, data_type_name: &str) -> Field {
             DataType::Timestamp(TimeUnit::Second, None),
             true,
         ),
-        "uuid" => Field::new(field_name, DataType::FixedSizeBinary(16), true)
-            .with_extension_type(ArrowUuid),
         "meta_data" => soda_meta_data_field(field_name),
+        // uuid, text, url, location, point, html, and all other types → Utf8.
+        // UUID values arrive as JSON strings; SodaReader does not coerce them to binary.
         _ => Field::new(field_name, DataType::Utf8, true),
     }
 }
@@ -2716,7 +2716,7 @@ mod tests {
                     "calendar_date",
                     DataType::Timestamp(TimeUnit::Second, None),
                 ),
-                ("f_uuid", "uuid", DataType::FixedSizeBinary(16)),
+                ("f_uuid", "uuid", DataType::Utf8),
                 ("f_url", "url", DataType::Utf8),
                 ("f_location", "location", DataType::Utf8),
                 ("f_point", "point", DataType::Utf8),
@@ -2733,14 +2733,6 @@ mod tests {
                 assert_eq!(schema.field(i).name(), *field_name);
                 assert_eq!(*schema.field(i).data_type(), *expected_type);
             }
-
-            // Verify the UUID field carries the canonical extension type metadata
-            let uuid_field = schema.field_with_name("f_uuid").expect("uuid field");
-            assert_eq!(
-                uuid_field.metadata().get("ARROW:extension:name"),
-                Some(&"arrow.uuid".to_string()),
-                "UUID field should have arrow.uuid extension type"
-            );
         }
 
         // ---- SodaReader data conversion ----
@@ -4375,6 +4367,75 @@ mod tests {
             // 12 values per row
             assert!(r0.get("0").is_some());
             assert!(r0.get("11").is_some());
+        }
+
+        // Config 5 & 6: json_format: soda (overrides auto default) — equivalent to explicit SODA
+        // At the stream level, json_format=soda produces the same output as file_format=soda.
+        // These tests verify the SodaReader path produces correct output when invoked explicitly.
+        #[test]
+        fn test_house_price_index_json_format_soda() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            // json_format: soda → SodaReader with no metadata (same as explicit soda)
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 2);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+            assert!(r0.get(":sid").is_none());
+        }
+
+        #[test]
+        fn test_single_fmly_home_json_format_soda() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 4);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
+            assert!(r0.get(":sid").is_none());
+        }
+
+        // Config 9 & 10: file_format: json + json_format: soda + soda_metadata: enabled
+        // The connector routes this as Format::Json default, then json_format overrides to Soda.
+        // At the stream level, this is SodaReader with metadata enabled.
+        #[test]
+        fn test_house_price_index_json_soda_with_metadata() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), true).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 10);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            // Meta columns present
+            assert!(r0.get(":sid").is_some());
+            assert!(r0.get(":id").is_some());
+            assert!(r0[":position"].is_number());
+            assert!(r0[":created_at"].is_number());
+            // User columns present
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+        }
+
+        #[test]
+        fn test_single_fmly_home_json_soda_with_metadata() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), true).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 12);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert!(r0.get(":sid").is_some());
+            assert!(r0[":position"].is_number());
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
         }
     }
 

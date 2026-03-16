@@ -55,7 +55,8 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_source_path")
         .description("Specify a path to use for schema inference."),
     ParameterSpec::runtime("json_format")
-        .description("json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. Defaults to auto.")
+        .description("json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).")
+        .default("auto")
         .one_of(&["json", "jsonl", "ndjson", "ldjson", "array", "object", "soda", "socrata", "auto"]),
     ParameterSpec::runtime("json_pointer")
         .description("An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing."),
