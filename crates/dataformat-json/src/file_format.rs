@@ -487,6 +487,7 @@ impl FileFormat for SpiceJsonFormat {
                 .with_format(self.options.format)
                 .with_json_pointer(self.options.json_pointer.clone())
                 .with_unnest_struct(self.options.flatten_json.clone())
+                .with_soda_metadata(self.options.soda_metadata)
                 .with_table_schema(table_schema),
         )
     }
