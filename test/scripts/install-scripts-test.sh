@@ -757,7 +757,7 @@ test_spiced_variant_empty_documented() {
 }
 
 test_spiced_variant_models_documented() {
-    grep -Eq 'Default.*VARIANT="".*models|models.*default' "$INSTALL_SPICED_SCRIPT"
+    grep -Eq 'Default.*VARIANT="".*includes models' "$INSTALL_SPICED_SCRIPT"
 }
 
 test_spiced_variant_metal_documented() {

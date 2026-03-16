@@ -43,9 +43,6 @@ pub enum Error {
     #[snafu(display("Missing required parameter: adbc_uri"))]
     MissingAdbcUri,
 
-    #[snafu(display("In-memory database URIs (e.g., ':memory:') are not supported by the ADBC connector. Use specific data connectors (e.g., 'duckdb', 'sqlite') instead."))]
-    InMemoryUriNotSupported,
-
     #[snafu(display(
         "Invalid value for parameter '{name}': expected a positive integer, got '{value}'"
     ))]
@@ -177,16 +174,18 @@ impl DataConnectorFactory for AdbcFactory {
             };
 
             let pool_size = parse_pool_param("connection_pool_size").map_err(|e| {
-                DataConnectorError::UnableToConnectInternal {
+                DataConnectorError::InvalidConfiguration {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
+                    message: String::new(),
                     source: Box::new(e),
                 }
             })?;
             let pool_min_idle = parse_pool_param("connection_pool_min_idle").map_err(|e| {
-                DataConnectorError::UnableToConnectInternal {
+                DataConnectorError::InvalidConfiguration {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
+                    message: String::new(),
                     source: Box::new(e),
                 }
             })?;
@@ -195,10 +194,10 @@ impl DataConnectorFactory for AdbcFactory {
 
             if uri_str == ":memory:" || uri_str.contains("mode=memory") {
                 let err: Box<dyn std::error::Error + Send + Sync> =
-                    Box::new(DataConnectorError::UnableToConnectInternal {
+                    Box::new(DataConnectorError::InvalidConfigurationNoSource {
                         dataconnector: "adbc".to_string(),
                         connector_component: component,
-                        source: Box::new(Error::InMemoryUriNotSupported),
+                        message: "In-memory database URIs (e.g., ':memory:') are not supported because each pooled connection creates an isolated database, leading to data inconsistency".to_string(),
                     });
                 return Err(err);
             }

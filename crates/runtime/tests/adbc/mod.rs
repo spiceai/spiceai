@@ -15,14 +15,16 @@ limitations under the License.
 */
 
 use crate::{
-    init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
+use runtime::Runtime;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
     let mut params = HashMap::new();
@@ -37,12 +39,12 @@ fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
 
 fn temp_sqlite_uri(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("spice_adbc_test_{name}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("Failed to create temp directory for ADBC test");
     dir.join("test.db").to_string_lossy().to_string()
 }
 
 #[tokio::test]
-async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
+async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let db_path = temp_sqlite_uri("basic");
 
@@ -56,8 +58,17 @@ async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
                 ))
                 .build();
 
-            let status = runtime_ready_check(app).await;
-            let rt = status.runtime;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = Arc::new(rt.clone()).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
 
             // Create test table
             rt.datafusion()
@@ -180,14 +191,15 @@ async fn test_adbc_sqlite_in_memory() -> Result<(), String> {
 
 #[tokio::test]
 #[ignore] // Requires ADBC DuckDB driver to be installed
-async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
+async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    let db_path = temp_sqlite_uri("duckdb");
 
     test_request_context()
         .scope(async {
             let mut params = HashMap::new();
             params.insert("adbc_driver".to_string(), "duckdb".to_string());
-            params.insert("adbc_uri".to_string(), temp_sqlite_uri("duckdb"));
+            params.insert("adbc_uri".to_string(), db_path);
             params.insert("connection_pool_size".to_string(), "1".to_string());
 
             let mut dataset = Dataset::new("adbc:test_table".to_string(), "test_table".to_string());
@@ -197,8 +209,17 @@ async fn test_adbc_duckdb_in_memory() -> Result<(), String> {
                 .with_dataset(dataset)
                 .build();
 
-            let status = runtime_ready_check(app).await;
-            let rt = status.runtime;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = Arc::new(rt.clone()).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
 
             // Create test table
             rt.datafusion()
@@ -258,8 +279,17 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
                 .with_dataset(make_adbc_sqlite_dataset("rw_table", "rw_table", &db_path))
                 .build();
 
-            let status = runtime_ready_check(app).await;
-            let rt = status.runtime;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = Arc::new(rt.clone()).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
 
             // Create table
             rt.datafusion()
@@ -342,7 +372,6 @@ async fn test_adbc_connection_options() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            // Test with only declared/supported connection options
             let mut params = HashMap::new();
             params.insert("adbc_driver".to_string(), "sqlite".to_string());
             params.insert("adbc_uri".to_string(), db_path.clone());
@@ -357,8 +386,17 @@ async fn test_adbc_connection_options() -> Result<(), String> {
                 .with_dataset(dataset)
                 .build();
 
-            let status = runtime_ready_check(app).await;
-            let rt = status.runtime;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = Arc::new(rt.clone()).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
 
             // Simple connectivity test
             let result = rt
@@ -378,5 +416,7 @@ async fn test_adbc_connection_options() -> Result<(), String> {
 
             Ok(())
         })
+        .await
+}
         .await
 }
