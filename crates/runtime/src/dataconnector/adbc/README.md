@@ -32,8 +32,8 @@ datasets:
 
 - `adbc_driver` (required): The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres')
 - `adbc_driver_path` (optional): Path to the ADBC driver library
-- `adbc_uri` (optional): Database URI/connection string
-- `connection_pool_size` (optional, default: 5): Maximum connections in the pool
+- `adbc_uri` (required): Database URI/connection string
+- `connection_pool_size` (optional, default: 5): Maximum connections in the pool. Note: automatically set to 1 for in-memory URIs (e.g., `:memory:`) since each connection gets its own isolated database.
 - `connection_pool_min_idle` (optional, default: 1): Minimum idle connections
 
 ## Architecture

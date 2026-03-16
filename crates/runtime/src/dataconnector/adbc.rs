@@ -48,14 +48,23 @@ pub enum Error {
     ))]
     InvalidPoolParameter { name: String, value: String },
 
-    #[snafu(display("Failed to load ADBC driver: {source}"))]
-    UnableToLoadDriver { source: adbc_core::error::Error },
+    #[snafu(display("Failed to load ADBC driver '{driver_location}': {source}"))]
+    UnableToLoadDriver {
+        driver_location: String,
+        source: adbc_core::error::Error,
+    },
 
-    #[snafu(display("Failed to create ADBC database: {source}"))]
-    UnableToCreateDatabase { source: adbc_core::error::Error },
+    #[snafu(display("Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"))]
+    UnableToCreateDatabase {
+        driver_location: String,
+        uri: String,
+        source: adbc_core::error::Error,
+    },
 
-    #[snafu(display("Failed to create ADBC connection pool: {source}"))]
+    #[snafu(display("Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"))]
     UnableToCreateConnectionPool {
+        driver_location: String,
+        uri: String,
         source: datafusion_table_providers::sql::db_connection_pool::Error,
     },
 }
@@ -140,8 +149,10 @@ impl DataConnectorFactory for AdbcFactory {
                     source: Box::new(e),
                 })?;
 
-            let mut db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> = Vec::new();
-            db_options.push((OptionDatabase::Uri, uri.into()));
+            let uri_str = uri.to_string();
+
+            let db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> =
+                vec![(OptionDatabase::Uri, uri.into())];
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -179,6 +190,20 @@ impl DataConnectorFactory for AdbcFactory {
 
             let component = params.component.clone();
 
+            // In-memory URIs (e.g., `:memory:`) create isolated databases per
+            // connection, so pooling more than one connection leads to data
+            // inconsistency. Force pool_size=1 and warn when the user asked
+            // for more.
+            let is_memory_uri = uri_str == ":memory:" || uri_str.contains("mode=memory");
+            let (pool_size, pool_min_idle) = if is_memory_uri {
+                if pool_size.is_some_and(|s| s > 1) || pool_min_idle.is_some_and(|s| s > 1) {
+                    tracing::warn!("In-memory URI detected — overriding connection_pool_size and connection_pool_min_idle to 1 to prevent data inconsistency");
+                }
+                (Some(1), Some(1))
+            } else {
+                (pool_size, pool_min_idle)
+            };
+
             // Driver loading, database creation, and pool creation are all
             // synchronous FFI/IO operations — offload to a blocking thread.
             let pool = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
@@ -189,17 +214,25 @@ impl DataConnectorFactory for AdbcFactory {
                     LOAD_FLAG_DEFAULT,
                     None,
                 )
-                .context(UnableToLoadDriverSnafu)?;
+                .context(UnableToLoadDriverSnafu {
+                    driver_location: driver_location.clone(),
+                })?;
 
                 let db = driver
                     .new_database_with_opts(db_options)
-                    .context(UnableToCreateDatabaseSnafu)?;
+                    .context(UnableToCreateDatabaseSnafu {
+                        driver_location: driver_location.clone(),
+                        uri: uri_str.clone(),
+                    })?;
 
                 let pool = AdbcConnectionPoolBuilder::new(db)
                     .with_max_size(pool_size)
                     .with_min_idle(pool_min_idle)
                     .build()
-                    .context(UnableToCreateConnectionPoolSnafu)?;
+                    .context(UnableToCreateConnectionPoolSnafu {
+                        driver_location,
+                        uri: uri_str,
+                    })?;
 
                 Ok(Arc::new(pool))
             })
