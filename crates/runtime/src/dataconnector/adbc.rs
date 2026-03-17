@@ -320,6 +320,10 @@ fn build_db_options(
             }
             if let Some((key, value)) = pair.split_once('=') {
                 let key = key.trim();
+                if key.is_empty() {
+                    tracing::warn!("Ignoring ADBC option with empty key: {pair}");
+                    continue;
+                }
                 let key = if key.starts_with("adbc.") {
                     key.to_string()
                 } else {
@@ -554,6 +558,13 @@ mod tests {
             Some("good=val;bad_no_equals;another=ok"),
         );
         assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_empty_key_ignored() {
+        let opts = build_db_options("uri://db", None, None, Some("=value;good=ok"));
+        assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
     }
 
     #[test]

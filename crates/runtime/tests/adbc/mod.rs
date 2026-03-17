@@ -26,7 +26,6 @@ use rusqlite::Connection;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
@@ -55,12 +54,12 @@ fn temp_sqlite_db(name: &str) -> (String, tempfile::TempDir) {
 /// Pre-create a table in the SQLite database so the ADBC connector can
 /// discover its schema during `load_components()`.  Idempotent: drops
 /// any previous version of the table first.
-fn setup_sqlite_table(db_path: &str, table_name: &str, create_ddl: &str) {
+fn setup_sqlite_table(db_path: &str, table_name: &str, setup_sql: &str) {
     let conn = Connection::open(db_path).expect("Failed to open SQLite database");
     conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name};"))
         .expect("Failed to drop existing table");
-    conn.execute_batch(create_ddl)
-        .expect("Failed to create table in SQLite");
+    conn.execute_batch(setup_sql)
+        .expect("Failed to execute setup SQL in SQLite");
 }
 
 #[tokio::test]
@@ -200,10 +199,7 @@ async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
 #[ignore = "Requires ADBC DuckDB driver to be installed"]
 async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let db_path = PathBuf::from(std::env::temp_dir())
-        .join(format!("spice_adbc_test_duckdb_{}", std::process::id()))
-        .to_string_lossy()
-        .to_string();
+    let (db_path, _guard) = temp_sqlite_db("duckdb");
 
     test_request_context()
         .scope(async {
