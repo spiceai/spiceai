@@ -561,7 +561,14 @@ fn generate_adbc_create_table_statement(
     }
 
     let partition_clause = (!partition_columns.is_empty())
-        .then(|| format!(" PARTITION BY ({})", partition_columns.join(", ")))
+        .then(|| {
+            let quoted_partition_columns = partition_columns
+                .iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" PARTITION BY ({quoted_partition_columns})")
+        })
         .unwrap_or_default();
 
     Ok(format!(
