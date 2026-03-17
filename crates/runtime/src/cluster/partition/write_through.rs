@@ -31,7 +31,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{ResolvedTableReference, TableReference},
 };
-use datafusion_expr::{Expr, execution_props::ExecutionProps, expr::ScalarFunction};
+use datafusion_expr::{Expr, execution_props::ExecutionProps, expr::ScalarFunction, lit};
 use datafusion_proto::bytes::Serializeable;
 use futures::TryStreamExt as _;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -90,10 +90,11 @@ pub enum Error {
     #[snafu(display("Stream error while reading FlightData: {source}"))]
     StreamRead { source: tonic::Status },
 
-    #[snafu(display("Filter evaluation failed for executor {executor_id}: {source}"))]
+    #[snafu(display("Filter evaluation failed for executor {executor_id} and {filter}: {source}"))]
     FilterEval {
         executor_id: String,
         source: datafusion::error::DataFusionError,
+        filter: String,
     },
 
     #[snafu(display("Failed to filter record batch: {source}"))]
@@ -202,7 +203,7 @@ pub(crate) async fn forward_federated_partitioned_write(
         .collect::<Result<Vec<Expr>, _>>()
         .context(CreateDFSchemaSnafu)?;
 
-    let partitions_by_executor = table_partitions
+    let mut partitions_by_executor = table_partitions
         .all_executor_partitions(&ctx, schema)
         .context(ResolvePartitionsSnafu)?;
 
@@ -210,10 +211,11 @@ pub(crate) async fn forward_federated_partitioned_write(
         try_schema_from_flatbuffer_bytes(&first_message.data_header).context(DecodeSchemaSnafu)?,
     );
 
-    let executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
+    let mut executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
-    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, &schema)?; //i changed
+    // TODO: need to update these on each batch?
+    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, &schema)?;
 
     let tbl = path
         .clone()
@@ -245,11 +247,11 @@ pub(crate) async fn forward_federated_partitioned_write(
     {
         route_batch_and_assign_unseen(
             &batch,
-            &executor_filters,
+            &mut executor_filters,
             &senders,
             &partition_phys_exprs,
             &raw_partition_by,
-            &partitions_by_executor,
+            &mut partitions_by_executor,
             &partition_manager,
             path,
         )
@@ -267,11 +269,11 @@ pub(crate) async fn forward_federated_partitioned_write(
         if batch.num_rows() > 0 {
             route_batch_and_assign_unseen(
                 &batch,
-                &executor_filters,
+                &mut executor_filters,
                 &senders,
                 &partition_phys_exprs,
                 &raw_partition_by,
-                &partitions_by_executor,
+                &mut partitions_by_executor,
                 &partition_manager,
                 path,
             )
@@ -295,11 +297,11 @@ pub(crate) async fn forward_federated_partitioned_write(
 #[expect(clippy::too_many_arguments)]
 async fn route_batch_and_assign_unseen(
     batch: &RecordBatch,
-    executor_filters: &[ExecutorFilter],
+    executor_filters: &mut Vec<ExecutorFilter>,
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
     partition_phys_exprs: &[(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)],
     partition_expr_keys: &[String],
-    partitions_by_executor: &HashMap<String, Vec<Expr>>,
+    partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
     partition_manager: &Arc<PartitionManager>,
     path: &TableReference,
 ) -> Result<()> {
@@ -350,6 +352,49 @@ async fn route_batch_and_assign_unseen(
             "Assigned new partition and forwarding rows"
         );
 
+        // Update in-memory filters so subsequent batches route via the fast matched path
+        // instead of re-entering the expensive unmatched → repartition → assign path.
+        {
+            let new_pred = partition_phys_exprs
+                .iter()
+                .zip(scalar_values.iter())
+                .map(|((logical_expr, _), scalar)| logical_expr.clone().eq(lit(scalar.clone())))
+                .reduce(Expr::and);
+
+            if let Some(new_pred) = new_pred {
+                partitions_by_executor
+                    .entry(executor_id.clone())
+                    .or_default()
+                    .push(new_pred);
+
+                // Rebuild physical filter for this executor from its full predicate list.
+                let df_schema = DFSchema::try_from(batch.schema().as_ref().clone())
+                    .context(CreateDFSchemaSnafu)?;
+                let combined = partitions_by_executor[&executor_id]
+                    .iter()
+                    .cloned()
+                    .reduce(Expr::or)
+                    .expect("just pushed an entry");
+                let physical = datafusion::physical_expr::create_physical_expr(
+                    &combined,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                )
+                .context(CreatePhysicalFilterSnafu {
+                    executor_id: executor_id.clone(),
+                })?;
+
+                if let Some(entry) = executor_filters
+                    .iter_mut()
+                    .find(|(id, _)| *id == executor_id)
+                {
+                    entry.1 = physical;
+                } else {
+                    executor_filters.push((executor_id.clone(), physical));
+                }
+            }
+        }
+
         // Forward the rows.
         if let Some(tx) = senders.get(&executor_id) {
             tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
@@ -362,53 +407,69 @@ async fn route_batch_and_assign_unseen(
 }
 
 /// Routes matched rows to known executors and returns the unmatched rows.
+///
+/// Partitions are non-overlapping, so each row matches at most one executor.
+/// We progressively shrink the remaining batch as rows get matched, avoiding
+/// redundant filter evaluations and data copies on already-routed rows.
 async fn route_matched_and_collect_unmatched(
     batch: &RecordBatch,
     executor_filters: &[ExecutorFilter],
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
 ) -> Result<RecordBatch> {
-    // Track which rows are matched by any executor.
-    let mut any_matched = arrow::array::BooleanArray::from(vec![false; batch.num_rows()]);
+    let mut remaining = batch.clone();
 
     for (executor_id, filter_expr) in executor_filters {
-        tracing::warn!("[route_matched_and_collect_unmatched] on {filter_expr:?}");
+        if remaining.num_rows() == 0 {
+            break;
+        }
+
         let arr = filter_expr
-            .evaluate(batch)
+            .evaluate(&remaining)
             .context(FilterEvalSnafu {
+                filter: filter_expr.to_string(),
                 executor_id: executor_id.clone(),
             })?
-            .into_array(batch.num_rows())
+            .into_array(remaining.num_rows())
             .context(FilterEvalSnafu {
+                filter: filter_expr.to_string(),
                 executor_id: executor_id.clone(),
             })?;
         let mask = arr
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
             .ok_or_else(|| Error::FilterEval {
+                filter: filter_expr.to_string(),
                 executor_id: executor_id.clone(),
                 source: datafusion::error::DataFusionError::Internal(
                     "Filter did not produce boolean array".to_string(),
                 ),
             })?;
 
-        let filtered =
-            arrow::compute::filter_record_batch(batch, mask).context(FilterBatchSnafu)?;
-
-        if filtered.num_rows() > 0 {
-            if let Some(tx) = senders.get(executor_id) {
-                tx.send(filtered).await.map_err(|_| Error::SendBatch {
-                    executor_id: executor_id.clone(),
-                })?;
-            }
+        let matched_count = mask.true_count();
+        if matched_count == 0 {
+            continue;
         }
 
-        // OR into the cumulative matched mask.
-        any_matched = arrow::compute::or(&any_matched, mask).context(FilterBatchSnafu)?;
+        let filtered =
+            arrow::compute::filter_record_batch(&remaining, mask).context(FilterBatchSnafu)?;
+        if let Some(tx) = senders.get(executor_id) {
+            tx.send(filtered).await.map_err(|_| Error::SendBatch {
+                executor_id: executor_id.clone(),
+            })?;
+        }
+
+        // If every remaining row was matched, nothing left to process.
+        if matched_count == remaining.num_rows() {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+
+        // Shrink remaining to only unmatched rows for subsequent executors.
+        let negated = arrow::compute::not(mask).context(FilterBatchSnafu)?;
+        remaining =
+            arrow::compute::filter_record_batch(&remaining, &negated).context(FilterBatchSnafu)?;
     }
 
-    // Negate to get unmatched rows.
-    let unmatched_mask = arrow::compute::not(&any_matched).context(FilterBatchSnafu)?;
-    arrow::compute::filter_record_batch(batch, &unmatched_mask).context(FilterBatchSnafu)
+    Ok(remaining)
 }
 
 /// Parses partition-by SQL expression strings into logical + physical expression pairs.

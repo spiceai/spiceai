@@ -21,7 +21,7 @@ use bytes::Bytes;
 use datafusion::{
     common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
 };
-use datafusion_expr::{Expr, lit};
+use datafusion_expr::{Cast, Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 
@@ -171,9 +171,16 @@ impl TablePartitionMetadata {
             let partition_predicate = partition_value
                 .iter()
                 .map(|(proj, lit)| {
-                    Ok(ctx
-                        .parse_sql_expr(proj, &df_schema)?
-                        .eq(ctx.parse_sql_expr(lit, &df_schema)?))
+                    // Ensure lit is same type as proj
+                    let col = ctx.parse_sql_expr(proj, &df_schema)?;
+                    let col_type = col.get_type(&df_schema)?;
+                    let mut lit = ctx.parse_sql_expr(lit, &df_schema)?;
+                    if let Expr::Literal(ref s, None) = lit
+                        && s.data_type() != col_type
+                    {
+                        lit = lit.cast_to(&col_type, &df_schema)?;
+                    };
+                    Ok(col.eq(lit))
                 })
                 .collect::<Result<Vec<Expr>, DataFusionError>>()?
                 .into_iter()
