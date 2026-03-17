@@ -875,15 +875,19 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns the partition expression for a table by querying the catalog provider.
+    /// Returns the partition expression string for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
-    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
-    /// The returned string is parsed as a SQL expression against the table's schema.
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`),
+    /// and returns a SQL partition expression as a string.
+    ///
+    /// This function does not parse or validate the returned string into a DataFusion
+    /// [`Expr`]; callers that require a parsed expression must perform that parsing
+    /// themselves against the table's schema.
     ///
     /// When the catalog returns an auto-generated label like `"expr0"` (used for function
     /// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
-    /// is resolved from [`TablePartitionMetadata`] stored in the partition manager.
+    /// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
@@ -1219,21 +1223,6 @@ impl DataFusion {
 
         Ok(())
     }
-
-    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
-    /// meaning the write should be forwarded to an executor.
-    // pub(crate) async fn should_forward_writes_to_executors(
-    //     &self,
-    //     table_reference: &TableReference,
-    // ) -> bool {
-    //     matches!(
-    //         self.cluster_config.effective_role(),
-    //         Some(ClusterRole::Scheduler)
-    //     ) && self
-    //         .get_table(table_reference)
-    //         .await
-    //         .is_some_and(|t| is_cayenne_table(t.as_ref()))
-    // }
 
     pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
         let table_reference = dataset.into();

@@ -29,7 +29,6 @@ use arrow_schema::SchemaRef;
 use byte_unit::rust_decimal::prelude::Zero;
 use datafusion::{
     common::DFSchema,
-    scalar::ScalarValue,
     sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
@@ -339,7 +338,7 @@ async fn route_batch_and_assign_unseen(
             let partition_value: PartitionValue = partition_expr_keys
                 .iter()
                 .zip(scalar_values.iter())
-                .map(|(expr_key, scalar)| (expr_key.clone(), scalar.to_string()))
+                .map(|(expr_key, scalar)| (expr_key.clone(), scalar_to_sql_literal(scalar)))
                 .collect();
             Some((scalar_values, partition_value, sub_batch))
         })
@@ -431,6 +430,21 @@ async fn route_batch_and_assign_unseen(
     }
 
     Ok(())
+}
+
+fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
+    if scalar.is_null() {
+        return "NULL".to_string();
+    }
+    match scalar.get_datatype() {
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            // For string types, produce a properly quoted and escaped SQL literal.
+            let value = scalar.to_string();
+            let escaped = value.replace('\'', "''");
+            format!("'{}'", escaped)
+        }
+        _ => scalar.to_string(),
+    }
 }
 
 /// Routes matched rows to known executors and returns the unmatched rows.
