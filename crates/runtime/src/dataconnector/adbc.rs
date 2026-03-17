@@ -108,6 +108,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("uri")
         .description("Database URI/connection string for the ADBC driver")
         .required(),
+    ParameterSpec::component("username")
+        .description("Username for database authentication")
+        .secret(),
+    ParameterSpec::component("password")
+        .description("Password for database authentication")
+        .secret(),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -155,8 +161,15 @@ impl DataConnectorFactory for AdbcFactory {
 
             let uri_str = uri.to_string();
 
-            let db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> =
+            let mut db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> =
                 vec![(OptionDatabase::Uri, uri.into())];
+
+            if let Some(username) = params.parameters.get("username").expose().ok() {
+                db_options.push((OptionDatabase::Username, username.into()));
+            }
+            if let Some(password) = params.parameters.get("password").expose().ok() {
+                db_options.push((OptionDatabase::Password, password.into()));
+            }
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -331,6 +344,8 @@ mod tests {
         assert!(param_names.contains(&"driver"));
         assert!(param_names.contains(&"driver_path"));
         assert!(param_names.contains(&"uri"));
+        assert!(param_names.contains(&"username"));
+        assert!(param_names.contains(&"password"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
     }
