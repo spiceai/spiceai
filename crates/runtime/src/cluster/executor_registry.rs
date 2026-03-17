@@ -42,8 +42,6 @@ use crate::{
         partition::{PartitionValue, executor_selection},
     },
 };
-#[cfg(not(windows))]
-use cayenne::CayenneTableProvider;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]

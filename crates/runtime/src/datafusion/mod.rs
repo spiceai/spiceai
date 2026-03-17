@@ -78,7 +78,9 @@ use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
+use futures::TryFutureExt;
 use itertools::Itertools;
+use moka::future::FutureExt;
 use query::QueryBuilder;
 #[cfg(any(
     feature = "duckdb",
@@ -917,7 +919,7 @@ impl DataFusion {
         label: &str,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
-        let Ok(idx) = label.strip_prefix("expr")?.parse::<usize>() else {
+        let Some(Ok(idx)) = label.strip_prefix("expr").map(|s| s.parse::<usize>()) else {
             return Ok(None);
         };
         let Some(ref executor_registry) = self.executor_registry else {
@@ -927,7 +929,9 @@ impl DataFusion {
         let Some(metadata) = executor_registry
             .federated_partition_manager()
             .get_table_metadata(table_reference)
-            .await?
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
         else {
             return Ok(None);
         };

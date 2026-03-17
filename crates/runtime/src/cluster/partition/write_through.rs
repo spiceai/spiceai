@@ -437,7 +437,7 @@ fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
     if scalar.is_null() {
         return "NULL".to_string();
     }
-    match scalar.get_datatype() {
+    match scalar.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 => {
             // For string types, produce a properly quoted and escaped SQL literal.
             let value = scalar.to_string();
