@@ -881,7 +881,7 @@ impl DataFusion {
     /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`),
     /// and returns a SQL partition expression as a string.
     ///
-    /// This function does not parse or validate the returned string into a DataFusion
+    /// This function does not parse or validate the returned string into a `DataFusion`
     /// [`Expr`]; callers that require a parsed expression must perform that parsing
     /// themselves against the table's schema.
     ///
@@ -906,7 +906,7 @@ impl DataFusion {
                 .await?
                 .unwrap_or(expr_string);
             return Ok(Some(resolved));
-        };
+        }
         Ok(None)
     }
 
@@ -917,7 +917,7 @@ impl DataFusion {
         label: &str,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
-        let Some(Ok(idx)) = label.strip_prefix("expr").map(|s| s.parse::<usize>()) else {
+        let Some(Ok(idx)) = label.strip_prefix("expr").map(str::parse::<usize>) else {
             return Ok(None);
         };
         let Some(ref executor_registry) = self.executor_registry else {
@@ -936,7 +936,7 @@ impl DataFusion {
         Ok(metadata.partition_expressions.get(idx).cloned())
     }
 
-    /// Parses a SQL expression string into a DataFusion `Expr`, using the schema of the given table reference for resolution.
+    /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
     pub async fn sql_expr(
         &self,
         tbl: &TableReference,
