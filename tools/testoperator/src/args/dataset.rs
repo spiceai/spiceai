@@ -163,6 +163,12 @@ pub enum QueryOverridesArg {
     GlueCatalog,
     #[serde(rename = "databricks-catalog")]
     DatabricksCatalog,
+    #[serde(rename = "postgres-catalog")]
+    PostgresCatalog,
+    #[serde(rename = "mysql-catalog")]
+    MysqlCatalog,
+    #[serde(rename = "mssql-catalog")]
+    MsSqlCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
     #[serde(rename = "saffron-views")]
@@ -290,6 +296,9 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::SaffronDuckdbCTE => QueryOverrides::SaffronDuckdbCTE,
             QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
             QueryOverridesArg::Arrow => QueryOverrides::Arrow,
+            QueryOverridesArg::PostgresCatalog => QueryOverrides::PostgresCatalog,
+            QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
+            QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
         }
     }
 }

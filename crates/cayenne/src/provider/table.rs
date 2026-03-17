@@ -2937,6 +2937,86 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Refresh in-memory query state from a freshly opened provider for the same table.
+    ///
+    /// This keeps existing `Arc<CayenneTableProvider>` handles usable after catalog refreshes
+    /// by updating mutable state in place instead of swapping provider objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `source` refers to a different table (mismatched table IDs)
+    /// or if updating internal deletion/listing state fails.
+    pub fn refresh_from(&self, source: &Self) -> Result<()> {
+        if self.table_metadata.table_id != source.table_metadata.table_id {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "Cannot refresh table {} from different table {}",
+                    self.table_metadata.table_id, source.table_metadata.table_id,
+                ),
+            });
+        }
+
+        self.pk_deletion_strategy.refresh_from(
+            &source.pk_deletion_strategy,
+            &self.table_metadata.table_name,
+        )?;
+
+        let refreshed_listing_table = {
+            let guard = source
+                .listing_table
+                .read()
+                .map_err(|_| Error::LockPoisoned {
+                    table: self.table_metadata.table_name.clone(),
+                    lock: LISTING_TABLE_LOCK_POISONED,
+                })?;
+            Arc::clone(&guard)
+        };
+
+        {
+            let mut guard = self
+                .listing_table
+                .write()
+                .map_err(|_| Error::LockPoisoned {
+                    table: self.table_metadata.table_name.clone(),
+                    lock: LISTING_TABLE_LOCK_POISONED,
+                })?;
+            *guard = refreshed_listing_table;
+        }
+
+        let refreshed_snapshot_id = source.get_current_snapshot_id()?;
+        self.update_current_snapshot_id(&refreshed_snapshot_id)?;
+
+        let refreshed_protected_snapshots = {
+            let guard = source
+                .protected_snapshots
+                .read()
+                .map_err(|_| Error::LockPoisoned {
+                    table: self.table_metadata.table_name.clone(),
+                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
+                })?;
+            guard.clone()
+        };
+
+        {
+            let mut guard = self
+                .protected_snapshots
+                .write()
+                .map_err(|_| Error::LockPoisoned {
+                    table: self.table_metadata.table_name.clone(),
+                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
+                })?;
+            *guard = refreshed_protected_snapshots;
+        }
+
+        tracing::debug!(
+            "Refreshed in-memory state for table {} from freshly opened provider",
+            self.table_metadata.table_name
+        );
+
+        Ok(())
+    }
+
     /// Delete rows matching the given primary key values.
     ///
     /// # Errors

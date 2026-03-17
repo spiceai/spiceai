@@ -236,7 +236,7 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
         id: github-app-token
         with:
           app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}

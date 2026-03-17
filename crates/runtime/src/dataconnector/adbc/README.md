@@ -23,6 +23,9 @@ datasets:
     params:
       adbc_driver: duckdb # or sqlite, postgres, etc.
       adbc_uri: path/to/database.db
+      # Optional authentication
+      adbc_username: ${secrets:adbc_username}
+      adbc_password: ${secrets:adbc_password}
       # Optional connection pool settings
       connection_pool_size: 5
       connection_pool_min_idle: 1
@@ -33,6 +36,8 @@ datasets:
 - `adbc_driver` (required): The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres')
 - `adbc_driver_path` (optional): Path to the ADBC driver library
 - `adbc_uri` (required): Database URI/connection string. Note: in-memory URIs (e.g., `:memory:`) are not supported.
+- `adbc_username` (optional, secret): Username for database authentication
+- `adbc_password` (optional, secret): Password for database authentication
 - `connection_pool_size` (optional, default: 5): Maximum connections in the pool.
 - `connection_pool_min_idle` (optional, default: 1): Minimum idle connections
 

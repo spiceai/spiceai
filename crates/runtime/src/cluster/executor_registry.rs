@@ -42,8 +42,6 @@ use crate::{
         partition::{PartitionValue, executor_selection},
     },
 };
-#[cfg(not(windows))]
-use cayenne::CayenneTableProvider;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -358,10 +356,6 @@ fn get_partitions_from_manager(
             return Vec::new();
         };
 
-        tracing::debug!(
-            "No partition assignments for table {table:?}; routing query to executor '{executor_id}'"
-        );
-
         return vec![(
             flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
             Vec::new(),
@@ -493,22 +487,9 @@ impl FederatedPartitionProvider {
 
 impl TablePartitionProvider for FederatedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
-        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
-            return false;
-        };
-
-        #[cfg(not(windows))]
-        if default
-            .table_provider
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        self.partition_manager
+            .get_cached_table_metadata(&tbl.table_name)
             .is_some()
-        {
-            return true;
-        }
-
-        let _ = default; // suppress unused warning on windows
-        false
     }
 
     fn get_partitions(
@@ -532,6 +513,9 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             table,
             schema,
         )
+        .into_iter()
+        .map(|(provider, _)| (provider, vec![])) // For now, do not need partition values. Executors only have required data.
+        .collect()
     }
 }
 
