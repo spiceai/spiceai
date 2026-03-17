@@ -22,6 +22,7 @@ use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
+use rusqlite::Connection;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use std::collections::HashMap;
@@ -44,10 +45,26 @@ fn temp_sqlite_uri(name: &str) -> String {
     dir.join("test.db").to_string_lossy().to_string()
 }
 
+/// Pre-create a table in the SQLite database so the ADBC connector can
+/// discover its schema during `load_components()`.
+fn create_sqlite_table(db_path: &str, ddl: &str) {
+    let conn = Connection::open(db_path).expect("Failed to open SQLite database");
+    conn.execute_batch(ddl)
+        .expect("Failed to create table in SQLite");
+}
+
 #[tokio::test]
 async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let db_path = temp_sqlite_uri("basic");
+
+    // Pre-create the table so the ADBC connector can discover the schema
+    // during load_components().
+    create_sqlite_table(
+        &db_path,
+        "CREATE TABLE test_table (id INTEGER, name TEXT, value DOUBLE);
+         INSERT INTO test_table VALUES (1, 'alice', 10.5), (2, 'bob', 20.3), (3, 'charlie', 15.7);",
+    );
 
     test_request_context()
         .scope(async {
@@ -70,26 +87,6 @@ async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
             }
 
             runtime_ready_check(&rt).await;
-
-            // Create test table
-            rt.datafusion()
-                .query_builder(
-                    "CREATE TABLE test_table (id INTEGER, name TEXT, value DOUBLE)",
-                )
-                .build()
-                .run()
-                .await
-                .map_err(|e| format!("Failed to create table: {e}"))?;
-
-            // Insert test data
-            rt.datafusion()
-                .query_builder(
-                    "INSERT INTO test_table VALUES (1, 'alice', 10.5), (2, 'bob', 20.3), (3, 'charlie', 15.7)",
-                )
-                .build()
-                .run()
-                .await
-                .map_err(|e| format!("Failed to insert data: {e}"))?;
 
             // Query the data
             let result = rt
@@ -274,6 +271,13 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let db_path = temp_sqlite_uri("rw");
 
+    // Pre-create the table so the ADBC connector can discover the schema
+    // during load_components().
+    create_sqlite_table(
+        &db_path,
+        "CREATE TABLE rw_table (key INTEGER PRIMARY KEY, value TEXT);",
+    );
+
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("adbc_rw_test")
@@ -291,14 +295,6 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
             }
 
             runtime_ready_check(&rt).await;
-
-            // Create table
-            rt.datafusion()
-                .query_builder("CREATE TABLE rw_table (key INTEGER PRIMARY KEY, value TEXT)")
-                .build()
-                .run()
-                .await
-                .map_err(|e| e.to_string())?;
 
             // Test INSERT
             rt.datafusion()
@@ -370,6 +366,10 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
 async fn test_adbc_connection_options() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let db_path = temp_sqlite_uri("options");
+
+    // Pre-create the table so the ADBC connector can discover the schema
+    // during load_components().
+    create_sqlite_table(&db_path, "CREATE TABLE options_test (id INTEGER);");
 
     test_request_context()
         .scope(async {
