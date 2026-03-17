@@ -2,16 +2,19 @@ tests:
   bench:
     spicepod_path: accelerated/postgres-arrow.yaml
     query_set: tpcds
+    query_overrides: arrow
     ready_wait: 600
     runner_type: spiceai-dev-runners
   throughput:
     spicepod_path: accelerated/postgres-arrow.yaml
     query_set: tpcds
+    query_overrides: arrow
     ready_wait: 600
     runner_type: spiceai-dev-large-runners
   load:
     spicepod_path: accelerated/postgres-arrow.yaml
     query_set: tpcds
+    query_overrides: arrow
     ready_wait: 600
     runner_type: spiceai-dev-large-runners
     duration: 28800

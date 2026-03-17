@@ -642,9 +642,15 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
-    let (app_id, app_api_key) = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
+    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
 
-    let api_key = app_api_key.ok_or_else(|| {
+    // Fetch API key from the dedicated api-keys endpoint
+    let api_keys = cloud
+        .get_api_keys(app_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch API keys for app '{app_name}': {e}"))?;
+
+    let api_key = api_keys.api_key.ok_or_else(|| {
         anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
     })?;
 

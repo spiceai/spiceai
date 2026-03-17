@@ -171,8 +171,30 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         let slice = &tee.buf[..];
         let tee_buf_len = tee.buf.len();
 
-        // Push the clean element (without internal newlines and carriage returns) plus newline to `pending`.
-        filter_element_bytes(slice, &mut self.pending);
+        // If the element is a JSON array (e.g. from SODA `/data`), convert it
+        // to a JSON object with positional string keys ("0", "1", …) so that
+        // Arrow's JSON reader can handle it (it requires objects, not arrays).
+        let first_non_ws = slice.iter().find(|b| !b.is_ascii_whitespace());
+        if first_non_ws == Some(&b'[') {
+            if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(slice) {
+                let obj: serde_json::Map<String, serde_json::Value> = arr
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (i.to_string(), v))
+                    .collect();
+                if let Ok(serialized) = serde_json::to_string(&serde_json::Value::Object(obj)) {
+                    self.pending.extend(serialized.bytes());
+                    self.pending.push_back(b'\n');
+                } else {
+                    filter_element_bytes(slice, &mut self.pending);
+                }
+            } else {
+                filter_element_bytes(slice, &mut self.pending);
+            }
+        } else {
+            // Push the clean element (without internal newlines and carriage returns) plus newline to `pending`.
+            filter_element_bytes(slice, &mut self.pending);
+        }
 
         // Discard bytes we no longer need from tee.buf.
         tee.drain_front(tee_buf_len);
@@ -566,27 +588,87 @@ pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
 SODA (Socrata Open Data API) format support
 -------------------------------------------------------------*/
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+/// Returns `true` if the given bytes look like a SODA (Socrata Open Data API) response.
+///
+/// A SODA response is a JSON object containing:
+/// - `meta`: an object containing at least one child object (e.g. `view`)
+/// - `data`: an array of row arrays
+///
+/// This fully parses the JSON via `serde_json::from_slice` to inspect its structure,
+/// so it should only be called on already-buffered data.
+pub fn is_soda_response(buf: &[u8]) -> bool {
+    let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf) else {
+        return false;
+    };
+    let has_meta_with_child_object = value
+        .get("meta")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|m| m.values().any(serde_json::Value::is_object));
+    let has_data_array = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .is_some();
+    has_meta_with_child_object && has_data_array
+}
 
-/// Maps a Socrata `dataTypeName` string to an Arrow [`DataType`].
-fn soda_type_to_arrow(data_type_name: &str) -> DataType {
+/// Build an Arrow [`Field`] for a Socrata column.
+///
+/// Maps Socrata `dataTypeName` values to Arrow [`DataType`]s.
+///
+/// Numeric types map to `Float64`, `calendar_date` maps to `Timestamp(Second)`,
+/// and most other types (including `uuid`) map to `Utf8`.
+///
+/// For `"meta_data"` columns, the type is inferred from the well-known Socrata
+/// system field names (`:id`, `:position`, `:created_at`, `:updated_at`, etc.).
+fn soda_field(field_name: &str, data_type_name: &str) -> Field {
     match data_type_name {
-        "number" | "money" | "percent" => DataType::Float64,
-        "checkbox" => DataType::Boolean,
-        _ => DataType::Utf8,
+        "number" | "money" | "percent" => Field::new(field_name, DataType::Float64, true),
+        "checkbox" => Field::new(field_name, DataType::Boolean, true),
+        "calendar_date" => Field::new(
+            field_name,
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        ),
+        "meta_data" => soda_meta_data_field(field_name),
+        // uuid, text, url, location, point, html, and all other types → Utf8.
+        // UUID values arrive as JSON strings; SodaReader does not coerce them to binary.
+        _ => Field::new(field_name, DataType::Utf8, true),
+    }
+}
+
+/// Build an Arrow [`Field`] for a Socrata `meta_data` system column.
+///
+/// Socrata system columns have well-known semantics:
+/// - `:id` — row UUID
+/// - `:position` — integer row position
+/// - `:created_at` / `:updated_at` — integer epoch timestamps (seconds)
+/// - `:sid`, `:created_meta`, `:updated_meta`, `:meta` — string/JSON metadata
+fn soda_meta_data_field(field_name: &str) -> Field {
+    match field_name {
+        // :position — integer row position; :created_at / :updated_at — epoch timestamps
+        ":position" | ":created_at" | ":updated_at" => {
+            Field::new(field_name, DataType::Int64, true)
+        }
+        // :id, :sid, :created_meta, :updated_meta, :meta, and any unknown meta fields → Utf8
+        _ => Field::new(field_name, DataType::Utf8, true),
     }
 }
 
 /// Extract an Arrow [`Schema`] from the `meta.view.columns` array in a SODA response.
 ///
 /// Columns with `dataTypeName == "meta_data"` are internal Socrata metadata and are
-/// excluded from the returned schema.
+/// excluded from the returned schema unless `include_metadata` is `true`.
 ///
 /// # Errors
 ///
 /// Returns an error if the JSON is not a valid SODA response (missing `meta.view.columns`
 /// or if the columns array cannot be read).
-pub fn soda_schema_from_meta(value: &serde_json::Value) -> io::Result<Schema> {
+pub fn soda_schema_from_meta(
+    value: &serde_json::Value,
+    include_metadata: bool,
+) -> io::Result<Schema> {
     let columns = value
         .pointer("/meta/view/columns")
         .and_then(serde_json::Value::as_array)
@@ -601,12 +683,11 @@ pub fn soda_schema_from_meta(value: &serde_json::Value) -> io::Result<Schema> {
         .iter()
         .filter_map(|col| {
             let type_name = col.get("dataTypeName")?.as_str()?;
-            if type_name == "meta_data" {
+            if !include_metadata && type_name == "meta_data" {
                 return None;
             }
             let field_name = col.get("fieldName")?.as_str()?;
-            let arrow_type = soda_type_to_arrow(type_name);
-            Some(Field::new(field_name, arrow_type, true))
+            Some(soda_field(field_name, type_name))
         })
         .collect();
 
@@ -639,16 +720,19 @@ pub struct SodaReader {
 impl SodaReader {
     /// Create a new `SodaReader` from a reader containing a SODA JSON response.
     ///
+    /// When `include_metadata` is `true`, Socrata internal `meta_data` columns
+    /// (sid, id, position, etc.) are included in the schema.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The input cannot be parsed as valid JSON
     /// - The JSON is not a valid SODA response (missing `meta.view.columns` or `data`)
     /// - The `data` field is not an array
-    pub fn new<R: Read>(mut reader: R) -> io::Result<Self> {
+    pub fn new<R: Read>(mut reader: R, include_metadata: bool) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
-        Self::from_vec(&buf)
+        Self::from_vec(&buf, include_metadata)
     }
 
     /// Create a new `SodaReader` from an already-buffered byte slice.
@@ -659,7 +743,7 @@ impl SodaReader {
     ///
     /// Returns an error if the bytes cannot be parsed as valid JSON or are not
     /// a valid SODA response.
-    pub fn from_vec(buf: &[u8]) -> io::Result<Self> {
+    pub fn from_vec(buf: &[u8], include_metadata: bool) -> io::Result<Self> {
         // Strip leading UTF-8 BOM if present so serde_json can parse the input.
         let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
 
@@ -670,7 +754,7 @@ impl SodaReader {
             )
         })?;
 
-        let schema = soda_schema_from_meta(&value)?;
+        let schema = soda_schema_from_meta(&value, include_metadata)?;
 
         // Determine which column indices in the data rows correspond to user-visible columns
         let all_columns = value
@@ -683,10 +767,11 @@ impl SodaReader {
                 )
             })?;
 
-        // Build a mapping: for each user-visible column, store its index in the
+        // Build a mapping: for each included column, store its index in the
         // full columns array. Use the same filter as soda_schema_from_meta (both
-        // dataTypeName and fieldName must be present and non-meta) so that
-        // visible_indices stays in sync with schema.fields().
+        // dataTypeName and fieldName must be present, and non-meta unless
+        // include_metadata is true) so that visible_indices stays in sync with
+        // schema.fields().
         let visible_indices: Vec<usize> = all_columns
             .iter()
             .enumerate()
@@ -694,7 +779,7 @@ impl SodaReader {
                 let is_visible = col
                     .get("dataTypeName")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|t| t != "meta_data");
+                    .is_some_and(|t| include_metadata || t != "meta_data");
                 let has_field_name = col
                     .get("fieldName")
                     .and_then(serde_json::Value::as_str)
@@ -731,6 +816,19 @@ impl SodaReader {
                     .get(col_idx)
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+
+                // For Utf8 fields, coerce non-string values (numbers, objects,
+                // arrays, booleans) to their JSON string representation so
+                // Arrow's reader doesn't fail on type mismatches.
+                let val = if *field.data_type() == DataType::Utf8 {
+                    match &val {
+                        serde_json::Value::Null | serde_json::Value::String(_) => val,
+                        other => serde_json::Value::String(other.to_string()),
+                    }
+                } else {
+                    val
+                };
+
                 obj.insert(field.name().clone(), val);
             }
 
@@ -2482,7 +2580,7 @@ mod tests {
 
     mod soda_tests {
         use crate::{SodaReader, soda_schema_from_meta};
-        use arrow::datatypes::DataType;
+        use arrow::datatypes::{DataType, TimeUnit};
         use std::io::{Cursor, Read};
 
         /// Helper: build a minimal SODA response JSON string.
@@ -2524,7 +2622,7 @@ mod tests {
                 &[],
             );
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
-            let schema = soda_schema_from_meta(&val).expect("should extract schema");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
             assert_eq!(schema.fields().len(), 2);
             assert_eq!(schema.field(0).name(), "name");
             assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
@@ -2539,15 +2637,69 @@ mod tests {
                 &[],
             );
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
-            let err = soda_schema_from_meta(&val).expect_err("should fail: no visible columns");
+            let err =
+                soda_schema_from_meta(&val, false).expect_err("should fail: no visible columns");
             assert!(err.to_string().contains("no user-visible columns"));
+        }
+
+        #[test]
+        fn test_soda_schema_include_metadata() {
+            let input = soda_response(
+                &[
+                    (":sid", "meta_data", "SID"),
+                    (":id", "meta_data", "ID"),
+                    ("name", "text", "Name"),
+                ],
+                &[],
+            );
+            let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
+
+            // Without metadata: only user columns
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
+            assert_eq!(schema.fields().len(), 1);
+            assert_eq!(schema.field(0).name(), "name");
+
+            // With metadata: all columns including meta_data
+            let schema = soda_schema_from_meta(&val, true).expect("should extract schema");
+            assert_eq!(schema.fields().len(), 3);
+            assert_eq!(schema.field(0).name(), ":sid");
+            assert_eq!(schema.field(1).name(), ":id");
+            assert_eq!(schema.field(2).name(), "name");
+        }
+
+        #[test]
+        fn test_soda_reader_include_metadata() {
+            let input = soda_response(
+                &[(":sid", "meta_data", "SID"), ("name", "text", "Name")],
+                &[vec![
+                    serde_json::json!("row-abc"),
+                    serde_json::json!("Alice"),
+                ]],
+            );
+
+            // Without metadata
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 1);
+            assert_eq!(soda.schema().field(0).name(), "name");
+
+            // With metadata
+            let mut soda =
+                SodaReader::new(Cursor::new(input.as_bytes()), true).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 2);
+            assert_eq!(soda.schema().field(0).name(), ":sid");
+            assert_eq!(soda.schema().field(1).name(), "name");
+            let mut output = String::new();
+            soda.read_to_string(&mut output).expect("should read");
+            let line: serde_json::Value = serde_json::from_str(output.trim()).expect("parse line");
+            assert_eq!(line[":sid"], "row-abc");
+            assert_eq!(line["name"], "Alice");
         }
 
         #[test]
         fn test_soda_schema_missing_meta() {
             let input = r#"{"data": []}"#;
             let val: serde_json::Value = serde_json::from_str(input).expect("parse");
-            let err = soda_schema_from_meta(&val).expect_err("should fail: no meta");
+            let err = soda_schema_from_meta(&val, false).expect_err("should fail: no meta");
             assert!(err.to_string().contains("meta.view.columns"));
         }
 
@@ -2559,7 +2711,12 @@ mod tests {
                 ("f_money", "money", DataType::Float64),
                 ("f_percent", "percent", DataType::Float64),
                 ("f_checkbox", "checkbox", DataType::Boolean),
-                ("f_date", "calendar_date", DataType::Utf8),
+                (
+                    "f_date",
+                    "calendar_date",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                ),
+                ("f_uuid", "uuid", DataType::Utf8),
                 ("f_url", "url", DataType::Utf8),
                 ("f_location", "location", DataType::Utf8),
                 ("f_point", "point", DataType::Utf8),
@@ -2570,7 +2727,7 @@ mod tests {
                 types.iter().map(|(f, t, _)| (*f, *t, *f)).collect();
             let input = soda_response(&columns, &[]);
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
-            let schema = soda_schema_from_meta(&val).expect("should extract schema");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
             assert_eq!(schema.fields().len(), types.len());
             for (i, (field_name, _, expected_type)) in types.iter().enumerate() {
                 assert_eq!(schema.field(i).name(), *field_name);
@@ -2601,7 +2758,7 @@ mod tests {
                     ],
                 ],
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             assert_eq!(soda.schema().fields().len(), 2);
             assert_eq!(soda.schema().field(0).name(), "name");
 
@@ -2627,7 +2784,7 @@ mod tests {
                 &[("name", "text", "Name"), ("count", "number", "Count")],
                 &[],
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
@@ -2648,7 +2805,7 @@ mod tests {
                     serde_json::json!(null),
                 ]],
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
@@ -2676,7 +2833,7 @@ mod tests {
                     serde_json::json!(750_000),
                 ]],
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             assert_eq!(soda.schema().fields().len(), 2);
             assert_eq!(soda.schema().field(0).name(), "city");
             assert_eq!(soda.schema().field(1).name(), "population");
@@ -2697,7 +2854,7 @@ mod tests {
         fn test_soda_reader_missing_data_field() {
             let input =
                 r#"{"meta":{"view":{"columns":[{"fieldName":"name","dataTypeName":"text"}]}}}"#;
-            let err = SodaReader::new(Cursor::new(input.as_bytes()))
+            let err = SodaReader::new(Cursor::new(input.as_bytes()), false)
                 .expect_err("should fail: no data field");
             assert!(err.to_string().contains("missing 'data' array"));
         }
@@ -2705,7 +2862,7 @@ mod tests {
         #[test]
         fn test_soda_reader_invalid_json() {
             let input = b"not valid json";
-            let err = SodaReader::new(Cursor::new(input.to_vec()))
+            let err = SodaReader::new(Cursor::new(input.to_vec()), false)
                 .expect_err("should fail: invalid JSON");
             assert!(err.to_string().contains("Failed to parse SODA"));
         }
@@ -2716,7 +2873,7 @@ mod tests {
             let json = r#"{"meta":{"view":{"columns":[{"fieldName":"name","dataTypeName":"text"}]}},"data":[["Alice"]]}"#;
             let mut input = vec![0xEF, 0xBB, 0xBF];
             input.extend_from_slice(json.as_bytes());
-            let mut reader = SodaReader::from_vec(&input).expect("BOM input should parse");
+            let mut reader = SodaReader::from_vec(&input, false).expect("BOM input should parse");
             let mut out = String::new();
             reader
                 .read_to_string(&mut out)
@@ -2727,7 +2884,7 @@ mod tests {
         #[test]
         fn test_soda_reader_data_row_not_array() {
             let input = r#"{"meta":{"view":{"columns":[{"fieldName":"x","dataTypeName":"text"}]}},"data":["not_an_array"]}"#;
-            let err = SodaReader::new(Cursor::new(input.as_bytes()))
+            let err = SodaReader::new(Cursor::new(input.as_bytes()), false)
                 .expect_err("should fail: row not array");
             assert!(err.to_string().contains("not an array"));
         }
@@ -2743,7 +2900,7 @@ mod tests {
                 ],
                 &[vec![serde_json::json!("row-1"), serde_json::json!("Alice")]],
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
@@ -2754,6 +2911,7 @@ mod tests {
 
         #[test]
         fn test_soda_reader_preserves_nested_json() {
+            // Nested objects in Utf8 columns are stringified for Arrow compatibility
             let input = soda_response(
                 &[("name", "text", "Name"), ("coords", "point", "Coordinates")],
                 &[vec![
@@ -2761,13 +2919,16 @@ mod tests {
                     serde_json::json!({"lat": 40.785, "lon": -73.968}),
                 ]],
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
             let row: serde_json::Value = serde_json::from_str(output.trim()).expect("parse row");
             assert_eq!(row["name"], "Central Park");
-            assert_eq!(row["coords"]["lat"], 40.785);
+            // coords is Utf8 so nested object is stringified
+            let coords_str = row["coords"].as_str().expect("coords should be a string");
+            let coords: serde_json::Value = serde_json::from_str(coords_str).expect("parse coords");
+            assert_eq!(coords["lat"], 40.785);
         }
 
         #[test]
@@ -2779,7 +2940,7 @@ mod tests {
                 &[("name", "text", "Name"), ("value", "number", "Value")],
                 &rows,
             );
-            let soda = SodaReader::new(Cursor::new(input.as_bytes())).expect("should parse");
+            let soda = SodaReader::new(Cursor::new(input.as_bytes()), false).expect("should parse");
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
@@ -2793,7 +2954,7 @@ mod tests {
                 &[],
             );
             let val: serde_json::Value = serde_json::from_str(&input).expect("parse");
-            let schema = soda_schema_from_meta(&val).expect("should extract schema");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
             // All SODA columns should be nullable
             for field in schema.fields() {
                 assert!(
@@ -2811,9 +2972,16 @@ mod tests {
 
     /// Helper: simulate the full auto-detect flow used by `Format::Auto`.
     /// Peeks at the first non-ws byte, then reads data through the appropriate
-    /// pipeline (`ArrayToNdjson` for arrays, direct `BufRead` for objects/JSONL).
+    /// pipeline (`SodaReader` for SODA, `ArrayToNdjson` for arrays, direct
+    /// `BufRead` for objects/JSONL).
     /// Returns the parsed NDJSON lines.
     fn auto_detect_and_read(input: &[u8]) -> io::Result<Vec<String>> {
+        // Try SODA first (needs full buffer)
+        if is_soda_response(input) {
+            let soda = SodaReader::new(Cursor::new(input), false)?;
+            return read_all_lines(BufReader::new(soda));
+        }
+
         let mut reader = BufReader::new(Cursor::new(input));
         let first_byte = peek_first_non_ws_byte(&mut reader)?;
 
@@ -3265,13 +3433,17 @@ mod tests {
             // The whole object is one JSONL line, not 3 array elements
         }
 
-        /// Array of arrays — first `[` triggers array mode
+        /// Array of arrays — inner arrays are converted to positional objects
+        /// so Arrow's JSON reader can handle them (it requires objects, not arrays).
         #[test]
         fn test_auto_array_of_arrays() {
             let input = br"[[1,2],[3,4]]";
             let lines = auto_detect_and_read(input).expect("should read");
             assert_eq!(lines.len(), 2);
-            assert_eq!(lines[0], "[1,2]");
+            // Inner arrays become {"0":1,"1":2} etc.
+            let parsed: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid JSON");
+            assert_eq!(parsed["0"], 1);
+            assert_eq!(parsed["1"], 2);
         }
 
         /// Array containing mixed types (objects of different shapes)
@@ -3456,6 +3628,24 @@ mod tests {
             let lines = auto_detect_and_read(&data).expect("auto-detect JSONL");
             assert_eq!(lines.len(), 3);
         }
+
+        #[test]
+        fn test_file_jsonl_crlf_auto_detect() {
+            let data = load_fixture("jsonl_crlf.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect CRLF JSONL");
+            assert_eq!(lines.len(), 3);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["id"], 1);
+        }
+
+        #[test]
+        fn test_file_jsonl_nested_auto_detect() {
+            let data = load_fixture("jsonl_nested.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect nested JSONL");
+            assert_eq!(lines.len(), 2);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["user"]["name"], "Alice");
+        }
     }
 
     mod file_array_tests {
@@ -3554,6 +3744,41 @@ mod tests {
             let lines = auto_detect_and_read(&data).expect("auto-detect pretty array");
             assert_eq!(lines.len(), 3);
         }
+
+        #[test]
+        fn test_file_array_empty_auto_detect() {
+            let data = load_fixture("array_empty.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect empty array");
+            assert!(lines.is_empty());
+        }
+
+        #[test]
+        fn test_file_array_single_auto_detect() {
+            let data = load_fixture("array_single.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect single array");
+            assert_eq!(lines.len(), 1);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["only"], "one");
+        }
+
+        #[test]
+        fn test_file_array_nested_auto_detect() {
+            let data = load_fixture("array_nested.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect nested array");
+            assert_eq!(lines.len(), 3);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["tags"].as_array().expect("tags").len(), 2);
+        }
+
+        #[test]
+        fn test_file_array_mixed_types_auto_detect() {
+            let data = load_fixture("array_mixed_types.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect mixed types array");
+            assert_eq!(lines.len(), 1);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["str"], "hello");
+            assert_eq!(r0["int"], 42);
+        }
     }
 
     mod file_object_tests {
@@ -3611,6 +3836,23 @@ mod tests {
             let data = load_fixture("object_single.json");
             let lines = auto_detect_and_read(&data).expect("auto-detect object");
             assert_eq!(lines.len(), 1);
+        }
+
+        #[test]
+        fn test_file_object_nulls_auto_detect() {
+            let data = load_fixture("object_nulls.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect nulls object");
+            assert_eq!(lines.len(), 1);
+            let r: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert!(r["middle_name"].is_null());
+        }
+
+        #[test]
+        fn test_file_object_empty_auto_detect() {
+            let data = load_fixture("object_empty.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect empty object");
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0], "{}");
         }
     }
 
@@ -3759,7 +4001,7 @@ mod tests {
         fn test_file_soda_schema() {
             let data = load_fixture("soda_response.json");
             let val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
-            let schema = soda_schema_from_meta(&val).expect("should extract schema");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
 
             // meta_data columns should be filtered out → 3 user columns
             assert_eq!(schema.fields().len(), 3);
@@ -3774,7 +4016,7 @@ mod tests {
         #[test]
         fn test_file_soda_reader_data() {
             let data = load_fixture("soda_response.json");
-            let soda = SodaReader::new(Cursor::new(data)).expect("should parse SODA");
+            let soda = SodaReader::new(Cursor::new(data), false).expect("should parse SODA");
 
             assert_eq!(soda.schema().fields().len(), 3);
 
@@ -3803,7 +4045,7 @@ mod tests {
         #[test]
         fn test_file_soda_empty_data() {
             let data = load_fixture("soda_empty_data.json");
-            let mut soda = SodaReader::new(Cursor::new(data)).expect("should parse SODA");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse SODA");
 
             let schema = soda.schema().clone();
             assert_eq!(schema.fields().len(), 2);
@@ -3821,7 +4063,7 @@ mod tests {
         fn test_file_soda_all_nullable() {
             let data = load_fixture("soda_response.json");
             let val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
-            let schema = soda_schema_from_meta(&val).expect("should extract schema");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
             for field in schema.fields() {
                 assert!(
                     field.is_nullable(),
@@ -3829,6 +4071,499 @@ mod tests {
                     field.name()
                 );
             }
+        }
+
+        #[test]
+        fn test_file_soda_auto_detect() {
+            let data = load_fixture("soda_response.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect SODA");
+            assert_eq!(lines.len(), 3);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["city"], "Seattle");
+        }
+
+        #[test]
+        fn test_file_soda_empty_data_auto_detect() {
+            let data = load_fixture("soda_empty_data.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect empty SODA");
+            assert!(lines.is_empty());
+        }
+    }
+
+    mod file_soda_real_world_tests {
+        use super::*;
+        use crate::{SodaReader, soda_schema_from_meta};
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        #[test]
+        fn test_house_price_index_schema() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let val: serde_json::Value = serde_json::from_slice(&data).expect("parse JSON");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
+
+            // 10 total columns, 8 meta_data → 2 user-visible columns
+            assert_eq!(schema.fields().len(), 2);
+            assert_eq!(schema.field(0).name(), "observation_date");
+            assert_eq!(
+                *schema.field(0).data_type(),
+                DataType::Timestamp(TimeUnit::Second, None)
+            ); // calendar_date → Timestamp
+            assert_eq!(schema.field(1).name(), "ctsthpi");
+            assert_eq!(*schema.field(1).data_type(), DataType::Float64); // number → Float64
+        }
+
+        #[test]
+        fn test_house_price_index_data() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse SODA");
+
+            assert_eq!(soda.schema().fields().len(), 2);
+
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse row 0");
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+            assert_eq!(r0["ctsthpi"], "62.9");
+
+            // meta_data columns must not appear
+            assert!(r0.get(":sid").is_none());
+            assert!(r0.get(":id").is_none());
+            assert!(r0.get(":position").is_none());
+            assert!(r0.get(":created_at").is_none());
+            assert!(r0.get(":meta").is_none());
+
+            let last: serde_json::Value = serde_json::from_str(lines[202]).expect("parse last row");
+            assert_eq!(last["observation_date"], "2025-07-01T00:00:00");
+            assert_eq!(last["ctsthpi"], "708.94");
+        }
+
+        #[test]
+        fn test_single_fmly_home_schema() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let val: serde_json::Value = serde_json::from_slice(&data).expect("parse JSON");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
+
+            // 12 total columns, 8 meta_data → 4 user-visible columns
+            assert_eq!(schema.fields().len(), 4);
+            assert_eq!(schema.field(0).name(), "date");
+            assert_eq!(
+                *schema.field(0).data_type(),
+                DataType::Timestamp(TimeUnit::Second, None)
+            ); // calendar_date → Timestamp
+            assert_eq!(schema.field(1).name(), "median_sale_price");
+            assert_eq!(*schema.field(1).data_type(), DataType::Float64); // number → Float64
+            assert_eq!(schema.field(2).name(), "average_sale_price");
+            assert_eq!(*schema.field(2).data_type(), DataType::Float64); // number → Float64
+            assert_eq!(schema.field(3).name(), "county");
+            assert_eq!(*schema.field(3).data_type(), DataType::Utf8); // text → Utf8
+        }
+
+        #[test]
+        fn test_single_fmly_home_data() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse SODA");
+
+            assert_eq!(soda.schema().fields().len(), 4);
+
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse row 0");
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
+            assert_eq!(r0["county"], "Fairfield");
+            // Check that numeric columns appear and are non-null
+            assert!(!r0["median_sale_price"].is_null());
+            assert!(!r0["average_sale_price"].is_null());
+
+            // meta_data columns must not appear
+            assert!(r0.get(":sid").is_none());
+            assert!(r0.get(":id").is_none());
+        }
+
+        #[test]
+        fn test_single_fmly_home_all_nullable() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
+            let schema = soda_schema_from_meta(&val, false).expect("should extract schema");
+            for field in schema.fields() {
+                assert!(
+                    field.is_nullable(),
+                    "field '{}' should be nullable",
+                    field.name()
+                );
+            }
+        }
+
+        #[test]
+        fn test_house_price_index_auto_detect() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect house price SODA");
+            assert_eq!(lines.len(), 203);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+            // meta_data columns must not appear
+            assert!(r0.get(":sid").is_none());
+        }
+
+        #[test]
+        fn test_single_fmly_home_auto_detect() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let lines = auto_detect_and_read(&data).expect("auto-detect single fmly SODA");
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
+            assert_eq!(r0["county"], "Fairfield");
+        }
+
+        // ---- Scenarios matching the 8-dataset YAML config ----
+
+        // Config 1 & 2: no file_format, no json_pointer → Auto → SODA detected
+        // (Already covered by test_house_price_index_auto_detect and test_single_fmly_home_auto_detect)
+
+        // Config 3 & 4: file_format: soda (explicit) → SODA reader, no metadata
+        #[test]
+        fn test_house_price_index_explicit_soda() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 2);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+            // No meta_data columns
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert!(r0.get(":sid").is_none());
+            assert!(r0.get(":position").is_none());
+        }
+
+        #[test]
+        fn test_single_fmly_home_explicit_soda() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 4);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert!(r0.get(":sid").is_none());
+        }
+
+        // Config 5 & 6: file_format: soda + soda_metadata: enabled → all columns
+        #[test]
+        fn test_house_price_index_soda_with_metadata() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
+            let schema = soda_schema_from_meta(&val, true).expect("schema with metadata");
+
+            // 10 total columns (8 meta + 2 user)
+            assert_eq!(schema.fields().len(), 10);
+            assert_eq!(schema.field(0).name(), ":sid");
+            assert_eq!(schema.field(7).name(), ":meta");
+            assert_eq!(schema.field(8).name(), "observation_date");
+            assert_eq!(schema.field(9).name(), "ctsthpi");
+
+            let mut soda = SodaReader::new(Cursor::new(data), true).expect("should parse");
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+
+            // Verify meta_data columns ARE present with correct types
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse row 0");
+            assert!(r0.get(":sid").is_some(), ":sid should be present");
+            assert!(r0.get(":id").is_some(), ":id should be present");
+            assert!(r0.get(":position").is_some(), ":position should be present");
+            // :position is Int64 — should remain a JSON number
+            assert!(
+                r0[":position"].is_number(),
+                ":position should be a number, got {:?}",
+                r0[":position"]
+            );
+            // :created_at is Int64 — should remain a JSON number
+            assert!(
+                r0[":created_at"].is_number(),
+                ":created_at should be a number, got {:?}",
+                r0[":created_at"]
+            );
+            // :meta is Utf8 — an object in raw data, coerced to string
+            assert!(
+                r0[":meta"].is_string(),
+                ":meta should be a string, got {:?}",
+                r0[":meta"]
+            );
+            // User columns still present
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+            assert_eq!(r0["ctsthpi"], "62.9");
+        }
+
+        #[test]
+        fn test_single_fmly_home_soda_with_metadata() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let val: serde_json::Value = serde_json::from_slice(&data).expect("parse");
+            let schema = soda_schema_from_meta(&val, true).expect("schema with metadata");
+
+            // 12 total columns (8 meta + 4 user)
+            assert_eq!(schema.fields().len(), 12);
+
+            let mut soda = SodaReader::new(Cursor::new(data), true).expect("should parse");
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse row 0");
+            // Meta columns present with correct types
+            assert!(r0.get(":sid").is_some());
+            assert!(r0[":position"].is_number(), ":position should be a number");
+            assert!(
+                r0[":created_at"].is_number(),
+                ":created_at should be a number"
+            );
+            // User columns present
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
+            assert_eq!(r0["county"], "Fairfield");
+        }
+
+        // Config 7 & 8: file_format: json + json_pointer: /data → plain JSON, arrays of arrays
+        #[test]
+        fn test_house_price_index_json_pointer_data() {
+            use crate::JsonPointerReader;
+            let data = load_fixture("house_price_index_connecticut.json");
+            let extracted = JsonPointerReader::from_vec(&data, "/data").expect("extract /data");
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(extracted), &mut buf)
+                .expect("read");
+            // Should be an array of arrays — use ArrayToNdjson
+            let adapter =
+                ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf))).expect("ArrayToNdjson");
+            let lines = read_all_lines(adapter).expect("read lines");
+            assert_eq!(lines.len(), 203);
+            // Each inner array → positional object with keys "0", "1", ...
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse row 0");
+            // 10 values per row (all columns including meta)
+            assert!(r0.get("0").is_some(), "positional key '0' should exist");
+            assert!(r0.get("9").is_some(), "positional key '9' should exist");
+        }
+
+        #[test]
+        fn test_single_fmly_home_json_pointer_data() {
+            use crate::JsonPointerReader;
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let extracted = JsonPointerReader::from_vec(&data, "/data").expect("extract /data");
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(extracted), &mut buf)
+                .expect("read");
+            let adapter =
+                ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf))).expect("ArrayToNdjson");
+            let lines = read_all_lines(adapter).expect("read lines");
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse row 0");
+            // 12 values per row
+            assert!(r0.get("0").is_some());
+            assert!(r0.get("11").is_some());
+        }
+
+        // Config 5 & 6: json_format: soda (overrides auto default) — equivalent to explicit SODA
+        // At the stream level, json_format=soda produces the same output as file_format=soda.
+        // These tests verify the SodaReader path produces correct output when invoked explicitly.
+        #[test]
+        fn test_house_price_index_json_format_soda() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            // json_format: soda → SodaReader with no metadata (same as explicit soda)
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 2);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+            assert!(r0.get(":sid").is_none());
+        }
+
+        #[test]
+        fn test_single_fmly_home_json_format_soda() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), false).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 4);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
+            assert!(r0.get(":sid").is_none());
+        }
+
+        // Config 9 & 10: file_format: json + json_format: soda + soda_metadata: enabled
+        // The connector routes this as Format::Json default, then json_format overrides to Soda.
+        // At the stream level, this is SodaReader with metadata enabled.
+        #[test]
+        fn test_house_price_index_json_soda_with_metadata() {
+            let data = load_fixture("house_price_index_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), true).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 10);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 203);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            // Meta columns present
+            assert!(r0.get(":sid").is_some());
+            assert!(r0.get(":id").is_some());
+            assert!(r0[":position"].is_number());
+            assert!(r0[":created_at"].is_number());
+            // User columns present
+            assert_eq!(r0["observation_date"], "1975-01-01T00:00:00");
+        }
+
+        #[test]
+        fn test_single_fmly_home_json_soda_with_metadata() {
+            let data = load_fixture("single_fmly_home_connecticut.json");
+            let mut soda = SodaReader::new(Cursor::new(data), true).expect("should parse");
+            assert_eq!(soda.schema().fields().len(), 12);
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut soda, &mut output).expect("should read");
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), 2358);
+            let r0: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
+            assert!(r0.get(":sid").is_some());
+            assert!(r0[":position"].is_number());
+            assert_eq!(r0["date"], "2001-01-01T00:00:00");
+        }
+    }
+
+    mod soda_auto_detect_tests {
+        use crate::is_soda_response;
+
+        #[test]
+        fn test_auto_detect_soda_house_price_index() {
+            let data = std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/test_data/house_price_index_connecticut.json"
+            ))
+            .expect("read fixture");
+            assert!(
+                is_soda_response(&data),
+                "house_price_index_connecticut.json should be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_soda_single_fmly_home() {
+            let data = std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/test_data/single_fmly_home_connecticut.json"
+            ))
+            .expect("read fixture");
+            assert!(
+                is_soda_response(&data),
+                "single_fmly_home_connecticut.json should be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_soda_synthetic() {
+            let data = std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/test_data/soda_response.json"
+            ))
+            .expect("read fixture");
+            assert!(
+                is_soda_response(&data),
+                "soda_response.json should be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_plain_json_array() {
+            let data = br#"[{"name":"Alice"},{"name":"Bob"}]"#;
+            assert!(
+                !is_soda_response(data),
+                "plain JSON array should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_plain_json_object() {
+            let data = br#"{"name":"Alice","age":30}"#;
+            assert!(
+                !is_soda_response(data),
+                "plain JSON object should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_ndjson() {
+            let data = b"{\"name\":\"Alice\"}\n{\"name\":\"Bob\"}\n";
+            assert!(
+                !is_soda_response(data),
+                "NDJSON should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_object_with_meta_but_no_data() {
+            let data =
+                br#"{"meta":{"view":{"columns":[{"fieldName":"x","dataTypeName":"text"}]}}}"#;
+            assert!(
+                !is_soda_response(data),
+                "object with meta but no data should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_object_with_data_but_no_meta() {
+            let data = br#"{"data":[[1,2],[3,4]]}"#;
+            assert!(
+                !is_soda_response(data),
+                "object with data but no meta should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_meta_without_child_objects() {
+            // meta exists but has no child objects — just scalar/string values
+            let data = br#"{"meta":{"version":"1.0"},"data":[[1,2]]}"#;
+            assert!(
+                !is_soda_response(data),
+                "meta with only scalar children should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_soda_without_view_columns() {
+            // meta.view exists as a child object but has no columns key
+            let data = br#"{"meta":{"view":{"name":"test"}},"data":[[1,2]]}"#;
+            assert!(
+                is_soda_response(data),
+                "meta with a child object + data array should be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_rejects_invalid_json() {
+            let data = b"not valid json at all";
+            assert!(
+                !is_soda_response(data),
+                "invalid JSON should not be detected as SODA"
+            );
+        }
+
+        #[test]
+        fn test_auto_detect_soda_with_bom() {
+            let mut data = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+            data.extend_from_slice(br#"{"meta":{"view":{"columns":[{"fieldName":"x","dataTypeName":"text"}]}},"data":[[1]]}"#);
+            assert!(
+                is_soda_response(&data),
+                "SODA with BOM prefix should be detected"
+            );
         }
     }
 
@@ -4057,6 +4792,45 @@ mod tests {
             let mut reader = BufReader::new(Cursor::new(&data));
             let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
             assert_eq!(byte, b'[', "should detect array after BOM");
+        }
+
+        // -- native format variants for BOM files --
+
+        #[test]
+        fn test_file_bom_object_native() {
+            let data = load_fixture("bom_object.json");
+            // Strip BOM, then read as single-line object via BufReader
+            let stripped = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&data);
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(stripped))).expect("should read object");
+            assert_eq!(lines.len(), 1);
+            let r: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r["name"], "Alice");
+            assert_eq!(r["age"], 30);
+        }
+
+        #[test]
+        fn test_file_bom_jsonl_native() {
+            let data = load_fixture("bom_jsonl.json");
+            // Strip BOM, then read as JSONL (line-delimited) via BufReader
+            let stripped = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&data);
+            let lines =
+                read_all_lines(BufReader::new(Cursor::new(stripped))).expect("should read JSONL");
+            assert_eq!(lines.len(), 2);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["name"], "Alice");
+        }
+
+        #[test]
+        fn test_file_bom_whitespace_array_native() {
+            let data = load_fixture("bom_whitespace_array.json");
+            // Native: read as array via ArrayToNdjson
+            let adapter =
+                ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse BOM+ws array file");
+            let lines = read_all_lines(adapter).expect("should read");
+            assert_eq!(lines.len(), 2);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
+            assert_eq!(r0["x"], 1);
         }
     }
 }

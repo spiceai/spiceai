@@ -221,14 +221,14 @@ jobs:
       # Download the test archive artifact
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-test-archive
           path: ./integration_test
 
       - name: Download retention OOM test archive
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-retention-oom-test-archive
           path: ./retention_oom_test
@@ -363,7 +363,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -409,7 +409,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download AWS SDK test archive
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk_test
@@ -449,7 +449,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download AWS SDK credential bridge test archive
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test
@@ -493,7 +493,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download data components test archive
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-data-components-test-archive
           path: ./data_components_test
@@ -522,7 +522,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download partition table test archive
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test
