@@ -27,7 +27,7 @@ datasets:
       adbc_username: ${secrets:adbc_username}
       adbc_password: ${secrets:adbc_password}
       # Optional driver-specific database options (semicolon-delimited key=value pairs)
-      adbc_driver_options: adbc.snowflake.sql.db=MY_DB; adbc.snowflake.sql.schema=MY_SCHEMA
+      adbc_driver_options: snowflake.sql.db=MY_DB; snowflake.sql.schema=MY_SCHEMA
       # Optional connection defaults
       adbc_catalog: my_catalog
       adbc_schema: my_schema
@@ -47,9 +47,9 @@ datasets:
       adbc_uri: "user@account/database/schema"
       adbc_password: ${secrets:snowflake_password}
       adbc_driver_options: >-
-        adbc.snowflake.sql.warehouse=MY_WH;
-        adbc.snowflake.sql.role=MY_ROLE;
-        adbc.snowflake.sql.auth_type=auth_snowflake
+        snowflake.sql.warehouse=MY_WH;
+        snowflake.sql.role=MY_ROLE;
+        snowflake.sql.auth_type=auth_snowflake
 ```
 
 See the [Snowflake ADBC driver docs](https://arrow.apache.org/adbc/current/driver/snowflake.html#client-options) for all available client options.
@@ -61,7 +61,7 @@ See the [Snowflake ADBC driver docs](https://arrow.apache.org/adbc/current/drive
 - `adbc_uri` (required): Database URI/connection string. Note: in-memory URIs (e.g., `:memory:`) are not supported.
 - `adbc_username` (optional, secret): Username for database authentication
 - `adbc_password` (optional, secret): Password for database authentication
-- `adbc_driver_options` (optional): Semicolon-delimited driver-specific database options (e.g., `key1=value1; key2=value2`). Each key-value pair is passed as an `OptionDatabase::Other` entry to the ADBC driver. See driver-specific documentation for available options.
+- `adbc_driver_options` (optional): Semicolon-delimited driver-specific database options (e.g., `key1=value1; key2=value2`). Keys are automatically prefixed with `adbc.` if not already present (e.g., `snowflake.sql.db` becomes `adbc.snowflake.sql.db`). See driver-specific documentation for available options.
 - `adbc_catalog` (optional): The catalog for the connection
 - `adbc_schema` (optional): The schema for the connection
 - `connection_pool_size` (optional, default: 5): Maximum connections in the pool.

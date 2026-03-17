@@ -320,7 +320,9 @@ fn build_db_options(
                 continue;
             }
             if let Some((key, value)) = pair.split_once('=') {
-                opts.push((OptionDatabase::Other(key.trim().to_string()), value.trim().into()));
+                let key = key.trim();
+                let key = if key.starts_with("adbc.") { key.to_string() } else { format!("adbc.{key}") };
+                opts.push((OptionDatabase::Other(key), value.trim().into()));
             } else {
                 tracing::warn!("Ignoring malformed ADBC option (expected 'key=value'): {pair}");
             }
@@ -496,21 +498,29 @@ mod tests {
     }
 
     #[test]
-    fn test_build_db_options_with_driver_options() {
+    fn test_build_db_options_with_driver_options_unprefixed() {
         let opts = build_db_options("uri://db", None, None, Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"));
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(opts[1].0, OptionDatabase::Other("snowflake.sql.db".to_string()));
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.snowflake.sql.db".to_string()));
         assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
-        assert_eq!(opts[2].0, OptionDatabase::Other("snowflake.sql.schema".to_string()));
+        assert_eq!(opts[2].0, OptionDatabase::Other("adbc.snowflake.sql.schema".to_string()));
         assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
+    }
+
+    #[test]
+    fn test_build_db_options_with_driver_options_prefixed() {
+        let opts = build_db_options("uri://db", None, None, Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"));
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.snowflake.sql.db".to_string()));
+        assert_eq!(opts[2].0, OptionDatabase::Other("adbc.snowflake.sql.schema".to_string()));
     }
 
     #[test]
     fn test_build_db_options_driver_options_trailing_semicolon() {
         let opts = build_db_options("uri://db", None, None, Some("key=value;"));
         assert_eq!(opts.len(), 2);
-        assert_eq!(opts[1].0, OptionDatabase::Other("key".to_string()));
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
         assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
     }
 
