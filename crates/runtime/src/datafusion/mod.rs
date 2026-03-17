@@ -903,6 +903,7 @@ impl DataFusion {
         {
             let resolved = self
                 .resolve_partition_label(&expr_string, table_reference)
+                .await?
                 .unwrap_or(expr_string);
             return Ok(Some(resolved));
         };
@@ -911,18 +912,26 @@ impl DataFusion {
 
     /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
     /// the original SQL expression string from the partition manager metadata.
-    fn resolve_partition_label(
+    async fn resolve_partition_label(
         &self,
         label: &str,
         table_reference: &TableReference,
-    ) -> Option<String> {
-        let idx: usize = label.strip_prefix("expr")?.parse().ok()?;
-        let metadata = self
-            .executor_registry
-            .as_ref()?
+    ) -> Result<Option<String>, DataFusionError> {
+        let Ok(idx) = label.strip_prefix("expr")?.parse::<usize>() else {
+            return Ok(None);
+        };
+        let Some(ref executor_registry) = self.executor_registry else {
+            return Ok(None);
+        };
+
+        let Some(metadata) = executor_registry
             .federated_partition_manager()
-            .get_cached_table_metadata(table_reference)?;
-        metadata.partition_expressions.get(idx).cloned()
+            .get_table_metadata(table_reference)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(metadata.partition_expressions.get(idx).cloned())
     }
 
     /// Parses a SQL expression string into a DataFusion `Expr`, using the schema of the given table reference for resolution.

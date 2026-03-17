@@ -25,10 +25,11 @@ use arrow_flight::{
     utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use byte_unit::rust_decimal::prelude::Zero;
 use datafusion::{
     common::DFSchema,
+    scalar::ScalarValue,
     sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
@@ -565,7 +566,9 @@ fn select_least_loaded_executors(
             .min_by_key(|&(_, &count)| count)
             .map(|(&id, _)| id.to_string())
             .ok_or(Error::NoExecutorsAvailable)?;
-        *load.get_mut(executor_id.as_str()).expect("just selected") += 1;
+        *load
+            .get_mut(executor_id.as_str())
+            .context(NoExecutorsAvailableSnafu)? += 1;
         result.push(executor_id);
     }
     Ok(result)

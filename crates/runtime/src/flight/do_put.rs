@@ -204,6 +204,9 @@ pub(crate) async fn handle(
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
+        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
+            "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
+        )))?
         && matches!(
             datafusion.cluster_config.effective_role(),
             Some(ClusterRole::Scheduler)
@@ -214,14 +217,6 @@ pub(crate) async fn handle(
                 "No executors available to write data to. Ensure that at least one executor is connected to the cluster and try again.",
             ));
         }
-
-        let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
-            "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
-        )))? else {
-            return Err(Status::failed_precondition(
-                format!("Failed to write to distributed Cayenne table `{path}` via Flight: table is managed by a scheduler with connected executors but has no partition expression configured; configure a partition expression or disable scheduler mode for this table to allow writes"
-            )))
-        };
 
         return partition::write_through::forward_federated_partitioned_write(
             executor_registry,
