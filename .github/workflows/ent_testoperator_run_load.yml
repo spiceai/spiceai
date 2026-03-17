@@ -54,6 +54,9 @@ on:
           - 'iceberg-hadoop'
           - 'saffron-views'
           - 'saffron-duckdb-cte'
+          - 'postgres-catalog'
+          - 'mysql-catalog'
+          - 'mssql-catalog'
       runner_type:
         description: 'Runner type'
         required: true

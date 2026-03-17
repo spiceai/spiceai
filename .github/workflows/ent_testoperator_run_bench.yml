@@ -51,6 +51,9 @@ on:
           - 'dynamodb'
           - 'arrow'
           - 'saffron-views'
+          - 'postgres-catalog'
+          - 'mysql-catalog'
+          - 'mssql-catalog'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
