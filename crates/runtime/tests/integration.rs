@@ -72,6 +72,7 @@ mod graphql;
 mod http;
 mod iceberg;
 mod iceberg_api;
+mod json;
 
 #[cfg(feature = "kafka")]
 mod kafka;

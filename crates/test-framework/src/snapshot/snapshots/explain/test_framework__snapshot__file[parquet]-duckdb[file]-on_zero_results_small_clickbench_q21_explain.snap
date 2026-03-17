@@ -15,15 +15,14 @@ description: "Query: clickbench_q21"
 |               |     CoalescePartitionsExec                                                                                         |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                  |
 |               |         ProjectionExec: expr=[]                                                                                    |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                              |
-|               |             FilterExec: CAST(URL@0 AS LargeUtf8) LIKE %google%                                                     |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                |
-|               |                 SchemaCastScanExec                                                                                 |
-|               |                   FallbackOnZeroResultsScanExec                                                                    |
-|               |                     CoalescePartitionsExec                                                                         |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                        |
-|               |                         CooperativeExec                                                                            |
-|               |                           BytesProcessedExec                                                                       |
-|               |                             DuckSqlExec sql= SELECT "URL" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%'      |
+|               |           FilterExec: CAST(URL@0 AS LargeUtf8) LIKE %google%                                                       |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                  |
+|               |               SchemaCastScanExec                                                                                   |
+|               |                 FallbackOnZeroResultsScanExec                                                                      |
+|               |                   CoalescePartitionsExec                                                                           |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                          |
+|               |                       CooperativeExec                                                                              |
+|               |                         BytesProcessedExec                                                                         |
+|               |                           DuckSqlExec sql= SELECT "URL" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%'        |
 |               |                                                                                                                    |
 +---------------+--------------------------------------------------------------------------------------------------------------------+

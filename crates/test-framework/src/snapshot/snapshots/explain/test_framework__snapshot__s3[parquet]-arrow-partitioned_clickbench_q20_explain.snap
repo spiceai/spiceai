@@ -1,0 +1,24 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q20"
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                    |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: hits.UserID = Int64(435090932899640449)                                                                                         |
+|               |   TableScan: hits projection=[UserID], partial_filters=[hits.UserID = Int64(435090932899640449)]                                        |
+| physical_plan | FilterExec: UserID@0 = 435090932899640449                                                                                               |
+|               |   SchemaCastScanExec                                                                                                                    |
+|               |     PartitionedUnionExec                                                                                                                |
+|               |       BytesProcessedExec                                                                                                                |
+|               |         DataSourceExec: partitions=16, partition_sizes=[109, 109, 109, 109, 109, 108, 108, 108, 108, 108, 108, 108, 108, 121, 171, 451] |
+|               |       BytesProcessedExec                                                                                                                |
+|               |         DataSourceExec: partitions=16, partition_sizes=[139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 141, 185, 494] |
+|               |       BytesProcessedExec                                                                                                                |
+|               |         DataSourceExec: partitions=16, partition_sizes=[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 19, 24, 190]                |
+|               |       BytesProcessedExec                                                                                                                |
+|               |         DataSourceExec: partitions=16, partition_sizes=[37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 36, 52, 272]                |
+|               |       BytesProcessedExec                                                                                                                |
+|               |         DataSourceExec: partitions=16, partition_sizes=[78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 79, 462]                |
+|               |                                                                                                                                         |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
