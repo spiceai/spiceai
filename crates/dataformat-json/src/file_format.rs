@@ -420,15 +420,6 @@ impl FileFormat for SpiceJsonFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table_schema = conf.file_source().table_schema().clone();
-        let source = Arc::new(
-            SpiceJsonSource::new(table_schema)
-                .with_format(self.options.format)
-                .with_json_pointer(self.options.json_pointer.clone())
-                .with_unnest_struct(self.options.flatten_json.clone())
-                .with_soda_metadata(self.options.soda_metadata),
-        );
-
         let needs_non_repartitioned = matches!(
             self.options.format,
             Format::Array | Format::Object | Format::Auto | Format::Json | Format::Soda
@@ -455,7 +446,6 @@ impl FileFormat for SpiceJsonFormat {
             let conf = FileScanConfigBuilder::from(conf)
                 .with_file_groups(individual_file_groups)
                 .with_file_compression_type(FileCompressionType::from(self.options.compression))
-                .with_source(source)
                 .build();
 
             return Ok(DataSourceExec::from_data_source(
@@ -465,7 +455,6 @@ impl FileFormat for SpiceJsonFormat {
 
         let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(FileCompressionType::from(self.options.compression))
-            .with_source(source)
             .build();
 
         Ok(DataSourceExec::from_data_source(conf))
@@ -633,7 +622,24 @@ impl DataSource for NonRepartitionedFileScanConfig {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
-        self.inner.try_swapping_with_projection(projection)
+        match self.inner.try_swapping_with_projection(projection)? {
+            Some(new_inner) => {
+                let new_config = new_inner
+                    .as_any()
+                    .downcast_ref::<FileScanConfig>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "NonRepartitionedFileScanConfig inner must be FileScanConfig"
+                                .to_string(),
+                        )
+                    })?
+                    .clone();
+                Ok(Some(Arc::new(NonRepartitionedFileScanConfig::new(
+                    new_config,
+                ))))
+            }
+            None => Ok(None),
+        }
     }
 }
 
