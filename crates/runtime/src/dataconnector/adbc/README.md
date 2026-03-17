@@ -26,20 +26,48 @@ datasets:
       # Optional authentication
       adbc_username: ${secrets:adbc_username}
       adbc_password: ${secrets:adbc_password}
+      # Optional driver-specific database options (semicolon-delimited key=value pairs)
+      adbc_driver_options: adbc.snowflake.sql.db=MY_DB; adbc.snowflake.sql.schema=MY_SCHEMA
+      # Optional connection defaults
+      adbc_catalog: my_catalog
+      adbc_schema: my_schema
       # Optional connection pool settings
       connection_pool_size: 5
       connection_pool_min_idle: 1
 ```
 
+### Snowflake Example
+
+```yaml
+datasets:
+  - from: adbc:MY_TABLE
+    name: my_table
+    params:
+      adbc_driver: snowflake
+      adbc_uri: "user@account/database/schema"
+      adbc_password: ${secrets:snowflake_password}
+      adbc_driver_options: >-
+        adbc.snowflake.sql.warehouse=MY_WH;
+        adbc.snowflake.sql.role=MY_ROLE;
+        adbc.snowflake.sql.auth_type=auth_snowflake
+```
+
+See the [Snowflake ADBC driver docs](https://arrow.apache.org/adbc/current/driver/snowflake.html#client-options) for all available client options.
+
 ### Parameters
 
-- `adbc_driver` (required): The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres')
+- `adbc_driver` (required): The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres', 'snowflake')
 - `adbc_driver_path` (optional): Path to the ADBC driver library
 - `adbc_uri` (required): Database URI/connection string. Note: in-memory URIs (e.g., `:memory:`) are not supported.
 - `adbc_username` (optional, secret): Username for database authentication
 - `adbc_password` (optional, secret): Password for database authentication
+- `adbc_driver_options` (optional): Semicolon-delimited driver-specific database options (e.g., `key1=value1; key2=value2`). Each key-value pair is passed as an `OptionDatabase::Other` entry to the ADBC driver. See driver-specific documentation for available options.
+- `adbc_catalog` (optional): The catalog for the connection
+- `adbc_schema` (optional): The schema for the connection
 - `connection_pool_size` (optional, default: 5): Maximum connections in the pool.
 - `connection_pool_min_idle` (optional, default: 1): Minimum idle connections
+
+**Note:** The `read_only` connection option is automatically set based on the dataset's `mode` field. When `mode: read` (the default), connections are marked read-only.
 
 ## Architecture
 
@@ -65,5 +93,7 @@ The connector leverages the ADBC table providers from `datafusion-table-provider
 ## References
 
 - [ADBC Specification](https://arrow.apache.org/adbc/)
+- [ADBC Driver Status & Options](https://arrow.apache.org/adbc/current/driver/status.html)
+- [Snowflake ADBC Driver](https://arrow.apache.org/adbc/current/driver/snowflake.html)
 - [datafusion-table-providers ADBC PR](https://github.com/datafusion-contrib/datafusion-table-providers/pull/481)
 - [Spice Architecture](https://docs.spice.ai/architecture)
