@@ -192,7 +192,7 @@ pub(crate) struct PreparedStatement {
 pub(crate) async fn do_action_create_prepared_statement(
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
-    tracing::trace!("do_action_create_prepared_statement: {statement:#?}");
+    tracing::trace!("do_action_create_prepared_statement: {statement:?}");
     set_flightsql_protocol().await;
 
     let query = convert_jdbc_parameter_placeholders(&statement.query).map_err(error_to_status)?;

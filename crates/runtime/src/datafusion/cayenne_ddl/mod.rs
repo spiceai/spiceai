@@ -25,15 +25,11 @@ pub mod logical_nodes;
 pub mod physical_plans;
 pub mod planner;
 
-use ::data_components::delete::DeletionTableProviderAdapter;
-use cayenne::CayenneTableProvider;
-use datafusion::catalog::{CatalogProvider, TableProvider};
-use runtime_table_partition::provider::PartitionTableProvider;
+use datafusion::catalog::CatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
+use crate::catalogconnector::PartitionAwareCatalog;
 use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
-use crate::catalogconnector::{PartitionAwareCatalog, RefreshingCatalogProvider};
-use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {

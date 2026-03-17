@@ -25,7 +25,7 @@ use arrow_flight::{
     utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use byte_unit::rust_decimal::prelude::Zero;
 use datafusion::{
     common::DFSchema,
@@ -339,7 +339,7 @@ async fn route_batch_and_assign_unseen(
             let partition_value: PartitionValue = partition_expr_keys
                 .iter()
                 .zip(scalar_values.iter())
-                .map(|(expr_key, scalar)| (expr_key.clone(), scalar.to_string()))
+                .map(|(expr_key, scalar)| (expr_key.clone(), scalar_to_sql_literal(scalar)))
                 .collect();
             Some((scalar_values, partition_value, sub_batch))
         })
@@ -431,6 +431,21 @@ async fn route_batch_and_assign_unseen(
     }
 
     Ok(())
+}
+
+fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
+    if scalar.is_null() {
+        return "NULL".to_string();
+    }
+    match scalar.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            // For string types, produce a properly quoted and escaped SQL literal.
+            let value = scalar.to_string();
+            let escaped = value.replace('\'', "''");
+            format!("'{}'", escaped)
+        }
+        _ => scalar.to_string(),
+    }
 }
 
 /// Routes matched rows to known executors and returns the unmatched rows.
@@ -550,7 +565,9 @@ fn select_least_loaded_executors(
             .min_by_key(|&(_, &count)| count)
             .map(|(&id, _)| id.to_string())
             .ok_or(Error::NoExecutorsAvailable)?;
-        *load.get_mut(executor_id.as_str()).expect("just selected") += 1;
+        *load
+            .get_mut(executor_id.as_str())
+            .ok_or(Error::NoExecutorsAvailable)? += 1;
         result.push(executor_id);
     }
     Ok(result)

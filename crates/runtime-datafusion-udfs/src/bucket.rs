@@ -118,7 +118,19 @@ impl ScalarUDFImpl for Bucket {
             }
             .into());
         }
-        Ok(arg_types[0].clone())
+        match &arg_types[0] {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => Ok(arg_types[0].clone()),
+            other => Err(DataFusionError::Plan(format!(
+                "BUCKET UDF expects first argument to be an integer type, but got {other:?}"
+            ))),
+        }
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
@@ -140,7 +152,7 @@ impl ScalarUDFImpl for Bucket {
                     .into());
                 }
             },
-            arg => {
+            arg @ ColumnarValue::Array(_) => {
                 return Err(BucketError::InvalidFirstArgType {
                     description: describe_columnar_value(arg),
                 }
@@ -172,9 +184,6 @@ fn wrap_bucket(bucket: u64, output_type: &DataType) -> Result<ScalarValue, DataF
         DataType::Int16 => Ok(ScalarValue::Int16(Some(
             i16::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
         ))),
-        DataType::Int32 => Ok(ScalarValue::Int32(Some(
-            i32::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
-        ))),
         DataType::Int64 => Ok(ScalarValue::Int64(Some(
             i64::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
         ))),
@@ -188,6 +197,7 @@ fn wrap_bucket(bucket: u64, output_type: &DataType) -> Result<ScalarValue, DataF
             u32::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
         ))),
         DataType::UInt64 => Ok(ScalarValue::UInt64(Some(bucket))),
+        // Also catches `DataType::Int32`.
         _ => Ok(ScalarValue::Int32(Some(
             i32::try_from(bucket).context(BucketLargerThanTypeSnafu)?,
         ))),

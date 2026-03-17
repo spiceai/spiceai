@@ -372,10 +372,6 @@ impl RefreshingCatalogProvider {
             refresh_task: None,
         }
     }
-    #[must_use]
-    pub(crate) fn inner_catalog(&self) -> &Arc<dyn RefreshableCatalogProvider> {
-        &self.inner
-    }
 
     fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
         if self.refresh_task.is_some() {

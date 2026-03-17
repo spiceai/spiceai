@@ -875,15 +875,19 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns the partition expression for a table by querying the catalog provider.
+    /// Returns the partition expression string for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
-    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
-    /// The returned string is parsed as a SQL expression against the table's schema.
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`),
+    /// and returns a SQL partition expression as a string.
+    ///
+    /// This function does not parse or validate the returned string into a DataFusion
+    /// [`Expr`]; callers that require a parsed expression must perform that parsing
+    /// themselves against the table's schema.
     ///
     /// When the catalog returns an auto-generated label like `"expr0"` (used for function
     /// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
-    /// is resolved from [`TablePartitionMetadata`] stored in the partition manager.
+    /// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
@@ -899,6 +903,7 @@ impl DataFusion {
         {
             let resolved = self
                 .resolve_partition_label(&expr_string, table_reference)
+                .await?
                 .unwrap_or(expr_string);
             return Ok(Some(resolved));
         };
@@ -907,18 +912,28 @@ impl DataFusion {
 
     /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
     /// the original SQL expression string from the partition manager metadata.
-    fn resolve_partition_label(
+    async fn resolve_partition_label(
         &self,
         label: &str,
         table_reference: &TableReference,
-    ) -> Option<String> {
-        let idx: usize = label.strip_prefix("expr")?.parse().ok()?;
-        let metadata = self
-            .executor_registry
-            .as_ref()?
+    ) -> Result<Option<String>, DataFusionError> {
+        let Some(Ok(idx)) = label.strip_prefix("expr").map(|s| s.parse::<usize>()) else {
+            return Ok(None);
+        };
+        let Some(ref executor_registry) = self.executor_registry else {
+            return Ok(None);
+        };
+
+        let Some(metadata) = executor_registry
             .federated_partition_manager()
-            .get_cached_table_metadata(table_reference)?;
-        metadata.partition_expressions.get(idx).cloned()
+            .get_table_metadata(table_reference)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+        else {
+            return Ok(None);
+        };
+        Ok(metadata.partition_expressions.get(idx).cloned())
     }
 
     /// Parses a SQL expression string into a DataFusion `Expr`, using the schema of the given table reference for resolution.
@@ -1219,21 +1234,6 @@ impl DataFusion {
 
         Ok(())
     }
-
-    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
-    /// meaning the write should be forwarded to an executor.
-    // pub(crate) async fn should_forward_writes_to_executors(
-    //     &self,
-    //     table_reference: &TableReference,
-    // ) -> bool {
-    //     matches!(
-    //         self.cluster_config.effective_role(),
-    //         Some(ClusterRole::Scheduler)
-    //     ) && self
-    //         .get_table(table_reference)
-    //         .await
-    //         .is_some_and(|t| is_cayenne_table(t.as_ref()))
-    // }
 
     pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
         let table_reference = dataset.into();
