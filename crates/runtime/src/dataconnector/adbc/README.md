@@ -67,8 +67,6 @@ See the [Snowflake ADBC driver docs](https://arrow.apache.org/adbc/current/drive
 - `connection_pool_size` (optional, default: 5): Maximum connections in the pool.
 - `connection_pool_min_idle` (optional, default: 1): Minimum idle connections
 
-**Note:** The `read_only` connection option is automatically set based on the dataset's `mode` field. When `mode: read` (the default), connections are marked read-only.
-
 ## Architecture
 
 The ADBC connector follows the standard Spice connector pattern:

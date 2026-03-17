@@ -115,12 +115,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .description("Password for database authentication")
         .secret(),
-    ParameterSpec::component("driver_options")
-        .description("Semicolon-delimited driver-specific database options (e.g., 'key1=value1;key2=value2')"),
-    ParameterSpec::component("catalog")
-        .description("The catalog for the connection"),
-    ParameterSpec::component("schema")
-        .description("The schema for the connection"),
+    ParameterSpec::component("driver_options").description(
+        "Semicolon-delimited driver-specific database options (e.g., 'key1=value1;key2=value2')",
+    ),
+    ParameterSpec::component("catalog").description("The catalog for the connection"),
+    ParameterSpec::component("schema").description("The schema for the connection"),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -173,22 +172,20 @@ impl DataConnectorFactory for AdbcFactory {
             let driver_options = params.parameters.get("driver_options").expose().ok();
             let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-            let catalog = params.parameters.get("catalog").expose().ok().map(String::from);
-            let schema = params.parameters.get("schema").expose().ok().map(String::from);
+            let catalog = params
+                .parameters
+                .get("catalog")
+                .expose()
+                .ok()
+                .map(String::from);
+            let schema = params
+                .parameters
+                .get("schema")
+                .expose()
+                .ok()
+                .map(String::from);
 
-            // Determine read-only from the dataset's access mode.
-            let is_read_only = match &params.component {
-                super::ConnectorComponent::Dataset(ds) => {
-                    ds.access() == crate::component::access::AccessMode::Read
-                }
-                super::ConnectorComponent::Catalog(_) => false,
-            };
-
-            let conn_options = build_conn_options(
-                is_read_only,
-                catalog.as_deref(),
-                schema.as_deref(),
-            );
+            let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -265,7 +262,9 @@ impl DataConnectorFactory for AdbcFactory {
                     pool_builder = pool_builder.with_conn_options(conn_opts);
                 }
 
-                let pool = pool_builder.build().context(UnableToCreateConnectionPoolSnafu {
+                let pool = pool_builder
+                    .build()
+                    .context(UnableToCreateConnectionPoolSnafu {
                         driver_location,
                         uri: uri_str,
                     })?;
@@ -321,7 +320,11 @@ fn build_db_options(
             }
             if let Some((key, value)) = pair.split_once('=') {
                 let key = key.trim();
-                let key = if key.starts_with("adbc.") { key.to_string() } else { format!("adbc.{key}") };
+                let key = if key.starts_with("adbc.") {
+                    key.to_string()
+                } else {
+                    format!("adbc.{key}")
+                };
                 opts.push((OptionDatabase::Other(key), value.trim().into()));
             } else {
                 tracing::warn!("Ignoring malformed ADBC option (expected 'key=value'): {pair}");
@@ -331,31 +334,27 @@ fn build_db_options(
     opts
 }
 
-/// Builds connection-level options from connector parameters and dataset access mode.
+/// Builds connection-level options from connector parameters.
 fn build_conn_options(
-    is_read_only: bool,
     catalog: Option<&str>,
     schema: Option<&str>,
 ) -> Option<HashMap<String, String>> {
     let mut opts = HashMap::new();
 
-    if is_read_only {
-        opts.insert(
-            adbc_core::options::OptionConnection::ReadOnly.as_ref().to_string(),
-            "true".to_string(),
-        );
-    }
-
     if let Some(catalog) = catalog {
         opts.insert(
-            adbc_core::options::OptionConnection::CurrentCatalog.as_ref().to_string(),
+            adbc_core::options::OptionConnection::CurrentCatalog
+                .as_ref()
+                .to_string(),
             catalog.to_string(),
         );
     }
 
     if let Some(schema) = schema {
         opts.insert(
-            adbc_core::options::OptionConnection::CurrentSchema.as_ref().to_string(),
+            adbc_core::options::OptionConnection::CurrentSchema
+                .as_ref()
+                .to_string(),
             schema.to_string(),
         );
     }
@@ -499,21 +498,43 @@ mod tests {
 
     #[test]
     fn test_build_db_options_with_driver_options_unprefixed() {
-        let opts = build_db_options("uri://db", None, None, Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"));
+        let opts = build_db_options(
+            "uri://db",
+            None,
+            None,
+            Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"),
+        );
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.snowflake.sql.db".to_string()));
+        assert_eq!(
+            opts[1].0,
+            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
+        );
         assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
-        assert_eq!(opts[2].0, OptionDatabase::Other("adbc.snowflake.sql.schema".to_string()));
+        assert_eq!(
+            opts[2].0,
+            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
+        );
         assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
     }
 
     #[test]
     fn test_build_db_options_with_driver_options_prefixed() {
-        let opts = build_db_options("uri://db", None, None, Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"));
+        let opts = build_db_options(
+            "uri://db",
+            None,
+            None,
+            Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"),
+        );
         assert_eq!(opts.len(), 3);
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.snowflake.sql.db".to_string()));
-        assert_eq!(opts[2].0, OptionDatabase::Other("adbc.snowflake.sql.schema".to_string()));
+        assert_eq!(
+            opts[1].0,
+            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
+        );
+        assert_eq!(
+            opts[2].0,
+            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
+        );
     }
 
     #[test]
@@ -526,37 +547,43 @@ mod tests {
 
     #[test]
     fn test_build_db_options_driver_options_malformed_ignored() {
-        let opts = build_db_options("uri://db", None, None, Some("good=val;bad_no_equals;another=ok"));
+        let opts = build_db_options(
+            "uri://db",
+            None,
+            None,
+            Some("good=val;bad_no_equals;another=ok"),
+        );
         assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
     }
 
     #[test]
     fn test_build_conn_options_none_when_empty() {
-        let opts = build_conn_options(false, None, None);
+        let opts = build_conn_options(None, None);
         assert!(opts.is_none());
     }
 
     #[test]
-    fn test_build_conn_options_read_only() {
-        let opts = build_conn_options(true, None, None).expect("should have options");
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts.get("adbc.connection.readonly"), Some(&"true".to_string()));
-    }
-
-    #[test]
-    fn test_build_conn_options_all() {
-        let opts = build_conn_options(true, Some("my_catalog"), Some("my_schema"))
-            .expect("should have options");
-        assert_eq!(opts.len(), 3);
-        assert_eq!(opts.get("adbc.connection.readonly"), Some(&"true".to_string()));
-        assert_eq!(opts.get("adbc.connection.catalog"), Some(&"my_catalog".to_string()));
-        assert_eq!(opts.get("adbc.connection.db_schema"), Some(&"my_schema".to_string()));
+    fn test_build_conn_options_both() {
+        let opts =
+            build_conn_options(Some("my_catalog"), Some("my_schema")).expect("should have options");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(
+            opts.get("adbc.connection.catalog"),
+            Some(&"my_catalog".to_string())
+        );
+        assert_eq!(
+            opts.get("adbc.connection.db_schema"),
+            Some(&"my_schema".to_string())
+        );
     }
 
     #[test]
     fn test_build_conn_options_catalog_only() {
-        let opts = build_conn_options(false, Some("cat"), None).expect("should have options");
+        let opts = build_conn_options(Some("cat"), None).expect("should have options");
         assert_eq!(opts.len(), 1);
-        assert_eq!(opts.get("adbc.connection.catalog"), Some(&"cat".to_string()));
+        assert_eq!(
+            opts.get("adbc.connection.catalog"),
+            Some(&"cat".to_string())
+        );
     }
 }
