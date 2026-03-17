@@ -228,6 +228,49 @@ impl CayenneCatalog {
             }),
         }
     }
+
+    /// Execute a single parameterized `INSERT OR REPLACE` for a chunk of insert
+    /// records that fits within `SQLite`'s parameter limit.
+    async fn insert_records_chunk(
+        &self,
+        table_id: &str,
+        pk_bytes_list: Vec<Vec<u8>>,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
+        let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
+        let table_id = table_id.to_string();
+
+        for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
+            let base = i * 4 + 1; // SQLite params are 1-indexed
+            values_parts.push(format!(
+                "(?{}, ?{}, ?{}, ?{})",
+                base,
+                base + 1,
+                base + 2,
+                base + 3
+            ));
+            params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
+            params.push(MetastoreValue::Text(table_id.clone()));
+            params.push(MetastoreValue::Blob(pk_bytes));
+            params.push(MetastoreValue::Integer(sequence_number));
+        }
+
+        let sql = format!(
+            "INSERT OR REPLACE INTO cayenne_insert_record \
+             (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
+            values_parts.join(", ")
+        );
+
+        self.metastore
+            .execute_helper(ExecuteParams { sql: &sql, params })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to add insert record entries in batch".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -762,43 +805,69 @@ impl MetadataCatalog for CayenneCatalog {
         pk_bytes_list: Vec<Vec<u8>>,
         sequence_number: i64,
     ) -> CatalogResult<()> {
+        // SQLite has a compile-time limit of SQLITE_MAX_VARIABLE_NUMBER (default
+        // 32 766) parameters per prepared statement.  Each row needs 4 params
+        // (insert_record_id, table_id, pk_bytes, sequence_number), so we chunk
+        // the list to stay within the limit.
+        //
+        // All chunks are wrapped in a single transaction so the operation is
+        // atomic: either every chunk is applied or none is.
+        const PARAMS_PER_ROW: usize = 4;
+        const MAX_PARAMS: usize = 32_000; // conservative cap below the 32 766 default
+        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
+
         if pk_bytes_list.is_empty() {
             return Ok(());
         }
 
-        // Build a batch insert with all PKs
-        // Using INSERT OR REPLACE to update sequence if PK already exists
-        let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
-        let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
-        let table_id = table_id.to_string();
-
-        for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
-            let base = i * 4 + 1; // SQLite params are 1-indexed
-            values_parts.push(format!(
-                "(?{}, ?{}, ?{}, ?{})",
-                base,
-                base + 1,
-                base + 2,
-                base + 3
-            ));
-            params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
-            params.push(MetastoreValue::Text(table_id.clone()));
-            params.push(MetastoreValue::Blob(pk_bytes));
-            params.push(MetastoreValue::Integer(sequence_number));
+        // Single chunk that fits within the parameter limit — no transaction
+        // overhead needed.
+        if pk_bytes_list.len() <= MAX_ROWS_PER_CHUNK {
+            return self
+                .insert_records_chunk(table_id, pk_bytes_list, sequence_number)
+                .await;
         }
 
-        let sql = format!(
-            "INSERT OR REPLACE INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
-            values_parts.join(", ")
-        );
-
+        // Multiple chunks required — wrap in a transaction for atomicity.
+        let begin = if self.metastore.is_turso() {
+            BEGIN_CONCURRENT_SQL
+        } else {
+            BEGIN_TRANSACTION_SQL
+        };
         self.metastore
-            .execute_helper(ExecuteParams { sql: &sql, params })
+            .execute_batch_helper(begin)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to add insert record entries in batch".to_string(),
+                message: "Failed to begin transaction for batch insert records".to_string(),
                 source: Box::new(e),
             })?;
+
+        for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
+            if let Err(e) = self
+                .insert_records_chunk(table_id, chunk.to_vec(), sequence_number)
+                .await
+            {
+                // Best-effort rollback; if it fails, the connection will
+                // auto-rollback when the next statement runs.
+                let _ = self
+                    .metastore
+                    .execute_helper(ExecuteParams {
+                        sql: "ROLLBACK",
+                        params: vec![],
+                    })
+                    .await;
+                return Err(e);
+            }
+        }
+
+        self.metastore
+            .execute_batch_helper(COMMIT_SQL)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to commit transaction for batch insert records".to_string(),
+                source: Box::new(e),
+            })?;
+
         Ok(())
     }
 
