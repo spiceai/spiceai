@@ -560,8 +560,8 @@ fn generate_adbc_create_table_statement(
         }
     }
 
-    let partition_clause = (!partition_columns.is_empty())
-        .then(|| {
+    let partition_clause = if (!partition_columns.is_empty()) {
+        {
             format!(
                 "PARTITION BY ({})",
                 partition_columns
@@ -570,8 +570,10 @@ fn generate_adbc_create_table_statement(
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        })
-        .unwrap_or_default();
+        }
+    } else {
+        Default::default()
+    };
 
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}) {partition_clause}",
