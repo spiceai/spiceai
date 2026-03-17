@@ -559,20 +559,17 @@ fn generate_adbc_create_table_statement(
             }
         }
     }
-
-    let partition_clause = if (!partition_columns.is_empty()) {
-        {
-            format!(
-                "PARTITION BY ({})",
-                partition_columns
-                    .iter()
-                    .map(|column| quote_identifier(column))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
+    let partition_clause = if partition_columns.is_empty() {
+        String::default()
     } else {
-        Default::default()
+        format!(
+            "PARTITION BY ({})",
+            partition_columns
+                .iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
 
     Ok(format!(
