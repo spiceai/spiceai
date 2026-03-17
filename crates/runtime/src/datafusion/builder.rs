@@ -465,6 +465,7 @@ impl DataFusionBuilder {
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
                 Arc::clone(&ddl_extension_store),
+                self.executor_registry.clone(),
             ),
         ));
 

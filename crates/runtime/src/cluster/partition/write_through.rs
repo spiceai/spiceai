@@ -521,7 +521,6 @@ fn build_partition_physical_exprs(
         .collect()
 }
 
-/// Selects the executor with the fewest currently assigned partitions.
 /// Selects the least-loaded executor for each of `count` new partition values,
 /// distributing them across executors by incrementally accounting for each assignment.
 fn select_least_loaded_executors(

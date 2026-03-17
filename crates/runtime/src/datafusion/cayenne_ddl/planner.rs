@@ -26,9 +26,13 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
-use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
+use super::logical_nodes::{
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDeleteNode, CayenneDropTableNode,
+    CayenneUpdateNode,
+};
 use super::physical_plans::{
-    CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDropTableExec,
+    CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDeleteExec,
+    CayenneDropTableExec, CayenneUpdateExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 
@@ -101,6 +105,35 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 drop.df_schema_name.clone(),
                 catalog_list,
                 self.executor_registry.clone(),
+            ))));
+        }
+
+        if let Some(delete) = node.as_any().downcast_ref::<CayenneDeleteNode>() {
+            let input = _physical_inputs.first().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "CayenneDeleteNode requires exactly one physical input".to_string(),
+                )
+            })?;
+            return Ok(Some(Arc::new(CayenneDeleteExec::new(
+                delete.table_name.clone(),
+                self.executor_registry.clone(),
+                delete.filter_sql.clone(),
+                Arc::clone(input),
+            ))));
+        }
+
+        if let Some(update) = node.as_any().downcast_ref::<CayenneUpdateNode>() {
+            let input = _physical_inputs.first().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "CayenneUpdateNode requires exactly one physical input".to_string(),
+                )
+            })?;
+            return Ok(Some(Arc::new(CayenneUpdateExec::new(
+                update.table_name.clone(),
+                self.executor_registry.clone(),
+                update.filter_sql.clone(),
+                update.assignments_sql.clone(),
+                Arc::clone(input),
             ))));
         }
 
