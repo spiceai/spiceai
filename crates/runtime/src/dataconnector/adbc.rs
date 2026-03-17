@@ -108,6 +108,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("uri")
         .description("Database URI/connection string for the ADBC driver")
         .required(),
+    ParameterSpec::component("username")
+        .description("Username for database authentication")
+        .secret(),
+    ParameterSpec::component("password")
+        .description("Password for database authentication")
+        .secret(),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -155,8 +161,9 @@ impl DataConnectorFactory for AdbcFactory {
 
             let uri_str = uri.to_string();
 
-            let db_options: Vec<(OptionDatabase, adbc_core::options::OptionValue)> =
-                vec![(OptionDatabase::Uri, uri.into())];
+            let username = params.parameters.get("username").expose().ok();
+            let password = params.parameters.get("password").expose().ok();
+            let db_options = build_db_options(&uri_str, username, password);
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -263,6 +270,22 @@ impl DataConnectorFactory for AdbcFactory {
     }
 }
 
+/// Builds the list of ADBC database options from connector parameters.
+fn build_db_options(
+    uri: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
+    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
+    if let Some(u) = username {
+        opts.push((OptionDatabase::Username, u.into()));
+    }
+    if let Some(p) = password {
+        opts.push((OptionDatabase::Password, p.into()));
+    }
+    opts
+}
+
 register_data_connector!("adbc", AdbcFactory);
 
 #[async_trait]
@@ -331,6 +354,8 @@ mod tests {
         assert!(param_names.contains(&"driver"));
         assert!(param_names.contains(&"driver_path"));
         assert!(param_names.contains(&"uri"));
+        assert!(param_names.contains(&"username"));
+        assert!(param_names.contains(&"password"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
     }
@@ -354,5 +379,41 @@ mod tests {
         let factory = AdbcFactory::new();
         let debug_str = format!("{factory:?}");
         assert!(debug_str.contains("AdbcFactory"));
+    }
+
+    #[test]
+    fn test_build_db_options_uri_only() {
+        let opts = build_db_options("file:test.db", None, None);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db")
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_with_username_password() {
+        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"));
+        assert_eq!(opts.len(), 3);
+
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db")
+        );
+
+        assert_eq!(opts[1].0, OptionDatabase::Username);
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "admin"));
+
+        assert_eq!(opts[2].0, OptionDatabase::Password);
+        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "secret"));
+    }
+
+    #[test]
+    fn test_build_db_options_username_only() {
+        let opts = build_db_options("sqlite:test.db", Some("user"), None);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert_eq!(opts[1].0, OptionDatabase::Username);
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "user"));
     }
 }
