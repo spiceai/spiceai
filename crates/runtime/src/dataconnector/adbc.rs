@@ -161,10 +161,19 @@ impl DataConnectorFactory for AdbcFactory {
 
             let uri_str = uri.to_string();
 
-            let username = params.parameters.get("username").expose().ok().map(str::to_string);
-            let password = params.parameters.get("password").expose().ok().map(str::to_string);
-            let db_options =
-                build_db_options(&uri_str, username.as_deref(), password.as_deref());
+            let username = params
+                .parameters
+                .get("username")
+                .expose()
+                .ok()
+                .map(str::to_string);
+            let password = params
+                .parameters
+                .get("password")
+                .expose()
+                .ok()
+                .map(str::to_string);
+            let db_options = build_db_options(&uri_str, username.as_deref(), password.as_deref());
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -387,7 +396,9 @@ mod tests {
         let opts = build_db_options("file:test.db", None, None);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert!(matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db"));
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db")
+        );
     }
 
     #[test]
@@ -396,7 +407,9 @@ mod tests {
         assert_eq!(opts.len(), 3);
 
         assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert!(matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db"));
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db")
+        );
 
         assert_eq!(opts[1].0, OptionDatabase::Username);
         assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "admin"));
