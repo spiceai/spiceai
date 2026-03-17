@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/json/mod.rs
+expression: result
+---
++---------+
+| ctsthpi |
++---------+
+| 61.85   |
+| 61.93   |
+| 62.9    |
++---------+

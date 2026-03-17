@@ -1094,7 +1094,7 @@ mod tests {
         let region = "us-east-2";
         let filters = &[col("region").eq(lit(region))];
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-        let ScalarValue::Int32(Some(us_east_2)) = call(
+        let ScalarValue::Int64(Some(us_east_2)) = call(
             &f,
             vec![
                 ScalarValue::Int64(Some(10)),
@@ -1102,9 +1102,9 @@ mod tests {
             ],
         )?
         else {
-            panic!("expected Int32");
+            panic!("expected Int64");
         };
-        let ScalarValue::Int32(Some(ap_northeast_2)) = call(
+        let ScalarValue::Int64(Some(ap_northeast_2)) = call(
             &f,
             vec![
                 ScalarValue::Int64(Some(10)),
@@ -1112,13 +1112,13 @@ mod tests {
             ],
         )?
         else {
-            panic!("expected Int32");
+            panic!("expected Int64");
         };
         assert_prune_partition!(
             filters,
             &partition_by,
             schema,
-            Int32,
+            Int64,
             [(us_east_2, false), (ap_northeast_2, true)]
         );
         Ok(())
@@ -1136,18 +1136,18 @@ mod tests {
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
         let hashed_values = (1..=6)
             .map(|i| {
-                let ScalarValue::Int32(Some(val)) = call(
+                let ScalarValue::Int64(Some(val)) = call(
                     &f,
                     vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(i))],
                 )?
                 else {
-                    panic!("expected Int32");
+                    panic!("expected Int64");
                 };
                 Ok(val)
             })
             .collect::<Result<Vec<_>, DataFusionError>>()?;
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i > 3)) {
-            let partition_value = ScalarValue::Int32(Some(val));
+            let partition_value = ScalarValue::Int64(Some(val));
             assert_eq!(
                 prune_partition(filters.as_slice(), &partition_by, &partition_value, &schema)?,
                 should_prune,
@@ -1202,18 +1202,18 @@ mod tests {
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
         let hashed_values = (1..=6)
             .map(|i| {
-                let ScalarValue::Int32(Some(val)) = call(
+                let ScalarValue::Int64(Some(val)) = call(
                     &f,
                     vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(i))],
                 )?
                 else {
-                    panic!("expected Int32");
+                    panic!("expected Int64");
                 };
                 Ok(val)
             })
             .collect::<Result<Vec<_>, DataFusionError>>()?;
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i <= 3)) {
-            let partition_value = ScalarValue::Int32(Some(val));
+            let partition_value = ScalarValue::Int64(Some(val));
             assert_eq!(
                 prune_partition(
                     std::slice::from_ref(&filter),
@@ -1450,18 +1450,18 @@ mod tests {
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
         let hashed_values = (1..=6)
             .map(|i| {
-                let ScalarValue::Int32(Some(val)) = call(
+                let ScalarValue::Int64(Some(val)) = call(
                     &f,
                     vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(i))],
                 )?
                 else {
-                    panic!("expected Int32");
+                    panic!("expected Int64");
                 };
                 Ok(val)
             })
             .collect::<Result<Vec<_>, DataFusionError>>()?;
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i > 3)) {
-            let partition_value = ScalarValue::Int32(Some(val));
+            let partition_value = ScalarValue::Int64(Some(val));
             assert_eq!(
                 prune_partition(&filters[..], &partition_by, &partition_value, &schema)?,
                 should_prune,
@@ -1525,7 +1525,7 @@ mod tests {
         // Compute which buckets contain values in range (50, 100]
         let mut buckets_with_matches = std::collections::HashSet::new();
         for user_id in 51..=100 {
-            let ScalarValue::Int32(Some(bucket)) = call(
+            let ScalarValue::Int64(Some(bucket)) = call(
                 &f,
                 vec![
                     ScalarValue::Int64(Some(10)),
@@ -1533,7 +1533,7 @@ mod tests {
                 ],
             )?
             else {
-                panic!("expected Int32");
+                panic!("expected Int64");
             };
             buckets_with_matches.insert(bucket);
         }
@@ -1545,7 +1545,7 @@ mod tests {
                 prune_partition(
                     &filters[..],
                     &partition_by,
-                    &ScalarValue::Int32(Some(partition_value)),
+                    &ScalarValue::Int64(Some(partition_value)),
                     &schema
                 )?,
                 should_prune,
@@ -1873,7 +1873,7 @@ mod tests {
 
         // Compute which bucket this UUID hashes to
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-        let ScalarValue::Int32(Some(expected_bucket)) = call(
+        let ScalarValue::Int64(Some(expected_bucket)) = call(
             &f,
             vec![
                 ScalarValue::Int64(Some(5)),
@@ -1881,15 +1881,15 @@ mod tests {
             ],
         )?
         else {
-            panic!("expected Int32");
+            panic!("expected Int64");
         };
 
         // Only the matching partition should NOT be pruned
-        for partition_value in 0..5_i32 {
+        for partition_value in 0..5_i64 {
             let pruned = prune_partition(
                 std::slice::from_ref(&filter),
                 &partition_by,
-                &ScalarValue::Int32(Some(partition_value)),
+                &ScalarValue::Int64(Some(partition_value)),
                 &schema,
             )?;
             let should_prune = partition_value != expected_bucket;
@@ -1998,7 +1998,7 @@ mod tests {
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
         let mut expected_buckets = std::collections::HashSet::new();
         for uuid in &uuids {
-            let ScalarValue::Int32(Some(bucket)) = call(
+            let ScalarValue::Int64(Some(bucket)) = call(
                 &f,
                 vec![
                     ScalarValue::Int64(Some(5)),
@@ -2006,17 +2006,17 @@ mod tests {
                 ],
             )?
             else {
-                panic!("expected Int32");
+                panic!("expected Int64");
             };
             expected_buckets.insert(bucket);
         }
 
         // Only partitions containing the UUIDs should NOT be pruned
-        for partition_value in 0..5_i32 {
+        for partition_value in 0..5_i64 {
             let pruned = prune_partition(
                 std::slice::from_ref(&filter),
                 &partition_by,
-                &ScalarValue::Int32(Some(partition_value)),
+                &ScalarValue::Int64(Some(partition_value)),
                 &schema,
             )?;
             let should_prune = !expected_buckets.contains(&partition_value);
@@ -2055,20 +2055,20 @@ mod tests {
 
         // Compute which bucket 42 hashes to
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-        let ScalarValue::Int32(Some(expected_bucket)) = call(
+        let ScalarValue::Int64(Some(expected_bucket)) = call(
             &f,
             vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(42))],
         )?
         else {
-            panic!("expected Int32");
+            panic!("expected Int64");
         };
 
         // Only the matching partition should NOT be pruned
-        for partition_value in 0..10_i32 {
+        for partition_value in 0..10_i64 {
             let pruned = prune_partition(
                 std::slice::from_ref(&filter),
                 &partition_by,
-                &ScalarValue::Int32(Some(partition_value)),
+                &ScalarValue::Int64(Some(partition_value)),
                 &schema,
             )?;
             let should_prune = partition_value != expected_bucket;
@@ -2238,19 +2238,19 @@ mod tests {
 
         // Bucket maps to whatever the hash function returns
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-        let ScalarValue::Int32(Some(bucket_partition)) = call(
+        let ScalarValue::Int64(Some(bucket_partition)) = call(
             &f,
             vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(42))],
         )?
         else {
-            panic!("expected Int32");
+            panic!("expected Int64");
         };
 
         assert!(
             !prune_partition(
                 std::slice::from_ref(&filter),
                 &partition_by_bucket,
-                &ScalarValue::Int32(Some(bucket_partition)),
+                &ScalarValue::Int64(Some(bucket_partition)),
                 &schema
             )?,
             "Bucket partition {bucket_partition} should not be pruned for value 42"
@@ -2262,8 +2262,8 @@ mod tests {
         let mut differences_found = false;
 
         for &value in &test_values {
-            let modulo_result = value % 10;
-            let ScalarValue::Int32(Some(bucket_result)) = call(
+            let modulo_result = i64::from(value % 10);
+            let ScalarValue::Int64(Some(bucket_result)) = call(
                 &f,
                 vec![
                     ScalarValue::Int64(Some(10)),
@@ -2271,7 +2271,7 @@ mod tests {
                 ],
             )?
             else {
-                panic!("expected Int32");
+                panic!("expected Int64");
             };
 
             if modulo_result != bucket_result {
@@ -2301,7 +2301,7 @@ mod tests {
             &ScalarValue::Int32(Some(221)),
             &schema,
         )?;
-        assert!(matches!(result, ScalarValue::Int32(_)));
+        assert!(matches!(result, ScalarValue::Int64(_)));
 
         // Verify the same value always produces the same result
         let result2 = transform_and_evaluate(
@@ -2327,13 +2327,13 @@ mod tests {
         )?;
 
         // All results should be in range [0, 3)
-        if let ScalarValue::Int32(Some(val)) = result_100 {
+        if let ScalarValue::Int64(Some(val)) = result_100 {
             assert!(
                 (0..3).contains(&val),
                 "bucket result should be in [0, 3), got {val}"
             );
         }
-        if let ScalarValue::Int32(Some(val)) = result_200 {
+        if let ScalarValue::Int64(Some(val)) = result_200 {
             assert!(
                 (0..3).contains(&val),
                 "bucket result should be in [0, 3), got {val}"

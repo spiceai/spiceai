@@ -304,6 +304,17 @@ install-odbc:
 install-nfs:
 	make install SPICED_NON_DEFAULT_FEATURES="nfs"
 
+# Install from a CI build artifact (branch or commit SHA)
+# Usage:
+#   make install-build              # Latest build from trunk
+#   make install-build REF=<branch> # Latest build from a branch
+#   make install-build REF=<sha>    # Build for a specific commit
+REF ?= trunk
+
+.PHONY: install-build
+install-build:
+	./install/install-build.sh $(REF)
+
 .PHONY: install-testoperator-dev
 install-testoperator-dev: build-testoperator-dev
 	mkdir -p ~/.spice/bin

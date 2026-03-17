@@ -475,8 +475,8 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
     let bucket_values = match batch_values {
         ColumnarValue::Array(array) => array
             .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("Expected Int32Array from bucket function")
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array from bucket function")
             .values()
             .to_vec(),
         ColumnarValue::Scalar(_) => panic!("Expected array from bucket expression"),
@@ -487,12 +487,12 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("Expected Int64Array for id column");
-    let mut bucket_to_ids: HashMap<i32, Vec<i64>> = HashMap::new();
+    let mut bucket_to_ids: HashMap<i64, Vec<i64>> = HashMap::new();
     for (id, bucket) in id_array.values().iter().zip(bucket_values.iter()) {
         bucket_to_ids.entry(*bucket).or_default().push(*id);
     }
 
-    let unique_buckets: Vec<i32> = bucket_to_ids.keys().copied().collect();
+    let unique_buckets: Vec<i64> = bucket_to_ids.keys().copied().collect();
     assert!(
         unique_buckets.len() >= 2,
         "Expected at least two distinct buckets, got {}",
@@ -528,14 +528,14 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
     );
     for bucket in selected_buckets {
         assert!(
-            partition_values.contains(&ScalarValue::Int32(Some(*bucket))),
+            partition_values.contains(&ScalarValue::Int64(Some(*bucket))),
             "Expected bucket {bucket} in filtered plan",
         );
     }
     for bucket in 0..4 {
         if !selected_buckets.contains(&bucket) {
             assert!(
-                !partition_values.contains(&ScalarValue::Int32(Some(bucket))),
+                !partition_values.contains(&ScalarValue::Int64(Some(bucket))),
                 "Bucket {bucket} should be pruned",
             );
         }

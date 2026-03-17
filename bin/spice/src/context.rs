@@ -53,8 +53,8 @@ pub struct RuntimeContext {
     /// API key for authentication
     api_key: Option<String>,
 
-    /// Whether to use cloud mode
-    is_cloud: bool,
+    /// Cloud region (e.g. "us-east-1"). When set, cloud mode is active.
+    cloud_region: Option<String>,
 
     /// User agent string for HTTP requests
     user_agent: String,
@@ -95,7 +95,7 @@ impl RuntimeContext {
             pods_dir,
             http_endpoint: "http://127.0.0.1:8090".to_string(),
             api_key: None,
-            is_cloud: false,
+            cloud_region: None,
             user_agent: Self::default_user_agent(),
             extra_headers: HashMap::new(),
             http_client,
@@ -104,10 +104,13 @@ impl RuntimeContext {
     }
 
     /// Create a runtime context from CLI arguments.
+    ///
+    /// `cloud` is `None` when `--cloud` is not passed, or `Some("region")` with the
+    /// cloud region name.
     pub fn with_args(
         http_endpoint: Option<String>,
         api_key: Option<String>,
-        is_cloud: bool,
+        cloud: Option<&str>,
         tls_root_certificate_file: Option<String>,
     ) -> Result<Self> {
         let mut ctx = Self::new()?;
@@ -116,9 +119,9 @@ impl RuntimeContext {
             ctx.http_endpoint = endpoint;
         }
 
-        if is_cloud {
-            ctx.http_endpoint = "https://data.spiceai.io".to_string();
-            ctx.is_cloud = true;
+        if let Some(region) = cloud {
+            ctx.http_endpoint = format!("https://{region}-data.spiceai.io");
+            ctx.cloud_region = Some(region.to_string());
         }
 
         ctx.api_key = api_key;
@@ -210,7 +213,13 @@ impl RuntimeContext {
     /// Check if cloud mode is enabled.
     #[must_use]
     pub fn is_cloud(&self) -> bool {
-        self.is_cloud
+        self.cloud_region.is_some()
+    }
+
+    /// Get the cloud region if one was specified.
+    #[must_use]
+    pub fn cloud_region(&self) -> Option<&str> {
+        self.cloud_region.as_deref()
     }
 
     /// Get the HTTP client.
@@ -485,7 +494,7 @@ mod tests {
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
             api_key: None,
-            is_cloud: false,
+            cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
@@ -509,7 +518,7 @@ mod tests {
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
             api_key: None,
-            is_cloud: false,
+            cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
@@ -858,7 +867,7 @@ mod tests {
     #[test]
     fn test_with_args_sets_http_endpoint() {
         let ctx =
-            RuntimeContext::with_args(Some("http://custom:9999".to_string()), None, false, None)
+            RuntimeContext::with_args(Some("http://custom:9999".to_string()), None, None, None)
                 .expect("with_args should succeed");
 
         assert_eq!(ctx.http_endpoint(), "http://custom:9999");
@@ -866,25 +875,26 @@ mod tests {
 
     #[test]
     fn test_with_args_sets_api_key() {
-        let ctx = RuntimeContext::with_args(None, Some("test-key".to_string()), false, None)
+        let ctx = RuntimeContext::with_args(None, Some("test-key".to_string()), None, None)
             .expect("with_args should succeed");
 
         assert_eq!(ctx.api_key(), Some("test-key"));
     }
 
     #[test]
-    fn test_with_args_sets_cloud_mode() {
-        let ctx =
-            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+    fn test_with_args_sets_cloud_mode_and_region() {
+        let ctx = RuntimeContext::with_args(None, None, Some("us-east-1"), None)
+            .expect("with_args should succeed");
 
         assert!(ctx.is_cloud());
-        assert_eq!(ctx.http_endpoint(), "https://data.spiceai.io");
+        assert_eq!(ctx.http_endpoint(), "https://us-east-1-data.spiceai.io");
+        assert_eq!(ctx.cloud_region(), Some("us-east-1"));
     }
 
     #[test]
     fn test_with_args_sets_tls_certificate() {
         let ctx =
-            RuntimeContext::with_args(None, None, false, Some("/path/to/cert.pem".to_string()))
+            RuntimeContext::with_args(None, None, None, Some("/path/to/cert.pem".to_string()))
                 .expect("with_args should succeed");
 
         assert_eq!(
@@ -974,7 +984,7 @@ mod tests {
         let ctx = RuntimeContext::with_args(
             Some("http://192.168.1.100:8090".to_string()),
             None,
-            false,
+            None,
             None,
         )
         .expect("with_args should succeed");
@@ -989,24 +999,28 @@ mod tests {
         let ctx = RuntimeContext::with_args(
             Some("http://custom:9999".to_string()), // This should be ignored
             None,
-            true, // Cloud mode enabled
+            Some("us-west-2"), // Cloud mode enabled with region
             None,
         )
         .expect("with_args should succeed");
 
         assert!(ctx.is_cloud());
-        assert_eq!(ctx.http_endpoint(), "https://data.spiceai.io");
+        assert_eq!(ctx.http_endpoint(), "https://us-west-2-data.spiceai.io");
     }
 
     #[test]
     fn test_cloud_mode_with_api_key() {
         // Cloud mode with API key
-        let ctx =
-            RuntimeContext::with_args(None, Some("cloud-api-key-12345".to_string()), true, None)
-                .expect("with_args should succeed");
+        let ctx = RuntimeContext::with_args(
+            None,
+            Some("cloud-api-key-12345".to_string()),
+            Some("us-west-2"),
+            None,
+        )
+        .expect("with_args should succeed");
 
         assert!(ctx.is_cloud());
-        assert_eq!(ctx.http_endpoint(), "https://data.spiceai.io");
+        assert_eq!(ctx.http_endpoint(), "https://us-west-2-data.spiceai.io");
         assert_eq!(ctx.api_key(), Some("cloud-api-key-12345"));
     }
 
@@ -1016,7 +1030,7 @@ mod tests {
         let ctx = RuntimeContext::with_args(
             Some("http://localhost:8090".to_string()),
             Some("local-api-key".to_string()),
-            false,
+            None,
             None,
         )
         .expect("with_args should succeed");
@@ -1028,8 +1042,8 @@ mod tests {
 
     #[test]
     fn test_cloud_mode_uses_https() {
-        let ctx =
-            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+        let ctx = RuntimeContext::with_args(None, None, Some("us-east-1"), None)
+            .expect("with_args should succeed");
 
         assert!(
             ctx.http_endpoint().starts_with("https://"),
@@ -1041,7 +1055,7 @@ mod tests {
     #[test]
     fn test_local_mode_socket_address() {
         let ctx =
-            RuntimeContext::with_args(None, None, false, None).expect("with_args should succeed");
+            RuntimeContext::with_args(None, None, None, None).expect("with_args should succeed");
 
         // Local mode socket address should not have scheme prefix
         assert_eq!(ctx.http_socket_address(), "127.0.0.1:8090");
@@ -1049,20 +1063,20 @@ mod tests {
 
     #[test]
     fn test_cloud_mode_socket_address() {
-        let ctx =
-            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+        let ctx = RuntimeContext::with_args(None, None, Some("us-east-1"), None)
+            .expect("with_args should succeed");
 
         // Cloud mode socket address should strip https://
-        assert_eq!(ctx.http_socket_address(), "data.spiceai.io");
+        assert_eq!(ctx.http_socket_address(), "us-east-1-data.spiceai.io");
     }
 
     #[test]
     fn test_mode_reflected_in_headers() {
         // Both local and cloud modes should include user agent
         let local_ctx =
-            RuntimeContext::with_args(None, None, false, None).expect("with_args should succeed");
-        let cloud_ctx =
-            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+            RuntimeContext::with_args(None, None, None, None).expect("with_args should succeed");
+        let cloud_ctx = RuntimeContext::with_args(None, None, Some("us-east-1"), None)
+            .expect("with_args should succeed");
 
         let local_headers = local_ctx.get_headers();
         let cloud_headers = cloud_ctx.get_headers();
