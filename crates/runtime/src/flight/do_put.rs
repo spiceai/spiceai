@@ -203,28 +203,20 @@ pub(crate) async fn handle(
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
-    //
-    // Note: `get_table_partition_expr` currently resolves the partition label
-    // stored in Cayenne metadata (e.g. the column name) and parses it as a SQL
-    // expression. This works for column-based partitions but will fail for
-    // expression-based partitions (where the label is `expr0`). A follow-up
-    // should persist the original SQL expression in Cayenne metadata.
     if let Some(executor_registry) = datafusion.executor_registry.as_ref()
-        && datafusion.should_forward_writes_to_executors(&path).await
+        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
+            "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
+        )))?
+        && matches!(
+            datafusion.cluster_config.effective_role(),
+            Some(ClusterRole::Scheduler)
+        )
     {
-        let partition_expression = datafusion
-            .get_table_partition_expr(&path)
-            .await
-            .map_err(|e| {
-                Status::internal(format!(
-                    "Failed to resolve partition expression for table `{path}`: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Status::internal(format!(
-                    "In distributed mode, Cayenne tables must have partition expressions defined to be written to via Flight. Table `{path}` does not have partition expressions."
-                ))
-            })?;
+        if executor_registry.flight_sql_clients.read().await.is_empty() {
+            return Err(Status::unavailable(
+                "No executors available to write data to. Ensure that at least one executor is connected to the cluster and try again.",
+            ));
+        }
 
         return partition::write_through::forward_federated_partitioned_write(
             executor_registry,

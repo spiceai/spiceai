@@ -16,9 +16,12 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use arrow_schema::Schema;
 use bytes::Bytes;
-use datafusion::{error::DataFusionError, prelude::SessionContext, sql::TableReference};
-use datafusion_expr::{Expr, lit};
+use datafusion::{
+    common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
+};
+use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +116,11 @@ pub struct TablePartitionMetadata {
     pub schema_version: u32,
     /// Last updated timestamp (milliseconds since UNIX epoch)
     pub updated_at: u128,
+    /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
+    /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
+    /// original SQL expression for query routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_expressions: Vec<String>,
 }
 
 impl TablePartitionMetadata {
@@ -123,6 +131,7 @@ impl TablePartitionMetadata {
             partitions: Vec::new(),
             schema_version,
             updated_at,
+            partition_expressions: Vec::new(),
         }
     }
 
@@ -147,7 +156,9 @@ impl TablePartitionMetadata {
     pub fn all_executor_partitions(
         &self,
         ctx: &Arc<SessionContext>,
+        table_schema: &Arc<Schema>,
     ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
+        let df_schema = DFSchema::try_from(Arc::clone(table_schema))?;
         let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
         for PartitionMetadata {
             partition_value,
@@ -160,11 +171,16 @@ impl TablePartitionMetadata {
             let partition_predicate = partition_value
                 .iter()
                 .map(|(proj, lit)| {
-                    Ok(
-                        Expr::from_bytes_with_registry(proj.as_bytes(), ctx.as_ref())?.eq(
-                            Expr::from_bytes_with_registry(lit.as_bytes(), ctx.as_ref())?,
-                        ),
-                    )
+                    // Ensure lit is same type as proj
+                    let col = ctx.parse_sql_expr(proj, &df_schema)?;
+                    let col_type = col.get_type(&df_schema)?;
+                    let mut lit = ctx.parse_sql_expr(lit, &df_schema)?;
+                    if let Expr::Literal(ref s, None) = lit
+                        && s.data_type() != col_type
+                    {
+                        lit = lit.cast_to(&col_type, &df_schema)?;
+                    }
+                    Ok(col.eq(lit))
                 })
                 .collect::<Result<Vec<Expr>, DataFusionError>>()?
                 .into_iter()

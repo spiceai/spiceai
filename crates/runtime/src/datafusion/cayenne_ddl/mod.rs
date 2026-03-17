@@ -50,6 +50,7 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>();
     }
+
     None
 }
 
@@ -60,16 +61,6 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
 /// [`ComposedCatalogProvider`] wrappers whose external provider is a
 /// [`CayenneCatalogProvider`].
 pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
-    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
-        return Some(cayenne);
-    }
-    if let Some(composed) = provider.as_any().downcast_ref::<ComposedCatalogProvider>()
-        && let Some(cayenne) = composed
-            .external()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>()
-    {
-        return Some(cayenne);
-    }
-    None
+    let cayenne_catalog = get_cayenne_provider(provider)?;
+    Some(cayenne_catalog as &dyn PartitionAwareCatalog)
 }
