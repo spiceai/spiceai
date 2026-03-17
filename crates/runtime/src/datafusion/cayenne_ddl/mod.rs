@@ -25,7 +25,7 @@ pub mod logical_nodes;
 pub mod physical_plans;
 pub mod planner;
 
-use datafusion::catalog::{CatalogProvider, TableProvider};
+use datafusion::catalog::CatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;

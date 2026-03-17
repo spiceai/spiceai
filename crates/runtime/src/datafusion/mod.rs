@@ -78,9 +78,7 @@ use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::TryFutureExt;
 use itertools::Itertools;
-use moka::future::FutureExt;
 use query::QueryBuilder;
 #[cfg(any(
     feature = "duckdb",

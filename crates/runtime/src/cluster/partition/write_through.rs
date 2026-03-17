@@ -568,7 +568,7 @@ fn select_least_loaded_executors(
             .ok_or(Error::NoExecutorsAvailable)?;
         *load
             .get_mut(executor_id.as_str())
-            .context(NoExecutorsAvailableSnafu)? += 1;
+            .ok_or(Error::NoExecutorsAvailable)? += 1;
         result.push(executor_id);
     }
     Ok(result)
