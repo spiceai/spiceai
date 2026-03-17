@@ -1147,6 +1147,19 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
+        // Invalidate any cached logical plans that reference this table.
+        // Cached plans hold stale `Arc<dyn TableProvider>` references; after a
+        // write the underlying provider's in-memory state (e.g. Cayenne's
+        // protected snapshots and deletion caches) has changed, so plans must be
+        // re-resolved to pick up the new state.
+        if let Some(cache) = self.plans_cache_provider() {
+            if let Err(e) = cache.invalidate_for_table(table_reference.clone()) {
+                tracing::warn!(
+                    "Failed to invalidate plans cache for table {table_reference} after write: {e}"
+                );
+            }
+        }
+
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
@@ -1199,6 +1212,19 @@ impl DataFusion {
             .context(UnableToExecuteTableInsertSnafu {
                 table_name: table_reference.to_string(),
             })?;
+
+        // Invalidate any cached logical plans that reference this table.
+        // Cached plans hold stale `Arc<dyn TableProvider>` references; after a
+        // write the underlying provider's in-memory state (e.g. Cayenne's
+        // protected snapshots and deletion caches) has changed, so plans must be
+        // re-resolved to pick up the new state.
+        if let Some(cache) = self.plans_cache_provider() {
+            if let Err(e) = cache.invalidate_for_table(table_reference.clone()) {
+                tracing::warn!(
+                    "Failed to invalidate plans cache for table {table_reference} after streaming write: {e}"
+                );
+            }
+        }
 
         Ok(())
     }

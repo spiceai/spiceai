@@ -591,6 +591,22 @@ impl Query {
                 )
             }
 
+            // Proactively invalidate plans cache for tables affected by DML
+            // mutations (INSERT, DELETE, UPDATE). Cached logical plans hold stale
+            // `Arc<dyn TableProvider>` references that won't reflect the upcoming
+            // data changes, so subsequent queries must re-resolve through the
+            // catalog.
+            if let LogicalPlan::Dml(dml) = &*plan {
+                if let Some(cache) = ctx.df.plans_cache_provider() {
+                    if let Err(e) = cache.invalidate_for_table(dml.table_name.clone()) {
+                        tracing::warn!(
+                            "Failed to invalidate plans cache for table {} before DML: {e}",
+                            dml.table_name
+                        );
+                    }
+                }
+            }
+
             let input_tables = get_logical_plan_input_tables(&plan);
             if input_tables
                 .iter()
