@@ -54,14 +54,18 @@ pub enum Error {
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display("Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"))]
+    #[snafu(display(
+        "Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"
+    ))]
     UnableToCreateDatabase {
         driver_location: String,
         uri: String,
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display("Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"))]
+    #[snafu(display(
+        "Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"
+    ))]
     UnableToCreateConnectionPool {
         driver_location: String,
         uri: String,
@@ -214,12 +218,12 @@ impl DataConnectorFactory for AdbcFactory {
                     driver_location: driver_location.clone(),
                 })?;
 
-                let db = driver
-                    .new_database_with_opts(db_options)
-                    .context(UnableToCreateDatabaseSnafu {
+                let db = driver.new_database_with_opts(db_options).context(
+                    UnableToCreateDatabaseSnafu {
                         driver_location: driver_location.clone(),
                         uri: uri_str.clone(),
-                    })?;
+                    },
+                )?;
 
                 let pool = AdbcConnectionPoolBuilder::new(db)
                     .with_max_size(pool_size)

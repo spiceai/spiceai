@@ -191,7 +191,7 @@ async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore] // Requires ADBC DuckDB driver to be installed
+#[ignore = "Requires ADBC DuckDB driver to be installed"]
 async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let db_path = temp_sqlite_uri("duckdb");
