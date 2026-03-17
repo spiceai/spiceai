@@ -19,6 +19,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "adbc_core"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a38cdcc3e43dc645038c2b6339dd98610c48ae593cc67839452e6670fa09f27"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
+name = "adbc_driver_manager"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c8a313f30eb7d90584eda8760037c746a1827297100b64704b30f3f6cbd203"
+dependencies = [
+ "adbc_core",
+ "adbc_ffi",
+ "arrow-array",
+ "arrow-schema",
+ "libloading",
+ "toml",
+]
+
+[[package]]
+name = "adbc_ffi"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d36274376fdc4849cf47a78f3baeef4ae1654ef703dc3148d91adde3336c11"
+dependencies = [
+ "adbc_core",
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6077,6 +6112,8 @@ name = "datafusion-table-providers"
 version = "0.1.0"
 source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=9748420cbbd92d40369bce45d9e3227ca7cd261a#9748420cbbd92d40369bce45d9e3227ca7cd261a"
 dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
  "arrow",
  "arrow-json",
  "arrow-schema",
@@ -6109,6 +6146,7 @@ dependencies = [
  "pem",
  "postgres-native-tls",
  "r2d2",
+ "r2d2_adbc",
  "rand 0.9.2",
  "regex",
  "rusqlite",
@@ -14810,6 +14848,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "r2d2_adbc"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ceae1815a5cc7165bb1841a4318561921303c9283a4706f4044d989bd29236d"
+dependencies = [
+ "adbc_core",
+ "r2d2",
+]
+
+[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15821,6 +15869,8 @@ dependencies = [
 name = "runtime"
 version = "2.0.0-unstable"
 dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
  "anyhow",
  "app",
  "arrow",
