@@ -64,19 +64,16 @@ jobs:
                 runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64",
-                target_arch_go: "arm64",
               }, {
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
               }
             ];
             return matrix;
@@ -564,7 +561,6 @@ jobs:
             runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
-            target_arch_go: 'arm64'
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -612,7 +608,6 @@ jobs:
             runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
-            target_arch_go: 'arm64'
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
