@@ -39,9 +39,9 @@ struct Cli {
     #[arg(long, global = true, env = "SPICE_API_KEY")]
     api_key: Option<String>,
 
-    /// Use cloud instance of Spice. Requires --api-key
-    #[arg(long, global = true)]
-    cloud: bool,
+    /// Use cloud instance of Spice in the specified region. Requires --api-key
+    #[arg(long, global = true, value_parser = ["us-east-1", "us-west-2"])]
+    cloud: Option<String>,
 
     /// HTTP endpoint of Spice
     #[arg(long, global = true, default_value = "http://127.0.0.1:8090")]
@@ -206,7 +206,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     let ctx = RuntimeContext::with_args(
         Some(cli.http_endpoint),
         cli.api_key,
-        cli.cloud,
+        cli.cloud.as_deref(),
         cli.tls_root_certificate_file,
     )?;
 
