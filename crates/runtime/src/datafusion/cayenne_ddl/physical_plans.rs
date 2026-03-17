@@ -986,7 +986,7 @@ impl ExecutionPlan for CayenneDropTableExec {
 
 /// Physical plan for `DELETE` on a Cayenne-backed table.
 ///
-/// Forwards the DELETE statement to all connected executor nodes via FlightSQL.
+/// Forwards the DELETE statement to all connected executor nodes via `FlightSQL`.
 pub struct CayenneDeleteExec {
     table_name: datafusion::sql::TableReference,
     executor_registry: Option<Arc<ExecutorRegistry>>,
@@ -1083,7 +1083,7 @@ impl ExecutionPlan for CayenneDeleteExec {
             if let Some(ref registry) = executor_registry {
                 let mut sql = format!("DELETE FROM {table_name}");
                 if let Some(ref filter) = filter_sql {
-                    sql.push_str(&format!(" WHERE {filter}"));
+                    write!(sql, " WHERE {filter}");
                 }
                 forward_ddl_to_executors(registry, &sql).await?;
             }
@@ -1106,7 +1106,7 @@ impl ExecutionPlan for CayenneDeleteExec {
 
 /// Physical plan for `UPDATE` on a Cayenne-backed table.
 ///
-/// Forwards the UPDATE statement to all connected executor nodes via FlightSQL.
+/// Forwards the UPDATE statement to all connected executor nodes via `FlightSQL`.
 pub struct CayenneUpdateExec {
     table_name: datafusion::sql::TableReference,
     executor_registry: Option<Arc<ExecutorRegistry>>,
@@ -1220,7 +1220,7 @@ impl ExecutionPlan for CayenneUpdateExec {
                     .join(", ");
                 let mut sql = format!("UPDATE {table_name} SET {set_clause}");
                 if let Some(ref filter) = filter_sql {
-                    sql.push_str(&format!(" WHERE {filter}"));
+                    write!(sql, format!(" WHERE {filter}"));
                 }
                 forward_ddl_to_executors(registry, &sql).await?;
             }

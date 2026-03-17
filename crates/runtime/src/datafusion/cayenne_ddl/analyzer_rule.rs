@@ -282,15 +282,13 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 let filter_sql = extract_filter_sql(input)?;
 
-                let node = CayenneDeleteNode::new(
-                    table_name.clone(),
-                    Arc::clone(input),
-                    Arc::clone(output_schema),
-                    filter_sql,
-                );
-
                 Ok(LogicalPlan::Extension(Extension {
-                    node: Arc::new(node),
+                    node: Arc::new(CayenneDeleteNode::new(
+                        table_name.clone(),
+                        Arc::clone(input),
+                        Arc::clone(output_schema),
+                        filter_sql,
+                    )),
                 }))
             }
             LogicalPlan::Dml(DmlStatement {
@@ -409,7 +407,7 @@ fn extract_filter_sql(plan: &LogicalPlan) -> DFResult<Option<String>> {
 /// - `col AS col` (unchanged) — skip
 /// - `<new_expr> AS col` (SET assignment) — include
 ///
-/// Note: DataFusion may wrap unchanged columns in CAST expressions, which would
+/// Note: `DataFusion` may wrap unchanged columns in CAST expressions, which would
 /// not match the identity check and would be treated as assignments. In practice
 /// this is rare and harmless (it would SET the column to its own value).
 fn extract_update_assignments(
@@ -428,10 +426,11 @@ fn extract_update_assignments(
         let col_name = &alias.name;
 
         // Check if this is an identity projection (unchanged column).
-        if let Expr::Column(col) = alias.expr.as_ref() {
-            if col.name == *col_name && col.relation.as_ref().map_or(true, |r| *r == *table_name) {
-                continue;
-            }
+        if let Expr::Column(col) = alias.expr.as_ref()
+            && col.name == *col_name
+            && col.relation.as_ref().is_none_or(|r| *r == *table_name)
+        {
+            continue;
         }
 
         // This column is being updated — convert the value expression to SQL.
