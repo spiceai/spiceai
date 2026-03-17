@@ -26,6 +26,7 @@ use rusqlite::Connection;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
@@ -39,29 +40,37 @@ fn make_adbc_sqlite_dataset(ds_name: &str, table: &str, uri: &str) -> Dataset {
     dataset
 }
 
-fn temp_sqlite_uri(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("spice_adbc_test_{name}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("Failed to create temp directory for ADBC test");
-    dir.join("test.db").to_string_lossy().to_string()
+/// Returns a `(db_path, _guard)` pair. The `_guard` is a `TempDir` that
+/// automatically removes the directory (and the database file inside it)
+/// when it goes out of scope — even if the test panics.
+fn temp_sqlite_db(name: &str) -> (String, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("spice_adbc_test_{name}_"))
+        .tempdir()
+        .expect("Failed to create temp directory for ADBC test");
+    let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+    (db_path, dir)
 }
 
 /// Pre-create a table in the SQLite database so the ADBC connector can
-/// discover its schema during `load_components()`.
-fn create_sqlite_table(db_path: &str, ddl: &str) {
+/// discover its schema during `load_components()`.  Idempotent: drops
+/// any previous version of the table first.
+fn setup_sqlite_table(db_path: &str, table_name: &str, create_ddl: &str) {
     let conn = Connection::open(db_path).expect("Failed to open SQLite database");
-    conn.execute_batch(ddl)
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name};"))
+        .expect("Failed to drop existing table");
+    conn.execute_batch(create_ddl)
         .expect("Failed to create table in SQLite");
 }
 
 #[tokio::test]
 async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let db_path = temp_sqlite_uri("basic");
+    let (db_path, _guard) = temp_sqlite_db("basic");
 
-    // Pre-create the table so the ADBC connector can discover the schema
-    // during load_components().
-    create_sqlite_table(
+    setup_sqlite_table(
         &db_path,
+        "test_table",
         "CREATE TABLE test_table (id INTEGER, name TEXT, value DOUBLE);
          INSERT INTO test_table VALUES (1, 'alice', 10.5), (2, 'bob', 20.3), (3, 'charlie', 15.7);",
     );
@@ -191,7 +200,10 @@ async fn test_adbc_sqlite_file_backed() -> Result<(), String> {
 #[ignore = "Requires ADBC DuckDB driver to be installed"]
 async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let db_path = temp_sqlite_uri("duckdb");
+    let db_path = PathBuf::from(std::env::temp_dir())
+        .join(format!("spice_adbc_test_duckdb_{}", std::process::id()))
+        .to_string_lossy()
+        .to_string();
 
     test_request_context()
         .scope(async {
@@ -269,12 +281,11 @@ async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
 #[tokio::test]
 async fn test_adbc_read_write_operations() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let db_path = temp_sqlite_uri("rw");
+    let (db_path, _guard) = temp_sqlite_db("rw");
 
-    // Pre-create the table so the ADBC connector can discover the schema
-    // during load_components().
-    create_sqlite_table(
+    setup_sqlite_table(
         &db_path,
+        "rw_table",
         "CREATE TABLE rw_table (key INTEGER PRIMARY KEY, value TEXT);",
     );
 
@@ -365,11 +376,13 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
 #[tokio::test]
 async fn test_adbc_connection_options() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let db_path = temp_sqlite_uri("options");
+    let (db_path, _guard) = temp_sqlite_db("options");
 
-    // Pre-create the table so the ADBC connector can discover the schema
-    // during load_components().
-    create_sqlite_table(&db_path, "CREATE TABLE options_test (id INTEGER);");
+    setup_sqlite_table(
+        &db_path,
+        "options_test",
+        "CREATE TABLE options_test (id INTEGER);",
+    );
 
     test_request_context()
         .scope(async {
