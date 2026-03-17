@@ -56,7 +56,7 @@ impl std::fmt::Display for Https {
 }
 
 impl Https {
-    /// Determines if the dataset uses a structured file format (parquet, csv, etc.)
+    /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
     fn is_structured_format(&self, dataset: &Dataset) -> bool {
         let file_format = self
@@ -69,7 +69,17 @@ impl Https {
         // Check if explicitly configured as a structured format
         if matches!(
             file_format.as_str(),
-            "parquet" | "csv" | "tsv" | "arrow" | "avro"
+            "parquet"
+                | "csv"
+                | "tsv"
+                | "arrow"
+                | "avro"
+                | "json"
+                | "jsonl"
+                | "ndjson"
+                | "ldjson"
+                | "soda"
+                | "socrata"
         ) {
             return true;
         }
@@ -88,7 +98,15 @@ impl Https {
 
             return matches!(
                 extension.as_str(),
-                "parquet" | "csv" | "tsv" | "arrow" | "avro"
+                "parquet"
+                    | "csv"
+                    | "tsv"
+                    | "arrow"
+                    | "avro"
+                    | "json"
+                    | "jsonl"
+                    | "ndjson"
+                    | "ldjson"
             );
         }
 

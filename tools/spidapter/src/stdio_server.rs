@@ -559,20 +559,21 @@ fn generate_adbc_create_table_statement(
             }
         }
     }
-
     let partition_clause = if partition_columns.is_empty() {
-        String::new()
+        String::default()
     } else {
-        let quoted = partition_columns
-            .iter()
-            .map(|c| quote_identifier(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(" PARTITION BY ({quoted})")
+        format!(
+            "PARTITION BY ({})",
+            partition_columns
+                .iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
 
     Ok(format!(
-        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}){partition_clause}",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}) {partition_clause}",
         table_elements.join(", ")
     ))
 }

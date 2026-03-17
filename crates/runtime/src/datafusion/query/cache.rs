@@ -204,7 +204,7 @@ impl Query {
         parameters: Option<ParamValues>,
     ) -> super::Result<LogicalPlan> {
         let plan = match df
-            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
+            .get_or_create_logical_plan(session, Some(sql_raw_cache_key), sql)
             .await
         {
             Ok(plan) => plan,
