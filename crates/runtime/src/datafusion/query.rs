@@ -596,15 +596,14 @@ impl Query {
             // `Arc<dyn TableProvider>` references that won't reflect the upcoming
             // data changes, so subsequent queries must re-resolve through the
             // catalog.
-            if let LogicalPlan::Dml(dml) = &*plan {
-                if let Some(cache) = ctx.df.plans_cache_provider() {
-                    if let Err(e) = cache.invalidate_for_table(dml.table_name.clone()) {
-                        tracing::warn!(
-                            "Failed to invalidate plans cache for table {} before DML: {e}",
-                            dml.table_name
-                        );
-                    }
-                }
+            if let LogicalPlan::Dml(dml) = &*plan
+                && let Some(cache) = ctx.df.plans_cache_provider()
+                && let Err(e) = cache.invalidate_for_table(dml.table_name.clone())
+            {
+                tracing::warn!(
+                    "Failed to invalidate plans cache for table {} before DML: {e}",
+                    dml.table_name
+                );
             }
 
             let input_tables = get_logical_plan_input_tables(&plan);

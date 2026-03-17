@@ -34,26 +34,26 @@ use data_components::RefreshableCatalogProvider;
 use datafusion::assert_batches_eq;
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
+use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 use rand::Rng as _;
 use runtime::auth::EndpointAuth;
 use runtime::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use runtime::config::Config;
-use runtime_auth::FlightBasicAuth;
-use runtime_auth::api_key::ApiKeyAuth;
-use spicepod::component::catalog::Catalog;
-use spicepod::component::runtime::ApiKey;
-use tokio::time::sleep;
-use tonic::transport::Channel;
-use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime_auth::FlightBasicAuth;
+use runtime_auth::api_key::ApiKeyAuth;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::access::AccessMode;
+use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
+use spicepod::component::runtime::ApiKey;
 use spicepod::param::Params;
 use spicepod::partitioning::PartitionedBy;
 use test_framework::queries::QuerySet;
+use tokio::time::sleep;
+use tonic::transport::Channel;
 
 /// Append a single row to a Cayenne-accelerated table through the Runtime write path.
 ///
@@ -738,14 +738,18 @@ async fn exec(rt: &Runtime, sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Send record batches to a Cayenne table via Flight DoPut.
+/// Send record batches to a Cayenne table via Flight `DoPut`.
 async fn doput_to_table(
     client: &mut FlightClient,
     table_path: &[&str],
     batch: RecordBatch,
 ) -> Result<(), String> {
-    let flight_descriptor =
-        FlightDescriptor::new_path(table_path.iter().map(|s| s.to_string()).collect());
+    let flight_descriptor = FlightDescriptor::new_path(
+        table_path
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+    );
 
     #[expect(clippy::needless_collect)]
     let flight_data_stream = FlightDataEncoderBuilder::new()
@@ -765,7 +769,7 @@ async fn doput_to_table(
     Ok(())
 }
 
-/// Build a RecordBatch with (id: Int64, name: Utf8View) columns.
+/// Build a `RecordBatch` with (id: Int64, name: `Utf8View`) columns.
 fn make_batch(ids: &[i64], names: &[&str]) -> Result<RecordBatch, String> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -781,7 +785,7 @@ fn make_batch(ids: &[i64], names: &[&str]) -> Result<RecordBatch, String> {
     .map_err(|e| format!("failed to create RecordBatch: {e}"))
 }
 
-/// Helper: DoPut data, refresh catalog, query, and assert expected output.
+/// Helper: `DoPut` data, refresh catalog, query, and assert expected output.
 async fn doput_refresh_and_assert(
     client: &mut FlightClient,
     table_path: &[&str],
@@ -801,8 +805,14 @@ async fn doput_refresh_and_assert(
 
     let batches = run_query(rt, "SELECT id, name FROM stlcyc.ns.items ORDER BY id").await?;
 
-    let expected_vec: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
-    let expected_refs: Vec<&str> = expected_vec.iter().map(|s| s.as_str()).collect();
+    let expected_vec: Vec<String> = expected
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    let expected_refs: Vec<&str> = expected_vec
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
     assert_batches_eq!(&expected_refs, &batches);
 
     Ok(())
@@ -988,7 +998,7 @@ async fn test_cayenne_doput_upsert_cycle_stale() -> Result<(), String> {
         .await
 }
 
-/// Helper struct that bundles everything needed to run Cayenne DoPut + SQL
+/// Helper struct that bundles everything needed to run Cayenne `DoPut` + SQL
 /// operations against a local catalog backed runtime.
 struct CayenneTestHarness {
     rt: Arc<Runtime>,
@@ -1003,7 +1013,10 @@ unsafe impl Send for CayenneTestHarness {}
 
 impl CayenneTestHarness {
     /// Spin up a Cayenne-backed runtime with HTTP + Flight servers.
-    async fn new(data_dir: &std::path::Path, metadata_dir: &std::path::Path) -> Result<Self, String> {
+    async fn new(
+        data_dir: &std::path::Path,
+        metadata_dir: &std::path::Path,
+    ) -> Result<Self, String> {
         let catalog = make_cayenne_catalog(
             "cyc",
             &data_dir.to_string_lossy(),
@@ -1091,10 +1104,7 @@ impl CayenneTestHarness {
         exec(&rt, "CREATE SCHEMA cyc.ns").await?;
 
         let df = rt.datafusion();
-        let catalog_provider = df
-            .ctx
-            .catalog("cyc")
-            .ok_or("catalog 'cyc' not found")?;
+        let catalog_provider = df.ctx.catalog("cyc").ok_or("catalog 'cyc' not found")?;
         let cayenne_provider = catalog_provider
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>()
@@ -1102,7 +1112,7 @@ impl CayenneTestHarness {
 
         Ok(Self {
             rt,
-            cayenne_provider: cayenne_provider as *const _,
+            cayenne_provider: std::ptr::from_ref(cayenne_provider),
             client,
         })
     }
@@ -1127,7 +1137,7 @@ impl CayenneTestHarness {
         .await
     }
 
-    /// DoPut a batch, refresh the catalog, then SELECT and assert.
+    /// `DoPut` a batch, refresh the catalog, then SELECT and assert.
     async fn doput_and_assert(
         &mut self,
         table_name: &str,
@@ -1165,19 +1175,21 @@ impl CayenneTestHarness {
     }
 
     /// SELECT all rows ordered by id and assert.
-    async fn assert_query(
-        &self,
-        table_name: &str,
-        expected: &[&str],
-    ) -> Result<(), String> {
+    async fn assert_query(&self, table_name: &str, expected: &[&str]) -> Result<(), String> {
         let batches = run_query(
             &self.rt,
             &format!("SELECT id, name FROM cyc.ns.{table_name} ORDER BY id"),
         )
         .await?;
 
-        let expected_vec: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
-        let expected_refs: Vec<&str> = expected_vec.iter().map(|s| s.as_str()).collect();
+        let expected_vec: Vec<String> = expected
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let expected_refs: Vec<&str> = expected_vec
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         assert_batches_eq!(&expected_refs, &batches);
         Ok(())
     }
@@ -1187,7 +1199,7 @@ impl CayenneTestHarness {
 // Comprehensive DoPut / DELETE / UPDATE edge-case test
 // ---------------------------------------------------------------------------
 
-/// Exercises every combination of INSERT (DoPut), SQL DELETE, and SQL UPDATE
+/// Exercises every combination of INSERT (`DoPut`), SQL DELETE, and SQL UPDATE
 /// against Cayenne tables with a PRIMARY KEY.
 ///
 /// Each scenario uses its own table so failures are independent.
@@ -1251,137 +1263,347 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
             // S3  Upsert with partial PK overlap (some new, some existing)
             // ---------------------------------------------------------------
             h.create_table("s3").await?;
-            h.doput_and_assert("s3", &[1, 2], &["Alice", "Bob"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 2  | Bob   |", "+----+-------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s3",
+                &[1, 2],
+                &["Alice", "Bob"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
             // Upsert ids 2,3 - id 2 updated, id 3 inserted
-            h.doput_and_assert("s3", &[2, 3], &["Bob2", "Carol"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 2  | Bob2  |", "| 3  | Carol |", "+----+-------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s3",
+                &[2, 3],
+                &["Bob2", "Carol"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob2  |",
+                    "| 3  | Carol |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
             // Upsert ids 1,3,4 - ids 1,3 updated, id 4 inserted
-            h.doput_and_assert("s3", &[1, 3, 4], &["Ax", "Cx", "Dave"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | Ax   |", "| 2  | Bob2 |", "| 3  | Cx   |", "| 4  | Dave |",
-                "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s3",
+                &[1, 3, 4],
+                &["Ax", "Cx", "Dave"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | Ax   |",
+                    "| 2  | Bob2 |",
+                    "| 3  | Cx   |",
+                    "| 4  | Dave |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S4  Insert then DELETE one specific row
             // ---------------------------------------------------------------
             h.create_table("s4").await?;
-            h.doput_and_assert("s4", &[1, 2, 3], &["Alice", "Bob", "Carol"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 2  | Bob   |", "| 3  | Carol |", "+----+-------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s4 WHERE id = 2", "s4", &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 3  | Carol |", "+----+-------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s4",
+                &[1, 2, 3],
+                &["Alice", "Bob", "Carol"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "| 3  | Carol |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s4 WHERE id = 2",
+                "s4",
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 3  | Carol |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S5  Insert then DELETE all rows
             // ---------------------------------------------------------------
             h.create_table("s5").await?;
-            h.doput_and_assert("s5", &[1, 2], &["Alice", "Bob"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 2  | Bob   |", "+----+-------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s5", "s5", &[
-                "++", "++",
-            ]).await?;
+            h.doput_and_assert(
+                "s5",
+                &[1, 2],
+                &["Alice", "Bob"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s5", "s5", &["++", "++"])
+                .await?;
 
             // ---------------------------------------------------------------
             // S6  Insert -> DELETE one row -> re-insert same PK with new value
             // ---------------------------------------------------------------
             h.create_table("s6").await?;
-            h.doput_and_assert("s6", &[1, 2], &["Alice", "Bob"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 2  | Bob   |", "+----+-------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s6 WHERE id = 1", "s6", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 2  | Bob  |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s6",
+                &[1, 2],
+                &["Alice", "Bob"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s6 WHERE id = 1",
+                "s6",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 2  | Bob  |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
             // Re-insert id=1 with different value
-            h.doput_and_assert("s6", &[1], &["Alice2"], &[
-                "+----+--------+", "| id | name   |", "+----+--------+",
-                "| 1  | Alice2 |", "| 2  | Bob    |", "+----+--------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s6",
+                &[1],
+                &["Alice2"],
+                &[
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 1  | Alice2 |",
+                    "| 2  | Bob    |",
+                    "+----+--------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S7  Insert -> SQL UPDATE one row
             // ---------------------------------------------------------------
             h.create_table("s7").await?;
-            h.doput_and_assert("s7", &[1, 2], &["Alice", "Bob"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "| 2  | Bob   |", "+----+-------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s7",
+                &[1, 2],
+                &["Alice", "Bob"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
             h.sql_mutate_and_assert(
-                "UPDATE cyc.ns.s7 SET name = 'Alice2' WHERE id = 1", "s7", &[
-                "+----+--------+", "| id | name   |", "+----+--------+",
-                "| 1  | Alice2 |", "| 2  | Bob    |", "+----+--------+",
-            ]).await?;
+                "UPDATE cyc.ns.s7 SET name = 'Alice2' WHERE id = 1",
+                "s7",
+                &[
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 1  | Alice2 |",
+                    "| 2  | Bob    |",
+                    "+----+--------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S8  Insert -> UPDATE -> UPDATE again (chained updates)
             // ---------------------------------------------------------------
             h.create_table("s8").await?;
-            h.doput_and_assert("s8", &[1, 2], &["A", "B"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("UPDATE cyc.ns.s8 SET name = 'X' WHERE id = 1", "s8", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | X    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("UPDATE cyc.ns.s8 SET name = 'Y' WHERE id = 1", "s8", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | Y    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("UPDATE cyc.ns.s8 SET name = 'Z'", "s8", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | Z    |", "| 2  | Z    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s8",
+                &[1, 2],
+                &["A", "B"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "UPDATE cyc.ns.s8 SET name = 'X' WHERE id = 1",
+                "s8",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | X    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "UPDATE cyc.ns.s8 SET name = 'Y' WHERE id = 1",
+                "s8",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | Y    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "UPDATE cyc.ns.s8 SET name = 'Z'",
+                "s8",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | Z    |",
+                    "| 2  | Z    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S9  Insert -> Upsert -> DELETE -> verify deletion post-upsert
             // ---------------------------------------------------------------
             h.create_table("s9").await?;
-            h.doput_and_assert("s9", &[1, 2], &["A", "B"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.doput_and_assert("s9", &[1, 2], &["A2", "B2"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A2   |", "| 2  | B2   |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s9 WHERE id = 1", "s9", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 2  | B2   |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s9",
+                &[1, 2],
+                &["A", "B"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.doput_and_assert(
+                "s9",
+                &[1, 2],
+                &["A2", "B2"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A2   |",
+                    "| 2  | B2   |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s9 WHERE id = 1",
+                "s9",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 2  | B2   |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S10  Interleaved: Insert 1,2 -> Upsert 1 -> Delete 2 -> Insert 3
             // ---------------------------------------------------------------
             h.create_table("s10").await?;
-            h.doput_and_assert("s10", &[1, 2], &["A", "B"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.doput_and_assert("s10", &[1], &["A2"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A2   |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s10 WHERE id = 2", "s10", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A2   |", "+----+------+",
-            ]).await?;
-            h.doput_and_assert("s10", &[3], &["C"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A2   |", "| 3  | C    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s10",
+                &[1, 2],
+                &["A", "B"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.doput_and_assert(
+                "s10",
+                &[1],
+                &["A2"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A2   |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s10 WHERE id = 2",
+                "s10",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A2   |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.doput_and_assert(
+                "s10",
+                &[3],
+                &["C"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A2   |",
+                    "| 3  | C    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S11  Upsert with NULL -> non-NULL -> back to NULL
@@ -1392,70 +1614,154 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
                     Field::new("id", DataType::Int64, false),
                     Field::new("name", DataType::Utf8View, true),
                 ]));
-                let batch = RecordBatch::try_new(schema, vec![
-                    Arc::new(Int64Array::from(vec![1])),
-                    Arc::new(StringViewArray::from(vec![None::<&str>])),
-                ]).map_err(|e| format!("batch: {e}"))?;
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(Int64Array::from(vec![1])),
+                        Arc::new(StringViewArray::from(vec![None::<&str>])),
+                    ],
+                )
+                .map_err(|e| format!("batch: {e}"))?;
                 doput_to_table(&mut h.client, &["cyc", "ns", "s11"], batch).await?;
-                h.cayenne_provider().refresh().await.map_err(|e| e.to_string())?;
+                h.cayenne_provider()
+                    .refresh()
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
-            h.assert_query("s11", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  |      |", "+----+------+",
-            ]).await?;
-            h.doput_and_assert("s11", &[1], &["Alice"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | Alice |", "+----+-------+",
-            ]).await?;
+            h.assert_query(
+                "s11",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  |      |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.doput_and_assert(
+                "s11",
+                &[1],
+                &["Alice"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
             {
                 let schema = Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Int64, false),
                     Field::new("name", DataType::Utf8View, true),
                 ]));
-                let batch = RecordBatch::try_new(schema, vec![
-                    Arc::new(Int64Array::from(vec![1])),
-                    Arc::new(StringViewArray::from(vec![None::<&str>])),
-                ]).map_err(|e| format!("batch: {e}"))?;
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(Int64Array::from(vec![1])),
+                        Arc::new(StringViewArray::from(vec![None::<&str>])),
+                    ],
+                )
+                .map_err(|e| format!("batch: {e}"))?;
                 doput_to_table(&mut h.client, &["cyc", "ns", "s11"], batch).await?;
-                h.cayenne_provider().refresh().await.map_err(|e| e.to_string())?;
+                h.cayenne_provider()
+                    .refresh()
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
-            h.assert_query("s11", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  |      |", "+----+------+",
-            ]).await?;
+            h.assert_query(
+                "s11",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  |      |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S12  DELETE -> Upsert deleted PK -> verify re-appears
             // ---------------------------------------------------------------
             h.create_table("s12").await?;
-            h.doput_and_assert("s12", &[1, 2], &["A", "B"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s12 WHERE id = 1", "s12", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.doput_and_assert("s12", &[1], &["A_new"], &[
-                "+----+-------+", "| id | name  |", "+----+-------+",
-                "| 1  | A_new |", "| 2  | B     |", "+----+-------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s12",
+                &[1, 2],
+                &["A", "B"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s12 WHERE id = 1",
+                "s12",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.doput_and_assert(
+                "s12",
+                &[1],
+                &["A_new"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | A_new |",
+                    "| 2  | B     |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S13  DELETE all -> Insert -> verify
             // ---------------------------------------------------------------
             h.create_table("s13").await?;
-            h.doput_and_assert("s13", &[1, 2], &["A", "B"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s13", "s13", &[
-                "++", "++",
-            ]).await?;
-            h.doput_and_assert("s13", &[10, 20], &["X", "Y"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 10 | X    |", "| 20 | Y    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s13",
+                &[1, 2],
+                &["A", "B"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s13", "s13", &["++", "++"])
+                .await?;
+            h.doput_and_assert(
+                "s13",
+                &[10, 20],
+                &["X", "Y"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 10 | X    |",
+                    "| 20 | Y    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S14  Single-row table - multiple upserts (8 rounds)
@@ -1463,79 +1769,194 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
             h.create_table("s14").await?;
             for round in 1..=8u32 {
                 let name = format!("v{round}");
-                h.doput_and_assert("s14", &[1], &[&name], &[
-                    "+----+------+", "| id | name |", "+----+------+",
-                    &format!("| 1  | {name:<4} |"), "+----+------+",
-                ]).await.map_err(|e| format!("S14 round {round}: {e}"))?;
+                h.doput_and_assert(
+                    "s14",
+                    &[1],
+                    &[&name],
+                    &[
+                        "+----+------+",
+                        "| id | name |",
+                        "+----+------+",
+                        &format!("| 1  | {name:<4} |"),
+                        "+----+------+",
+                    ],
+                )
+                .await
+                .map_err(|e| format!("S14 round {round}: {e}"))?;
             }
 
             // ---------------------------------------------------------------
             // S15  Insert -> UPDATE -> DELETE updated row -> verify others
             // ---------------------------------------------------------------
             h.create_table("s15").await?;
-            h.doput_and_assert("s15", &[1, 2, 3], &["A", "B", "C"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "| 3  | C    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("UPDATE cyc.ns.s15 SET name = 'B2' WHERE id = 2", "s15", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B2   |", "| 3  | C    |", "+----+------+",
-            ]).await?;
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s15 WHERE id = 2", "s15", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 3  | C    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s15",
+                &[1, 2, 3],
+                &["A", "B", "C"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "| 3  | C    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "UPDATE cyc.ns.s15 SET name = 'B2' WHERE id = 2",
+                "s15",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B2   |",
+                    "| 3  | C    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s15 WHERE id = 2",
+                "s15",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 3  | C    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             // ---------------------------------------------------------------
             // S16  Rapid back-to-back upserts (10 rounds, no sleep)
             // ---------------------------------------------------------------
             h.create_table("s16").await?;
-            h.doput_and_assert("s16", &[1], &["v0"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | v0   |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s16",
+                &[1],
+                &["v0"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | v0   |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
             for round in 1..=10u32 {
                 let name = format!("v{round}");
-                h.doput_and_assert("s16", &[1], &[&name], &[
-                    "+----+------+", "| id | name |", "+----+------+",
-                    &format!("| 1  | {name:<4} |"), "+----+------+",
-                ]).await.map_err(|e| format!("S16 round {round}: {e}"))?;
+                h.doput_and_assert(
+                    "s16",
+                    &[1],
+                    &[&name],
+                    &[
+                        "+----+------+",
+                        "| id | name |",
+                        "+----+------+",
+                        &format!("| 1  | {name:<4} |"),
+                        "+----+------+",
+                    ],
+                )
+                .await
+                .map_err(|e| format!("S16 round {round}: {e}"))?;
             }
 
             // ---------------------------------------------------------------
             // S17  Mix: DoPut inserts + DoPut upsert + SQL DELETE + SQL UPDATE
             // ---------------------------------------------------------------
             h.create_table("s17").await?;
-            h.doput_and_assert("s17", &[1, 2, 3, 4, 5], &["A", "B", "C", "D", "E"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B    |", "| 3  | C    |",
-                "| 4  | D    |", "| 5  | E    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s17",
+                &[1, 2, 3, 4, 5],
+                &["A", "B", "C", "D", "E"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B    |",
+                    "| 3  | C    |",
+                    "| 4  | D    |",
+                    "| 5  | E    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
             // Upsert ids 2,4 (overlap) + insert id 6 (new)
-            h.doput_and_assert("s17", &[2, 4, 6], &["B2", "D2", "F"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B2   |", "| 3  | C    |",
-                "| 4  | D2   |", "| 5  | E    |", "| 6  | F    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s17",
+                &[2, 4, 6],
+                &["B2", "D2", "F"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B2   |",
+                    "| 3  | C    |",
+                    "| 4  | D2   |",
+                    "| 5  | E    |",
+                    "| 6  | F    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
             // Delete ids 3,5
-            h.sql_mutate_and_assert("DELETE FROM cyc.ns.s17 WHERE id IN (3, 5)", "s17", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A    |", "| 2  | B2   |", "| 4  | D2   |",
-                "| 6  | F    |", "+----+------+",
-            ]).await?;
+            h.sql_mutate_and_assert(
+                "DELETE FROM cyc.ns.s17 WHERE id IN (3, 5)",
+                "s17",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A    |",
+                    "| 2  | B2   |",
+                    "| 4  | D2   |",
+                    "| 6  | F    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
             // Update remaining: set name = name || '!'
             h.sql_mutate_and_assert(
-                "UPDATE cyc.ns.s17 SET name = concat(name, '!')", "s17", &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | A!   |", "| 2  | B2!  |", "| 4  | D2!  |",
-                "| 6  | F!   |", "+----+------+",
-            ]).await?;
+                "UPDATE cyc.ns.s17 SET name = name || '!'",
+                "s17",
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | A!   |",
+                    "| 2  | B2!  |",
+                    "| 4  | D2!  |",
+                    "| 6  | F!   |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
             // DoPut upsert + new: ids 1 (existing) and 7 (new)
-            h.doput_and_assert("s17", &[1, 7], &["AX", "G"], &[
-                "+----+------+", "| id | name |", "+----+------+",
-                "| 1  | AX   |", "| 2  | B2!  |", "| 4  | D2!  |",
-                "| 6  | F!   |", "| 7  | G    |", "+----+------+",
-            ]).await?;
+            h.doput_and_assert(
+                "s17",
+                &[1, 7],
+                &["AX", "G"],
+                &[
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 1  | AX   |",
+                    "| 2  | B2!  |",
+                    "| 4  | D2!  |",
+                    "| 6  | F!   |",
+                    "| 7  | G    |",
+                    "+----+------+",
+                ],
+            )
+            .await?;
 
             Ok(())
         })
