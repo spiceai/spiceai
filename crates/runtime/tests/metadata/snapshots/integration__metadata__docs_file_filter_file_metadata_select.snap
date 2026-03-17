@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: formatted
+---
++-------------------+---------------------------------------------------------------------------------------+
+| filename          | _location                                                                             |
++-------------------+---------------------------------------------------------------------------------------+
+| arch_review.md    | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet |
+| identity_api.html | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet |
+| onboarding.md     | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-10/data_0.parquet |
+| pg_migration.sql  | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-15/data_0.parquet |
+| requirements.pdf  | s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet |
++-------------------+---------------------------------------------------------------------------------------+

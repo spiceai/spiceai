@@ -539,8 +539,12 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
                 extension.unwrap_or(".tsv".to_string()),
             )),
-            (Some("json"), _) | (None, Some("json")) => Ok((
-                Some(self.get_json_format(dataset, params, Format::Jsonl)?),
+            (Some("json"), _) => Ok((
+                Some(self.get_json_format(dataset, params, Format::Json)?),
+                extension.unwrap_or(".json".to_string()),
+            )),
+            (None, Some("json")) => Ok((
+                Some(self.get_json_format(dataset, params, Format::Auto)?),
                 extension.unwrap_or(".json".to_string()),
             )),
             (Some("jsonl" | "ndjson" | "ldjson"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => {
@@ -744,6 +748,23 @@ pub trait ListingTableConnector: DataConnector {
             && flatten_json.eq_ignore_ascii_case("true")
         {
             format = format.with_flatten_json(".".to_string());
+        }
+
+        if let ExposedParamLookup::Present(soda_metadata) = params.get("soda_metadata").expose() {
+            format = format.with_soda_metadata(soda_metadata.eq_ignore_ascii_case("enabled"));
+        }
+
+        // Validate: json_pointer is incompatible with file_format=soda.
+        // SODA responses carry their own schema in meta.view.columns and SodaReader
+        // handles data extraction internally — json_pointer cannot be applied.
+        if format.options().format == Format::Soda && format.options().json_pointer.is_some() {
+            return Err(
+                crate::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: "'json_pointer' cannot be used with 'file_format: soda'. SODA format extracts data from the response automatically.".to_string(),
+                },
+            );
         }
 
         Ok(Arc::new(format))

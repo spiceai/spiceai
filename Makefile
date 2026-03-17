@@ -95,7 +95,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## Default variant: no models, no nfs
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -110,7 +110,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -130,7 +130,7 @@ lint-rust:
 .PHONY: lint-rust-models
 lint-rust-models:
 	## Models variant lint
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -145,7 +145,7 @@ lint-rust-models:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -180,7 +180,7 @@ lint-rust-nas:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -257,6 +257,7 @@ lint-rust-fix:
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
+	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
 	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
 	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite

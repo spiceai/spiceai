@@ -939,7 +939,10 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                 return write_json(&app);
             }
             println!("\x1b[32m✓ Created app {}\x1b[0m", app.full_name());
-            if let Some(api_key) = app.api_key {
+            let org_app = app.full_name();
+            if let Ok(api_keys) = client.get_api_keys(&org_app).await
+                && let Some(api_key) = api_keys.api_key
+            {
                 println!("\nAPI Key: {api_key}");
                 println!("\nSave this key - it won't be shown again.");
             }
