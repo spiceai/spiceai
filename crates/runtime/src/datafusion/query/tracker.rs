@@ -151,7 +151,6 @@ fn trace_query(
     }
 
     tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
-    tracing::warn!("rows_produced={}", query_tracker.rows_produced);
 
     if query_tracker.results_cache_hit == Some(true) {
         tracing::info!(target: "task_history", results_cache_hit = true, "labels");

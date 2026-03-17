@@ -212,6 +212,11 @@ pub(crate) async fn handle(
             Some(ClusterRole::Scheduler)
         )
     {
+        if executor_registry.flight_sql_clients.read().await.is_empty() {
+            return Err(Status::unavailable(
+                "No executors available to write data to. Ensure that at least one executor is connected to the cluster and try again.",
+            ));
+        }
 
         return partition::write_through::forward_federated_partitioned_write(
             executor_registry,

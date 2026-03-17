@@ -29,7 +29,6 @@ use ::data_components::delete::DeletionTableProviderAdapter;
 use cayenne::CayenneTableProvider;
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use runtime_table_partition::provider::PartitionTableProvider;
-use vortex::session::SessionVar;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
@@ -55,15 +54,7 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>();
     }
-    if let Some(refreshing) = provider
-        .as_any()
-        .downcast_ref::<RefreshingCatalogProvider>()
-    {
-        return refreshing
-            .inner_catalog()
-            .as_any()
-            .downcast_ref::<CayenneCatalogProvider>();
-    }
+
     None
 }
 
@@ -76,28 +67,4 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
 pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
     let cayenne_catalog = get_cayenne_provider(provider)?;
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)
-}
-
-#[expect(dead_code)]
-pub fn is_cayenne_table(provider: &dyn TableProvider) -> bool {
-    if provider.as_any().is::<CayenneTableProvider>() {
-        return true;
-    };
-    if let Some(deletion_adapter) = provider
-        .as_any()
-        .downcast_ref::<DeletionTableProviderAdapter>()
-    {
-        let source = deletion_adapter.source();
-        return is_cayenne_table(source.as_ref());
-    }
-    let Some(partition_table_provider) = provider.as_any().downcast_ref::<PartitionTableProvider>()
-    else {
-        return false;
-    };
-    // This isn't working.
-    partition_table_provider
-        .creator()
-        .as_any()
-        .downcast_ref::<CayennePartitionCreator>()
-        .is_some()
 }

@@ -77,7 +77,7 @@ pub(crate) async fn do_put(
     }
 
     let sql = &cmd.query;
-    tracing::debug!("do_put_statement_update: {sql}");
+    tracing::trace!("do_put_statement_update: {sql}");
 
     // Execute through the standard query path, which handles DELETE and UPDATE
     // via the runtime's DML interception in Query::run().

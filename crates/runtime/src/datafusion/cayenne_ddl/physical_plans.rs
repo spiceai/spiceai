@@ -606,14 +606,9 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         df_schema_name.clone(),
                         table_name.clone(),
                     );
-                    let expr_sql = partition_expr_sql
-                        .clone()
-                        .unwrap_or_else(|| pe.to_string());
+                    let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
                     let pm = registry.federated_partition_manager();
-                    if let Err(e) = pm
-                        .initialize_metadata(&table_ref, vec![expr_sql])
-                        .await
-                    {
+                    if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
                         tracing::warn!(
                             table = %table_ref,
                             error = %e,
@@ -645,18 +640,8 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
                 }
 
-                let partition_clause = String::new(); //
-                // partition_expr
-                //     .as_ref()
-                //     .map(|expr| {
-                //         let partition_sql = partition_expr_sql
-                //             .clone()
-                //             .unwrap_or_else(|| expr.to_string());
-                //         format!(" PARTITION BY ({partition_sql})")
-                //     })
-                //     .unwrap_or_default();
                 let ddl_sql = format!(
-                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({}){partition_clause}",
+                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
                 forward_ddl_to_executors(registry, &ddl_sql).await?;

@@ -22,7 +22,6 @@ use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{

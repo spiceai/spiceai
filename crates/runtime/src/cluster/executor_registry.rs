@@ -358,10 +358,6 @@ fn get_partitions_from_manager(
             return Vec::new();
         };
 
-        tracing::warn!(
-            "No partition assignments for table {table:?}; routing query to executor '{executor_id}'"
-        );
-
         return vec![(
             flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
             Vec::new(),
@@ -496,24 +492,6 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         self.partition_manager
             .get_cached_table_metadata(&tbl.table_name)
             .is_some()
-        //     &&
-        // let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
-        //     return false;
-        // };
-
-        // #[cfg(not(windows))]
-        // if default
-        //     .table_provider
-        //     .as_any()
-        //     .downcast_ref::<CayenneTableProvider>()
-        //     .is_some()
-        // {
-        //     // TODO: this is the bug. Most likely this bad boy is wrapped like crazy.
-        //     return true;
-        // }
-
-        // let _ = default; // suppress unused warning on windows
-        // false
     }
 
     fn get_partitions(

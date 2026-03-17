@@ -76,7 +76,7 @@ pub(crate) async fn do_get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    tracing::warn!("do_get_statement: {:?}", cmd.query);
+    tracing::trace!("do_get_statement: {:?}", cmd.query);
     let (output, from_cache) =
         Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query, None)).await?;
     let timed_output = TimedStream::new(output, move || start);

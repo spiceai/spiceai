@@ -77,11 +77,6 @@ impl DdlExtensionStore {
 
     /// Remove and return DDL extensions for a table (consume on use).
     pub fn remove(&mut self, table_name: &TableReference) -> Option<CreateTableStatementExtension> {
-        tracing::warn!(
-            "Consuming DDL extensions for table '{}'. curently={:?}",
-            table_name,
-            self.extensions
-        );
         self.extensions.remove(
             &table_name
                 .clone()
@@ -399,7 +394,7 @@ mod tests {
             store
                 .remove(&TableReference::parse_str("my_table"))
                 .is_none()
-        ); // consumed
+        );
     }
 
     #[test]

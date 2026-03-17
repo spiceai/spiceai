@@ -21,7 +21,7 @@ use bytes::Bytes;
 use datafusion::{
     common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
 };
-use datafusion_expr::{Cast, Expr, ExprSchemable, lit};
+use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 

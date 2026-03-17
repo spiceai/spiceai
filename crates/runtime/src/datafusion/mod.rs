@@ -28,7 +28,6 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
-use crate::config::ClusterRole;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
@@ -78,7 +77,6 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_proto::bytes::Serializeable;
 use error::{find_datafusion_root, format_datafusion_error};
 use itertools::Itertools;
 use query::QueryBuilder;
@@ -2389,9 +2387,6 @@ impl DataFusion {
             } => (modified.as_str(), Some(store_key)),
             ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
-        tracing::warn!(
-            "Preprocessed SQL: {sql}. (effective_sql={effective_sql}, store_key={store_key:?})"
-        );
 
         let plan = match session.create_logical_plan(effective_sql).await {
             Ok(plan) => plan,

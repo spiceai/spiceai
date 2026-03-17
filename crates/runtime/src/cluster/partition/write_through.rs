@@ -31,8 +31,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{ResolvedTableReference, TableReference},
 };
-use datafusion_expr::{Expr, execution_props::ExecutionProps, expr::ScalarFunction, lit};
-use datafusion_proto::bytes::Serializeable;
+use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
 use futures::TryStreamExt as _;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{ResultExt, Snafu};
