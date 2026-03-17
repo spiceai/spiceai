@@ -123,8 +123,11 @@ pub async fn initialize_partition_metadata(
                 }
             };
 
+        let partition_expressions: Vec<String> =
+            partitioning.iter().map(|p| p.expression.clone()).collect();
+
         match partition_manager
-            .set_unassigned_partitions(&table, partition_values)
+            .set_unassigned_partitions(&table, partition_values, partition_expressions)
             .await
         {
             Ok(()) => {

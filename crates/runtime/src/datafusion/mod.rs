@@ -28,7 +28,6 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
-use crate::config::ClusterRole;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
@@ -78,7 +77,6 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
-
 use error::{find_datafusion_root, format_datafusion_error};
 use itertools::Itertools;
 use query::QueryBuilder;
@@ -877,49 +875,83 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns the partition expression for a table by querying the catalog provider.
+    /// Returns the partition expression string for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
-    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`).
-    /// The returned string is parsed as a SQL expression against the table's schema.
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`),
+    /// and returns a SQL partition expression as a string.
     ///
-    /// **Limitation**: Cayenne currently persists only the partition *label* (column name
-    /// or `expr0` for non-column expressions), not the original SQL expression. For
-    /// column-based partitions this works correctly; for expression-based partitions
-    /// (e.g. `date_trunc(...)`) the label `expr0` will fail to parse and this method
-    /// will return an error. A follow-up should persist `partition_expr_sql` in Cayenne
-    /// metadata to support arbitrary partition expressions.
+    /// This function does not parse or validate the returned string into a `DataFusion`
+    /// [`Expr`]; callers that require a parsed expression must perform that parsing
+    /// themselves against the table's schema.
     ///
-    /// Returns `Ok(None)` when the table has no partition expression defined.
+    /// When the catalog returns an auto-generated label like `"expr0"` (used for function
+    /// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
+    /// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
     pub async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
-    ) -> Result<Option<Expr>, DataFusionError> {
+    ) -> Result<Option<String>, DataFusionError> {
         let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
         if let Some(catalog) = self.resolve_catalog_provider(table_reference)
             && let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref())
             && let Some(expr_string) = aware
                 .table_partition_expr(schema_name, table_reference.table())
                 .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .boxed()
+                .map_err(DataFusionError::External)?
         {
-            let table_schema = self
-                .get_table(table_reference)
-                .await
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "Table '{table_reference}' not found when resolving partition expression"
-                    ))
-                })?
-                .schema();
-            let df_schema = table_schema.as_ref().clone().to_dfschema()?;
-            return self
-                .ctx
-                .state()
-                .create_logical_expr(&expr_string, &df_schema)
-                .map(Some);
+            let resolved = self
+                .resolve_partition_label(&expr_string, table_reference)
+                .await?
+                .unwrap_or(expr_string);
+            return Ok(Some(resolved));
         }
         Ok(None)
+    }
+
+    /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
+    /// the original SQL expression string from the partition manager metadata.
+    async fn resolve_partition_label(
+        &self,
+        label: &str,
+        table_reference: &TableReference,
+    ) -> Result<Option<String>, DataFusionError> {
+        let Some(Ok(idx)) = label.strip_prefix("expr").map(str::parse::<usize>) else {
+            return Ok(None);
+        };
+        let Some(ref executor_registry) = self.executor_registry else {
+            return Ok(None);
+        };
+
+        let Some(metadata) = executor_registry
+            .federated_partition_manager()
+            .get_table_metadata(table_reference)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+        else {
+            return Ok(None);
+        };
+        Ok(metadata.partition_expressions.get(idx).cloned())
+    }
+
+    /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
+    pub async fn sql_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        let df_schema = self
+            .get_table(tbl)
+            .await
+            .ok_or(DataFusionError::Plan(format!(
+                "Table not found for SQL expression: {tbl}"
+            )))?
+            .schema()
+            .try_into()?;
+
+        self.ctx.parse_sql_expr(expr, &df_schema)
     }
 
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
@@ -1201,34 +1233,6 @@ impl DataFusion {
             })?;
 
         Ok(())
-    }
-
-    /// Returns `true` if this is a scheduler node, the table is a Cayenne table,
-    /// and at least one executor is connected to receive forwarded writes.
-    pub(crate) async fn should_forward_writes_to_executors(
-        &self,
-        table_reference: &TableReference,
-    ) -> bool {
-        if !matches!(
-            self.cluster_config.effective_role(),
-            Some(ClusterRole::Scheduler)
-        ) {
-            return false;
-        }
-
-        let has_executors = match self.executor_registry.as_ref() {
-            Some(reg) => !reg.flight_sql_clients.read().await.is_empty(),
-            None => false,
-        };
-        if !has_executors {
-            return false;
-        }
-
-        self.get_table(table_reference).await.is_some_and(|t| {
-            t.as_any()
-                .downcast_ref::<cayenne::CayenneTableProvider>()
-                .is_some()
-        })
     }
 
     pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
@@ -2352,20 +2356,25 @@ impl DataFusion {
     }
 
     /// Create or get a logical plan from the query
-    async fn get_or_create_logical_plan(
+    pub(crate) async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
-        key: &RawCacheKey,
+        cache_key_opt: Option<&RawCacheKey>,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let plans_cache = self.plans_cache_provider();
+        let plans_cache = if let Some(cache_key) = cache_key_opt {
+            let plans_cache = self.plans_cache_provider();
 
-        if let Some(cache) = plans_cache.as_ref()
-            && let Some(plan) = cache.get_raw_key(&key.as_u64()).await
-        {
-            tracing::trace!("using cached plan for {sql}");
-            return Ok(plan);
-        }
+            if let Some(cache) = plans_cache.as_ref()
+                && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
+            {
+                tracing::trace!("using cached plan for {sql}");
+                return Ok(plan);
+            }
+            plans_cache
+        } else {
+            None
+        };
 
         // Pre-process CREATE TABLE statements to extract DDL extensions
         // (WITH options, PARTITION BY) before planning.
@@ -2375,7 +2384,7 @@ impl DataFusion {
             ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,
                 store_key,
-            } => (modified.as_str(), Some(store_key.as_str())),
+            } => (modified.as_str(), Some(store_key)),
             ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
@@ -2392,9 +2401,11 @@ impl DataFusion {
             }
         };
 
-        if let Some(cache) = plans_cache {
+        if let Some(cache) = plans_cache
+            && let Some(cache_key) = cache_key_opt
+        {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
         }
 
         Ok(plan)
@@ -2744,7 +2755,7 @@ mod tests {
 
         let session = df.ctx.state();
 
-        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
             .await
             .expect("logical plan");
 
@@ -2757,7 +2768,7 @@ mod tests {
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
-        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
             .await
             .expect("logical plan");
 
