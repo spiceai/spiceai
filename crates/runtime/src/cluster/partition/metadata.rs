@@ -158,7 +158,7 @@ impl TablePartitionMetadata {
         ctx: &Arc<SessionContext>,
         table_schema: &Arc<Schema>,
     ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
-        let df_schema = DFSchema::try_from(Arc::clone(&table_schema))?;
+        let df_schema = DFSchema::try_from(Arc::clone(table_schema))?;
         let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
         for PartitionMetadata {
             partition_value,
@@ -179,7 +179,7 @@ impl TablePartitionMetadata {
                         && s.data_type() != col_type
                     {
                         lit = lit.cast_to(&col_type, &df_schema)?;
-                    };
+                    }
                     Ok(col.eq(lit))
                 })
                 .collect::<Result<Vec<Expr>, DataFusionError>>()?
