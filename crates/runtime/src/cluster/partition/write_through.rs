@@ -26,6 +26,7 @@ use arrow_flight::{
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
+use byte_unit::rust_decimal::prelude::Zero;
 use datafusion::{
     common::DFSchema,
     scalar::ScalarValue,
@@ -213,7 +214,6 @@ pub(crate) async fn forward_federated_partitioned_write(
     let mut executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
-    // TODO: need to update these on each batch?
     let partition_phys_exprs = build_partition_physical_exprs(&partition_by, &schema)?;
 
     let tbl = path
@@ -296,17 +296,20 @@ pub(crate) async fn forward_federated_partitioned_write(
 #[expect(clippy::too_many_arguments)]
 async fn route_batch_and_assign_unseen(
     batch: &RecordBatch,
+    // This is the boolean filter for each executor. It is the OR-combination of all partition predicates assigned to that executor.
     executor_filters: &mut Vec<ExecutorFilter>,
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+    // Partition_by expressions, both logical and physical.
     partition_phys_exprs: &[(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)],
+    // The original partition expression strings, used for constructing string representations of new partition predicates and values.
     partition_expr_keys: &[String],
+    // For each executor, the PartitionValue boolean expressions it currently has.
     partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
     partition_manager: &Arc<PartitionManager>,
     path: &TableReference,
 ) -> Result<()> {
     // Route matched rows to known executors.
     let unmatched = route_matched_and_collect_unmatched(batch, executor_filters, senders).await?;
-
     if unmatched.num_rows() == 0 {
         return Ok(());
     }
@@ -322,29 +325,52 @@ async fn route_batch_and_assign_unseen(
         runtime_table_partition::insert::partition_batch_composite(&unmatched, &physical_exprs)
             .context(PartitionBatchSnafu)?;
 
-    for (_key, (scalar_values, sub_batch)) in partitioned {
-        if sub_batch.num_rows() == 0 {
-            continue;
-        }
+    // Collect non-empty partitioned sub-batches with their partition values.
+    let entries: Vec<(
+        Vec<datafusion::common::ScalarValue>,
+        PartitionValue,
+        RecordBatch,
+    )> = partitioned
+        .into_iter()
+        .filter_map(|(_key, (scalar_values, sub_batch))| {
+            if sub_batch.num_rows().is_zero() {
+                return None;
+            }
+            let partition_value: PartitionValue = partition_expr_keys
+                .iter()
+                .zip(scalar_values.iter())
+                .map(|(expr_key, scalar)| (expr_key.clone(), scalar.to_string()))
+                .collect();
+            Some((scalar_values, partition_value, sub_batch))
+        })
+        .collect();
 
-        // Build the PartitionValue (HashMap<serialized_expr_key, serialized_lit_value>).
-        let partition_value: PartitionValue = partition_expr_keys
-            .iter()
-            .zip(scalar_values.iter())
-            .map(|(expr_key, scalar)| Ok((expr_key.clone(), scalar.to_string())))
-            .collect::<Result<HashMap<_, _>>>()?;
+    if entries.is_empty() {
+        return Ok(());
+    }
 
-        // Select least-loaded executor.
-        let executor_id = select_least_loaded_executor(partitions_by_executor, senders)?;
+    // Assign an executor for each new partition value up front.
+    let executor_ids =
+        select_least_loaded_executors(partitions_by_executor, senders, entries.len())?;
 
-        // Persist the assignment before forwarding.
-        partition_manager
-            .add_and_assign_partition(path, &partition_value, &executor_id)
-            .await
-            .map_err(|source| Error::PersistAssignment {
-                source: Box::new(source),
-            })?;
+    // Persist all assignments in a single OCC write.
+    let assignments: Vec<(&PartitionValue, &str)> = entries
+        .iter()
+        .zip(executor_ids.iter())
+        .map(|((_, pv, _), eid)| (pv, eid.as_str()))
+        .collect();
 
+    partition_manager
+        .add_and_assign_partitions(path, &assignments)
+        .await
+        .map_err(|source| Error::PersistAssignment {
+            source: Box::new(source),
+        })?;
+
+    // Update in-memory filters and forward rows for each partition.
+    for ((scalar_values, _partition_value, sub_batch), executor_id) in
+        entries.into_iter().zip(executor_ids.into_iter())
+    {
         tracing::debug!(
             table = %path,
             executor = %executor_id,
@@ -373,7 +399,9 @@ async fn route_batch_and_assign_unseen(
                     .iter()
                     .cloned()
                     .reduce(Expr::or)
-                    .expect("just pushed an entry");
+                    .ok_or(Error::EmptyPartitionExprs {
+                        executor_id: executor_id.clone(),
+                    })?;
                 let physical = datafusion::physical_expr::create_physical_expr(
                     &combined,
                     &df_schema,
@@ -494,15 +522,39 @@ fn build_partition_physical_exprs(
 }
 
 /// Selects the executor with the fewest currently assigned partitions.
-fn select_least_loaded_executor(
+/// Selects the least-loaded executor for each of `count` new partition values,
+/// distributing them across executors by incrementally accounting for each assignment.
+fn select_least_loaded_executors(
     partitions_by_executor: &HashMap<String, Vec<Expr>>,
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
-) -> Result<ExecutorId> {
-    senders
+    count: usize,
+) -> Result<Vec<ExecutorId>> {
+    if senders.is_empty() {
+        return Err(Error::NoExecutorsAvailable);
+    }
+
+    // Track load counts so each successive pick accounts for prior assignments.
+    let mut load: HashMap<&str, usize> = senders
         .keys()
-        .min_by_key(|id| partitions_by_executor.get(id.as_str()).map_or(0, Vec::len))
-        .cloned()
-        .ok_or(Error::NoExecutorsAvailable)
+        .map(|id| {
+            (
+                id.as_str(),
+                partitions_by_executor.get(id.as_str()).map_or(0, Vec::len),
+            )
+        })
+        .collect();
+
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let executor_id = load
+            .iter()
+            .min_by_key(|&(_, &count)| count)
+            .map(|(&id, _)| id.to_string())
+            .ok_or(Error::NoExecutorsAvailable)?;
+        *load.get_mut(executor_id.as_str()).expect("just selected") += 1;
+        result.push(executor_id);
+    }
+    Ok(result)
 }
 
 /// Builds a physical filter expression per executor by OR-ing its partition expressions.

@@ -323,15 +323,20 @@ impl PartitionManager {
         })
     }
 
-    /// Adds a new partition to a table's metadata and assigns it to an executor
-    /// in a single OCC write. If the partition already exists, it is assigned
-    /// (or left as-is if already assigned to the same executor).
-    pub async fn add_and_assign_partition(
+    /// Adds new partitions to a table's metadata and assigns each to its
+    /// respective executor in a single OCC write. If a partition already exists,
+    /// it is assigned (or left as-is if already assigned to the same executor).
+    ///
+    /// assignments is a list of (partition_value, executor_id) tuples.
+    pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
-        partition_value: &PartitionValue,
-        executor_id: &str,
+        assignments: &[(&PartitionValue, &str)],
     ) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+
         let key = table.to_string();
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
@@ -344,21 +349,29 @@ impl PartitionManager {
                 .await?
                 .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
-            // Find existing partition or add a new one.
-            let partition = metadata
-                .partitions
-                .iter_mut()
-                .find(|p| p.partition_value == *partition_value);
+            let mut changes = false;
 
-            if let Some(p) = partition {
-                if p.is_assigned_to(executor_id) {
-                    return Ok(());
+            for &(partition_value, executor_id) in assignments {
+                let existing = metadata
+                    .partitions
+                    .iter_mut()
+                    .find(|p| p.partition_value == *partition_value);
+
+                if let Some(p) = existing {
+                    if !p.is_assigned_to(executor_id) {
+                        p.assign_to(executor_id.to_string(), now_ms);
+                        changes = true;
+                    }
+                } else {
+                    let mut new_partition = PartitionMetadata::new(partition_value.clone());
+                    new_partition.assign_to(executor_id.to_string(), now_ms);
+                    metadata.add_partition(new_partition);
+                    changes = true;
                 }
-                p.assign_to(executor_id.to_string(), now_ms);
-            } else {
-                let mut new_partition = PartitionMetadata::new(partition_value.clone());
-                new_partition.assign_to(executor_id.to_string(), now_ms);
-                metadata.add_partition(new_partition);
+            }
+
+            if !changes {
+                return Ok(());
             }
 
             metadata.updated_at = now_ms;
