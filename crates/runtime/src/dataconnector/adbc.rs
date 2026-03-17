@@ -161,19 +161,9 @@ impl DataConnectorFactory for AdbcFactory {
 
             let uri_str = uri.to_string();
 
-            let username = params
-                .parameters
-                .get("username")
-                .expose()
-                .ok()
-                .map(str::to_string);
-            let password = params
-                .parameters
-                .get("password")
-                .expose()
-                .ok()
-                .map(str::to_string);
-            let db_options = build_db_options(&uri_str, username.as_deref(), password.as_deref());
+            let username = params.parameters.get("username").expose().ok();
+            let password = params.parameters.get("password").expose().ok();
+            let db_options = build_db_options(&uri_str, username, password);
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
