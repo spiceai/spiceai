@@ -9,6 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+adbc_core = { workspace = true, optional = true }
+adbc_driver_manager = { workspace = true, optional = true }
 app = { path = "../app" }
 arrow.workspace = true
 arrow-csv.workspace = true
@@ -250,6 +252,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]

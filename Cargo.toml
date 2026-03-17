@@ -85,6 +85,8 @@ rust-version = "1.93.1"
 version = "2.0.0-unstable"
 
 [workspace.dependencies]
+adbc_core = "0.21.0"
+adbc_driver_manager = "0.21.0"
 ahash = "0.8.12"
 anyhow = "1.0.99"
 arrow = { version = "57.0.0", features = ["prettyprint"] }
@@ -120,9 +122,9 @@ aws-sdk-s3 = "1.124.0"
 aws-sdk-s3vectors = "1.21.0"
 aws-sdk-secretsmanager = "1.101.0"
 aws-sdk-sts = "1.99.0"
-aws-smithy-async = "1.2.13"
+aws-smithy-async = "1.2.14"
 aws-smithy-runtime = "1.10.2"
-aws-smithy-runtime-api = "1.11.5"
+aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
 ballista-core = "52.0.0"
@@ -398,7 +400,6 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
-
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113

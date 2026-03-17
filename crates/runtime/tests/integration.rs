@@ -26,6 +26,8 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+#[cfg(feature = "adbc")]
+mod adbc;
 mod cache;
 mod catalog;
 mod cayenne;
