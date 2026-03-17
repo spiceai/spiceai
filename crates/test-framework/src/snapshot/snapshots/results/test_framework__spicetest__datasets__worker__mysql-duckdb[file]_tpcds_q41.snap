@@ -2,5 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q41"
 ---
-++
-++
++------------------------+
+| i_product_name         |
++------------------------+
+| ableableationbarought  |
+| ableableeingationought |
+| ableantiantieseought   |
+| ableationought         |
+| ablebarbarpriought     |
+| ablebarn station       |
+| ablebarn stbarought    |
+| ablebaroughtcallyought |
+| ablecallycallybarought |
+| ablecallyesen st       |
++------------------------+
