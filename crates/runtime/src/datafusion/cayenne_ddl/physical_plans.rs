@@ -599,22 +599,22 @@ impl ExecutionPlan for CayenneCreateTableExec {
             schema_provider.register_table(table_name.clone(), wrapped_provider)?;
 
             // Initialize partition metadata so the scheduler can route queries by partition.
-            if let Some(ref pe) = partition_expr {
-                if let Some(ref registry) = executor_registry {
-                    let table_ref = datafusion::sql::TableReference::full(
-                        df_catalog_name.clone(),
-                        df_schema_name.clone(),
-                        table_name.clone(),
+            if let Some(ref pe) = partition_expr
+                && let Some(ref registry) = executor_registry
+            {
+                let table_ref = datafusion::sql::TableReference::full(
+                    df_catalog_name.clone(),
+                    df_schema_name.clone(),
+                    table_name.clone(),
+                );
+                let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
+                let pm = registry.federated_partition_manager();
+                if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
+                    tracing::warn!(
+                        table = %table_ref,
+                        error = %e,
+                        "Failed to initialize partition metadata for table"
                     );
-                    let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
-                    let pm = registry.federated_partition_manager();
-                    if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
-                        tracing::warn!(
-                            table = %table_ref,
-                            error = %e,
-                            "Failed to initialize partition metadata for table"
-                        );
-                    }
                 }
             }
 

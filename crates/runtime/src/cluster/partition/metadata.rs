@@ -156,7 +156,7 @@ impl TablePartitionMetadata {
     pub fn all_executor_partitions(
         &self,
         ctx: &Arc<SessionContext>,
-        table_schema: Arc<Schema>,
+        table_schema: &Arc<Schema>,
     ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
         let df_schema = DFSchema::try_from(Arc::clone(&table_schema))?;
         let mut map: HashMap<String, Vec<Expr>> = HashMap::new();

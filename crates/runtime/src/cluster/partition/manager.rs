@@ -327,7 +327,7 @@ impl PartitionManager {
     /// respective executor in a single OCC write. If a partition already exists,
     /// it is assigned (or left as-is if already assigned to the same executor).
     ///
-    /// assignments is a list of (partition_value, executor_id) tuples.
+    /// `assignments` is a list of (`partition_value`, `executor_id`) tuples.
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,

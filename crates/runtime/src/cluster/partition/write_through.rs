@@ -204,7 +204,7 @@ pub(crate) async fn forward_federated_partitioned_write(
         .context(CreateDFSchemaSnafu)?;
 
     let mut partitions_by_executor = table_partitions
-        .all_executor_partitions(&ctx, schema)
+        .all_executor_partitions(&ctx, &schema)
         .context(ResolvePartitionsSnafu)?;
 
     let schema = Arc::new(
@@ -249,7 +249,7 @@ pub(crate) async fn forward_federated_partitioned_write(
             &mut executor_filters,
             &senders,
             &partition_phys_exprs,
-            &raw_partition_by,
+            raw_partition_by,
             &mut partitions_by_executor,
             &partition_manager,
             path,
@@ -271,7 +271,7 @@ pub(crate) async fn forward_federated_partitioned_write(
                 &mut executor_filters,
                 &senders,
                 &partition_phys_exprs,
-                &raw_partition_by,
+                raw_partition_by,
                 &mut partitions_by_executor,
                 &partition_manager,
                 path,
@@ -442,7 +442,7 @@ fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
             // For string types, produce a properly quoted and escaped SQL literal.
             let value = scalar.to_string();
             let escaped = value.replace('\'', "''");
-            format!("'{}'", escaped)
+            format!("'{escaped}'")
         }
         _ => scalar.to_string(),
     }
@@ -526,7 +526,7 @@ fn build_partition_physical_exprs(
         .iter()
         .map(|e| {
             let physical = datafusion::physical_expr::create_physical_expr(
-                &e,
+                e,
                 &df_schema,
                 &ExecutionProps::new(),
             )
