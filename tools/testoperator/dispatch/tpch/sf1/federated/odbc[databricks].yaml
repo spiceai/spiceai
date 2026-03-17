@@ -5,3 +5,4 @@ tests:
     query_overrides: odbc-databricks
     runner_type: spicehq-dev-runners
     validate_results: true
+    ready_wait: 720

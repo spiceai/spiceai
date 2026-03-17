@@ -1318,6 +1318,7 @@ impl SQLExecutor for TursoTableProvider {
         &self,
         query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let pool = Arc::clone(&self.pool);
         let query = query.to_string();

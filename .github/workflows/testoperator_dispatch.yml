@@ -128,6 +128,22 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      - name: Dispatch Testoperator - Scheduled Streaming - Bench
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Streaming - Correctness
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-correctness
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spicehq-dev-runners

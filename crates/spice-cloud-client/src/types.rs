@@ -35,7 +35,6 @@ pub struct App {
     pub created_at: Option<String>,
     pub region: Option<String>,
     pub production_branch: Option<String>,
-    pub api_key: Option<String>,
     #[serde(default)]
     pub config: Option<AppConfig>,
 }

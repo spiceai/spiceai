@@ -1,5 +1,5 @@
 name: testoperator streaming dynamodb correctness
-run-name: streaming-correctness - ${{ github.event.inputs.queryset }} - sf${{ github.event.inputs.scale_factor }}
+run-name: streaming-correctness - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:

@@ -148,10 +148,10 @@ fn env_var_resources_over(
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
-) -> anyhow::Result<(i64, Option<String>)> {
+) -> anyhow::Result<i64> {
     let apps = cloud.list_apps().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
-        return Ok((app.id, app.api_key));
+        return Ok(app.id);
     }
 
     let cname = resolve_default_cname(cloud).await?;
@@ -196,12 +196,12 @@ pub(crate) async fn ensure_spice_cloud_app(
         .await;
 
     match create_result {
-        Ok(app) => Ok((app.id, app.api_key)),
+        Ok(app) => Ok(app.id),
         Err(spice_cloud_client::error::Error::Conflict { .. }) => {
             // Race condition — another caller created it; re-fetch
             let apps = cloud.list_apps().await?;
             if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
-                return Ok((app.id, app.api_key));
+                return Ok(app.id);
             }
             Err(anyhow::anyhow!(
                 "App '{app_name}' not found after conflict on create"

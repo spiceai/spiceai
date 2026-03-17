@@ -19,7 +19,7 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StructArray, TimestampNanosecondArray,
+    StringArray, StructArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
@@ -96,15 +96,31 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         SnowflakeConnection { api }
     }
 
-    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        Err(dbconnection::Error::UnableToGetTables {
-            source: "Snowflake tables() not implemented".into(),
-        })
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // Quote the identifier to prevent SQL injection and handle special characters
+        let escaped_schema = schema.replace('"', "\"\"");
+        let query = format!("SHOW TABLES IN SCHEMA \"{escaped_schema}\"");
+        let res =
+            self.api
+                .exec(&query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetTables {
+                    source: e.to_string().into(),
+                })?;
+
+        match res {
+            snowflake_api::QueryResult::Arrow(batches) => {
+                names_from_arrow_batches(batches, tables_error)
+            }
+            snowflake_api::QueryResult::Json(resp) => {
+                names_from_json_rows(&resp.value, tables_error)
+            }
+            snowflake_api::QueryResult::Empty => Ok(Vec::new()),
+        }
     }
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
         let query = "SHOW SCHEMAS";
-
         let res =
             self.api
                 .exec(query)
@@ -115,23 +131,11 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
         match res {
             snowflake_api::QueryResult::Arrow(batches) => {
-                let mut schemas = Vec::new();
-                for batch in batches {
-                    if let Some(name_column) = batch.column_by_name("name")
-                        && let Some(array) = name_column
-                            .as_any()
-                            .downcast_ref::<arrow::array::StringArray>()
-                    {
-                        for value in array.iter().flatten() {
-                            schemas.push(value.to_string());
-                        }
-                    }
-                }
-                Ok(schemas)
+                names_from_arrow_batches(batches, schemas_error)
             }
-            snowflake_api::QueryResult::Json(_) => Err(dbconnection::Error::UnableToGetSchemas {
-                source: "Expected Arrow response, got JSON".into(),
-            }),
+            snowflake_api::QueryResult::Json(resp) => {
+                names_from_json_rows(&resp.value, schemas_error)
+            }
             snowflake_api::QueryResult::Empty => Ok(Vec::new()),
         }
     }
@@ -225,6 +229,65 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()))
+}
+
+fn names_from_arrow_batches(
+    batches: Vec<RecordBatch>,
+    make_error: fn(String) -> dbconnection::Error,
+) -> Result<Vec<String>, dbconnection::Error> {
+    let mut names = Vec::new();
+
+    for batch in batches {
+        let name_column = batch
+            .column_by_name("name")
+            .ok_or_else(|| make_error("Arrow response missing 'name' column".to_string()))?;
+        let array = name_column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| make_error("'name' column is not a StringArray".to_string()))?;
+        names.extend(array.iter().flatten().map(ToString::to_string));
+    }
+
+    Ok(names)
+}
+
+fn tables_error(msg: String) -> dbconnection::Error {
+    dbconnection::Error::UnableToGetTables { source: msg.into() }
+}
+
+fn schemas_error(msg: String) -> dbconnection::Error {
+    dbconnection::Error::UnableToGetSchemas { source: msg.into() }
+}
+
+/// Extracts names from a Snowflake JSON response.
+///
+/// Supports two formats:
+/// - Array of objects with a `"name"` field (e.g., `[{"name": "foo"}, ...]`)
+/// - Array of arrays where the second element (index 1) is the name
+///   (matching the positional format used by `SHOW COLUMNS`)
+fn names_from_json_rows(
+    value: &serde_json::Value,
+    make_error: fn(String) -> dbconnection::Error,
+) -> Result<Vec<String>, dbconnection::Error> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| make_error("Expected array response".to_string()))?;
+    let mut names = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = if let Some(obj) = row.as_object() {
+            // Object format: {"name": "table_name", ...}
+            obj.get("name")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        } else if let Some(arr) = row.as_array() {
+            // Array format: [_, "table_name", ...] (name at index 1)
+            arr.get(1).and_then(|v| v.as_str()).map(ToString::to_string)
+        } else {
+            None
+        };
+        names.push(name.ok_or_else(|| make_error("Row missing valid 'name' field".to_string()))?);
+    }
+    Ok(names)
 }
 
 /// Converts `Snowflake` specific types to standard Arrow types.

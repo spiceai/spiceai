@@ -49,6 +49,7 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'dynamodb'
+          - 'arrow'
           - 'saffron-views'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'

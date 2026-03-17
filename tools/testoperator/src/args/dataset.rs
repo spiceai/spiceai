@@ -172,6 +172,8 @@ pub enum QueryOverridesArg {
     #[serde(rename = "dynamodb")]
     #[value(name = "dynamodb")]
     DynamoDB,
+    #[serde(rename = "arrow")]
+    Arrow,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -287,6 +289,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::SaffronViews => QueryOverrides::SaffronViews,
             QueryOverridesArg::SaffronDuckdbCTE => QueryOverrides::SaffronDuckdbCTE,
             QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
+            QueryOverridesArg::Arrow => QueryOverrides::Arrow,
         }
     }
 }
