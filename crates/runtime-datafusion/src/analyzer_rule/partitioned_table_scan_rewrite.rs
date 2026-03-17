@@ -29,7 +29,7 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     execution::SessionState,
-    logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, Union, lit},
+    logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, lit},
     optimizer::AnalyzerRule,
     prelude::SessionContext,
     sql::TableReference,
@@ -170,19 +170,28 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             }
 
             // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
-            if sub_scans.is_empty() {
+            let Some(first_scan) = sub_scans.first() else {
                 return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                     EmptyRelation {
                         produce_one_row: false,
                         schema: Arc::clone(plan.schema()),
                     },
                 )));
+            };
+            let first_scan = Arc::unwrap_or_clone(Arc::clone(first_scan));
+            let sub_scans = sub_scans.into_iter().skip(1).collect::<Vec<_>>();
+
+            // Single partition: no Union needed, just return the sub-scan directly.
+            if sub_scans.is_empty() {
+                return Ok(Transformed::yes(first_scan));
             }
 
-            Ok(Transformed::yes(LogicalPlan::Union(Union {
-                inputs: sub_scans,
-                schema: Arc::clone(plan.schema()),
-            })))
+            let mut builder = LogicalPlanBuilder::from(first_scan);
+            for scan in sub_scans {
+                builder = builder.union(Arc::unwrap_or_clone(scan))?;
+            }
+            let result = builder.alias(scan.table_name.clone())?.build()?;
+            Ok(Transformed::yes(result))
         })
         .data()
     }
