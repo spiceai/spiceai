@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,22 +23,37 @@ use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check_with_timeout;
 use crate::{
     RecordBatch, init_tracing,
-    utils::{register_test_connectors, test_request_context},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use app::AppBuilder;
+use arrow::array::{Int64Array, StringViewArray};
+use arrow_flight::{FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder};
+use arrow_schema::{DataType, Field, Schema};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
+use data_components::RefreshableCatalogProvider;
+use datafusion::assert_batches_eq;
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
+use rand::Rng as _;
+use runtime::auth::EndpointAuth;
+use runtime::catalogconnector::cayenne::provider::CayenneCatalogProvider;
+use runtime::config::Config;
 use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime_auth::FlightBasicAuth;
+use runtime_auth::api_key::ApiKeyAuth;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::access::AccessMode;
+use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
+use spicepod::component::runtime::ApiKey;
 use spicepod::param::Params;
 use spicepod::partitioning::PartitionedBy;
 use test_framework::queries::QuerySet;
+use tokio::time::sleep;
+use tonic::transport::Channel;
 
 /// Append a single row to a Cayenne-accelerated table through the Runtime write path.
 ///
@@ -682,4 +698,292 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
 
         Ok(())
     }).await
+}
+
+/// Creates a Cayenne `Catalog` component with `read_write_create` access.
+fn make_cayenne_catalog(catalog_name: &str, data_dir: &str, metadata_dir: &str) -> Catalog {
+    let mut catalog = Catalog::new("cayenne".to_string(), catalog_name.to_string())
+        .with_access(AccessMode::ReadWriteCreate);
+    catalog.params = Some(Params::from_string_map(
+        vec![
+            ("cayenne_data_dir".to_string(), data_dir.to_string()),
+            ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
+        ]
+        .into_iter()
+        .collect::<HashMap<String, String>>(),
+    ));
+    catalog
+}
+
+/// Run a SQL query and collect all result batches.
+async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    let result = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query '{sql}' failed: {e}"))?;
+
+    result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| format!("collecting results for '{sql}' failed: {e}"))
+}
+
+/// Run a SQL statement (DDL/DML) and discard results.
+async fn exec(rt: &Runtime, sql: &str) -> Result<(), String> {
+    run_query(rt, sql).await?;
+    Ok(())
+}
+
+/// Send record batches to a Cayenne table via Flight DoPut.
+async fn doput_to_table(
+    client: &mut FlightClient,
+    table_path: &[&str],
+    batch: RecordBatch,
+) -> Result<(), String> {
+    let flight_descriptor =
+        FlightDescriptor::new_path(table_path.iter().map(|s| s.to_string()).collect());
+
+    #[expect(clippy::needless_collect)]
+    let flight_data_stream = FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(flight_descriptor))
+        .build(futures::stream::iter(
+            vec![Ok(batch)].into_iter().collect::<Vec<_>>(),
+        ));
+
+    let _response: Vec<_> = client
+        .do_put(flight_data_stream)
+        .await
+        .map_err(|e| format!("do_put failed: {e}"))?
+        .try_collect()
+        .await
+        .map_err(|e| format!("do_put response stream failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Build a RecordBatch with (id: Int64, name: Utf8View) columns.
+fn make_batch(ids: &[i64], names: &[&str]) -> Result<RecordBatch, String> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8View, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringViewArray::from(names.to_vec())),
+        ],
+    )
+    .map_err(|e| format!("failed to create RecordBatch: {e}"))
+}
+
+/// Helper: DoPut data, refresh catalog, query, and assert expected output.
+async fn doput_refresh_and_assert(
+    client: &mut FlightClient,
+    table_path: &[&str],
+    rt: &Runtime,
+    cayenne_provider: &CayenneCatalogProvider,
+    ids: &[i64],
+    names: &[&str],
+    expected: &[&str],
+) -> Result<(), String> {
+    let batch = make_batch(ids, names)?;
+    doput_to_table(client, table_path, batch).await?;
+
+    cayenne_provider
+        .refresh()
+        .await
+        .map_err(|e| format!("catalog refresh failed: {e}"))?;
+
+    let batches = run_query(rt, "SELECT id, name FROM stlcyc.ns.items ORDER BY id").await?;
+
+    let expected_vec: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    let expected_refs: Vec<&str> = expected_vec.iter().map(|s| s.as_str()).collect();
+    assert_batches_eq!(&expected_refs, &batches);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cayenne_doput_upsert_cycle_stale() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "stlcyc",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let mut rng = rand::rng();
+            let http_port: u16 = rng.random_range(50000..60000);
+            let flight_port: u16 = http_port + 1;
+            let metrics_port: u16 = http_port + 2;
+
+            let api_config = Config::new()
+                .with_http_bind_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_port))
+                .with_flight_bind_address(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    flight_port,
+                ));
+
+            let app = AppBuilder::new("cayenne_doput_upsert_cycle_stale_test")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let registry = prometheus::Registry::new();
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_metrics_server(
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), metrics_port),
+                        registry,
+                    )
+                    .with_app(app)
+                    .with_runtime_config(Config::default().with_caching_disabled())
+                    .build()
+                    .await,
+            );
+
+            let cloned_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("testkey:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+            let endpoint_auth = EndpointAuth::default().with_flight_basic_auth(auth);
+
+            let server_rt = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(server_rt.start_servers(api_config, None, endpoint_auth)).await
+            });
+
+            wait_until_true(Duration::from_secs(10), || async {
+                reqwest::get(format!("http://localhost:{http_port}/health"))
+                    .await
+                    .is_ok()
+            })
+            .await;
+
+            let channel = {
+                let start = std::time::Instant::now();
+                loop {
+                    if start.elapsed() > Duration::from_secs(30) {
+                        return Err("Flight server not ready within 30s".to_string());
+                    }
+                    match Channel::from_shared(format!("http://localhost:{flight_port}"))
+                        .map_err(|e| format!("invalid URI: {e}"))?
+                        .connect()
+                        .await
+                    {
+                        Ok(ch) => break ch,
+                        Err(_) => sleep(Duration::from_millis(100)).await,
+                    }
+                }
+            };
+
+            let mut client = FlightClient::new(channel);
+            client
+                .add_header("authorization", "Bearer testkey")
+                .map_err(|e| format!("failed to add auth header: {e}"))?;
+
+            exec(&rt, "CREATE SCHEMA stlcyc.ns").await?;
+            exec(
+                &rt,
+                "CREATE TABLE stlcyc.ns.items (
+                    id BIGINT NOT NULL,
+                    name VARCHAR,
+                    PRIMARY KEY (id)
+                )",
+            )
+            .await?;
+
+            let table_path = &["stlcyc", "ns", "items"];
+
+            let df = rt.datafusion();
+            let catalog_provider = df
+                .ctx
+                .catalog("stlcyc")
+                .ok_or("catalog 'stlcyc' not found")?;
+            let cayenne_provider = catalog_provider
+                .as_any()
+                .downcast_ref::<CayenneCatalogProvider>()
+                .ok_or("failed to downcast to CayenneCatalogProvider")?;
+
+            doput_refresh_and_assert(
+                &mut client,
+                table_path,
+                &rt,
+                cayenne_provider,
+                &[1, 2],
+                &["Alice", "Bob"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            doput_refresh_and_assert(
+                &mut client,
+                table_path,
+                &rt,
+                cayenne_provider,
+                &[1, 2],
+                &["Alice2", "Bob2"],
+                &[
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 1  | Alice2 |",
+                    "| 2  | Bob2   |",
+                    "+----+--------+",
+                ],
+            )
+            .await?;
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            doput_refresh_and_assert(
+                &mut client,
+                table_path,
+                &rt,
+                cayenne_provider,
+                &[1, 2],
+                &["Alice", "Bob"],
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | Alice |",
+                    "| 2  | Bob   |",
+                    "+----+-------+",
+                ],
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
 }
