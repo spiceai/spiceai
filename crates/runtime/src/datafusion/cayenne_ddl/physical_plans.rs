@@ -202,7 +202,7 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
 }
 
 /// Creates a result schema for DDL operations (single "result" column).
-fn ddl_result_schema() -> SchemaRef {
+pub fn ddl_result_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "result",
         DataType::Utf8,
@@ -975,6 +975,263 @@ impl ExecutionPlan for CayenneDropTableExec {
                 )]))],
             )?;
             Ok(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Physical plan to forward `DELETE` DML operations to Cayenne table across relevant executors in distributed mode.
+///
+/// Forwards the DELETE statement to all connected executor nodes via `FlightSQL`.
+pub struct DistributedCayenneDeleteExec {
+    table_name: datafusion::sql::TableReference,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// SQL text of the WHERE clause, if any.
+    filter_sql: Option<String>,
+    /// The child physical plan (produces the delete filter/rows).
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for DistributedCayenneDeleteExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneDeleteExec")
+            .field("table_name", &self.table_name.to_string())
+            .field("filter_sql", &self.filter_sql)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DistributedCayenneDeleteExec {
+    #[must_use]
+    pub fn new(
+        table_name: datafusion::sql::TableReference,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
+        filter_sql: Option<String>,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            table_name,
+            executor_registry,
+            filter_sql,
+            input,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for DistributedCayenneDeleteExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneDeleteExec: {}", self.table_name)
+    }
+}
+
+impl ExecutionPlan for DistributedCayenneDeleteExec {
+    fn name(&self) -> &'static str {
+        "CayenneDeleteExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let input = children.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal("CayenneDeleteExec requires exactly one child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(
+            self.table_name.clone(),
+            self.executor_registry.clone(),
+            self.filter_sql.clone(),
+            input,
+        )))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let executor_registry = self.executor_registry.clone();
+        let filter_sql = self.filter_sql.clone();
+        let result_schema = ddl_result_schema();
+
+        let stream = futures::stream::once(async move {
+            if let Some(ref registry) = executor_registry {
+                let mut sql = format!("DELETE FROM {table_name}");
+                if let Some(ref filter) = filter_sql {
+                    sql.push_str(&format!(" WHERE {filter}"));
+                }
+                forward_ddl_to_executors(registry, &sql).await?;
+            }
+
+            RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "DELETE from '{table_name}' forwarded"
+                )]))],
+            )
+            .map_err(Into::into)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Physical plan to forward `UPDATE` DML operations to Cayenne table across relevant executors in distributed mode.
+///
+/// Forwards the UPDATE statement to all connected executor nodes via `FlightSQL`.
+pub struct DistributedCayenneUpdateExec {
+    table_name: datafusion::sql::TableReference,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// SQL text of the WHERE clause, if any.
+    filter_sql: Option<String>,
+    /// SET assignments as `(column_name, value_sql)` pairs.
+    assignments_sql: Vec<(String, String)>,
+    /// The child physical plan (produces the update assignments/filter).
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for DistributedCayenneUpdateExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneUpdateExec")
+            .field("table_name", &self.table_name.to_string())
+            .field("filter_sql", &self.filter_sql)
+            .field("assignments_sql", &self.assignments_sql)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DistributedCayenneUpdateExec {
+    #[must_use]
+    pub fn new(
+        table_name: datafusion::sql::TableReference,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
+        filter_sql: Option<String>,
+        assignments_sql: Vec<(String, String)>,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            table_name,
+            executor_registry,
+            filter_sql,
+            assignments_sql,
+            input,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for DistributedCayenneUpdateExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneUpdateExec: {}", self.table_name)
+    }
+}
+
+impl ExecutionPlan for DistributedCayenneUpdateExec {
+    fn name(&self) -> &'static str {
+        "CayenneUpdateExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let input = children.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal("CayenneUpdateExec requires exactly one child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(
+            self.table_name.clone(),
+            self.executor_registry.clone(),
+            self.filter_sql.clone(),
+            self.assignments_sql.clone(),
+            input,
+        )))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let executor_registry = self.executor_registry.clone();
+        let filter_sql = self.filter_sql.clone();
+        let assignments_sql = self.assignments_sql.clone();
+        let result_schema = ddl_result_schema();
+
+        let stream = futures::stream::once(async move {
+            if let Some(ref registry) = executor_registry {
+                if assignments_sql.is_empty() {
+                    return Err(DataFusionError::Execution(format!(
+                        "UPDATE on '{table_name}' has no SET assignments"
+                    )));
+                }
+                let set_clause = assignments_sql
+                    .iter()
+                    .map(|(col, val)| format!("\"{col}\" = {val}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut sql = format!("UPDATE {table_name} SET {set_clause}");
+                if let Some(ref filter) = filter_sql {
+                    sql.push_str(&format!(" WHERE {filter}"));
+                }
+                forward_ddl_to_executors(registry, &sql).await?;
+            }
+
+            RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "UPDATE on '{table_name}' forwarded"
+                )]))],
+            )
+            .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(

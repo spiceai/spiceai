@@ -588,6 +588,22 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
             && args.runtime.cluster.scheduler_address.is_some());
 
     if is_executor {
+        // If a spicepod is explicitly provided, load just the runtime config (e.g. flight rate
+        // limits, telemetry) while using a default App for datasets/catalogs (those come from
+        // the scheduler via the cluster protocol).
+        if let Some(ref path) = args.spicepod {
+            if let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await {
+                let mut app = App::default();
+                // Copy only runtime flight and telemetry config from the spicepod.
+                app.runtime.flight = built_app.runtime.flight;
+                app.runtime.telemetry = built_app.runtime.telemetry;
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                tracing::info!(
+                    "Starting as a cluster executor with runtime config from spicepod."
+                );
+                return Ok((Some(Arc::new(app)), None));
+            }
+        }
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
