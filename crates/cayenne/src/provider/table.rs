@@ -1658,6 +1658,18 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 if let (Some(pk_array), Some(deleted_pks)) = (int64_pk_array, deleted_pk_i64) {
                     for row_idx in 0..batch_rows {
+                        if has_any_pk_nulls
+                            && (pk_array.is_null(row_idx)
+                                || pk_columns.iter().any(|col| col.is_null(row_idx)))
+                        {
+                            return Err(Error::DataValidation {
+                                table: table_name.to_string(),
+                                message: format!(
+                                    "Null primary key encountered in existing data for table {table_name}",
+                                ),
+                            });
+                        }
+
                         let pk_value = pk_array.value(row_idx);
                         if deleted_pks
                             .get(&pk_value)
@@ -1665,15 +1677,6 @@ impl CayenneTableProvider {
                         {
                             row_id += 1;
                             continue;
-                        }
-
-                        if has_any_pk_nulls && pk_columns.iter().any(|col| col.is_null(row_idx)) {
-                            return Err(Error::DataValidation {
-                                table: table_name.to_string(),
-                                message: format!(
-                                    "Null primary key encountered in existing data for table {table_name}",
-                                ),
-                            });
                         }
 
                         let key = rows.row(row_idx).owned();
@@ -1785,9 +1788,11 @@ impl CayenneTableProvider {
     /// Prepare an incoming stream for insert by validating `on_conflict` constraints.
     ///
     /// Processes the stream batch-by-batch. For each incoming batch:
-    /// 1. Extracts PK values and builds IN-list filter expressions
-    /// 2. Scans existing data with those filters pushed down (zone-map + row-level)
-    /// 3. Builds a small per-batch keyset of only the affected existing rows
+    /// 1. Extracts PK values and builds per-column min/max "bounding box" predicates
+    ///    (via `build_pk_filter_exprs`) over the incoming batch
+    /// 2. Scans existing data with those predicates pushed down (zone-map + row-level)
+    /// 3. Builds a small per-batch keyset from only the existing rows that fall within
+    ///    those PK ranges
     /// 4. Validates on-conflict behavior against that keyset
     ///
     /// This avoids loading ALL existing keys upfront, dramatically reducing memory
