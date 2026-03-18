@@ -16,10 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use tokio::process::{Child, Command as TokioCommand};
 
 use arrow::datatypes::DataType;
@@ -1278,7 +1276,7 @@ fn generate_initial_spicepod(
         if let Some(p) = path.strip_suffix('/') {
             path = p;
         }
-        let state_location = format!("{path}/{}", run_id.to_string());
+        let state_location = format!("{path}/{run_id}");
         if !loc.is_empty() {
             let mut sched = Scheduler {
                 state_location,
@@ -1293,7 +1291,7 @@ fn generate_initial_spicepod(
                     p.data
                         .insert("s3_region".to_string(), ParamValue::String(region))
                 });
-            };
+            }
             spicepod.runtime.scheduler = Some(sched);
         }
     }
