@@ -50,6 +50,9 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'dynamodb'
+          - 'postgres-catalog'
+          - 'mysql-catalog'
+          - 'mssql-catalog'
       load_interval:
         description: 'Interval in seconds between append operations'
         required: true

@@ -51,6 +51,9 @@ on:
           - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
+          - 'postgres-catalog'
+          - 'mysql-catalog'
+          - 'mssql-catalog'
       runner_type:
         description: 'Runner type'
         required: true

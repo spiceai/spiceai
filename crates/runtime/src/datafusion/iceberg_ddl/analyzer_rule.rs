@@ -31,6 +31,7 @@ use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion::optimizer::AnalyzerRule;
 
 use data_components::iceberg::provider::IcebergCatalogProvider;
+use datafusion::sql::TableReference;
 
 use super::acceleration_options::{DatasetOptions, SharedDdlExtensionStore};
 use super::composed_catalog_to_iceberg;
@@ -141,7 +142,7 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                             "Failed to acquire DDL extension store lock: {e}"
                         ))
                     })?;
-                    match store.remove(&acceleration_key) {
+                    match store.remove(&TableReference::parse_str(&acceleration_key)) {
                         Some(ext) => (ext.acceleration, ext.dataset),
                         None => (None, DatasetOptions::default()),
                     }

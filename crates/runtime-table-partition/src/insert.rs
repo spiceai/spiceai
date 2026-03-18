@@ -501,13 +501,14 @@ pub fn partition_batch_composite(
     // Evaluate all partition expressions to get arrays
     let arrays: Vec<Arc<dyn Array>> = physical_exprs
         .iter()
-        .map(|expr| {
-            let column = expr.evaluate(batch)?;
-            match column {
-                ColumnarValue::Array(array) => Ok(array),
-                ColumnarValue::Scalar(_) => Err(DataFusionError::Execution(
-                    "Invalid partition expression: expected array, got scalar".to_string(),
-                )),
+        .map(|expr| match expr.evaluate(batch) {
+            Ok(ColumnarValue::Array(array)) => Ok(array),
+            Ok(ColumnarValue::Scalar(_)) => Err(DataFusionError::Execution(
+                "Invalid partition expression: expected array, got scalar".to_string(),
+            )),
+            Err(e) => {
+                tracing::warn!("Failed to evaluate partition expression {}: {e}", expr);
+                Err(e)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;

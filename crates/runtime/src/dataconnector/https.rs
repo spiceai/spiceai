@@ -56,7 +56,7 @@ impl std::fmt::Display for Https {
 }
 
 impl Https {
-    /// Determines if the dataset uses a structured file format (parquet, csv, etc.)
+    /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
     fn is_structured_format(&self, dataset: &Dataset) -> bool {
         let file_format = self
@@ -69,8 +69,24 @@ impl Https {
         // Check if explicitly configured as a structured format
         if matches!(
             file_format.as_str(),
-            "parquet" | "csv" | "tsv" | "arrow" | "avro"
+            "parquet"
+                | "csv"
+                | "tsv"
+                | "arrow"
+                | "avro"
+                | "jsonl"
+                | "ndjson"
+                | "ldjson"
+                | "soda"
+                | "socrata"
         ) {
+            return true;
+        }
+
+        // JSON format is structured only for static file endpoints.
+        // Dynamic API endpoints (with allowed_request_paths, request_query_filters, etc.)
+        // should use HttpTableProvider instead.
+        if file_format == "json" && !self.has_dynamic_api_params() {
             return true;
         }
 
@@ -86,13 +102,46 @@ impl Https {
                 .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
 
-            return matches!(
+            if matches!(
                 extension.as_str(),
-                "parquet" | "csv" | "tsv" | "arrow" | "avro"
-            );
+                "parquet" | "csv" | "tsv" | "arrow" | "avro" | "jsonl" | "ndjson" | "ldjson"
+            ) {
+                return true;
+            }
+
+            if extension == "json" && !self.has_dynamic_api_params() {
+                return true;
+            }
         }
 
         false
+    }
+
+    /// Returns true if the connector is configured with parameters that indicate
+    /// a dynamic HTTP API endpoint (as opposed to a static file download).
+    fn has_dynamic_api_params(&self) -> bool {
+        let has_allowed_paths = self
+            .params
+            .get("allowed_request_paths")
+            .expose()
+            .ok()
+            .is_some_and(|v| !v.is_empty());
+
+        let has_query_filters = self
+            .params
+            .get("request_query_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
+        let has_body_filters = self
+            .params
+            .get("request_body_filters")
+            .expose()
+            .ok()
+            .is_some_and(util::parse_enabled);
+
+        has_allowed_paths || has_query_filters || has_body_filters
     }
 }
 

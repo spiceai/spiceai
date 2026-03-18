@@ -24,7 +24,8 @@ use std::task::Poll;
 
 use crate::file_format::{Format, SpiceJsonDecoder};
 use crate::{
-    ArrayToNdjson, JsonPointerReader, SodaReader, nest_struct_schema, peek_first_non_ws_byte,
+    ArrayToNdjson, JsonPointerReader, SodaReader, is_soda_response, nest_struct_schema,
+    peek_first_non_ws_byte,
 };
 use crate::{extract_flattened_from_nested, project_nested_schema};
 
@@ -55,6 +56,7 @@ pub struct SpiceJsonOpener {
     format: Format,
     json_pointer: Option<String>,
     unnest_struct: Option<String>,
+    soda_metadata: bool,
 }
 
 /// `SpiceJsonSource` holds the extra configuration that is necessary for [`SpiceJsonOpener`]
@@ -65,6 +67,7 @@ pub struct SpiceJsonSource {
     format: Format,
     json_pointer: Option<String>,
     unnest_struct: Option<String>,
+    soda_metadata: bool,
     table_schema: TableSchema,
     projection: SplitProjection,
 }
@@ -80,6 +83,7 @@ impl SpiceJsonSource {
             format: Format::Jsonl,
             json_pointer: None,
             unnest_struct: None,
+            soda_metadata: false,
             table_schema,
             projection,
         }
@@ -100,6 +104,12 @@ impl SpiceJsonSource {
     #[must_use]
     pub fn with_unnest_struct(mut self, unnest_struct: Option<String>) -> Self {
         self.unnest_struct = unnest_struct;
+        self
+    }
+
+    #[must_use]
+    pub fn with_soda_metadata(mut self, enabled: bool) -> Self {
+        self.soda_metadata = enabled;
         self
     }
 
@@ -130,6 +140,7 @@ impl FileSource for SpiceJsonSource {
             format: self.format,
             json_pointer: self.json_pointer.clone(),
             unnest_struct: self.unnest_struct.clone(),
+            soda_metadata: self.soda_metadata,
         });
 
         ProjectionOpener::try_new(self.projection.clone(), opener, file_schema)
@@ -216,6 +227,7 @@ impl FileOpener for SpiceJsonOpener {
         let format = self.format;
         let json_pointer = self.json_pointer.clone();
         let unnest_struct_separator = self.unnest_struct.clone();
+        let soda_metadata = self.soda_metadata;
         let file_range = partitioned_file.range.clone();
 
         tracing::trace!(
@@ -257,17 +269,31 @@ impl FileOpener for SpiceJsonOpener {
                         file_compression_type.convert_read(file.take(limit as u64))?
                     };
 
+                    // Buffer the content for SODA auto-detection when Auto
+                    let mut raw_buf = Vec::new();
+                    let mut bytes = bytes;
+                    bytes
+                        .read_to_end(&mut raw_buf)
+                        .map_err(DataFusionError::from)?;
+
+                    // Check SODA on raw data before json_pointer extraction.
+                    let is_soda = format == Format::Soda
+                        || (format == Format::Auto && is_soda_response(&raw_buf));
+
+                    if is_soda && json_pointer.is_some() {
+                        return Err(DataFusionError::Configuration(
+                            "'json_pointer' cannot be used with SODA format data. \
+                             SODA responses contain their own schema in 'meta.view.columns' \
+                             and data is extracted automatically. \
+                             Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
+                                .to_string(),
+                        ));
+                    }
+
                     // SODA format: convert to NDJSON via SodaReader
-                    if format == Format::Soda {
-                        // Apply json_pointer before SODA if both are configured
-                        let soda_reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
-                            let ptr = JsonPointerReader::new(bytes, path)
-                                .map_err(DataFusionError::from)?;
-                            Box::new(ptr)
-                        } else {
-                            bytes
-                        };
-                        let soda = SodaReader::new(soda_reader).map_err(DataFusionError::from)?;
+                    if is_soda {
+                        let soda = SodaReader::from_vec(&raw_buf, soda_metadata)
+                            .map_err(DataFusionError::from)?;
                         let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                             .with_batch_size(batch_size)
                             .build(BufReader::new(soda))?;
@@ -293,22 +319,27 @@ impl FileOpener for SpiceJsonOpener {
                         return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
                     }
 
-                    // Apply json_pointer extraction if configured
-                    let reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
-                        Box::new(
-                            JsonPointerReader::new(bytes, path).map_err(DataFusionError::from)?,
-                        )
+                    // Not SODA — apply json_pointer if configured
+                    let buf = if let Some(path) = &json_pointer {
+                        let ptr = JsonPointerReader::from_vec(&raw_buf, path)
+                            .map_err(DataFusionError::from)?;
+                        let mut out = Vec::new();
+                        BufReader::new(ptr)
+                            .read_to_end(&mut out)
+                            .map_err(DataFusionError::from)?;
+                        out
                     } else {
-                        bytes
+                        raw_buf
                     };
-                    let mut buf_reader = BufReader::new(reader);
+
+                    let mut buf_reader = BufReader::new(std::io::Cursor::new(buf));
 
                     // Determine if the content is a JSON array
                     let is_array = match format {
                         Format::Array => true,
                         Format::Jsonl | Format::Object => false,
                         Format::Soda => unreachable!("handled above"),
-                        Format::Auto => {
+                        Format::Auto | Format::Json => {
                             peek_first_non_ws_byte(&mut buf_reader).is_ok_and(|b| b == b'[')
                         }
                     };
@@ -351,7 +382,9 @@ impl FileOpener for SpiceJsonOpener {
                     // because they must parse the entire JSON document.
                     // Auto needs buffering to peek the first byte then decode.
                     // Object and JSONL/Array can stream directly.
-                    if json_pointer.is_some() || matches!(format, Format::Auto | Format::Soda) {
+                    if json_pointer.is_some()
+                        || matches!(format, Format::Auto | Format::Json | Format::Soda)
+                    {
                         let s = s.map_err(DataFusionError::from);
                         let decompressed = file_compression_type.convert_stream(s.boxed())?;
                         let chunks: Vec<bytes::Bytes> = decompressed.try_collect().await?;
@@ -362,22 +395,23 @@ impl FileOpener for SpiceJsonOpener {
                             all_bytes.extend_from_slice(chunk);
                         }
 
-                        // SODA format: convert to NDJSON via SodaReader (use from_vec to avoid double alloc)
-                        if format == Format::Soda {
-                            // Apply json_pointer before SODA if both are configured
-                            let soda_bytes = if let Some(path) = &json_pointer {
-                                let ptr = JsonPointerReader::from_vec(&all_bytes, path)
-                                    .map_err(DataFusionError::from)?;
-                                let mut out = Vec::new();
-                                BufReader::new(ptr)
-                                    .read_to_end(&mut out)
-                                    .map_err(DataFusionError::from)?;
-                                out
-                            } else {
-                                all_bytes
-                            };
-                            let soda =
-                                SodaReader::from_vec(&soda_bytes).map_err(DataFusionError::from)?;
+                        // Check SODA on raw data before json_pointer extraction
+                        let is_soda = format == Format::Soda
+                            || (format == Format::Auto && is_soda_response(&all_bytes));
+
+                        if is_soda && json_pointer.is_some() {
+                            return Err(DataFusionError::Configuration(
+                                "'json_pointer' cannot be used with SODA format data. \
+                                 SODA responses contain their own schema in 'meta.view.columns' \
+                                 and data is extracted automatically. \
+                                 Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
+                                    .to_string(),
+                            ));
+                        }
+
+                        if is_soda {
+                            let soda = SodaReader::from_vec(&all_bytes, soda_metadata)
+                                .map_err(DataFusionError::from)?;
                             let reader = ReaderBuilder::new(Arc::clone(&projected_schema))
                                 .with_batch_size(batch_size)
                                 .build(BufReader::new(soda))?;
@@ -403,22 +437,26 @@ impl FileOpener for SpiceJsonOpener {
                             return Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed());
                         }
 
-                        // Use from_vec to avoid double allocation
-                        let reader: Box<dyn Read + Send> = if let Some(path) = &json_pointer {
-                            Box::new(
-                                JsonPointerReader::from_vec(&all_bytes, path)
-                                    .map_err(DataFusionError::from)?,
-                            )
+                        // Not SODA — apply json_pointer if configured
+                        let processed_bytes = if let Some(path) = &json_pointer {
+                            let ptr = JsonPointerReader::from_vec(&all_bytes, path)
+                                .map_err(DataFusionError::from)?;
+                            let mut out = Vec::new();
+                            BufReader::new(ptr)
+                                .read_to_end(&mut out)
+                                .map_err(DataFusionError::from)?;
+                            out
                         } else {
-                            Box::new(std::io::Cursor::new(all_bytes))
+                            all_bytes
                         };
-                        let mut buf_reader = BufReader::new(reader);
+
+                        let mut buf_reader = BufReader::new(std::io::Cursor::new(processed_bytes));
 
                         let is_array = match format {
                             Format::Array => true,
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
-                            Format::Auto => {
+                            Format::Auto | Format::Json => {
                                 peek_first_non_ws_byte(&mut buf_reader).is_ok_and(|b| b == b'[')
                             }
                         };

@@ -26,6 +26,8 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+#[cfg(feature = "adbc")]
+mod adbc;
 mod cache;
 mod catalog;
 mod cayenne;
@@ -67,8 +69,10 @@ mod gcs;
 mod github;
 mod glue;
 mod graphql;
+mod http;
 mod iceberg;
 mod iceberg_api;
+mod json;
 
 #[cfg(feature = "kafka")]
 mod kafka;
