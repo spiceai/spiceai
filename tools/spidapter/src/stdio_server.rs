@@ -31,7 +31,7 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
     ApiKey, ApiKeyAuth, Auth, Flight, Runtime, Scheduler, TelemetryConfig,
 };
-use spicepod::param::Params;
+use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
@@ -309,6 +309,7 @@ impl Handler for SpidapterHandler {
         };
 
         self.runs.insert(run_id, state);
+
         Ok(response)
     }
 
@@ -542,32 +543,10 @@ fn generate_adbc_create_table_statement(
         ));
     }
 
-    if !partition_columns.is_empty() {
-        let schema_columns = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect::<HashSet<_>>();
-
-        for partition_column in partition_columns {
-            if !schema_columns.contains(partition_column) {
-                return Err(anyhow::anyhow!(
-                    "Dataset '{dataset_name}' has partition column '{partition_column}' that is not present in the schema"
-                ));
-            }
-        }
-    }
     let partition_clause = if partition_columns.is_empty() {
         String::default()
     } else {
-        format!(
-            "PARTITION BY ({})",
-            partition_columns
-                .iter()
-                .map(|column| quote_identifier(column))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        format!("PARTITION BY ({})", partition_columns.join(", "))
     };
 
     Ok(format!(
@@ -1293,16 +1272,27 @@ fn generate_initial_spicepod(
     }?;
 
     if let Ok(loc) = std::env::var("SCHEDULER_STATE_LOCATION") {
-        let loc = loc.trim().to_string();
+        let mut path = loc.trim();
+        if let Some(p) = path.strip_suffix('/') {
+            path = p;
+        }
+        let state_location = format!("{path}/{run_id}");
         if !loc.is_empty() {
-            spicepod.runtime.scheduler = Some(Scheduler {
-                state_location: loc,
+            let mut sched = Scheduler {
+                state_location,
                 params: Some(Params::from_string_map(HashMap::from([(
                     "s3_auth".to_string(),
                     "key".to_string(),
                 )]))),
                 partition_management: None,
-            });
+            };
+            if let Ok(region) = std::env::var("AWS_REGION") {
+                sched.params.as_mut().map(|p| {
+                    p.data
+                        .insert("s3_region".to_string(), ParamValue::String(region))
+                });
+            }
+            spicepod.runtime.scheduler = Some(sched);
         }
     }
 
