@@ -31,7 +31,6 @@ use super::delete::{
 use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 use super::streaming::StreamingExec;
 use super::vortex_format::DeletionFilteringVortexFormat;
-use std::cmp::Ordering;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
@@ -74,6 +73,7 @@ use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::task;
@@ -1659,10 +1659,7 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 if let (Some(pk_array), Some(deleted_pks)) = (int64_pk_array, deleted_pk_i64) {
                     for row_idx in 0..batch_rows {
-                        if has_any_pk_nulls
-                            && (pk_array.is_null(row_idx)
-                                || pk_columns.iter().any(|col| col.is_null(row_idx)))
-                        {
+                        if has_any_pk_nulls && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                             return Err(Error::DataValidation {
                                 table: table_name.to_string(),
                                 message: format!(
