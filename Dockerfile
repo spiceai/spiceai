@@ -5,15 +5,14 @@ FROM rust:${RUST_VERSION}-slim-bookworm as build
 # cache mounts below may already exist and owned by root
 USER root
 
-ARG CARGO_FEATURES=default
 RUN apt update \
     && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev libclang-dev \
-    && if echo "$CARGO_FEATURES" | grep -q "nfs"; then apt install --yes libnfs-dev --no-install-recommends; fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build
 WORKDIR /build
 
+ARG CARGO_FEATURES=default
 ARG CARGO_NO_DEFAULT_FEATURES=false
 ARG RUST_PROFILE=release
 ARG CARGO_INCREMENTAL=yes
@@ -46,17 +45,14 @@ FROM debian:bookworm-slim as sandbox-setup
 ARG CARGO_FEATURES
 
 ARG INSTALL_ORACLE_ODPIC=false
-ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=208bc7a9372efae098ab743d6e76aeb66e6f42579dcdbb7a6a8438412481b02e
-ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=390999bc623c39c065f1236b8b1331b342431564a7a5e36e4c645fe8d159fc5e
+ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=05b4c01c77521eee32c89550d3a2e2f4d9f9601a79af96da441dfdd2d2a32ec4
+ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25ed881edde56543f8c6d135
 
 # Install required packages
 RUN apt update \
     && apt install --yes ca-certificates libssl3 findutils tzdata --no-install-recommends \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
-    fi \
-    && if echo "$CARGO_FEATURES" | grep -q "nfs"; then \
-    apt install --yes libnfs-dev --no-install-recommends; \
     fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
@@ -92,7 +88,7 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
-    set -eu; \
+    set -euo pipefail; \
     apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \
