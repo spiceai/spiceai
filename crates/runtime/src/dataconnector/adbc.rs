@@ -20,6 +20,7 @@ use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
@@ -78,6 +79,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Adbc {
     adbc_factory: AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
+    driver_name: String,
 }
 
 impl std::fmt::Debug for Adbc {
@@ -150,6 +152,7 @@ impl DataConnectorFactory for AdbcFactory {
                     source: Box::new(e),
                 })?;
 
+            let driver_name_owned = driver_name.to_string();
             let driver_path = params.parameters.get("driver_path").expose().ok();
             let driver_location = driver_path.unwrap_or(driver_name).to_string();
 
@@ -285,7 +288,10 @@ impl DataConnectorFactory for AdbcFactory {
 
             let adbc_factory = AdbcTableFactory::new(pool);
 
-            Ok(Arc::new(Adbc { adbc_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Adbc {
+                adbc_factory,
+                driver_name: driver_name_owned,
+            }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -365,6 +371,12 @@ fn build_conn_options(
 
     if opts.is_empty() { None } else { Some(opts) }
 }
+fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+    match driver_name {
+        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
+        _ => None,
+    }
+}
 
 register_data_connector!("adbc", AdbcFactory);
 
@@ -379,9 +391,9 @@ impl DataConnector for Adbc {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = dataset.path().into();
-
+        let dialect = dialect_for_driver(&self.driver_name);
         self.adbc_factory
-            .table_provider(table_reference, None)
+            .table_provider(table_reference, dialect)
             .await
             .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "adbc".to_string(),
@@ -395,10 +407,11 @@ impl DataConnector for Adbc {
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_reference = dataset.path().into();
+        let dialect = dialect_for_driver(&self.driver_name);
 
         Some(
             self.adbc_factory
-                .read_write_table_provider(table_reference, None)
+                .read_write_table_provider(table_reference, dialect)
                 .await
                 .map_err(|e| DataConnectorError::UnableToGetReadWriteProvider {
                     dataconnector: "adbc".to_string(),
