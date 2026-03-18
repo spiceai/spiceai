@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::SetOnce;
+
 use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
@@ -362,7 +364,26 @@ pub async fn run(args: Args) -> Result<()> {
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
-    let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
+
+    // Anonymous telemetry is a function of two inputs: the CLI flag and the
+    // spicepod `runtime.telemetry` config.  For schedulers and standalone
+    // instances the config is available immediately from the local spicepod.
+    // Executors don't have a spicepod — they fetch the app definition from the
+    // scheduler after joining the cluster — so the config is resolved later.
+    // A `SetOnce` lets `start_anonymous_telemetry` wait for the value.
+    let telemetry_config: Arc<SetOnce<TelemetryConfig>> = Arc::new(SetOnce::new());
+
+    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
+        || (args.runtime.cluster.role.is_none()
+            && args.runtime.cluster.scheduler_address.is_some());
+
+    if !is_executor {
+        // Resolve immediately from the local spicepod (or use default).
+        let config = runtime_config
+            .map(|rt| rt.telemetry.clone())
+            .unwrap_or_default();
+        let _ = telemetry_config.set(config);
+    }
 
     // Configure Flight `DoPut` rate limits from spicepod runtime.flight settings
     let flight_config = runtime_config.and_then(|rt| rt.flight.clone());
@@ -437,6 +458,10 @@ pub async fn run(args: Args) -> Result<()> {
         builder = builder.with_metrics_reader(reader.clone());
     }
 
+    if is_executor {
+        builder = builder.with_telemetry_config(Arc::clone(&telemetry_config));
+    }
+
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
         builder = builder.with_pods_watcher(pods_watcher);
@@ -509,7 +534,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     if let Some(ref metrics_registry) = prometheus_registry {
         let otel_config = telemetry_config
-            .as_ref()
+            .get()
             .and_then(|c| c.otel_exporter.as_ref())
             .filter(|c| c.enabled);
 
@@ -531,12 +556,12 @@ pub async fn run(args: Args) -> Result<()> {
         .context(UnableToInitializeTlsSnafu)?;
 
     let telemetry_enabled = args.telemetry_enabled;
-    let telemetry_config_clone = telemetry_config.clone();
+    let telemetry_config_clone = Arc::clone(&telemetry_config);
     let app_name_clone = app_name.clone();
     tokio::spawn(async move {
         start_anonymous_telemetry(
             telemetry_enabled,
-            telemetry_config_clone.as_ref(),
+            telemetry_config_clone,
             app_name_clone.as_ref(),
         )
         .await;
@@ -709,7 +734,7 @@ fn create_otel_reader(
 
 async fn start_anonymous_telemetry(
     telemetry_enabled: Option<bool>,
-    spicepod_telemetry_config: Option<&TelemetryConfig>,
+    telemetry_config: Arc<SetOnce<TelemetryConfig>>,
     spicepod_name: Option<&String>,
 ) {
     // Always log hardware info at debug level regardless of telemetry settings
@@ -719,27 +744,32 @@ async fn start_anonymous_telemetry(
         .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
     hardware_info.log_debug();
 
-    let explicitly_disabled =
-        telemetry_enabled == Some(false) || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
-
-    let telemetry_properties = match spicepod_telemetry_config {
-        Some(config) => config
-            .properties
-            .clone()
-            .into_iter()
-            .map(|(k, v)| KeyValue::new(k, v))
-            .collect(),
-        None => Vec::new(),
-    };
-
-    if !explicitly_disabled {
-        #[cfg(feature = "anonymous_telemetry")]
-        telemetry::anonymous::start(
-            spicepod_name.map_or_else(|| "unknown", String::as_str),
-            telemetry_properties,
-        )
-        .await;
+    // CLI flag takes immediate priority.
+    if telemetry_enabled == Some(false) {
+        return;
     }
+
+    // Wait for the spicepod telemetry config to be resolved.  For schedulers
+    // and standalone instances this is already set; for executors it will be
+    // set once the app definition is fetched from the scheduler.
+    let config = telemetry_config.wait().await;
+
+    if telemetry_enabled != Some(true) && !config.enabled {
+        return;
+    }
+
+    let telemetry_properties: Vec<KeyValue> = config
+        .properties
+        .iter()
+        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+        .collect();
+
+    #[cfg(feature = "anonymous_telemetry")]
+    telemetry::anonymous::start(
+        spicepod_name.map_or_else(|| "unknown", String::as_str),
+        telemetry_properties,
+    )
+    .await;
 }
 
 fn parse_set_string(s: &str) -> Result<(String, String), String> {
