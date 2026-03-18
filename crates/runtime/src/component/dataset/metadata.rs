@@ -35,6 +35,21 @@ impl Dataset {
             return None;
         }
 
+        let known_metadata_columns: &[&str] = &[
+            MetadataColumn::LastModified.name(),
+            MetadataColumn::Location(None).name(),
+            MetadataColumn::Size.name(),
+        ];
+        for (key, value) in &self.metadata {
+            // Only check "enabled" values — metadata can also contain arbitrary user-defined entries (e.g. instructions).
+            if value == "enabled" && !known_metadata_columns.contains(&key.as_str()) {
+                tracing::warn!(
+                    "Dataset {}: '{key}: enabled' is not a recognized listing table metadata column and will be ignored. If this is a custom metadata entry, no action is needed. Otherwise, supported listing table metadata columns are: {known_metadata_columns:?}",
+                    self.name
+                );
+            }
+        }
+
         let mut columns = Vec::new();
 
         if self.metadata_column_enabled(MetadataColumn::LastModified.name(), schema)
