@@ -56,7 +56,7 @@ fn temp_sqlite_db(name: &str) -> (String, tempfile::TempDir) {
     (db_path, dir)
 }
 
-/// Pre-create a table in the SQLite database so the ADBC connector can
+/// Pre-create a table in the `SQLite` database so the ADBC connector can
 /// discover its schema during `load_components()`.  Idempotent: drops
 /// any previous version of the table first.
 fn setup_sqlite_table(db_path: &str, table_name: &str, setup_sql: &str) {
