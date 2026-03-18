@@ -29,8 +29,8 @@ pub struct StdioArgs {
     pub verbose: bool,
 
     /// Base URL for Spice Cloud API calls.
-    /// Falls back to `SPICE_CLOUD_API_URL` env var, then `https://api.spice.ai`.
-    #[arg(long)]
+    /// Falls back to `https://api.spice.ai` when not set.
+    #[arg(long, env = "SPICE_CLOUD_API_URL")]
     pub spice_cloud_api_url: Option<String>,
 
     /// Timeout in seconds to wait for a Spice Cloud deployment to become ready.
@@ -40,4 +40,66 @@ pub struct StdioArgs {
     /// Release channel for the spice.ai runtime image (stable, preview, nightly, internal).
     #[arg(long)]
     pub channel: Option<String>,
+
+    /// Spice Cloud API key for authentication.
+    /// When not provided, falls back to SPICE_API_KEY, SPICE_SPICEAI_API_KEY, or SPICE_SPICEAI_TOKEN.
+    #[arg(long, env = "SPICEAI_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// Backend mode for provisioning: `scp` (Spice Cloud Platform, default) or `local`.
+    #[arg(long, env = "SPIDAPTER_BACKEND", default_value = "scp")]
+    pub backend: String,
+
+    /// Override the Flight SQL endpoint URL instead of deriving it from the deployment cname.
+    #[arg(long, env = "SPIDAPTER_FLIGHT_URL")]
+    pub flight_url: Option<String>,
+
+    /// Memory limit for the Spice Cloud app (scheduler) pod (e.g. `16Gi`).
+    #[arg(long, env = "SPIDAPTER_APP_MEMORY_LIMIT")]
+    pub app_memory_limit: Option<String>,
+
+    /// CPU limit for the Spice Cloud app (scheduler) pod (e.g. `2`).
+    #[arg(long, env = "SPIDAPTER_APP_CPU_LIMIT")]
+    pub app_cpu_limit: Option<String>,
+
+    /// CPU request for the Spice Cloud app (scheduler) pod (e.g. `0.1`).
+    #[arg(long, env = "SPIDAPTER_APP_CPU_REQUEST")]
+    pub app_cpu_request: Option<String>,
+
+    /// Memory request for the Spice Cloud app (scheduler) pod (e.g. `256Mi`).
+    #[arg(long, env = "SPIDAPTER_APP_MEMORY_REQUEST")]
+    pub app_memory_request: Option<String>,
+
+    /// Number of replicas for the Spice Cloud app (scheduler). Defaults to the platform default when not set.
+    #[arg(long, env = "SPIDAPTER_APP_REPLICAS")]
+    pub app_replicas: Option<i32>,
+
+    /// Number of replicas for the Spice Cloud executor.
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_REPLICAS", default_value = "1")]
+    pub executor_replicas: i32,
+
+    /// Memory limit for the Spice Cloud executor pod (e.g. `16Gi`).
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_MEMORY_LIMIT")]
+    pub executor_memory_limit: Option<String>,
+
+    /// CPU limit for the Spice Cloud executor pod (e.g. `2`).
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_CPU_LIMIT")]
+    pub executor_cpu_limit: Option<String>,
+
+    /// CPU request for the Spice Cloud executor pod (e.g. `0.1`).
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_CPU_REQUEST")]
+    pub executor_cpu_request: Option<String>,
+
+    /// Memory request for the Spice Cloud executor pod (e.g. `256Mi`).
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_MEMORY_REQUEST")]
+    pub executor_memory_request: Option<String>,
+
+    /// S3 URL prefix for the spiced scheduler state location (e.g. `s3://bucket/state`).
+    #[arg(long, env = "SCHEDULER_STATE_LOCATION")]
+    pub scheduler_state_location: Option<String>,
+
+    /// AWS region for S3 data sources and scheduler state (e.g. `us-east-1`).
+    /// Falls back to `AWS_DEFAULT_REGION` environment variable if not set.
+    #[arg(long, env = "AWS_REGION")]
+    pub aws_region: Option<String>,
 }

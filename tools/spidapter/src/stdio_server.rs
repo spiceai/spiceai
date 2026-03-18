@@ -16,10 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use tokio::process::{Child, Command as TokioCommand};
 
 use arrow::datatypes::DataType;
@@ -52,6 +50,7 @@ const LOCAL_SPICED_BINARY: &str = "spiced";
 const LOCAL_SPICE_BINARY: &str = "spice";
 
 /// State for an active benchmark run provisioned via `setup`.
+#[allow(dead_code)]
 enum RunState {
     Scp {
         /// Spice Cloud app ID.
@@ -105,16 +104,8 @@ enum BackendMode {
 }
 
 impl BackendMode {
-    fn from_env() -> Result<Self, String> {
-        let raw = match std::env::var(SPIDAPTER_BACKEND_ENV) {
-            Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => return Ok(Self::Scp),
-            Err(err) => {
-                return Err(format!("Failed to read {SPIDAPTER_BACKEND_ENV}: {err}"));
-            }
-        };
-
-        parse_backend_mode(&raw)
+    fn from_args(args: &StdioArgs) -> Result<Self, String> {
+        parse_backend_mode(&args.backend)
     }
 }
 
@@ -216,21 +207,15 @@ fn sum_opt_f64_as_u64(
 struct SpidapterHandler {
     /// Active runs keyed by run ID.
     runs: HashMap<Uuid, RunState>,
-    /// Spice Cloud API URL override (from CLI args).
-    api_url_override: Option<String>,
-    /// Timeout in seconds for deployment readiness.
-    ready_wait: u64,
-    /// Release channel for the spice.ai runtime image.
-    channel: Option<String>,
+    /// Full CLI args (includes all flags and env-var-backed configuration).
+    args: StdioArgs,
 }
 
 impl SpidapterHandler {
     fn new(args: &StdioArgs) -> Self {
         Self {
             runs: HashMap::new(),
-            api_url_override: args.spice_cloud_api_url.clone(),
-            ready_wait: args.ready_wait,
-            channel: args.channel.clone(),
+            args: args.clone(),
         }
     }
 }
@@ -250,26 +235,19 @@ impl Handler for SpidapterHandler {
         );
 
         let setup_config = SetupConfig::from_metadata(&metadata).set_etl_sink_type(etl_sink_type);
-        let backend = BackendMode::from_env()?;
+        let backend = BackendMode::from_args(&self.args)?;
 
         let state = match backend {
             BackendMode::Scp => {
-                provision_spice_cloud_app(
-                    run_id,
-                    self.api_url_override.as_deref(),
-                    self.ready_wait,
-                    self.channel.as_deref(),
-                    &setup_config,
-                    &datasets,
-                )
-                .await
+                provision_spice_cloud_app(run_id, &self.args, &setup_config, &datasets).await
             }
             BackendMode::Local => {
                 provision_local_spiced_cluster(
                     run_id,
-                    Duration::from_secs(self.ready_wait),
+                    Duration::from_secs(self.args.ready_wait),
                     &setup_config,
                     &datasets,
+                    &self.args,
                 )
                 .await
             }
@@ -609,17 +587,18 @@ fn quote_identifier(identifier: &str) -> String {
 /// 6. Wait for the deployment to become ready
 async fn provision_spice_cloud_app(
     run_id: Uuid,
-    api_url_override: Option<&str>,
-    ready_wait: u64,
-    channel: Option<&str>,
+    args: &StdioArgs,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
-    let cloud = commands::build_cloud_client(api_url_override)?;
+    let cloud =
+        commands::build_cloud_client(args.spice_cloud_api_url.as_deref(), args.api_key.as_deref())?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = std::env::var("SPIDAPTER_FLIGHT_URL")
-        .unwrap_or_else(|_| commands::flight_url_from_cname(&cname));
+    let flight_url = args
+        .flight_url
+        .clone()
+        .unwrap_or_else(|| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
@@ -629,7 +608,19 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
-    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
+    let app_create_config = commands::AppCreateConfig {
+        app_memory_limit: args.app_memory_limit.clone(),
+        app_cpu_limit: args.app_cpu_limit.clone(),
+        app_cpu_request: args.app_cpu_request.clone(),
+        app_memory_request: args.app_memory_request.clone(),
+        app_replicas: args.app_replicas,
+        executor_replicas: args.executor_replicas,
+        executor_memory_limit: args.executor_memory_limit.clone(),
+        executor_cpu_limit: args.executor_cpu_limit.clone(),
+        executor_cpu_request: args.executor_cpu_request.clone(),
+        executor_memory_request: args.executor_memory_request.clone(),
+    };
+    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
 
     // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
@@ -643,7 +634,14 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None)?;
+    let spicepod = generate_initial_spicepod(
+        &run_id,
+        setup_config,
+        datasets,
+        None,
+        args.scheduler_state_location.as_deref(),
+        args.aws_region.as_deref(),
+    )?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
@@ -661,7 +659,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] RUNNER secret set");
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, channel).await?;
+    commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -670,7 +668,7 @@ async fn provision_spice_cloud_app(
         &poll_client,
         &cname,
         &api_key,
-        Duration::from_secs(ready_wait),
+        Duration::from_secs(args.ready_wait),
     )
     .await?;
 
@@ -711,6 +709,7 @@ async fn provision_local_spiced_cluster(
     ready_wait: Duration,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
+    args: &StdioArgs,
 ) -> anyhow::Result<RunState> {
     let ports = allocate_local_ports(LOCAL_BIND_HOST)?;
 
@@ -729,6 +728,8 @@ async fn provision_local_spiced_cluster(
             setup_config,
             datasets,
             local_flight_api_key.as_deref(),
+            args.scheduler_state_location.as_deref(),
+            args.aws_region.as_deref(),
         )?;
         let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;
 
@@ -1177,13 +1178,14 @@ fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
+    aws_region: Option<&str>,
 ) -> anyhow::Result<SpicepodDefinition> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
         .region
         .clone()
-        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| aws_region.map(ToString::to_string))
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
         .unwrap_or_else(|| "us-east-1".to_string());
 
@@ -1267,19 +1269,21 @@ fn generate_initial_spicepod(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
+    scheduler_state_location: Option<&str>,
+    aws_region: Option<&str>,
 ) -> anyhow::Result<SpicepodDefinition> {
     let mut spicepod = match setup_config.sink_type {
         Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key)),
-        _ => generate_hive_spicepod(run_id, setup_config, datasets),
+        _ => generate_hive_spicepod(run_id, setup_config, datasets, aws_region),
     }?;
 
-    if let Ok(loc) = std::env::var("SCHEDULER_STATE_LOCATION") {
+    if let Some(loc) = scheduler_state_location {
         let mut path = loc.trim();
         if let Some(p) = path.strip_suffix('/') {
             path = p;
         }
-        let state_location = format!("{path}/{}", run_id.to_string());
-        if !loc.is_empty() {
+        if !path.is_empty() {
+            let state_location = format!("{path}/{}", run_id);
             let mut sched = Scheduler {
                 state_location,
                 params: Some(Params::from_string_map(HashMap::from([(
@@ -1288,12 +1292,12 @@ fn generate_initial_spicepod(
                 )]))),
                 partition_management: None,
             };
-            if let Ok(region) = std::env::var("AWS_REGION") {
+            if let Some(region) = aws_region {
                 sched.params.as_mut().map(|p| {
                     p.data
-                        .insert("s3_region".to_string(), ParamValue::String(region))
+                        .insert("s3_region".to_string(), ParamValue::String(region.to_string()))
                 });
-            };
+            }
             spicepod.runtime.scheduler = Some(sched);
         }
     }
@@ -1361,17 +1365,17 @@ mod tests {
             },
         )]);
 
-        // SAFETY: Test-only; no concurrent env reads in this single-threaded test.
-        unsafe { std::env::set_var("SCHEDULER_STATE_LOCATION", "s3://bucket/state") };
-
-        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None)
-            .expect("spicepod should generate");
+        let spicepod = generate_initial_spicepod(
+            &Uuid::nil(),
+            &setup_config,
+            &datasets,
+            None,
+            Some("s3://bucket/state"),
+            None,
+        )
+        .expect("spicepod should generate");
         let spicepod_yaml =
             serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
-
-        // Clean up env var.
-        // SAFETY: Test-only; no concurrent env reads in this single-threaded test.
-        unsafe { std::env::remove_var("SCHEDULER_STATE_LOCATION") };
 
         assert!(spicepod_yaml.contains("from: \"s3://bucket/path/my_table/\""));
         assert!(spicepod_yaml.contains("name: my_table"));
@@ -1407,8 +1411,9 @@ mod tests {
             },
         )]);
 
-        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None)
-            .expect_err("missing source should fail");
+        let err =
+            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, None, None)
+                .expect_err("missing source should fail");
         assert!(
             err.to_string().contains("missing_table"),
             "unexpected error: {err}"

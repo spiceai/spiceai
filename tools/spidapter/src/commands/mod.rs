@@ -27,16 +27,37 @@ use spice_cloud_client::{
 
 pub(crate) mod secrets;
 
+/// Resource and replica configuration for creating a Spice Cloud app.
+pub(crate) struct AppCreateConfig {
+    pub app_memory_limit: Option<String>,
+    pub app_cpu_limit: Option<String>,
+    pub app_cpu_request: Option<String>,
+    pub app_memory_request: Option<String>,
+    pub app_replicas: Option<i32>,
+    pub executor_replicas: i32,
+    pub executor_memory_limit: Option<String>,
+    pub executor_cpu_limit: Option<String>,
+    pub executor_cpu_request: Option<String>,
+    pub executor_memory_request: Option<String>,
+}
+
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
     api_url_override
         .map(ToString::to_string)
-        .or_else(|| std::env::var("SPICE_CLOUD_API_URL").ok())
         .unwrap_or_else(|| "https://api.spice.ai".to_string())
         .trim_end_matches('/')
         .to_string()
 }
 
-pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
+/// Resolve the Spice Cloud API token.
+///
+/// Uses `api_key_override` when provided; otherwise falls back to the
+/// `SPICEAI_API_KEY`, `SPICE_API_KEY`, `SPICE_SPICEAI_API_KEY`, and
+/// `SPICE_SPICEAI_TOKEN` environment variables (in that order).
+pub(crate) fn spice_cloud_token(api_key_override: Option<&str>) -> anyhow::Result<String> {
+    if let Some(key) = api_key_override {
+        return Ok(key.to_string());
+    }
     std::env::var("SPICEAI_API_KEY")
         .or_else(|_| std::env::var("SPICE_API_KEY"))
         .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
@@ -48,39 +69,20 @@ pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
         })
 }
 
-/// Build a [`CloudClient`] from an optional API URL override and environment token.
-pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Result<CloudClient> {
+/// Build a [`CloudClient`] from an optional API URL override, optional API key
+/// override, and environment token fallback.
+pub(crate) fn build_cloud_client(
+    api_url_override: Option<&str>,
+    api_key_override: Option<&str>,
+) -> anyhow::Result<CloudClient> {
     let base_url = spice_cloud_base_url(api_url_override);
-    let token = spice_cloud_token()?;
+    let token = spice_cloud_token(api_key_override)?;
     Ok(CloudClient::new(&base_url)?
         .with_token(token)
         .with_timeout(Duration::from_secs(600))?)
 }
 
-/// Parse an optional non-negative integer from an environment variable.
-///
-/// Returns `Ok(None)` when the variable is unset, and an error when it is set
-/// but cannot be parsed as a non-negative integer, is negative, or contains
-/// invalid Unicode.
-fn env_var_replicas(name: &str) -> anyhow::Result<Option<i32>> {
-    match std::env::var(name) {
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
-            "Environment variable {name} contains invalid Unicode; expected a non-negative integer"
-        )),
-        Ok(val) => {
-            let trimmed = val.trim();
-            match trimmed.parse::<i32>() {
-                Ok(n) if n >= 0 => Ok(Some(n)),
-                Ok(_) | Err(_) => Err(anyhow::anyhow!(
-                    "{name} must be a non-negative integer, got '{val}'"
-                )),
-            }
-        }
-    }
-}
-
-/// Default resource allocation shared by scheduler and executor when no env vars override them.
+/// Default resource allocation shared by scheduler and executor when no overrides are provided.
 fn default_resources() -> AppResources {
     AppResources {
         limits: AppResourceLimits {
@@ -95,59 +97,50 @@ fn default_resources() -> AppResources {
     }
 }
 
-/// Read a string environment variable, returning `None` when unset and an
-/// error when the value contains invalid Unicode.
-fn env_var_str(name: &str) -> anyhow::Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(val) => Ok(Some(val)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
-            "Environment variable {name} contains invalid Unicode; expected a UTF-8 string"
-        )),
-    }
-}
-
-/// Build an [`AppResources`] by merging environment variable overrides on top
-/// of a set of base (default) resources.
+/// Build an [`AppResources`] by merging explicit overrides on top of a set of
+/// base (default) resources.
 ///
-/// Each field is overridden independently: only the env vars that are actually
-/// set replace the corresponding field in `base`. This means callers can
-/// override, e.g., only the memory limit without losing the CPU request
-/// default.
-fn env_var_resources_over(
+/// Each field is overridden independently: only the values that are `Some`
+/// replace the corresponding field in `base`.
+fn resources_over(
     base: AppResources,
-    memory_limit_var: &str,
-    cpu_limit_var: &str,
-    cpu_request_var: &str,
-    memory_request_var: &str,
-) -> anyhow::Result<AppResources> {
-    let memory_limit = env_var_str(memory_limit_var)?.unwrap_or(base.limits.memory);
-    let cpu_limit = env_var_str(cpu_limit_var)?.or(base.limits.cpu);
-    let cpu_request =
-        env_var_str(cpu_request_var)?.or(base.requests.as_ref().and_then(|r| r.cpu.clone()));
-    let memory_request =
-        env_var_str(memory_request_var)?.or(base.requests.as_ref().and_then(|r| r.memory.clone()));
+    memory_limit: Option<&str>,
+    cpu_limit: Option<&str>,
+    cpu_request: Option<&str>,
+    memory_request: Option<&str>,
+) -> AppResources {
+    let memory_limit_val = memory_limit
+        .map(ToString::to_string)
+        .unwrap_or(base.limits.memory);
+    let cpu_limit_val = cpu_limit.map(ToString::to_string).or(base.limits.cpu);
+    let cpu_request_val = cpu_request
+        .map(ToString::to_string)
+        .or(base.requests.as_ref().and_then(|r| r.cpu.clone()));
+    let memory_request_val = memory_request
+        .map(ToString::to_string)
+        .or(base.requests.as_ref().and_then(|r| r.memory.clone()));
 
-    Ok(AppResources {
+    AppResources {
         limits: AppResourceLimits {
-            cpu: cpu_limit,
-            memory: memory_limit,
+            cpu: cpu_limit_val,
+            memory: memory_limit_val,
             ephemeral_storage: None,
         },
-        requests: if cpu_request.is_some() || memory_request.is_some() {
+        requests: if cpu_request_val.is_some() || memory_request_val.is_some() {
             Some(AppResourceRequests {
-                cpu: cpu_request,
-                memory: memory_request,
+                cpu: cpu_request_val,
+                memory: memory_request_val,
             })
         } else {
             None
         },
-    })
+    }
 }
 
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
+    config: &AppCreateConfig,
 ) -> anyhow::Result<i64> {
     let apps = cloud.list_apps().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
@@ -156,27 +149,25 @@ pub(crate) async fn ensure_spice_cloud_app(
 
     let cname = resolve_default_cname(cloud).await?;
 
-    // App (scheduler) resources — start from defaults, then apply any env var overrides.
-    let resources = env_var_resources_over(
+    // App (scheduler) resources — start from defaults, then apply any overrides.
+    let resources = resources_over(
         default_resources(),
-        "SPIDAPTER_APP_MEMORY_LIMIT",
-        "SPIDAPTER_APP_CPU_LIMIT",
-        "SPIDAPTER_APP_CPU_REQUEST",
-        "SPIDAPTER_APP_MEMORY_REQUEST",
-    )?;
-
-    let replicas = env_var_replicas("SPIDAPTER_APP_REPLICAS")?;
+        config.app_memory_limit.as_deref(),
+        config.app_cpu_limit.as_deref(),
+        config.app_cpu_request.as_deref(),
+        config.app_memory_request.as_deref(),
+    );
 
     // Executor — same resource defaults as scheduler; each field overridable independently.
     let executor = Some(AppExecutor {
-        replicas: Some(env_var_replicas("SPIDAPTER_EXECUTOR_REPLICAS")?.unwrap_or(1)),
-        resources: Some(env_var_resources_over(
+        replicas: Some(config.executor_replicas),
+        resources: Some(resources_over(
             default_resources(),
-            "SPIDAPTER_EXECUTOR_MEMORY_LIMIT",
-            "SPIDAPTER_EXECUTOR_CPU_LIMIT",
-            "SPIDAPTER_EXECUTOR_CPU_REQUEST",
-            "SPIDAPTER_EXECUTOR_MEMORY_REQUEST",
-        )?),
+            config.executor_memory_limit.as_deref(),
+            config.executor_cpu_limit.as_deref(),
+            config.executor_cpu_request.as_deref(),
+            config.executor_memory_request.as_deref(),
+        )),
     });
 
     let create_result = cloud
@@ -189,7 +180,7 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
-            replicas,
+            replicas: config.app_replicas,
             resources: Some(resources),
             executor,
         })
