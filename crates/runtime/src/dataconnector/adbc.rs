@@ -321,7 +321,7 @@ fn build_db_options(
             if let Some((key, value)) = pair.split_once('=') {
                 let key = key.trim();
                 if key.is_empty() {
-                    tracing::warn!("Ignoring ADBC option with empty key: {pair}");
+                    tracing::warn!("Ignoring ADBC driver option with empty key");
                     continue;
                 }
                 let key = if key.starts_with("adbc.") {
@@ -331,7 +331,7 @@ fn build_db_options(
                 };
                 opts.push((OptionDatabase::Other(key), value.trim().into()));
             } else {
-                tracing::warn!("Ignoring malformed ADBC option (expected 'key=value'): {pair}");
+                tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
             }
         }
     }

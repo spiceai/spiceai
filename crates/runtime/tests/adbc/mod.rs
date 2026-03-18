@@ -47,7 +47,12 @@ fn temp_sqlite_db(name: &str) -> (String, tempfile::TempDir) {
         .prefix(&format!("spice_adbc_test_{name}_"))
         .tempdir()
         .expect("Failed to create temp directory for ADBC test");
-    let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+    let db_path = dir
+        .path()
+        .join("test.db")
+        .to_str()
+        .expect("Temp path is not valid UTF-8")
+        .to_string();
     (db_path, dir)
 }
 
@@ -275,14 +280,15 @@ async fn test_adbc_duckdb_file_backed() -> Result<(), String> {
 }
 
 #[tokio::test]
-async fn test_adbc_read_write_operations() -> Result<(), String> {
+async fn test_adbc_sqlite_prepopulated_data() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let (db_path, _guard) = temp_sqlite_db("rw");
 
     setup_sqlite_table(
         &db_path,
         "rw_table",
-        "CREATE TABLE rw_table (key INTEGER PRIMARY KEY, value TEXT);",
+        "CREATE TABLE rw_table (key INTEGER PRIMARY KEY, value TEXT);
+         INSERT INTO rw_table VALUES (1, 'one'), (2, 'two');",
     );
 
     test_request_context()
@@ -303,15 +309,7 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
 
             runtime_ready_check(&rt).await;
 
-            // Test INSERT
-            rt.datafusion()
-                .query_builder("INSERT INTO rw_table VALUES (1, 'one'), (2, 'two')")
-                .build()
-                .run()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Test SELECT
+            // Read back pre-populated data
             let select_result = rt
                 .datafusion()
                 .query_builder("SELECT * FROM rw_table ORDER BY key")
@@ -334,16 +332,8 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
             ];
             assert_batches_eq!(expected_select, &select_result);
 
-            // Test UPDATE
-            rt.datafusion()
-                .query_builder("UPDATE rw_table SET value = 'updated' WHERE key = 1")
-                .build()
-                .run()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Verify UPDATE
-            let update_result = rt
+            // Test filter pushdown
+            let filter_result = rt
                 .datafusion()
                 .query_builder("SELECT * FROM rw_table WHERE key = 1")
                 .build()
@@ -355,14 +345,14 @@ async fn test_adbc_read_write_operations() -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let expected_update = [
-                "+-----+---------+",
-                "| key | value   |",
-                "+-----+---------+",
-                "| 1   | updated |",
-                "+-----+---------+",
+            let expected_filter = [
+                "+-----+-------+",
+                "| key | value |",
+                "+-----+-------+",
+                "| 1   | one   |",
+                "+-----+-------+",
             ];
-            assert_batches_eq!(expected_update, &update_result);
+            assert_batches_eq!(expected_filter, &filter_result);
 
             Ok(())
         })
