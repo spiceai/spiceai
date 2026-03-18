@@ -23,11 +23,14 @@ use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
     PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, STAGING_WAL_FILENAME,
 };
+use super::context::CayenneContext;
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
+use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 use super::streaming::StreamingExec;
+use super::vortex_format::DeletionFilteringVortexFormat;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
@@ -47,20 +50,22 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::{Constraints, DFSchema};
+use datafusion_common::{Constraints, DFSchema, ScalarValue};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
+use datafusion_expr::{
+    col, lit, Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType,
+};
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::{collect, execute_stream};
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{StreamExt, TryStreamExt};
@@ -73,12 +78,11 @@ use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 
-use super::context::CayenneContext;
-use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
-use super::vortex_format::DeletionFilteringVortexFormat;
-
 /// Maps serialized primary key bytes to their maximum delete sequence number.
 type DeletedRowKeysMap = HashMap<Box<[u8]>, i64>;
+
+/// Fast map type for on-conflict key lookups in ingest hot paths.
+type OwnedRowMap = HashMap<OwnedRow, RowLocation>;
 
 /// Extension trait to extract `UpsertOptions` from `OnConflict`.
 ///
@@ -302,20 +306,9 @@ struct RowLocation {
 struct BatchValidationResult {
     filtered_batch: Option<RecordBatch>,
     delete_specs: Vec<(i64, Vec<i64>)>,
-    kept_keys: HashSet<OwnedRow>,
     /// Int64 PK values being deleted (for `Int64Pk` strategy)
     deleted_pk_i64: Vec<i64>,
     /// Row key bytes being deleted (for `RowConverterBased` strategy)
-    deleted_row_keys: Vec<Box<[u8]>>,
-}
-
-/// Result of on-conflict validation containing deleted PK information.
-struct OnConflictValidationResult {
-    filtered_batches: Vec<RecordBatch>,
-    delete_specs: HashMap<i64, Vec<i64>>,
-    /// Deleted Int64 PK values (for `Int64Pk` strategy)
-    deleted_pk_i64: Vec<i64>,
-    /// Deleted row keys (for `RowConverterBased` strategy)
     deleted_row_keys: Vec<Box<[u8]>>,
 }
 
@@ -324,8 +317,7 @@ struct OnConflictContext<'a> {
     converter: &'a RowConverter,
     on_conflict: &'a OnConflict,
     upsert_options: &'a UpsertOptions,
-    existing_keys: &'a mut HashMap<OwnedRow, RowLocation>,
-    incoming_keys: &'a HashSet<OwnedRow>,
+    existing_keys: &'a mut OwnedRowMap,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -1577,24 +1569,401 @@ impl CayenneTableProvider {
         Ok(RowConverter::new(sort_fields)?)
     }
 
-    /// Build the existing keyset (primary key bytes -> row location) for append-mode inserts.
+    /// Process an execution plan by streaming its record batches and adding visible keys to the keyset.
+    #[expect(clippy::too_many_arguments)]
+    async fn process_scan_plan_into_keyset(
+        &self,
+        scan_plan: Arc<dyn ExecutionPlan>,
+        pk_deletion_strategy: &PkDeletionStrategyWithCache,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        projected_pk_indices: &[usize],
+        deleted_pk_i64: Option<&Arc<HashMap<i64, i64>>>,
+        deleted_row_keys: Option<&Arc<DeletedRowKeysMap>>,
+        min_delete_seq_threshold: Option<i64>,
+        table_name: &str,
+        keyset: &mut OwnedRowMap,
+        row_id_base: &mut i64,
+        ctx: &SessionContext,
+    ) -> Result<()> {
+        let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            Self::process_single_batch_into_keyset(
+                &batch,
+                pk_deletion_strategy,
+                pk_indices,
+                converter,
+                projected_pk_indices,
+                deleted_pk_i64,
+                deleted_row_keys,
+                min_delete_seq_threshold,
+                table_name,
+                keyset,
+                row_id_base,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn process_single_batch_into_keyset(
+        batch: &RecordBatch,
+        pk_deletion_strategy: &PkDeletionStrategyWithCache,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        projected_pk_indices: &[usize],
+        deleted_pk_i64: Option<&Arc<HashMap<i64, i64>>>,
+        deleted_row_keys: Option<&Arc<DeletedRowKeysMap>>,
+        min_delete_seq_threshold: Option<i64>,
+        table_name: &str,
+        keyset: &mut OwnedRowMap,
+        row_id_base: &mut i64,
+    ) -> Result<()> {
+        // Inline deletion check for sequence-threshold semantics.
+        #[inline]
+        fn delete_applies(delete_seq: i64, threshold: Option<i64>) -> bool {
+            match threshold {
+                None => true,
+                Some(min_threshold) => delete_seq > min_threshold,
+            }
+        }
+
+        let batch_rows = batch.num_rows();
+        let pk_columns: Vec<_> = projected_pk_indices
+            .iter()
+            .map(|idx| Arc::clone(batch.column(*idx)))
+            .collect();
+
+        let rows = converter.convert_columns(&pk_columns)?;
+
+        // Most datasets have non-null PKs; avoid scanning all PK columns per-row in that case.
+        let has_any_pk_nulls = pk_columns.iter().any(|col| col.null_count() > 0);
+
+        // Pre-reserve to reduce hash table reallocation in append-heavy workloads.
+        keyset.reserve(batch_rows);
+
+        let mut row_id = *row_id_base;
+
+        // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
+        let int64_pk_array: Option<&arrow::array::Int64Array> =
+            if pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1 {
+                batch.column(0).as_any().downcast_ref()
+            } else {
+                None
+            };
+
+        match pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                if let (Some(pk_array), Some(deleted_pks)) = (int64_pk_array, deleted_pk_i64) {
+                    for row_idx in 0..batch_rows {
+                        let pk_value = pk_array.value(row_idx);
+                        if deleted_pks
+                            .get(&pk_value)
+                            .is_some_and(|&seq| delete_applies(seq, min_delete_seq_threshold))
+                        {
+                            row_id += 1;
+                            continue;
+                        }
+
+                        if has_any_pk_nulls && pk_columns.iter().any(|col| col.is_null(row_idx)) {
+                            return Err(Error::DataValidation {
+                                table: table_name.to_string(),
+                                message: format!(
+                                    "Null primary key encountered in existing data for table {table_name}",
+                                ),
+                            });
+                        }
+
+                        let key = rows.row(row_idx).owned();
+                        keyset.insert(
+                            key,
+                            RowLocation {
+                                data_file_id: DEFAULT_DATA_FILE_ID,
+                                row_id,
+                            },
+                        );
+                        row_id += 1;
+                    }
+                } else {
+                    for row_idx in 0..batch_rows {
+                        if has_any_pk_nulls && pk_columns.iter().any(|col| col.is_null(row_idx)) {
+                            return Err(Error::DataValidation {
+                                table: table_name.to_string(),
+                                message: format!(
+                                    "Null primary key encountered in existing data for table {table_name}",
+                                ),
+                            });
+                        }
+
+                        let key = rows.row(row_idx).owned();
+                        keyset.insert(
+                            key,
+                            RowLocation {
+                                data_file_id: DEFAULT_DATA_FILE_ID,
+                                row_id,
+                            },
+                        );
+                        row_id += 1;
+                    }
+                }
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                if let Some(deleted_keys) = deleted_row_keys {
+                    for row_idx in 0..batch_rows {
+                        let row = rows.row(row_idx);
+
+                        if deleted_keys
+                            .get(row.as_ref())
+                            .is_some_and(|&seq| delete_applies(seq, min_delete_seq_threshold))
+                        {
+                            row_id += 1;
+                            continue;
+                        }
+
+                        if has_any_pk_nulls && pk_columns.iter().any(|col| col.is_null(row_idx)) {
+                            return Err(Error::DataValidation {
+                                table: table_name.to_string(),
+                                message: format!(
+                                    "Null primary key encountered in existing data for table {table_name}",
+                                ),
+                            });
+                        }
+
+                        keyset.insert(
+                            row.owned(),
+                            RowLocation {
+                                data_file_id: DEFAULT_DATA_FILE_ID,
+                                row_id,
+                            },
+                        );
+                        row_id += 1;
+                    }
+                } else {
+                    for row_idx in 0..batch_rows {
+                        if has_any_pk_nulls && pk_columns.iter().any(|col| col.is_null(row_idx)) {
+                            return Err(Error::DataValidation {
+                                table: table_name.to_string(),
+                                message: format!(
+                                    "Null primary key encountered in existing data for table {table_name}",
+                                ),
+                            });
+                        }
+
+                        let row = rows.row(row_idx);
+                        keyset.insert(
+                            row.owned(),
+                            RowLocation {
+                                data_file_id: DEFAULT_DATA_FILE_ID,
+                                row_id,
+                            },
+                        );
+                        row_id += 1;
+                    }
+                }
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                unreachable!("PositionBased strategy should not reach load_existing_keyset")
+            }
+        }
+
+        let batch_rows_i64 = i64::try_from(batch_rows).map_err(|_| Error::Internal {
+            table: table_name.to_string(),
+            message: "Batch row count exceeds i64::MAX; cannot compute row_id_base".to_string(),
+        })?;
+        *row_id_base = row_id_base
+            .checked_add(batch_rows_i64)
+            .ok_or_else(|| Error::Internal {
+                table: table_name.to_string(),
+                message: "row_id_base overflow while building keyset".to_string(),
+            })?;
+
+        Ok(())
+    }
+
+    /// Prepare an incoming stream for insert by validating `on_conflict` constraints.
     ///
-    /// This method scans BOTH the main listing table AND any protected snapshots to build
-    /// a complete keyset of all existing primary keys.
+    /// Processes the stream batch-by-batch. For each incoming batch:
+    /// 1. Extracts PK values and builds IN-list filter expressions
+    /// 2. Scans existing data with those filters pushed down (zone-map + row-level)
+    /// 3. Builds a small per-batch keyset of only the affected existing rows
+    /// 4. Validates on-conflict behavior against that keyset
     ///
-    /// This method respects ALL deletion caches based on `pk_deletion_strategy`:
-    /// - `Int64Pk`: Uses `cached_deleted_pk_i64` and `cached_insert_records_pk_i64`
-    /// - `RowConverterBased`: Uses `cached_deleted_row_keys` and `cached_insert_records_row_keys`
-    /// - `PositionBased`: Uses `cached_deleted_row_ids` (no primary key)
+    /// This avoids loading ALL existing keys upfront, dramatically reducing memory
+    /// and CPU for tables with many existing rows but small incoming batches.
     ///
-    /// Rows marked as deleted are excluded unless they were re-inserted with a higher
-    /// sequence number (upsert semantics).
-    async fn load_existing_keyset(
+    /// If no primary key is configured, returns the stream unchanged with empty deletion specs.
+    pub(crate) async fn prepare_stream_for_insert(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<(
+        SendableRecordBatchStream,
+        HashMap<i64, Vec<i64>>,
+        Vec<i64>,
+        Vec<Box<[u8]>>,
+    )> {
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok((stream, HashMap::new(), Vec::new(), Vec::new()));
+        };
+
+        let converter = self.build_pk_converter(&pk_indices)?;
+
+        let on_conflict = self
+            .table_metadata
+            .on_conflict
+            .clone()
+            .unwrap_or(OnConflict::DoNothingAll);
+        let upsert_options = on_conflict.get_upsert_options();
+
+        // Keys from previous incoming batches, used for cross-batch duplicate detection.
+        // Survivors are stored with row_id=-1 sentinel.
+        let mut incoming_keys: OwnedRowMap = HashMap::new();
+
+        let mut filtered_batches = Vec::new();
+        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
+        let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+
+        let mut stream = stream;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // 1. Build filter expressions from this batch's PK values.
+            let filters = Self::build_pk_filter_exprs(&batch, &pk_indices)?;
+
+            // 2. Load existing keyset for just these PKs (filtered scan).
+            let mut batch_keyset = self
+                .load_filtered_keyset(&pk_indices, &converter, &filters)
+                .await?;
+
+            // 3. Merge relevant cross-batch incoming keys into batch_keyset.
+            //    This enables duplicate detection across batches without maintaining
+            //    a full copy of all existing keys.
+            let pk_columns: Vec<_> = pk_indices
+                .iter()
+                .map(|&idx| Arc::clone(batch.column(idx)))
+                .collect();
+            let rows = converter.convert_columns(&pk_columns)?;
+            for row_idx in 0..batch.num_rows() {
+                let key = rows.row(row_idx).owned();
+                if let Some(loc) = incoming_keys.get(&key) {
+                    batch_keyset.entry(key).or_insert(*loc);
+                }
+            }
+
+            // 4. Apply on_conflict to this batch against the per-batch keyset.
+            let mut ctx = OnConflictContext {
+                pk_indices: &pk_indices,
+                converter: &converter,
+                on_conflict: &on_conflict,
+                upsert_options: &upsert_options,
+                existing_keys: &mut batch_keyset,
+            };
+
+            let result = self.apply_on_conflict_to_batch(batch, &mut ctx)?;
+
+            // 5. Track surviving incoming keys for future cross-batch duplicate detection.
+            //    apply_on_conflict_to_batch inserts survivors with row_id=-1 into batch_keyset.
+            for (key, loc) in batch_keyset.drain() {
+                if loc.row_id < 0 {
+                    incoming_keys.insert(key, loc);
+                }
+            }
+
+            // 6. Accumulate results.
+            for (data_file_id, row_ids) in result.delete_specs {
+                delete_specs
+                    .entry(data_file_id)
+                    .or_default()
+                    .extend(row_ids);
+            }
+            all_deleted_pk_i64.extend(result.deleted_pk_i64);
+            all_deleted_row_keys.extend(result.deleted_row_keys);
+
+            if let Some(batch) = result.filtered_batch {
+                filtered_batches.push(batch);
+            }
+        }
+
+        // Build a new stream from the validated batches.
+        let schema = filtered_batches.first().map_or_else(
+            || Arc::clone(&self.table_metadata.schema),
+            RecordBatch::schema,
+        );
+        let validated_stream = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(filtered_batches.into_iter().map(Ok)),
+        );
+
+        Ok((
+            Box::pin(validated_stream) as SendableRecordBatchStream,
+            delete_specs,
+            all_deleted_pk_i64,
+            all_deleted_row_keys,
+        ))
+    }
+
+    /// Build bounding-box filter expressions from the incoming batch's primary key values.
+    ///
+    /// For each PK column, computes the min and max values and returns
+    /// `col(pk) >= min AND col(pk) <= max`. This enables Vortex zone-map file pruning
+    /// without the optimizer overhead of large IN-list expressions.
+    ///
+    /// Works for all orderable data types via `ScalarValue` ordering.
+    fn build_pk_filter_exprs(batch: &RecordBatch, pk_indices: &[usize]) -> Result<Vec<Expr>> {
+        let schema = batch.schema();
+        let mut filters = Vec::with_capacity(pk_indices.len());
+
+        for &idx in pk_indices {
+            let col_name = schema.field(idx).name();
+            let column = batch.column(idx);
+
+            let mut min_val: Option<ScalarValue> = None;
+            let mut max_val: Option<ScalarValue> = None;
+
+            for row_idx in 0..batch.num_rows() {
+                let scalar = ScalarValue::try_from_array(column, row_idx)?;
+                if scalar.is_null() {
+                    continue;
+                }
+                min_val = Some(match min_val {
+                    Some(cur) if cur <= scalar => cur,
+                    _ => scalar.clone(),
+                });
+                max_val = Some(match max_val {
+                    Some(cur) if cur >= scalar => cur,
+                    _ => scalar,
+                });
+            }
+
+            if let (Some(lo), Some(hi)) = (min_val, max_val) {
+                filters.push(
+                    col(col_name)
+                        .gt_eq(lit(lo))
+                        .and(col(col_name).lt_eq(lit(hi))),
+                );
+            }
+        }
+
+        Ok(filters)
+    }
+
+    /// Load existing keyset for only the rows matching the given PK filter expressions.
+    ///
+    /// Like `load_existing_keyset` but passes filters to `ListingTable::scan()` for
+    /// zone-map file pruning, and wraps the plan with `FilterExec` for row-level filtering.
+    /// This loads only the subset of existing keys that could conflict with the current
+    /// incoming batch rather than all existing keys.
+    async fn load_filtered_keyset(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
-    ) -> Result<HashMap<OwnedRow, RowLocation>> {
-        // Clone listing table to avoid holding locks across await points
+        filters: &[Expr],
+    ) -> Result<OwnedRowMap> {
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
                 table: self.table_metadata.table_name.clone(),
@@ -1603,7 +1972,6 @@ impl CayenneTableProvider {
             Arc::clone(&guard)
         };
 
-        // Clone protected snapshots to avoid holding locks across await points
         let protected_snapshots = {
             let guard = self
                 .protected_snapshots
@@ -1616,19 +1984,8 @@ impl CayenneTableProvider {
         };
 
         let ctx = self.create_session_context();
-        // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
 
-        // Scan main listing table
-        let scan_plan = listing_table
-            .scan(&ctx.state(), Some(&pk_projection), &[], None)
-            .await?;
-
-        let main_batches = collect(scan_plan, ctx.task_ctx()).await?;
-
-        // Load the deletion caches based on pk_deletion_strategy.
-        // Note: PositionBased strategy is never used here since it implies no primary key,
-        // and this function is only called for tables with primary keys.
         let deleted_pk_i64 = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 cached_deleted_pk, ..
@@ -1658,33 +2015,35 @@ impl CayenneTableProvider {
             _ => None,
         };
 
-        let mut keyset = HashMap::with_capacity(1024);
+        let mut keyset = HashMap::new();
         let mut row_id_base: i64 = 0;
-
-        // After projection, batch columns are at indices 0..pk_indices.len()
         let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
 
-        // Process main listing table batches with the FULL deletion filter (no insert_records).
-        // This mirrors scan()'s apply_deletion_filter() which uses all deletions without
-        // insert_records when protected snapshots exist.
-        // min_delete_seq_threshold=None means ALL deletions apply.
-        Self::process_batches_into_keyset(
-            &main_batches,
+        // Scan main listing table with PK filters for zone-map pruning.
+        let scan_plan = listing_table
+            .scan(&ctx.state(), Some(&pk_projection), filters, None)
+            .await?;
+
+        // Wrap with FilterExec for row-level filtering (ListingTable only uses
+        // filters for file-limit heuristics, not actual row filtering).
+        let filtered_plan = Self::wrap_plan_with_filter_exprs(scan_plan, filters)?;
+
+        self.process_scan_plan_into_keyset(
+            filtered_plan,
             &self.pk_deletion_strategy,
             pk_indices,
             converter,
             &projected_pk_indices,
             deleted_pk_i64.as_ref(),
             deleted_row_keys.as_ref(),
-            None, // all deletions apply to main listing table
+            None,
             &self.table_metadata.table_name,
             &mut keyset,
             &mut row_id_base,
-        )?;
+            &ctx,
+        )
+        .await?;
 
-        // Process each protected snapshot with a PARTIAL deletion filter.
-        // Only deletions with seq > max_delete_seq_at_creation apply, mirroring
-        // scan()'s apply_partial_deletion_filter().
         for (snapshot_id, max_delete_seq_at_creation) in &protected_snapshots {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
@@ -1700,278 +2059,54 @@ impl CayenneTableProvider {
             )?;
 
             let snapshot_plan = snapshot_listing_table
-                .scan(&ctx.state(), Some(&pk_projection), &[], None)
+                .scan(&ctx.state(), Some(&pk_projection), filters, None)
                 .await?;
 
-            let snapshot_batches = collect(snapshot_plan, ctx.task_ctx()).await?;
+            let filtered_snapshot_plan = Self::wrap_plan_with_filter_exprs(snapshot_plan, filters)?;
 
-            Self::process_batches_into_keyset(
-                &snapshot_batches,
+            self.process_scan_plan_into_keyset(
+                filtered_snapshot_plan,
                 &self.pk_deletion_strategy,
                 pk_indices,
                 converter,
                 &projected_pk_indices,
                 deleted_pk_i64.as_ref(),
                 deleted_row_keys.as_ref(),
-                Some(*max_delete_seq_at_creation), // only deletions with seq > threshold apply
+                Some(*max_delete_seq_at_creation),
                 &self.table_metadata.table_name,
                 &mut keyset,
                 &mut row_id_base,
-            )?;
+                &ctx,
+            )
+            .await?;
         }
 
         Ok(keyset)
     }
 
-    /// Process record batches and add visible keys to the keyset.
+    /// Wrap a plan with a `FilterExec` that enforces the given PK filter expressions.
     ///
-    /// Filters out deleted rows using the provided deletion maps. No `insert_records` are
-    /// used — visibility is determined solely by whether a deletion exists for the key.
-    ///
-    /// `min_delete_seq_threshold`: When `Some(threshold)`, only deletions with
-    /// `seq > threshold` are considered (for protected snapshots). When `None`, all
-    /// deletions apply (for the main listing table). This avoids building filtered
-    /// `HashMap` copies per snapshot — each row is checked with a single O(1) lookup.
-    ///
-    /// Keys from later batches override earlier ones in the keyset, which is correct
-    /// because protected snapshots contain data inserted at higher sequence numbers.
-    #[expect(clippy::too_many_arguments)]
-    fn process_batches_into_keyset(
-        batches: &[RecordBatch],
-        pk_deletion_strategy: &PkDeletionStrategyWithCache,
-        pk_indices: &[usize],
-        converter: &RowConverter,
-        projected_pk_indices: &[usize],
-        deleted_pk_i64: Option<&Arc<HashMap<i64, i64>>>,
-        deleted_row_keys: Option<&Arc<DeletedRowKeysMap>>,
-        min_delete_seq_threshold: Option<i64>,
-        table_name: &str,
-        keyset: &mut HashMap<OwnedRow, RowLocation>,
-        row_id_base: &mut i64,
-    ) -> Result<()> {
-        for batch in batches {
-            let pk_columns: Vec<_> = projected_pk_indices
-                .iter()
-                .map(|idx| Arc::clone(batch.column(*idx)))
-                .collect();
-
-            let rows = converter.convert_columns(&pk_columns)?;
-
-            // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
-            let int64_pk_array: Option<&arrow::array::Int64Array> =
-                if pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1 {
-                    batch.column(0).as_any().downcast_ref()
-                } else {
-                    None
-                };
-
-            for row_idx in 0..batch.num_rows() {
-                let row_id = *row_id_base
-                    + i64::try_from(row_idx).map_err(|_| Error::Internal {
-                        table: table_name.to_string(),
-                        message: "Row index exceeds i64::MAX; cannot compute row_id".to_string(),
-                    })?;
-
-                // Check if row is deleted based on pk_deletion_strategy.
-                // For main batches (threshold=None): all deletions apply.
-                // For protected snapshots (threshold=Some(T)): only deletions with seq > T apply.
-                let is_deleted = match pk_deletion_strategy {
-                    PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                        if let (Some(pk_array), Some(deleted_pks)) =
-                            (int64_pk_array, deleted_pk_i64)
-                        {
-                            let pk_value = pk_array.value(row_idx);
-                            match deleted_pks.get(&pk_value) {
-                                None => false, // not deleted
-                                Some(&del_seq) => match min_delete_seq_threshold {
-                                    None => true, // all deletions apply
-                                    Some(threshold) => del_seq > threshold,
-                                },
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        if let Some(deleted_keys) = deleted_row_keys {
-                            let key = rows.row(row_idx);
-                            match deleted_keys.get(key.as_ref()) {
-                                None => false, // not deleted
-                                Some(&del_seq) => match min_delete_seq_threshold {
-                                    None => true, // all deletions apply
-                                    Some(threshold) => del_seq > threshold,
-                                },
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    PkDeletionStrategyWithCache::PositionBased { .. } => {
-                        unreachable!("PositionBased strategy should not reach load_existing_keyset")
-                    }
-                };
-
-                if is_deleted {
-                    continue;
-                }
-
-                // Enforce non-null primary key values
-                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
-                if has_null {
-                    return Err(Error::DataValidation {
-                        table: table_name.to_string(),
-                        message: format!(
-                            "Null primary key encountered in existing data for table {table_name}",
-                        ),
-                    });
-                }
-
-                let key = rows.row(row_idx).owned();
-
-                // Insert or update the key in the keyset.
-                // Keys from protected snapshots may override keys from the main listing table
-                // because protected snapshots contain data inserted at higher sequence numbers.
-                // This is expected behavior for upserts.
-                keyset.insert(
-                    key,
-                    RowLocation {
-                        data_file_id: DEFAULT_DATA_FILE_ID,
-                        row_id,
-                    },
-                );
-            }
-
-            *row_id_base += i64::try_from(batch.num_rows()).map_err(|_| Error::Internal {
-                table: table_name.to_string(),
-                message: "Batch row count exceeds i64::MAX; cannot compute row_id_base".to_string(),
-            })?;
-        }
-
-        Ok(())
-    }
-
-    /// Prepare an incoming stream for insert by validating `on_conflict` constraints.
-    ///
-    /// If a primary key is configured, this method:
-    /// 1. Loads existing keys from the table (respecting deletion visibility)
-    /// 2. Validates incoming rows against `on_conflict` behavior (drop/upsert)
-    /// 3. Returns a prepared stream with conflicts resolved and deletion specs
-    ///
-    /// If no primary key is configured, returns the stream unchanged with empty deletion specs.
-    pub(crate) async fn prepare_stream_for_insert(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> Result<(
-        SendableRecordBatchStream,
-        HashMap<i64, Vec<i64>>,
-        Vec<i64>,
-        Vec<Box<[u8]>>,
-    )> {
-        let Some(pk_indices) = self.primary_key_indices()? else {
-            return Ok((stream, HashMap::new(), Vec::new(), Vec::new()));
+    /// Combines multiple filter expressions with AND, then converts to a physical
+    /// expression for the `FilterExec`. Returns the plan unchanged if no filters are given.
+    fn wrap_plan_with_filter_exprs(
+        plan: Arc<dyn ExecutionPlan>,
+        filters: &[Expr],
+    ) -> std::result::Result<Arc<dyn ExecutionPlan>, datafusion_common::DataFusionError> {
+        let Some(combined) = filters.iter().cloned().reduce(Expr::and) else {
+            return Ok(plan);
         };
 
-        let converter = self.build_pk_converter(&pk_indices)?;
-        let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
-        tracing::debug!(
-            "prepare_stream_for_insert: loaded {} existing keys for table {}",
-            existing_keys.len(),
-            self.table_metadata.table_name
-        );
+        let arrow_schema = plan.schema();
+        let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone())?;
+        let execution_props = ExecutionProps::new();
 
-        let validation_result = self
-            .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
-            .await?;
+        let physical_filter = datafusion_physical_expr::create_physical_expr(
+            &combined,
+            &df_schema,
+            &execution_props,
+        )?;
 
-        // Build a new stream from the validated batches.
-        let schema = validation_result.filtered_batches.first().map_or_else(
-            || Arc::clone(&self.table_metadata.schema),
-            RecordBatch::schema,
-        );
-        let validated_stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
-        );
-
-        Ok((
-            Box::pin(validated_stream) as SendableRecordBatchStream,
-            validation_result.delete_specs,
-            validation_result.deleted_pk_i64,
-            validation_result.deleted_row_keys,
-        ))
-    }
-
-    /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
-    ///
-    /// Returns filtered batches (with dropped rows removed) and a map of deletion vector specs
-    /// keyed by `data_file_id`.
-    async fn validate_on_conflict(
-        &self,
-        mut stream: SendableRecordBatchStream,
-        pk_indices: &[usize],
-        converter: &RowConverter,
-        existing_keys: &mut HashMap<OwnedRow, RowLocation>,
-    ) -> Result<OnConflictValidationResult> {
-        let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
-        let mut filtered_batches = Vec::new();
-        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
-        let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-
-        // Use configured on_conflict or default to DoNothingAll (silently drops duplicates).
-        // When a primary key is configured without explicit on_conflict, this ensures
-        // inserts succeed without unique constraint errors.
-        let on_conflict = self
-            .table_metadata
-            .on_conflict
-            .clone()
-            .unwrap_or(OnConflict::DoNothingAll);
-        let upsert_options = on_conflict.get_upsert_options();
-
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            let mut ctx = OnConflictContext {
-                pk_indices,
-                converter,
-                on_conflict: &on_conflict,
-                upsert_options: &upsert_options,
-                existing_keys,
-                incoming_keys: &incoming_keys,
-            };
-
-            let BatchValidationResult {
-                filtered_batch,
-                delete_specs: batch_delete_specs,
-                kept_keys,
-                deleted_pk_i64,
-                deleted_row_keys,
-            } = self.apply_on_conflict_to_batch(batch, &mut ctx)?;
-
-            for (data_file_id, rows) in batch_delete_specs {
-                delete_specs.entry(data_file_id).or_default().extend(rows);
-            }
-
-            all_deleted_pk_i64.extend(deleted_pk_i64);
-            all_deleted_row_keys.extend(deleted_row_keys);
-
-            incoming_keys.extend(kept_keys);
-
-            if let Some(batch) = filtered_batch {
-                filtered_batches.push(batch);
-            }
-        }
-
-        Ok(OnConflictValidationResult {
-            filtered_batches,
-            delete_specs,
-            deleted_pk_i64: all_deleted_pk_i64,
-            deleted_row_keys: all_deleted_row_keys,
-        })
+        Ok(Arc::new(FilterExec::try_new(physical_filter, plan)?))
     }
 
     fn apply_on_conflict_to_batch(
@@ -2013,15 +2148,17 @@ impl CayenneTableProvider {
             }
 
             let key = rows.row(row_idx).owned();
-            if ctx.incoming_keys.contains(&key) {
-                return Err(Error::DataValidation {
-                    table: self.table_metadata.table_name.clone(),
-                    message: "Incoming data contains duplicate primary key across batches"
-                        .to_string(),
-                });
-            }
-
             if let Some(existing) = ctx.existing_keys.get(&key) {
+                // Keys inserted from earlier incoming batches are marked with row_id=-1.
+                // Keep explicit duplicate-across-batches behavior without a second key set.
+                if existing.row_id < 0 {
+                    return Err(Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Incoming data contains duplicate primary key across batches"
+                            .to_string(),
+                    });
+                }
+
                 match ctx.on_conflict {
                     OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
                         keep_mask.push(false);
@@ -2046,14 +2183,6 @@ impl CayenneTableProvider {
                                 // Position-based doesn't need PK values
                             }
                         }
-
-                        ctx.existing_keys.insert(
-                            key.clone(),
-                            RowLocation {
-                                data_file_id: DEFAULT_DATA_FILE_ID,
-                                row_id: -1,
-                            },
-                        );
                         keep_mask.push(true);
                     }
                 }
@@ -2065,7 +2194,7 @@ impl CayenneTableProvider {
         }
 
         if !ctx.upsert_options.is_default() {
-            let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
+            let mut seen: HashMap<OwnedRow, usize> = HashMap::with_capacity(row_keys.len());
             for (row_idx, key) in row_keys.iter().enumerate() {
                 if !keep_mask[row_idx] {
                     continue;
@@ -2089,13 +2218,25 @@ impl CayenneTableProvider {
             }
         }
 
-        let (filtered_batch, kept_keys) =
-            Self::filter_validated_batch(batch, keep_mask, &row_keys)?;
+        // Record keys that survive on-conflict filtering so later batches can detect duplicates
+        // without maintaining a second incoming-key hash set.
+        for (row_idx, key) in row_keys.iter().enumerate() {
+            if keep_mask[row_idx] {
+                ctx.existing_keys.insert(
+                    key.clone(),
+                    RowLocation {
+                        data_file_id: DEFAULT_DATA_FILE_ID,
+                        row_id: -1,
+                    },
+                );
+            }
+        }
+
+        let filtered_batch = Self::filter_validated_batch(batch, keep_mask)?;
 
         Ok(BatchValidationResult {
             filtered_batch,
             delete_specs: delete_specs.into_iter().collect(),
-            kept_keys,
             deleted_pk_i64,
             deleted_row_keys,
         })
@@ -2104,27 +2245,19 @@ impl CayenneTableProvider {
     fn filter_validated_batch(
         batch: RecordBatch,
         keep_mask: Vec<bool>,
-        row_keys: &[OwnedRow],
-    ) -> Result<(Option<RecordBatch>, HashSet<OwnedRow>)> {
+    ) -> Result<Option<RecordBatch>> {
         if keep_mask.iter().all(|v| !*v) {
-            return Ok((None, HashSet::new()));
+            return Ok(None);
         }
 
-        let kept_keys: HashSet<OwnedRow> = row_keys
-            .iter()
-            .zip(&keep_mask)
-            .filter(|(_, keep)| **keep)
-            .map(|(key, _)| key.clone())
-            .collect();
-
         if keep_mask.iter().all(|v| *v) {
-            return Ok((Some(batch), kept_keys));
+            return Ok(Some(batch));
         }
 
         let filter_array = arrow::array::BooleanArray::from(keep_mask);
         let filtered_batch = arrow::compute::filter_record_batch(&batch, &filter_array)?;
 
-        Ok((Some(filtered_batch), kept_keys))
+        Ok(Some(filtered_batch))
     }
 
     /// Apply deletion vectors generated by on-conflict (upsert) handling.
@@ -4539,8 +4672,23 @@ mod tests {
         (batch, converter)
     }
 
+    /// Helper: build a single-column Utf8 `RecordBatch` and the matching `RowConverter`.
+    fn make_utf8_pk_batch(values: &[&str]) -> (RecordBatch, RowConverter) {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Utf8, false)]));
+        let col = Arc::new(StringArray::from(values.to_vec()));
+        let batch = RecordBatch::try_new(schema, vec![col]).expect("valid batch");
+        let converter =
+            RowConverter::new(vec![SortField::new(DataType::Utf8)]).expect("valid converter");
+        (batch, converter)
+    }
+
+    // ── process_single_batch_into_keyset tests ──────────────────────────────
+
     #[test]
-    fn test_process_batches_into_keyset_int64pk_filters_deleted() {
+    fn test_keyset_int64pk_filters_deleted() {
         let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
 
         // Delete pk=2 with del_seq=1
@@ -4553,8 +4701,8 @@ mod tests {
         let mut keyset = HashMap::new();
         let mut row_id_base: i64 = 0;
 
-        CayenneTableProvider::process_batches_into_keyset(
-            &[batch],
+        CayenneTableProvider::process_single_batch_into_keyset(
+            &batch,
             &strategy,
             &[0],
             &converter,
@@ -4566,14 +4714,14 @@ mod tests {
             &mut keyset,
             &mut row_id_base,
         )
-        .expect("process_batches_into_keyset should succeed");
+        .expect("process_single_batch_into_keyset should succeed");
 
         assert_eq!(keyset.len(), 2, "pk=2 should be filtered out");
         assert_eq!(row_id_base, 3);
     }
 
     #[test]
-    fn test_process_batches_into_keyset_threshold_filters_partial() {
+    fn test_keyset_threshold_filters_partial() {
         let (batch, converter) = make_int64_pk_batch(&[1, 2, 3]);
 
         // pk=1 deleted at seq 5, pk=2 deleted at seq 15
@@ -4587,8 +4735,8 @@ mod tests {
         let mut row_id_base: i64 = 0;
 
         // threshold=10: only deletions with del_seq > 10 apply
-        CayenneTableProvider::process_batches_into_keyset(
-            &[batch],
+        CayenneTableProvider::process_single_batch_into_keyset(
+            &batch,
             &strategy,
             &[0],
             &converter,
@@ -4600,7 +4748,7 @@ mod tests {
             &mut keyset,
             &mut row_id_base,
         )
-        .expect("process_batches_into_keyset should succeed");
+        .expect("process_single_batch_into_keyset should succeed");
 
         // pk=1 (del_seq=5 <= 10) => visible, pk=2 (del_seq=15 > 10) => filtered, pk=3 => visible
         assert_eq!(
@@ -4612,7 +4760,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_batches_into_keyset_no_deletions() {
+    fn test_keyset_no_deletions() {
         let (batch, converter) = make_int64_pk_batch(&[10, 20, 30]);
 
         let strategy = PkDeletionStrategyWithCache::Int64Pk {
@@ -4623,8 +4771,8 @@ mod tests {
         let mut keyset = HashMap::new();
         let mut row_id_base: i64 = 0;
 
-        CayenneTableProvider::process_batches_into_keyset(
-            &[batch],
+        CayenneTableProvider::process_single_batch_into_keyset(
+            &batch,
             &strategy,
             &[0],
             &converter,
@@ -4636,10 +4784,116 @@ mod tests {
             &mut keyset,
             &mut row_id_base,
         )
-        .expect("process_batches_into_keyset should succeed");
+        .expect("process_single_batch_into_keyset should succeed");
 
         assert_eq!(keyset.len(), 3, "all rows should be in keyset");
         assert_eq!(row_id_base, 3, "row_id_base should advance by batch size");
+    }
+
+    // ── build_pk_filter_exprs tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_build_pk_filter_exprs_int64_bounding_box() {
+        let (batch, _) = make_int64_pk_batch(&[5, 1, 9, 3]);
+
+        let filters = CayenneTableProvider::build_pk_filter_exprs(&batch, &[0])
+            .expect("build_pk_filter_exprs should succeed");
+
+        assert_eq!(filters.len(), 1, "one filter per PK column");
+
+        // Should produce: pk >= 1 AND pk <= 9
+        let filter_str = format!("{}", filters[0]);
+        assert!(
+            filter_str.contains("pk >= Int64(1)"),
+            "filter should contain lower bound: {filter_str}"
+        );
+        assert!(
+            filter_str.contains("pk <= Int64(9)"),
+            "filter should contain upper bound: {filter_str}"
+        );
+    }
+
+    #[test]
+    fn test_build_pk_filter_exprs_utf8_bounding_box() {
+        let (batch, _) = make_utf8_pk_batch(&["delta", "alpha", "gamma", "beta"]);
+
+        let filters = CayenneTableProvider::build_pk_filter_exprs(&batch, &[0])
+            .expect("build_pk_filter_exprs should succeed");
+
+        assert_eq!(filters.len(), 1);
+        let filter_str = format!("{}", filters[0]);
+        assert!(
+            filter_str.contains("alpha"),
+            "filter should contain min value 'alpha': {filter_str}"
+        );
+        assert!(
+            filter_str.contains("gamma"),
+            "filter should contain max value 'gamma': {filter_str}"
+        );
+    }
+
+    #[test]
+    fn test_build_pk_filter_exprs_single_row() {
+        let (batch, _) = make_int64_pk_batch(&[42]);
+
+        let filters = CayenneTableProvider::build_pk_filter_exprs(&batch, &[0])
+            .expect("build_pk_filter_exprs should succeed");
+
+        assert_eq!(filters.len(), 1);
+        let filter_str = format!("{}", filters[0]);
+        // min == max == 42
+        assert!(
+            filter_str.contains("pk >= Int64(42)") && filter_str.contains("pk <= Int64(42)"),
+            "single row should produce pk >= 42 AND pk <= 42: {filter_str}"
+        );
+    }
+
+    #[test]
+    fn test_build_pk_filter_exprs_empty_batch() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)]));
+        let col = Arc::new(Int64Array::from(Vec::<i64>::new()));
+        let batch = RecordBatch::try_new(schema, vec![col]).expect("valid batch");
+
+        let filters = CayenneTableProvider::build_pk_filter_exprs(&batch, &[0])
+            .expect("build_pk_filter_exprs should succeed");
+
+        assert!(filters.is_empty(), "empty batch should produce no filters");
+    }
+
+    #[test]
+    fn test_build_pk_filter_exprs_composite_key() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let region_col = Arc::new(StringArray::from(vec!["us", "eu", "ap"]));
+        let id_col = Arc::new(Int64Array::from(vec![10, 5, 20]));
+        let batch = RecordBatch::try_new(schema, vec![region_col, id_col]).expect("valid batch");
+
+        let filters = CayenneTableProvider::build_pk_filter_exprs(&batch, &[0, 1])
+            .expect("build_pk_filter_exprs should succeed");
+
+        assert_eq!(filters.len(), 2, "one bounding-box filter per PK column");
+
+        // region: min="ap", max="us"
+        let region_str = format!("{}", filters[0]);
+        assert!(
+            region_str.contains("ap") && region_str.contains("us"),
+            "region filter should bound [ap, us]: {region_str}"
+        );
+
+        // id: min=5, max=20
+        let id_str = format!("{}", filters[1]);
+        assert!(
+            id_str.contains("Int64(5)") && id_str.contains("Int64(20)"),
+            "id filter should bound [5, 20]: {id_str}"
+        );
     }
 
     /// Helper to create a `CayenneTableProvider` with sort columns configured.

@@ -3529,6 +3529,7 @@ dependencies = [
  "tracing",
  "turso",
  "turso-shared",
+ "twox-hash",
  "url",
  "util",
  "uuid 1.21.0",
