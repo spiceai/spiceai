@@ -17,17 +17,8 @@ jobs:
   make_install:
     name: make install*
     runs-on: spicehq-dev-runners
-    env:
-      GOVER: 1.25.3
-
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

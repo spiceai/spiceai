@@ -76,6 +76,7 @@ cuda = ["runtime/cuda"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
+    "adbc",
     "duckdb",
     "postgres",
     "sqlite",

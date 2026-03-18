@@ -40,6 +40,7 @@ use crate::{
 use app::App;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
+use spicepod::component::runtime::TelemetryConfig;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -65,6 +66,7 @@ pub struct RuntimeBuilder {
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
     resolved_cluster_config: Option<ResolvedClusterConfig>,
+    telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
 }
 
 impl RuntimeBuilder {
@@ -86,6 +88,7 @@ impl RuntimeBuilder {
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
             resolved_cluster_config: None,
+            telemetry_config: None,
         }
     }
 
@@ -163,6 +166,17 @@ impl RuntimeBuilder {
         resolved_cluster_config: ResolvedClusterConfig,
     ) -> Self {
         self.resolved_cluster_config = Some(resolved_cluster_config);
+        self
+    }
+
+    /// Sets a `SetOnce` handle that will be resolved with the spicepod
+    /// `TelemetryConfig` once it is available.  For executors, this is set
+    /// after the app definition is fetched from the scheduler.
+    pub fn with_telemetry_config(
+        mut self,
+        telemetry_config: Arc<tokio::sync::SetOnce<TelemetryConfig>>,
+    ) -> Self {
+        self.telemetry_config = Some(telemetry_config);
         self
     }
 
@@ -373,6 +387,7 @@ impl RuntimeBuilder {
             distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
+            telemetry_config: self.telemetry_config,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
