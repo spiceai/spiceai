@@ -31,6 +31,7 @@ use super::delete::{
 use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 use super::streaming::StreamingExec;
 use super::vortex_format::DeletionFilteringVortexFormat;
+use std::cmp::Ordering;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
@@ -1856,7 +1857,9 @@ impl CayenneTableProvider {
             for row_idx in 0..batch.num_rows() {
                 let key = rows.row(row_idx).owned();
                 if let Some(loc) = incoming_keys.get(&key) {
-                    batch_keyset.entry(key).or_insert(*loc);
+                    // Overwrite any existing entry so that the sentinel row_id < 0
+                    // from incoming_keys is preserved for cross-batch duplicate detection.
+                    batch_keyset.insert(key, *loc);
                 }
             }
 
@@ -1929,20 +1932,58 @@ impl CayenneTableProvider {
 
             let mut min_val: Option<ScalarValue> = None;
             let mut max_val: Option<ScalarValue> = None;
+            let mut has_total_order = true;
 
             for row_idx in 0..batch.num_rows() {
                 let scalar = ScalarValue::try_from_array(column, row_idx)?;
                 if scalar.is_null() {
                     continue;
                 }
-                min_val = Some(match min_val {
-                    Some(cur) if cur <= scalar => cur,
-                    _ => scalar.clone(),
-                });
-                max_val = Some(match max_val {
-                    Some(cur) if cur >= scalar => cur,
-                    _ => scalar,
-                });
+
+                // Update min_val using explicit partial_cmp; if comparison is undefined
+                // (e.g., NaN with floats), mark this column as not totally ordered and
+                // skip filter generation for it.
+                if let Some(ref cur_min) = min_val {
+                    match scalar.partial_cmp(cur_min) {
+                        Some(Ordering::Less) => {
+                            min_val = Some(scalar.clone());
+                        }
+                        Some(_) => {
+                            // current min remains
+                        }
+                        None => {
+                            has_total_order = false;
+                            break;
+                        }
+                    }
+                } else {
+                    min_val = Some(scalar.clone());
+                }
+
+                // Update max_val similarly.
+                if let Some(ref cur_max) = max_val {
+                    match scalar.partial_cmp(cur_max) {
+                        Some(Ordering::Greater) => {
+                            max_val = Some(scalar);
+                        }
+                        Some(_) => {
+                            // current max remains
+                        }
+                        None => {
+                            has_total_order = false;
+                            break;
+                        }
+                    }
+                } else {
+                    max_val = Some(scalar);
+                }
+            }
+
+            // If we encountered a non-total comparison (e.g., involving NaN), skip
+            // generating a range filter for this PK column and fall back to an
+            // unfiltered scan for it to preserve correctness.
+            if !has_total_order {
+                continue;
             }
 
             if let (Some(lo), Some(hi)) = (min_val, max_val) {
