@@ -191,6 +191,8 @@ x509-certificate.workspace = true
 yaml = { path = "../yaml" }
 
 [dev-dependencies]
+adbc_core = { workspace = true }
+adbc_driver_manager = { workspace = true }
 anyhow.workspace = true
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
