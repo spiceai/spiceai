@@ -20,6 +20,7 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
 use init::scheduler::ScheduleRegistry;
+use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::future::Future;
@@ -506,6 +507,12 @@ pub struct Runtime {
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
+
+    /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
+    /// telemetry.  For executors this is set after the app definition is
+    /// fetched from the scheduler; for all other modes it is set before
+    /// the runtime starts.
+    telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
 }
 
 impl Debug for Runtime {
