@@ -26,8 +26,8 @@ use super::{
 };
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
-use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -465,7 +465,9 @@ impl DataFusionBuilder {
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
                 Arc::clone(&ddl_extension_store),
-                self.executor_registry.clone(),
+                self.cluster_config.is_some_and(|cfg| {
+                    matches!(cfg.effective_role(), Some(ClusterRole::Scheduler))
+                }),
             ),
         ));
 

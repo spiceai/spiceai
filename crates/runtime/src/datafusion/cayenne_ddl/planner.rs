@@ -27,12 +27,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
 use super::logical_nodes::{
-    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDeleteNode, CayenneDropTableNode,
-    CayenneUpdateNode,
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
+    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
 };
 use super::physical_plans::{
-    CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDeleteExec,
-    CayenneDropTableExec, CayenneUpdateExec,
+    CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDropTableExec,
+    DistributedCayenneDeleteExec, DistributedCayenneUpdateExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 
@@ -108,13 +108,13 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
             ))));
         }
 
-        if let Some(delete) = node.as_any().downcast_ref::<CayenneDeleteNode>() {
+        if let Some(delete) = node.as_any().downcast_ref::<DistributedCayenneDeleteNode>() {
             let input = _physical_inputs.first().ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(
                     "CayenneDeleteNode requires exactly one physical input".to_string(),
                 )
             })?;
-            return Ok(Some(Arc::new(CayenneDeleteExec::new(
+            return Ok(Some(Arc::new(DistributedCayenneDeleteExec::new(
                 delete.table_name.clone(),
                 self.executor_registry.clone(),
                 delete.filter_sql.clone(),
@@ -122,13 +122,13 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
             ))));
         }
 
-        if let Some(update) = node.as_any().downcast_ref::<CayenneUpdateNode>() {
+        if let Some(update) = node.as_any().downcast_ref::<DistributedCayenneUpdateNode>() {
             let input = _physical_inputs.first().ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(
                     "CayenneUpdateNode requires exactly one physical input".to_string(),
                 )
             })?;
-            return Ok(Some(Arc::new(CayenneUpdateExec::new(
+            return Ok(Some(Arc::new(DistributedCayenneUpdateExec::new(
                 update.table_name.clone(),
                 self.executor_registry.clone(),
                 update.filter_sql.clone(),

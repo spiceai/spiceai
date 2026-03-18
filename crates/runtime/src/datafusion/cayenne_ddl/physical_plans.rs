@@ -984,10 +984,10 @@ impl ExecutionPlan for CayenneDropTableExec {
     }
 }
 
-/// Physical plan for `DELETE` on a Cayenne-backed table.
+/// Physical plan to forward `DELETE` DML operations to Cayenne table across relevant executors in distributed mode.
 ///
 /// Forwards the DELETE statement to all connected executor nodes via `FlightSQL`.
-pub struct CayenneDeleteExec {
+pub struct DistributedCayenneDeleteExec {
     table_name: datafusion::sql::TableReference,
     executor_registry: Option<Arc<ExecutorRegistry>>,
     /// SQL text of the WHERE clause, if any.
@@ -997,7 +997,7 @@ pub struct CayenneDeleteExec {
     properties: PlanProperties,
 }
 
-impl fmt::Debug for CayenneDeleteExec {
+impl fmt::Debug for DistributedCayenneDeleteExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CayenneDeleteExec")
             .field("table_name", &self.table_name.to_string())
@@ -1006,7 +1006,7 @@ impl fmt::Debug for CayenneDeleteExec {
     }
 }
 
-impl CayenneDeleteExec {
+impl DistributedCayenneDeleteExec {
     #[must_use]
     pub fn new(
         table_name: datafusion::sql::TableReference,
@@ -1031,13 +1031,13 @@ impl CayenneDeleteExec {
     }
 }
 
-impl DisplayAs for CayenneDeleteExec {
+impl DisplayAs for DistributedCayenneDeleteExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "CayenneDeleteExec: {}", self.table_name)
     }
 }
 
-impl ExecutionPlan for CayenneDeleteExec {
+impl ExecutionPlan for DistributedCayenneDeleteExec {
     fn name(&self) -> &'static str {
         "CayenneDeleteExec"
     }
@@ -1104,10 +1104,10 @@ impl ExecutionPlan for CayenneDeleteExec {
     }
 }
 
-/// Physical plan for `UPDATE` on a Cayenne-backed table.
+/// Physical plan to forward `UPDATE` DML operations to Cayenne table across relevant executors in distributed mode.
 ///
 /// Forwards the UPDATE statement to all connected executor nodes via `FlightSQL`.
-pub struct CayenneUpdateExec {
+pub struct DistributedCayenneUpdateExec {
     table_name: datafusion::sql::TableReference,
     executor_registry: Option<Arc<ExecutorRegistry>>,
     /// SQL text of the WHERE clause, if any.
@@ -1119,7 +1119,7 @@ pub struct CayenneUpdateExec {
     properties: PlanProperties,
 }
 
-impl fmt::Debug for CayenneUpdateExec {
+impl fmt::Debug for DistributedCayenneUpdateExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CayenneUpdateExec")
             .field("table_name", &self.table_name.to_string())
@@ -1129,7 +1129,7 @@ impl fmt::Debug for CayenneUpdateExec {
     }
 }
 
-impl CayenneUpdateExec {
+impl DistributedCayenneUpdateExec {
     #[must_use]
     pub fn new(
         table_name: datafusion::sql::TableReference,
@@ -1156,13 +1156,13 @@ impl CayenneUpdateExec {
     }
 }
 
-impl DisplayAs for CayenneUpdateExec {
+impl DisplayAs for DistributedCayenneUpdateExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "CayenneUpdateExec: {}", self.table_name)
     }
 }
 
-impl ExecutionPlan for CayenneUpdateExec {
+impl ExecutionPlan for DistributedCayenneUpdateExec {
     fn name(&self) -> &'static str {
         "CayenneUpdateExec"
     }

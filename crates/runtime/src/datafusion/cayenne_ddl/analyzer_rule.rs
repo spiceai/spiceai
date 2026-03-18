@@ -40,8 +40,8 @@ use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
 use super::logical_nodes::{
-    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDeleteNode, CayenneDropTableNode,
-    CayenneUpdateNode,
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
+    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
@@ -93,8 +93,7 @@ pub struct CayenneDdlAnalyzerRule {
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     ddl_options: SharedDdlExtensionStore,
-    /// Optional executor registry for partition-aware DML routing in scheduler mode.
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    apply_distributed_nodes: bool,
 }
 
 impl fmt::Debug for CayenneDdlAnalyzerRule {
@@ -111,14 +110,14 @@ impl CayenneDdlAnalyzerRule {
         catalog_list: &Arc<dyn CatalogProviderList>,
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
         ddl_options: SharedDdlExtensionStore,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        apply_distributed_nodes: bool,
     ) -> Self {
         Self {
             session_state,
             catalog_list: Arc::downgrade(catalog_list),
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
             ddl_options,
-            executor_registry,
+            apply_distributed_nodes,
         }
     }
 
@@ -265,9 +264,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 output_schema,
                 ..
             }) => {
-                // Only rewrite DML in scheduler mode; standalone executors
-                // handle DML locally via the standard DataFusion path.
-                if self.executor_registry.is_none() {
+                if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
 
@@ -283,7 +280,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 let filter_sql = extract_filter_sql(input)?;
 
                 Ok(LogicalPlan::Extension(Extension {
-                    node: Arc::new(CayenneDeleteNode::new(
+                    node: Arc::new(DistributedCayenneDeleteNode::new(
                         table_name.clone(),
                         Arc::clone(input),
                         Arc::clone(output_schema),
@@ -298,7 +295,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 output_schema,
                 ..
             }) => {
-                if self.executor_registry.is_none() {
+                if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
 
@@ -314,7 +311,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 let filter_sql = extract_filter_sql(input)?;
                 let assignments_sql = extract_update_assignments(input, table_name)?;
 
-                let node = CayenneUpdateNode::new(
+                let node = DistributedCayenneUpdateNode::new(
                     table_name.clone(),
                     Arc::clone(input),
                     Arc::clone(output_schema),

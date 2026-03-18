@@ -411,9 +411,9 @@ impl UserDefinedLogicalNodeCore for CayenneDropTableNode {
     }
 }
 
-/// Logical plan node for `DELETE` on a Cayenne-backed partitioned table.
+/// Logical plan node to forward `DELETE` DML operations to Cayenne table across relevant executors in distributed mode.
 #[derive(Debug)]
-pub struct CayenneDeleteNode {
+pub struct DistributedCayenneDeleteNode {
     /// Fully qualified table reference.
     pub table_name: TableReference,
     /// The input plan producing the delete filter/rows.
@@ -424,7 +424,7 @@ pub struct CayenneDeleteNode {
     pub filter_sql: Option<String>,
 }
 
-impl CayenneDeleteNode {
+impl DistributedCayenneDeleteNode {
     #[must_use]
     pub fn new(
         table_name: TableReference,
@@ -441,7 +441,7 @@ impl CayenneDeleteNode {
     }
 }
 
-impl Hash for CayenneDeleteNode {
+impl Hash for DistributedCayenneDeleteNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.table_name.hash(state);
         self.input.hash(state);
@@ -450,15 +450,15 @@ impl Hash for CayenneDeleteNode {
     }
 }
 
-impl PartialEq for CayenneDeleteNode {
+impl PartialEq for DistributedCayenneDeleteNode {
     fn eq(&self, other: &Self) -> bool {
         self.table_name == other.table_name && self.input == other.input
     }
 }
 
-impl Eq for CayenneDeleteNode {}
+impl Eq for DistributedCayenneDeleteNode {}
 
-impl PartialOrd for CayenneDeleteNode {
+impl PartialOrd for DistributedCayenneDeleteNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.table_name
             .to_string()
@@ -466,7 +466,7 @@ impl PartialOrd for CayenneDeleteNode {
     }
 }
 
-impl UserDefinedLogicalNodeCore for CayenneDeleteNode {
+impl UserDefinedLogicalNodeCore for DistributedCayenneDeleteNode {
     fn name(&self) -> &'static str {
         "CayenneDelete"
     }
@@ -506,9 +506,9 @@ impl UserDefinedLogicalNodeCore for CayenneDeleteNode {
     }
 }
 
-/// Logical plan node for `UPDATE` on a Cayenne-backed partitioned table.
+/// Logical plan node to forward `UPDATE` DML operations to Cayenne table across relevant executors in distributed mode.
 #[derive(Debug)]
-pub struct CayenneUpdateNode {
+pub struct DistributedCayenneUpdateNode {
     /// Fully qualified table reference.
     pub table_name: TableReference,
     /// The input plan producing the update assignments/filter.
@@ -521,7 +521,7 @@ pub struct CayenneUpdateNode {
     pub assignments_sql: Vec<(String, String)>,
 }
 
-impl CayenneUpdateNode {
+impl DistributedCayenneUpdateNode {
     #[must_use]
     pub fn new(
         table_name: TableReference,
@@ -540,7 +540,7 @@ impl CayenneUpdateNode {
     }
 }
 
-impl Hash for CayenneUpdateNode {
+impl Hash for DistributedCayenneUpdateNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.table_name.hash(state);
         self.input.hash(state);
@@ -550,15 +550,15 @@ impl Hash for CayenneUpdateNode {
     }
 }
 
-impl PartialEq for CayenneUpdateNode {
+impl PartialEq for DistributedCayenneUpdateNode {
     fn eq(&self, other: &Self) -> bool {
         self.table_name == other.table_name && self.input == other.input
     }
 }
 
-impl Eq for CayenneUpdateNode {}
+impl Eq for DistributedCayenneUpdateNode {}
 
-impl PartialOrd for CayenneUpdateNode {
+impl PartialOrd for DistributedCayenneUpdateNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.table_name
             .to_string()
@@ -566,7 +566,7 @@ impl PartialOrd for CayenneUpdateNode {
     }
 }
 
-impl UserDefinedLogicalNodeCore for CayenneUpdateNode {
+impl UserDefinedLogicalNodeCore for DistributedCayenneUpdateNode {
     fn name(&self) -> &'static str {
         "CayenneUpdate"
     }
