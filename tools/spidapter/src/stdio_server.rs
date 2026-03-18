@@ -1271,13 +1271,14 @@ fn generate_initial_spicepod(
                 )]))),
                 partition_management: None,
             };
-            if let Some(region) = aws_region
-                && let Some(p) = sched.params.as_mut()
-            {
-                p.data.insert(
-                    "s3_region".to_string(),
-                    ParamValue::String(region.to_string()),
-                );
+
+            if let Some(region) = aws_region {
+                sched.params.as_mut().map(|p| {
+                    p.data.insert(
+                        "s3_region".to_string(),
+                        ParamValue::String(region.to_string()),
+                    )
+                });
             }
             spicepod.runtime.scheduler = Some(sched);
         }
