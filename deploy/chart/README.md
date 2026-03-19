@@ -19,7 +19,7 @@ helm install spiceai deploy/chart \
 | `image.tag`                     | Container image tag                                                          | `latest-models`                   |
 | `replicaCount`                  | Number of replicas                                                           | `1`                               |
 | `serviceAccount.create`         | Create a ServiceAccount                                                      | `false`                           |
-| `serviceAccount.name`           | ServiceAccount name (auto-generated if empty and `create` is true)           | `""`                              |
+| `serviceAccount.name`           | ServiceAccount name (auto-generated if empty and `create` is true)           | `null`                            |
 | `serviceAccount.annotations`    | Annotations for the ServiceAccount                                           | `{}`                              |
 | `service.type`                  | Kubernetes Service type (`ClusterIP`, `NodePort`, `LoadBalancer`, or `null`) | `null`                            |
 | `service.additionalAnnotations` | Additional annotations on the Service                                        | `{}`                              |
@@ -53,7 +53,7 @@ serviceAccount:
 
 #### AWS EKS Pod Identity
 
-[EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html) is a newer alternative to IRSA. It uses the EKS Pod Identity Agent add-on instead of OIDC, so no ServiceAccount annotation is required — the association is configured via the EKS API. You still need `serviceAccount.create: true` to reference a named ServiceAccount.
+[EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html) is a newer alternative to IRSA. It uses the EKS Pod Identity Agent add-on instead of OIDC, so no ServiceAccount annotation is required — the association is configured via the EKS API. You still need a named ServiceAccount; either set `serviceAccount.create: true` to have the chart create one, or set `serviceAccount.name` to reference a pre-existing ServiceAccount.
 
 #### GKE Workload Identity
 
