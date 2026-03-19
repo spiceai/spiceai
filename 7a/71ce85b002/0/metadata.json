@@ -3,7 +3,7 @@
   "checkpoint_id": "7a71ce85b002",
   "session_id": "54c8b261-017b-4bbf-8674-cb5e9df71346",
   "strategy": "manual-commit",
-  "created_at": "2026-03-19T03:10:17.558002Z",
+  "created_at": "2026-03-19T03:13:25.592859Z",
   "branch": "jeadie/26-03-18/flags-spidapter",
   "checkpoints_count": 0,
   "files_touched": [
@@ -22,12 +22,12 @@
     "api_call_count": 10
   },
   "initial_attribution": {
-    "calculated_at": "2026-03-19T03:10:17.451717Z",
-    "agent_lines": 359,
-    "human_added": 187316,
+    "calculated_at": "2026-03-19T03:13:25.501488Z",
+    "agent_lines": 7,
+    "human_added": 0,
     "human_modified": 0,
     "human_removed": 0,
-    "total_committed": 187675,
-    "agent_percentage": 0.19128813107766085
+    "total_committed": 7,
+    "agent_percentage": 100
   }
 }
