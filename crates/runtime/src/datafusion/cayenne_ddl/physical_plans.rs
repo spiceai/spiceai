@@ -387,12 +387,12 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let stream = futures::stream::once(async move {
             // In distributed mode, at least one executor must be connected
             // before creating Cayenne catalog tables.
-            if let Some(ref registry) = executor_registry {
-                if registry.flight_sql_clients.read().await.is_empty() {
-                    return Err(DataFusionError::Execution(format!(
-                        "Failed to create table '{table_name}' in Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before creating tables. Ensure an executor is running and connected to the scheduler."
-                    )));
-                }
+            if let Some(ref registry) = executor_registry
+                && registry.flight_sql_clients.read().await.is_empty()
+            {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to create table '{table_name}' in Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before creating tables. Ensure an executor is running and connected to the scheduler."
+                )));
             }
 
             // Get the Cayenne catalog provider
@@ -924,12 +924,12 @@ impl ExecutionPlan for CayenneDropTableExec {
         let stream = futures::stream::once(async move {
             // In distributed mode, at least one executor must be connected
             // before dropping Cayenne catalog tables.
-            if let Some(ref registry) = executor_registry {
-                if registry.flight_sql_clients.read().await.is_empty() {
-                    return Err(DataFusionError::Execution(format!(
-                        "Failed to drop table '{table_name}' from Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before modifying tables. Ensure an executor is running and connected to the scheduler."
-                    )));
-                }
+            if let Some(ref registry) = executor_registry
+                && registry.flight_sql_clients.read().await.is_empty()
+            {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to drop table '{table_name}' from Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before modifying tables. Ensure an executor is running and connected to the scheduler."
+                )));
             }
 
             // Get the Cayenne catalog provider
