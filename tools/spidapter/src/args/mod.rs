@@ -29,9 +29,12 @@ pub struct StdioArgs {
     pub verbose: bool,
 
     /// Base URL for Spice Cloud API calls.
-    /// Falls back to `https://api.spice.ai` when not set.
-    #[arg(long, env = "SPICE_CLOUD_API_URL")]
-    pub spice_cloud_api_url: Option<String>,
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_API_URL",
+        default_value = "https://api.spice.ai"
+    )]
+    pub spice_cloud_api_url: String,
 
     /// Timeout in seconds to wait for a Spice Cloud deployment to become ready.
     #[arg(long, default_value = "600")]

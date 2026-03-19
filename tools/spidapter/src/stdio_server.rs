@@ -591,8 +591,10 @@ async fn provision_spice_cloud_app(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
-    let cloud =
-        commands::build_cloud_client(args.spice_cloud_api_url.as_deref(), args.api_key.as_deref())?;
+    let cloud = commands::build_cloud_client(
+        Some(args.spice_cloud_api_url.as_str()),
+        args.api_key.as_deref(),
+    )?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
     let flight_url = args
