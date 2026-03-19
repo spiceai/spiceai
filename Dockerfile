@@ -88,7 +88,9 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
-    set -euo pipefail; \
+    # Use `set -eu` instead of `set -euo pipefail` because this stage runs on
+    # debian:bookworm-slim where /bin/sh is dash, which does not support pipefail.
+    set -eu; \
     apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \
