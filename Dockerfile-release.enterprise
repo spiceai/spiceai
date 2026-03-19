@@ -1,6 +1,23 @@
 #syntax=docker/dockerfile:1.7
 
+# Build the ADBC BigQuery driver from source
+ARG ADBC_BIGQUERY_VERSION=1.11.2
+ARG GO_VERSION=1.26.1
 ARG BASE_IMAGE=debian:bookworm-slim
+
+FROM golang:${GO_VERSION}-bookworm AS adbc-bigquery
+ARG ADBC_BIGQUERY_VERSION
+RUN set -eu; \
+    apt-get update && apt-get install -y --no-install-recommends git ca-certificates gcc libc6-dev && \
+    rm -rf /var/lib/{apt,dpkg,cache,log}
+RUN set -eu; \
+    git clone --depth 1 --branch "go/v${ADBC_BIGQUERY_VERSION}" \
+      https://github.com/adbc-drivers/bigquery.git /src/bigquery; \
+    cd /src/bigquery/go; \
+    CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
+      -o /libadbc_driver_bigquery.so ./pkg/; \
+    rm -f /libadbc_driver_bigquery.h; \
+    strip /libadbc_driver_bigquery.so
 
 FROM ${BASE_IMAGE} AS binary
 
@@ -189,6 +206,11 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
 # Minimal passwd & group for the nobody user
 RUN echo 'nobody:x:65534:65534:nobody:/app:/usr/sbin/nologin' > /spice_sandbox/etc/passwd \
     && echo 'nogroup:x:65534:' > /spice_sandbox/etc/group
+
+# Copy ADBC BigQuery driver into system ADBC driver search path
+RUN mkdir -p /spice_sandbox/etc/adbc/drivers
+COPY --from=adbc-bigquery /libadbc_driver_bigquery.so /spice_sandbox/etc/adbc/drivers/
+RUN printf '[Driver]\nshared = "/etc/adbc/drivers/libadbc_driver_bigquery.so"\n' > /spice_sandbox/etc/adbc/drivers/bigquery.toml
 
 # Create DuckDB directory in sandbox
 RUN mkdir -p /spice_sandbox/.duckdb \
