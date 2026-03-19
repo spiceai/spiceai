@@ -20,9 +20,7 @@ use crate::auth::EndpointAuth;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
-use crate::flight::{
-    Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error, session_auth,
-};
+use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
@@ -233,6 +231,7 @@ pub async fn start_executor_flight_server(
     let job_executor = rt.job_executor();
 
     // Add middleware layers for request context, auth, and rate limiting
+    let rate_limits = &rt.rate_limits;
     let mut server = server
         .layer(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
@@ -240,8 +239,8 @@ pub async fn start_executor_flight_server(
         )
         .layer(auth_layer)
         .layer(WriteRateLimitLayer::new(
-            RateLimiter::direct(RateLimits::default().flight_write_limit),
-            true,
+            RateLimiter::direct(rate_limits.flight_write_limit),
+            rate_limits.flight_write_enabled,
         ));
 
     let server = server.add_service(
