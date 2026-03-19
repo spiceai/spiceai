@@ -1015,6 +1015,12 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
+    // Resolve the telemetry config from the scheduler's app definition so that
+    // `start_anonymous_telemetry` (which is waiting on this value) can proceed.
+    if let Some(ref telemetry_config) = rt.telemetry_config {
+        let _ = telemetry_config.set(app_def.runtime.telemetry.clone());
+    }
+
     // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
     // Otherwise fall back to temp_directory from query config or system temp dir
     // Note: shuffle_memory_mode and object store config is set via the scheduler's override_session_builder
