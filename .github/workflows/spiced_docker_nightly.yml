@@ -11,6 +11,19 @@ on:
         required: false
         type: boolean
         default: false
+      variant:
+        description: 'Which image tag(s) to build'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'default'
+          - 'data'
+          - 'jemalloc'
+          - 'mimalloc'
+          - 'sysalloc'
+          - 'nas'
+        default: 'all'
       profile_option:
         description: 'Which Rust build profile to use? (Default is release)'
         required: false
@@ -63,6 +76,7 @@ jobs:
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
+      variant: ${{ steps.set_version.outputs.variant }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -78,6 +92,25 @@ jobs:
           nightly_label="nightly.${date}.${commit_hash}"
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            variant="${{ github.event.inputs.variant }}"
+          else
+            variant="all"
+          fi
+
+          variant="${variant:-all}"
+
+          case "$variant" in
+            all|default|data|jemalloc|mimalloc|sysalloc|nas)
+              ;;
+            *)
+              echo "Unknown variant selection: $variant" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "variant=${variant}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
 
   build-arm64:
@@ -86,6 +119,7 @@ jobs:
 
     runs-on: hosted-linux-arm-runner
     env:
+      SELECTED_VARIANT: ${{ needs.setup.outputs.variant }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
@@ -136,6 +170,7 @@ jobs:
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - &build-arm64-image
         name: Build ARM64 ${{ env.IMAGE_TAG }} image
+        if: env.SELECTED_VARIANT == 'all' || env.SELECTED_VARIANT == env.IMAGE_TAG
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
@@ -191,6 +226,7 @@ jobs:
 
     runs-on: spicehq-dev-runners
     env:
+      SELECTED_VARIANT: ${{ needs.setup.outputs.variant }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
@@ -223,6 +259,7 @@ jobs:
           echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - &build-amd64-image
         name: Build AMD64 ${{ env.IMAGE_TAG }} image
+        if: env.SELECTED_VARIANT == 'all' || env.SELECTED_VARIANT == env.IMAGE_TAG
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
@@ -278,6 +315,8 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
     runs-on: ubuntu-22.04
+    env:
+      SELECTED_VARIANT: ${{ needs.setup.outputs.variant }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -312,8 +351,13 @@ jobs:
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
 
-          # Variants: default (models), data (no models), allocator variants, and nas (NFS support)
-          variants=("default" "data" "jemalloc" "mimalloc" "sysalloc" "nas")
+          if [[ "${SELECTED_VARIANT}" == "all" ]]; then
+            # Variants: default (models), data (no models), allocator variants, and nas (NFS support)
+            variants=("default" "data" "jemalloc" "mimalloc" "sysalloc" "nas")
+          else
+            variants=("${SELECTED_VARIANT}")
+          fi
+
           for variant in "${variants[@]}"; do
             suffix=""
             if [ "$variant" != "default" ]; then
