@@ -428,6 +428,8 @@ async fn post_setup_sink_action(
 
             loop {
                 let mut request = sql_client.post(sql_url).body(statement.clone());
+                // Prefer non-streaming response path for DDL by setting row limit
+                request = request.header("X-Accept-Rows", "999");
                 if let Some(key) = api_key {
                     request = request.header("X-API-Key", key);
                 }
@@ -438,13 +440,8 @@ async fn post_setup_sink_action(
                     .text()
                     .await
                     .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-                let trimmed_body = body.trim();
 
-                // A successful DDL response is HTTP 2xx with a non-empty JSON array, e.g. `[{"result":"Table 'X' created"}]`.
-                let is_success =
-                    status.is_success() && !trimmed_body.is_empty() && trimmed_body != "[]";
-
-                if is_success {
+                if status.is_success() {
                     break;
                 }
 
@@ -458,7 +455,7 @@ async fn post_setup_sink_action(
 
                 let backoff_seconds = attempts * 2;
                 eprintln!(
-                    "[stdio] Post-setup SQL failed (status={status}, body={trimmed_body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
+                    "[stdio] Post-setup SQL failed (status={status}, body={body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
                 );
                 sleep(Duration::from_secs(backoff_seconds)).await;
             }
