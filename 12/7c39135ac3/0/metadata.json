@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "127c39135ac3",
+  "session_id": "a555d55a-5eab-41e9-aaad-8ac31e88458b",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-18T22:04:55.347904Z",
+  "branch": "jeadie/26-03-18/flags-spidapter",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "4a75ea13bcf9",
+  "token_usage": {
+    "input_tokens": 40,
+    "cache_creation_tokens": 76268,
+    "cache_read_tokens": 1676523,
+    "output_tokens": 637,
+    "api_call_count": 36
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-18T22:04:55.143063Z",
+    "agent_lines": 0,
+    "human_added": 770,
+    "human_modified": 62,
+    "human_removed": 0,
+    "total_committed": 770,
+    "agent_percentage": 0
+  }
+}
