@@ -385,6 +385,16 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let runtime_env = context.runtime_env();
 
         let stream = futures::stream::once(async move {
+            // In distributed mode, at least one executor must be connected
+            // before creating Cayenne catalog tables.
+            if let Some(ref registry) = executor_registry {
+                if registry.flight_sql_clients.read().await.is_empty() {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to create table '{table_name}' in Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before creating tables. Ensure an executor is running and connected to the scheduler."
+                    )));
+                }
+            }
+
             // Get the Cayenne catalog provider
             let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
                 DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
@@ -912,6 +922,16 @@ impl ExecutionPlan for CayenneDropTableExec {
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
+            // In distributed mode, at least one executor must be connected
+            // before dropping Cayenne catalog tables.
+            if let Some(ref registry) = executor_registry {
+                if registry.flight_sql_clients.read().await.is_empty() {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to drop table '{table_name}' from Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before modifying tables. Ensure an executor is running and connected to the scheduler."
+                    )));
+                }
+            }
+
             // Get the Cayenne catalog provider
             let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
                 DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
