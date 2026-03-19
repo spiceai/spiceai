@@ -234,7 +234,25 @@ impl SqlWarehouseApi {
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
         let payload = self.create_schema_payload(table)?;
-        let response = self.execute_sql_statement(&token, &payload).await?;
+        let mut response = self.execute_sql_statement(&token, &payload).await?;
+
+        let mut state = Self::extract_response_status(&response)?;
+        let statement_id = Self::extract_statement_id(&response)?;
+
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(Duration::from_secs(5)))
+            .build();
+        while Self::is_async_query(state) {
+            let Some(backoff_duration) = backoff.next_backoff() else {
+                break;
+            };
+            tokio::time::sleep(backoff_duration).await;
+            response = self
+                .get_sql_statement_status(&token, &statement_id)
+                .await?;
+            state = Self::extract_response_status(&response)?;
+        }
+
         schema_from_json(&response)
     }
 
@@ -257,6 +275,10 @@ impl SqlWarehouseApi {
             "catalog": table_catalog,
             "schema": table_schema,
             "statement": sql,
+            "format": "JSON_ARRAY",
+            "disposition": "INLINE",
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
         }))
     }
 
@@ -742,6 +764,380 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
 
 fn databricks_dialect() -> super::dialect::DatabricksDialect {
     super::dialect::DatabricksDialect::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use serde_json::json;
+
+    /// Helper to create a valid Databricks schema response JSON.
+    fn make_schema_response(data_array: Value) -> Value {
+        json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "test-stmt-id",
+            "result": { "data_array": data_array }
+        })
+    }
+
+    #[test]
+    fn test_schema_from_json_basic() {
+        let response = make_schema_response(json!([
+            ["id", "int", "NO"],
+            ["name", "string", "YES"],
+            ["amount", "double", "NO"]
+        ]));
+
+        let schema = schema_from_json(&response).expect("should parse schema");
+        assert_eq!(schema.fields().len(), 3);
+
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert!(!schema.field(0).is_nullable());
+
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(schema.field(1).is_nullable());
+
+        assert_eq!(schema.field(2).name(), "amount");
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert!(!schema.field(2).is_nullable());
+    }
+
+    #[test]
+    fn test_schema_from_json_many_types() {
+        let response = make_schema_response(json!([
+            ["col_bigint",    "bigint",    "NO"],
+            ["col_smallint",  "smallint",  "YES"],
+            ["col_boolean",   "boolean",   "NO"],
+            ["col_float",     "float",     "YES"],
+            ["col_date",      "date",      "NO"],
+            ["col_timestamp", "timestamp", "YES"],
+            ["col_binary",    "binary",    "NO"],
+            ["col_decimal",   "decimal(10,2)", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response).expect("should parse schema");
+        assert_eq!(schema.fields().len(), 8);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int16);
+        assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float32);
+        assert_eq!(schema.field(4).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(6).data_type(), &DataType::Binary);
+        assert_eq!(
+            schema.field(7).data_type(),
+            &DataType::Decimal128(10, 2)
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_empty_table() {
+        let response = make_schema_response(json!([]));
+
+        let schema = schema_from_json(&response).expect("should parse empty schema");
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    #[test]
+    fn test_schema_from_json_stops_at_clustering_metadata() {
+        let response = make_schema_response(json!([
+            ["id", "int", "NO"],
+            ["name", "string", "YES"],
+            ["# Clustering Information", "", ""],
+            ["# col_name", "data_type", "comment"]
+        ]));
+
+        let schema = schema_from_json(&response).expect("should stop at clustering marker");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_result() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" }
+        });
+
+        let err = schema_from_json(&response).expect_err("should fail without result");
+        assert!(
+            err.to_string().contains("result.data_array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_data_array() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "result": {}
+        });
+
+        let err = schema_from_json(&response).expect_err("should fail without data_array");
+        assert!(
+            err.to_string().contains("result.data_array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_data_array_not_array() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "result": { "data_array": "not_an_array" }
+        });
+
+        let err = schema_from_json(&response).expect_err("should fail when data_array is string");
+        assert!(
+            err.to_string().contains("result.data_array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_row_not_array() {
+        let response = make_schema_response(json!([
+            "not_an_array"
+        ]));
+
+        let err = schema_from_json(&response).expect_err("should fail on non-array row");
+        assert!(
+            err.to_string().contains("data_array[0] is not an array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_row_too_short() {
+        let response = make_schema_response(json!([
+            ["id", "int"]
+        ]));
+
+        let err = schema_from_json(&response).expect_err("should fail on short row");
+        assert!(
+            err.to_string().contains("lacks column_name or full_data_type or is_nullable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_column_name_not_string() {
+        let response = make_schema_response(json!([
+            [123, "int", "NO"]
+        ]));
+
+        let err = schema_from_json(&response).expect_err("should fail on non-string col name");
+        assert!(
+            err.to_string().contains("data_array[0][0] is not a string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_data_type_not_string() {
+        let response = make_schema_response(json!([
+            ["id", 42, "NO"]
+        ]));
+
+        let err = schema_from_json(&response).expect_err("should fail on non-string data type");
+        assert!(
+            err.to_string().contains("data_array[0][1] is not a string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_nullable_not_string() {
+        let response = make_schema_response(json!([
+            ["id", "int", true]
+        ]));
+
+        let err = schema_from_json(&response).expect_err("should fail on non-string nullable");
+        assert!(
+            err.to_string().contains("data_array[0][2] is not a boolean"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_nullable_case_insensitive() {
+        let response = make_schema_response(json!([
+            ["a", "int", "YES"],
+            ["b", "int", "Yes"],
+            ["c", "int", "yes"],
+            ["d", "int", "NO"],
+            ["e", "int", "No"],
+            ["f", "int", "no"],
+            ["g", "int", "anything_else"]
+        ]));
+
+        let schema = schema_from_json(&response).expect("should parse nullable variations");
+        assert!(schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+        assert!(schema.field(2).is_nullable());
+        assert!(!schema.field(3).is_nullable());
+        assert!(!schema.field(4).is_nullable());
+        assert!(!schema.field(5).is_nullable());
+        assert!(!schema.field(6).is_nullable());
+    }
+
+    #[test]
+    fn test_schema_from_json_failed_status() {
+        let response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "table not found" }
+            },
+            "statement_id": "test-stmt-id",
+            "result": { "data_array": [] }
+        });
+
+        let err = schema_from_json(&response).expect_err("should fail on FAILED status");
+        assert!(
+            err.to_string().contains("table not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_pending_status() {
+        let response = json!({
+            "status": { "state": "PENDING" },
+            "statement_id": "test-stmt-id"
+        });
+
+        let err = schema_from_json(&response).expect_err("should fail on PENDING status");
+        assert!(
+            err.to_string().contains("Warehouse is not ready"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_unsupported_type() {
+        let response = make_schema_response(json!([
+            ["col", "TOTALLY_FAKE_TYPE", "NO"]
+        ]));
+
+        let err = schema_from_json(&response).expect_err("should fail on unsupported type");
+        assert!(
+            err.to_string().contains("parse"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_extra_columns_ignored() {
+        // Rows with more than 3 elements should still work (extra fields ignored)
+        let response = make_schema_response(json!([
+            ["id", "int", "NO", "extra_col", "another_extra"]
+        ]));
+
+        let schema = schema_from_json(&response).expect("should parse with extra columns");
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "id");
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_status() {
+        let response = json!({
+            "result": { "data_array": [["id", "int", "NO"]] }
+        });
+
+        let err = schema_from_json(&response).expect_err("should fail without status");
+        assert!(
+            err.to_string().contains("status.state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_includes_inline_disposition() {
+        let api = SqlWarehouseApi::new("host.example.com", "warehouse-123", Arc::new(StaticTokenProvider("token".to_string())))
+            .expect("should create api");
+        let table = TableReference::full("my_catalog", "my_schema", "my_table");
+
+        let payload = api.create_schema_payload(&table).expect("should create payload");
+
+        assert_eq!(payload["format"], "JSON_ARRAY");
+        assert_eq!(payload["disposition"], "INLINE");
+        assert_eq!(payload["wait_timeout"], "30s");
+        assert_eq!(payload["on_wait_timeout"], "CONTINUE");
+        assert_eq!(payload["warehouse_id"], "warehouse-123");
+        assert!(
+            payload["statement"]
+                .as_str()
+                .expect("statement should be string")
+                .contains("my_table"),
+            "statement should reference the table"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_missing_schema() {
+        let api = SqlWarehouseApi::new("host.example.com", "wh-1", Arc::new(StaticTokenProvider("t".to_string())))
+            .expect("should create api");
+        let table = TableReference::bare("just_table");
+
+        let err = api.create_schema_payload(&table).expect_err("should fail without schema");
+        assert!(
+            err.to_string().contains("missing schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_missing_catalog() {
+        let api = SqlWarehouseApi::new("host.example.com", "wh-1", Arc::new(StaticTokenProvider("t".to_string())))
+            .expect("should create api");
+        let table = TableReference::partial("my_schema", "my_table");
+
+        let err = api.create_schema_payload(&table).expect_err("should fail without catalog");
+        assert!(
+            err.to_string().contains("missing catalog"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_sql_injection_prevention() {
+        let api = SqlWarehouseApi::new("host.example.com", "wh-1", Arc::new(StaticTokenProvider("t".to_string())))
+            .expect("should create api");
+        let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
+
+        let payload = api.create_schema_payload(&table).expect("should create payload");
+        let stmt = payload["statement"].as_str().expect("statement should be string");
+
+        // Single quotes should be escaped as double single-quotes
+        assert!(stmt.contains("tab''le"), "table name not escaped: {stmt}");
+        assert!(stmt.contains("sch''ema"), "schema not escaped: {stmt}");
+        assert!(stmt.contains("cat''alog"), "catalog not escaped: {stmt}");
+        // Should NOT contain unescaped single quotes between the SQL string quotes
+        assert!(
+            !stmt.contains("tab'le"),
+            "unescaped table name found: {stmt}"
+        );
+    }
+
+    /// Simple test [`TokenProvider`] for unit tests.
+    #[derive(Debug)]
+    struct StaticTokenProvider(String);
+
+    impl TokenProvider for StaticTokenProvider {
+        fn get_token(&self) -> String {
+            self.0.clone()
+        }
+
+        fn dyn_hash(&self) -> String {
+            self.0.clone()
+        }
+    }
 }
 
 #[async_trait]
