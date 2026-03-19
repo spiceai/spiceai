@@ -686,7 +686,10 @@ async fn wait_for_row_count(
                     .downcast_ref::<arrow::array::Int64Array>()
                 {
                     #[expect(clippy::cast_sign_loss, reason = "COUNT(*) is always non-negative")]
-                    #[expect(clippy::cast_possible_truncation, reason = "row count fits in usize on 64-bit")]
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "row count fits in usize on 64-bit"
+                    )]
                     let count = arr.value(0) as usize;
                     last_count = Some(count);
                     if count == expected {
