@@ -43,8 +43,7 @@ pub(crate) struct AppCreateConfig {
 
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
     api_url_override
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "https://api.spice.ai".to_string())
+        .map_or_else(|| "https://api.spice.ai".to_string(), ToString::to_string)
         .trim_end_matches('/')
         .to_string()
 }

@@ -14,7 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BackendMode {
+    Scp,
+    Local,
+}
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -45,13 +51,13 @@ pub struct StdioArgs {
     pub channel: Option<String>,
 
     /// Spice Cloud API key for authentication.
-    /// When not provided, falls back to SPICEAI_API_KEY, SPICE_API_KEY, SPICE_SPICEAI_API_KEY, or SPICE_SPICEAI_TOKEN.
+    /// When not provided, falls back to `SPICEAI_API_KEY`, `SPICE_API_KEY`, `SPICE_SPICEAI_API_KEY`, or `SPICE_SPICEAI_TOKEN`.
     #[arg(long, env = "SPICEAI_API_KEY")]
     pub api_key: Option<String>,
 
     /// Backend mode for provisioning: `scp` (Spice Cloud Platform, default) or `local`.
     #[arg(long, env = "SPIDAPTER_BACKEND", default_value = "scp")]
-    pub backend: String,
+    pub backend: BackendMode,
 
     /// Override the Flight SQL endpoint URL instead of deriving it from the deployment cname.
     #[arg(long, env = "SPIDAPTER_FLIGHT_URL")]

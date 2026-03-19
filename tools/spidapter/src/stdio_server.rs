@@ -43,14 +43,12 @@ use uuid::Uuid;
 use crate::args::StdioArgs;
 use crate::commands;
 
-const SPIDAPTER_BACKEND_ENV: &str = "SPIDAPTER_BACKEND";
 const LOCAL_BIND_HOST: &str = "0.0.0.0";
 const LOCAL_CONNECT_HOST: &str = "127.0.0.1";
 const LOCAL_SPICED_BINARY: &str = "spiced";
 const LOCAL_SPICE_BINARY: &str = "spice";
 
 /// State for an active benchmark run provisioned via `setup`.
-#[allow(dead_code)]
 enum RunState {
     Scp {
         /// Spice Cloud app ID.
@@ -97,31 +95,7 @@ impl Drop for LocalRunState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum BackendMode {
-    Scp,
-    Local,
-}
-
-impl BackendMode {
-    fn from_args(args: &StdioArgs) -> Result<Self, String> {
-        parse_backend_mode(&args.backend)
-    }
-}
-
-fn parse_backend_mode(raw_value: &str) -> Result<BackendMode, String> {
-    let value = raw_value.trim();
-
-    if value.is_empty() || value.eq_ignore_ascii_case("scp") {
-        Ok(BackendMode::Scp)
-    } else if value.eq_ignore_ascii_case("local") {
-        Ok(BackendMode::Local)
-    } else {
-        Err(format!(
-            "Invalid {SPIDAPTER_BACKEND_ENV} value '{value}'. Supported values: scp, local"
-        ))
-    }
-}
+use crate::args::BackendMode;
 
 #[derive(Debug, Clone)]
 struct SetupConfig {
@@ -235,7 +209,7 @@ impl Handler for SpidapterHandler {
         );
 
         let setup_config = SetupConfig::from_metadata(&metadata).set_etl_sink_type(etl_sink_type);
-        let backend = BackendMode::from_args(&self.args)?;
+        let backend = self.args.backend;
 
         let state = match backend {
             BackendMode::Scp => {
@@ -1297,13 +1271,13 @@ fn generate_initial_spicepod(
                 )]))),
                 partition_management: None,
             };
-            if let Some(region) = aws_region {
-                if let Some(p) = sched.params.as_mut() {
-                    p.data.insert(
-                        "s3_region".to_string(),
-                        ParamValue::String(region.to_string()),
-                    );
-                }
+            if let Some(region) = aws_region
+                && let Some(p) = sched.params.as_mut()
+            {
+                p.data.insert(
+                    "s3_region".to_string(),
+                    ParamValue::String(region.to_string()),
+                );
             }
             spicepod.runtime.scheduler = Some(sched);
         }
@@ -1316,6 +1290,7 @@ fn generate_initial_spicepod(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use clap::ValueEnum;
     use std::sync::Arc;
 
     #[test]
@@ -1331,25 +1306,23 @@ mod tests {
 
     #[test]
     fn backend_mode_parser_defaults_to_scp() {
-        assert!(matches!(parse_backend_mode(""), Ok(BackendMode::Scp)));
-        assert!(matches!(parse_backend_mode("scp"), Ok(BackendMode::Scp)));
+        assert!(matches!(
+            BackendMode::from_str("scp", true),
+            Ok(BackendMode::Scp)
+        ));
     }
 
     #[test]
     fn backend_mode_parser_supports_local() {
         assert!(matches!(
-            parse_backend_mode("LOCAL"),
+            BackendMode::from_str("local", true),
             Ok(BackendMode::Local)
         ));
     }
 
     #[test]
     fn backend_mode_parser_rejects_unknown_values() {
-        let error = parse_backend_mode("unexpected").expect_err("invalid backend should fail");
-        assert!(
-            error.contains("Invalid SPIDAPTER_BACKEND value"),
-            "unexpected error: {error}"
-        );
+        assert!(BackendMode::from_str("unexpected", true).is_err());
     }
 
     #[test]
