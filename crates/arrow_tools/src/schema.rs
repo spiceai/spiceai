@@ -120,7 +120,10 @@ fn is_null_placeholder(field: &Arc<Field>) -> bool {
 }
 
 fn is_utf8_family(dt: &DataType) -> bool {
-    matches!(dt, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+    matches!(
+        dt,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
 }
 
 #[must_use]

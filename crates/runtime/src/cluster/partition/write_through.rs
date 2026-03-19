@@ -245,8 +245,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     if let Ok(batch) =
         flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)
         && batch.num_rows() > 0
-    {
-        if let Err(e) = route_batch_and_assign_unseen(
+        && let Err(e) = route_batch_and_assign_unseen(
             &batch,
             &mut executor_filters,
             &senders,
@@ -257,9 +256,8 @@ pub(crate) async fn forward_federated_partitioned_write(
             path,
         )
         .await
-        {
-            routing_error = Some(e);
-        }
+    {
+        routing_error = Some(e);
     }
 
     // Decode and route the rest of the stream.
@@ -271,8 +269,8 @@ pub(crate) async fn forward_federated_partitioned_write(
                 &dictionaries_by_id,
             )
             .context(DecodeBatchSnafu)?;
-            if batch.num_rows() > 0 {
-                if let Err(e) = route_batch_and_assign_unseen(
+            if batch.num_rows() > 0
+                && let Err(e) = route_batch_and_assign_unseen(
                     &batch,
                     &mut executor_filters,
                     &senders,
@@ -283,10 +281,9 @@ pub(crate) async fn forward_federated_partitioned_write(
                     path,
                 )
                 .await
-                {
-                    routing_error = Some(e);
-                    break;
-                }
+            {
+                routing_error = Some(e);
+                break;
             }
         }
     }
@@ -797,13 +794,11 @@ fn adapt_batch_schema(batch: &RecordBatch, target: &SchemaRef) -> RecordBatch {
             let source_field = &source_fields[i];
 
             // Cast data type if needed (e.g. Utf8 -> Utf8View).
-            let col = if source_field.data_type() != target_field.data_type() {
-                cast(col.as_ref(), target_field.data_type()).unwrap_or_else(|_| Arc::clone(col))
-            } else {
+            if source_field.data_type() == target_field.data_type() {
                 Arc::clone(col)
-            };
-
-            col
+            } else {
+                cast(col.as_ref(), target_field.data_type()).unwrap_or_else(|_| Arc::clone(col))
+            }
         })
         .collect();
 

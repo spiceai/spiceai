@@ -20,9 +20,7 @@ use crate::auth::EndpointAuth;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
-use crate::flight::{
-    Error, Service as SpiceFlightService, is_address_in_use_error, session_auth,
-};
+use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;

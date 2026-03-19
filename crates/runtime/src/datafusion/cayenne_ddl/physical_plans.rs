@@ -34,6 +34,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -202,6 +203,7 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
 }
 
 /// Creates a result schema for DDL operations (single "result" column).
+#[must_use]
 pub fn ddl_result_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "result",
@@ -1083,7 +1085,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
             if let Some(ref registry) = executor_registry {
                 let mut sql = format!("DELETE FROM {table_name}");
                 if let Some(ref filter) = filter_sql {
-                    sql.push_str(&format!(" WHERE {filter}"));
+                    let _ = write!(sql, " WHERE {filter}");
                 }
                 forward_ddl_to_executors(registry, &sql).await?;
             }
@@ -1220,7 +1222,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
                     .join(", ");
                 let mut sql = format!("UPDATE {table_name} SET {set_clause}");
                 if let Some(ref filter) = filter_sql {
-                    sql.push_str(&format!(" WHERE {filter}"));
+                    let _ = write!(sql, " WHERE {filter}");
                 }
                 forward_ddl_to_executors(registry, &sql).await?;
             }
