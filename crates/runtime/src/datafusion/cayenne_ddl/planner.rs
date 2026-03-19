@@ -111,7 +111,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
         if let Some(delete) = node.as_any().downcast_ref::<DistributedCayenneDeleteNode>() {
             let input = _physical_inputs.first().ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(
-                    "CayenneDeleteNode requires exactly one physical input".to_string(),
+                    "DistributedCayenneDeleteNode requires exactly one physical input".to_string(),
                 )
             })?;
             return Ok(Some(Arc::new(DistributedCayenneDeleteExec::new(
@@ -125,7 +125,7 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
         if let Some(update) = node.as_any().downcast_ref::<DistributedCayenneUpdateNode>() {
             let input = _physical_inputs.first().ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(
-                    "CayenneUpdateNode requires exactly one physical input".to_string(),
+                    "DistributedCayenneUpdateNode requires exactly one physical input".to_string(),
                 )
             })?;
             return Ok(Some(Arc::new(DistributedCayenneUpdateExec::new(

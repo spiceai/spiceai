@@ -708,7 +708,12 @@ async fn forward_batches_to_executor(
                 .with_schema(encoder_schema)
                 .build(ReceiverStream::new(rx).map(
                     move |b| -> std::result::Result<RecordBatch, arrow_flight::error::FlightError> {
-                        Ok(adapt_batch_schema(&b, &adapt_schema))
+                        arrow_tools::record_batch::try_cast_to(b, Arc::clone(&adapt_schema))
+                            .map_err(|e| {
+                                arrow_flight::error::FlightError::Arrow(
+                                    arrow::error::ArrowError::SchemaError(e.to_string()),
+                                )
+                            })
                     },
                 )),
         );
@@ -768,39 +773,4 @@ async fn forward_batches_to_executor(
         Ok(Ok(())) | Err(_) => Ok(()),
         Ok(Err(message)) => Err(Error::Encode { message }),
     }
-}
-
-/// Adapt a `RecordBatch` so its schema metadata (field nullability and data types)
-/// matches `target`. This handles the common case where the incoming batch has
-/// `Utf8` columns but the target table uses `Utf8View`, or where nullability
-/// differs between the client-provided schema and the registered table schema.
-fn adapt_batch_schema(batch: &RecordBatch, target: &SchemaRef) -> RecordBatch {
-    use arrow::compute::cast;
-
-    let target_fields = target.fields();
-    let source_fields = batch.schema().fields().clone();
-
-    // Fast path: if schemas already match, return as-is.
-    if source_fields == *target_fields {
-        return batch.clone();
-    }
-
-    let columns: Vec<Arc<dyn arrow::array::Array>> = batch
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            let target_field = &target_fields[i];
-            let source_field = &source_fields[i];
-
-            // Cast data type if needed (e.g. Utf8 -> Utf8View).
-            if source_field.data_type() == target_field.data_type() {
-                Arc::clone(col)
-            } else {
-                cast(col.as_ref(), target_field.data_type()).unwrap_or_else(|_| Arc::clone(col))
-            }
-        })
-        .collect();
-
-    RecordBatch::try_new(Arc::clone(target), columns).unwrap_or_else(|_| batch.clone())
 }

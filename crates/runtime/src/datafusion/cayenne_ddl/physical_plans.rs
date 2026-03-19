@@ -1082,13 +1082,16 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
-            if let Some(ref registry) = executor_registry {
-                let mut sql = format!("DELETE FROM {table_name}");
-                if let Some(ref filter) = filter_sql {
-                    let _ = write!(sql, " WHERE {filter}");
-                }
-                forward_ddl_to_executors(registry, &sql).await?;
+            let Some(ref registry) = executor_registry else {
+                return Err(DataFusionError::Execution(format!(
+                    "DELETE on '{table_name}' cannot be forwarded: no executor registry available"
+                )));
+            };
+            let mut sql = format!("DELETE FROM {table_name}");
+            if let Some(ref filter) = filter_sql {
+                let _ = write!(sql, " WHERE {filter}");
             }
+            forward_ddl_to_executors(registry, &sql).await?;
 
             RecordBatch::try_new(
                 result_schema,

@@ -452,7 +452,10 @@ impl Hash for DistributedCayenneDeleteNode {
 
 impl PartialEq for DistributedCayenneDeleteNode {
     fn eq(&self, other: &Self) -> bool {
-        self.table_name == other.table_name && self.input == other.input
+        self.table_name == other.table_name
+            && self.input == other.input
+            && self.output_schema == other.output_schema
+            && self.filter_sql == other.filter_sql
     }
 }
 

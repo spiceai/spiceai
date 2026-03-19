@@ -1352,9 +1352,7 @@ async fn create_delete_physical_plan(
             .await?
             .is_some()
     {
-        let filter_sql = super::cayenne_ddl::analyzer_rule::extract_filter_sql(&dml.input)
-            .ok()
-            .flatten();
+        let filter_sql = super::cayenne_ddl::analyzer_rule::extract_filter_sql(&dml.input)?;
         let result_schema = super::cayenne_ddl::physical_plans::ddl_result_schema();
         return Ok(Arc::new(
             super::cayenne_ddl::physical_plans::DistributedCayenneDeleteExec::new(
