@@ -764,6 +764,29 @@ fn databricks_dialect() -> super::dialect::DatabricksDialect {
     super::dialect::DatabricksDialect::new()
 }
 
+#[async_trait]
+impl crate::Read for DatabricksSqlWarehouse {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let dialect = Arc::new(databricks_dialect());
+
+        let table_provider = Arc::new(
+            SqlTable::new("databricks", &self.pool, table_reference, None)
+                .await
+                .context(SqlTableInitializationFailedSnafu)?
+                .with_dialect(dialect),
+        );
+
+        Ok(Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .context(TableProviderCreationFailedSnafu)?,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,7 +794,7 @@ mod tests {
     use serde_json::json;
 
     /// Helper to create a valid Databricks schema response JSON.
-    fn make_schema_response(data_array: Value) -> Value {
+    fn make_schema_response(data_array: &Value) -> Value {
         json!({
             "status": { "state": "SUCCEEDED" },
             "statement_id": "test-stmt-id",
@@ -781,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_basic() {
-        let response = make_schema_response(json!([
+        let response = make_schema_response(&json!([
             ["id", "int", "NO"],
             ["name", "string", "YES"],
             ["amount", "double", "NO"]
@@ -805,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_many_types() {
-        let response = make_schema_response(json!([
+        let response = make_schema_response(&json!([
             ["col_bigint", "bigint", "NO"],
             ["col_smallint", "smallint", "YES"],
             ["col_boolean", "boolean", "NO"],
@@ -833,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_empty_table() {
-        let response = make_schema_response(json!([]));
+        let response = make_schema_response(&json!([]));
 
         let schema = schema_from_json(&response).expect("should parse empty schema");
         assert_eq!(schema.fields().len(), 0);
@@ -841,7 +864,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_stops_at_clustering_metadata() {
-        let response = make_schema_response(json!([
+        let response = make_schema_response(&json!([
             ["id", "int", "NO"],
             ["name", "string", "YES"],
             ["# Clustering Information", "", ""],
@@ -897,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_row_not_array() {
-        let response = make_schema_response(json!(["not_an_array"]));
+        let response = make_schema_response(&json!(["not_an_array"]));
 
         let err = schema_from_json(&response).expect_err("should fail on non-array row");
         assert!(
@@ -908,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_row_too_short() {
-        let response = make_schema_response(json!([["id", "int"]]));
+        let response = make_schema_response(&json!([["id", "int"]]));
 
         let err = schema_from_json(&response).expect_err("should fail on short row");
         assert!(
@@ -919,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_column_name_not_string() {
-        let response = make_schema_response(json!([[123, "int", "NO"]]));
+        let response = make_schema_response(&json!([[123, "int", "NO"]]));
 
         let err = schema_from_json(&response).expect_err("should fail on non-string col name");
         assert!(
@@ -930,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_data_type_not_string() {
-        let response = make_schema_response(json!([["id", 42, "NO"]]));
+        let response = make_schema_response(&json!([["id", 42, "NO"]]));
 
         let err = schema_from_json(&response).expect_err("should fail on non-string data type");
         assert!(
@@ -941,7 +964,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_nullable_not_string() {
-        let response = make_schema_response(json!([["id", "int", true]]));
+        let response = make_schema_response(&json!([["id", "int", true]]));
 
         let err = schema_from_json(&response).expect_err("should fail on non-string nullable");
         assert!(
@@ -952,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_nullable_case_insensitive() {
-        let response = make_schema_response(json!([
+        let response = make_schema_response(&json!([
             ["a", "int", "YES"],
             ["b", "int", "Yes"],
             ["c", "int", "yes"],
@@ -1006,7 +1029,7 @@ mod tests {
 
     #[test]
     fn test_schema_from_json_unsupported_type() {
-        let response = make_schema_response(json!([["col", "TOTALLY_FAKE_TYPE", "NO"]]));
+        let response = make_schema_response(&json!([["col", "TOTALLY_FAKE_TYPE", "NO"]]));
 
         let err = schema_from_json(&response).expect_err("should fail on unsupported type");
         assert!(
@@ -1019,7 +1042,7 @@ mod tests {
     fn test_schema_from_json_extra_columns_ignored() {
         // Rows with more than 3 elements should still work (extra fields ignored)
         let response =
-            make_schema_response(json!([["id", "int", "NO", "extra_col", "another_extra"]]));
+            make_schema_response(&json!([["id", "int", "NO", "extra_col", "another_extra"]]));
 
         let schema = schema_from_json(&response).expect("should parse with extra columns");
         assert_eq!(schema.fields().len(), 1);
@@ -1145,28 +1168,5 @@ mod tests {
         fn dyn_hash(&self) -> String {
             self.0.clone()
         }
-    }
-}
-
-#[async_trait]
-impl crate::Read for DatabricksSqlWarehouse {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let dialect = Arc::new(databricks_dialect());
-
-        let table_provider = Arc::new(
-            SqlTable::new("databricks", &self.pool, table_reference, None)
-                .await
-                .context(SqlTableInitializationFailedSnafu)?
-                .with_dialect(dialect),
-        );
-
-        Ok(Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .context(TableProviderCreationFailedSnafu)?,
-        ))
     }
 }
