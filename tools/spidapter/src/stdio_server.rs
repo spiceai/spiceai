@@ -1322,7 +1322,7 @@ mod tests {
 
     #[test]
     fn backend_mode_parser_rejects_unknown_values() {
-        assert!(BackendMode::from_str("unexpected", true).is_err());
+        BackendMode::from_str("unexpected", true).unwrap_err()
     }
 
     #[test]
