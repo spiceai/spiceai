@@ -87,9 +87,9 @@ jobs:
         id: set_version
         run: |
           commit_hash=$(git rev-parse --short HEAD)
-          date="$(date +%Y%m%d)"
-          version="${date}-${commit_hash}"
-          nightly_label="nightly.${date}.${commit_hash}"
+          timestamp="$(date +%Y%m%d%H%M)"
+          version="${timestamp}-${commit_hash}"
+          nightly_label="nightly.${timestamp}.${commit_hash}"
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
 
