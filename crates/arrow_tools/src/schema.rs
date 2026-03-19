@@ -93,10 +93,11 @@ pub fn verify_schema(
             continue;
         }
 
-        // We set the DataFusion option `df_config.options_mut().optimizer.expand_views_at_output = true`
-        // to expand views at the output of a query. This means that a query that expects a
-        // `Utf8View` will be expanded to a `LargeUtf8` in the result set.
-        if a_data_type == &DataType::Utf8View && b_data_type == &DataType::LargeUtf8 {
+        // Utf8View is semantically equivalent to Utf8 and LargeUtf8 — they differ
+        // only in memory layout. Accept any combination of these string types so
+        // that DoPut clients (ADBC, Flight) can send Utf8 data to Cayenne tables
+        // that store columns as Utf8View.
+        if is_utf8_family(a_data_type) && is_utf8_family(b_data_type) {
             continue;
         }
 
@@ -116,6 +117,13 @@ pub fn verify_schema(
 fn is_null_placeholder(field: &Arc<Field>) -> bool {
     let is_placeholder = field.name().starts_with('$') || field.name().starts_with('?');
     is_placeholder && field.data_type() == &DataType::Null
+}
+
+fn is_utf8_family(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
 }
 
 #[must_use]
