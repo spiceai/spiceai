@@ -16,8 +16,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::str::FromStr;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use tokio::process::{Child, Command as TokioCommand};
 
 use arrow::datatypes::DataType;
@@ -678,6 +680,9 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
+    // Verify that both scheduler and executor pods are reporting metrics before proceeding.
+    wait_for_expected_pods(&cloud, app_id, Duration::from_secs(ready_wait)).await?;
+
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
     post_setup_sink_action(setup_config, datasets, &sql_url, Some(&api_key)).await?;
 
@@ -1057,6 +1062,58 @@ fn spawn_local_spiced(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| anyhow::anyhow!("Failed to start local {process_name} process: {error}"))
+}
+
+/// Poll [`CloudClient::get_app_metrics`] until both a scheduler and an executor
+/// pod are present, or `timeout` elapses.
+async fn wait_for_expected_pods(
+    cloud: &CloudClient,
+    app_id: i64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    let started = tokio::time::Instant::now();
+
+    loop {
+        match cloud.get_app_metrics(app_id, None).await {
+            Ok(metrics) => {
+                let has_scheduler = metrics
+                    .metrics
+                    .keys()
+                    .any(|name| name.contains("scheduler"));
+                let has_executor = metrics
+                    .metrics
+                    .keys()
+                    .any(|name| name.contains("executor"));
+
+                if has_scheduler && has_executor {
+                    eprintln!(
+                        "[stdio] All expected pods are present ({} pod(s) reporting)",
+                        metrics.metrics.len()
+                    );
+                    return Ok(());
+                }
+
+                let elapsed = started.elapsed().as_secs();
+                eprintln!(
+                    "[stdio] Waiting for pods: scheduler={has_scheduler}, executor={has_executor} ({elapsed}s elapsed)"
+                );
+            }
+            Err(e) => {
+                let elapsed = started.elapsed().as_secs();
+                eprintln!("[stdio] Failed to fetch app metrics: {e} ({elapsed}s elapsed)");
+            }
+        }
+
+        if started.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "Timed out after {}s waiting for scheduler and executor pods to appear in metrics",
+                timeout.as_secs(),
+            ));
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 async fn wait_for_local_http_ready(
