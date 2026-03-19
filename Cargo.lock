@@ -4427,6 +4427,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "cookie"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
+dependencies = [
+ "percent-encoding",
+ "time",
+ "version_check",
+]
+
+[[package]]
+name = "cookie_store"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "indexmap 2.13.0",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6611,6 +6640,15 @@ name = "doctest-file"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
+
+[[package]]
+name = "document-features"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
+dependencies = [
+ "litrs",
+]
 
 [[package]]
 name = "document_parse"
@@ -8897,6 +8935,29 @@ dependencies = [
  "indicatif 0.17.11",
  "libc",
  "log",
+ "num_cpus",
+ "rand 0.9.2",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "ureq 2.12.1",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "hf-hub"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
+dependencies = [
+ "dirs",
+ "futures",
+ "http 1.4.0",
+ "indicatif 0.18.4",
+ "libc",
+ "log",
  "native-tls",
  "num_cpus",
  "rand 0.9.2",
@@ -8905,8 +8966,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "ureq",
- "windows-sys 0.60.2",
+ "ureq 3.2.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10670,6 +10731,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
+name = "litrs"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+
+[[package]]
 name = "llguidance"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10706,7 +10773,7 @@ dependencies = [
  "futures",
  "google-genai",
  "governor",
- "hf-hub",
+ "hf-hub 0.5.0",
  "indexmap 2.13.0",
  "insta",
  "itertools 0.14.0",
@@ -11400,7 +11467,7 @@ dependencies = [
  "galil-seiferas",
  "half",
  "hashbrown 0.16.1",
- "hf-hub",
+ "hf-hub 0.4.3",
  "hound",
  "html2text",
  "http 1.4.0",
@@ -11525,7 +11592,7 @@ dependencies = [
  "candle-nn 0.9.2",
  "float8 0.6.1",
  "half",
- "hf-hub",
+ "hf-hub 0.4.3",
  "lazy_static",
  "memmap2",
  "objc2-foundation 0.3.2",
@@ -11560,7 +11627,7 @@ dependencies = [
  "anyhow",
  "clap",
  "half",
- "hf-hub",
+ "hf-hub 0.4.3",
  "ndarray 0.15.6",
  "safetensors 0.5.3",
  "serde_json",
@@ -15958,7 +16025,7 @@ dependencies = [
  "governor",
  "graphql-parser",
  "headers-accept",
- "hf-hub",
+ "hf-hub 0.5.0",
  "http 1.4.0",
  "http-body-util",
  "humantime",
@@ -19380,7 +19447,7 @@ dependencies = [
  "clap",
  "duckdb",
  "futures",
- "hf-hub",
+ "hf-hub 0.5.0",
  "insta",
  "itertools 0.14.0",
  "rand 0.9.2",
@@ -19400,7 +19467,7 @@ name = "text-embeddings-backend"
 version = "1.8.2"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=58b44fbbbde55a6ea33c8d0b4b9504942405c481#58b44fbbbde55a6ea33c8d0b4b9504942405c481"
 dependencies = [
- "hf-hub",
+ "hf-hub 0.4.3",
  "rand 0.9.2",
  "serde",
  "serde_json",
@@ -19449,7 +19516,7 @@ version = "1.8.2"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=58b44fbbbde55a6ea33c8d0b4b9504942405c481#58b44fbbbde55a6ea33c8d0b4b9504942405c481"
 dependencies = [
  "async-channel 2.5.0",
- "hf-hub",
+ "hf-hub 0.4.3",
  "metrics",
  "serde_json",
  "text-embeddings-backend",
@@ -19746,7 +19813,7 @@ dependencies = [
  "esaxx-rs",
  "fancy-regex 0.14.0",
  "getrandom 0.3.4",
- "hf-hub",
+ "hf-hub 0.4.3",
  "indicatif 0.17.11",
  "itertools 0.14.0",
  "log",
@@ -21086,7 +21153,6 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "log",
- "native-tls",
  "once_cell",
  "rustls 0.23.36",
  "rustls-pki-types",
@@ -21095,6 +21161,42 @@ dependencies = [
  "socks",
  "url",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ureq"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdc97a28575b85cfedf2a7e7d3cc64b3e11bd8ac766666318003abbacc7a21fc"
+dependencies = [
+ "base64 0.22.1",
+ "cookie_store",
+ "der 0.7.10",
+ "flate2",
+ "log",
+ "native-tls",
+ "percent-encoding",
+ "rustls 0.23.36",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "socks",
+ "ureq-proto",
+ "utf-8",
+ "webpki-root-certs",
+ "webpki-roots 1.0.5",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d81f9efa9df032be5934a46a068815a10a042b494b6a58cb0a1a97bb5467ed6f"
+dependencies = [
+ "base64 0.22.1",
+ "http 1.4.0",
+ "httparse",
+ "log",
 ]
 
 [[package]]
