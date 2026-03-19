@@ -1228,6 +1228,9 @@ fn generate_hive_spicepod(
         ]);
         if let Some(endpoint) = &setup_config.endpoint {
             param_map.insert("s3_endpoint".to_string(), endpoint.clone());
+            if endpoint.starts_with("http://") {
+                param_map.insert("allow_http".to_string(), "true".to_string());
+            }
         }
 
         let mut dataset = Dataset::new(from, dataset_name.as_str());
@@ -1386,6 +1389,7 @@ mod tests {
         assert!(spicepod_yaml.contains("file_format: parquet"));
         assert!(spicepod_yaml.contains("s3_region: us-west-2"));
         assert!(spicepod_yaml.contains("s3_endpoint: \"http://localhost:9000\""));
+        assert!(spicepod_yaml.contains("allow_http: \"true\""));
         assert!(spicepod_yaml.contains("engine: cayenne"));
         assert!(spicepod_yaml.contains("mode: file"));
         assert!(spicepod_yaml.contains("refresh_mode: full"));
