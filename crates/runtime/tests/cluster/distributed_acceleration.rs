@@ -55,7 +55,7 @@ const TEST_DATA_CSV: &str = r"id,name,age,city,score
 10,Anna Garcia,41,San Jose,90
 ";
 
-/// Secondary CSV for join tests: id + category + rating, matching TEST_DATA_CSV ids 1–10.
+/// Secondary CSV for join tests: id + category + rating, matching `TEST_DATA_CSV` ids 1–10.
 const CATEGORIES_CSV: &str = r"id,category,rating
 1,A,4.5
 2,B,3.2
@@ -149,7 +149,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                     |
             |               |   CooperativeExec                                                                                                                                                                       |
             |               |     BytesProcessedExec                                                                                                                                                                  |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2'                                   |
+            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2'                                  |
             |               |                                                                                                                                                                                         |
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);
@@ -276,17 +276,17 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 .expect("format explain")
                 .to_string();
             insta::assert_snapshot!(plan_fmt, @r"
-            +---------------+----------------------------------------------------------------------------+
-            | plan_type     | plan                                                                       |
-            +---------------+----------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                          |
-            |               |   TableScan: test_data projection=[id, name, age, city, score]             |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]        |
-            |               |   CooperativeExec                                                          |
-            |               |     BytesProcessedExec                                                     |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data   |
-            |               |                                                                            |
-            +---------------+----------------------------------------------------------------------------+
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | plan_type     | plan                                                                                                                                                                                                                        |
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                                           |
+            |               |   TableScan: test_data projection=[id, name, age, city, score], full_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")] |
+            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                         |
+            |               |   CooperativeExec                                                                                                                                                                                                           |
+            |               |     BytesProcessedExec                                                                                                                                                                                                      |
+            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(4, "id") = '0' OR bucket(4, "id") = '1' OR bucket(4, "id") = '2' OR bucket(4, "id") = '3'                                             |
+            |               |                                                                                                                                                                                                                             |
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             ");
 
             let rows = harness.query(select_all_sql).await?;
@@ -390,17 +390,17 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
                 .expect("format explain")
                 .to_string();
             insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+-------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                            |
-            +---------------+-------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                               |
-            |               |   TableScan: test_data projection=[id, name, score], full_filters=[test_data.score > Int64(85)] |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                             |
-            |               |   CooperativeExec                                                                               |
-            |               |     BytesProcessedExec                                                                          |
-            |               |       FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE "score" > 85                |
-            |               |                                                                                                 |
-            +---------------+-------------------------------------------------------------------------------------------------+
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | plan_type     | plan                                                                                                                                                                                                      |
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                         |
+            |               |   TableScan: test_data projection=[id, name, score], full_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2"), test_data.score > Int64(85)] |
+            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                       |
+            |               |   CooperativeExec                                                                                                                                                                                         |
+            |               |     BytesProcessedExec                                                                                                                                                                                    |
+            |               |       FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2' AND "score" > 85                                              |
+            |               |                                                                                                                                                                                                           |
+            +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);
 
             let rows = harness.query(filtered_sql).await?;
@@ -609,28 +609,28 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .expect("format explain")
                 .to_string();
             insta::assert_snapshot!(plan_fmt, @r"
-            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                       |
-            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: t.id ASC NULLS LAST                                                                                                                                  |
-            |               |   Projection: t.id, t.name, c.category, c.rating                                                                                                           |
-            |               |     Inner Join: t.id = c.id                                                                                                                                |
-            |               |       SubqueryAlias: t                                                                                                                                     |
-            |               |         TableScan: test_data projection=[id, name]                                                                                                         |
-            |               |       SubqueryAlias: c                                                                                                                                     |
-            |               |         TableScan: categories projection=[id, category, rating]                                                                                            |
-            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                             |
-            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                       |
-            |               |     HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4] |
-            |               |       CooperativeExec                                                                                                                                      |
-            |               |         BytesProcessedExec                                                                                                                                 |
-            |               |           FlightSqlExec sql=SELECT id, name FROM test_data                                                                                                 |
-            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                 |
-            |               |         CooperativeExec                                                                                                                                    |
-            |               |           BytesProcessedExec                                                                                                                               |
-            |               |             FlightSqlExec sql=SELECT id, category, rating FROM categories                                                                                  |
-            |               |                                                                                                                                                            |
-            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | plan_type     | plan                                                                                                                                                                                                                         |
+            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | logical_plan  | Sort: t.id ASC NULLS LAST                                                                                                                                                                                                    |
+            |               |   Projection: t.id, t.name, c.category, c.rating                                                                                                                                                                             |
+            |               |     Inner Join: t.id = c.id                                                                                                                                                                                                  |
+            |               |       SubqueryAlias: t                                                                                                                                                                                                       |
+            |               |         TableScan: test_data projection=[id, name], full_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")]              |
+            |               |       SubqueryAlias: c                                                                                                                                                                                                       |
+            |               |         TableScan: categories projection=[id, category, rating], full_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")] |
+            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                                                                                               |
+            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                                         |
+            |               |     HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4]                                                                   |
+            |               |       CooperativeExec                                                                                                                                                                                                        |
+            |               |         BytesProcessedExec                                                                                                                                                                                                   |
+            |               |           FlightSqlExec sql=SELECT id, name FROM test_data WHERE bucket(4, "id") = '0' OR bucket(4, "id") = '1' OR bucket(4, "id") = '2' OR bucket(4, "id") = '3'                                                            |
+            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                                   |
+            |               |         CooperativeExec                                                                                                                                                                                                      |
+            |               |           BytesProcessedExec                                                                                                                                                                                                 |
+            |               |             FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE bucket(4, "id") = '0' OR bucket(4, "id") = '1' OR bucket(4, "id") = '2' OR bucket(4, "id") = '3'                                             |
+            |               |                                                                                                                                                                                                                              |
+            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             ");
 
             let rows = harness.query(join_sql).await?;
@@ -672,30 +672,28 @@ async fn wait_for_row_count(
     let start = std::time::Instant::now();
     let mut last_count: Option<usize> = None;
     loop {
-        match harness
+        if let Ok(batches) = harness
             .query(&format!("SELECT COUNT(*) AS cnt FROM {table}"))
             .await
         {
-            Ok(batches) => {
-                for batch in &batches {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    if let Some(arr) = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int64Array>()
-                    {
-                        #[allow(clippy::cast_sign_loss)]
-                        let count = arr.value(0) as usize;
-                        last_count = Some(count);
-                        if count == expected {
-                            return Ok(());
-                        }
+            for batch in &batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                if let Some(arr) = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                {
+                    #[expect(clippy::cast_sign_loss, reason = "COUNT(*) is always non-negative")]
+                    #[expect(clippy::cast_possible_truncation, reason = "row count fits in usize on 64-bit")]
+                    let count = arr.value(0) as usize;
+                    last_count = Some(count);
+                    if count == expected {
+                        return Ok(());
                     }
                 }
             }
-            Err(_) => {}
         }
         if start.elapsed() > timeout {
             return Err(anyhow::anyhow!(
