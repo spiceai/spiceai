@@ -37,7 +37,7 @@ use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
     ResourceMetrics, Server, SetupResponse, TeardownResponse,
 };
-use tokio::time::sleep;
+use tokio::time::{Sleep, sleep};
 use uuid::Uuid;
 
 use crate::args::StdioArgs;
@@ -674,6 +674,8 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
+    sleep(Duration::from_secs(15)).await;
+    
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
     post_setup_sink_action(setup_config, datasets, &sql_url, Some(&api_key)).await?;
 
