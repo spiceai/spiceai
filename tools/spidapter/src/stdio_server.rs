@@ -1081,10 +1081,7 @@ async fn wait_for_expected_pods(
                     .metrics
                     .keys()
                     .any(|name| name.contains("scheduler"));
-                let has_executor = metrics
-                    .metrics
-                    .keys()
-                    .any(|name| name.contains("executor"));
+                let has_executor = metrics.metrics.keys().any(|name| name.contains("executor"));
 
                 if has_scheduler && has_executor {
                     eprintln!(
