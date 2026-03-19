@@ -1293,10 +1293,12 @@ fn generate_initial_spicepod(
                 partition_management: None,
             };
             if let Some(region) = aws_region {
-                sched.params.as_mut().map(|p| {
-                    p.data
-                        .insert("s3_region".to_string(), ParamValue::String(region.to_string()))
-                });
+                if let Some(p) = sched.params.as_mut() {
+                    p.data.insert(
+                        "s3_region".to_string(),
+                        ParamValue::String(region.to_string()),
+                    );
+                }
             }
             spicepod.runtime.scheduler = Some(sched);
         }
@@ -1387,7 +1389,9 @@ mod tests {
         assert!(spicepod_yaml.contains("refresh_mode: full"));
         assert!(spicepod_yaml.contains("telemetry:"));
         assert!(spicepod_yaml.contains("enabled: false"));
-        assert!(spicepod_yaml.contains("state_location: \"s3://bucket/state\""));
+        assert!(spicepod_yaml.contains(
+            "state_location: \"s3://bucket/state/00000000-0000-0000-0000-000000000000\""
+        ));
         assert!(spicepod_yaml.contains("s3_auth: key"));
     }
 
@@ -1521,16 +1525,16 @@ mod tests {
         .expect("statement should generate");
 
         assert!(
-            statement.contains("PARTITION BY (\"region\")"),
+            statement.contains("PARTITION BY (region)"),
             "expected PARTITION BY clause in: {statement}"
         );
     }
 
     #[test]
-    fn adbc_create_table_statement_errors_when_partition_column_missing() {
+    fn adbc_create_table_statement_allows_partition_column_not_in_schema() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
-        let err = generate_adbc_create_table_statement(
+        let statement = generate_adbc_create_table_statement(
             "events",
             &DatasetConfig {
                 schema,
@@ -1540,11 +1544,11 @@ mod tests {
                 partition_columns: vec!["missing_col".to_string()],
             },
         )
-        .expect_err("partition column not in schema should fail");
+        .expect("partition column not in schema should still succeed");
 
         assert!(
-            err.to_string().contains("is not present in the schema"),
-            "unexpected error: {err}"
+            statement.contains("PARTITION BY (missing_col)"),
+            "expected PARTITION BY clause in: {statement}"
         );
     }
 

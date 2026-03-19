@@ -42,7 +42,7 @@ pub struct StdioArgs {
     pub channel: Option<String>,
 
     /// Spice Cloud API key for authentication.
-    /// When not provided, falls back to SPICE_API_KEY, SPICE_SPICEAI_API_KEY, or SPICE_SPICEAI_TOKEN.
+    /// When not provided, falls back to SPICEAI_API_KEY, SPICE_API_KEY, SPICE_SPICEAI_API_KEY, or SPICE_SPICEAI_TOKEN.
     #[arg(long, env = "SPICEAI_API_KEY")]
     pub api_key: Option<String>,
 
@@ -71,11 +71,11 @@ pub struct StdioArgs {
     pub app_memory_request: Option<String>,
 
     /// Number of replicas for the Spice Cloud app (scheduler). Defaults to the platform default when not set.
-    #[arg(long, env = "SPIDAPTER_APP_REPLICAS")]
+    #[arg(long, env = "SPIDAPTER_APP_REPLICAS", value_parser = clap::value_parser!(i32).range(0..))]
     pub app_replicas: Option<i32>,
 
     /// Number of replicas for the Spice Cloud executor.
-    #[arg(long, env = "SPIDAPTER_EXECUTOR_REPLICAS", default_value = "1")]
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_REPLICAS", default_value = "1", value_parser = clap::value_parser!(i32).range(0..))]
     pub executor_replicas: i32,
 
     /// Memory limit for the Spice Cloud executor pod (e.g. `16Gi`).
