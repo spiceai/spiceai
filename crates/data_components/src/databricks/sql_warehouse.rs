@@ -260,7 +260,7 @@ impl SqlWarehouseApi {
             "statement": sql,
             "format": "JSON_ARRAY",
             "disposition": "INLINE",
-            "wait_timeout": "30s",
+            "wait_timeout": "5m",
             "on_wait_timeout": "CONTINUE",
         }))
     }
@@ -652,7 +652,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
-            "wait_timeout": "30s",
+            "wait_timeout": "5m",
             "on_wait_timeout": "CONTINUE",
             "statement": query,
         });
@@ -721,7 +721,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
-            "wait_timeout": "30s",
+            "wait_timeout": "5m",
             "on_wait_timeout": "CONTINUE",
             "statement": sql,
         });
@@ -1051,7 +1051,7 @@ mod tests {
 
         assert_eq!(payload["format"], "JSON_ARRAY");
         assert_eq!(payload["disposition"], "INLINE");
-        assert_eq!(payload["wait_timeout"], "30s");
+        assert_eq!(payload["wait_timeout"], "5m");
         assert_eq!(payload["on_wait_timeout"], "CONTINUE");
         assert_eq!(payload["warehouse_id"], "warehouse-123");
         assert!(
