@@ -298,7 +298,10 @@ impl JobExecutor {
             Error::SessionCreationFailed { .. } | Error::JobSubmissionFailed { .. } => {
                 JobErrorCode::SubmissionFailed
             }
-            Error::UnableToExecuteQuery { .. } | Error::TableAccessDisallowed { .. } => {
+            Error::UnableToExecuteQuery { .. }
+            | Error::TableAccessDisallowed { .. }
+            | Error::AcceleratedTableNotSupportedInDistributedQuery { .. }
+            | Error::CayenneCatalogTableNotSupportedInDistributedQuery { .. } => {
                 JobErrorCode::ExecutionFailed
             }
             Error::BindingParameters { .. } => JobErrorCode::ParameterBindingFailed,
