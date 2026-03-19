@@ -420,6 +420,8 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
+        const MAX_ATTEMPTS: u64 = 5;
+
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
@@ -432,26 +434,36 @@ async fn post_setup_sink_action(
                 }
                 let response = request.send().await?;
 
-                if response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+                let trimmed_body = body.trim();
+
+                // A successful DDL response is HTTP 2xx with a non-empty JSON array, e.g. `[{"result":"Table 'X' created"}]`.
+                let is_success =
+                    status.is_success() && !trimmed_body.is_empty() && trimmed_body != "[]";
+
+                if is_success {
+                    eprintln!(
+                        "[stdio] SQL succeeded on attempt {}: {trimmed_body}",
+                        attempts + 1
+                    );
                     break;
                 }
 
                 attempts += 1;
 
-                if attempts >= 3 {
-                    let status = response.status();
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|e| format!("<failed to read error response body: {e}>"));
+                if attempts >= MAX_ATTEMPTS {
                     return Err(anyhow::anyhow!(
-                        "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
+                        "Failed to execute post-setup SQL against {sql_url} after {MAX_ATTEMPTS} attempts: status={status}, sql={statement}, body={body}"
                     ));
                 }
 
                 let backoff_seconds = attempts * 2;
                 eprintln!(
-                    "[stdio] Post-setup SQL failed, retrying in {backoff_seconds}s (attempt {attempts}/3)"
+                    "[stdio] Post-setup SQL failed (status={status}, body={trimmed_body}), retrying in {backoff_seconds}s (attempt {attempts}/{MAX_ATTEMPTS})"
                 );
                 sleep(Duration::from_secs(backoff_seconds)).await;
             }
