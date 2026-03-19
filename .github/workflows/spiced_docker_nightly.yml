@@ -174,7 +174,7 @@ jobs:
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.enterprise
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-arm64
@@ -263,7 +263,7 @@ jobs:
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.enterprise
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai-enterprise-nightly:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-amd64

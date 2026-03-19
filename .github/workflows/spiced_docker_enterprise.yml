@@ -138,7 +138,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile-release
+          file: Dockerfile-release.enterprise
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai-enterprise:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-amd64
@@ -216,7 +216,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile-release
+          file: Dockerfile-release.enterprise
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai-enterprise:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-arm64
@@ -277,7 +277,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile-cuda-release
+          file: Dockerfile-cuda-release.enterprise
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai-enterprise:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda.tar
           cache-from: type=gha,scope=build-cuda
