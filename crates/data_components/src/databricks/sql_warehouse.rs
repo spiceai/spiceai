@@ -526,6 +526,10 @@ impl SqlWarehouseApi {
             state = Self::extract_response_status(&response)?;
         }
 
+        if Self::is_async_query(state) {
+            return Err(Error::QueryStillRunning);
+        }
+
         Ok(response)
     }
 
