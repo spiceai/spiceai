@@ -1,0 +1,27 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "e2044fa11e98",
+  "strategy": "manual-commit",
+  "branch": "jeadie/26-03-18/flags-spidapter",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "tools/spidapter/src/args/mod.rs",
+    "tools/spidapter/src/stdio_server.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/e2/044fa11e98/0/metadata.json",
+      "transcript": "/e2/044fa11e98/0/full.jsonl",
+      "context": "/e2/044fa11e98/0/context.md",
+      "content_hash": "/e2/044fa11e98/0/content_hash.txt",
+      "prompt": "/e2/044fa11e98/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 12,
+    "cache_creation_tokens": 22824,
+    "cache_read_tokens": 329924,
+    "output_tokens": 2260,
+    "api_call_count": 10
+  }
+}
