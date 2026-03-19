@@ -43,7 +43,9 @@ limitations under the License.
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::TableReference;
-use datafusion::sql::sqlparser::ast::{CreateTableOptions, SqlOption, Statement};
+use datafusion::sql::sqlparser::ast::{
+    ColumnOption, CreateTableOptions, SqlOption, Statement, TableConstraint,
+};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -138,6 +140,19 @@ pub fn preprocess_create_table_with_options(
 
     // Extract PARTITION BY expression if present
     let partition_by_expr = create_table.partition_by.clone();
+
+    // Limitation: In distributed mode, primary keys must include the partitioning key
+    // to ensure correct on-conflict behavior. When data is partitioned across different
+    // executor nodes, on-conflict checks cannot work correctly if the partition key is
+    // not part of the primary key — a conflicting row may reside on a different
+    // executor's partition and be invisible during the conflict check.
+    if let Some(ref partition_expr) = partition_by_expr {
+        validate_partition_key_in_primary_key(
+            partition_expr,
+            &create_table.constraints,
+            &create_table.columns,
+        )?;
+    }
 
     let has_with_options = with_options.is_some();
     let has_partition_by = partition_by_expr.is_some();
@@ -296,6 +311,125 @@ fn clean_option_values(opts: Vec<(String, String)>) -> Vec<(String, String)> {
             (k, v)
         })
         .collect()
+}
+
+/// Extract simple column names from a `PARTITION BY` expression.
+///
+/// Handles:
+/// - `Identifier` for single-column partition keys (e.g., `PARTITION BY region`)
+/// - `bucket(num_buckets, column)` function calls (extracts the column argument)
+/// - Nested/parenthesized expressions
+///
+/// Returns an empty vec for unrecognized complex expressions.
+fn extract_partition_column_names(expr: &datafusion::sql::sqlparser::ast::Expr) -> Vec<String> {
+    use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+
+    match expr {
+        Expr::Identifier(ident) => {
+            vec![ident.value.to_lowercase()]
+        }
+        Expr::Nested(inner) => extract_partition_column_names(inner),
+        Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("bucket") => {
+            // bucket(num_buckets, column) — extract the column from the second argument.
+            if let FunctionArguments::List(ref arg_list) = func.args {
+                arg_list
+                    .args
+                    .get(1)
+                    .and_then(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                            Some(vec![ident.value.to_lowercase()])
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Extract primary key column names from a `CREATE TABLE` statement.
+///
+/// Checks both table-level `PRIMARY KEY (col1, col2)` constraints and
+/// column-level `col INT PRIMARY KEY` definitions.
+fn extract_primary_key_columns(
+    constraints: &[TableConstraint],
+    columns: &[datafusion::sql::sqlparser::ast::ColumnDef],
+) -> Vec<String> {
+    let mut pk_cols = Vec::new();
+
+    // Table-level PRIMARY KEY constraint
+    for constraint in constraints {
+        if let TableConstraint::PrimaryKey { columns, .. } = constraint {
+            for idx_col in columns {
+                if let datafusion::sql::sqlparser::ast::Expr::Identifier(ident) =
+                    &idx_col.column.expr
+                {
+                    pk_cols.push(ident.value.to_lowercase());
+                }
+            }
+        }
+    }
+
+    // Column-level PRIMARY KEY (e.g., `id INT PRIMARY KEY`)
+    for col_def in columns {
+        for opt_def in &col_def.options {
+            if matches!(
+                &opt_def.option,
+                ColumnOption::Unique {
+                    is_primary: true,
+                    ..
+                }
+            ) {
+                pk_cols.push(col_def.name.value.to_lowercase());
+            }
+        }
+    }
+
+    pk_cols
+}
+
+/// Validate that partition key columns are included in the primary key.
+///
+/// This is currently required to satisfy on-conflict behavior in distributed mode.
+/// When data is partitioned across different executor nodes, on-conflict checks
+/// cannot work correctly if the partition key is not part of the primary key,
+/// because a conflicting row may reside on a different executor's partition and
+/// be invisible during the conflict check.
+fn validate_partition_key_in_primary_key(
+    partition_expr: &datafusion::sql::sqlparser::ast::Expr,
+    constraints: &[TableConstraint],
+    columns: &[datafusion::sql::sqlparser::ast::ColumnDef],
+) -> DFResult<()> {
+    let partition_cols = extract_partition_column_names(partition_expr);
+    if partition_cols.is_empty() {
+        return Ok(());
+    }
+
+    let pk_cols = extract_primary_key_columns(constraints, columns);
+    if pk_cols.is_empty() {
+        // No primary key defined — nothing to validate.
+        return Ok(());
+    }
+
+    let missing: Vec<&str> = partition_cols
+        .iter()
+        .filter(|p| !pk_cols.iter().any(|pk| pk == *p))
+        .map(String::as_str)
+        .collect();
+
+    if !missing.is_empty() {
+        return Err(DataFusionError::Plan(format!(
+            "The primary key must include the partition column(s) '{}'. \
+             Add the missing column(s) to the PRIMARY KEY constraint. \
+             This is required for correct on-conflict behavior in distributed mode.",
+            missing.join("', '")
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -504,5 +638,78 @@ mod tests {
             .expect("should have extensions for 'foo'");
         assert!(ddl_ext.acceleration.is_some());
         assert!(ddl_ext.partition_by.is_some());
+    }
+
+    #[test]
+    fn test_preprocess_partition_key_included_in_primary_key() {
+        let store = new_shared_store();
+        let sql = "CREATE TABLE foo (id INT, p_category TEXT, PRIMARY KEY (id, p_category)) PARTITION BY p_category";
+        let result = preprocess_create_table_with_options(sql, &store).expect("should succeed");
+        assert!(matches!(result, PreprocessResult::Modified { .. }));
+    }
+
+    #[test]
+    fn test_preprocess_partition_key_not_in_primary_key_errors() {
+        let store = new_shared_store();
+        let sql =
+            "CREATE TABLE foo (id INT, p_category TEXT, PRIMARY KEY (id)) PARTITION BY p_category";
+        let result = preprocess_create_table_with_options(sql, &store);
+        let err = result.expect_err("should return an error").to_string();
+        assert!(
+            err.contains("p_category"),
+            "Error should mention the missing partition column: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("primary key"),
+            "Error should mention primary key: {err}"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_partition_key_with_column_level_primary_key_errors() {
+        let store = new_shared_store();
+        let sql = "CREATE TABLE foo (id INT PRIMARY KEY, p_category TEXT) PARTITION BY p_category";
+        let result = preprocess_create_table_with_options(sql, &store);
+        let err = result.expect_err("should return an error").to_string();
+        assert!(
+            err.contains("p_category"),
+            "Error should mention the missing partition column: {err}"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_partition_by_no_primary_key_succeeds() {
+        let store = new_shared_store();
+        let sql = "CREATE TABLE foo (id INT, p_category TEXT) PARTITION BY p_category";
+        let result = preprocess_create_table_with_options(sql, &store).expect("should succeed");
+        assert!(matches!(result, PreprocessResult::Modified { .. }));
+    }
+
+    #[test]
+    fn test_preprocess_partition_key_composite_primary_key_valid() {
+        let store = new_shared_store();
+        let sql = "CREATE TABLE foo (p_id INT, p_category TEXT, name VARCHAR, PRIMARY KEY (p_id, p_category)) PARTITION BY p_category";
+        let result = preprocess_create_table_with_options(sql, &store).expect("should succeed");
+        assert!(matches!(result, PreprocessResult::Modified { .. }));
+    }
+
+    #[test]
+    fn test_preprocess_bucket_partition_key_in_primary_key() {
+        let store = new_shared_store();
+        let sql = "CREATE TABLE foo (id INT, region TEXT, PRIMARY KEY (id, region)) PARTITION BY bucket(4, region)";
+        let result = preprocess_create_table_with_options(sql, &store).expect("should succeed");
+        assert!(matches!(result, PreprocessResult::Modified { .. }));
+    }
+
+    #[test]
+    fn test_preprocess_bucket_partition_key_not_in_primary_key_errors() {
+        let store = new_shared_store();
+        let sql = "CREATE TABLE foo (id INT, region TEXT, PRIMARY KEY (id)) PARTITION BY bucket(4, region)";
+        let result = preprocess_create_table_with_options(sql, &store);
+        let err = result.expect_err("should return an error").to_string();
+        assert!(
+            err.contains("region"),
+            "Error should mention the missing partition column: {err}"
+        );
     }
 }
