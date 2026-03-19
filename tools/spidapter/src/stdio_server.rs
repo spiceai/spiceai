@@ -48,6 +48,7 @@ const LOCAL_BIND_HOST: &str = "0.0.0.0";
 const LOCAL_CONNECT_HOST: &str = "127.0.0.1";
 const LOCAL_SPICED_BINARY: &str = "spiced";
 const LOCAL_SPICE_BINARY: &str = "spice";
+const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
 
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
@@ -420,8 +421,6 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
-        const MAX_ATTEMPTS: u64 = 5;
-
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
@@ -446,24 +445,20 @@ async fn post_setup_sink_action(
                     status.is_success() && !trimmed_body.is_empty() && trimmed_body != "[]";
 
                 if is_success {
-                    eprintln!(
-                        "[stdio] SQL succeeded on attempt {}: {trimmed_body}",
-                        attempts + 1
-                    );
                     break;
                 }
 
                 attempts += 1;
 
-                if attempts >= MAX_ATTEMPTS {
+                if attempts >= POST_SETUP_SQL_MAX_RETRIES {
                     return Err(anyhow::anyhow!(
-                        "Failed to execute post-setup SQL against {sql_url} after {MAX_ATTEMPTS} attempts: status={status}, sql={statement}, body={body}"
+                        "Failed to execute post-setup SQL against {sql_url} after {POST_SETUP_SQL_MAX_RETRIES} attempts: status={status}, sql={statement}, body={body}"
                     ));
                 }
 
                 let backoff_seconds = attempts * 2;
                 eprintln!(
-                    "[stdio] Post-setup SQL failed (status={status}, body={trimmed_body}), retrying in {backoff_seconds}s (attempt {attempts}/{MAX_ATTEMPTS})"
+                    "[stdio] Post-setup SQL failed (status={status}, body={trimmed_body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
                 );
                 sleep(Duration::from_secs(backoff_seconds)).await;
             }
