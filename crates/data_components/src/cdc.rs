@@ -22,6 +22,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
+use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
@@ -79,12 +80,13 @@ impl std::fmt::Display for StreamError {
 }
 
 /// Allows to commit a change that has been processed.
+#[async_trait]
 pub trait CommitChange {
-    fn commit(&self) -> Result<(), CommitError>;
+    async fn commit(&self) -> Result<(), CommitError>;
 }
 
 pub struct ChangeEnvelope {
-    change_committer: Box<dyn CommitChange + Send>,
+    change_committer: Box<dyn CommitChange + Send + Sync>,
     pub change_batch: ChangeBatch,
     is_dataset_ready: bool,
 }
@@ -92,7 +94,7 @@ pub struct ChangeEnvelope {
 impl ChangeEnvelope {
     #[must_use]
     pub fn new(
-        change_committer: Box<dyn CommitChange + Send>,
+        change_committer: Box<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
         is_dataset_ready: bool,
     ) -> Self {
@@ -103,12 +105,12 @@ impl ChangeEnvelope {
         }
     }
 
-    pub fn commit(self) -> Result<(), CommitError> {
-        self.change_committer.commit()
+    pub async fn commit(self) -> Result<(), CommitError> {
+        self.change_committer.commit().await
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch, bool) {
+    pub fn into_parts(self) -> (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool) {
         (
             self.change_committer,
             self.change_batch,
@@ -118,7 +120,7 @@ impl ChangeEnvelope {
 
     #[must_use]
     pub fn from_parts(
-        change_committer: Box<dyn CommitChange + Send>,
+        change_committer: Box<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
         is_dataset_ready: bool,
     ) -> Self {

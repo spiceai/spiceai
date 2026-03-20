@@ -443,8 +443,9 @@ pub fn subscribe_to_append_stream(
 
 pub struct SpiceAIChangeCommiter {}
 
+#[async_trait]
 impl CommitChange for SpiceAIChangeCommiter {
-    fn commit(&self) -> Result<(), CommitError> {
+    async fn commit(&self) -> Result<(), CommitError> {
         // Noop
         Ok(())
     }
