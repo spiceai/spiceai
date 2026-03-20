@@ -42,7 +42,6 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 use token_provider::TokenProvider;
 use util::{
@@ -207,7 +206,7 @@ impl FromStr for ResponseStatus {
 
 struct SqlWarehouseApi {
     client: Client,
-    host: String,
+    base_url: String,
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
 }
@@ -225,7 +224,7 @@ impl SqlWarehouseApi {
 
         Ok(Self {
             client,
-            host: host.to_string(),
+            base_url: format!("https://{host}"),
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
         })
@@ -266,7 +265,7 @@ impl SqlWarehouseApi {
     }
 
     async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
-        let url = format!("https://{}/api/2.0/sql/statements/", self.host);
+        let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         self.client
             .post(&url)
             .bearer_auth(token)
@@ -286,10 +285,7 @@ impl SqlWarehouseApi {
         token: &str,
         statement_id: &str,
     ) -> Result<Value, Error> {
-        let url = format!(
-            "https://{}/api/2.0/sql/statements/{statement_id}",
-            self.host
-        );
+        let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
         self.client
             .get(&url)
             .bearer_auth(token)
@@ -344,7 +340,7 @@ impl SqlWarehouseApi {
 
                 let next_link = match link.next_chunk_internal_link {
                     Some(path) => {
-                        let url = format!("https://{}{path}", api.host);
+                        let url = format!("{}{path}", api.base_url);
                         match api
                             .client
                             .get(&url)
@@ -513,10 +509,7 @@ impl SqlWarehouseApi {
         let mut state = Self::extract_response_status(&response)?;
         let statement_id = Self::extract_statement_id(&response)?;
 
-        let mut backoff = FibonacciBackoffBuilder::new()
-            .max_retries(Some(10))
-            .max_duration(Some(Duration::from_secs(5)))
-            .build();
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(14)).build();
         while Self::is_async_query(state) {
             let Some(backoff_duration) = backoff.next_backoff() else {
                 break;
@@ -526,11 +519,13 @@ impl SqlWarehouseApi {
             state = Self::extract_response_status(&response)?;
         }
 
-        if Self::is_async_query(state) {
-            return Err(Error::QueryStillRunning);
+        match state {
+            ResponseStatus::Pending => Err(Error::InvalidWarehouseState {
+                state: state.to_string(),
+            }),
+            ResponseStatus::Running => Err(Error::QueryStillRunning),
+            _ => Ok(response),
         }
-
-        Ok(response)
     }
 
     fn extract_error_message(response: &Value) -> Option<String> {
@@ -1168,5 +1163,196 @@ mod tests {
         fn dyn_hash(&self) -> String {
             self.0.clone()
         }
+    }
+
+    /// Starts a mock HTTP server that serves JSON responses in order.
+    /// Once the queue is exhausted, `default_response` is returned for all subsequent requests.
+    async fn start_mock_server(responses: Vec<Value>, default_response: Value) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let responses = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+            responses,
+        )));
+        let default = Arc::new(default_response);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = Arc::clone(&responses);
+                let default = Arc::clone(&default);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+
+                    let response_json = {
+                        let mut q = responses.lock().await;
+                        q.pop_front().unwrap_or_else(|| (*default).clone())
+                    };
+
+                    let body =
+                        serde_json::to_string(&response_json).expect("should serialize response");
+                    let http_response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        port
+    }
+
+    fn create_test_api(port: u16) -> SqlWarehouseApi {
+        let client = ClientBuilder::new().build().expect("should build client");
+        SqlWarehouseApi {
+            client,
+            base_url: format!("http://127.0.0.1:{port}"),
+            sql_warehouse_id: "test-warehouse".to_string(),
+            token_provider: Arc::new(StaticTokenProvider("test-token".to_string())),
+        }
+    }
+
+    fn pending_response() -> Value {
+        json!({"status": {"state": "PENDING"}, "statement_id": "stmt-1"})
+    }
+
+    fn running_response() -> Value {
+        json!({"status": {"state": "RUNNING"}, "statement_id": "stmt-1"})
+    }
+
+    fn succeeded_response() -> Value {
+        json!({"status": {"state": "SUCCEEDED"}, "statement_id": "stmt-1", "result": {"data_array": []}})
+    }
+
+    fn failed_response() -> Value {
+        json!({"status": {"state": "FAILED"}, "statement_id": "stmt-1", "status": {"state": "FAILED", "error": {"message": "table not found"}}})
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_immediate_success() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", succeeded_response())
+            .await;
+        let response = result.expect("SUCCEEDED should return Ok");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_immediate_failed() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", failed_response())
+            .await;
+        // FAILED is a terminal state — wait_for_statement_completion returns it as Ok
+        let response = result.expect("FAILED should return Ok (terminal state)");
+        assert_eq!(response["status"]["state"], "FAILED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_immediate_canceled() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+        let response = json!({"status": {"state": "CANCELED"}, "statement_id": "stmt-1"});
+
+        let result = api.wait_for_statement_completion("token", response).await;
+        let response = result.expect("CANCELED should return Ok (terminal state)");
+        assert_eq!(response["status"]["state"], "CANCELED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_pending_then_success() {
+        let port = start_mock_server(vec![succeeded_response()], pending_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", pending_response())
+            .await;
+        let response = result.expect("should eventually succeed");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_running_then_success() {
+        let port = start_mock_server(vec![succeeded_response()], running_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", running_response())
+            .await;
+        let response = result.expect("should eventually succeed");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_exhaustion_pending() {
+        let port = start_mock_server(vec![], pending_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", pending_response())
+            .await;
+        let err = result.expect_err("should fail after exhausting retries");
+        assert!(
+            matches!(&err, Error::InvalidWarehouseState { state } if state == "PENDING"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_exhaustion_running() {
+        let port = start_mock_server(vec![], running_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", running_response())
+            .await;
+        let err = result.expect_err("should fail after exhausting retries");
+        assert!(
+            matches!(&err, Error::QueryStillRunning),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_missing_status() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+        let response = json!({"statement_id": "stmt-1"});
+
+        let result = api.wait_for_statement_completion("token", response).await;
+        let err = result.expect_err("should fail on missing status");
+        assert!(
+            matches!(&err, Error::MissingJsonField { field } if field == "status.state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_missing_statement_id() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+        let response = json!({"status": {"state": "PENDING"}});
+
+        let result = api.wait_for_statement_completion("token", response).await;
+        let err = result.expect_err("should fail on missing statement_id");
+        assert!(
+            matches!(&err, Error::MissingJsonField { field } if field == "statement_id"),
+            "unexpected error: {err}"
+        );
     }
 }
