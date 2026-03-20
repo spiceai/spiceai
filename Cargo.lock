@@ -6109,7 +6109,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=de767a2a9eb3f48be5e917fce1f864d7588ec6ed#de767a2a9eb3f48be5e917fce1f864d7588ec6ed"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d3ae59a3efd87545d6fbfe96a7ff52445c1e7e29#d3ae59a3efd87545d6fbfe96a7ff52445c1e7e29"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
