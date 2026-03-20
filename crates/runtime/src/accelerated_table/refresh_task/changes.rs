@@ -105,7 +105,7 @@ impl RefreshTask {
                                     .await;
                             }
 
-                            if let Err(e) = change_envelope.commit()
+                            if let Err(e) = change_envelope.commit().await
                                 && !self.runtime_status.is_shutdown()
                             {
                                 tracing::error!("Failed to commit CDC change envelope: {e}");
