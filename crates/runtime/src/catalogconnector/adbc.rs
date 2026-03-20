@@ -101,7 +101,9 @@ pub enum Error {
         source: datafusion_table_providers::sql::db_connection_pool::Error,
     },
 
-    #[snafu(display("In-memory database URIs are not supported for catalog connectors"))]
+    #[snafu(display(
+        "In-memory database URIs (for example ':memory:') are not supported for catalog connectors because each pooled connection would create its own isolated in-memory database, leading to incorrect or inconsistent query results; use a file-based or network URI instead"
+    ))]
     InMemoryUriNotSupported,
 
     #[snafu(display("Failed to create ADBC connection pool: {source}"))]
