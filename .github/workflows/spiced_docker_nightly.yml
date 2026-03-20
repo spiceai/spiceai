@@ -115,7 +115,7 @@ jobs:
 
   build-arm64:
     needs: [check_commits, setup]
-    if: needs.check_commits.outputs.has_new_commits == 'true'
+    if: needs.check_commits.outputs.has_new_commits == 'true' && github.event_name == 'schedule'
 
     runs-on: hosted-linux-arm-runner
     env:
