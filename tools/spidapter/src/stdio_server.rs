@@ -676,6 +676,17 @@ async fn provision_spice_cloud_app(
     )
     .await?;
 
+    // after the deployment is reported "ready", wait for another 10 seconds (or SPIDAPTER_DEPLOYMENT_READY_WAIT seconds if set)
+    // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
+    let deployment_ready_wait = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    eprintln!("[stdio] Deployment is ready, waiting an additional {deployment_ready_wait}s for executors to connect...");
+
+    tokio::time::sleep(Duration::from_secs(deployment_ready_wait)).await;
+
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
