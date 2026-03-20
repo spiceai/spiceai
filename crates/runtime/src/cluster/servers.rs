@@ -26,7 +26,6 @@ use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -251,28 +250,20 @@ pub async fn start_executor_flight_server(
 
     // Use the executor's bound address if it was dynamically assigned during registration.
     #[expect(clippy::cast_possible_truncation)]
-    let bind_address = rt
-        .df
-        .executor
-        .read()
-        .ok()
-        .and_then(|maybe_executor| {
-            maybe_executor
-                .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
-        })
-        .and_then(|spec| {
-            let (host, port) = &spec;
-            tokio::task::block_in_place(|| match spec.to_socket_addrs() {
-                Ok(sa) => Some(sa),
-                Err(e) => {
-                    tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
-                    None
-                }
-            })
-        })
-        .and_then(|mut addrs| addrs.next())
-        .unwrap_or(bind_address);
+    let bind_address = match rt.df.executor.read().ok().and_then(|maybe_executor| {
+        maybe_executor
+            .as_ref()
+            .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
+    }) {
+        Some((host, port)) => match tokio::net::lookup_host((&*host, port)).await {
+            Ok(mut addrs) => addrs.next().unwrap_or(bind_address),
+            Err(e) => {
+                tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
+                bind_address
+            }
+        },
+        None => bind_address,
+    };
 
     tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
