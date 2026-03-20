@@ -153,7 +153,7 @@ impl IcebergCatalog {
     }
 }
 
-pub const ICEBERG_PARAM_LEN: usize = 22;
+pub const ICEBERG_PARAM_LEN: usize = 23;
 pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -201,6 +201,10 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("s3_session_token")
         .description("Configure the static session token used for S3 storage.")
         .secret(),
+    ParameterSpec::component("s3_iam_role_source")
+        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+        .one_of(&["auto", "metadata", "env"])
+        .default("auto"),
     ParameterSpec::component("s3_region")
         .description("The AWS S3 region to use.")
         .secret(),
@@ -318,6 +322,7 @@ impl CatalogConnector for IcebergCatalog {
                 "s3_secret_access_key",
                 "s3_session_token",
                 &self.params,
+                self.params.get("s3_iam_role_source").expose().ok(),
             )
             .await
             .map_err(|e| super::Error::InvalidConfiguration {

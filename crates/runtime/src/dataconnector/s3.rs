@@ -141,6 +141,10 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
+            ParameterSpec::component("iam_role_source")
+                .description("IAM role credential source (only used when auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+                .one_of(&["auto", "metadata", "env"])
+                .default("auto"),
             ParameterSpec::component("versioning")
                 .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled"),
@@ -189,25 +193,36 @@ impl DataConnectorFactory for S3Factory {
             }
 
             // Initialize AWS SDK credentials for IAM role authentication.
-            // Skip initialization for 'public' and 'key' auth methods which use explicit credentials.
-            // Default to 'public' if no auth method is specified.
-            let auth = params
-                .parameters
-                .get("auth")
-                .expose()
-                .ok()
-                .unwrap_or("public");
-
-            match auth {
-                "public" | "key" => {
+            // Skip initialization only for 'public' and 'key' auth methods which use
+            // explicit credentials. When auth is unset, attempt to load credentials from
+            // the environment (including IRSA web identity tokens, ECS container credentials,
+            // and IMDS) so that IAM-based access works by default.
+            match params.parameters.get("auth").expose().ok() {
+                Some("public") | Some("key") => {
                     // Skip AWS SDK initialization - use explicit auth method directly
                 }
                 _ => {
-                    // Initialize AWS SDK for IAM role or any other auth method
-                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-                        tracing::warn!(
-                            "Unable to initialize AWS credentials for S3 connector: {err}"
-                        );
+                    let iam_role_source = params
+                        .parameters
+                        .get("iam_role_source")
+                        .expose()
+                        .ok();
+                    match iam_role_source {
+                        Some("metadata") | Some("env") => {
+                            // Restricted IAM role source - build a custom config instead
+                            // of using the global SDK config. The object store registry
+                            // will handle the restricted source when building credentials.
+                        }
+                        _ => {
+                            // Initialize global AWS SDK for default credential chain.
+                            if let Err(err) =
+                                aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                            {
+                                tracing::warn!(
+                                    "Unable to initialize AWS credentials for S3 connector: {err}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -284,6 +299,7 @@ impl ListingTableConnector for S3 {
                 "allow_http",
                 "auth",
                 "session_token",
+                "iam_role_source",
             ],
         )));
 

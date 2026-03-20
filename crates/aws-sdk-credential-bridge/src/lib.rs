@@ -293,6 +293,9 @@ pub struct S3CredentialConfig {
     pub load_from_environment: bool,
     /// Whether to skip request signature (for public/anonymous access)
     pub skip_signature: bool,
+    /// Optional IAM role source restriction: "auto", "metadata", or "env".
+    /// Only meaningful when `load_from_environment` is true.
+    pub iam_role_source: Option<String>,
 }
 
 /// Determines the S3 credential configuration based on provided parameters.
@@ -317,12 +320,14 @@ pub fn determine_s3_credential_config(
     key: Option<&str>,
     secret: Option<&str>,
     auth_method: Option<&str>,
+    iam_role_source: Option<&str>,
 ) -> std::result::Result<S3CredentialConfig, String> {
     // If explicit credentials are provided, use them directly
     if key.is_some() && secret.is_some() {
         return Ok(S3CredentialConfig {
             load_from_environment: false,
             skip_signature: false,
+            iam_role_source: None,
         });
     }
 
@@ -331,19 +336,49 @@ pub fn determine_s3_credential_config(
         Some("public") => Ok(S3CredentialConfig {
             load_from_environment: false,
             skip_signature: true,
+            iam_role_source: None,
         }),
         Some("key") => Ok(S3CredentialConfig {
             load_from_environment: false,
             skip_signature: false,
+            iam_role_source: None,
         }),
         Some("iam_role") | None => Ok(S3CredentialConfig {
             load_from_environment: true,
             skip_signature: false,
+            iam_role_source: iam_role_source.map(ToString::to_string),
         }),
         Some(method) => Err(format!(
             "Unsupported S3 authentication method: '{method}'. Supported methods are: 'public', 'key', 'iam_role'"
         )),
     }
+}
+
+/// Builds an `S3CredentialProvider` for a restricted IAM role source.
+///
+/// This is used by the object store registry (synchronous context) when `iam_role_source`
+/// is `metadata` or `env`, requiring a credential chain that differs from the global cached config.
+///
+/// # Parameters
+/// - `iam_role_source`: The IAM role credential source ("metadata" or "env")
+/// - `region`: Optional AWS region
+///
+/// # Returns
+/// An `SdkConfig` with the restricted credential chain.
+///
+/// # Errors
+/// Returns an error if the config cannot be loaded.
+pub async fn build_restricted_sdk_config(
+    iam_role_source: &str,
+    region: Option<String>,
+) -> std::result::Result<SdkConfig, LoadError> {
+    let region_str = region.unwrap_or_else(|| "us-east-1".to_string());
+    let config_loader = match iam_role_source {
+        "metadata" => initiate_config_auth_iam_metadata(region_str),
+        "env" => initiate_config_auth_iam_env(region_str),
+        _ => initiate_config_default_auth(region_str).await,
+    };
+    Ok(config_loader.load().await)
 }
 
 /// Checks if explicit AWS credentials are provided in the parameters.
@@ -400,12 +435,18 @@ pub fn should_use_sdk_credentials<V, S: std::hash::BuildHasher>(
 ///
 /// # Returns
 /// A `ConfigLoader` that can be further customized before loading.
+///
+/// When `iam_role_source` is provided:
+/// - `"auto"` or `None`: Uses the default AWS credential chain (env vars, shared config, web identity, ECS, IMDS).
+/// - `"metadata"`: Restricts to metadata-based sources only (Web Identity/IRSA, ECS, IMDS).
+/// - `"env"`: Restricts to environment variable credentials only.
 pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region: String,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     session_token: Option<String>,
+    iam_role_source: Option<&str>,
 ) -> aws_config::ConfigLoader {
     use aws_config::Region;
     use aws_credential_types::Credentials;
@@ -423,12 +464,19 @@ pub async fn initiate_config_with_credentials(
             .region(Region::new(region))
             .credentials_provider(credentials)
     } else {
-        // Initialize AWS SDK credentials for IAM role authentication.
-        // This will automatically load credentials from the environment or IAM roles.
-        if let Err(err) = get_or_init_sdk_config().await {
-            tracing::warn!("Unable to initialize AWS credentials for {provider_name}: {err}");
+        match iam_role_source {
+            Some("metadata") => initiate_config_auth_iam_metadata(region),
+            Some("env") => initiate_config_auth_iam_env(region),
+            _ => {
+                // Initialize AWS SDK credentials using the default credential chain.
+                if let Err(err) = get_or_init_sdk_config().await {
+                    tracing::warn!(
+                        "Unable to initialize AWS credentials for {provider_name}: {err}"
+                    );
+                }
+                default_aws_config().region(Region::new(region))
+            }
         }
-        default_aws_config().region(Region::new(region))
     }
 }
 
@@ -638,6 +686,7 @@ mod tests {
             Some("AKIAIOSFODNN7EXAMPLE"),
             Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
             None,
+            None,
         )
         .expect("Should succeed with explicit credentials");
 
@@ -647,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_determine_s3_credential_config_public_auth() {
-        let config = determine_s3_credential_config(None, None, Some("public"))
+        let config = determine_s3_credential_config(None, None, Some("public"), None)
             .expect("Should succeed with public auth");
 
         assert!(!config.load_from_environment);
@@ -656,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_determine_s3_credential_config_iam_role() {
-        let config = determine_s3_credential_config(None, None, Some("iam_role"))
+        let config = determine_s3_credential_config(None, None, Some("iam_role"), None)
             .expect("Should succeed with iam_role");
 
         assert!(config.load_from_environment);
@@ -666,7 +715,7 @@ mod tests {
     #[test]
     fn test_determine_s3_credential_config_default_iam_role() {
         let config =
-            determine_s3_credential_config(None, None, None).expect("Should default to iam_role");
+            determine_s3_credential_config(None, None, None, None).expect("Should default to iam_role");
 
         assert!(config.load_from_environment);
         assert!(!config.skip_signature);
@@ -674,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_determine_s3_credential_config_key_auth() {
-        let config = determine_s3_credential_config(None, None, Some("key"))
+        let config = determine_s3_credential_config(None, None, Some("key"), None)
             .expect("Should succeed with key auth");
 
         assert!(!config.load_from_environment);
@@ -688,6 +737,7 @@ mod tests {
             Some("AKIAIOSFODNN7EXAMPLE"),
             Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
             Some("public"),
+            None,
         )
         .expect("Explicit credentials should override auth method");
 
@@ -697,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_determine_s3_credential_config_invalid_auth() {
-        let result = determine_s3_credential_config(None, None, Some("invalid_method"));
+        let result = determine_s3_credential_config(None, None, Some("invalid_method"), None);
 
         assert!(result.is_err());
         assert!(
@@ -705,6 +755,52 @@ mod tests {
                 .expect_err("Should error")
                 .contains("Unsupported S3 authentication method")
         );
+    }
+
+    #[test]
+    fn test_determine_s3_credential_config_iam_role_with_metadata_source() {
+        let config =
+            determine_s3_credential_config(None, None, Some("iam_role"), Some("metadata"))
+                .expect("Should succeed with iam_role and metadata source");
+
+        assert!(config.load_from_environment);
+        assert!(!config.skip_signature);
+        assert_eq!(config.iam_role_source.as_deref(), Some("metadata"));
+    }
+
+    #[test]
+    fn test_determine_s3_credential_config_iam_role_with_env_source() {
+        let config = determine_s3_credential_config(None, None, Some("iam_role"), Some("env"))
+            .expect("Should succeed with iam_role and env source");
+
+        assert!(config.load_from_environment);
+        assert!(!config.skip_signature);
+        assert_eq!(config.iam_role_source.as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn test_determine_s3_credential_config_iam_role_with_auto_source() {
+        let config = determine_s3_credential_config(None, None, Some("iam_role"), Some("auto"))
+            .expect("Should succeed with iam_role and auto source");
+
+        assert!(config.load_from_environment);
+        assert!(!config.skip_signature);
+        assert_eq!(config.iam_role_source.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn test_determine_s3_credential_config_explicit_creds_ignore_iam_role_source() {
+        let config = determine_s3_credential_config(
+            Some("AKIAIOSFODNN7EXAMPLE"),
+            Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            Some("iam_role"),
+            Some("metadata"),
+        )
+        .expect("Explicit credentials should ignore iam_role_source");
+
+        assert!(!config.load_from_environment);
+        assert!(!config.skip_signature);
+        assert!(config.iam_role_source.is_none());
     }
 
     // Tests for has_explicit_credentials
@@ -788,6 +884,7 @@ mod tests {
             Some("AKIAIOSFODNN7EXAMPLE".to_string()),
             Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             None,
+            None,
         )
         .await;
 
@@ -804,6 +901,7 @@ mod tests {
         let config_loader = initiate_config_with_credentials(
             "test-provider",
             "eu-west-1".to_string(),
+            None,
             None,
             None,
             None,
