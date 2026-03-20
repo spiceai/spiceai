@@ -218,11 +218,46 @@ where
 
             // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
             let cursor = unsafe {
-                if let SqlResult::Error { function } = statement.execute() {
-                    return Err(Error::ODBCAPIErrorNoSource {
-                        message: function.to_string(),
+                match statement.execute() {
+                    SqlResult::Success(_) | SqlResult::SuccessWithInfo(_) => {}
+                    SqlResult::Error { function } => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("SQLExecute failed: {function}"),
+                        }
+                        .into());
                     }
-                    .into());
+                    SqlResult::NoData => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: "Query returned NoData (no result set)".to_string(),
+                        }
+                        .into());
+                    }
+                    state @ (SqlResult::NeedData | SqlResult::StillExecuting) => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("Unexpected ODBC state after execute: {state:?}"),
+                        }
+                        .into());
+                    }
+                }
+
+                // Verify the statement actually produced a result set before creating a cursor
+                // Reading from an invalid cursor would segfault in the ODBC C driver.
+                match statement.num_result_cols() {
+                    SqlResult::Success(_) | SqlResult::SuccessWithInfo(_) => {}
+                    SqlResult::Error { function } => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("Failed to determine result column count: {function}"),
+                        }
+                        .into());
+                    }
+                    state => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!(
+                                "Unexpected ODBC state checking result columns: {state:?}"
+                            ),
+                        }
+                        .into());
+                    }
                 }
 
                 Ok::<_, GenericError>(CursorImpl::new(statement.as_stmt_ref()))
@@ -265,10 +300,18 @@ where
                 yield Ok(batch);
             }
 
-            if let Err(e) = join_handle.await {
-                yield Err(DataFusionError::Execution(format!(
-                    "Failed to execute ODBC query: {e}"
-                )))
+            match join_handle.await {
+                Err(e) => {
+                    yield Err(DataFusionError::Execution(format!(
+                        "Failed to execute ODBC query: {e}"
+                    )))
+                }
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Execution(format!(
+                        "Failed to execute ODBC query: {e}"
+                    )))
+                }
+                Ok(Ok(())) => {}
             }
         };
 
@@ -360,12 +403,15 @@ fn build_odbc_reader<C: Cursor>(
 fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<(), Error> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
-            statement
-                .bind_input_parameter(
-                    (i + 1).try_into().context(UnableToBindIntParameterSnafu)?,
-                    param.as_input_parameter(),
-                )
-                .unwrap();
+            let param_index = (i + 1).try_into().context(UnableToBindIntParameterSnafu)?;
+            if let SqlResult::Error { function } =
+                statement.bind_input_parameter(param_index, param.as_input_parameter())
+            {
+                return Err(Error::ODBCAPIErrorNoSource {
+                    message: format!("Failed to bind parameter {}: {function}", i + 1),
+                }
+                .into());
+            }
         }
     }
 
