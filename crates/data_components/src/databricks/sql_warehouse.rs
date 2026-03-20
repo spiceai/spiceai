@@ -252,6 +252,8 @@ impl SqlWarehouseApi {
         let sql = format!(
             "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
+        // Databricks SQL Statements API max wait_timeout is 50s.
+        // https://docs.databricks.com/api/workspace/statementexecution/executestatement
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
             "catalog": table_catalog,
@@ -259,7 +261,7 @@ impl SqlWarehouseApi {
             "statement": sql,
             "format": "JSON_ARRAY",
             "disposition": "INLINE",
-            "wait_timeout": "5m",
+            "wait_timeout": "50s",
             "on_wait_timeout": "CONTINUE",
         }))
     }
@@ -651,7 +653,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
-            "wait_timeout": "5m",
+            "wait_timeout": "50s",
             "on_wait_timeout": "CONTINUE",
             "statement": query,
         });
@@ -720,7 +722,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
-            "wait_timeout": "5m",
+            "wait_timeout": "50s",
             "on_wait_timeout": "CONTINUE",
             "statement": sql,
         });
@@ -1073,7 +1075,7 @@ mod tests {
 
         assert_eq!(payload["format"], "JSON_ARRAY");
         assert_eq!(payload["disposition"], "INLINE");
-        assert_eq!(payload["wait_timeout"], "5m");
+        assert_eq!(payload["wait_timeout"], "50s");
         assert_eq!(payload["on_wait_timeout"], "CONTINUE");
         assert_eq!(payload["warehouse_id"], "warehouse-123");
         assert!(
