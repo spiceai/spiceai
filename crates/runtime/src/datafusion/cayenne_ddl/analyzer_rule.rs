@@ -34,15 +34,10 @@ use datafusion::optimizer::AnalyzerRule;
 use datafusion::prelude::Expr;
 
 use datafusion::sql::TableReference;
-use datafusion::sql::unparser::expr_to_sql;
-use datafusion_expr::{DmlStatement, WriteOp};
 use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
-use super::logical_nodes::{
-    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
-};
+use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
@@ -92,7 +87,6 @@ pub struct CayenneDdlAnalyzerRule {
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     ddl_options: SharedDdlExtensionStore,
-    apply_distributed_nodes: bool,
 }
 
 impl fmt::Debug for CayenneDdlAnalyzerRule {
@@ -109,14 +103,12 @@ impl CayenneDdlAnalyzerRule {
         catalog_list: &Arc<dyn CatalogProviderList>,
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
         ddl_options: SharedDdlExtensionStore,
-        apply_distributed_nodes: bool,
     ) -> Self {
         Self {
             session_state,
             catalog_list: Arc::downgrade(catalog_list),
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
             ddl_options,
-            apply_distributed_nodes,
         }
     }
 
@@ -256,72 +248,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     node: Arc::new(node),
                 }))
             }
-            LogicalPlan::Dml(DmlStatement {
-                input,
-                table_name,
-                op: WriteOp::Delete,
-                output_schema,
-                ..
-            }) => {
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
-                let catalog_name = table_name
-                    .catalog()
-                    .unwrap_or(SPICE_DEFAULT_CATALOG)
-                    .to_string();
-
-                if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
-                    return Ok(plan);
-                }
-
-                let filter_sql = extract_filter_sql(input)?;
-
-                Ok(LogicalPlan::Extension(Extension {
-                    node: Arc::new(DistributedCayenneDeleteNode::new(
-                        table_name.clone(),
-                        Arc::clone(input),
-                        Arc::clone(output_schema),
-                        filter_sql,
-                    )),
-                }))
-            }
-            LogicalPlan::Dml(DmlStatement {
-                input,
-                table_name,
-                op: WriteOp::Update,
-                output_schema,
-                ..
-            }) => {
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
-                let catalog_name = table_name
-                    .catalog()
-                    .unwrap_or(SPICE_DEFAULT_CATALOG)
-                    .to_string();
-
-                if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
-                    return Ok(plan);
-                }
-
-                let filter_sql = extract_filter_sql(input)?;
-                let assignments_sql = extract_update_assignments(input, table_name)?;
-
-                let node = DistributedCayenneUpdateNode::new(
-                    table_name.clone(),
-                    Arc::clone(input),
-                    Arc::clone(output_schema),
-                    filter_sql,
-                    assignments_sql,
-                );
-
-                Ok(LogicalPlan::Extension(Extension {
-                    node: Arc::new(node),
-                }))
-            }
             LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(create)) => {
                 let (catalog_name, schema_name) =
                     parse_qualified_schema_name(create.schema_name.as_str());
@@ -382,58 +308,6 @@ fn is_boolean_partition_expr(expr: &Expr) -> bool {
         expr,
         Expr::BinaryExpr(bin) if matches!(bin.op, Operator::And | Operator::Or)
     )
-}
-
-/// Walks the input plan to find the topmost `Filter` and converts its predicate to SQL text.
-pub fn extract_filter_sql(plan: &LogicalPlan) -> DFResult<Option<String>> {
-    match plan {
-        LogicalPlan::Filter(filter) => {
-            let ast = expr_to_sql(&filter.predicate)?;
-            Ok(Some(ast.to_string()))
-        }
-        LogicalPlan::Projection(proj) => extract_filter_sql(&proj.input),
-        _ => Ok(None),
-    }
-}
-
-/// Extracts `(column_name, value_sql)` assignment pairs from an UPDATE input plan.
-///
-/// The input for UPDATE is a `Projection` over a (possibly filtered) `TableScan`.
-/// Each projection expression is either:
-/// - `col AS col` (unchanged) — skip
-/// - `<new_expr> AS col` (SET assignment) — include
-///
-/// Note: `DataFusion` may wrap unchanged columns in CAST expressions, which would
-/// not match the identity check and would be treated as assignments. In practice
-/// this is rare and harmless (it would SET the column to its own value).
-fn extract_update_assignments(
-    plan: &LogicalPlan,
-    table_name: &TableReference,
-) -> DFResult<Vec<(String, String)>> {
-    let LogicalPlan::Projection(proj) = plan else {
-        return Ok(Vec::new());
-    };
-
-    let mut assignments = Vec::new();
-    for expr in &proj.expr {
-        let Expr::Alias(alias) = expr else {
-            continue;
-        };
-        let col_name = &alias.name;
-
-        // Check if this is an identity projection (unchanged column).
-        if let Expr::Column(col) = alias.expr.as_ref()
-            && col.name == *col_name
-            && col.relation.as_ref().is_none_or(|r| *r == *table_name)
-        {
-            continue;
-        }
-
-        // This column is being updated — convert the value expression to SQL.
-        let ast = expr_to_sql(alias.expr.as_ref())?;
-        assignments.push((col_name.clone(), ast.to_string()));
-    }
-    Ok(assignments)
 }
 
 #[cfg(test)]

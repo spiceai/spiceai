@@ -191,7 +191,7 @@ pub(crate) async fn forward_federated_partitioned_write(
             });
         }
     };
-    let target_schema = ctx
+    let schema = ctx
         .table_provider(path.clone())
         .await
         .context(CreateDFSchemaSnafu)?
@@ -199,12 +199,12 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     let partition_by = raw_partition_by
         .iter()
-        .map(|p| ctx.parse_sql_expr(p, &DFSchema::try_from(Arc::clone(&target_schema))?))
+        .map(|p| ctx.parse_sql_expr(p, &DFSchema::try_from(Arc::clone(&schema))?))
         .collect::<Result<Vec<Expr>, _>>()
         .context(CreateDFSchemaSnafu)?;
 
     let mut partitions_by_executor = table_partitions
-        .all_executor_partitions(&ctx, &target_schema)
+        .all_executor_partitions(&ctx, &schema)
         .context(ResolvePartitionsSnafu)?;
 
     let schema = Arc::new(
@@ -230,7 +230,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     let (senders, join_handles) = spawn_executor_forwarding_tasks(
         executor_registry,
         &all_executor_ids,
-        &target_schema,
+        &schema,
         tbl,
         &io_runtime,
     )
@@ -240,12 +240,11 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     // Decode and route the first message.
     let dictionaries_by_id = Arc::new(HashMap::new());
-    let mut routing_error: Option<Error> = None;
-
     if let Ok(batch) =
         flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)
         && batch.num_rows() > 0
-        && let Err(e) = route_batch_and_assign_unseen(
+    {
+        route_batch_and_assign_unseen(
             &batch,
             &mut executor_filters,
             &senders,
@@ -255,68 +254,36 @@ pub(crate) async fn forward_federated_partitioned_write(
             &partition_manager,
             path,
         )
-        .await
-    {
-        routing_error = Some(e);
+        .await?;
     }
 
     // Decode and route the rest of the stream.
-    if routing_error.is_none() {
-        while let Some(result) = streaming_flight.next().await {
-            let batch = flight_data_to_arrow_batch(
-                &result.context(StreamReadSnafu)?,
-                Arc::clone(&schema),
-                &dictionaries_by_id,
+    while let Some(result) = streaming_flight.next().await {
+        let batch = flight_data_to_arrow_batch(
+            &result.context(StreamReadSnafu)?,
+            Arc::clone(&schema),
+            &dictionaries_by_id,
+        )
+        .context(DecodeBatchSnafu)?;
+        if batch.num_rows() > 0 {
+            route_batch_and_assign_unseen(
+                &batch,
+                &mut executor_filters,
+                &senders,
+                &partition_phys_exprs,
+                raw_partition_by,
+                &mut partitions_by_executor,
+                &partition_manager,
+                path,
             )
-            .context(DecodeBatchSnafu)?;
-            if batch.num_rows() > 0
-                && let Err(e) = route_batch_and_assign_unseen(
-                    &batch,
-                    &mut executor_filters,
-                    &senders,
-                    &partition_phys_exprs,
-                    raw_partition_by,
-                    &mut partitions_by_executor,
-                    &partition_manager,
-                    path,
-                )
-                .await
-            {
-                routing_error = Some(e);
-                break;
-            }
+            .await?;
         }
     }
 
     // Signal completion by dropping senders, then await all forwarding tasks.
-    // Collect executor-side errors even when routing failed — the forwarding
-    // tasks may hold the real error (e.g. DoPut rejection from the executor)
-    // that caused the channel to close and triggered a SendBatch error.
     drop(senders);
-    let mut executor_error: Option<Error> = None;
     for handle in join_handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if executor_error.is_none() {
-                    executor_error = Some(e);
-                }
-            }
-            Err(e) => {
-                if executor_error.is_none() {
-                    executor_error = Some(Error::JoinTask { source: e });
-                }
-            }
-        }
-    }
-
-    // Prefer the executor-side error (root cause) over the routing error
-    // (which is typically a SendBatch from a closed channel).
-    if let Some(exec_err) = executor_error {
-        return Err(exec_err);
-    }
-    if let Some(route_err) = routing_error {
-        return Err(route_err);
+        handle.await.context(JoinTaskSnafu)??;
     }
 
     Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
@@ -569,6 +536,7 @@ fn build_partition_physical_exprs(
         .collect()
 }
 
+/// Selects the executor with the fewest currently assigned partitions.
 /// Selects the least-loaded executor for each of `count` new partition values,
 /// distributing them across executors by incrementally accounting for each assignment.
 fn select_least_loaded_executors(
@@ -701,19 +669,13 @@ async fn forward_batches_to_executor(
         tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
 
     let encoder_schema = Arc::clone(&schema);
-    let adapt_schema = Arc::clone(&schema);
     io_runtime.spawn(async move {
         let mut flight_data_encoder = Box::pin(
             arrow_flight::encode::FlightDataEncoderBuilder::new()
                 .with_schema(encoder_schema)
                 .build(ReceiverStream::new(rx).map(
-                    move |b| -> std::result::Result<RecordBatch, arrow_flight::error::FlightError> {
-                        arrow_tools::record_batch::try_cast_to(b, Arc::clone(&adapt_schema))
-                            .map_err(|e| {
-                                arrow_flight::error::FlightError::Arrow(
-                                    arrow::error::ArrowError::SchemaError(e.to_string()),
-                                )
-                            })
+                    |b| -> std::result::Result<RecordBatch, arrow_flight::error::FlightError> {
+                        Ok(b)
                     },
                 )),
         );
@@ -756,18 +718,13 @@ async fn forward_batches_to_executor(
     }
 
     let mut inner_client = client.into_inner();
-    let response = match inner_client.do_put(request).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("DoPut to executor failed: {e}");
-            return Err(Error::DoPut { source: e });
-        }
-    };
+    let response = inner_client.do_put(request).await.context(DoPutSnafu)?;
 
-    if let Err(e) = response.into_inner().try_collect::<Vec<_>>().await {
-        tracing::error!("Executor DoPut acknowledgement failed: {e}");
-        return Err(Error::DoPutAck { source: e });
-    }
+    response
+        .into_inner()
+        .try_collect::<Vec<_>>()
+        .await
+        .context(DoPutAckSnafu)?;
 
     match encode_result_rx.await {
         Ok(Ok(())) | Err(_) => Ok(()),

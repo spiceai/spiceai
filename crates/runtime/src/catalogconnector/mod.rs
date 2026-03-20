@@ -94,6 +94,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(feature = "adbc")]
+pub mod adbc;
 #[cfg(not(windows))]
 pub mod cayenne;
 #[cfg(feature = "databricks")]
@@ -256,6 +258,16 @@ pub async fn register_all() {
             cayenne::CayenneCatalogConnector::new_connector,
             cayenne::PREFIX,
             cayenne::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "adbc")]
+    registry.insert(
+        adbc::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            adbc::AdbcCatalog::new_connector,
+            adbc::PREFIX,
+            adbc::PARAMETERS,
         ),
     );
 }

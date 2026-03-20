@@ -20,14 +20,12 @@ use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -79,7 +77,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Adbc {
     adbc_factory: AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
-    driver_name: String,
 }
 
 impl std::fmt::Debug for Adbc {
@@ -117,11 +114,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .description("Password for database authentication")
         .secret(),
-    ParameterSpec::component("driver_options").description(
-        "Semicolon-delimited driver-specific database options (e.g., 'key1=value1;key2=value2')",
-    ),
-    ParameterSpec::component("catalog").description("The catalog for the connection"),
-    ParameterSpec::component("schema").description("The schema for the connection"),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -152,7 +144,6 @@ impl DataConnectorFactory for AdbcFactory {
                     source: Box::new(e),
                 })?;
 
-            let driver_name_owned = driver_name.to_string();
             let driver_path = params.parameters.get("driver_path").expose().ok();
             let driver_location = driver_path.unwrap_or(driver_name).to_string();
 
@@ -172,23 +163,7 @@ impl DataConnectorFactory for AdbcFactory {
 
             let username = params.parameters.get("username").expose().ok();
             let password = params.parameters.get("password").expose().ok();
-            let driver_options = params.parameters.get("driver_options").expose().ok();
-            let db_options = build_db_options(&uri_str, username, password, driver_options);
-
-            let catalog = params
-                .parameters
-                .get("catalog")
-                .expose()
-                .ok()
-                .map(String::from);
-            let schema = params
-                .parameters
-                .get("schema")
-                .expose()
-                .ok()
-                .map(String::from);
-
-            let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
+            let db_options = build_db_options(&uri_str, username, password);
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -257,15 +232,9 @@ impl DataConnectorFactory for AdbcFactory {
                     },
                 )?;
 
-                let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
+                let pool = AdbcConnectionPoolBuilder::new(db)
                     .with_max_size(pool_size)
-                    .with_min_idle(pool_min_idle);
-
-                if let Some(conn_opts) = conn_options {
-                    pool_builder = pool_builder.with_conn_options(conn_opts);
-                }
-
-                let pool = pool_builder
+                    .with_min_idle(pool_min_idle)
                     .build()
                     .context(UnableToCreateConnectionPoolSnafu {
                         driver_location,
@@ -288,10 +257,7 @@ impl DataConnectorFactory for AdbcFactory {
 
             let adbc_factory = AdbcTableFactory::new(pool);
 
-            Ok(Arc::new(Adbc {
-                adbc_factory,
-                driver_name: driver_name_owned,
-            }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Adbc { adbc_factory }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -309,7 +275,6 @@ fn build_db_options(
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
-    driver_options: Option<&str>,
 ) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
     let mut opts = vec![(OptionDatabase::Uri, uri.into())];
     if let Some(u) = username {
@@ -318,64 +283,7 @@ fn build_db_options(
     if let Some(p) = password {
         opts.push((OptionDatabase::Password, p.into()));
     }
-    if let Some(options_str) = driver_options {
-        for pair in options_str.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            if let Some((key, value)) = pair.split_once('=') {
-                let key = key.trim();
-                if key.is_empty() {
-                    tracing::warn!("Ignoring ADBC driver option with empty key");
-                    continue;
-                }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
-            } else {
-                tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
-            }
-        }
-    }
     opts
-}
-
-/// Builds connection-level options from connector parameters.
-fn build_conn_options(
-    catalog: Option<&str>,
-    schema: Option<&str>,
-) -> Option<HashMap<String, String>> {
-    let mut opts = HashMap::new();
-
-    if let Some(catalog) = catalog {
-        opts.insert(
-            adbc_core::options::OptionConnection::CurrentCatalog
-                .as_ref()
-                .to_string(),
-            catalog.to_string(),
-        );
-    }
-
-    if let Some(schema) = schema {
-        opts.insert(
-            adbc_core::options::OptionConnection::CurrentSchema
-                .as_ref()
-                .to_string(),
-            schema.to_string(),
-        );
-    }
-
-    if opts.is_empty() { None } else { Some(opts) }
-}
-fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
-        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
-        _ => None,
-    }
 }
 
 register_data_connector!("adbc", AdbcFactory);
@@ -391,9 +299,9 @@ impl DataConnector for Adbc {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = dataset.path().into();
-        let dialect = dialect_for_driver(&self.driver_name);
+
         self.adbc_factory
-            .table_provider(table_reference, dialect)
+            .table_provider(table_reference, None)
             .await
             .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "adbc".to_string(),
@@ -407,11 +315,10 @@ impl DataConnector for Adbc {
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_reference = dataset.path().into();
-        let dialect = dialect_for_driver(&self.driver_name);
 
         Some(
             self.adbc_factory
-                .read_write_table_provider(table_reference, dialect)
+                .read_write_table_provider(table_reference, None)
                 .await
                 .map_err(|e| DataConnectorError::UnableToGetReadWriteProvider {
                     dataconnector: "adbc".to_string(),
@@ -449,9 +356,6 @@ mod tests {
         assert!(param_names.contains(&"uri"));
         assert!(param_names.contains(&"username"));
         assert!(param_names.contains(&"password"));
-        assert!(param_names.contains(&"driver_options"));
-        assert!(param_names.contains(&"catalog"));
-        assert!(param_names.contains(&"schema"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
     }
@@ -479,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_build_db_options_uri_only() {
-        let opts = build_db_options("file:test.db", None, None, None);
+        let opts = build_db_options("file:test.db", None, None);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
         assert!(
@@ -489,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_build_db_options_with_username_password() {
-        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"), None);
+        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"));
         assert_eq!(opts.len(), 3);
 
         assert_eq!(opts[0].0, OptionDatabase::Uri);
@@ -506,108 +410,10 @@ mod tests {
 
     #[test]
     fn test_build_db_options_username_only() {
-        let opts = build_db_options("sqlite:test.db", Some("user"), None, None);
+        let opts = build_db_options("sqlite:test.db", Some("user"), None);
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
         assert_eq!(opts[1].0, OptionDatabase::Username);
         assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "user"));
-    }
-
-    #[test]
-    fn test_build_db_options_with_driver_options_unprefixed() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"),
-        );
-        assert_eq!(opts.len(), 3);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(
-            opts[1].0,
-            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
-        );
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
-        assert_eq!(
-            opts[2].0,
-            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
-        );
-        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
-    }
-
-    #[test]
-    fn test_build_db_options_with_driver_options_prefixed() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"),
-        );
-        assert_eq!(opts.len(), 3);
-        assert_eq!(
-            opts[1].0,
-            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
-        );
-        assert_eq!(
-            opts[2].0,
-            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_trailing_semicolon() {
-        let opts = build_db_options("uri://db", None, None, Some("key=value;"));
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_malformed_ignored() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("good=val;bad_no_equals;another=ok"),
-        );
-        assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_empty_key_ignored() {
-        let opts = build_db_options("uri://db", None, None, Some("=value;good=ok"));
-        assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
-    }
-
-    #[test]
-    fn test_build_conn_options_none_when_empty() {
-        let opts = build_conn_options(None, None);
-        assert!(opts.is_none());
-    }
-
-    #[test]
-    fn test_build_conn_options_both() {
-        let opts =
-            build_conn_options(Some("my_catalog"), Some("my_schema")).expect("should have options");
-        assert_eq!(opts.len(), 2);
-        assert_eq!(
-            opts.get("adbc.connection.catalog"),
-            Some(&"my_catalog".to_string())
-        );
-        assert_eq!(
-            opts.get("adbc.connection.db_schema"),
-            Some(&"my_schema".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_conn_options_catalog_only() {
-        let opts = build_conn_options(Some("cat"), None).expect("should have options");
-        assert_eq!(opts.len(), 1);
-        assert_eq!(
-            opts.get("adbc.connection.catalog"),
-            Some(&"cat".to_string())
-        );
     }
 }

@@ -875,25 +875,6 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
-    #[must_use]
-    pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
-        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
-
-        #[cfg(not(windows))]
-        {
-            self.ctx
-                .catalog(catalog_name)
-                .is_some_and(|catalog| cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = catalog_name;
-            false
-        }
-    }
-
     /// Returns the partition expression string for a table by querying the catalog provider.
     ///
     /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
