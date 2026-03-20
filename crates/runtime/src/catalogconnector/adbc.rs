@@ -34,7 +34,6 @@ use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use globset::GlobSet;
 use snafu::prelude::*;
 use std::any::Any;
@@ -47,8 +46,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("driver")
         .description("The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres', 'snowflake')")
         .required(),
-    ParameterSpec::component("driver_path")
-        .description("Optional path to the ADBC driver library"),
+    ParameterSpec::component("driver_path").description("Optional path to the ADBC driver library"),
     ParameterSpec::component("uri")
         .description("Database URI/connection string for the ADBC driver")
         .required(),
@@ -101,6 +99,14 @@ pub enum Error {
         driver_location: String,
         uri: String,
         source: datafusion_table_providers::sql::db_connection_pool::Error,
+    },
+
+    #[snafu(display("In-memory database URIs are not supported for catalog connectors"))]
+    InMemoryUriNotSupported,
+
+    #[snafu(display("Failed to create ADBC connection pool: {source}"))]
+    PoolCreationTaskFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to list schemas: {source}"))]
@@ -160,13 +166,14 @@ impl CatalogConnector for AdbcCatalog {
             catalog.include.clone(),
         ));
 
-        provider.refresh().await.map_err(|e| {
-            super::Error::UnableToGetCatalogProvider {
+        provider
+            .refresh()
+            .await
+            .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component,
                 source: e,
-            }
-        })?;
+            })?;
 
         Ok(provider as Arc<dyn RefreshableCatalogProvider>)
     }
@@ -235,6 +242,10 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
     let pool_size = parse_pool_param("connection_pool_size")?;
     let pool_min_idle = parse_pool_param("connection_pool_min_idle")?;
 
+    if uri_str == ":memory:" || uri_str.contains("mode=memory") {
+        return Err(Error::InMemoryUriNotSupported);
+    }
+
     // Driver loading, database creation, and pool creation are all
     // synchronous FFI/IO operations — offload to a blocking thread.
     tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
@@ -249,12 +260,13 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
             driver_location: driver_location.clone(),
         })?;
 
-        let db = driver.new_database_with_opts(db_options).context(
-            UnableToCreateDatabaseSnafu {
-                driver_location: driver_location.clone(),
-                uri: uri_str.clone(),
-            },
-        )?;
+        let db =
+            driver
+                .new_database_with_opts(db_options)
+                .context(UnableToCreateDatabaseSnafu {
+                    driver_location: driver_location.clone(),
+                    uri: uri_str.clone(),
+                })?;
 
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
@@ -268,7 +280,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
         Ok(Arc::new(pool))
     })
     .await
-    .map_err(|e| Error::UnableToListSchemas {
+    .map_err(|e| Error::PoolCreationTaskFailed {
         source: Box::new(e),
     })?
 }
@@ -307,50 +319,48 @@ impl AdbcCatalogProvider {
 
     async fn refresh_schemas(&self) -> Result<()> {
         // Phase 1: Discover schemas and tables via ADBC metadata API.
-        // These are synchronous FFI calls; collect all metadata first
-        // before proceeding to async table provider creation.
-        let schema_tables = {
-            let conn = self
-                .pool
-                .connect()
-                .await
-                .map_err(|e| Error::UnableToListSchemas { source: e })?;
+        // These are synchronous FFI calls — offload to a blocking thread
+        // to avoid stalling the async runtime.
+        let pool = Arc::clone(&self.pool);
+        let schema_tables =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<String>)>> {
+                let conn = pool
+                    .connect_sync()
+                    .map_err(|e| Error::UnableToListSchemas { source: e })?;
 
-            let sync_conn =
-                conn.as_sync()
-                    .ok_or_else(|| Error::UnableToListSchemas {
-                        source: "ADBC connection does not support synchronous operations".into(),
-                    })?;
+                let sync_conn = conn.as_sync().ok_or_else(|| Error::UnableToListSchemas {
+                    source: "ADBC connection does not support synchronous operations".into(),
+                })?;
 
-            let schema_names =
-                sync_conn
+                let schema_names = sync_conn
                     .schemas()
                     .map_err(|e| Error::UnableToListSchemas {
                         source: Box::new(e),
                     })?;
 
-            let mut schema_tables = Vec::with_capacity(schema_names.len());
-            for schema_name in schema_names {
-                let table_names =
-                    sync_conn
-                        .tables(&schema_name)
-                        .map_err(|e| Error::UnableToListTables {
-                            schema: schema_name.clone(),
-                            source: Box::new(e),
-                        })?;
-                schema_tables.push((schema_name, table_names));
-            }
+                let mut schema_tables = Vec::with_capacity(schema_names.len());
+                for schema_name in schema_names {
+                    let table_names =
+                        sync_conn
+                            .tables(&schema_name)
+                            .map_err(|e| Error::UnableToListTables {
+                                schema: schema_name.clone(),
+                                source: Box::new(e),
+                            })?;
+                    schema_tables.push((schema_name, table_names));
+                }
 
-            schema_tables
-            // conn dropped here, returned to pool
-        };
+                Ok(schema_tables)
+            })
+            .await
+            .map_err(|e| Error::UnableToListSchemas {
+                source: Box::new(e),
+            })??;
 
         // Phase 2: Create table providers (async).
         let mut schemas = HashMap::new();
         for (schema_name, table_names) in schema_tables {
-            let tables = self
-                .create_table_providers(&schema_name, table_names)
-                .await;
+            let tables = self.create_table_providers(&schema_name, table_names).await;
             schemas.insert(
                 schema_name,
                 Arc::new(AdbcSchemaProvider {
@@ -449,8 +459,7 @@ struct AdbcSchemaProvider {
 
 impl std::fmt::Debug for AdbcSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdbcSchemaProvider")
-            .finish_non_exhaustive()
+        f.debug_struct("AdbcSchemaProvider").finish_non_exhaustive()
     }
 }
 
