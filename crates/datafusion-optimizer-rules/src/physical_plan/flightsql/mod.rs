@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,15 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! General [`datafusion::physical_optimizer::PhysicalOptimizerRule`] not in [`datafusion`] by default.
-//! These optimizations should be unrelated to the `runtime` or `spiced`. Ideally they could be contributed
-//! upstream to `datafusion` directly.
-
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
-pub mod flightsql;
-pub mod hash_join_optimization;
-
-pub mod cluster;
-
-pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
+pub mod aggregate_pushdown;
+mod exec;
