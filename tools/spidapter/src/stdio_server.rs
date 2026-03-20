@@ -683,7 +683,9 @@ async fn provision_spice_cloud_app(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(10);
 
-    eprintln!("[stdio] Deployment is ready, waiting an additional {deployment_ready_wait}s for executors to connect...");
+    eprintln!(
+        "[stdio] Deployment is ready, waiting an additional {deployment_ready_wait}s for executors to connect..."
+    );
 
     tokio::time::sleep(Duration::from_secs(deployment_ready_wait)).await;
 
