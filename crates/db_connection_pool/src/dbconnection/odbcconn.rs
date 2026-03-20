@@ -243,7 +243,14 @@ where
                 // Verify the statement actually produced a result set before creating a cursor
                 // Reading from an invalid cursor would segfault in the ODBC C driver.
                 match statement.num_result_cols() {
-                    SqlResult::Success(_) | SqlResult::SuccessWithInfo(_) => {}
+                    SqlResult::Success(cols) | SqlResult::SuccessWithInfo(cols) => {
+                        if cols == 0 {
+                            return Err(Error::ODBCAPIErrorNoSource {
+                                message: "Statement did not produce a result set (0 columns reported)".to_string(),
+                            }
+                            .into());
+                        }
+                    }
                     SqlResult::Error { function } => {
                         return Err(Error::ODBCAPIErrorNoSource {
                             message: format!("Failed to determine result column count: {function}"),
