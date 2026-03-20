@@ -305,6 +305,8 @@ tracing::error!(
 
 **Why this matters**: Blocking an async runtime thread prevents other tasks from running, causing cascading delays and poor throughput under load.
 
+**NEVER use `block_in_place`**: `tokio::task::block_in_place` is a workaround for bad architecture, not a solution. Instead, either refactor the method to be fully async, or pre-initialize the required data ahead of time (e.g. at startup, like a global cache) so it's available without blocking.
+
 ### Connection Pooling
 
 - **Always use connection pools** for database connectors
