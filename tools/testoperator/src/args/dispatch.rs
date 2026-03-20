@@ -117,7 +117,7 @@ pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySetArg,
     pub query_overrides: Option<QueryOverridesArg>,
-    /// Path to a scenario query set file (required when query_set is Scenario)
+    /// Path to a scenario query set file (required when `query_set` is `Scenario`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scenario_query_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
