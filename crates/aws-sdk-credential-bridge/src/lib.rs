@@ -343,11 +343,22 @@ pub fn determine_s3_credential_config(
             skip_signature: false,
             iam_role_source: None,
         }),
-        Some("iam_role") | None => Ok(S3CredentialConfig {
-            load_from_environment: true,
-            skip_signature: false,
-            iam_role_source: iam_role_source.map(ToString::to_string),
-        }),
+        Some("iam_role") | None => {
+            let validated_iam_role_source = match iam_role_source {
+                None => None,
+                Some("auto" | "metadata" | "env") => iam_role_source.map(ToString::to_string),
+                Some(other) => {
+                    return Err(format!(
+                        "Unsupported iam_role_source: '{other}'. Supported values are: 'auto', 'metadata', 'env'"
+                    ));
+                }
+            };
+            Ok(S3CredentialConfig {
+                load_from_environment: true,
+                skip_signature: false,
+                iam_role_source: validated_iam_role_source,
+            })
+        }
         Some(method) => Err(format!(
             "Unsupported S3 authentication method: '{method}'. Supported methods are: 'public', 'key', 'iam_role'"
         )),
@@ -372,11 +383,25 @@ pub async fn build_restricted_sdk_config(
     iam_role_source: &str,
     region: Option<String>,
 ) -> std::result::Result<SdkConfig, LoadError> {
-    let region_str = region.unwrap_or_else(|| "us-east-1".to_string());
+    let region_str = region.unwrap_or_else(|| {
+        // Derive region from environment variables before falling back to us-east-1.
+        std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| {
+                tracing::warn!("No AWS region specified and AWS_REGION/AWS_DEFAULT_REGION not set; defaulting to us-east-1");
+                "us-east-1".to_string()
+            })
+    });
     let config_loader = match iam_role_source {
         "metadata" => initiate_config_auth_iam_metadata(region_str),
         "env" => initiate_config_auth_iam_env(region_str),
-        _ => initiate_config_default_auth(region_str).await,
+        other => {
+            tracing::warn!(
+                iam_role_source = other,
+                "Unknown iam_role_source value in build_restricted_sdk_config; defaulting to metadata credentials"
+            );
+            initiate_config_auth_iam_metadata(region_str)
+        }
     };
     Ok(config_loader.load().await)
 }
@@ -714,8 +739,8 @@ mod tests {
 
     #[test]
     fn test_determine_s3_credential_config_default_iam_role() {
-        let config =
-            determine_s3_credential_config(None, None, None, None).expect("Should default to iam_role");
+        let config = determine_s3_credential_config(None, None, None, None)
+            .expect("Should default to iam_role");
 
         assert!(config.load_from_environment);
         assert!(!config.skip_signature);
@@ -759,9 +784,8 @@ mod tests {
 
     #[test]
     fn test_determine_s3_credential_config_iam_role_with_metadata_source() {
-        let config =
-            determine_s3_credential_config(None, None, Some("iam_role"), Some("metadata"))
-                .expect("Should succeed with iam_role and metadata source");
+        let config = determine_s3_credential_config(None, None, Some("iam_role"), Some("metadata"))
+            .expect("Should succeed with iam_role and metadata source");
 
         assert!(config.load_from_environment);
         assert!(!config.skip_signature);
@@ -801,6 +825,19 @@ mod tests {
         assert!(!config.load_from_environment);
         assert!(!config.skip_signature);
         assert!(config.iam_role_source.is_none());
+    }
+
+    #[test]
+    fn test_determine_s3_credential_config_invalid_iam_role_source() {
+        let result =
+            determine_s3_credential_config(None, None, Some("iam_role"), Some("invalid_source"));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("Should error")
+                .contains("Unsupported iam_role_source")
+        );
     }
 
     // Tests for has_explicit_credentials

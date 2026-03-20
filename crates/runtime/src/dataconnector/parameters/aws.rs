@@ -209,14 +209,13 @@ impl Validator for AuthValidator {
         }
 
         // Validate iam_role_source if present
-        if let Some(iam_role_source) = params.parameters.get("iam_role_source").expose().ok() {
-            if !matches!(iam_role_source, "auto" | "metadata" | "env") {
+        if let Some(iam_role_source) = params.parameters.get("iam_role_source").expose().ok()
+            && !matches!(iam_role_source, "auto" | "metadata" | "env") {
                 return Err(Error::InvalidIamRoleSource {
                     key: "iam_role_source".to_string(),
                     iam_source: iam_role_source.to_string(),
                 });
             }
-        }
 
         Ok(())
     }

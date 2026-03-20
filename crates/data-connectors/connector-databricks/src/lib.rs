@@ -153,10 +153,6 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
         .secret(),
-    ParameterSpec::component("aws_iam_role_source")
-        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-        .one_of(&["auto", "metadata", "env"])
-        .default("auto"),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
         .secret(),
@@ -654,10 +650,6 @@ pub const CATALOG_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
         .secret(),
-    ParameterSpec::component("aws_iam_role_source")
-        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-        .one_of(&["auto", "metadata", "env"])
-        .default("auto"),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
         .secret(),

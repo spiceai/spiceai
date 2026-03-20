@@ -197,31 +197,24 @@ impl DataConnectorFactory for S3Factory {
             // explicit credentials. When auth is unset, attempt to load credentials from
             // the environment (including IRSA web identity tokens, ECS container credentials,
             // and IMDS) so that IAM-based access works by default.
-            match params.parameters.get("auth").expose().ok() {
-                Some("public") | Some("key") => {
-                    // Skip AWS SDK initialization - use explicit auth method directly
-                }
-                _ => {
-                    let iam_role_source = params
-                        .parameters
-                        .get("iam_role_source")
-                        .expose()
-                        .ok();
-                    match iam_role_source {
-                        Some("metadata") | Some("env") => {
-                            // Restricted IAM role source - build a custom config instead
-                            // of using the global SDK config. The object store registry
-                            // will handle the restricted source when building credentials.
-                        }
-                        _ => {
-                            // Initialize global AWS SDK for default credential chain.
-                            if let Err(err) =
-                                aws_sdk_credential_bridge::get_or_init_sdk_config().await
-                            {
-                                tracing::warn!(
-                                    "Unable to initialize AWS credentials for S3 connector: {err}"
-                                );
-                            }
+            if let Some("public" | "key") = params.parameters.get("auth").expose().ok() {
+                // Skip AWS SDK initialization - use explicit auth method directly
+            } else {
+                let iam_role_source = params.parameters.get("iam_role_source").expose().ok();
+                match iam_role_source {
+                    Some("metadata" | "env") => {
+                        // Restricted IAM role source - build a custom config instead
+                        // of using the global SDK config. The object store registry
+                        // will handle the restricted source when building credentials.
+                    }
+                    _ => {
+                        // Initialize global AWS SDK for default credential chain.
+                        if let Err(err) =
+                            aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                        {
+                            tracing::warn!(
+                                "Unable to initialize AWS credentials for S3 connector: {err}"
+                            );
                         }
                     }
                 }

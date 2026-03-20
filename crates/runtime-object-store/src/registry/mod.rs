@@ -365,29 +365,23 @@ impl SpiceObjectStoreRegistry {
                     .as_deref()
                     .unwrap_or("auto");
                 let region = params.get("region").cloned();
-                let restricted_config =
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            aws_sdk_credential_bridge::build_restricted_sdk_config(
-                                iam_source, region,
-                            ),
-                        )
-                    });
+                let restricted_config = self.io_runtime.block_on(
+                    aws_sdk_credential_bridge::build_restricted_sdk_config(iam_source, region),
+                );
                 match restricted_config {
                     Ok(sdk_config) => {
                         if sdk_config.credentials_provider().is_some() {
                             tracing::trace!(
                                 "Using S3 credentials provider with restricted IAM role source: {iam_source}"
                             );
-                            s3_builder =
-                                s3_builder.with_credentials(Arc::new(
-                                    S3CredentialProvider::from_config(&sdk_config).map_err(
-                                        |e| object_store::Error::Generic {
-                                            store: "S3",
-                                            source: e.into(),
-                                        },
-                                    )?,
-                                ));
+                            s3_builder = s3_builder.with_credentials(Arc::new(
+                                S3CredentialProvider::from_config(&sdk_config).map_err(|e| {
+                                    object_store::Error::Generic {
+                                        store: "S3",
+                                        source: e.into(),
+                                    }
+                                })?,
+                            ));
                         } else {
                             tracing::trace!(
                                 "No S3 credentials provider found from restricted IAM source, assuming public access"
@@ -396,9 +390,7 @@ impl SpiceObjectStoreRegistry {
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            "Failed to build restricted AWS SDK config for S3: {err}"
-                        );
+                        tracing::warn!("Failed to build restricted AWS SDK config for S3: {err}");
                         s3_builder = s3_builder.with_skip_signature(true);
                     }
                 }
