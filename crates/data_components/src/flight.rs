@@ -429,7 +429,7 @@ impl FlightExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| expr::to_sql(f).map(|sql| format!("({sql})")))
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))

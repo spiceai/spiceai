@@ -472,7 +472,18 @@ impl FlightSqlExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| {
+                    expr::to_sql(f).map(|sql| {
+                        // Wrap each filter in parentheses to preserve semantics when
+                        // joining with AND.  Without this, an OR filter like
+                        //   "col" = 'A' OR "col" = 'B'
+                        // combined with another filter via AND becomes
+                        //   "col" = 'A' OR "col" = 'B' AND other_filter
+                        // which SQL parses as  col='A' OR (col='B' AND other_filter)
+                        // instead of the intended (col='A' OR col='B') AND other_filter.
+                        format!("({sql})")
+                    })
+                })
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
