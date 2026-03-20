@@ -1198,14 +1198,11 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
-        // Invalidate any cached logical plans that reference this table.
-        // Cached plans hold stale `Arc<dyn TableProvider>` references; after a
-        // write the underlying provider's in-memory state (e.g. Cayenne's
-        // protected snapshots and deletion caches) has changed, so plans must be
-        // re-resolved to pick up the new state.
-        if let Some(cache) = self.plans_cache_provider()
-            && let Err(e) = cache.invalidate_for_table(table_reference.clone())
-        {
+        // Invalidate all caches (results, plans, search) that reference this table.
+        // Cached plans hold stale `Arc<dyn TableProvider>` references and cached
+        // results hold stale query output; after a write both must be invalidated
+        // so subsequent queries pick up the new data.
+        if let Err(e) = self.caching.invalidate_for_table(table_reference.clone()) {
             tracing::warn!(
                 "Failed to invalidate plans cache for table {table_reference} after write: {e}"
             );
@@ -1264,14 +1261,11 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
-        // Invalidate any cached logical plans that reference this table.
-        // Cached plans hold stale `Arc<dyn TableProvider>` references; after a
-        // write the underlying provider's in-memory state (e.g. Cayenne's
-        // protected snapshots and deletion caches) has changed, so plans must be
-        // re-resolved to pick up the new state.
-        if let Some(cache) = self.plans_cache_provider()
-            && let Err(e) = cache.invalidate_for_table(table_reference.clone())
-        {
+        // Invalidate all caches (results, plans, search) that reference this table.
+        // Cached plans hold stale `Arc<dyn TableProvider>` references and cached
+        // results hold stale query output; after a streaming write both must be
+        // invalidated so subsequent queries pick up the new data.
+        if let Err(e) = self.caching.invalidate_for_table(table_reference.clone()) {
             tracing::warn!(
                 "Failed to invalidate plans cache for table {table_reference} after streaming write: {e}"
             );
