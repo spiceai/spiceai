@@ -24,6 +24,11 @@ serviceAccount:
   # The name of the ServiceAccount to use.
   # If not set and create is true, a name is generated using the fullname template
   name:
+  # Annotations to add to the ServiceAccount (e.g. for AWS IRSA, GKE Workload Identity)
+  annotations: {}
+  # Examples:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/my-spice-role
+  #   iam.gke.io/gcp-service-account: my-sa@my-project.iam.gserviceaccount.com
 
 # Resource requests and limits
 # resources:

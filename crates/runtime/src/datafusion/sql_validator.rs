@@ -117,19 +117,15 @@ pub fn validate_sql_query_operations(
                     );
                 }
 
-                let target_catalog = dml
-                    .table_name
-                    .catalog()
-                    .unwrap_or(super::SPICE_DEFAULT_CATALOG);
-
-                if !df.is_catalog_writable(target_catalog) {
+                if !df.is_path_catalog_writable(&dml.table_name) {
                     return plan_err!(
                         "UPDATE operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
                         dml.table_name
                     );
                 }
 
-                if !is_cayenne_catalog(df, target_catalog) {
+                if !df.is_cayenne_catalog(&dml.table_name) {
+                    let target_catalog = dml.table_name.catalog().unwrap_or(super::SPICE_DEFAULT_CATALOG);
                     return plan_err!(
                         "UPDATE operations are only supported on writable Cayenne catalog tables. Table '{}', catalog '{}' is not Cayenne-backed.",
                         dml.table_name,
@@ -155,22 +151,6 @@ pub fn validate_sql_query_operations(
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
-}
-
-fn is_cayenne_catalog(df: &Arc<DataFusion>, catalog_name: &str) -> bool {
-    #[cfg(not(windows))]
-    {
-        df.ctx
-            .catalog(catalog_name)
-            .is_some_and(|catalog| super::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = df;
-        let _ = catalog_name;
-        false
-    }
 }
 
 /// Validates DDL operations. DDL is only allowed on catalogs with `access: read_write_create`.

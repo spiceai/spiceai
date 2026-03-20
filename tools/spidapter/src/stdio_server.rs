@@ -48,6 +48,7 @@ const LOCAL_BIND_HOST: &str = "0.0.0.0";
 const LOCAL_CONNECT_HOST: &str = "127.0.0.1";
 const LOCAL_SPICED_BINARY: &str = "spiced";
 const LOCAL_SPICE_BINARY: &str = "spice";
+const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
 
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
@@ -427,31 +428,34 @@ async fn post_setup_sink_action(
 
             loop {
                 let mut request = sql_client.post(sql_url).body(statement.clone());
+                // Prefer non-streaming response path for DDL by setting row limit
+                request = request.header("X-Accept-Rows", "999");
                 if let Some(key) = api_key {
                     request = request.header("X-API-Key", key);
                 }
                 let response = request.send().await?;
 
-                if response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+                if status.is_success() {
                     break;
                 }
 
                 attempts += 1;
 
-                if attempts >= 3 {
-                    let status = response.status();
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|e| format!("<failed to read error response body: {e}>"));
+                if attempts >= POST_SETUP_SQL_MAX_RETRIES {
                     return Err(anyhow::anyhow!(
-                        "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
+                        "Failed to execute post-setup SQL against {sql_url} after {POST_SETUP_SQL_MAX_RETRIES} attempts: status={status}, sql={statement}, body={body}"
                     ));
                 }
 
                 let backoff_seconds = attempts * 2;
                 eprintln!(
-                    "[stdio] Post-setup SQL failed, retrying in {backoff_seconds}s (attempt {attempts}/3)"
+                    "[stdio] Post-setup SQL failed (status={status}, body={body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
                 );
                 sleep(Duration::from_secs(backoff_seconds)).await;
             }

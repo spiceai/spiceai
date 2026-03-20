@@ -131,6 +131,18 @@ pub enum Error {
 
     #[snafu(display("Failed to submit job to distributed scheduler: {message}"))]
     JobSubmissionFailed { message: String },
+
+    #[snafu(display(
+        "Querying locally accelerated dataset '{table}' via async queries API is not currently supported. \
+        Use the synchronous query API (/v1/sql or Flight SQL) instead."
+    ))]
+    AcceleratedTableNotSupportedInDistributedQuery { table: String },
+
+    #[snafu(display(
+        "Querying Cayenne catalog table '{table}' via async queries API is not currently supported. \
+        Use the synchronous query API (/v1/sql or Flight SQL) instead."
+    ))]
+    CayenneCatalogTableNotSupportedInDistributedQuery { table: String },
 }
 
 impl Error {
@@ -381,20 +393,26 @@ impl Query {
             span.record("runtime_query", true);
         }
 
-        // If any of the input tables are accelerated, mark the query as accelerated
-        let mut is_accelerated = false;
+        // Distributed execution doesn't currently support querying accelerated datasets
+        // or Cayenne catalog tables
         for tr in &input_tables {
             if self.df.is_accelerated(tr).await {
-                is_accelerated = true;
-                break;
+                return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
+            }
+            if self.df.is_cayenne_catalog(tr) {
+                return Err(Error::CayenneCatalogTableNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
             }
         }
-        if is_accelerated {
-            tracker = tracker.map(|mut t| {
-                t.is_accelerated = Some(true);
-                t
-            });
-        }
+
+        // All tables verified non-accelerated above
+        tracker = tracker.map(|mut t| {
+            t.is_accelerated = Some(false);
+            t
+        });
 
         let datasets = Arc::new(input_tables);
         let tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
