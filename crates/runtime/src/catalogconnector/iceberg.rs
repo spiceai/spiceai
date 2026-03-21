@@ -203,8 +203,7 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
         .secret(),
     ParameterSpec::component("s3_iam_role_source")
         .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-        .one_of(&["auto", "metadata", "env"])
-        .default("auto"),
+        .one_of(&["auto", "metadata", "env"]),
     ParameterSpec::component("s3_region")
         .description("The AWS S3 region to use.")
         .secret(),

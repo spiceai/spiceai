@@ -32,8 +32,7 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 8] = [
     ParameterSpec::runtime("aws_region").description("The AWS region to use for Bedrock models."),
     ParameterSpec::runtime("aws_iam_role_source")
         .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-        .one_of(&["auto", "metadata", "env"])
-        .default("auto"),
+        .one_of(&["auto", "metadata", "env"]),
     ParameterSpec::component("guardrail_identifier").description("Identifier for the guardrail. Pattern: `(([a-z0-9]+) | (arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))`. Length: 0-2048."),
     ParameterSpec::component("guardrail_version").description("Guardrail version. Pattern: `(([1-9][0-9]{0,7})|(DRAFT))`"),
     ParameterSpec::component("trace").description("Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`").one_of(&["enabled", "disabled", "enabled_full"]),

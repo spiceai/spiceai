@@ -143,8 +143,7 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
                 .secret(),
             ParameterSpec::component("iam_role_source")
                 .description("IAM role credential source (only used when auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-                .one_of(&["auto", "metadata", "env"])
-                .default("auto"),
+                .one_of(&["auto", "metadata", "env"]),
             ParameterSpec::component("versioning")
                 .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled"),
@@ -209,8 +208,7 @@ impl DataConnectorFactory for S3Factory {
                     }
                     _ => {
                         // Initialize global AWS SDK for default credential chain.
-                        if let Err(err) =
-                            aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                        if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
                         {
                             tracing::warn!(
                                 "Unable to initialize AWS credentials for S3 connector: {err}"

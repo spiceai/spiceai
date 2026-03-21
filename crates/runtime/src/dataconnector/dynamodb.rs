@@ -126,7 +126,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("iam_role"),
     ParameterSpec::component("aws_iam_role_source")
         .description("IAM role credential source (only used when aws_auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables")
-        .default("auto"),
+        .one_of(&["auto", "metadata", "env"]),
     ParameterSpec::runtime("unnest_depth")
         .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
     ParameterSpec::runtime("schema_infer_max_records")
