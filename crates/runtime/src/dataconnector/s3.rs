@@ -142,10 +142,10 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
             ParameterSpec::component("iam_role_source")
-                .description("IAM role credential source (only used when auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+                .description("IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
                 .one_of(&["auto", "metadata", "env"]),
             ParameterSpec::component("versioning")
-                .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
+                .description("Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled"),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
@@ -426,5 +426,42 @@ mod tests {
             .expect("object store URL should be constructed");
 
         assert_eq!(object_store_url.fragment(), Some("url_style=path"));
+    }
+
+    #[tokio::test]
+    async fn test_iam_role_source_included_in_fragments_when_set() {
+        let params = create_test_parameters(vec![(
+            "s3_iam_role_source".to_string(),
+            "metadata".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(
+            object_store_url.fragment(),
+            Some("iam_role_source=metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iam_role_source_omitted_from_fragments_when_unset() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        let fragment = object_store_url.fragment().unwrap_or("");
+        assert!(
+            !fragment.contains("iam_role_source"),
+            "iam_role_source should not be in fragment when not set, got: {fragment}"
+        );
     }
 }

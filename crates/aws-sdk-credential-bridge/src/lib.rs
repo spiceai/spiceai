@@ -304,12 +304,14 @@ pub struct S3CredentialConfig {
 /// - `key`: Optional access key ID
 /// - `secret`: Optional secret access key
 /// - `auth_method`: Optional authentication method ("public", "key", "`iam_role`")
+/// - `iam_role_source`: Optional IAM role credential source restriction ("auto", "metadata", "env").
+///   Only applied when `auth_method` is "`iam_role`" or `None`. Returns an error for unsupported values.
 ///
 /// # Returns
 /// A `S3CredentialConfig` indicating how credentials should be loaded.
 ///
 /// # Errors
-/// Returns an error if the authentication method is not recognized.
+/// Returns an error if the authentication method or `iam_role_source` is not recognized.
 ///
 /// # Logic
 /// - If both `key` and `secret` are provided: Use explicit credentials (no environment loading, no skip signature)
@@ -365,7 +367,7 @@ pub fn determine_s3_credential_config(
     }
 }
 
-/// Builds an `S3CredentialProvider` for a restricted IAM role source.
+/// Builds an [`SdkConfig`] for a restricted IAM role source.
 ///
 /// This is used by the object store registry (synchronous context) when `iam_role_source`
 /// is `metadata` or `env`, requiring a credential chain that differs from the global cached config.
