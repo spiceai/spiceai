@@ -81,6 +81,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("aws_iam_role_source")
+        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+        .one_of(&["auto", "metadata", "env"]),
     ParameterSpec::component("index_poll_interval")
         .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query."),
     ParameterSpec::component("batch_write_rows")
@@ -248,6 +251,7 @@ async fn try_vector_table(
         "aws_secret_access_key",
         "aws_session_token",
         &params,
+        params.get("aws_iam_role_source").expose().ok(),
     )
     .await?;
 
