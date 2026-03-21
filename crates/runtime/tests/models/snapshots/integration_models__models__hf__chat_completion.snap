@@ -5,11 +5,20 @@ expression: "normalize_chat_completion_response(response, true)"
 {
   "choices": [
     {
-      "finish_reason": "stop",
+      "finish_reason": "tool_calls",
       "index": 0,
       "message": {
-        "content": "content_val",
-        "role": "assistant"
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"name\":\"taxi_trips\"}",
+              "name": "download_dataset"
+            },
+            "id": "call-688f0fcb-a431-43f9-a434-53d9eb9a5296",
+            "type": "function"
+          }
+        ]
       }
     }
   ],
