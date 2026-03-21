@@ -24,6 +24,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{CommandStatementUpdate, DoPutUpdateResult},
 };
+use datafusion::logical_expr::LogicalPlan;
 use futures::TryStreamExt;
 use prost::Message;
 use tonic::{Response, Status};
@@ -79,9 +80,14 @@ pub(crate) async fn do_put(
     let sql = &cmd.query;
     tracing::trace!("do_put_statement_update: {sql}");
 
+    let dml_table = match datafusion.ctx.state().create_logical_plan(sql).await {
+        Ok(LogicalPlan::Dml(dml)) => Some(dml.table_name.clone()),
+        Ok(_) | Err(_) => None,
+    };
+
     // Execute through the standard query path, which handles DELETE and UPDATE
     // via the runtime's DML interception in Query::run().
-    let query_result = QueryBuilder::new(sql, datafusion)
+    let query_result = QueryBuilder::new(sql, datafusion.clone())
         .build()
         .run()
         .await
@@ -92,6 +98,15 @@ pub(crate) async fn do_put(
         .try_collect()
         .await
         .map_err(to_tonic_err)?;
+
+    if let Some(table_name) = dml_table
+        && let Err(e) = datafusion.caching().invalidate_for_table(table_name.clone())
+    {
+        tracing::warn!(
+            "Failed to invalidate caches for table {} after statement update: {e}",
+            table_name
+        );
+    }
 
     // Extract affected rows count
     let affected_rows = extract_affected_rows(&results);

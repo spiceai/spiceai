@@ -26,6 +26,7 @@ use spice_cloud_client::CloudClient;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::access::AccessMode;
+use spicepod::component::caching::{CacheConfig, Caching, SQLResultsCacheConfig};
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
@@ -754,7 +755,7 @@ async fn provision_local_spiced_cluster(
             datasets,
             local_flight_api_key.as_deref(),
         )?;
-        let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;
+        let spicepod_path = write_local_spicepod(&spicepod, &working_dir, "spicepod.yaml").await?;
 
         let run_id_str = run_id.to_string();
         let short_run_id = run_id_str.split('-').next().unwrap_or_default();
@@ -915,9 +916,10 @@ async fn create_local_working_dir(run_id: Uuid) -> anyhow::Result<PathBuf> {
 async fn write_local_spicepod(
     spicepod: &SpicepodDefinition,
     working_dir: &Path,
+    file_name: &str,
 ) -> anyhow::Result<PathBuf> {
     let spicepod_yaml = serialize_spicepod(spicepod)?;
-    let spicepod_path = working_dir.join("spicepod.yaml");
+    let spicepod_path = working_dir.join(file_name);
     tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
     Ok(spicepod_path)
 }
@@ -1307,12 +1309,30 @@ fn generate_hive_spicepod(
     Ok(spicepod)
 }
 
+fn disabled_runtime_caching() -> Caching {
+    Caching {
+        sql_results: Some(SQLResultsCacheConfig {
+            enabled: false,
+            ..SQLResultsCacheConfig::default()
+        }),
+        search_results: Some(CacheConfig {
+            enabled: false,
+            ..CacheConfig::default()
+        }),
+        embeddings: Some(CacheConfig {
+            enabled: false,
+            ..CacheConfig::default()
+        }),
+    }
+}
+
 fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
     let mut spicepod = SpicepodDefinition::new(format!("spidapter-{short_id}"));
     spicepod.runtime = Runtime {
+        caching: disabled_runtime_caching(),
         telemetry: TelemetryConfig {
             enabled: false,
             ..TelemetryConfig::default()
@@ -1648,4 +1668,5 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
 }

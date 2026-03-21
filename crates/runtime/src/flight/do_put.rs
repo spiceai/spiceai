@@ -218,7 +218,7 @@ pub(crate) async fn handle(
             ));
         }
 
-        return partition::write_through::forward_federated_partitioned_write(
+        let response = partition::write_through::forward_federated_partitioned_write(
             executor_registry,
             Arc::clone(&datafusion.ctx),
             datafusion.io_runtime.clone(),
@@ -227,8 +227,17 @@ pub(crate) async fn handle(
             streaming_flight,
             &[partition_expression],
         )
-        .await
-        .map_err(Into::into);
+        .await;
+
+        if response.is_ok()
+            && let Err(e) = datafusion.caching().invalidate_for_table(path.clone())
+        {
+            tracing::warn!(
+                "Failed to invalidate caches for distributed Flight DoPut table {path}: {e}"
+            );
+        }
+
+        return response.map_err(Into::into);
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)

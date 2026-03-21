@@ -62,6 +62,57 @@ use crate::Read;
 
 pub mod federation;
 
+fn to_sql_preserving_precedence(expr_value: &Expr) -> expr::Result<String> {
+    match expr_value {
+        Expr::BinaryExpr(binary_expr) => {
+            let left = to_sql_preserving_precedence(binary_expr.left.as_ref())?;
+            let right = to_sql_preserving_precedence(binary_expr.right.as_ref())?;
+            Ok(format!("({left} {} {right})", binary_expr.op))
+        }
+        Expr::Not(inner) => Ok(format!(
+            "(NOT {})",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsNull(inner) => Ok(format!(
+            "({} IS NULL)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsNotNull(inner) => Ok(format!(
+            "({} IS NOT NULL)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsTrue(inner) => Ok(format!(
+            "({} IS TRUE)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsFalse(inner) => Ok(format!(
+            "({} IS FALSE)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsUnknown(inner) => Ok(format!(
+            "({} IS UNKNOWN)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsNotTrue(inner) => Ok(format!(
+            "({} IS NOT TRUE)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsNotFalse(inner) => Ok(format!(
+            "({} IS NOT FALSE)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::IsNotUnknown(inner) => Ok(format!(
+            "({} IS NOT UNKNOWN)",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        Expr::Negative(inner) => Ok(format!(
+            "(-{})",
+            to_sql_preserving_precedence(inner.as_ref())?
+        )),
+        _ => expr::to_sql(expr_value),
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -394,8 +445,12 @@ impl TableProvider for FlightSQLTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+            match to_sql_preserving_precedence(filter) {
+                Ok(_) => {
+                    // Keep remote filtering for performance, but mark it inexact so
+                    // DataFusion re-applies the predicate locally for correctness.
+                    filter_push_down.push(TableProviderFilterPushDown::Inexact)
+                }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
         }
@@ -473,14 +528,11 @@ impl FlightSqlExec {
                 .filters
                 .iter()
                 .map(|f| {
-                    expr::to_sql(f).map(|sql| {
-                        // Wrap each filter in parentheses to preserve semantics when
-                        // joining with AND.  Without this, an OR filter like
-                        //   "col" = 'A' OR "col" = 'B'
-                        // combined with another filter via AND becomes
-                        //   "col" = 'A' OR "col" = 'B' AND other_filter
-                        // which SQL parses as  col='A' OR (col='B' AND other_filter)
-                        // instead of the intended (col='A' OR col='B') AND other_filter.
+                    to_sql_preserving_precedence(f).map(|sql| {
+                        // Wrap each top-level filter in parentheses to preserve semantics when
+                        // joining with AND, and recursively parenthesize nested binary
+                        // expressions so mixed AND/OR trees inside a single filter keep the
+                        // original DataFusion meaning.
                         format!("({sql})")
                     })
                 })
