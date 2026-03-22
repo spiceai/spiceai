@@ -19,9 +19,12 @@ use std::{any::Any, sync::Arc};
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
+use futures::TryStreamExt;
+
 use datafusion_physical_plan::{
     execution_plan::{check_default_invariants, CardinalityEffect, InvariantLevel},
     expressions::PhysicalSortExpr,
@@ -147,7 +150,30 @@ impl ExecutionPlan for CayenneAccelerationExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        self.inner.execute(partition, context)
+        let stream = self.inner.execute(partition, context)?;
+        let schema = stream.schema();
+        let mapped = stream.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("Too many open files") {
+                // Extract the file path from messages like "Unable to open file /path/to/file.vortex: Too many ..."
+                let file_path = msg
+                    .find("Unable to open file ")
+                    .and_then(|start| {
+                        let after = &msg[start + "Unable to open file ".len()..];
+                        after.find(':').map(|end| &after[..end])
+                    })
+                    .unwrap_or("unknown");
+                DataFusionError::External(Box::new(super::Error::Internal {
+                    table: String::new(),
+                    message: format!(
+                        "Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
+                    ),
+                }))
+            } else {
+                e
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
