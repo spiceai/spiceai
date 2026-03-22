@@ -609,6 +609,7 @@ pub enum QueryOverrides {
     Spicecloud,
     DynamoDB,
     Arrow,
+    Turso,
 }
 
 impl QueryOverrides {
@@ -624,6 +625,7 @@ impl QueryOverrides {
             "duckdb" => Some(Self::DuckDB),
             "dynamodb" => Some(Self::DynamoDB),
             "arrow" => Some(Self::Arrow),
+            "turso" => Some(Self::Turso),
             _ => None,
         }
     }
@@ -896,6 +898,17 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             20, // Physical plan does not support logical expression ScalarSubquery(<subquery>); https://github.com/spiceai/spiceai/issues/8384
             21  // Binder Error; https://github.com/spiceai/spiceai/issues/8384
         ),
+        Some(QueryOverrides::Turso) => {
+            let mut queries: Vec<Query> = remove_tpch_query!(
+                queries,
+                2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
+                6, // Rewritten: explicit BETWEEN 0.05 AND 0.07 to avoid libSQL float arithmetic precision issue; https://github.com/spiceai/spiceai/issues/9872
+                17, // Correlated scalar subquery not supported
+                20  // Correlated scalar subquery not supported
+            );
+            queries.extend(generate_tpch_queries_override!("turso", q6));
+            queries
+        }
         _ => queries,
     }
 }
