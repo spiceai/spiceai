@@ -275,7 +275,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r"
+            insta::assert_snapshot!(plan_fmt, @r#"
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             | plan_type     | plan                                                                                                                                                                                                                        |
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
@@ -287,7 +287,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE bucket(4, "id") = '0' OR bucket(4, "id") = '1' OR bucket(4, "id") = '2' OR bucket(4, "id") = '3'                                             |
             |               |                                                                                                                                                                                                                             |
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            ");
+            "#);
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -608,7 +608,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r"
+            insta::assert_snapshot!(plan_fmt, @r#"
             +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             | plan_type     | plan                                                                                                                                                                                                                         |
             +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
@@ -631,7 +631,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             |               |             FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE bucket(4, "id") = '0' OR bucket(4, "id") = '1' OR bucket(4, "id") = '2' OR bucket(4, "id") = '3'                                             |
             |               |                                                                                                                                                                                                                              |
             +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            ");
+            "#);
 
             let rows = harness.query(join_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
