@@ -1271,9 +1271,7 @@ fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
         .lines()
         .filter(|line| line.starts_with("scheduler_active_executors_count"))
         .filter_map(|line| line.split_whitespace().last())
-        .filter_map(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| value as usize)
+        .filter_map(|value| value.parse::<usize>().ok())
         .max()
 }
 
