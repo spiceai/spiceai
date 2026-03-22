@@ -558,7 +558,9 @@ impl ClusterService for ClusterServiceImpl {
             }
 
             // Unregister the executor when the stream ends.
-            executor_registry.unregister(&executor_id).await;
+            if let Err(e) = executor_registry.unregister(&executor_id).await {
+                tracing::warn!("Failed to unregister executor {executor_id}: {e}");
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
