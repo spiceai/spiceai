@@ -358,7 +358,7 @@ impl TableProvider for FlightTable {
                 Ok(_) => {
                     // Keep remote filtering for performance, but mark it inexact so
                     // DataFusion re-applies the predicate locally for correctness.
-                    filter_push_down.push(TableProviderFilterPushDown::Inexact)
+                    filter_push_down.push(TableProviderFilterPushDown::Inexact);
                 }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
