@@ -163,11 +163,8 @@ impl ExecutionPlan for CayenneAccelerationExec {
                         after.find(':').map(|end| &after[..end])
                     })
                     .unwrap_or("unknown");
-                DataFusionError::External(Box::new(super::Error::Internal {
-                    table: String::new(),
-                    message: format!(
-                        "Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
-                    ),
+                DataFusionError::External(Box::new(super::Error::TooManyOpenFiles {
+                    file_path: file_path.to_string(),
                 }))
             } else {
                 e
