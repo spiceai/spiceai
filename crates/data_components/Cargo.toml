@@ -162,7 +162,7 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso", "dep:turso-shared"]
+turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 test_hadoop_catalog_docker = []
 

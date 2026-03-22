@@ -104,11 +104,6 @@ use arrow::{
     },
 };
 use async_trait::async_trait;
-use datafusion_table_providers::util::supported_functions::{
-    FunctionSupport, contains_unsupported_functions,
-};
-use std::ops::ControlFlow;
-
 use datafusion::{
     catalog::Session,
     common::{SchemaExt, utils::quote_identifier},
@@ -128,14 +123,12 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{
         TableReference,
-        sqlparser::ast::{
-            BinaryOperator, DateTimeField, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr,
-            Ident, ObjectName, ObjectNamePart, Value as SqlValue, ValueWithSpan, VisitMut,
-            VisitorMut,
-        },
+        sqlparser::ast::{self as sqlast, VisitMut},
         unparser::{
             Unparser,
-            dialect::{Dialect, SqliteDialect},
+            dialect::{
+                CharacterLengthStyle, DateFieldExtractStyle, Dialect, IntervalStyle, SqliteDialect,
+            },
         },
     },
 };
@@ -145,6 +138,10 @@ use datafusion_federation::{
         RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
         ast_analyzer::{AstAnalyzer, AstAnalyzerRule},
     },
+};
+use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
+use datafusion_table_providers::util::supported_functions::{
+    FunctionSupport, contains_unsupported_functions,
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
@@ -242,129 +239,86 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Visitor that transforms INTERVAL expressions to SQLite-compatible datetime() calls
+/// Turso dialect wrapping `SqliteDialect` with Turso-specific overrides.
 ///
-/// SQLite doesn't support INTERVAL literals, so we need to transform them to datetime() function calls.
-/// This handles expressions like `NOW() - INTERVAL '1' DAY` → `datetime('now', '-1 day')`
-struct IntervalTransformer;
+/// Differences from plain `SqliteDialect`:
+/// - `supports_nulls_first_in_sort` returns `false` (libSQL/Turso does not support it)
+/// - `now()` is rewritten to `datetime('now')` (libSQL has no `now()` function)
+struct TursoDialect {
+    inner: SqliteDialect,
+}
 
-impl VisitorMut for IntervalTransformer {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &mut SqlExpr) -> ControlFlow<Self::Break> {
-        // Look for BinaryOp(left, +/-, Interval) patterns
-        if let SqlExpr::BinaryOp { left, op, right } = expr
-            && let SqlExpr::Interval(interval) = right.as_ref()
-        {
-            // Found an INTERVAL expression - transform it
-            if let Some(transformed) = transform_interval_expr(left, op, interval) {
-                *expr = transformed;
-            }
+impl TursoDialect {
+    fn new() -> Self {
+        Self {
+            inner: SqliteDialect {},
         }
-        ControlFlow::Continue(())
     }
 }
 
-/// Transform INTERVAL expressions to SQLite datetime() function calls
-///
-/// Handles patterns like:
-/// - `column - INTERVAL '1' DAY` → `datetime(column, '-1 day')`
-/// - `NOW() + INTERVAL '5' HOUR` → `datetime('now', '+5 hours')`
-fn transform_interval_expr(
-    base: &SqlExpr,
-    op: &BinaryOperator,
-    interval: &datafusion::sql::sqlparser::ast::Interval,
-) -> Option<SqlExpr> {
-    // Only handle +/- operators
-    let sign = match op {
-        BinaryOperator::Plus => "+",
-        BinaryOperator::Minus => "-",
-        _ => return None,
-    };
-
-    // Extract interval value and unit
-    let value_expr = interval.value.as_ref();
-    let unit = interval.leading_field.as_ref()?;
-
-    // Get the numeric value from the interval
-    let value_str = match value_expr {
-        SqlExpr::Value(ValueWithSpan {
-            value: SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s),
-            ..
-        }) => s,
-        SqlExpr::Value(ValueWithSpan {
-            value: SqlValue::Number(n, _),
-            ..
-        }) => n,
-        _ => return None,
-    };
-
-    // Map SQL interval units to SQLite datetime modifiers
-    let unit_str = match unit {
-        DateTimeField::Year => "years",
-        DateTimeField::Month => "months",
-        DateTimeField::Day => "days",
-        DateTimeField::Hour => "hours",
-        DateTimeField::Minute => "minutes",
-        DateTimeField::Second => "seconds",
-        _ => return None, // Unsupported unit
-    };
-
-    // Build the datetime modifier string: '+5 hours' or '-1 day'
-    let modifier = format!("{sign}{value_str} {unit_str}");
-
-    // Convert base expression
-    let base_arg = match base {
-        // Special case: NOW() → 'now'
-        SqlExpr::Function(func) if is_now_function(func) => SqlExpr::Value(ValueWithSpan {
-            value: SqlValue::SingleQuotedString("now".to_string()),
-            span: datafusion::sql::sqlparser::tokenizer::Span::empty(),
-        }),
-        // Other expressions pass through as-is
-        expr => expr.clone(),
-    };
-
-    // Build datetime(base, modifier) function call
-    Some(SqlExpr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("datetime"))]),
-        args: datafusion::sql::sqlparser::ast::FunctionArguments::List(
-            datafusion::sql::sqlparser::ast::FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(base_arg)),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(ValueWithSpan {
-                        value: SqlValue::SingleQuotedString(modifier),
-                        span: datafusion::sql::sqlparser::tokenizer::Span::empty(),
-                    }))),
-                ],
-                clauses: vec![],
-            },
-        ),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-        parameters: datafusion::sql::sqlparser::ast::FunctionArguments::None,
-        uses_odbc_syntax: false,
-    }))
-}
-
-/// Check if a function is NOW() or CURRENT_TIMESTAMP
-fn is_now_function(func: &Function) -> bool {
-    if func.args
-        != datafusion::sql::sqlparser::ast::FunctionArguments::List(
-            datafusion::sql::sqlparser::ast::FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![],
-                clauses: vec![],
-            },
-        )
-    {
-        return false;
+impl Dialect for TursoDialect {
+    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+        self.inner.identifier_quote_style(identifier)
     }
 
-    let name = func.name.to_string().to_uppercase();
-    matches!(name.as_str(), "NOW" | "CURRENT_TIMESTAMP")
+    // Override: libSQL/Turso does not support NULLS FIRST/LAST in ORDER BY
+    // (SqliteDialect returns true)
+    fn supports_nulls_first_in_sort(&self) -> bool {
+        false
+    }
+
+    fn supports_qualify(&self) -> bool {
+        self.inner.supports_qualify()
+    }
+
+    fn date_field_extract_style(&self) -> DateFieldExtractStyle {
+        self.inner.date_field_extract_style()
+    }
+
+    fn date32_cast_dtype(&self) -> sqlast::DataType {
+        self.inner.date32_cast_dtype()
+    }
+
+    fn character_length_style(&self) -> CharacterLengthStyle {
+        self.inner.character_length_style()
+    }
+
+    fn supports_column_alias_in_table_alias(&self) -> bool {
+        self.inner.supports_column_alias_in_table_alias()
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        self.inner.interval_style()
+    }
+
+    fn timestamp_cast_dtype(
+        &self,
+        time_unit: &arrow::datatypes::TimeUnit,
+        tz: &Option<Arc<str>>,
+    ) -> sqlast::DataType {
+        self.inner.timestamp_cast_dtype(time_unit, tz)
+    }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> DataFusionResult<Option<sqlast::Expr>> {
+        // Override: libSQL/Turso has no built-in now() function;
+        // rewrite to datetime('now') which is the SQLite/libSQL equivalent.
+        if func_name == "now" {
+            return Ok(Some(unparser.scalar_function_to_sql(
+                "datetime",
+                &[Expr::Literal(
+                    ScalarValue::Utf8(Some("now".to_string())),
+                    None,
+                )],
+            )?));
+        }
+        self.inner
+            .scalar_function_to_sql_overrides(unparser, func_name, args)
+    }
 }
 
 /// Connection pool for Turso databases
@@ -777,11 +731,17 @@ impl TursoTableProvider {
                     }
                 }
                 DataType::Date32 => {
-                    // Date32 stored as days since Unix epoch
+                    // Date32 stored as ISO-8601 date string (e.g. '1993-07-01')
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                        .ok_or_else(|| Error::MissingColumnValue { col_idx })?;
                     let values: Vec<Option<i32>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                            TursoValue::Text(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                                .ok()
+                                .and_then(|d| {
+                                    i32::try_from(d.signed_duration_since(epoch).num_days()).ok()
+                                }),
                             TursoValue::Null => None,
                             _ => None,
                         })
@@ -789,11 +749,15 @@ impl TursoTableProvider {
                     Arc::new(Date32Array::from(values))
                 }
                 DataType::Date64 => {
-                    // Date64 stored as milliseconds since Unix epoch
+                    // Date64 stored as ISO-8601 date string (e.g. '1993-07-01')
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                        .ok_or_else(|| Error::MissingColumnValue { col_idx })?;
                     let values: Vec<Option<i64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Text(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                                .ok()
+                                .map(|d| d.signed_duration_since(epoch).num_days() * 86_400_000),
                             TursoValue::Null => None,
                             _ => None,
                         })
@@ -1139,27 +1103,20 @@ impl TursoTableProvider {
         Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
     }
 
-    /// Returns AST analyzer rules for Turso-specific SQL transformations
+    /// Returns AST analyzer rules for Turso-specific SQL transformations.
     ///
-    /// Turso uses `SQLite` dialect which doesn't support INTERVAL literals.
-    /// This analyzer transforms INTERVAL expressions to SQLite-compatible `datetime()` calls.
+    /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL literals to
+    /// `CAST(date/datetime(col, modifier) AS TEXT)` calls.
     ///
-    /// Examples:
-    /// - `NOW() - INTERVAL '1' DAY` → `datetime('now', '-1 day')`
-    /// - `timestamp + INTERVAL '5' HOUR` → `datetime(timestamp, '+5 hours')`
+    /// Note: Unlike the SQLite accelerator, we do NOT run `SQLiteBetweenVisitor`
+    /// here. That visitor rewrites `BETWEEN` into `decimal_cmp()` calls which is not supported by Turso.
     fn turso_ast_analyzer() -> AstAnalyzerRule {
         Box::new(|mut ast| {
-            // Transform INTERVAL expressions to SQLite datetime() calls
-            transform_intervals(&mut ast);
+            let mut interval_visitor = SQLiteIntervalVisitor::default();
+            let _ = ast.visit(&mut interval_visitor);
             Ok(ast)
         })
     }
-}
-
-/// Transforms INTERVAL expressions in a SQL statement to SQLite-compatible `datetime()` calls
-fn transform_intervals(statement: &mut datafusion::sql::sqlparser::ast::Statement) {
-    let mut transformer = IntervalTransformer;
-    let _ = statement.visit(&mut transformer);
 }
 
 #[async_trait]
@@ -1180,7 +1137,7 @@ impl TableProvider for TursoTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        let dialect = SqliteDialect {};
+        let dialect = TursoDialect::new();
         let unparser = Unparser::new(&dialect);
 
         let mut filter_push_down = vec![];
@@ -1296,11 +1253,11 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     fn compute_context(&self) -> Option<String> {
-        None
+        Some(self.pool.db_path().to_string())
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(SqliteDialect {})
+        Arc::new(TursoDialect::new())
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
@@ -1407,6 +1364,7 @@ impl SQLExecutor for TursoTableProvider {
                 let data_type = match col_type.to_uppercase().as_str() {
                     "INTEGER" | "BLOB" => DataType::Int64,
                     "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
+                    "DATE_TEXT" => DataType::Date32,
                     _ => DataType::Utf8,
                 };
                 let nullable = *not_null == 0;
@@ -1488,7 +1446,7 @@ impl TursoExec {
         let where_expr = if self.filters.is_empty() {
             String::new()
         } else {
-            let dialect = SqliteDialect {};
+            let dialect = TursoDialect::new();
             let unparser = Unparser::new(&dialect);
             let filter_sqls: Vec<String> = self
                 .filters
@@ -1637,7 +1595,7 @@ impl DeletionSink for TursoDeletionSink {
         let where_clause = if self.filters.is_empty() {
             String::new()
         } else {
-            let dialect = SqliteDialect {};
+            let dialect = TursoDialect::new();
             let unparser = Unparser::new(&dialect);
             let filter_sqls: Vec<String> = self
                 .filters
@@ -2025,8 +1983,18 @@ fn scalar_value_to_turso(
             convert_timestamp_to_turso(v, TimeUnit::Nanosecond, tz.as_deref(), timestamp_format)?
         }
 
-        ScalarValue::Date32(Some(v)) => TursoValue::Integer(i64::from(v)),
-        ScalarValue::Date64(Some(v)) => TursoValue::Integer(v),
+        ScalarValue::Date32(Some(v)) => {
+            // Store as ISO-8601 date string (matching SQLite accelerator behavior)
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).ok_or("invalid epoch date")?;
+            let date = epoch + chrono::Duration::days(i64::from(v));
+            TursoValue::Text(date.format("%Y-%m-%d").to_string())
+        }
+        ScalarValue::Date64(Some(v)) => {
+            // Store as ISO-8601 date string (ms since epoch → date string)
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).ok_or("invalid epoch date")?;
+            let date = epoch + chrono::Duration::milliseconds(v);
+            TursoValue::Text(date.format("%Y-%m-%d").to_string())
+        }
         ScalarValue::Time32Second(Some(v)) | ScalarValue::Time32Millisecond(Some(v)) => {
             TursoValue::Integer(i64::from(v))
         }

@@ -553,10 +553,10 @@ impl DataAccelerator for TursoAccelerator {
                 DataType::Binary | DataType::LargeBinary => "BLOB",
                 // Boolean maps to INTEGER (0/1)
                 DataType::Boolean => "INTEGER",
-                // Temporal types map to INTEGER
+                // Similar to SQLite Date types stored as `date_text` (ISO-8601 strings) for correct comparison semantics, like o_orderdate > '1894-01-01';
+                DataType::Date32 | DataType::Date64 => "date_text",
+                // Other temporal types map to INTEGER
                 DataType::Timestamp(_, _)
-                | DataType::Date32
-                | DataType::Date64
                 | DataType::Time32(_)
                 | DataType::Time64(_)
                 | DataType::Duration(_)

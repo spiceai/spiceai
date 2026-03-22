@@ -141,8 +141,11 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
+            ParameterSpec::component("iam_role_source")
+                .description("IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+                .one_of(&["auto", "metadata", "env"]),
             ParameterSpec::component("versioning")
-                .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
+                .description("Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled"),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
@@ -189,25 +192,28 @@ impl DataConnectorFactory for S3Factory {
             }
 
             // Initialize AWS SDK credentials for IAM role authentication.
-            // Skip initialization for 'public' and 'key' auth methods which use explicit credentials.
-            // Default to 'public' if no auth method is specified.
-            let auth = params
-                .parameters
-                .get("auth")
-                .expose()
-                .ok()
-                .unwrap_or("public");
-
-            match auth {
-                "public" | "key" => {
-                    // Skip AWS SDK initialization - use explicit auth method directly
-                }
-                _ => {
-                    // Initialize AWS SDK for IAM role or any other auth method
-                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-                        tracing::warn!(
-                            "Unable to initialize AWS credentials for S3 connector: {err}"
-                        );
+            // Skip initialization only for 'public' and 'key' auth methods which use
+            // explicit credentials. When auth is unset, attempt to load credentials from
+            // the environment (including IRSA web identity tokens, ECS container credentials,
+            // and IMDS) so that IAM-based access works by default.
+            if let Some("public" | "key") = params.parameters.get("auth").expose().ok() {
+                // Skip AWS SDK initialization - use explicit auth method directly
+            } else {
+                let iam_role_source = params.parameters.get("iam_role_source").expose().ok();
+                match iam_role_source {
+                    Some("metadata" | "env") => {
+                        // Restricted IAM role source - build a custom config instead
+                        // of using the global SDK config. The object store registry
+                        // will handle the restricted source when building credentials.
+                    }
+                    _ => {
+                        // Initialize global AWS SDK for default credential chain.
+                        if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                        {
+                            tracing::warn!(
+                                "Unable to initialize AWS credentials for S3 connector: {err}"
+                            );
+                        }
                     }
                 }
             }
@@ -284,6 +290,7 @@ impl ListingTableConnector for S3 {
                 "allow_http",
                 "auth",
                 "session_token",
+                "iam_role_source",
             ],
         )));
 
@@ -419,5 +426,42 @@ mod tests {
             .expect("object store URL should be constructed");
 
         assert_eq!(object_store_url.fragment(), Some("url_style=path"));
+    }
+
+    #[tokio::test]
+    async fn test_iam_role_source_included_in_fragments_when_set() {
+        let params = create_test_parameters(vec![(
+            "s3_iam_role_source".to_string(),
+            "metadata".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(
+            object_store_url.fragment(),
+            Some("iam_role_source=metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iam_role_source_omitted_from_fragments_when_unset() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        let fragment = object_store_url.fragment().unwrap_or("");
+        assert!(
+            !fragment.contains("iam_role_source"),
+            "iam_role_source should not be in fragment when not set, got: {fragment}"
+        );
     }
 }

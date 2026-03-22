@@ -253,7 +253,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc", "datafusion-table-providers/adbc"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
