@@ -55,19 +55,6 @@ use yaml::Value;
 mod spiced_tracing;
 mod tls;
 
-const SPICED_DO_PUT_RATE_LIMIT_ENABLED_ENV: &str = "SPICED_DO_PUT_RATE_LIMIT_ENABLED";
-
-fn env_bool_override(key: &str) -> Option<bool> {
-    env::var(key).ok().and_then(|raw| {
-        let value = raw.trim().to_ascii_lowercase();
-        match value.as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
-}
-
 /// Registers all external data connectors with the runtime.
 ///
 /// This function must be called during runtime initialization to make the
@@ -398,20 +385,13 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = telemetry_config.set(config);
     }
 
-    // Configure Flight `DoPut` rate limits from spicepod runtime.flight settings
+    // Configure Flight `DoPut` rate limits from the local spicepod runtime.flight settings.
+    // Executors inherit their effective setting from the scheduler's app definition after they join the cluster.
     let flight_config = runtime_config.and_then(|rt| rt.flight.clone());
     let rate_limits = {
         let mut limits = runtime::flight::RateLimits::default();
         if let Some(ref flight) = flight_config {
             limits = limits.with_flight_write_enabled(flight.do_put_rate_limit_enabled);
-        }
-        if let Some(enabled) = env_bool_override(SPICED_DO_PUT_RATE_LIMIT_ENABLED_ENV) {
-            tracing::info!(
-                enabled,
-                env = SPICED_DO_PUT_RATE_LIMIT_ENABLED_ENV,
-                "Overriding Flight DoPut rate limiting from environment"
-            );
-            limits = limits.with_flight_write_enabled(enabled);
         }
         limits
     };

@@ -26,7 +26,6 @@ use spice_cloud_client::CloudClient;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::access::AccessMode;
-use spicepod::component::caching::{CacheConfig, Caching, SQLResultsCacheConfig};
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
@@ -52,6 +51,7 @@ const LOCAL_SPICE_BINARY: &str = "spice";
 const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
 const SPIDAPTER_NUM_EXECUTORS_ENV: &str = "SPIDAPTER_NUM_EXECUTORS";
 const MAX_LOCAL_EXECUTORS: usize = 16;
+const LOCAL_EXECUTOR_REGISTRATION_METRIC_GRACE: Duration = Duration::from_secs(15);
 
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
@@ -827,6 +827,13 @@ async fn provision_local_spiced_cluster(
         return Err(error);
     }
 
+    let executor_http_urls = ports
+        .executor_ports
+        .iter()
+        .take(num_exec)
+        .map(|ports| format!("http://{}:{}", LOCAL_CONNECT_HOST, ports.0))
+        .collect::<Vec<_>>();
+
     let mut executor_children = Vec::with_capacity(num_exec);
     for (i, executor_dir) in executor_dirs.iter().enumerate().take(num_exec) {
         let (executor_cert, executor_key) = &pki_paths.executor_pki[i];
@@ -878,6 +885,7 @@ async fn provision_local_spiced_cluster(
         );
         if let Err(error) = wait_for_local_executor_count(
             &scheduler_http_url,
+            &executor_http_urls,
             &mut scheduler_child,
             &mut executor_children,
             num_exec,
@@ -1229,6 +1237,7 @@ async fn wait_for_local_sql_ready(
 
 async fn wait_for_local_executor_count(
     scheduler_http_url: &str,
+    executor_http_urls: &[String],
     scheduler_child: &mut Child,
     executor_children: &mut [Child],
     expected_count: usize,
@@ -1262,8 +1271,32 @@ async fn wait_for_local_executor_count(
             return Ok(());
         }
 
+        if started.elapsed() >= LOCAL_EXECUTOR_REGISTRATION_METRIC_GRACE
+            && all_local_executor_http_ready(&client, executor_http_urls).await
+        {
+            eprintln!(
+                "[stdio] local backend: scheduler executor-count metric unavailable; falling back to per-executor health checks"
+            );
+            return Ok(());
+        }
+
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+async fn all_local_executor_http_ready(
+    client: &reqwest::Client,
+    executor_http_urls: &[String],
+) -> bool {
+    for executor_http_url in executor_http_urls {
+        let ready_url = format!("{executor_http_url}/health");
+        match client.get(&ready_url).send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(_) | Err(_) => return false,
+        }
+    }
+
+    true
 }
 
 fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
@@ -1389,30 +1422,12 @@ fn generate_hive_spicepod(
     Ok(spicepod)
 }
 
-fn disabled_runtime_caching() -> Caching {
-    Caching {
-        sql_results: Some(SQLResultsCacheConfig {
-            enabled: false,
-            ..SQLResultsCacheConfig::default()
-        }),
-        search_results: Some(CacheConfig {
-            enabled: false,
-            ..CacheConfig::default()
-        }),
-        embeddings: Some(CacheConfig {
-            enabled: false,
-            ..CacheConfig::default()
-        }),
-    }
-}
-
 fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
     let mut spicepod = SpicepodDefinition::new(format!("spidapter-{short_id}"));
     spicepod.runtime = Runtime {
-        caching: disabled_runtime_caching(),
         telemetry: TelemetryConfig {
             enabled: false,
             ..TelemetryConfig::default()

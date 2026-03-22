@@ -229,6 +229,7 @@ pub async fn start_executor_flight_server(
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();
+    let flight_write_rate_limit_enabled = rt.flight_write_rate_limit_enabled();
 
     // Add middleware layers for request context, auth, and rate limiting
     let rate_limits = &rt.rate_limits;
@@ -240,7 +241,7 @@ pub async fn start_executor_flight_server(
         .layer(auth_layer)
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
-            rate_limits.flight_write_enabled,
+            flight_write_rate_limit_enabled,
         ));
 
     let server = server.add_service(
