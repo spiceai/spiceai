@@ -1,0 +1,30 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "7f5359852068",
+  "session_id": "ffaebec9-a81e-468e-8f98-fcf757a45e60",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-22T23:10:10.666824Z",
+  "branch": "jeadie/26-03-12/tests",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/runtime/tests/cluster/distributed_acceleration.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "4f7aeefb6a81",
+  "token_usage": {
+    "input_tokens": 142,
+    "cache_creation_tokens": 313810,
+    "cache_read_tokens": 9617910,
+    "output_tokens": 79227,
+    "api_call_count": 118
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-22T23:10:09.608474Z",
+    "agent_lines": 0,
+    "human_added": 74395,
+    "human_modified": 73,
+    "human_removed": 0,
+    "total_committed": 74395,
+    "agent_percentage": 0
+  }
+}
