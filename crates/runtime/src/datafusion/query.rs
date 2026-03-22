@@ -29,11 +29,14 @@ use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
     datasource::memory::MemorySourceConfig,
-    error::DataFusionError,
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::dml::InsertOp,
     logical_expr::{Expr, LogicalPlan},
-    physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
+    physical_plan::{
+        ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
+        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    },
 };
 use datafusion_expr::expr_rewriter::unnormalize_col;
 use error_code::ErrorCode;
@@ -609,17 +612,20 @@ impl Query {
                 )
             }
 
-            // Proactively invalidate plans cache for tables affected by DML
-            // mutations (INSERT, DELETE, UPDATE). Cached logical plans hold stale
-            // `Arc<dyn TableProvider>` references that won't reflect the upcoming
-            // data changes, so subsequent queries must re-resolve through the
-            // catalog.
+            // Proactively invalidate cached query state for tables affected by
+            // DML mutations (INSERT, DELETE, UPDATE).
+            // - results cache must be cleared so repeated SQL does not replay
+            //   pre-mutation answers
+            // - plans cache must be cleared so future queries re-resolve table
+            //   providers with up-to-date in-memory state.
             if let LogicalPlan::Dml(dml) = &*plan
-                && let Some(cache) = ctx.df.plans_cache_provider()
-                && let Err(e) = cache.invalidate_for_table(dml.table_name.clone())
+                && let Err(e) = ctx
+                    .df
+                    .caching()
+                    .invalidate_for_table(dml.table_name.clone())
             {
                 tracing::warn!(
-                    "Failed to invalidate plans cache for table {} before DML: {e}",
+                    "Failed to invalidate caches for table {} before DML: {e}",
                     dml.table_name
                 );
             }
@@ -717,7 +723,10 @@ impl Query {
                     };
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
-                    let stream = match execute_stream(Arc::clone(&df_plan), task_ctx) {
+                    let stream = match execute_stream_preserving_output_order(
+                        Arc::clone(&df_plan),
+                        task_ctx,
+                    ) {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -755,7 +764,10 @@ impl Query {
                         };
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
-                    let stream = match execute_stream(Arc::clone(&delete_plan), task_ctx) {
+                    let stream = match execute_stream_preserving_output_order(
+                        Arc::clone(&delete_plan),
+                        task_ctx,
+                    ) {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -794,7 +806,10 @@ impl Query {
                         };
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
-                    let stream = match execute_stream(Arc::clone(&update_plan), task_ctx) {
+                    let stream = match execute_stream_preserving_output_order(
+                        Arc::clone(&update_plan),
+                        task_ctx,
+                    ) {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -828,7 +843,10 @@ impl Query {
 
                     let task_ctx = Arc::new(TaskContext::from(&session));
 
-                    let stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
+                    let stream = match execute_stream_preserving_output_order(
+                        Arc::clone(&physical_plan),
+                        task_ctx,
+                    ) {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -1259,6 +1277,74 @@ fn collect_physical_plan_metrics(plan: &dyn ExecutionPlan, totals: &mut Physical
     for child in plan.children() {
         collect_physical_plan_metrics(child.as_ref(), totals);
     }
+}
+
+fn execute_stream_preserving_output_order(
+    plan: Arc<dyn ExecutionPlan>,
+    context: Arc<TaskContext>,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    let plan = prepare_physical_plan_for_sync_results(plan)?;
+    execute_stream(plan, context)
+}
+
+fn prepare_physical_plan_for_sync_results(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let plan = strip_root_order_preserving_repartition(plan)?;
+
+    if plan.output_partitioning().partition_count() > 1
+        && let Some(ordering) = plan.output_ordering().cloned()
+    {
+        // `execute_stream()` coalesces multi-partition output with
+        // `CoalescePartitionsExec`, which does not preserve global ordering.
+        // For synchronous APIs (/v1/sql, FlightSQL), preserve SQL ORDER BY
+        // semantics by collapsing ordered multi-partition output with an
+        // explicit sort-preserving merge first.
+        return Ok(Arc::new(
+            SortPreservingMergeExec::new(ordering, plan).with_round_robin_repartition(false),
+        ));
+    }
+
+    Ok(plan)
+}
+
+fn strip_root_order_preserving_repartition(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let children = plan.children();
+    if children.len() != 1 {
+        return Ok(plan);
+    }
+
+    let child = Arc::clone(children[0]);
+    let rewritten_child = strip_root_order_preserving_repartition(child)?;
+    let plan = if Arc::ptr_eq(children[0], &rewritten_child) {
+        plan
+    } else {
+        plan.with_new_children(vec![rewritten_child])?
+    };
+
+    if let Some(spm) = plan.as_any().downcast_ref::<SortPreservingMergeExec>() {
+        return Ok(Arc::new(
+            SortPreservingMergeExec::new(spm.expr().clone(), Arc::clone(spm.input()))
+                .with_fetch(spm.fetch())
+                .with_round_robin_repartition(false),
+        ));
+    }
+
+    if let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>()
+        && repartition.input().output_partitioning().partition_count() == 1
+        && repartition.input().output_ordering().is_some()
+        && repartition.partitioning().partition_count() > 1
+    {
+        // The synchronous query APIs consume a single stream. Repartitioning a
+        // single already-sorted stream back out to multiple output partitions at
+        // the root only makes `execute_stream()` coalesce it again later,
+        // destroying row order for ORDER BY queries.
+        return Ok(Arc::clone(repartition.input()));
+    }
+
+    Ok(plan)
 }
 
 pub fn write_to_json_string(
@@ -2252,5 +2338,76 @@ mod tests {
 
         let batches = collect_stream(reconciled).await;
         assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_physical_plan_for_sync_results_preserves_ordered_rows() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::{
+            datasource::MemTable, execution::context::SessionContext, prelude::SessionConfig,
+        };
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..32))],
+        )
+        .expect("batch");
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("table");
+        ctx.register_table("t", Arc::new(table))
+            .expect("register table");
+
+        let dataframe = ctx
+            .sql("SELECT id FROM t ORDER BY id DESC")
+            .await
+            .expect("sql");
+        let plan = dataframe
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            plan.output_ordering().is_some(),
+            "expected ordered output plan"
+        );
+
+        let wrapped = Arc::new(
+            RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(4)).expect("repartition"),
+        ) as Arc<dyn ExecutionPlan>;
+        assert!(
+            wrapped.output_ordering().is_some(),
+            "expected ordered output after repartition"
+        );
+        assert!(
+            wrapped.output_partitioning().partition_count() > 1,
+            "expected multi-partition output before sync rewrite"
+        );
+
+        let prepared = prepare_physical_plan_for_sync_results(wrapped).expect("prepare plan");
+        assert_eq!(prepared.output_partitioning().partition_count(), 1);
+
+        let batches = collect_stream(
+            execute_stream(prepared, Arc::new(TaskContext::from(&ctx.state())))
+                .expect("execute prepared plan"),
+        )
+        .await;
+
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("int32 array")
+                    .iter()
+                    .map(|v| v.expect("non-null id"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(ids, (0..32).rev().collect::<Vec<_>>());
     }
 }
