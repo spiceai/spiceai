@@ -58,29 +58,56 @@ pub struct EnvSecretStore {
 }
 
 impl EnvSecretStore {
-    fn load(&self) {
-        if let Some(path) = &self.path {
-            match dotenvy::from_path(path) {
-                Ok(()) => return,
-                Err(err) => {
-                    if matches!(err, dotenvy::Error::LineParse(_, _)) {
-                        tracing::warn!("{err}");
-                    } else {
-                        tracing::warn!("Error opening path {}: {err}", path.display());
+    fn load_from_iter<I>(source: &str, iter: Result<I, dotenvy::Error>, warn_on_open_error: bool)
+    where
+        I: Iterator<Item = Result<(String, String), dotenvy::Error>>,
+    {
+        let iter = match iter {
+            Ok(iter) => iter,
+            Err(err) => {
+                if warn_on_open_error {
+                    tracing::warn!("{source}: {err}");
+                }
+                return;
+            }
+        };
+
+        for entry in iter {
+            match entry {
+                Ok((key, value)) => {
+                    // SAFETY: This matches dotenvy's process-wide environment loading behavior.
+                    // `EnvSecretStore::load()` performs this mutation during secret store setup.
+                    unsafe {
+                        std::env::set_var(key, value);
                     }
+                }
+                Err(dotenvy::Error::LineParse(line, _)) => {
+                    tracing::warn!("{source}: invalid .env line: {line}");
+                }
+                Err(err) => {
+                    tracing::warn!("{source}: {err}");
+                    break;
                 }
             }
         }
-        if let Err(err) = dotenvy::from_filename(".env.local")
-            && matches!(err, dotenvy::Error::LineParse(_, _))
-        {
-            tracing::warn!(".env.local: {err}");
+    }
+
+    fn load(&self) {
+        if let Some(path) = &self.path {
+            Self::load_from_iter(
+                &path.display().to_string(),
+                dotenvy::from_path_iter(path),
+                true,
+            );
+            return;
         }
-        if let Err(err) = dotenvy::from_filename(".env")
-            && matches!(err, dotenvy::Error::LineParse(_, _))
-        {
-            tracing::warn!(".env: {err}");
-        }
+
+        Self::load_from_iter(
+            ".env.local",
+            dotenvy::from_filename_iter(".env.local"),
+            false,
+        );
+        Self::load_from_iter(".env", dotenvy::from_filename_iter(".env"), false);
     }
 }
 
@@ -117,7 +144,25 @@ impl SecretStore for EnvSecretStore {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, path::Path};
+
+    use super::EnvSecretStore;
+
+    fn remove_env_var_if_present(key: &str) {
+        if std::env::var_os(key).is_some() {
+            // SAFETY: These tests manage their own process environment keys and run
+            // synchronously within the test body.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    fn write_env_file(path: &Path, content: &str) {
+        let mut file = std::fs::File::create(path).expect("Failed to create test .env file");
+        file.write_all(content.as_bytes())
+            .expect("Failed to write test .env file");
+    }
 
     /// Test that verifies the dotenvy patch disables variable substitution.
     ///
@@ -146,10 +191,7 @@ TEST_PATCH_CURLY_BRACES=value_${NOT_A_VAR}_here
 TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
 ";
 
-        let mut file = std::fs::File::create(&env_file).expect("Failed to create test .env file");
-        file.write_all(env_content.as_bytes())
-            .expect("Failed to write test .env file");
-        drop(file);
+        write_env_file(&env_file, env_content);
 
         // Load the .env file using dotenvy
         dotenvy::from_path(&env_file).expect("Failed to load .env file");
@@ -177,9 +219,41 @@ TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
             // Clean up - remove_var is unsafe in Rust 2024 edition because modifying
             // environment variables while other threads may be reading them is UB.
             // SAFETY: This is a single-threaded unit test, no other threads are accessing env vars.
-            unsafe {
-                std::env::remove_var(key);
-            }
+            remove_env_var_if_present(key);
         }
+    }
+
+    #[test]
+    fn test_load_continues_after_invalid_line() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let env_file = temp_dir.path().join(".env.invalid");
+
+        let first_key = "TEST_ENV_LOAD_FIRST";
+        let second_key = "TEST_ENV_LOAD_SECOND";
+
+        remove_env_var_if_present(first_key);
+        remove_env_var_if_present(second_key);
+
+        write_env_file(
+            &env_file,
+            "TEST_ENV_LOAD_FIRST=one\nnot a valid env line\nTEST_ENV_LOAD_SECOND=two\n",
+        );
+
+        let store = EnvSecretStore {
+            path: Some(env_file.clone()),
+        };
+        store.load();
+
+        assert_eq!(
+            std::env::var(first_key).expect("Expected first valid key to load"),
+            "one"
+        );
+        assert_eq!(
+            std::env::var(second_key).expect("Expected second valid key to load"),
+            "two"
+        );
+
+        remove_env_var_if_present(first_key);
+        remove_env_var_if_present(second_key);
     }
 }
