@@ -385,7 +385,8 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = telemetry_config.set(config);
     }
 
-    // Configure Flight `DoPut` rate limits from spicepod runtime.flight settings
+    // Configure Flight `DoPut` rate limits from the local spicepod runtime.flight settings.
+    // Executors inherit their effective setting from the scheduler's app definition after they join the cluster.
     let flight_config = runtime_config.and_then(|rt| rt.flight.clone());
     let rate_limits = {
         let mut limits = runtime::flight::RateLimits::default();

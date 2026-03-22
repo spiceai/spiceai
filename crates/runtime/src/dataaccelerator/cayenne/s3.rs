@@ -1010,6 +1010,7 @@ pub async fn create_s3_express_bucket_if_needed(
         access_key_id.clone(),
         secret_access_key.clone(),
         session_token.clone(),
+        None,
     )
     .await;
 

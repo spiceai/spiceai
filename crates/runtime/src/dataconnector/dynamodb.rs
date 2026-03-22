@@ -126,7 +126,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("iam_role"),
     ParameterSpec::component("aws_iam_role_source")
         .description("IAM role credential source (only used when aws_auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables")
-        .default("auto"),
+        .one_of(&["auto", "metadata", "env"]),
     ParameterSpec::runtime("unnest_depth")
         .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
     ParameterSpec::runtime("schema_infer_max_records")
@@ -621,7 +621,7 @@ async fn create_bootstrap_stream(
 
                     let committer =
                         DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
-                    if let Err(err) = committer.commit() {
+                    if let Err(err) = committer.commit().await {
                         tracing::error!(error = ?err, "Failed to commit initialization lag");
                     }
 
@@ -959,7 +959,7 @@ async fn do_rebootstrap(
 
     // 4. Commit the checkpoint
     let committer = DynamoDBStreamCommitter::new(Arc::clone(dynamodb_sys), new_checkpoint.clone());
-    if let Err(e) = committer.commit() {
+    if let Err(e) = committer.commit().await {
         tracing::error!(
             dataset = %dataset_name,
             error = ?e,
@@ -1106,8 +1106,9 @@ impl MetricsProvider for DynamoDBMetricsProvider {
 }
 
 struct NoOpCommitter;
+#[async_trait]
 impl CommitChange for NoOpCommitter {
-    fn commit(&self) -> Result<(), CommitError> {
+    async fn commit(&self) -> Result<(), CommitError> {
         Ok(())
     }
 }
@@ -1127,8 +1128,9 @@ impl DynamoDBStreamCommitter {
     }
 }
 
+#[async_trait]
 impl CommitChange for DynamoDBStreamCommitter {
-    fn commit(&self) -> Result<(), CommitError> {
+    async fn commit(&self) -> Result<(), CommitError> {
         tracing::trace!(checkpoint = ?self.checkpoint, "Committing DynamoDB lag");
 
         let checkpoint_json = serde_json::to_string(&self.checkpoint).map_err(|e| {
@@ -1143,14 +1145,10 @@ impl CommitChange for DynamoDBStreamCommitter {
         };
 
         match self.dynamodb_sys.as_ref() {
-            Some(dynamodb_sys) => tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    dynamodb_sys.upsert(&metadata).await.map_err(|e| {
-                        CommitError::UnableToCommitChange {
-                            source: Box::new(e),
-                        }
-                    })
-                })
+            Some(dynamodb_sys) => dynamodb_sys.upsert(&metadata).await.map_err(|e| {
+                CommitError::UnableToCommitChange {
+                    source: Box::new(e),
+                }
             }),
             None => Ok(()),
         }

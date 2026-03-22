@@ -163,6 +163,7 @@ impl IcebergDataConnector {
                 "s3_secret_access_key",
                 "s3_session_token",
                 &self.params,
+                self.params.get("s3_iam_role_source").expose().ok(),
             )
             .await
             .map_err(|e| Error::InvalidConfiguration {

@@ -1015,11 +1015,19 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    // Resolve the telemetry config from the scheduler's app definition so that
-    // `start_anonymous_telemetry` (which is waiting on this value) can proceed.
+    // Resolve executor settings from the scheduler's app definition before the
+    // executor Flight server starts.
     if let Some(ref telemetry_config) = rt.telemetry_config {
         let _ = telemetry_config.set(app_def.runtime.telemetry.clone());
     }
+    rt.rate_limits.set_flight_write_enabled(
+        app_def
+            .runtime
+            .flight
+            .clone()
+            .unwrap_or_default()
+            .do_put_rate_limit_enabled,
+    );
 
     // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
     // Otherwise fall back to temp_directory from query config or system temp dir

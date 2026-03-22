@@ -325,6 +325,7 @@ impl SpiceObjectStoreRegistry {
             params.get("key").map(String::as_str),
             params.get("secret").map(String::as_str),
             params.get("auth").map(String::as_str),
+            params.get("iam_role_source").map(String::as_str),
         )
         .map_err(DataFusionError::Configuration)?;
 
@@ -350,7 +351,50 @@ impl SpiceObjectStoreRegistry {
         // Load credentials from AWS SDK environment if needed
         if credential_config.load_from_environment {
             tracing::trace!("Loading S3 credentials from environment");
-            if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
+
+            let use_restricted_source = credential_config
+                .iam_role_source
+                .as_deref()
+                .is_some_and(|s| s == "metadata" || s == "env");
+
+            if use_restricted_source {
+                // For restricted IAM role sources (metadata/env), build a fresh config
+                // with the restricted credential chain instead of using the global cache.
+                let iam_source = credential_config
+                    .iam_role_source
+                    .as_deref()
+                    .unwrap_or("auto");
+                let region = params.get("region").cloned();
+                let restricted_config = self.io_runtime.block_on(
+                    aws_sdk_credential_bridge::build_restricted_sdk_config(iam_source, region),
+                );
+                match restricted_config {
+                    Ok(sdk_config) => {
+                        if sdk_config.credentials_provider().is_some() {
+                            tracing::trace!(
+                                "Using S3 credentials provider with restricted IAM role source: {iam_source}"
+                            );
+                            s3_builder = s3_builder.with_credentials(Arc::new(
+                                S3CredentialProvider::from_config(&sdk_config).map_err(|e| {
+                                    object_store::Error::Generic {
+                                        store: "S3",
+                                        source: e.into(),
+                                    }
+                                })?,
+                            ));
+                        } else {
+                            tracing::trace!(
+                                "No S3 credentials provider found from restricted IAM source, assuming public access"
+                            );
+                            s3_builder = s3_builder.with_skip_signature(true);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to build restricted AWS SDK config for S3: {err}");
+                        s3_builder = s3_builder.with_skip_signature(true);
+                    }
+                }
+            } else if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::trace!("Using S3 credentials provider from SDK config");
                     s3_builder = s3_builder.with_credentials(Arc::new(
