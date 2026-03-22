@@ -624,18 +624,37 @@ impl BedrockConverse {
                let mut state_ = state.write().await;
                let zz: Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> = match packet {
                     Err(SdkError::ServiceError(e)) => {
-                        match &e.err() {
-                            &ConverseStreamOutputError::InternalServerException(e) => {
-                                Some(Err(to_api_error(e.to_string())))
+                        match e.err() {
+                            ConverseStreamOutputError::InternalServerException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock internal server error: {e}"))))
+                            }
+                            ConverseStreamOutputError::ThrottlingException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock rate limit exceeded: {e}"))))
+                            }
+                            ConverseStreamOutputError::ValidationException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock validation error: {e}"))))
+                            }
+                            ConverseStreamOutputError::ModelStreamErrorException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock model stream error: {e}"))))
                             }
                             ee => {
-                                // TODO specialise
-                                Some(Err(to_api_error(ee.to_string())))
+                                Some(Err(to_api_error(format!("Bedrock error: {ee}"))))
                             }
                         }
                     }
                     Err(e) => {
-                        Some(Err(to_api_error(e.to_string())))
+                        let err_str = e.to_string();
+                        let msg = if err_str.contains("UnrecognizedClientException")
+                            || err_str.contains("InvalidSignatureException")
+                            || err_str.contains("AccessDeniedException")
+                            || err_str.contains("ExpiredTokenException")
+                            || err_str.contains("IncompleteSignature")
+                        {
+                            format!("Bedrock authentication failed. Check that your AWS credentials are valid and have permission to access Bedrock. Details: {err_str}")
+                        } else {
+                            format!("Bedrock error: {err_str}")
+                        };
+                        Some(Err(to_api_error(msg)))
                     }
                     Ok(None) => None, // Natural end-of-stream.
                     Ok(Some(pkt)) => {
