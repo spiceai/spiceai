@@ -229,9 +229,7 @@ pub(crate) async fn handle(
         )
         .await;
 
-        if response.is_ok()
-            && let Err(e) = datafusion.caching().invalidate_for_table(path.clone())
-        {
+        if let Err(e) = datafusion.caching().invalidate_for_table(path.clone()) {
             tracing::warn!(
                 "Failed to invalidate caches for distributed Flight DoPut table {path}: {e}"
             );

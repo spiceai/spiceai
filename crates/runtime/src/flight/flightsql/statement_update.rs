@@ -100,7 +100,9 @@ pub(crate) async fn do_put(
         .map_err(to_tonic_err)?;
 
     if let Some(table_name) = dml_table
-        && let Err(e) = datafusion.caching().invalidate_for_table(table_name.clone())
+        && let Err(e) = datafusion
+            .caching()
+            .invalidate_for_table(table_name.clone())
     {
         tracing::warn!(
             "Failed to invalidate caches for table {} after statement update: {e}",

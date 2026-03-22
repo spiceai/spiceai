@@ -34,9 +34,8 @@ use datafusion::{
     logical_expr::dml::InsertOp,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, execute_stream,
-        repartition::RepartitionExec, sorts::sort_preserving_merge::SortPreservingMergeExec,
-        stream::RecordBatchStreamAdapter,
+        ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
+        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
 };
 use datafusion_expr::expr_rewriter::unnormalize_col;
@@ -620,7 +619,10 @@ impl Query {
             // - plans cache must be cleared so future queries re-resolve table
             //   providers with up-to-date in-memory state.
             if let LogicalPlan::Dml(dml) = &*plan
-                && let Err(e) = ctx.df.caching().invalidate_for_table(dml.table_name.clone())
+                && let Err(e) = ctx
+                    .df
+                    .caching()
+                    .invalidate_for_table(dml.table_name.clone())
             {
                 tracing::warn!(
                     "Failed to invalidate caches for table {} before DML: {e}",
@@ -2343,9 +2345,7 @@ mod tests {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use datafusion::{
-            datasource::MemTable,
-            execution::context::SessionContext,
-            prelude::SessionConfig,
+            datasource::MemTable, execution::context::SessionContext, prelude::SessionConfig,
         };
 
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
@@ -2357,20 +2357,29 @@ mod tests {
         )
         .expect("batch");
         let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("table");
-        ctx.register_table("t", Arc::new(table)).expect("register table");
+        ctx.register_table("t", Arc::new(table))
+            .expect("register table");
 
         let dataframe = ctx
             .sql("SELECT id FROM t ORDER BY id DESC")
             .await
             .expect("sql");
-        let plan = dataframe.create_physical_plan().await.expect("physical plan");
-        assert!(plan.output_ordering().is_some(), "expected ordered output plan");
+        let plan = dataframe
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            plan.output_ordering().is_some(),
+            "expected ordered output plan"
+        );
 
         let wrapped = Arc::new(
-            RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(4))
-                .expect("repartition"),
+            RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(4)).expect("repartition"),
         ) as Arc<dyn ExecutionPlan>;
-        assert!(wrapped.output_ordering().is_some(), "expected ordered output after repartition");
+        assert!(
+            wrapped.output_ordering().is_some(),
+            "expected ordered output after repartition"
+        );
         assert!(
             wrapped.output_partitioning().partition_count() > 1,
             "expected multi-partition output before sync rewrite"

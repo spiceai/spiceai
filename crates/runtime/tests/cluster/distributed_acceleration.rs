@@ -127,12 +127,12 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             | plan_type     | plan                                                                                                                                                                                    |
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                       |
-            |               |   TableScan: test_data projection=[id, name, age, city, score], full_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                     |
-            |               |   CooperativeExec                                                                                                                                                                       |
-            |               |     BytesProcessedExec                                                                                                                                                                  |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE (bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2')                                |
+            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                          |
+            |               |   TableScan: test_data projection=[id, name, age, city, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
+            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                        |
+            |               |   CooperativeExec                                                                                                                                                                          |
+            |               |     BytesProcessedExec                                                                                                                                                                     |
+            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')))                         |
             |               |                                                                                                                                                                                         |
             +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);
@@ -168,17 +168,17 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             | plan_type     | plan                                                                                                                                                                      |
             +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                |
-            |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                        |
-            |               |     TableScan: test_data projection=[age, score], full_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
-            | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]             |
-            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                 |
-            |               |     CoalescePartitionsExec                                                                                                                                                |
-            |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                           |
-            |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                              |
-            |               |           CooperativeExec                                                                                                                                                 |
-            |               |             BytesProcessedExec                                                                                                                                            |
-            |               |               FlightSqlExec sql=SELECT age, score FROM test_data WHERE (bucket(3, "id") = '0' OR bucket(3, "id") = '1' OR bucket(3, "id") = '2')                          |
+            | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                   |
+            |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                           |
+            |               |     TableScan: test_data projection=[age, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
+            | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]                |
+            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                    |
+            |               |     CoalescePartitionsExec                                                                                                                                                   |
+            |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                              |
+            |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                 |
+            |               |           CooperativeExec                                                                                                                                                    |
+            |               |             BytesProcessedExec                                                                                                                                               |
+            |               |               FlightSqlExec sql=SELECT age, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')))                |
             |               |                                                                                                                                                                           |
             +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);

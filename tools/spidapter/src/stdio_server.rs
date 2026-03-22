@@ -51,6 +51,7 @@ const LOCAL_SPICED_BINARY: &str = "spiced";
 const LOCAL_SPICE_BINARY: &str = "spice";
 const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
 const SPIDAPTER_NUM_EXECUTORS_ENV: &str = "SPIDAPTER_NUM_EXECUTORS";
+const MAX_LOCAL_EXECUTORS: usize = 16;
 
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
@@ -730,7 +731,7 @@ async fn provision_local_spiced_cluster(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
-    let num_exec = num_executors();
+    let num_exec = num_executors()?;
     eprintln!("[stdio] local backend: provisioning cluster with {num_exec} executor(s)");
     let ports = allocate_local_ports(LOCAL_BIND_HOST, num_exec)?;
 
@@ -870,12 +871,27 @@ async fn provision_local_spiced_cluster(
         return Err(error);
     }
 
-    // If we have multiple executors, wait a bit for the rest to connect
     if num_exec > 1 {
+        let remaining = num_exec.saturating_sub(1);
         eprintln!(
-            "[stdio] local backend: waiting 10s for remaining {num_exec} executor(s) to connect..."
+            "[stdio] local backend: waiting for remaining {remaining} executor(s) to register with the scheduler..."
         );
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        if let Err(error) = wait_for_local_executor_count(
+            &scheduler_http_url,
+            &mut scheduler_child,
+            &mut executor_children,
+            num_exec,
+            ready_wait,
+        )
+        .await
+        {
+            for child in &mut executor_children {
+                let _ = stop_child_process(child, "executor").await;
+            }
+            let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
+        }
     }
 
     if let Err(error) = post_setup_sink_action(
@@ -928,12 +944,28 @@ fn serialize_spicepod(spicepod: &SpicepodDefinition) -> anyhow::Result<String> {
     yaml::to_string(spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
-fn num_executors() -> usize {
-    std::env::var(SPIDAPTER_NUM_EXECUTORS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
+fn num_executors() -> anyhow::Result<usize> {
+    match std::env::var(SPIDAPTER_NUM_EXECUTORS_ENV) {
+        Ok(raw) => {
+            let parsed = raw.trim().parse::<usize>().map_err(|error| {
+                anyhow::anyhow!(
+                    "Invalid {SPIDAPTER_NUM_EXECUTORS_ENV} value '{raw}': {error}. Expected an integer in the range 1..={MAX_LOCAL_EXECUTORS}."
+                )
+            })?;
+
+            if !(1..=MAX_LOCAL_EXECUTORS).contains(&parsed) {
+                anyhow::bail!(
+                    "Invalid {SPIDAPTER_NUM_EXECUTORS_ENV} value '{parsed}'. Supported range for the local backend is 1..={MAX_LOCAL_EXECUTORS}."
+                );
+            }
+
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "Invalid {SPIDAPTER_NUM_EXECUTORS_ENV} value: expected valid UTF-8 in the range 1..={MAX_LOCAL_EXECUTORS}."
+        ),
+    }
 }
 
 fn allocate_local_ports(host: &str, num_executors: usize) -> anyhow::Result<LocalPorts> {
@@ -1193,6 +1225,56 @@ async fn wait_for_local_sql_ready(
             Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
+}
+
+async fn wait_for_local_executor_count(
+    scheduler_http_url: &str,
+    scheduler_child: &mut Child,
+    executor_children: &mut [Child],
+    expected_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let metrics_url = format!("{scheduler_http_url}/metrics");
+    let started = tokio::time::Instant::now();
+
+    loop {
+        ensure_process_is_running(scheduler_child, "scheduler")?;
+        for (idx, child) in executor_children.iter_mut().enumerate() {
+            ensure_process_is_running(child, &format!("executor-{idx}"))?;
+        }
+
+        if started.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "Timed out after {}s waiting for {expected_count} local executors to register via {metrics_url}",
+                timeout.as_secs()
+            ));
+        }
+
+        if let Ok(response) = client.get(&metrics_url).send().await
+            && response.status().is_success()
+            && let Ok(body) = response.text().await
+            && scheduler_active_executor_count(&body)
+                .is_some_and(|active_count| active_count >= expected_count)
+        {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
+    metrics_body
+        .lines()
+        .filter(|line| line.starts_with("scheduler_active_executors_count"))
+        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value as usize)
+        .max()
 }
 
 fn ensure_process_is_running(child: &mut Child, process_name: &str) -> anyhow::Result<()> {
@@ -1668,5 +1750,4 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-
 }
