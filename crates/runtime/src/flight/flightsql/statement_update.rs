@@ -81,13 +81,13 @@ pub(crate) async fn do_put(
     tracing::trace!("do_put_statement_update: {sql}");
 
     let dml_table = match datafusion.ctx.state().create_logical_plan(sql).await {
-        Ok(LogicalPlan::Dml(dml)) => Some(dml.table_name.clone()),
+        Ok(LogicalPlan::Dml(dml)) => Some(dml.table_name),
         Ok(_) | Err(_) => None,
     };
 
     // Execute through the standard query path, which handles DELETE and UPDATE
     // via the runtime's DML interception in Query::run().
-    let query_result = QueryBuilder::new(sql, datafusion.clone())
+    let query_result = QueryBuilder::new(sql, std::sync::Arc::clone(&datafusion))
         .build()
         .run()
         .await
@@ -99,15 +99,14 @@ pub(crate) async fn do_put(
         .await
         .map_err(to_tonic_err)?;
 
-    if let Some(table_name) = dml_table
-        && let Err(e) = datafusion
-            .caching()
-            .invalidate_for_table(table_name.clone())
-    {
-        tracing::warn!(
-            "Failed to invalidate caches for table {} after statement update: {e}",
-            table_name
-        );
+    if let Some(table_name) = dml_table {
+        let table_name_display = table_name.to_string();
+        if let Err(e) = datafusion.caching().invalidate_for_table(table_name) {
+            tracing::warn!(
+                "Failed to invalidate caches for table {} after statement update: {e}",
+                table_name_display
+            );
+        }
     }
 
     // Extract affected rows count
