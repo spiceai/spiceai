@@ -299,16 +299,10 @@ struct RowLocation {
     row_id: i64,
 }
 
-struct BatchValidationResult {
-    filtered_batch: Option<RecordBatch>,
-    delete_specs: Vec<(i64, Vec<i64>)>,
-    /// Int64 PK values being deleted (for `Int64Pk` strategy)
-    deleted_pk_i64: Vec<i64>,
-    /// Row key bytes being deleted (for `RowConverterBased` strategy)
-    deleted_row_keys: Vec<Box<[u8]>>,
-    /// Keys that supersede rows from a previous batch in the same stream.
-    /// The caller uses these to build a targeted removal map.
-    cross_batch_superseded_keys: Vec<OwnedRow>,
+#[derive(Debug, Clone, Copy)]
+struct SurvivorHandle {
+    batch_idx: usize,
+    row_idx: usize,
 }
 
 /// Result of on-conflict validation containing deleted PK information.
@@ -319,14 +313,6 @@ struct OnConflictValidationResult {
     deleted_pk_i64: Vec<i64>,
     /// Deleted row keys (for `RowConverterBased` strategy)
     deleted_row_keys: Vec<Box<[u8]>>,
-}
-
-struct OnConflictContext<'a> {
-    pk_indices: &'a [usize],
-    converter: &'a RowConverter,
-    on_conflict: &'a OnConflict,
-    upsert_options: &'a UpsertOptions,
-    existing_keys: &'a mut HashMap<OwnedRow, RowLocation>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -1913,16 +1899,13 @@ impl CayenneTableProvider {
         converter: &RowConverter,
         existing_keys: &mut HashMap<OwnedRow, RowLocation>,
     ) -> Result<OnConflictValidationResult> {
-        let mut filtered_batches = Vec::new();
+        let mut input_batches: Vec<RecordBatch> = Vec::new();
+        let mut keep_masks: Vec<Vec<bool>> = Vec::new();
         let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
         let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-
-        // Maps each new key to the `filtered_batches` index where it was first kept.
-        // Used to locate exactly which batch to remove a row from on cross-batch upsert.
-        let mut new_key_batch_idx: HashMap<OwnedRow, usize> = HashMap::new();
-        // Accumulates targeted removals: batch_index -> set of PK keys to remove.
-        let mut batch_removals: HashMap<usize, HashSet<OwnedRow>> = HashMap::new();
+        let mut in_stream_winners: HashMap<OwnedRow, SurvivorHandle> = HashMap::new();
+        let mut deleted_existing_keys: HashSet<OwnedRow> = HashSet::new();
 
         // Use configured on_conflict or default to DoNothingAll (silently drops duplicates).
         // When a primary key is configured without explicit on_conflict, this ensures
@@ -1941,71 +1924,154 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            let mut ctx = OnConflictContext {
-                pk_indices,
-                converter,
-                on_conflict: &on_conflict,
-                upsert_options: &upsert_options,
-                existing_keys,
+            let current_batch_idx = input_batches.len();
+
+            let pk_columns: Vec<_> = pk_indices
+                .iter()
+                .map(|idx| Arc::clone(batch.column(*idx)))
+                .collect();
+            let rows = converter.convert_columns(&pk_columns)?;
+
+            // For Int64Pk strategy, get direct access to the PK column for value extraction.
+            let int64_pk_array = if self.pk_deletion_strategy.is_int64_pk() && pk_columns.len() == 1 {
+                Some(
+                    pk_columns[0]
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .ok_or_else(|| Error::Internal {
+                            table: self.table_metadata.table_name.clone(),
+                            message: "Int64 primary key strategy requires Int64Array column"
+                                .to_string(),
+                        })?,
+                )
+            } else {
+                None
             };
 
-            let BatchValidationResult {
-                filtered_batch,
-                delete_specs: batch_delete_specs,
-                deleted_pk_i64,
-                deleted_row_keys,
-                cross_batch_superseded_keys,
-            } = self.apply_on_conflict_to_batch(batch, &mut ctx)?;
+            let mut keep_mask = vec![false; batch.num_rows()];
 
-            for (data_file_id, rows) in batch_delete_specs {
-                delete_specs.entry(data_file_id).or_default().extend(rows);
-            }
-
-            all_deleted_pk_i64.extend(deleted_pk_i64);
-            all_deleted_row_keys.extend(deleted_row_keys);
-
-            // The current batch will be at this index in filtered_batches (if non-empty).
-            let current_batch_idx = filtered_batches.len();
-
-            // For each cross-batch superseded key, look up which previous batch
-            // contains its earlier occurrence and record a targeted removal.
-            for key in &cross_batch_superseded_keys {
-                if let Some(&prev_batch_idx) = new_key_batch_idx.get(key) {
-                    batch_removals
-                        .entry(prev_batch_idx)
-                        .or_default()
-                        .insert(key.clone());
-                }
-                // Update the index so further upserts of this key target the current batch.
-                new_key_batch_idx.insert(key.clone(), current_batch_idx);
-            }
-
-            if let Some(batch) = filtered_batch {
-                // Register all new keys in this batch for future cross-batch lookups.
-                // Only keys NOT already in new_key_batch_idx need registration
-                // (superseded keys were already updated above).
-                let pk_columns: Vec<_> = pk_indices
-                    .iter()
-                    .map(|&idx| Arc::clone(batch.column(idx)))
-                    .collect();
-                let rows = converter.convert_columns(&pk_columns)?;
-                for row_idx in 0..batch.num_rows() {
-                    let key = rows.row(row_idx).owned();
-                    new_key_batch_idx.entry(key).or_insert(current_batch_idx);
+            for row_idx in 0..batch.num_rows() {
+                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+                if has_null {
+                    return Err(Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Primary key values must be non-null".to_string(),
+                    });
                 }
 
-                filtered_batches.push(batch);
+                let key = rows.row(row_idx).owned();
+                let existing_on_disk = existing_keys.get(&key).copied().filter(|loc| loc.row_id != -1);
+
+                if let Some(prev) = in_stream_winners.get(&key).copied() {
+                    // Duplicate key within the input stream.
+                    if !upsert_options.is_default() {
+                        if upsert_options.last_write_wins {
+                            if prev.batch_idx == current_batch_idx {
+                                keep_mask[prev.row_idx] = false;
+                            } else {
+                                keep_masks[prev.batch_idx][prev.row_idx] = false;
+                            }
+                            keep_mask[row_idx] = true;
+                            in_stream_winners.insert(
+                                key,
+                                SurvivorHandle {
+                                    batch_idx: current_batch_idx,
+                                    row_idx,
+                                },
+                            );
+                            continue;
+                        }
+                        if upsert_options.remove_duplicates {
+                            continue;
+                        }
+                        return Err(Error::DataValidation {
+                            table: self.table_metadata.table_name.clone(),
+                            message: "Duplicate primary key found in input stream".to_string(),
+                        });
+                    }
+
+                    match on_conflict {
+                        OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
+                            // First writer wins.
+                        }
+                        OnConflict::Upsert(_) => {
+                            // Last writer wins.
+                            if prev.batch_idx == current_batch_idx {
+                                keep_mask[prev.row_idx] = false;
+                            } else {
+                                keep_masks[prev.batch_idx][prev.row_idx] = false;
+                            }
+                            keep_mask[row_idx] = true;
+                            in_stream_winners.insert(
+                                key,
+                                SurvivorHandle {
+                                    batch_idx: current_batch_idx,
+                                    row_idx,
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                match on_conflict {
+                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
+                        if existing_on_disk.is_none() {
+                            keep_mask[row_idx] = true;
+                            in_stream_winners.insert(
+                                key,
+                                SurvivorHandle {
+                                    batch_idx: current_batch_idx,
+                                    row_idx,
+                                },
+                            );
+                        }
+                    }
+                    OnConflict::Upsert(_) => {
+                        if let Some(existing_loc) = existing_on_disk {
+                            // Schedule delete for the existing on-disk row once per key.
+                            if deleted_existing_keys.insert(key.clone()) {
+                                delete_specs
+                                    .entry(existing_loc.data_file_id)
+                                    .or_default()
+                                    .push(existing_loc.row_id);
+
+                                match &self.pk_deletion_strategy {
+                                    PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                                        if let Some(arr) = int64_pk_array {
+                                            all_deleted_pk_i64.push(arr.value(row_idx));
+                                        }
+                                    }
+                                    PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                                        all_deleted_row_keys
+                                            .push(key.as_ref().to_vec().into_boxed_slice());
+                                    }
+                                    PkDeletionStrategyWithCache::PositionBased { .. } => {}
+                                }
+                            }
+                        }
+
+                        keep_mask[row_idx] = true;
+                        in_stream_winners.insert(
+                            key,
+                            SurvivorHandle {
+                                batch_idx: current_batch_idx,
+                                row_idx,
+                            },
+                        );
+                    }
+                }
             }
+
+            keep_masks.push(keep_mask);
+            input_batches.push(batch);
         }
 
-        // Apply targeted removals to only the specific batches that need filtering.
-        if !batch_removals.is_empty() {
-            Self::apply_targeted_removals(
-                &mut filtered_batches,
-                &batch_removals,
-                pk_indices,
-                converter,
-            )?;
+        let mut filtered_batches = Vec::new();
+        for (batch, keep_mask) in input_batches.into_iter().zip(keep_masks.into_iter()) {
+            if let Some(filtered_batch) = Self::filter_validated_batch(batch, keep_mask)? {
+                filtered_batches.push(filtered_batch);
+            }
         }
 
         Ok(OnConflictValidationResult {
@@ -2013,206 +2079,6 @@ impl CayenneTableProvider {
             delete_specs,
             deleted_pk_i64: all_deleted_pk_i64,
             deleted_row_keys: all_deleted_row_keys,
-        })
-    }
-
-    /// Apply targeted row removals to specific batches.
-    ///
-    /// Only scans and re-serializes PK columns for batches that actually contain
-    /// superseded keys. Unaffected batches are not touched.
-    fn apply_targeted_removals(
-        batches: &mut Vec<RecordBatch>,
-        removals: &HashMap<usize, HashSet<OwnedRow>>,
-        pk_indices: &[usize],
-        converter: &RowConverter,
-    ) -> Result<()> {
-        for (&batch_idx, keys_to_remove) in removals {
-            let batch = &batches[batch_idx];
-            let pk_columns: Vec<_> = pk_indices
-                .iter()
-                .map(|&idx| Arc::clone(batch.column(idx)))
-                .collect();
-            let rows = converter.convert_columns(&pk_columns)?;
-
-            let mut mask = vec![true; batch.num_rows()];
-            let mut needs_filter = false;
-            for row_idx in 0..batch.num_rows() {
-                let key = rows.row(row_idx).owned();
-                if keys_to_remove.contains(&key) {
-                    mask[row_idx] = false;
-                    needs_filter = true;
-                }
-            }
-
-            if needs_filter {
-                let filter_array = arrow::array::BooleanArray::from(mask);
-                batches[batch_idx] =
-                    arrow::compute::filter_record_batch(&batches[batch_idx], &filter_array)?;
-            }
-        }
-
-        // Remove any batches that became empty after filtering.
-        batches.retain(|b| b.num_rows() > 0);
-
-        Ok(())
-    }
-
-    fn apply_on_conflict_to_batch(
-        &self,
-        batch: RecordBatch,
-        ctx: &mut OnConflictContext<'_>,
-    ) -> Result<BatchValidationResult> {
-        use arrow::array::Int64Array;
-
-        let pk_columns: Vec<_> = ctx
-            .pk_indices
-            .iter()
-            .map(|idx| Arc::clone(batch.column(*idx)))
-            .collect();
-
-        let rows = ctx.converter.convert_columns(&pk_columns)?;
-
-        // For Int64Pk strategy, get direct access to the PK column for value extraction
-        let int64_pk_array: Option<&Int64Array> =
-            if self.pk_deletion_strategy.is_int64_pk() && pk_columns.len() == 1 {
-                pk_columns[0].as_any().downcast_ref::<Int64Array>()
-            } else {
-                None
-            };
-
-        let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut row_keys: Vec<OwnedRow> = Vec::with_capacity(batch.num_rows());
-        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut deleted_pk_i64: Vec<i64> = Vec::new();
-        let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-
-        // Track new keys within the current batch by their row index in keep_mask,
-        // so within-batch upserts can un-keep the earlier occurrence.
-        let mut within_batch_new_keys: HashMap<OwnedRow, usize> = HashMap::new();
-        // Track keys that supersede rows from a previous batch (cross-batch upsert).
-        let mut cross_batch_superseded_keys: Vec<OwnedRow> = Vec::new();
-
-        for row_idx in 0..batch.num_rows() {
-            let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
-            if has_null {
-                return Err(Error::DataValidation {
-                    table: self.table_metadata.table_name.clone(),
-                    message: "Primary key values must be non-null".to_string(),
-                });
-            }
-
-            let key = rows.row(row_idx).owned();
-
-            if let Some(existing) = ctx.existing_keys.get(&key) {
-                // Key exists — either on-disk or inserted earlier in this stream.
-                let is_in_stream = existing.row_id == -1;
-
-                match ctx.on_conflict {
-                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
-                        // Drop the new row regardless of origin — first writer wins.
-                        keep_mask.push(false);
-                    }
-                    OnConflict::Upsert(_) => {
-                        if is_in_stream {
-                            // The earlier row is from this stream (not on-disk).
-                            // No deletion vector is needed — just replace output rows.
-                            if let Some(&old_idx) = within_batch_new_keys.get(&key) {
-                                // Within the same batch: un-keep the earlier row.
-                                keep_mask[old_idx] = false;
-                            } else {
-                                // The earlier row is in a previous batch — mark for
-                                // cross-batch dedup after all batches are processed.
-                                cross_batch_superseded_keys.push(key.clone());
-                            }
-                            within_batch_new_keys.insert(key.clone(), row_idx);
-                            keep_mask.push(true);
-                        } else {
-                            // On-disk key: create deletion spec for the persisted row.
-                            delete_specs
-                                .entry(existing.data_file_id)
-                                .or_default()
-                                .push(existing.row_id);
-
-                            // Track the PK value being deleted for cache updates
-                            match &self.pk_deletion_strategy {
-                                PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                                    if let Some(arr) = int64_pk_array {
-                                        deleted_pk_i64.push(arr.value(row_idx));
-                                    }
-                                }
-                                PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                    deleted_row_keys
-                                        .push(key.as_ref().to_vec().into_boxed_slice());
-                                }
-                                PkDeletionStrategyWithCache::PositionBased { .. } => {
-                                    // Position-based doesn't need PK values
-                                }
-                            }
-
-                            ctx.existing_keys.insert(
-                                key.clone(),
-                                RowLocation {
-                                    data_file_id: DEFAULT_DATA_FILE_ID,
-                                    row_id: -1,
-                                },
-                            );
-                            within_batch_new_keys.insert(key.clone(), row_idx);
-                            keep_mask.push(true);
-                        }
-                    }
-                }
-            } else {
-                // Brand new key — keep the row and register it in existing_keys so
-                // that later occurrences (in this batch or subsequent batches) are
-                // treated as conflicts and follow the configured on_conflict behavior.
-                ctx.existing_keys.insert(
-                    key.clone(),
-                    RowLocation {
-                        data_file_id: DEFAULT_DATA_FILE_ID,
-                        row_id: -1,
-                    },
-                );
-                within_batch_new_keys.insert(key.clone(), row_idx);
-                keep_mask.push(true);
-            }
-
-            row_keys.push(key);
-        }
-
-        if !ctx.upsert_options.is_default() {
-            let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
-            for (row_idx, key) in row_keys.iter().enumerate() {
-                if !keep_mask[row_idx] {
-                    continue;
-                }
-
-                if let Some(existing_idx) = seen.get(key) {
-                    if ctx.upsert_options.last_write_wins {
-                        keep_mask[*existing_idx] = false;
-                        seen.insert(key.clone(), row_idx);
-                    } else if ctx.upsert_options.remove_duplicates {
-                        keep_mask[row_idx] = false;
-                    } else {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Duplicate primary key found in batch".to_string(),
-                        });
-                    }
-                } else {
-                    seen.insert(key.clone(), row_idx);
-                }
-            }
-        }
-
-        let filtered_batch =
-            Self::filter_validated_batch(batch, keep_mask)?;
-
-        Ok(BatchValidationResult {
-            filtered_batch,
-            delete_specs: delete_specs.into_iter().collect(),
-            deleted_pk_i64,
-            deleted_row_keys,
-            cross_batch_superseded_keys,
         })
     }
 

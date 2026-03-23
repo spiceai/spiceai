@@ -1101,3 +1101,206 @@ async fn test_intra_stream_do_nothing_new_key_impl(
 
     Ok(())
 }
+
+// =============================================================================
+// Test: Large cross-batch upsert keeps only latest winner per key
+// =============================================================================
+test_with_backends!(test_large_cross_batch_upsert_last_write_wins_impl);
+
+async fn test_large_cross_batch_upsert_last_write_wins_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "large_cross_batch_upsert".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = Arc::new(table);
+
+    ctx.register_table(
+        "large_cross_batch_upsert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // Seed on-disk keys that will be upserted repeatedly.
+    let seed_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from((0..100).collect::<Vec<i64>>())),
+            Arc::new(Int64Array::from(vec![0; 100])),
+        ],
+    )?;
+    common::insert_batch(&table, seed_batch).await?;
+
+    // Insert many batches where each key is repeated and value is monotonic by round.
+    // Final value for key k should be k + 9_000 (round 9).
+    let mut batches = Vec::new();
+    for round in 0..10i64 {
+        let ids: Vec<i64> = (0..100).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id + round * 1000).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(Int64Array::from(values))],
+        )?;
+        batches.push(batch);
+    }
+    common::insert_batches(&table, batches).await?;
+
+    let results = ctx
+        .sql("SELECT id, value FROM large_cross_batch_upsert ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 100,
+        "Should have exactly one row per key after repeated upserts"
+    );
+
+    let mut observed: Vec<(i64, i64)> = Vec::new();
+    for batch in &results {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column");
+        for i in 0..batch.num_rows() {
+            observed.push((ids.value(i), values.value(i)));
+        }
+    }
+
+    observed.sort_by_key(|(id, _)| *id);
+    for (id, value) in observed {
+        assert_eq!(
+            value,
+            id + 9_000,
+            "id={id} should keep the last write from the final batch"
+        );
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Test: Large cross-batch DoNothing keeps first stream occurrence
+// =============================================================================
+test_with_backends!(test_large_cross_batch_do_nothing_first_write_wins_impl);
+
+async fn test_large_cross_batch_do_nothing_first_write_wins_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "large_cross_batch_do_nothing".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::DoNothing(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = Arc::new(table);
+
+    ctx.register_table(
+        "large_cross_batch_do_nothing",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // Initial stream batch introduces keys with baseline values.
+    let first_ids: Vec<i64> = (0..100).collect();
+    let first_values: Vec<i64> = first_ids.iter().map(|id| id + 100).collect();
+    let first_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(first_ids)),
+            Arc::new(Int64Array::from(first_values)),
+        ],
+    )?;
+
+    // Additional batches repeat the same keys with different values; DoNothing should ignore them.
+    let mut batches = vec![first_batch];
+    for round in 1..6i64 {
+        let ids: Vec<i64> = (0..100).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id + 10_000 + round * 100).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(Int64Array::from(values))],
+        )?;
+        batches.push(batch);
+    }
+
+    common::insert_batches(&table, batches).await?;
+
+    let results = ctx
+        .sql("SELECT id, value FROM large_cross_batch_do_nothing ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 100,
+        "Should have exactly one row per key after DoNothing duplicates"
+    );
+
+    let mut observed: Vec<(i64, i64)> = Vec::new();
+    for batch in &results {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column");
+        for i in 0..batch.num_rows() {
+            observed.push((ids.value(i), values.value(i)));
+        }
+    }
+
+    observed.sort_by_key(|(id, _)| *id);
+    for (id, value) in observed {
+        assert_eq!(
+            value,
+            id + 100,
+            "id={id} should keep first-stream value under DoNothing"
+        );
+    }
+
+    Ok(())
+}
