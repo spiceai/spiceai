@@ -30,6 +30,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
@@ -56,6 +57,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .description("Password for database authentication")
         .secret(),
+    ParameterSpec::component("driver_options").description(
+        "Semicolon-delimited driver-specific database options (e.g., 'key1=value1;key2=value2')",
+    ),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -152,7 +156,7 @@ impl CatalogConnector for AdbcCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let pool = create_pool(&self.params).await.map_err(|e| {
+        let (driver_name, pool) = create_pool(&self.params).await.map_err(|e| {
             super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
@@ -166,6 +170,7 @@ impl CatalogConnector for AdbcCatalog {
             pool,
             table_factory,
             catalog.include.clone(),
+            driver_name,
         ));
 
         provider
@@ -186,6 +191,7 @@ fn build_db_options(
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
+    driver_options: Option<&str>,
 ) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
     let mut opts = vec![(OptionDatabase::Uri, uri.into())];
     if let Some(u) = username {
@@ -194,11 +200,34 @@ fn build_db_options(
     if let Some(p) = password {
         opts.push((OptionDatabase::Password, p.into()));
     }
+    if let Some(options_str) = driver_options {
+        for pair in options_str.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = pair.split_once('=') {
+                let key = key.trim();
+                if key.is_empty() {
+                    tracing::warn!("Ignoring ADBC driver option with empty key");
+                    continue;
+                }
+                let key = if key.starts_with("adbc.") {
+                    key.to_string()
+                } else {
+                    format!("adbc.{key}")
+                };
+                opts.push((OptionDatabase::Other(key), value.trim().into()));
+            } else {
+                tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
+            }
+        }
+    }
     opts
 }
 
 /// Creates an ADBC connection pool from connector parameters.
-async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDatabase>>> {
+async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<ManagedDatabase>>)> {
     let driver_name = params
         .parameters
         .get("driver")
@@ -220,7 +249,8 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
 
     let username = params.parameters.get("username").expose().ok();
     let password = params.parameters.get("password").expose().ok();
-    let db_options = build_db_options(&uri_str, username, password);
+    let driver_options = params.parameters.get("driver_options").expose().ok();
+    let db_options = build_db_options(&uri_str, username, password, driver_options);
 
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
@@ -243,6 +273,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
 
     let pool_size = parse_pool_param("connection_pool_size")?;
     let pool_min_idle = parse_pool_param("connection_pool_min_idle")?;
+    let driver_name = driver_name.to_string();
 
     if uri_str == ":memory:" || uri_str.contains("mode=memory") {
         return Err(Error::InMemoryUriNotSupported);
@@ -250,7 +281,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
 
     // Driver loading, database creation, and pool creation are all
     // synchronous FFI/IO operations — offload to a blocking thread.
-    tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+    tokio::task::spawn_blocking(move || -> Result<(String, Arc<ADBCPool<_>>)> {
         let mut driver = ManagedDriver::load_from_name(
             &driver_location,
             None,
@@ -279,12 +310,19 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
                 uri: uri_str,
             })?;
 
-        Ok(Arc::new(pool))
+        Ok((driver_name, Arc::new(pool)))
     })
     .await
     .map_err(|e| Error::PoolCreationTaskFailed {
         source: Box::new(e),
     })?
+}
+
+fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+    match driver_name {
+        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
+        _ => None,
+    }
 }
 
 // -- Catalog Provider --
@@ -296,6 +334,7 @@ struct AdbcCatalogProvider {
     table_factory: AdbcTableFactory<ManagedDatabase>,
     schemas: RwLock<HashMap<String, Arc<AdbcSchemaProvider>>>,
     include: Option<Arc<GlobSet>>,
+    driver_name: String,
 }
 
 impl std::fmt::Debug for AdbcCatalogProvider {
@@ -310,12 +349,14 @@ impl AdbcCatalogProvider {
         pool: Arc<ADBCPool<ManagedDatabase>>,
         table_factory: AdbcTableFactory<ManagedDatabase>,
         include: Option<GlobSet>,
+        driver_name: String,
     ) -> Self {
         Self {
             pool,
             table_factory,
             schemas: RwLock::new(HashMap::new()),
             include: include.map(Arc::new),
+            driver_name,
         }
     }
 
@@ -390,6 +431,8 @@ impl AdbcCatalogProvider {
     ) -> HashMap<String, Arc<dyn TableProvider>> {
         let mut tables = HashMap::new();
 
+        let dialect = dialect_for_driver(&self.driver_name);
+
         for table_name in table_names {
             let schema_with_table = format!("{schema_name}.{table_name}");
             if let Some(include) = &self.include
@@ -401,7 +444,11 @@ impl AdbcCatalogProvider {
 
             let table_ref = TableReference::partial(schema_name.to_owned(), table_name.clone());
 
-            match self.table_factory.table_provider(table_ref, None).await {
+            match self
+                .table_factory
+                .table_provider(table_ref, dialect.clone())
+                .await
+            {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
                 }
