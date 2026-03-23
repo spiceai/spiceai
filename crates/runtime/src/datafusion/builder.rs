@@ -74,6 +74,7 @@ use runtime_datafusion::{
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use search;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
 use std::sync::LazyLock;
@@ -471,6 +472,10 @@ impl DataFusionBuilder {
             ),
         ));
 
+        // Expand SearchQueryProvider table scans into their full logical plan equivalents so
+        // DataFusion's optimizer can act on the search plan structure.
+        ctx.add_analyzer_rule(Arc::new(search::analyzer_rule::SearchQueryAnalyzerRule));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -639,6 +644,7 @@ pub(crate) fn default_extension_planners(
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        Arc::new(search::telemetry_node::SearchTelemetryPlanner),
         Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
         #[cfg(not(windows))]
         Arc::new(super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(executor_registry)),

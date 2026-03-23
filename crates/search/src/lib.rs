@@ -20,11 +20,13 @@ use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
 
 use futures::StreamExt;
 pub mod aggregation;
+pub mod analyzer_rule;
 pub mod generation;
 pub mod index;
 pub mod metadata;
 pub mod pipeline;
 pub mod provider;
+pub mod telemetry_node;
 
 pub static SEARCH_SCORE_COLUMN_NAME: &str = "_score";
 pub static SEARCH_VALUE_COLUMN_NAME: &str = "_value";
