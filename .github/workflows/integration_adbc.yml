@@ -84,7 +84,7 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Set up ADBC drivers
-        uses: columnar-tech/setup-dbc@8e45547ef10ad4e8b697c0cce55f7167814006ed # v1.0.1
+        uses: columnar-tech/setup-dbc@b6ee17cd41eaac512c319524eac22b1331b9e675 # v1.0.1
         with:
           drivers: 'sqlite'
 
