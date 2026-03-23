@@ -848,3 +848,256 @@ async fn test_empty_batch_impl(
 
     Ok(())
 }
+
+// =============================================================================
+// Test: Intra-stream upsert within a single batch
+// =============================================================================
+test_with_backends!(test_intra_batch_upsert_new_key_impl);
+
+/// When a single batch contains two rows with the same new PK (not previously
+/// in the table) and the on-conflict is Upsert, the last occurrence should win
+/// and the table should contain exactly one row for that PK.
+async fn test_intra_batch_upsert_new_key_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "intra_batch_upsert".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = Arc::new(table);
+
+    ctx.register_table(
+        "intra_batch_upsert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // Single INSERT with duplicate PK=1 in the same batch: (1,100) then (1,999).
+    // The second row should supersede the first.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 1])),
+            Arc::new(Int64Array::from(vec![100, 200, 999])),
+        ],
+    )?;
+
+    common::insert_batch(&table, batch).await?;
+
+    let results = ctx
+        .sql("SELECT id, value FROM intra_batch_upsert ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(results[0].num_rows(), 2, "Should have 2 unique rows");
+
+    let ids = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column");
+    let values = results[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value column");
+
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(values.value(0), 999, "id=1 should keep the last value (999)");
+    assert_eq!(ids.value(1), 2);
+    assert_eq!(values.value(1), 200);
+
+    Ok(())
+}
+
+// =============================================================================
+// Test: Intra-stream upsert across batches
+// =============================================================================
+test_with_backends!(test_cross_batch_upsert_new_key_impl);
+
+/// When multiple batches in the same stream contain the same new PK and the
+/// on-conflict is Upsert, the last batch's row should win.
+async fn test_cross_batch_upsert_new_key_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "cross_batch_upsert".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = Arc::new(table);
+
+    ctx.register_table(
+        "cross_batch_upsert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // Insert two batches in the same call: batch 1 has (1,100), batch 2 has (1,999).
+    // The second batch's row should supersede the first.
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ],
+    )?;
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 3])),
+            Arc::new(Int64Array::from(vec![999, 300])),
+        ],
+    )?;
+
+    common::insert_batches(&table, vec![batch1, batch2]).await?;
+
+    let results = ctx
+        .sql("SELECT id, value FROM cross_batch_upsert ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Should have 3 unique rows (id=1,2,3)");
+
+    // Flatten results
+    let mut all_ids = Vec::new();
+    let mut all_values = Vec::new();
+    for batch in &results {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column");
+        for i in 0..batch.num_rows() {
+            all_ids.push(ids.value(i));
+            all_values.push(vals.value(i));
+        }
+    }
+
+    // Find value for id=1
+    let id1_value = all_ids
+        .iter()
+        .zip(&all_values)
+        .find(|(&id, _)| id == 1)
+        .map(|(_, &v)| v)
+        .expect("id=1 should exist");
+    assert_eq!(id1_value, 999, "id=1 should keep the last value (999)");
+
+    // Verify id=1 appears exactly once
+    let id1_count = all_ids.iter().filter(|&&id| id == 1).count();
+    assert_eq!(id1_count, 1, "id=1 should appear exactly once");
+
+    Ok(())
+}
+
+// =============================================================================
+// Test: DoNothing for intra-stream new-key duplicates
+// =============================================================================
+test_with_backends!(test_intra_stream_do_nothing_new_key_impl);
+
+/// When a stream contains duplicate new PKs and the on-conflict is DoNothing,
+/// the first occurrence should win and duplicates should be silently dropped.
+async fn test_intra_stream_do_nothing_new_key_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "do_nothing_stream".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::DoNothing(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = Arc::new(table);
+
+    ctx.register_table(
+        "do_nothing_stream",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // Batch with duplicate id=1: first (1,100) should win, second (1,999) dropped.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 1])),
+            Arc::new(Int64Array::from(vec![100, 200, 999])),
+        ],
+    )?;
+
+    common::insert_batch(&table, batch).await?;
+
+    let results = ctx
+        .sql("SELECT id, value FROM do_nothing_stream ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(results[0].num_rows(), 2, "Should have 2 unique rows");
+
+    let values = results[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value column");
+
+    assert_eq!(
+        values.value(0),
+        100,
+        "id=1 should keep the first value (100)"
+    );
+    assert_eq!(values.value(1), 200);
+
+    Ok(())
+}
