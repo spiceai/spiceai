@@ -40,7 +40,7 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use crate::dataconnector::adbc::build_db_options;
+use crate::dataconnector::adbc::{build_db_options, dialect_for_driver};
 
 pub const PREFIX: &str = "adbc";
 
@@ -277,13 +277,6 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     .map_err(|e| Error::PoolCreationTaskFailed {
         source: Box::new(e),
     })?
-}
-
-fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
-        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
-        _ => None,
-    }
 }
 
 // -- Catalog Provider --

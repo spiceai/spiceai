@@ -371,7 +371,7 @@ fn build_conn_options(
 
     if opts.is_empty() { None } else { Some(opts) }
 }
-fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         "bigquery" => Some(Arc::new(BigQueryDialect::new())),
         _ => None,
