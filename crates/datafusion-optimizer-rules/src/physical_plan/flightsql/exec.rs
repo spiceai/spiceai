@@ -238,10 +238,16 @@ fn remap_batch(
     column_mapping: &[usize],
     target_schema: &SchemaRef,
 ) -> Result<RecordBatch> {
+    let num_remote_cols = batch.num_columns();
     let columns: Vec<ArrayRef> = column_mapping
         .iter()
         .zip(target_schema.fields())
         .map(|(&remote_idx, target_field)| {
+            if remote_idx >= num_remote_cols {
+                return Err(DataFusionError::Execution(format!(
+                    "Column mapping references index {remote_idx} but remote batch only has {num_remote_cols} columns"
+                )));
+            }
             let col = batch.column(remote_idx);
             if col.data_type() == target_field.data_type() {
                 Ok(Arc::clone(col))
@@ -277,17 +283,19 @@ fn build_aggregate_sql(
     column_substitutions: &[Arc<dyn PhysicalExpr>],
 ) -> Result<AggregateQuery> {
     // Phase 1: collect all SQL fragments (before dedup) and their dedup keys.
-    // Each entry is (sql_fragment, dedup_key).
+    // Each entry is (sql_fragment, dedup_key, needs_alias).
+    // Group-by columns don't need aliases (they're plain column refs).
+    // Aggregate expressions need aliases to avoid remote-side name collisions.
     // The dedup_key strips outer CASTs so that SUM(col) and SUM(CAST(col AS X))
     // are recognized as duplicates.
-    let mut all_fragments: Vec<(String, String)> = Vec::new();
+    let mut all_fragments: Vec<(String, String, bool)> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
-    // Group-by columns
+    // Group-by columns — no alias needed
     for (_expr, name) in group_by.expr() {
         let quoted = quote_ident(name);
         group_by_cols.push(quoted.clone());
-        all_fragments.push((quoted.clone(), quoted));
+        all_fragments.push((quoted.clone(), quoted, false));
     }
 
     // Aggregate expressions
@@ -297,7 +305,7 @@ fn build_aggregate_sql(
 
         if SIMPLE_PUSHDOWN_AGGREGATES.contains(func_name) {
             if func_name == "count" && exprs.is_empty() {
-                all_fragments.push(("COUNT(*)".to_string(), "COUNT(*)".to_string()));
+                all_fragments.push(("COUNT(*)".to_string(), "COUNT(*)".to_string(), true));
             } else if func_name == "count" {
                 let arg_sql =
                     physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
@@ -308,7 +316,7 @@ fn build_aggregate_sql(
                         })?;
                 let frag = format!("COUNT({arg_sql})");
                 let key = format!("COUNT({})", strip_outer_cast(&arg_sql));
-                all_fragments.push((frag, key));
+                all_fragments.push((frag, key, true));
             } else {
                 let arg_sql =
                     physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
@@ -320,7 +328,7 @@ fn build_aggregate_sql(
                 let upper = func_name.to_uppercase();
                 let frag = format!("{upper}({arg_sql})");
                 let key = format!("{upper}({})", strip_outer_cast(&arg_sql));
-                all_fragments.push((frag, key));
+                all_fragments.push((frag, key, true));
             }
         } else if func_name == "avg" {
             let arg_sql =
@@ -337,11 +345,11 @@ fn build_aggregate_sql(
             let stripped = strip_outer_cast(&arg_sql);
             let sum_frag = format!("SUM({arg_sql})");
             let sum_key = format!("SUM({stripped})");
-            all_fragments.push((sum_frag, sum_key));
+            all_fragments.push((sum_frag, sum_key, true));
 
             let count_frag = format!("COUNT({arg_sql})");
             let count_key = format!("COUNT({stripped})");
-            all_fragments.push((count_frag, count_key));
+            all_fragments.push((count_frag, count_key, true));
         } else {
             return Err(DataFusionError::Internal(format!(
                 "Unsupported aggregate function for pushdown: {func_name}"
@@ -351,25 +359,33 @@ fn build_aggregate_sql(
 
     // Phase 2: deduplicate by key, preserving order.
     let mut dedup_map: HashMap<String, usize> = HashMap::new();
-    let mut unique_fragments: Vec<String> = Vec::new();
+    let mut unique_fragments: Vec<(String, bool)> = Vec::new();
     let mut column_mapping: Vec<usize> = Vec::with_capacity(all_fragments.len());
 
-    for (frag, key) in &all_fragments {
+    for (frag, key, needs_alias) in &all_fragments {
         if let Some(&idx) = dedup_map.get(key) {
             column_mapping.push(idx);
         } else {
             let idx = unique_fragments.len();
             dedup_map.insert(key.clone(), idx);
-            unique_fragments.push(frag.clone());
+            unique_fragments.push((frag.clone(), *needs_alias));
             column_mapping.push(idx);
         }
     }
 
-    // Phase 3: build SQL with aliases for unique fragments
+    // Phase 3: build SQL — alias only aggregate expressions, not plain columns
+    let mut agg_alias_idx: usize = 0;
     let select_parts: Vec<String> = unique_fragments
         .iter()
-        .enumerate()
-        .map(|(i, frag)| format!("{frag} AS \"__c{i}\""))
+        .map(|(frag, needs_alias)| {
+            if *needs_alias {
+                let part = format!("{frag} AS \"__agg_{agg_alias_idx}\"");
+                agg_alias_idx += 1;
+                part
+            } else {
+                frag.clone()
+            }
+        })
         .collect();
 
     // WHERE clause from source filters
@@ -514,13 +530,15 @@ fn scalar_to_sql(value: &datafusion::scalar::ScalarValue) -> Option<String> {
                 Some(v.to_string())
             } else {
                 // Render with the correct number of decimal places.
-                // e.g. Decimal128(100, _, 2) → "1.00"
+                // e.g. Decimal128(100, _, 2) → "1.00", Decimal128(-50, _, 2) → "-0.50"
                 let scale_u32 = u32::try_from(scale.unsigned_abs()).ok()?;
                 let divisor = i128::checked_pow(10, scale_u32)?;
-                let whole = v / divisor;
-                let frac = v.unsigned_abs() % (divisor as u128);
+                let abs = v.unsigned_abs();
+                let whole = abs / (divisor as u128);
+                let frac = abs % (divisor as u128);
                 let s = *scale as usize;
-                Some(format!("{whole}.{frac:0>width$}", width = s))
+                let sign = if *v < 0 { "-" } else { "" };
+                Some(format!("{sign}{whole}.{frac:0>width$}", width = s))
             }
         }
         ScalarValue::Utf8(Some(v))

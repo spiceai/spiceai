@@ -149,8 +149,6 @@ fn all_aggregates_pushable(agg: &AggregateExec) -> bool {
     let filters = agg.filter_expr();
     for (i, aggr) in agg.aggr_expr().iter().enumerate() {
         let name = aggr.fun().name();
-        // TODO: I think this can replace below
-        //   `return (SIMPLE_PUSHDOWN_AGGREGATES.contains(name) || DECOMPOSED_AGGREGATES.contains(name)) && aggr.is_distinct() & filters.get(i).is_none_or(|f| f.is_none())`
         if !SIMPLE_PUSHDOWN_AGGREGATES.contains(name) && !DECOMPOSED_AGGREGATES.contains(name) {
             return false;
         }
@@ -431,8 +429,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT(1) AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT(1) AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT(1) AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT(1) AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -457,8 +455,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__c0" FROM foo.foo.lineitem
-          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__c0" FROM foo.foo.lineitem
+          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem
+          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem
         "#);
 
         Ok(())
@@ -492,8 +490,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", MIN("l_quantity") AS "__c1", MAX("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", MIN("l_quantity") AS "__c1", MAX("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -522,8 +520,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -543,7 +541,7 @@ mod tests {
         let agg = partial_aggregate(flight, &[(3, "l_returnflag")], vec![Arc::new(sum_expr)])?;
 
         let optimized = optimize(agg)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1" FROM foo.foo.lineitem GROUP BY "l_returnflag""#);
+        insta::assert_snapshot!(plan_display(&optimized), @r#"PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag""#);
 
         Ok(())
     }
@@ -573,8 +571,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -603,8 +601,95 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", "l_linestatus" AS "__c1", SUM("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", "l_linestatus" AS "__c1", SUM("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", "l_linestatus", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", "l_linestatus", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
+        "#);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pushdown_sum_and_avg_same_column_dedup() -> Result<()> {
+        let schema = lineitem_schema();
+        let union_input = make_union(vec![
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        ]);
+
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
+        let avg_expr =
+            AggregateExprBuilder::new(avg_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("avg(l_quantity)")
+                .build()?;
+
+        let agg = partial_aggregate(
+            union_input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(sum_expr), Arc::new(avg_expr)],
+        )?;
+
+        let optimized = optimize(agg)?;
+        // SUM("l_quantity") appears only once (deduped); AVG reuses it + adds COUNT
+        insta::assert_snapshot!(plan_display(&optimized), @r#"
+        UnionExec
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+        "#);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pushdown_through_projection_exec() -> Result<()> {
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+
+        let schema = lineitem_schema();
+        let union_input = make_union(vec![
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        ]);
+
+        // Simulate CSE: ProjectionExec computes __common_expr_1 = l_extendedprice * l_discount
+        let proj = Arc::new(ProjectionExec::try_new(
+            vec![
+                ProjectionExpr {
+                    expr: Arc::new(BinaryExpr::new(
+                        Arc::new(Column::new("l_extendedprice", 1)),
+                        datafusion::logical_expr::Operator::Multiply,
+                        Arc::new(Column::new("l_discount", 2)),
+                    )),
+                    alias: "__common_expr_1".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("l_returnflag", 3)),
+                    alias: "l_returnflag".to_string(),
+                },
+            ],
+            union_input,
+        )?) as Arc<dyn ExecutionPlan>;
+
+        // Aggregate references __common_expr_1 at index 0 and l_returnflag at index 1
+        let proj_schema = proj.schema();
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("__common_expr_1", 0))])
+                .schema(Arc::clone(&proj_schema))
+                .alias("sum(__common_expr_1)")
+                .build()?;
+
+        let agg = partial_aggregate(proj, &[(1, "l_returnflag")], vec![Arc::new(sum_expr)])?;
+
+        let optimized = optimize(agg)?;
+        // The CSE column __common_expr_1 is inlined back to ("l_extendedprice" * "l_discount")
+        insta::assert_snapshot!(plan_display(&optimized), @r#"
+        UnionExec
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(("l_extendedprice" * "l_discount")) AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(("l_extendedprice" * "l_discount")) AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
