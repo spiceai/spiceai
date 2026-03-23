@@ -15,6 +15,7 @@ This folder contains educational and thought leadership content for LinkedIn and
 | [duckdb.md](duckdb.md)                                     | DuckDB                      | Embedded columnar analytics, SQLite comparison                     |
 | [rust-for-data-systems.md](rust-for-data-systems.md)       | Rust for Data Systems       | Ownership model, compile-time safety, async patterns               |
 | [vortex.md](vortex.md)                                     | Vortex Columnar Format      | Encoding-efficient compression, Cayenne architecture               |
+| [apache-ballista.md](apache-ballista.md)                   | Apache Ballista             | Distributed SQL execution, scheduler-executor, disk shuffle        |
 | [point-lookup-performance.md](point-lookup-performance.md) | Point Lookup Performance    | Benchmark comparison of Arrow, DuckDB, SQLite, PostgreSQL, Cayenne |
 
 ## Format

@@ -14,6 +14,7 @@ This article is part of our **Engineering at Spice AI** series, where we share t
 - [DuckDB at Spice AI](duckdb-at-spiceai.md) — Embedded analytics and acceleration
 - [Apache Iceberg at Spice AI](apache-iceberg-at-spiceai.md) — Open table format integration
 - [Vortex at Spice AI](vortex-at-spiceai.md) — Columnar compression for Cayenne
+- [Apache Ballista at Spice AI](apache-ballista-at-spiceai.md) — Distributed query execution
 
 ---
 
