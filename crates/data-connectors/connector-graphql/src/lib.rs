@@ -115,7 +115,7 @@ impl GraphQL {
                 reqwest::header::HeaderName::try_from(h).map_err(|source| {
                     DataConnectorError::InvalidConfiguration {
                         dataconnector: "graphql".to_string(),
-                        message: format!("Invalid 'auth_header' value: '{h}'. Ensure it is a valid HTTP header name. For details, visit: https://spiceai.org/docs/components/data-connectors/graphql"),
+                        message: format!("Invalid 'graphql_auth_header' value: '{h}'. Ensure it is a valid HTTP header name. For details, visit: https://spiceai.org/docs/components/data-connectors/graphql"),
                         connector_component: ConnectorComponent::from(dataset),
                         source: source.into(),
                     }

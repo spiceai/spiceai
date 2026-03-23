@@ -536,12 +536,14 @@ async fn start_auth_server() -> Result<(tokio::sync::oneshot::Sender<()>, Socket
     })?;
 
     tokio::spawn(async move {
-        axum::serve(tcp_listener, app)
+        if let Err(e) = axum::serve(tcp_listener, app)
             .with_graceful_shutdown(async {
                 rx.await.ok();
             })
             .await
-            .unwrap_or_default();
+        {
+            tracing::error!("GraphQL auth test server failed: {e}");
+        }
     });
 
     Ok((tx, addr))
