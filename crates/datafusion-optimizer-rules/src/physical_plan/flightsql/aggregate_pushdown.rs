@@ -842,4 +842,26 @@ mod tests {
         )?);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_no_pushdown_unsupported_aggregate_function() -> Result<()> {
+        use datafusion::functions_aggregate::variance::var_samp_udaf;
+
+        let schema = lineitem_schema();
+        let input = make_union(vec![make_flight_exec(&schema, "foo.foo.lineitem", &[])]);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(
+                    var_samp_udaf(),
+                    vec![Arc::new(Column::new("l_quantity", 0))],
+                )
+                .schema(Arc::clone(&schema))
+                .alias("var_samp")
+                .build()?,
+            )],
+        )?);
+        Ok(())
+    }
 }

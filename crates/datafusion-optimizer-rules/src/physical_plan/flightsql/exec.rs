@@ -54,7 +54,37 @@ pub(crate) static SIMPLE_PUSHDOWN_AGGREGATES: LazyLock<HashSet<&str>> =
 pub(crate) static DECOMPOSED_AGGREGATES: LazyLock<HashSet<&str>> =
     LazyLock::new(|| HashSet::from(["avg"]));
 
-/// Result of [`build_aggregate_sql`]: the SQL string plus a mapping from each
+/// A SQL `SELECT` statement built from structured components.
+///
+/// Avoids ad-hoc string concatenation by collecting each clause into a dedicated
+/// field, then rendering them all in [`SelectStatement::to_sql`].
+struct SelectStatement {
+    /// `SELECT` items, rendered as-is (e.g. `"col"`, `SUM("col") AS "__agg_0"`).
+    select_items: Vec<String>,
+    /// Fully-qualified table name for the `FROM` clause.
+    from: String,
+    /// Individual filter conditions joined with `AND` in the `WHERE` clause.
+    where_clauses: Vec<String>,
+    /// Column references for the `GROUP BY` clause.
+    group_by_cols: Vec<String>,
+}
+
+impl SelectStatement {
+    fn to_sql(&self) -> String {
+        let mut sql = format!("SELECT {} FROM {}", self.select_items.join(", "), self.from);
+        if !self.where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&self.where_clauses.join(" AND "));
+        }
+        if !self.group_by_cols.is_empty() {
+            sql.push_str(" GROUP BY ");
+            sql.push_str(&self.group_by_cols.join(", "));
+        }
+        sql
+    }
+}
+
+/// Result of [`build_aggregate_sql`]: the SQL statement plus a mapping from each
 /// output column position to the (deduplicated) remote column index.
 ///
 /// When the same aggregate expression appears multiple times (e.g. `SUM(col)`
@@ -65,6 +95,27 @@ struct AggregateQuery {
     sql: String,
     /// `column_mapping[output_idx] = remote_col_idx`
     column_mapping: Vec<usize>,
+}
+
+/// A SQL fragment before deduplication, carrying the rendered SQL, a
+/// dedup key (with outer CASTs stripped), and whether it needs an alias.
+struct SqlFragment {
+    /// The SQL expression to emit (e.g. `SUM("l_quantity")`).
+    sql: String,
+    /// Key used for deduplication. Outer CASTs are stripped so that
+    /// `SUM(col)` and `SUM(CAST(col AS DOUBLE))` are recognized as duplicates.
+    dedup_key: String,
+    /// Whether this fragment needs an `AS "__agg_N"` alias.
+    /// Group-by columns don't; aggregate expressions do.
+    needs_alias: bool,
+}
+
+/// A deduplicated SQL select item, ready for final rendering.
+struct SelectItem {
+    /// The SQL expression to emit.
+    sql: String,
+    /// Whether this item needs an `AS "__agg_N"` alias.
+    needs_alias: bool,
 }
 
 /// An [`ExecutionPlan`] that sends a SQL query with `GROUP BY` and aggregate functions
@@ -84,8 +135,6 @@ pub struct PartialAggregationFlightSqlExec {
     group_by: PhysicalGroupBy,
     /// Aggregate function expressions.
     aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
-    /// Schema of the `FlightSqlExec` input (used to resolve column references).
-    input_schema: SchemaRef,
     /// Schema of the output — matches the partial aggregate state fields.
     output_schema: SchemaRef,
     /// Column substitution map from an intermediate `ProjectionExec` (CSE).
@@ -127,7 +176,6 @@ impl PartialAggregationFlightSqlExec {
             source_filters: source.filters().to_vec(),
             group_by,
             aggr_exprs,
-            input_schema: source.schema(),
             output_schema,
             column_substitutions,
             client: source.client().clone(),
@@ -148,7 +196,6 @@ impl PartialAggregationFlightSqlExec {
             &self.source_filters,
             &self.group_by,
             &self.aggr_exprs,
-            &self.input_schema,
             &self.column_substitutions,
         )
     }
@@ -278,23 +325,21 @@ fn build_aggregate_sql(
     source_filters: &[Expr],
     group_by: &PhysicalGroupBy,
     aggr_exprs: &[Arc<AggregateFunctionExpr>],
-    input_schema: &SchemaRef,
     column_substitutions: &[Arc<dyn PhysicalExpr>],
 ) -> Result<AggregateQuery> {
     // Phase 1: collect all SQL fragments (before dedup) and their dedup keys.
-    // Each entry is (sql_fragment, dedup_key, needs_alias).
-    // Group-by columns don't need aliases (they're plain column refs).
-    // Aggregate expressions need aliases to avoid remote-side name collisions.
-    // The dedup_key strips outer CASTs so that SUM(col) and SUM(CAST(col AS X))
-    // are recognized as duplicates.
-    let mut all_fragments: Vec<(String, String, bool)> = Vec::new();
+    let mut all_fragments: Vec<SqlFragment> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
     // Group-by columns — no alias needed
     for (_expr, name) in group_by.expr() {
         let quoted = quote_ident(name);
         group_by_cols.push(quoted.clone());
-        all_fragments.push((quoted.clone(), quoted, false));
+        all_fragments.push(SqlFragment {
+            sql: quoted.clone(),
+            dedup_key: quoted,
+            needs_alias: false,
+        });
     }
 
     // Aggregate expressions
@@ -304,28 +349,38 @@ fn build_aggregate_sql(
 
         if SIMPLE_PUSHDOWN_AGGREGATES.contains(func_name) {
             if func_name == "count" && exprs.is_empty() {
-                all_fragments.push(("COUNT(*)".to_string(), "COUNT(*)".to_string(), true));
+                all_fragments.push(SqlFragment {
+                    sql: "COUNT(*)".to_string(),
+                    dedup_key: "COUNT(*)".to_string(),
+                    needs_alias: true,
+                });
             } else if func_name == "count" {
-                let arg_sql = physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
-                    .ok_or_else(|| {
-                    DataFusionError::Internal("Failed to convert count arg to SQL".to_string())
-                })?;
-                let frag = format!("COUNT({arg_sql})");
-                let key = format!("COUNT({})", strip_outer_cast(&arg_sql));
-                all_fragments.push((frag, key, true));
+                let arg_sql =
+                    physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
+                        DataFusionError::Internal("Failed to convert count arg to SQL".to_string())
+                    })?;
+                all_fragments.push(SqlFragment {
+                    sql: format!("COUNT({arg_sql})"),
+                    dedup_key: format!("COUNT({})", strip_outer_cast(&arg_sql)),
+                    needs_alias: true,
+                });
             } else {
-                let arg_sql = physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
-                    .ok_or_else(|| {
-                    DataFusionError::Internal(format!("Failed to convert {func_name} arg to SQL"))
-                })?;
+                let arg_sql =
+                    physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Failed to convert {func_name} arg to SQL"
+                        ))
+                    })?;
                 let upper = func_name.to_uppercase();
-                let frag = format!("{upper}({arg_sql})");
-                let key = format!("{upper}({})", strip_outer_cast(&arg_sql));
-                all_fragments.push((frag, key, true));
+                all_fragments.push(SqlFragment {
+                    sql: format!("{upper}({arg_sql})"),
+                    dedup_key: format!("{upper}({})", strip_outer_cast(&arg_sql)),
+                    needs_alias: true,
+                });
             }
         } else if func_name == "avg" {
-            let arg_sql = physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
-                .ok_or_else(|| {
+            let arg_sql =
+                physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
                     DataFusionError::Internal("Failed to convert avg arg to SQL".to_string())
                 })?;
             // AVG decomposes into SUM + COUNT.
@@ -333,13 +388,16 @@ fn build_aggregate_sql(
             // existing explicit SUM(col). The local side casts the Decimal
             // result to Float64 via remap_batch.
             let stripped = strip_outer_cast(&arg_sql);
-            let sum_frag = format!("SUM({arg_sql})");
-            let sum_key = format!("SUM({stripped})");
-            all_fragments.push((sum_frag, sum_key, true));
-
-            let count_frag = format!("COUNT({arg_sql})");
-            let count_key = format!("COUNT({stripped})");
-            all_fragments.push((count_frag, count_key, true));
+            all_fragments.push(SqlFragment {
+                sql: format!("SUM({arg_sql})"),
+                dedup_key: format!("SUM({stripped})"),
+                needs_alias: true,
+            });
+            all_fragments.push(SqlFragment {
+                sql: format!("COUNT({arg_sql})"),
+                dedup_key: format!("COUNT({stripped})"),
+                needs_alias: true,
+            });
         } else {
             return Err(DataFusionError::Internal(format!(
                 "Unsupported aggregate function for pushdown: {func_name}"
@@ -349,60 +407,53 @@ fn build_aggregate_sql(
 
     // Phase 2: deduplicate by key, preserving order.
     let mut dedup_map: HashMap<String, usize> = HashMap::new();
-    let mut unique_fragments: Vec<(String, bool)> = Vec::new();
+    let mut unique_items: Vec<SelectItem> = Vec::new();
     let mut column_mapping: Vec<usize> = Vec::with_capacity(all_fragments.len());
 
-    for (frag, key, needs_alias) in &all_fragments {
-        if let Some(&idx) = dedup_map.get(key) {
+    for frag in &all_fragments {
+        if let Some(&idx) = dedup_map.get(&frag.dedup_key) {
             column_mapping.push(idx);
         } else {
-            let idx = unique_fragments.len();
-            dedup_map.insert(key.clone(), idx);
-            unique_fragments.push((frag.clone(), *needs_alias));
+            let idx = unique_items.len();
+            dedup_map.insert(frag.dedup_key.clone(), idx);
+            unique_items.push(SelectItem {
+                sql: frag.sql.clone(),
+                needs_alias: frag.needs_alias,
+            });
             column_mapping.push(idx);
         }
     }
 
     // Phase 3: build SQL — alias only aggregate expressions, not plain columns
     let mut agg_alias_idx: usize = 0;
-    let select_parts: Vec<String> = unique_fragments
+    let select_items: Vec<String> = unique_items
         .iter()
-        .map(|(frag, needs_alias)| {
-            if *needs_alias {
-                let part = format!("{frag} AS \"__agg_{agg_alias_idx}\"");
+        .map(|item| {
+            if item.needs_alias {
+                let rendered = format!("{} AS \"__agg_{agg_alias_idx}\"", item.sql);
                 agg_alias_idx += 1;
-                part
+                rendered
             } else {
-                frag.clone()
+                item.sql.clone()
             }
         })
         .collect();
 
     // WHERE clause from source filters
-    let where_clause = if source_filters.is_empty() {
-        String::new()
-    } else {
-        let filter_strs: Vec<String> = source_filters
-            .iter()
-            .map(|f| expr_to_sql::to_sql(f).map_err(|e| DataFusionError::Internal(e.to_string())))
-            .collect::<Result<Vec<_>>>()?;
-        format!(" WHERE {}", filter_strs.join(" AND "))
-    };
+    let where_clauses: Vec<String> = source_filters
+        .iter()
+        .map(|f| expr_to_sql::to_sql(f).map_err(|e| DataFusionError::Internal(e.to_string())))
+        .collect::<Result<Vec<_>>>()?;
 
-    // GROUP BY clause
-    let group_by_clause = if group_by_cols.is_empty() {
-        String::new()
-    } else {
-        format!(" GROUP BY {}", group_by_cols.join(", "))
+    let stmt = SelectStatement {
+        select_items,
+        from: table_reference.to_quoted_string(),
+        where_clauses,
+        group_by_cols,
     };
-
-    let table = table_reference.to_quoted_string();
 
     Ok(AggregateQuery {
-        sql: format!(
-            "SELECT {} FROM {table}{where_clause}{group_by_clause}",
-            select_parts.join(", ")
-        ),
+        sql: stmt.to_sql(),
         column_mapping,
     })
 }
@@ -462,10 +513,8 @@ fn find_top_level_as(s: &str) -> Option<usize> {
 /// the original expression. The substituted expression is then converted
 /// recursively *without* substitutions, because its own column references
 /// target the scan schema directly.
-#[allow(clippy::only_used_in_recursion)] // schema reserved for future expression-type lookups
 pub(super) fn physical_expr_to_sql(
     expr: &Arc<dyn PhysicalExpr>,
-    schema: &SchemaRef,
     column_substitutions: &[Arc<dyn PhysicalExpr>],
 ) -> Option<String> {
     use datafusion::physical_expr::expressions::{
@@ -479,7 +528,7 @@ pub(super) fn physical_expr_to_sql(
         if let Some(subst) = column_substitutions.get(col.index()) {
             // Substituted expressions reference the scan schema directly,
             // so recurse without further substitutions.
-            return physical_expr_to_sql(subst, schema, &[]);
+            return physical_expr_to_sql(subst, &[]);
         }
         return Some(quote_ident(col.name()));
     }
@@ -487,17 +536,17 @@ pub(super) fn physical_expr_to_sql(
         return scalar_to_sql(lit.value());
     }
     if let Some(bin) = any.downcast_ref::<BinaryExpr>() {
-        let left = physical_expr_to_sql(bin.left(), schema, column_substitutions)?;
-        let right = physical_expr_to_sql(bin.right(), schema, column_substitutions)?;
+        let left = physical_expr_to_sql(bin.left(), column_substitutions)?;
+        let right = physical_expr_to_sql(bin.right(), column_substitutions)?;
         return Some(format!("({left} {op} {right})", op = bin.op()));
     }
     if let Some(cast) = any.downcast_ref::<CastExpr>() {
-        let inner = physical_expr_to_sql(cast.expr(), schema, column_substitutions)?;
+        let inner = physical_expr_to_sql(cast.expr(), column_substitutions)?;
         let dt = arrow_type_to_sql(cast.cast_type())?;
         return Some(format!("CAST({inner} AS {dt})"));
     }
     if let Some(neg) = any.downcast_ref::<NegativeExpr>() {
-        let inner = physical_expr_to_sql(neg.arg(), schema, column_substitutions)?;
+        let inner = physical_expr_to_sql(neg.arg(), column_substitutions)?;
         return Some(format!("(-{inner})"));
     }
     None
@@ -565,4 +614,134 @@ fn arrow_type_to_sql(dt: &datafusion::arrow::datatypes::DataType) -> Option<Stri
 
 fn quote_ident(name: &str) -> String {
     format!("\"{name}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    /// Identity mapping: same types, same column order.
+    #[test]
+    fn test_remap_batch_identity() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .expect("build batch");
+
+        let mapping = vec![0, 1];
+        let result = remap_batch(&batch, &mapping, &schema).expect("remap should succeed");
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+        let col_a = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array");
+        assert_eq!(col_a.values(), &[1, 2, 3]);
+    }
+
+    /// Column reuse via dedup mapping: output has 3 columns but remote batch
+    /// has only 2 — column 0 is read twice.
+    #[test]
+    fn test_remap_batch_column_reuse() {
+        let remote_schema = Arc::new(Schema::new(vec![
+            Field::new("sum_qty", DataType::Int64, false),
+            Field::new("count_qty", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&remote_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .expect("build batch");
+
+        // Output schema has 3 fields; column 0 from remote is reused at positions 0 and 2.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("sum_qty_1", DataType::Int64, false),
+            Field::new("count_qty", DataType::Int64, false),
+            Field::new("sum_qty_2", DataType::Int64, false),
+        ]));
+        let mapping = vec![0, 1, 0];
+        let result = remap_batch(&batch, &mapping, &target_schema).expect("remap should succeed");
+
+        assert_eq!(result.num_columns(), 3);
+        let col0 = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array");
+        let col2 = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("should be Int64Array");
+        assert_eq!(col0.value(0), 100);
+        assert_eq!(col2.value(0), 100);
+    }
+
+    /// Type casting: remote returns Int64, target expects Float64.
+    #[test]
+    fn test_remap_batch_type_cast() {
+        let remote_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_qty",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&remote_schema),
+            vec![Arc::new(Int64Array::from(vec![42, 100]))],
+        )
+        .expect("build batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_qty",
+            DataType::Float64,
+            true,
+        )]));
+        let mapping = vec![0];
+        let result = remap_batch(&batch, &mapping, &target_schema).expect("remap should succeed");
+
+        let col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("should be Float64Array");
+        assert!((col.value(0) - 42.0).abs() < f64::EPSILON);
+        assert!((col.value(1) - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// Out-of-bounds column index should return an error, not panic.
+    #[test]
+    fn test_remap_batch_out_of_bounds() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("build batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)]));
+        // Index 5 is out of bounds for a 1-column batch
+        let mapping = vec![5];
+        let result = remap_batch(&batch, &mapping, &target_schema);
+        assert!(result.is_err(), "should error on out-of-bounds index");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("index 5"),
+            "error should mention the bad index: {err_msg}"
+        );
+    }
 }

@@ -493,7 +493,7 @@ impl FlightSqlExec {
         self.limit
     }
 
-    /// Returns the SQL query that this exec will send to the FlightSQL endpoint.
+    /// Returns the SQL query that this exec will send to the `FlightSQL` endpoint.
     pub fn sql(&self) -> Result<String> {
         let columns = self
             .projected_schema
