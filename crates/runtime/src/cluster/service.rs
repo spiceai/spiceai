@@ -474,6 +474,7 @@ impl ClusterService for ClusterServiceImpl {
         let executor_registry = Arc::clone(&self.executor_registry);
         let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
+        let metrics_node_id = self.advertise_address.clone();
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
                 Some(Ok(msg)) => {
@@ -504,6 +505,10 @@ impl ClusterService for ClusterServiceImpl {
             let pending_requests = executor_registry
                 .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
+
+            // Update active executor count metric.
+            let count = executor_registry.connected_executors().await.len();
+            crate::metrics::cluster::set_active_executor_count(&metrics_node_id, count as u64);
 
             // Register the executor stream for PollNow broadcasts.
             executor_streams.register(&executor_id, registration_tx);
@@ -554,6 +559,10 @@ impl ClusterService for ClusterServiceImpl {
 
             // Unregister the executor when the stream ends.
             executor_registry.unregister(&executor_id).await;
+
+            // Update active executor count metric.
+            let count = executor_registry.connected_executors().await.len();
+            crate::metrics::cluster::set_active_executor_count(&metrics_node_id, count as u64);
 
             // Unregister the executor stream.
             executor_streams.unregister(&executor_id);
