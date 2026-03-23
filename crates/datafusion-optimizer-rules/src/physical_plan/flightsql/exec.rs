@@ -113,7 +113,6 @@ impl PartialAggregationFlightSqlExec {
         source: &FlightSqlExec,
         group_by: PhysicalGroupBy,
         aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
-        input_schema: SchemaRef,
         output_schema: SchemaRef,
         column_substitutions: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -128,7 +127,7 @@ impl PartialAggregationFlightSqlExec {
             source_filters: source.filters().to_vec(),
             group_by,
             aggr_exprs,
-            input_schema,
+            input_schema: source.schema(),
             output_schema,
             column_substitutions,
             client: source.client().clone(),
@@ -463,6 +462,7 @@ fn find_top_level_as(s: &str) -> Option<usize> {
 /// the original expression. The substituted expression is then converted
 /// recursively *without* substitutions, because its own column references
 /// target the scan schema directly.
+#[allow(clippy::only_used_in_recursion)] // schema reserved for future expression-type lookups
 pub(super) fn physical_expr_to_sql(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &SchemaRef,
@@ -522,14 +522,15 @@ fn scalar_to_sql(value: &datafusion::scalar::ScalarValue) -> Option<String> {
             } else {
                 // Render with the correct number of decimal places.
                 // e.g. Decimal128(100, _, 2) → "1.00", Decimal128(-50, _, 2) → "-0.50"
-                let scale_u32 = u32::try_from(scale.unsigned_abs()).ok()?;
+                let scale_u32 = u32::from(scale.unsigned_abs());
                 let divisor = i128::checked_pow(10, scale_u32)?;
+                let divisor_u = divisor.unsigned_abs();
                 let abs = v.unsigned_abs();
-                let whole = abs / (divisor as u128);
-                let frac = abs % (divisor as u128);
-                let s = *scale as usize;
+                let whole = abs / divisor_u;
+                let frac = abs % divisor_u;
+                let s = usize::from(scale.unsigned_abs());
                 let sign = if *v < 0 { "-" } else { "" };
-                Some(format!("{sign}{whole}.{frac:0>width$}", width = s))
+                Some(format!("{sign}{whole}.{frac:0>s$}"))
             }
         }
         ScalarValue::Utf8(Some(v))
@@ -544,16 +545,20 @@ fn scalar_to_sql(value: &datafusion::scalar::ScalarValue) -> Option<String> {
 fn arrow_type_to_sql(dt: &datafusion::arrow::datatypes::DataType) -> Option<String> {
     use datafusion::arrow::datatypes::DataType;
     match dt {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 => Some("INTEGER".to_string()),
-        DataType::Int64 => Some("BIGINT".to_string()),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Some("INTEGER".to_string()),
-        DataType::UInt64 => Some("BIGINT".to_string()),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => Some("INTEGER".to_string()),
+        DataType::Int64 | DataType::UInt64 => Some("BIGINT".to_string()),
         DataType::Float32 => Some("FLOAT".to_string()),
-        DataType::Float64 | DataType::Float16 => Some("DOUBLE".to_string()),
+        DataType::Float16 | DataType::Float64 => Some("DOUBLE".to_string()),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some("VARCHAR".to_string()),
         DataType::Boolean => Some("BOOLEAN".to_string()),
-        DataType::Decimal128(p, s) => Some(format!("DECIMAL({p},{s})")),
-        DataType::Decimal256(p, s) => Some(format!("DECIMAL({p},{s})")),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+            Some(format!("DECIMAL({p},{s})"))
+        }
         _ => None,
     }
 }

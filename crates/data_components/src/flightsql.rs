@@ -597,7 +597,7 @@ impl ExecutionPlan for FlightSqlExec {
 /// Coerce a [`RecordBatch`] to match a target schema by casting columns whose types
 /// differ but are compatible (e.g. `Utf8` → `Utf8View`). This handles cases where
 /// the Flight IPC layer returns data with slightly different types than the declared schema.
-pub fn coerce_batch_to_schema(
+fn coerce_batch_to_schema(
     batch: &RecordBatch,
     target_schema: &SchemaRef,
 ) -> DataFusionResult<RecordBatch> {
@@ -663,7 +663,7 @@ pub fn query_to_stream(
     }
 }
 
-pub fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
+fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()))
 }
 

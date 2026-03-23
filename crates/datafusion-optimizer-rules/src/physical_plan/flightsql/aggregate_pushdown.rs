@@ -78,7 +78,7 @@ impl PhysicalOptimizerRule for FlightSQLPartialAggregatePushdown {
             .map(|t| t.data)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "FlightSQLPartialAggregatePushdown"
     }
 
@@ -124,7 +124,7 @@ fn try_rewrite_partial_aggregate(
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(flight_execs.len());
     for flight in &flight_execs {
         let Some(new_exec) =
-            build_pushdown_exec(agg, flight, &output_schema, &column_substitutions)?
+            build_pushdown_exec(agg, flight, &output_schema, &column_substitutions)
         else {
             return Ok(Transformed::no(plan));
         };
@@ -155,7 +155,7 @@ fn all_aggregates_pushable(agg: &AggregateExec) -> bool {
         if aggr.is_distinct() {
             return false;
         }
-        if filters.get(i).is_some_and(|f| f.is_some()) {
+        if filters.get(i).is_some_and(Option::is_some) {
             return false;
         }
     }
@@ -166,10 +166,10 @@ fn all_aggregates_pushable(agg: &AggregateExec) -> bool {
 
 /// Skip through a `RepartitionExec(RoundRobinBatch)` if present.
 fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
-    if let Some(repart) = plan.as_any().downcast_ref::<RepartitionExec>() {
-        if matches!(repart.partitioning(), Partitioning::RoundRobinBatch(_)) {
-            return repart.input();
-        }
+    if let Some(repart) = plan.as_any().downcast_ref::<RepartitionExec>()
+        && matches!(repart.partitioning(), Partitioning::RoundRobinBatch(_))
+    {
+        return repart.input();
     }
     plan
 }
@@ -255,22 +255,21 @@ fn build_pushdown_exec(
     flight: &FlightSqlExec,
     output_schema: &SchemaRef,
     column_substitutions: &[Arc<dyn PhysicalExpr>],
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+) -> Option<Arc<dyn ExecutionPlan>> {
     let exec = PartialAggregationFlightSqlExec::new(
         flight,
         agg.group_expr().clone(),
         agg.aggr_expr().to_vec(),
-        flight.schema(),
         Arc::clone(output_schema),
         column_substitutions.to_vec(),
     );
 
     // Validate that SQL can be built (fail fast during optimization, not at execution)
     if exec.sql().is_err() {
-        return Ok(None);
+        return None;
     }
 
-    Ok(Some(Arc::new(exec)))
+    Some(Arc::new(exec))
 }
 
 /// Build the output schema for the pushdown.
