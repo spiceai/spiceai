@@ -20,6 +20,7 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
+use crate::dataconnector::adbc::{build_db_options, dialect_for_driver};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use adbc_core::options::{AdbcVersion, OptionDatabase};
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
@@ -40,7 +41,6 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use crate::dataconnector::adbc::{build_db_options, dialect_for_driver};
 
 pub const PREFIX: &str = "adbc";
 
