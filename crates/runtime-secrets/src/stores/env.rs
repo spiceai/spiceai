@@ -58,20 +58,10 @@ pub struct EnvSecretStore {
 }
 
 impl EnvSecretStore {
-    fn load_from_iter<I>(source: &str, iter: Result<I, dotenvy::Error>, warn_on_open_error: bool)
+    fn load_from_iter<I>(source: &str, iter: I)
     where
         I: Iterator<Item = Result<(String, String), dotenvy::Error>>,
     {
-        let iter = match iter {
-            Ok(iter) => iter,
-            Err(err) => {
-                if warn_on_open_error {
-                    tracing::warn!("{source}: {err}");
-                }
-                return;
-            }
-        };
-
         for entry in iter {
             match entry {
                 Ok((key, value)) => {
@@ -94,20 +84,19 @@ impl EnvSecretStore {
 
     fn load(&self) {
         if let Some(path) = &self.path {
-            Self::load_from_iter(
-                &path.display().to_string(),
-                dotenvy::from_path_iter(path),
-                true,
-            );
+            match dotenvy::from_path_iter(path) {
+                Ok(iter) => Self::load_from_iter(&path.display().to_string(), iter),
+                Err(err) => tracing::warn!("{}: {err}", path.display()),
+            }
             return;
         }
 
-        Self::load_from_iter(
-            ".env.local",
-            dotenvy::from_filename_iter(".env.local"),
-            false,
-        );
-        Self::load_from_iter(".env", dotenvy::from_filename_iter(".env"), false);
+        if let Ok(iter) = dotenvy::from_filename_iter(".env.local") {
+            Self::load_from_iter(".env.local", iter);
+        }
+        if let Ok(iter) = dotenvy::from_filename_iter(".env") {
+            Self::load_from_iter(".env", iter);
+        }
     }
 }
 
