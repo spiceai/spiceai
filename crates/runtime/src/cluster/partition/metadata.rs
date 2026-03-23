@@ -119,7 +119,6 @@ pub struct TablePartitionMetadata {
     /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_expressions: Vec<String>,
 }
 
