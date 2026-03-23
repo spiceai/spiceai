@@ -135,7 +135,6 @@ impl PartitionManager {
         let now_ms = now_ms()?;
         let metadata =
             TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions);
-        metadata.partition_expressions = partition_expressions;
 
         match self
             .state
