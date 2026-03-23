@@ -683,19 +683,23 @@ async fn provision_spice_cloud_app(
 
     // Wait for executors to connect before declaring the deployment ready.
     // Executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
-    let expected_executors: u64 = std::env::var("SPIDAPTER_NUM_EXECUTORS")
+    let _expected_executors: u64 = std::env::var("SPIDAPTER_NUM_EXECUTORS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    let executor_wait_timeout = Duration::from_secs(
-        std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120),
-    );
+    let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
 
-    wait_for_scp_executor_count(&cloud, app_id, expected_executors, executor_wait_timeout).await;
+    // after the deployment is reported "ready", wait for another 10 seconds (or SPIDAPTER_DEPLOYMENT_READY_WAIT seconds if set)
+    // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
+    eprintln!(
+        "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
+    );
+    tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
+    // wait_for_scp_executor_count(&cloud, app_id, expected_executors, Duration::from_secs(executor_wait_timeout)).await;
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
@@ -1240,6 +1244,7 @@ async fn wait_for_local_sql_ready(
 
 /// Polls the Spice Cloud metrics API until the expected number of executors have connected,
 /// or the timeout expires. On timeout, logs a warning and returns (non-fatal).
+#[expect(dead_code)]
 async fn wait_for_scp_executor_count(
     cloud: &CloudClient,
     app_id: i64,
