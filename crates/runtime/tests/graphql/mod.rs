@@ -216,13 +216,10 @@ async fn graphql_handler(schema: Extension<ServiceSchema>, req: GraphQLRequest) 
     response.into()
 }
 
-async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+async fn start_graphql_server(
+    app: Router,
+) -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-
-    let app = Router::new()
-        .route("/graphql", post(graphql_handler))
-        .layer(Extension(schema));
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
         tracing::error!("Failed to bind to address: {e}");
@@ -234,15 +231,25 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
     })?;
 
     tokio::spawn(async move {
-        axum::serve(tcp_listener, app)
+        if let Err(e) = axum::serve(tcp_listener, app)
             .with_graceful_shutdown(async {
                 rx.await.ok();
             })
             .await
-            .unwrap_or_default();
+        {
+            tracing::error!("GraphQL test server failed: {e}");
+        }
     });
 
     Ok((tx, addr))
+}
+
+async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
+    let app = Router::new()
+        .route("/graphql", post(graphql_handler))
+        .layer(Extension(schema));
+    start_graphql_server(app).await
 }
 
 fn make_graphql_dataset(
@@ -519,34 +526,11 @@ async fn graphql_handler_with_custom_auth(
 }
 
 async fn start_auth_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-
     let app = Router::new()
         .route("/graphql", post(graphql_handler_with_custom_auth))
         .layer(Extension(schema));
-
-    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        tracing::error!("Failed to bind to address: {e}");
-        e.to_string()
-    })?;
-    let addr = tcp_listener.local_addr().map_err(|e| {
-        tracing::error!("Failed to get local address: {e}");
-        e.to_string()
-    })?;
-
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(tcp_listener, app)
-            .with_graceful_shutdown(async {
-                rx.await.ok();
-            })
-            .await
-        {
-            tracing::error!("GraphQL auth test server failed: {e}");
-        }
-    });
-
-    Ok((tx, addr))
+    start_graphql_server(app).await
 }
 
 fn make_graphql_dataset_with_auth(

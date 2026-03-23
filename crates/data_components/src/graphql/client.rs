@@ -803,11 +803,18 @@ impl GraphQLClient {
             // regardless of whether a custom auth header was configured
             (Some(_), None, Some(user), pass) => {
                 tracing::warn!(
-                    "'graphql_auth_header' is configured but 'graphql_auth_token' is not set; falling back to Basic auth"
+                    "Custom auth header is configured without an auth token; falling back to Basic auth"
                 );
                 Some(Auth::Basic(user, pass))
             }
             (_, None, Some(user), pass) => Some(Auth::Basic(user, pass)),
+            // Custom auth header configured without any credentials
+            (Some(_), None, None, _) => {
+                tracing::warn!(
+                    "Custom auth header is configured but no credentials are provided; requests will be unauthenticated"
+                );
+                None
+            }
             // No authentication configured
             _ => None,
         };
@@ -2151,6 +2158,32 @@ mod tests {
         assert!(
             matches!(&client.auth, Some(super::Auth::Basic(u, None)) if u == "user"),
             "Expected Basic auth fallback when auth_header is set but token is missing"
+        );
+    }
+
+    #[test]
+    fn test_auth_header_without_credentials_warns_and_returns_none() {
+        let header = reqwest::header::HeaderName::from_static("x-custom");
+
+        let client = super::GraphQLClient::new(
+            reqwest::Client::new(),
+            Url::parse("https://example.com/graphql").expect("valid url"),
+            None,
+            None,
+            None,
+            None,
+            UnnestBehavior::Depth(0),
+            None,
+            None,
+            None,
+            None,
+            Some(header),
+        )
+        .expect("Should create client");
+
+        assert!(
+            client.auth.is_none(),
+            "Expected no auth when auth_header is set but no token or user"
         );
     }
 
