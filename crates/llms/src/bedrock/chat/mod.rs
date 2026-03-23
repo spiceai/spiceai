@@ -624,7 +624,7 @@ impl BedrockConverse {
                let mut state_ = state.write().await;
                let zz: Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> = match packet {
                     Err(SdkError::ServiceError(e)) => {
-                        match e.err() {
+                        match e.into_service_error() {
                             ConverseStreamOutputError::InternalServerException(e) => {
                                 Some(Err(to_api_error(format!("Bedrock internal server error: {e}"))))
                             }
