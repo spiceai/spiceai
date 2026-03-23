@@ -15,23 +15,7 @@ Apache Ballista extends Apache DataFusion into a distributed query engine. Same 
 
 Here's the architecture:
 
-```
-        SQL Query
-            │
-            ▼
-    ┌──────────────┐
-    │   Scheduler   │   Plans query, breaks into stages, assigns tasks
-    └──────────────┘
-      │       │       │
-      ▼       ▼       ▼
-   ┌─────┐ ┌─────┐ ┌─────┐
-   │Exec1│ │Exec2│ │Exec3│  Execute stages, exchange shuffle data
-   └─────┘ └─────┘ └─────┘
-      │       │       │
-      └───────┼───────┘
-              ▼
-       Arrow Results
-```
+![Ballista Architecture](logos/ballista-architecture.svg)
 
 The scheduler accepts a SQL query, runs it through DataFusion's planner and optimizer, then breaks the physical plan into stages separated by shuffle boundaries—repartitions, aggregations, joins. Each stage becomes a set of tasks distributed across executor workers.
 
@@ -67,6 +51,8 @@ When to stay single-node:
 Ballista is an Apache Software Foundation project with 346 contributors, production-used at companies including Apple and Coralogix (which maintains a fork with 65+ releases). It's the natural scale-out path for any system built on DataFusion.
 
 The broader trend: query engines are becoming composable. Arrow for the format. DataFusion for single-node execution. Ballista for distribution. Flight for transport. Each layer is a library you compose, not a monolith you adopt.
+
+At Spice.ai, we've integrated Ballista as our distributed query layer—extending it with mTLS cluster security, remote catalog sync, and HA multi-scheduler support. More on that: https://spiceai.org/docs/next/features/distributed-query
 
 ### First Reply (with links)
 

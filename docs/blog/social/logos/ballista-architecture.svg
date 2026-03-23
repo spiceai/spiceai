@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 520" width="720" height="520" style="background: #ffffff;">
+  <defs>
+    <style>
+      .box { fill: #f8f9fa; stroke: #343a40; stroke-width: 2; rx: 8; ry: 8; }
+      .box-scheduler { fill: #e8f4fd; stroke: #1971c2; stroke-width: 2.5; rx: 8; ry: 8; }
+      .box-executor { fill: #fff3e0; stroke: #e8590c; stroke-width: 2; rx: 8; ry: 8; }
+      .box-result { fill: #e6fcf5; stroke: #099268; stroke-width: 2; rx: 8; ry: 8; }
+      .box-query { fill: #f3f0ff; stroke: #7048e8; stroke-width: 2; rx: 8; ry: 8; }
+      .label { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 15px; fill: #212529; text-anchor: middle; }
+      .label-bold { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 16px; fill: #212529; text-anchor: middle; font-weight: 600; }
+      .label-small { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; fill: #868e96; text-anchor: middle; }
+      .label-desc { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; fill: #495057; text-anchor: start; }
+      .arrow { stroke: #495057; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .arrow-shuffle { stroke: #e8590c; stroke-width: 1.5; fill: none; stroke-dasharray: 6,4; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#495057" />
+    </marker>
+    <marker id="arrowhead-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#e8590c" />
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="360" y="30" class="label-bold" style="font-size: 20px;">Ballista Distributed Query Architecture</text>
+
+  <!-- SQL Query box -->
+  <rect x="270" y="50" width="180" height="44" class="box-query" />
+  <text x="360" y="77" class="label-bold" style="fill: #7048e8;">SQL Query</text>
+
+  <!-- Arrow: Query → Scheduler -->
+  <line x1="360" y1="94" x2="360" y2="130" class="arrow" />
+
+  <!-- Scheduler box -->
+  <rect x="210" y="130" width="300" height="54" class="box-scheduler" />
+  <text x="360" y="155" class="label-bold" style="fill: #1971c2;">Scheduler</text>
+  <text x="360" y="173" class="label-small">Plans query, breaks into stages, assigns tasks</text>
+
+  <!-- Arrows: Scheduler → Executors -->
+  <line x1="280" y1="184" x2="160" y2="240" class="arrow" />
+  <line x1="360" y1="184" x2="360" y2="240" class="arrow" />
+  <line x1="440" y1="184" x2="560" y2="240" class="arrow" />
+
+  <!-- Executor 1 -->
+  <rect x="80" y="240" width="160" height="80" class="box-executor" />
+  <text x="160" y="268" class="label-bold" style="fill: #e8590c;">Executor 1</text>
+  <text x="160" y="288" class="label-small">Stage A · Task 1</text>
+  <text x="160" y="304" class="label-small">Stage A · Task 4</text>
+
+  <!-- Executor 2 -->
+  <rect x="280" y="240" width="160" height="80" class="box-executor" />
+  <text x="360" y="268" class="label-bold" style="fill: #e8590c;">Executor 2</text>
+  <text x="360" y="288" class="label-small">Stage A · Task 2</text>
+  <text x="360" y="304" class="label-small">Stage B · Task 1</text>
+
+  <!-- Executor 3 -->
+  <rect x="480" y="240" width="160" height="80" class="box-executor" />
+  <text x="560" y="268" class="label-bold" style="fill: #e8590c;">Executor 3</text>
+  <text x="560" y="288" class="label-small">Stage A · Task 3</text>
+  <text x="560" y="304" class="label-small">Stage B · Task 2</text>
+
+  <!-- Shuffle arrows between executors -->
+  <path d="M 240,290 C 260,310 300,310 280,290" class="arrow-shuffle" marker-end="url(#arrowhead-orange)" />
+  <path d="M 440,290 C 460,310 500,310 480,290" class="arrow-shuffle" marker-end="url(#arrowhead-orange)" />
+
+  <!-- Shuffle label -->
+  <text x="360" y="348" class="label-small" style="fill: #e8590c;">Shuffle (disk-based, Arrow IPC)</text>
+
+  <!-- Arrows: Executors → Results -->
+  <line x1="160" y1="320" x2="160" y2="380" class="arrow" />
+  <line x1="360" y1="320" x2="360" y2="380" class="arrow" />
+  <line x1="560" y1="320" x2="560" y2="380" class="arrow" />
+
+  <!-- Convergence lines -->
+  <line x1="160" y1="380" x2="160" y2="400" stroke="#495057" stroke-width="2" fill="none" />
+  <line x1="360" y1="380" x2="360" y2="400" stroke="#495057" stroke-width="2" fill="none" />
+  <line x1="560" y1="380" x2="560" y2="400" stroke="#495057" stroke-width="2" fill="none" />
+  <line x1="160" y1="400" x2="560" y2="400" stroke="#495057" stroke-width="2" fill="none" />
+  <line x1="360" y1="400" x2="360" y2="430" class="arrow" />
+
+  <!-- Arrow Results box -->
+  <rect x="250" y="430" width="220" height="44" class="box-result" />
+  <text x="360" y="457" class="label-bold" style="fill: #099268;">Arrow Results</text>
+
+  <!-- Side annotations -->
+  <text x="30" y="165" class="label-desc" style="fill: #1971c2; font-weight: 600;">DataFusion</text>
+  <text x="30" y="180" class="label-desc" style="fill: #868e96;">Plan · Optimize</text>
+  <text x="30" y="195" class="label-desc" style="fill: #868e96;">Distribute</text>
+
+  <text x="650" y="268" class="label-desc" style="fill: #e8590c; font-weight: 600;">gRPC</text>
+  <text x="650" y="283" class="label-desc" style="fill: #868e96;">Arrow</text>
+  <text x="650" y="298" class="label-desc" style="fill: #868e96;">Flight</text>
+
+  <!-- Protocol labels on arrows -->
+  <text x="295" y="226" class="label-small" style="font-size: 11px;">tasks</text>
+  <text x="375" y="226" class="label-small" style="font-size: 11px;">tasks</text>
+  <text x="460" y="226" class="label-small" style="font-size: 11px;">tasks</text>
+
+  <!-- Apache Ballista logo (bottom right) -->
+  <image href="ballista-logo.png" x="540" y="480" width="160" height="31" opacity="0.7" />
+
+</svg>
