@@ -509,7 +509,7 @@ pub struct Runtime {
     config: Arc<Config>,
 
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
-    /// telemetry.  For executors this is set after the app definition is
+    /// telemetry. For executors this is set after the app definition is
     /// fetched from the scheduler; for all other modes it is set before
     /// the runtime starts.
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
@@ -541,6 +541,11 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
+    }
+
+    #[must_use]
+    pub fn flight_write_rate_limit_enabled(&self) -> bool {
+        self.rate_limits.flight_write_enabled()
     }
 
     #[must_use]

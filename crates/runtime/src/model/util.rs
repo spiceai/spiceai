@@ -51,6 +51,8 @@ pub(super) async fn create_bedrock_client(
     let session_token =
         extract_secret!(params, "aws_session_token").map(std::string::ToString::to_string);
 
+    let iam_role_source = extract_secret!(params, "aws_iam_role_source");
+
     // Use common credential initialization from aws-sdk-credential-bridge
     let mut config_builder = aws_sdk_credential_bridge::initiate_config_with_credentials(
         credential_provider_name,
@@ -58,6 +60,7 @@ pub(super) async fn create_bedrock_client(
         access_key_id,
         secret_access_key,
         session_token,
+        iam_role_source,
     )
     .await;
 

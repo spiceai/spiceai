@@ -173,6 +173,8 @@ pub enum QueryOverridesArg {
     DynamoDB,
     #[serde(rename = "arrow")]
     Arrow,
+    #[serde(rename = "turso")]
+    Turso,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -285,6 +287,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::PostgresCatalog => QueryOverrides::PostgresCatalog,
             QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
             QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
+            QueryOverridesArg::Turso => QueryOverrides::Turso,
         }
     }
 }

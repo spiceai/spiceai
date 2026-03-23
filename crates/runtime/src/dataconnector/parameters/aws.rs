@@ -207,6 +207,17 @@ impl Validator for AuthValidator {
                 });
             }
         }
+
+        // Validate iam_role_source if present
+        if let Some(iam_role_source) = params.parameters.get("iam_role_source").expose().ok()
+            && !matches!(iam_role_source, "auto" | "metadata" | "env")
+        {
+            return Err(Error::InvalidIamRoleSource {
+                key: "iam_role_source".to_string(),
+                iam_source: iam_role_source.to_string(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -221,6 +232,7 @@ pub async fn initiate_config_with_credentials(
     secret_name: &'static str,
     token_name: &'static str,
     params: &Parameters,
+    iam_role_source: Option<&str>,
 ) -> Result<ConfigLoader, Error> {
     let region = params
         .get(region_name)
@@ -249,6 +261,7 @@ pub async fn initiate_config_with_credentials(
         access_key_id,
         secret_access_key,
         session_token,
+        iam_role_source,
     )
     .await)
 }
