@@ -40,6 +40,7 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use crate::dataconnector::adbc::build_db_options;
 
 pub const PREFIX: &str = "adbc";
 
@@ -184,46 +185,6 @@ impl CatalogConnector for AdbcCatalog {
 
         Ok(provider as Arc<dyn RefreshableCatalogProvider>)
     }
-}
-
-/// Builds the list of ADBC database options from connection parameters.
-fn build_db_options(
-    uri: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    driver_options: Option<&str>,
-) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
-    if let Some(u) = username {
-        opts.push((OptionDatabase::Username, u.into()));
-    }
-    if let Some(p) = password {
-        opts.push((OptionDatabase::Password, p.into()));
-    }
-    if let Some(options_str) = driver_options {
-        for pair in options_str.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            if let Some((key, value)) = pair.split_once('=') {
-                let key = key.trim();
-                if key.is_empty() {
-                    tracing::warn!("Ignoring ADBC driver option with empty key");
-                    continue;
-                }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
-            } else {
-                tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
-            }
-        }
-    }
-    opts
 }
 
 /// Creates an ADBC connection pool from connector parameters.
@@ -566,21 +527,5 @@ mod tests {
 
         let err = Error::MissingUri;
         assert_eq!(err.to_string(), "Missing required parameter: uri");
-    }
-
-    #[test]
-    fn test_build_db_options_uri_only() {
-        let opts = build_db_options("file:test.db", None, None);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-    }
-
-    #[test]
-    fn test_build_db_options_with_credentials() {
-        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"));
-        assert_eq!(opts.len(), 3);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(opts[1].0, OptionDatabase::Username);
-        assert_eq!(opts[2].0, OptionDatabase::Password);
     }
 }

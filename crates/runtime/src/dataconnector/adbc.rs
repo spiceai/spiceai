@@ -305,7 +305,7 @@ impl DataConnectorFactory for AdbcFactory {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
-fn build_db_options(
+pub fn build_db_options(
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
