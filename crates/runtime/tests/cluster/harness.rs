@@ -156,7 +156,20 @@ impl ClusterHarness {
     /// Block until exactly `n` executors have registered with the scheduler,
     /// or return an error after `timeout`.
     pub async fn wait_for_executors(&self, timeout: Duration) -> Result<(), anyhow::Error> {
-        let n = self.executors.len();
+        self.wait_until_executor_count(self.executors.len(), timeout)
+            .await
+    }
+
+    /// Block until exactly `expected` executors are registered with the scheduler,
+    /// or return an error after `timeout`.
+    ///
+    /// Unlike [`wait_for_executors`], this accepts an arbitrary target count — useful
+    /// for waiting after an executor has been shut down.
+    pub async fn wait_until_executor_count(
+        &self,
+        expected: usize,
+        timeout: Duration,
+    ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         loop {
             let count = self
@@ -165,12 +178,12 @@ impl ClusterHarness {
                 .await
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?
                 .len();
-            if count == n {
+            if count == expected {
                 return Ok(());
             }
             if start.elapsed() > timeout {
                 return Err(anyhow::Error::msg(format!(
-                    "Timed out waiting for {n} executors; found {count}"
+                    "Timed out waiting for {expected} executors; found {count}"
                 )));
             }
             sleep(Duration::from_millis(200)).await;
