@@ -119,6 +119,15 @@ impl PartitionManager {
         self.state.get_cached(&key)
     }
 
+    /// Initialize a blank partition metadata file for a table.
+    ///
+    /// For acceleration table partitions this acts as a temporary lock during scheduler startup (other
+    ///  schedulers will not re-initialize, since a file exists, even if blank). If the file already
+    /// exists, this is a no-op and returns `Ok(false)`.
+    pub async fn initialize_blank_metadata(&self, table: &TableReference) -> Result<bool> {
+        self.initialize_metadata(table, Vec::new()).await
+    }
+
     /// Initialize partition metadata for a table with the given partition expression SQL strings.
     ///
     /// If the file already exists, this is a no-op and returns `Ok(false)`.
@@ -133,8 +142,8 @@ impl PartitionManager {
         }
         let key = table.to_string();
         let now_ms = now_ms()?;
-        let metadata =
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions);
+        let mut metadata = TablePartitionMetadata::blank(table.to_string(), now_ms);
+        metadata.partition_expressions = partition_expressions;
 
         match self
             .state
@@ -161,15 +170,19 @@ impl PartitionManager {
         let key = table.to_string();
         let now_ms = now_ms()?;
 
-        let mut metadata = self.get_table_metadata(table).await?.unwrap_or_else(|| {
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions)
-        });
+        let mut metadata = self
+            .get_table_metadata(table)
+            .await?
+            .unwrap_or_else(|| TablePartitionMetadata::blank(table.to_string(), now_ms));
 
         metadata.partitions = partition_values
             .into_iter()
             .map(PartitionMetadata::new)
             .collect();
         metadata.updated_at = now_ms;
+        if metadata.partition_expressions.is_empty() {
+            metadata.partition_expressions = partition_expressions;
+        }
 
         self.write_metadata(&key, metadata).await
     }

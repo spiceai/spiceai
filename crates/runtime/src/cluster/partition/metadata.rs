@@ -119,19 +119,25 @@ pub struct TablePartitionMetadata {
     /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_expressions: Vec<String>,
 }
 
 impl TablePartitionMetadata {
     #[must_use]
-    pub fn new(table_name: String, updated_at: u128, partition_expressions: Vec<String>) -> Self {
+    pub fn new(table_name: String, schema_version: u32, updated_at: u128) -> Self {
         Self {
             table_name,
             partitions: Vec::new(),
-            schema_version: 1,
+            schema_version,
             updated_at,
-            partition_expressions,
+            partition_expressions: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn blank(table_name: String, now_ms: u128) -> Self {
+        Self::new(table_name, 1, now_ms)
     }
 
     pub fn add_partition(&mut self, partition: PartitionMetadata) {
