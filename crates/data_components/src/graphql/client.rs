@@ -795,9 +795,14 @@ impl GraphQLClient {
         }
 
         let auth = match (auth_header, token, user, pass) {
+            // Custom header with token takes precedence when both are configured
             (Some(header_name), Some(token), _, _) => Some(Auth::CustomHeader(header_name, token)),
-            (None, None, Some(user), pass) => Some(Auth::Basic(user, pass)),
+            // Bearer token without custom header
             (None, Some(token), _, _) => Some(Auth::Bearer(token)),
+            // When no token is available but a username is provided, use Basic auth
+            // regardless of whether a custom auth header was configured
+            (_, None, Some(user), pass) => Some(Auth::Basic(user, pass)),
+            // No authentication configured
             _ => None,
         };
 
@@ -1485,6 +1490,7 @@ mod tests {
 
     use reqwest::StatusCode;
     use serde_json::Value;
+    use url::Url;
 
     use crate::graphql::client::GraphQLQuery;
 
@@ -2028,5 +2034,219 @@ mod tests {
         );
         assert_eq!(obj.get("1"), Some(&Value::String("a".to_string())));
         assert_eq!(obj.get("2"), Some(&Value::String("a".to_string())));
+    }
+
+    #[test]
+    fn test_auth_custom_header_with_token() {
+        let token = Arc::new(token_provider::StaticTokenProvider::new(
+            secrecy::SecretString::from("my_secret"),
+        )) as Arc<dyn token_provider::TokenProvider>;
+        let header = reqwest::header::HeaderName::from_static("x-shopify-access-token");
+
+        let client = super::GraphQLClient::new(
+            reqwest::Client::new(),
+            Url::parse("https://example.com/graphql").expect("valid url"),
+            Some("/data"),
+            Some(token),
+            None,
+            None,
+            UnnestBehavior::Depth(0),
+            None,
+            None,
+            None,
+            None,
+            Some(header),
+        )
+        .expect("Should create client");
+
+        assert!(
+            matches!(&client.auth, Some(super::Auth::CustomHeader(name, _)) if name.as_str() == "x-shopify-access-token"),
+            "Expected CustomHeader auth, got {:?}",
+            client.auth.as_ref().map(|a| match a {
+                super::Auth::Basic(_, _) => "Basic",
+                super::Auth::Bearer(_) => "Bearer",
+                super::Auth::CustomHeader(_, _) => "CustomHeader",
+            })
+        );
+    }
+
+    #[test]
+    fn test_auth_bearer_without_custom_header() {
+        let token = Arc::new(token_provider::StaticTokenProvider::new(
+            secrecy::SecretString::from("my_secret"),
+        )) as Arc<dyn token_provider::TokenProvider>;
+
+        let client = super::GraphQLClient::new(
+            reqwest::Client::new(),
+            Url::parse("https://example.com/graphql").expect("valid url"),
+            None,
+            Some(token),
+            None,
+            None,
+            UnnestBehavior::Depth(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Should create client");
+
+        assert!(
+            matches!(&client.auth, Some(super::Auth::Bearer(_))),
+            "Expected Bearer auth"
+        );
+    }
+
+    #[test]
+    fn test_auth_basic_when_no_token() {
+        let client = super::GraphQLClient::new(
+            reqwest::Client::new(),
+            Url::parse("https://example.com/graphql").expect("valid url"),
+            None,
+            None,
+            Some("user".to_string()),
+            Some("pass".to_string()),
+            UnnestBehavior::Depth(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Should create client");
+
+        assert!(
+            matches!(&client.auth, Some(super::Auth::Basic(u, Some(p))) if u == "user" && p == "pass"),
+            "Expected Basic auth with user and pass"
+        );
+    }
+
+    #[test]
+    fn test_auth_basic_fallback_when_auth_header_set_without_token() {
+        let header = reqwest::header::HeaderName::from_static("x-custom");
+
+        let client = super::GraphQLClient::new(
+            reqwest::Client::new(),
+            Url::parse("https://example.com/graphql").expect("valid url"),
+            None,
+            None,
+            Some("user".to_string()),
+            None,
+            UnnestBehavior::Depth(0),
+            None,
+            None,
+            None,
+            None,
+            Some(header),
+        )
+        .expect("Should create client");
+
+        assert!(
+            matches!(&client.auth, Some(super::Auth::Basic(u, None)) if u == "user"),
+            "Expected Basic auth fallback when auth_header is set but token is missing"
+        );
+    }
+
+    #[test]
+    fn test_auth_none_when_nothing_set() {
+        let client = super::GraphQLClient::new(
+            reqwest::Client::new(),
+            Url::parse("https://example.com/graphql").expect("valid url"),
+            None,
+            None,
+            None,
+            None,
+            UnnestBehavior::Depth(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Should create client");
+
+        assert!(client.auth.is_none(), "Expected no auth");
+    }
+
+    #[test]
+    fn test_request_with_auth_custom_header() {
+        let token = Arc::new(token_provider::StaticTokenProvider::new(
+            secrecy::SecretString::from("secret_token_value"),
+        )) as Arc<dyn token_provider::TokenProvider>;
+        let header = reqwest::header::HeaderName::from_static("x-api-key");
+        let auth = super::Auth::CustomHeader(header, token);
+
+        let client = reqwest::Client::new();
+        let request_builder = client.post("https://example.com/graphql");
+        let request_builder = super::request_with_auth(request_builder, Some(&auth));
+        let request = request_builder.build().expect("Should build request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .expect("Should have x-api-key header")
+                .to_str()
+                .expect("valid str"),
+            "secret_token_value"
+        );
+    }
+
+    #[test]
+    fn test_request_with_auth_bearer() {
+        let token = Arc::new(token_provider::StaticTokenProvider::new(
+            secrecy::SecretString::from("bearer_token"),
+        )) as Arc<dyn token_provider::TokenProvider>;
+        let auth = super::Auth::Bearer(token);
+
+        let client = reqwest::Client::new();
+        let request_builder = client.post("https://example.com/graphql");
+        let request_builder = super::request_with_auth(request_builder, Some(&auth));
+        let request = request_builder.build().expect("Should build request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .expect("Should have authorization header")
+                .to_str()
+                .expect("valid str"),
+            "Bearer bearer_token"
+        );
+    }
+
+    #[test]
+    fn test_request_with_auth_basic() {
+        let auth = super::Auth::Basic("user".to_string(), Some("pass".to_string()));
+
+        let client = reqwest::Client::new();
+        let request_builder = client.post("https://example.com/graphql");
+        let request_builder = super::request_with_auth(request_builder, Some(&auth));
+        let request = request_builder.build().expect("Should build request");
+
+        let auth_header = request
+            .headers()
+            .get("authorization")
+            .expect("Should have authorization header")
+            .to_str()
+            .expect("valid str");
+        assert!(
+            auth_header.starts_with("Basic "),
+            "Expected Basic auth header, got: {auth_header}"
+        );
+    }
+
+    #[test]
+    fn test_request_with_auth_none() {
+        let client = reqwest::Client::new();
+        let request_builder = client.post("https://example.com/graphql");
+        let request_builder = super::request_with_auth(request_builder, None);
+        let request = request_builder.build().expect("Should build request");
+
+        assert!(
+            request.headers().get("authorization").is_none(),
+            "Expected no authorization header"
+        );
     }
 }
