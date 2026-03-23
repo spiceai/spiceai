@@ -359,8 +359,22 @@ impl PartitionManager {
 
                 if let Some(p) = existing {
                     if !p.is_assigned_to(executor_id) {
-                        p.assign_to(executor_id.to_string(), now_ms);
-                        changes = true;
+                        if p.is_assigned() {
+                            // Partition is already assigned to another executor.
+                            // Do not add a second executor — this would cause
+                            // duplicate or inconsistent query results.
+                            tracing::warn!(
+                                "Partition {:?} in table {} is already assigned to {:?}; \
+                                 skipping re-assignment to {}",
+                                partition_value,
+                                table,
+                                p.assigned_executors,
+                                executor_id,
+                            );
+                        } else {
+                            p.assign_to(executor_id.to_string(), now_ms);
+                            changes = true;
+                        }
                     }
                 } else {
                     let mut new_partition = PartitionMetadata::new(partition_value.clone());
@@ -417,4 +431,70 @@ fn now_ms() -> Result<u128> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .context(SystemTimeSnafu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn test_add_and_assign_partitions_no_double_assignment() {
+        let store = Arc::new(InMemory::new());
+        let manager = PartitionManager::new(store);
+        let table = TableReference::bare("test_table");
+
+        manager.initialize_blank_metadata(&table).await.unwrap();
+
+        // First assignment: partition → executor_A
+        let pv: PartitionValue = [("key".to_string(), "0".to_string())].into_iter().collect();
+        manager
+            .add_and_assign_partitions(&table, &[(&pv, "executor_A")])
+            .await
+            .unwrap();
+
+        let meta = manager.get_table_metadata(&table).await.unwrap().unwrap();
+        assert_eq!(meta.partitions.len(), 1);
+        assert_eq!(meta.partitions[0].assigned_executors, vec!["executor_A"]);
+
+        // Second assignment: same partition → executor_B should be SKIPPED
+        manager
+            .add_and_assign_partitions(&table, &[(&pv, "executor_B")])
+            .await
+            .unwrap();
+
+        let meta = manager.get_table_metadata(&table).await.unwrap().unwrap();
+        assert_eq!(meta.partitions.len(), 1);
+        assert_eq!(
+            meta.partitions[0].assigned_executors,
+            vec!["executor_A"],
+            "Partition should remain assigned only to executor_A, not double-assigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_and_assign_partitions_unassigned_gets_assigned() {
+        let store = Arc::new(InMemory::new());
+        let manager = PartitionManager::new(store);
+        let table = TableReference::bare("test_table");
+
+        manager.initialize_blank_metadata(&table).await.unwrap();
+
+        // Create an unassigned partition via set_unassigned_partitions
+        let pv_map: HashMap<String, String> =
+            [("key".to_string(), "0".to_string())].into_iter().collect();
+        manager
+            .set_unassigned_partitions(&table, vec![pv_map.clone()], vec![])
+            .await
+            .unwrap();
+
+        // Now assign it
+        manager
+            .add_and_assign_partitions(&table, &[(&pv_map, "executor_A")])
+            .await
+            .unwrap();
+
+        let meta = manager.get_table_metadata(&table).await.unwrap().unwrap();
+        assert_eq!(meta.partitions[0].assigned_executors, vec!["executor_A"]);
+    }
 }

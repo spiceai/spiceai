@@ -238,6 +238,17 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     let partition_manager = executor_registry.federated_partition_manager();
 
+    // Build a lookup from known partition values to their assigned executor.
+    // This is used as a fallback when the physical filter fails to match rows
+    // for an already-assigned partition (e.g. due to schema/type mismatch).
+    // Uses a Vec because PartitionValue (HashMap) does not implement Hash.
+    let mut partition_executor_map: Vec<(PartitionValue, ExecutorId)> = Vec::new();
+    for pm in &table_partitions.partitions {
+        if let Some(executor_id) = pm.assigned_executors.first() {
+            partition_executor_map.push((pm.partition_value.clone(), executor_id.clone()));
+        }
+    }
+
     // Decode and route the first message.
     let dictionaries_by_id = Arc::new(HashMap::new());
     let mut routing_error: Option<Error> = None;
@@ -252,6 +263,7 @@ pub(crate) async fn forward_federated_partitioned_write(
             &partition_phys_exprs,
             raw_partition_by,
             &mut partitions_by_executor,
+            &mut partition_executor_map,
             &partition_manager,
             path,
         )
@@ -277,6 +289,7 @@ pub(crate) async fn forward_federated_partitioned_write(
                     &partition_phys_exprs,
                     raw_partition_by,
                     &mut partitions_by_executor,
+                    &mut partition_executor_map,
                     &partition_manager,
                     path,
                 )
@@ -338,6 +351,8 @@ async fn route_batch_and_assign_unseen(
     partition_expr_keys: &[String],
     // For each executor, the PartitionValue boolean expressions it currently has.
     partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
+    // Lookup from known partition values to their assigned executor (fallback for filter mismatches).
+    partition_executor_map: &mut Vec<(PartitionValue, ExecutorId)>,
     partition_manager: &Arc<PartitionManager>,
     path: &TableReference,
 ) -> Result<()> {
@@ -382,84 +397,150 @@ async fn route_batch_and_assign_unseen(
         return Ok(());
     }
 
-    // Assign an executor for each new partition value up front.
-    let executor_ids =
-        select_least_loaded_executors(partitions_by_executor, senders, entries.len())?;
+    // Split entries into already-assigned (filter mismatch fallback) vs truly new.
+    let mut already_assigned: Vec<(Vec<ScalarValue>, PartitionValue, RecordBatch, ExecutorId)> =
+        Vec::new();
+    let mut truly_new: Vec<(Vec<ScalarValue>, PartitionValue, RecordBatch)> = Vec::new();
 
-    // Persist all assignments in a single OCC write.
-    let assignments: Vec<(&PartitionValue, &str)> = entries
-        .iter()
-        .zip(executor_ids.iter())
-        .map(|((_, pv, _), eid)| (pv, eid.as_str()))
-        .collect();
-
-    partition_manager
-        .add_and_assign_partitions(path, &assignments)
-        .await
-        .map_err(|source| Error::PersistAssignment {
-            source: Box::new(source),
-        })?;
-
-    // Update in-memory filters and forward rows for each partition.
-    for ((scalar_values, _partition_value, sub_batch), executor_id) in
-        entries.into_iter().zip(executor_ids.into_iter())
-    {
-        tracing::debug!(
-            table = %path,
-            executor = %executor_id,
-            "Assigned new partition and forwarding rows"
-        );
-
-        // Update in-memory filters so subsequent batches route via the fast matched path
-        // instead of re-entering the expensive unmatched → repartition → assign path.
+    for (scalar_values, partition_value, sub_batch) in entries {
+        if let Some((_, existing_executor)) = partition_executor_map
+            .iter()
+            .find(|(pv, _)| *pv == partition_value)
         {
-            let new_pred = partition_phys_exprs
-                .iter()
-                .zip(scalar_values.iter())
-                .map(|((logical_expr, _), scalar)| logical_expr.clone().eq(lit(scalar.clone())))
-                .reduce(Expr::and);
-
-            if let Some(new_pred) = new_pred {
-                partitions_by_executor
-                    .entry(executor_id.clone())
-                    .or_default()
-                    .push(new_pred);
-
-                // Rebuild physical filter for this executor from its full predicate list.
-                let df_schema = DFSchema::try_from(batch.schema().as_ref().clone())
-                    .context(CreateDFSchemaSnafu)?;
-                let combined = partitions_by_executor[&executor_id]
-                    .iter()
-                    .cloned()
-                    .reduce(Expr::or)
-                    .ok_or(Error::EmptyPartitionExprs {
-                        executor_id: executor_id.clone(),
-                    })?;
-                let physical = datafusion::physical_expr::create_physical_expr(
-                    &combined,
-                    &df_schema,
-                    &ExecutionProps::new(),
-                )
-                .context(CreatePhysicalFilterSnafu {
-                    executor_id: executor_id.clone(),
-                })?;
-
-                if let Some(entry) = executor_filters
-                    .iter_mut()
-                    .find(|(id, _)| *id == executor_id)
-                {
-                    entry.1 = physical;
-                } else {
-                    executor_filters.push((executor_id.clone(), physical));
-                }
-            }
+            tracing::warn!(
+                table = %path,
+                executor = %existing_executor,
+                ?partition_value,
+                "Partition fell through physical filter but is already assigned; \
+                 routing to existing executor (possible schema/type mismatch in filter)"
+            );
+            already_assigned.push((
+                scalar_values,
+                partition_value,
+                sub_batch,
+                existing_executor.clone(),
+            ));
+        } else {
+            truly_new.push((scalar_values, partition_value, sub_batch));
         }
+    }
 
-        // Forward the rows.
+    // Route already-assigned partitions to their existing executors.
+    for (scalar_values, _partition_value, sub_batch, executor_id) in already_assigned {
+        update_in_memory_filters(
+            &scalar_values,
+            &executor_id,
+            partition_phys_exprs,
+            &batch.schema(),
+            partitions_by_executor,
+            executor_filters,
+        )?;
+
         if let Some(tx) = senders.get(&executor_id) {
             tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
                 executor_id: executor_id.clone(),
             })?;
+        }
+    }
+
+    // Assign executors for truly new partition values.
+    if !truly_new.is_empty() {
+        let executor_ids =
+            select_least_loaded_executors(partitions_by_executor, senders, truly_new.len())?;
+
+        // Persist all assignments in a single OCC write.
+        let assignments: Vec<(&PartitionValue, &str)> = truly_new
+            .iter()
+            .zip(executor_ids.iter())
+            .map(|((_, pv, _), eid)| (pv, eid.as_str()))
+            .collect();
+
+        partition_manager
+            .add_and_assign_partitions(path, &assignments)
+            .await
+            .map_err(|source| Error::PersistAssignment {
+                source: Box::new(source),
+            })?;
+
+        // Update in-memory state and forward rows.
+        for ((scalar_values, partition_value, sub_batch), executor_id) in
+            truly_new.into_iter().zip(executor_ids.into_iter())
+        {
+            tracing::debug!(
+                table = %path,
+                executor = %executor_id,
+                "Assigned new partition and forwarding rows"
+            );
+
+            partition_executor_map.push((partition_value, executor_id.clone()));
+
+            update_in_memory_filters(
+                &scalar_values,
+                &executor_id,
+                partition_phys_exprs,
+                &batch.schema(),
+                partitions_by_executor,
+                executor_filters,
+            )?;
+
+            if let Some(tx) = senders.get(&executor_id) {
+                tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
+                    executor_id: executor_id.clone(),
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Updates the in-memory `partitions_by_executor` and `executor_filters` after
+/// a partition is assigned (or re-routed) to an executor, so that subsequent
+/// batches route via the fast matched path.
+fn update_in_memory_filters(
+    scalar_values: &[ScalarValue],
+    executor_id: &str,
+    partition_phys_exprs: &[(Expr, Arc<dyn datafusion::physical_plan::PhysicalExpr>)],
+    schema: &SchemaRef,
+    partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
+    executor_filters: &mut Vec<ExecutorFilter>,
+) -> Result<()> {
+    let new_pred = partition_phys_exprs
+        .iter()
+        .zip(scalar_values.iter())
+        .map(|((logical_expr, _), scalar)| logical_expr.clone().eq(lit(scalar.clone())))
+        .reduce(Expr::and);
+
+    if let Some(new_pred) = new_pred {
+        partitions_by_executor
+            .entry(executor_id.to_string())
+            .or_default()
+            .push(new_pred);
+
+        let df_schema = DFSchema::try_from(schema.as_ref().clone()).context(CreateDFSchemaSnafu)?;
+        let combined = partitions_by_executor[executor_id]
+            .iter()
+            .cloned()
+            .reduce(Expr::or)
+            .ok_or(Error::EmptyPartitionExprs {
+                executor_id: executor_id.to_string(),
+            })?;
+        let physical = datafusion::physical_expr::create_physical_expr(
+            &combined,
+            &df_schema,
+            &ExecutionProps::new(),
+        )
+        .context(CreatePhysicalFilterSnafu {
+            executor_id: executor_id.to_string(),
+        })?;
+
+        if let Some(entry) = executor_filters
+            .iter_mut()
+            .find(|(id, _)| *id == executor_id)
+        {
+            entry.1 = physical;
+        } else {
+            executor_filters.push((executor_id.to_string(), physical));
         }
     }
 
