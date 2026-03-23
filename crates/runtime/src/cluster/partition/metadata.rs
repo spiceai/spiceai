@@ -125,16 +125,11 @@ pub struct TablePartitionMetadata {
 
 impl TablePartitionMetadata {
     #[must_use]
-    pub fn new(
-        table_name: String,
-        schema_version: u32,
-        updated_at: u128,
-        partition_expressions: Vec<String>,
-    ) -> Self {
+    pub fn new(table_name: String, updated_at: u128, partition_expressions: Vec<String>) -> Self {
         Self {
             table_name,
             partitions: Vec::new(),
-            schema_version,
+            schema_version: 1,
             updated_at,
             partition_expressions: Vec::new(),
         }
