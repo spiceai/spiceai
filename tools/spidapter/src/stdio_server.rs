@@ -16,10 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use tokio::process::{Child, Command as TokioCommand};
 
 use arrow::datatypes::DataType;
