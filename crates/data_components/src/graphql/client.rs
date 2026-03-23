@@ -802,7 +802,9 @@ impl GraphQLClient {
             // When no token is available but a username is provided, use Basic auth
             // regardless of whether a custom auth header was configured
             (Some(_), None, Some(user), pass) => {
-                tracing::warn!("'graphql_auth_header' is configured but 'graphql_auth_token' is not set; falling back to Basic auth");
+                tracing::warn!(
+                    "'graphql_auth_header' is configured but 'graphql_auth_token' is not set; falling back to Basic auth"
+                );
                 Some(Auth::Basic(user, pass))
             }
             (_, None, Some(user), pass) => Some(Auth::Basic(user, pass)),
