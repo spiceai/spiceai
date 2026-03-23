@@ -22,7 +22,7 @@ limitations under the License.
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::dataconnector::adbc::{build_db_options, dialect_for_driver};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
-use adbc_core::options::{AdbcVersion, OptionDatabase};
+use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
