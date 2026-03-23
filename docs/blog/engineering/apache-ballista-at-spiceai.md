@@ -89,15 +89,15 @@ Alternatives like `datafusion-distributed` use a fully in-memory model—faster 
 
 Ballista provides production infrastructure that would take months to build from scratch:
 
-| Component            | What Ballista Provides                                       |
-| -------------------- | ------------------------------------------------------------ |
-| **Scheduler**        | Query planning, task management, execution coordination      |
-| **Executor**         | Worker pool management, resource tracking                    |
-| **Shuffle Service**  | Disk-based intermediate data, stage retry                    |
-| **Arrow Flight RPC** | Efficient data transport between nodes                       |
-| **Work Queue**       | Dynamic executor pool resizing during query execution        |
-| **Metrics**          | Task-level execution metrics                                 |
-| **PySpark Client**   | Python client compatibility for data science workflows       |
+| Component            | What Ballista Provides                                  |
+| -------------------- | ------------------------------------------------------- |
+| **Scheduler**        | Query planning, task management, execution coordination |
+| **Executor**         | Worker pool management, resource tracking               |
+| **Shuffle Service**  | Disk-based intermediate data, stage retry               |
+| **Arrow Flight RPC** | Efficient data transport between nodes                  |
+| **Work Queue**       | Dynamic executor pool resizing during query execution   |
+| **Metrics**          | Task-level execution metrics                            |
+| **PySpark Client**   | Python client compatibility for data science workflows  |
 
 Building equivalent infrastructure in-house was estimated at 6-12+ months of engineering effort—time better spent on Spice's differentiating features like acceleration, search, and inference.
 
@@ -127,12 +127,12 @@ spiced --scheduler-address scheduler.cluster.local:50052 \
 
 Spice uses a two-port architecture to separate public and internal traffic:
 
-| Port  | Visibility | Services                                                     | Security            |
-| ----- | ---------- | ------------------------------------------------------------ | ------------------- |
-| 50051 | Public     | Arrow Flight (user queries), OpenTelemetry                   | Optional user TLS   |
-| 8090  | Public     | HTTP REST API (queries, health, status)                      | Optional user TLS   |
-| 50052 | Internal   | Ballista `SchedulerGrpcServer`, Spice `ClusterService`       | **mTLS required**   |
-| 9090  | Public     | Prometheus metrics                                           | None                |
+| Port  | Visibility | Services                                               | Security          |
+| ----- | ---------- | ------------------------------------------------------ | ----------------- |
+| 50051 | Public     | Arrow Flight (user queries), OpenTelemetry             | Optional user TLS |
+| 8090  | Public     | HTTP REST API (queries, health, status)                | Optional user TLS |
+| 50052 | Internal   | Ballista `SchedulerGrpcServer`, Spice `ClusterService` | **mTLS required** |
+| 9090  | Public     | Prometheus metrics                                     | None              |
 
 Users submit queries through the public ports (50051, 8090) exactly as they would with a single-node Spice deployment. The scheduler transparently distributes execution across executors.
 
@@ -414,10 +414,10 @@ On the client side, `RemoteTableProvider` and `RemoteScalarUDF` act as stubs tha
 
 This architecture is phased:
 
-| Phase   | Capability                      | How                                     |
-| ------- | ------------------------------- | --------------------------------------- |
-| Phase 1 | SQL (current)                   | Scheduler does all planning             |
-| Phase 2 | DataFrame API, Substrait        | Remote catalog enables client-side planning |
+| Phase   | Capability               | How                                         |
+| ------- | ------------------------ | ------------------------------------------- |
+| Phase 1 | SQL (current)            | Scheduler does all planning                 |
+| Phase 2 | DataFrame API, Substrait | Remote catalog enables client-side planning |
 
 ## High Availability Design
 
