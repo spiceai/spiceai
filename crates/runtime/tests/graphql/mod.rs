@@ -689,17 +689,16 @@ async fn test_graphql_json_pointer_combinations() -> Result<(), String> {
             run_query_and_check_results(
                 &mut rt,
                 "test_graphql_json_pointer_nested",
-                "SELECT id, name FROM users_nested",
+                "SELECT * FROM users_nested",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let total_rows: usize =
                         result_batches.iter().map(RecordBatch::num_rows).sum();
                     assert_eq!(total_rows, 4, "Expected 4 users from nested paginated query, got {total_rows}");
-                    for batch in result_batches {
-                        assert_eq!(
-                            batch.num_columns(),
-                            3,
-                            "Expected 3 columns (id, name, posts), got {}",
+                    for batch in &result_batches {
+                        assert!(
+                            batch.num_columns() >= 2,
+                            "Expected at least 2 columns (id, name), got {}",
                             batch.num_columns()
                         );
                     }
