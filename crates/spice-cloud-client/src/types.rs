@@ -312,11 +312,18 @@ pub struct IngestionMetrics {
     pub bytes_ingested: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClusterMetrics {
+    pub active_executors_count: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MetricsResponse {
     pub metrics: BTreeMap<String, PodMetrics>,
     #[serde(default)]
     pub ingestion: Option<IngestionMetrics>,
+    #[serde(default)]
+    pub cluster: Option<ClusterMetrics>,
 }
 
 // ============================================================================
