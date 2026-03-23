@@ -30,15 +30,19 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+
+use datafusion::physical_expr::PhysicalExpr;
 
 use data_components::flightsql::FlightSqlExec;
 
@@ -100,7 +104,13 @@ fn try_rewrite_partial_aggregate(
 
     let child = skip_repartition_roundrobin(agg.input());
 
-    let flight_execs = collect_flight_execs(child);
+    // Check for an intermediate ProjectionExec (inserted by CSE) between the
+    // aggregate and the scan. If present, build a substitution map so that
+    // synthetic columns like `__common_expr_1` can be inlined back to their
+    // original expressions during SQL generation.
+    let (scan_child, column_substitutions) = skip_projection(child);
+
+    let flight_execs = collect_flight_execs(scan_child);
     let Some(flight_execs) = flight_execs else {
         return Ok(Transformed::no(plan));
     };
@@ -108,12 +118,14 @@ fn try_rewrite_partial_aggregate(
         return Ok(Transformed::no(plan));
     }
 
-    // Build the output schema: group-by fields + aggregate state fields
-    let output_schema = Arc::new(build_output_schema(agg)?);
+    // Build the output schema: must match AggregateExec(Partial)'s output exactly
+    let output_schema = build_output_schema(agg);
 
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(flight_execs.len());
     for flight in &flight_execs {
-        let Some(new_exec) = build_pushdown_exec(agg, flight, &output_schema)? else {
+        let Some(new_exec) =
+            build_pushdown_exec(agg, flight, &output_schema, &column_substitutions)?
+        else {
             return Ok(Transformed::no(plan));
         };
         new_children.push(new_exec);
@@ -164,6 +176,27 @@ fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Execut
     plan
 }
 
+/// Skip through a `ProjectionExec` if present, returning a column substitution
+/// map that maps each output column index to the projection's source expression.
+///
+/// DataFusion's common subexpression elimination (CSE) can insert a
+/// `ProjectionExec` between `AggregateExec(Partial)` and the scan to
+/// pre-compute shared sub-expressions (e.g. `l_extendedprice * (1 - l_discount)`
+/// → `__common_expr_1`). The aggregate then references these synthetic columns.
+///
+/// The substitution map allows SQL generation to inline such synthetic columns
+/// back to the original expressions over the scan schema.
+fn skip_projection(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> (&Arc<dyn ExecutionPlan>, Vec<Arc<dyn PhysicalExpr>>) {
+    if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+        let substitutions: Vec<Arc<dyn PhysicalExpr>> =
+            proj.expr().iter().map(|pe| Arc::clone(&pe.expr)).collect();
+        return (proj.input(), substitutions);
+    }
+    (plan, Vec::new())
+}
+
 /// Collect `FlightSqlExec` references from a `UnionExec` or a single node.
 ///
 /// Walks through known pass-through nodes (`CooperativeExec`, `BytesProcessedExec`)
@@ -183,8 +216,16 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 
 /// Walk through single-input pass-through nodes to find a `FlightSqlExec`.
 ///
-/// Returns `None` if the chain contains a multi-input node, `FilterExec`,
-/// or terminates at a non-`FlightSqlExec`.
+/// Recognised pass-through nodes (single input, no semantic change for pushdown):
+/// - `FilterExec` — the underlying `FlightSqlExec` already carries the filter in
+///   its SQL; the `FilterExec` is a redundant safety layer added by DataFusion.
+/// - `RepartitionExec` — only shuffles partitions, no data change.
+/// - Name-identified nodes in [`PASS_THROUGH_EXEC_NAMES`] (`CooperativeExec`,
+///   `BytesProcessedExec`) — defined in upstream crates, not available for
+///   downcasting.
+///
+/// Returns `None` if the chain contains a multi-input node or an unrecognised
+/// node, or terminates at a non-`FlightSqlExec`.
 fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> {
     let mut current: &Arc<dyn ExecutionPlan> = plan;
     loop {
@@ -197,7 +238,10 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
             return None;
         }
 
-        if PASS_THROUGH_EXEC_NAMES.contains(&current.name()) {
+        if current.as_any().downcast_ref::<FilterExec>().is_some()
+            || current.as_any().downcast_ref::<RepartitionExec>().is_some()
+            || PASS_THROUGH_EXEC_NAMES.contains(&current.name())
+        {
             current = children[0];
         } else {
             return None;
@@ -211,14 +255,16 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
 fn build_pushdown_exec(
     agg: &AggregateExec,
     flight: &FlightSqlExec,
-    output_schema: &Arc<Schema>,
+    output_schema: &SchemaRef,
+    column_substitutions: &[Arc<dyn PhysicalExpr>],
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let exec = PartialAggregationFlightSqlExec::new(
         flight,
         agg.group_expr().clone(),
         agg.aggr_expr().to_vec(),
         flight.schema(),
-        Arc::new(output_schema.as_ref().clone()),
+        Arc::clone(output_schema),
+        column_substitutions.to_vec(),
     );
 
     // Validate that SQL can be built (fail fast during optimization, not at execution)
@@ -230,31 +276,16 @@ fn build_pushdown_exec(
 }
 
 /// Build the output schema for the pushdown.
-/// Matches `AggregateExec(Partial)` output: `[group_keys..., state_fields...]`.
-fn build_output_schema(agg: &AggregateExec) -> Result<Schema> {
-    let input_schema = agg.input().schema();
-    let mut fields: Vec<Field> = Vec::new();
-
-    for (expr, name) in agg.group_expr().expr() {
-        let dt = expr.data_type(&input_schema)?;
-        let nullable = expr.nullable(&input_schema)?;
-        fields.push(Field::new(name, dt, nullable));
-    }
-
-    for aggr in agg.aggr_expr() {
-        for state_field in aggr.state_fields()? {
-            fields.push(state_field.as_ref().clone());
-        }
-    }
-
-    Ok(Schema::new(fields))
+/// Uses the `AggregateExec(Partial)`'s own output schema, which is the exact
+/// schema that the parent `AggregateExec(FinalPartitioned)` expects.
+/// This preserves field names and types so the schema-check validation passes.
+fn build_output_schema(agg: &AggregateExec) -> SchemaRef {
+    agg.schema()
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::exec::PartialAggregationFlightSqlExec;
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::config::ConfigOptions;
@@ -263,7 +294,7 @@ mod tests {
     use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion::functions_aggregate::sum::sum_udaf;
-    use datafusion::physical_expr::aggregate::{AggregateFunctionExpr, AggregateExprBuilder};
+    use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
     use datafusion::physical_expr::expressions::{Column, Literal};
     use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
@@ -292,10 +323,8 @@ mod tests {
 
     fn dummy_client() -> data_components::flightsql::FlightSqlClient {
         let channel = Channel::from_static("http://[::1]:1").connect_lazy();
-        let cookie_svc = flight_client::cookie::CookieService::new(
-            channel,
-            Arc::new(CookieStore::new()),
-        );
+        let cookie_svc =
+            flight_client::cookie::CookieService::new(channel, Arc::new(CookieStore::new()));
         FlightSqlServiceClient::new(cookie_svc)
     }
 
@@ -380,13 +409,11 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
         ]);
 
-        let sum_expr = AggregateExprBuilder::new(
-            sum_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("sum(l_quantity)")
-        .build()?;
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
         let count_expr = AggregateExprBuilder::new(
             count_udaf(),
             vec![Arc::new(Literal::new(ScalarValue::Int64(Some(1))))],
@@ -404,8 +431,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity"), COUNT(1) FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity"), COUNT(1) FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT(1) AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT(1) AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -419,21 +446,19 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
         ]);
 
-        let sum_expr = AggregateExprBuilder::new(
-            sum_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("sum(l_quantity)")
-        .build()?;
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
 
         let agg = partial_aggregate(union_input, &[], vec![Arc::new(sum_expr)])?;
 
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") FROM foo.foo.lineitem
-          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") FROM foo.foo.lineitem
+          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__c0" FROM foo.foo.lineitem
+          PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__c0" FROM foo.foo.lineitem
         "#);
 
         Ok(())
@@ -447,20 +472,16 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
         ]);
 
-        let min_expr = AggregateExprBuilder::new(
-            min_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("min(l_quantity)")
-        .build()?;
-        let max_expr = AggregateExprBuilder::new(
-            max_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("max(l_quantity)")
-        .build()?;
+        let min_expr =
+            AggregateExprBuilder::new(min_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("min(l_quantity)")
+                .build()?;
+        let max_expr =
+            AggregateExprBuilder::new(max_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("max(l_quantity)")
+                .build()?;
 
         let agg = partial_aggregate(
             union_input,
@@ -471,8 +492,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", MIN("l_quantity"), MAX("l_quantity") FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", MIN("l_quantity"), MAX("l_quantity") FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", MIN("l_quantity") AS "__c1", MAX("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", MIN("l_quantity") AS "__c1", MAX("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -486,13 +507,11 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
         ]);
 
-        let avg_expr = AggregateExprBuilder::new(
-            avg_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("avg(l_quantity)")
-        .build()?;
+        let avg_expr =
+            AggregateExprBuilder::new(avg_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("avg(l_quantity)")
+                .build()?;
 
         let agg = partial_aggregate(
             union_input,
@@ -503,8 +522,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(CAST("l_quantity" AS DOUBLE)), COUNT("l_quantity") FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(CAST("l_quantity" AS DOUBLE)), COUNT("l_quantity") FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1", COUNT("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -515,19 +534,16 @@ mod tests {
         let schema = lineitem_schema();
         let flight = make_flight_exec(&schema, "foo.foo.lineitem", &[]);
 
-        let sum_expr = AggregateExprBuilder::new(
-            sum_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("sum(l_quantity)")
-        .build()?;
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
 
         let agg = partial_aggregate(flight, &[(3, "l_returnflag")], vec![Arc::new(sum_expr)])?;
 
         let optimized = optimize(agg)?;
-        insta::assert_snapshot!(plan_display(&optimized), @"PartialAggregationFlightSqlExec sql=SELECT \"l_returnflag\", SUM(\"l_quantity\") FROM foo.foo.lineitem GROUP BY \"l_returnflag\"
-");
+        insta::assert_snapshot!(plan_display(&optimized), @r#"PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1" FROM foo.foo.lineitem GROUP BY "l_returnflag""#);
 
         Ok(())
     }
@@ -542,13 +558,11 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[filter]),
         ]);
 
-        let sum_expr = AggregateExprBuilder::new(
-            sum_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("sum(l_quantity)")
-        .build()?;
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
 
         let agg = partial_aggregate(
             union_input,
@@ -559,8 +573,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", SUM("l_quantity") AS "__c1" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -574,13 +588,11 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
         ]);
 
-        let sum_expr = AggregateExprBuilder::new(
-            sum_udaf(),
-            vec![Arc::new(Column::new("l_quantity", 0))],
-        )
-        .schema(Arc::clone(&schema))
-        .alias("sum(l_quantity)")
-        .build()?;
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
 
         let agg = partial_aggregate(
             union_input,
@@ -591,8 +603,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", "l_linestatus", SUM("l_quantity") FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", "l_linestatus", SUM("l_quantity") FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", "l_linestatus" AS "__c1", SUM("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag" AS "__c0", "l_linestatus" AS "__c1", SUM("l_quantity") AS "__c2" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
         "#);
 
         Ok(())
@@ -615,7 +627,10 @@ mod tests {
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             );
-            Self { schema, properties: props }
+            Self {
+                schema,
+                properties: props,
+            }
         }
     }
 
@@ -626,13 +641,30 @@ mod tests {
     }
 
     impl ExecutionPlan for MockNonFlightExec {
-        fn name(&self) -> &'static str { "MockNonFlightExec" }
-        fn as_any(&self) -> &dyn Any { self }
-        fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
-        fn properties(&self) -> &PlanProperties { &self.properties }
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
-        fn with_new_children(self: Arc<Self>, _: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> { Ok(self) }
-        fn execute(&self, _: usize, _: Arc<TaskContext>) -> Result<SendableRecordBatchStream> { unimplemented!() }
+        fn name(&self) -> &'static str {
+            "MockNonFlightExec"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn properties(&self) -> &PlanProperties {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(&self, _: usize, _: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
     }
 
     /// Assert that the optimizer does not change the plan.
@@ -646,10 +678,16 @@ mod tests {
     async fn test_no_pushdown_non_flightsql_child() -> Result<()> {
         let schema = lineitem_schema();
         let input = make_union(vec![Arc::new(MockNonFlightExec::new(Arc::clone(&schema)))]);
-        assert_no_pushdown(partial_aggregate(input, &[(3, "l_returnflag")], vec![
-            Arc::new(AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
-                .schema(Arc::clone(&schema)).alias("sum").build()?),
-        ])?);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum")
+                    .build()?,
+            )],
+        )?);
         Ok(())
     }
 
@@ -657,10 +695,20 @@ mod tests {
     async fn test_no_pushdown_distinct_aggregate() -> Result<()> {
         let schema = lineitem_schema();
         let input = make_union(vec![make_flight_exec(&schema, "foo.foo.lineitem", &[])]);
-        assert_no_pushdown(partial_aggregate(input, &[(3, "l_returnflag")], vec![
-            Arc::new(AggregateExprBuilder::new(count_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
-                .schema(Arc::clone(&schema)).alias("cd").distinct().build()?),
-        ])?);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(
+                    count_udaf(),
+                    vec![Arc::new(Column::new("l_quantity", 0))],
+                )
+                .schema(Arc::clone(&schema))
+                .alias("cd")
+                .distinct()
+                .build()?,
+            )],
+        )?);
         Ok(())
     }
 
@@ -668,14 +716,22 @@ mod tests {
     async fn test_no_pushdown_final_mode() -> Result<()> {
         let schema = lineitem_schema();
         let input = make_union(vec![make_flight_exec(&schema, "foo.foo.lineitem", &[])]);
-        let group_by = PhysicalGroupBy::new_single(vec![
-            (Arc::new(Column::new("l_returnflag", 3)) as _, "l_returnflag".to_string()),
-        ]);
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("l_returnflag", 3)) as _,
+            "l_returnflag".to_string(),
+        )]);
         let agg: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
-            AggregateMode::FinalPartitioned, group_by,
-            vec![Arc::new(AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
-                .schema(Arc::clone(&schema)).alias("sum").build()?)],
-            vec![None], input, schema,
+            AggregateMode::FinalPartitioned,
+            group_by,
+            vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum")
+                    .build()?,
+            )],
+            vec![None],
+            input,
+            schema,
         )?);
         assert_no_pushdown(agg);
         Ok(())
@@ -688,10 +744,16 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
             Arc::new(MockNonFlightExec::new(Arc::clone(&schema))),
         ]);
-        assert_no_pushdown(partial_aggregate(input, &[(3, "l_returnflag")], vec![
-            Arc::new(AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
-                .schema(Arc::clone(&schema)).alias("sum").build()?),
-        ])?);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum")
+                    .build()?,
+            )],
+        )?);
         Ok(())
     }
 }
