@@ -125,7 +125,12 @@ pub struct TablePartitionMetadata {
 
 impl TablePartitionMetadata {
     #[must_use]
-    pub fn new(table_name: String, schema_version: u32, updated_at: u128) -> Self {
+    pub fn new(
+        table_name: String,
+        schema_version: u32,
+        updated_at: u128,
+        partition_expressions: Vec<String>,
+    ) -> Self {
         Self {
             table_name,
             partitions: Vec::new(),
@@ -133,11 +138,6 @@ impl TablePartitionMetadata {
             updated_at,
             partition_expressions: Vec::new(),
         }
-    }
-
-    #[must_use]
-    pub fn blank(table_name: String, now_ms: u128) -> Self {
-        Self::new(table_name, 1, now_ms)
     }
 
     pub fn add_partition(&mut self, partition: PartitionMetadata) {
