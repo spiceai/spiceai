@@ -49,6 +49,7 @@ use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchRecei
 pub enum Auth {
     Basic(String, Option<String>),
     Bearer(Arc<dyn TokenProvider>),
+    CustomHeader(reqwest::header::HeaderName, Arc<dyn TokenProvider>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -782,6 +783,7 @@ impl GraphQLClient {
         rate_limiter: Option<Arc<dyn RateLimiter>>,
         rate_controller: Option<Arc<RateController>>,
         semaphore: Option<Arc<Semaphore>>,
+        auth_header: Option<reqwest::header::HeaderName>,
     ) -> Result<Self> {
         // Validate unnest depth to prevent excessive recursion
         if let UnnestBehavior::Depth(depth) = &unnest_behavior
@@ -792,9 +794,10 @@ impl GraphQLClient {
             });
         }
 
-        let auth = match (token, user, pass) {
-            (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
-            (Some(token), _, _) => Some(Auth::Bearer(token)),
+        let auth = match (auth_header, token, user, pass) {
+            (Some(header_name), Some(token), _, _) => Some(Auth::CustomHeader(header_name, token)),
+            (None, None, Some(user), pass) => Some(Auth::Basic(user, pass)),
+            (None, Some(token), _, _) => Some(Auth::Bearer(token)),
             _ => None,
         };
 
@@ -1282,6 +1285,9 @@ fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> Re
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
         Some(Auth::Bearer(token_provider)) => {
             request_builder.bearer_auth(token_provider.get_token())
+        }
+        Some(Auth::CustomHeader(header_name, token_provider)) => {
+            request_builder.header(header_name.clone(), token_provider.get_token())
         }
         _ => request_builder,
     }

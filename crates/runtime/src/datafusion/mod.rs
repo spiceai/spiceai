@@ -1198,15 +1198,16 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
-        // Invalidate cached query state for this table.
-        // Both results and logical plans can become stale after a write:
-        // - results cache may otherwise replay pre-write answers
-        // - plans cache may hold stale `Arc<dyn TableProvider>` references
-        //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
-        //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        // Invalidate any cached logical plans that reference this table.
+        // Cached plans hold stale `Arc<dyn TableProvider>` references; after a
+        // write the underlying provider's in-memory state (e.g. Cayenne's
+        // protected snapshots and deletion caches) has changed, so plans must be
+        // re-resolved to pick up the new state.
+        if let Some(cache) = self.plans_cache_provider()
+            && let Err(e) = cache.invalidate_for_table(table_reference.clone())
+        {
             tracing::warn!(
-                "Failed to invalidate caches for table {table_reference} after write: {e}"
+                "Failed to invalidate plans cache for table {table_reference} after write: {e}"
             );
         }
 
@@ -1263,15 +1264,16 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
-        // Invalidate cached query state for this table.
-        // Both results and logical plans can become stale after a write:
-        // - results cache may otherwise replay pre-write answers
-        // - plans cache may hold stale `Arc<dyn TableProvider>` references
-        //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
-        //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        // Invalidate any cached logical plans that reference this table.
+        // Cached plans hold stale `Arc<dyn TableProvider>` references; after a
+        // write the underlying provider's in-memory state (e.g. Cayenne's
+        // protected snapshots and deletion caches) has changed, so plans must be
+        // re-resolved to pick up the new state.
+        if let Some(cache) = self.plans_cache_provider()
+            && let Err(e) = cache.invalidate_for_table(table_reference.clone())
+        {
             tracing::warn!(
-                "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
+                "Failed to invalidate plans cache for table {table_reference} after streaming write: {e}"
             );
         }
 

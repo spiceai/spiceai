@@ -52,6 +52,8 @@ impl GraphQLFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
+    ParameterSpec::component("auth_header")
+        .description("A custom header name to use for authentication instead of the default 'Authorization: Bearer' header. When set, the value of 'auth_token' is sent as the value of this header."),
     ParameterSpec::component("auth_token")
         .description("The bearer token to use in the GraphQL requests.")
         .secret(),
@@ -103,6 +105,23 @@ impl GraphQL {
         let token = self.params.get("auth_token").ok().map(|token| {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
+
+        let auth_header = self
+            .params
+            .get("auth_header")
+            .expose()
+            .ok()
+            .map(|h| {
+                reqwest::header::HeaderName::try_from(h).map_err(|source| {
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: "graphql".to_string(),
+                        message: format!("Invalid 'auth_header' value: '{h}'. Ensure it is a valid HTTP header name. For details, visit: https://spiceai.org/docs/components/data-connectors/graphql"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: source.into(),
+                    }
+                })
+            })
+            .transpose()?;
 
         let user = self
             .params
@@ -163,6 +182,7 @@ impl GraphQL {
             None,
             None,
             None,
+            auth_header,
         )
         .boxed()
         .map_err(|source| DataConnectorError::InternalWithSource {
