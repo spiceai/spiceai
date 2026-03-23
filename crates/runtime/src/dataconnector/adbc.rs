@@ -305,7 +305,7 @@ impl DataConnectorFactory for AdbcFactory {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
-pub fn build_db_options(
+pub(crate) fn build_db_options(
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
@@ -371,7 +371,7 @@ fn build_conn_options(
 
     if opts.is_empty() { None } else { Some(opts) }
 }
-pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         "bigquery" => Some(Arc::new(BigQueryDialect::new())),
         _ => None,
