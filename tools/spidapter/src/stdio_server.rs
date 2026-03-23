@@ -681,18 +681,21 @@ async fn provision_spice_cloud_app(
     )
     .await?;
 
-    // after the deployment is reported "ready", wait for another 10 seconds (or SPIDAPTER_DEPLOYMENT_READY_WAIT seconds if set)
-    // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
-    let deployment_ready_wait = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+    // Wait for executors to connect before declaring the deployment ready.
+    // Executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
+    let expected_executors: u64 = std::env::var("SPIDAPTER_NUM_EXECUTORS")
         .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10);
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
-    eprintln!(
-        "[stdio] Deployment is ready, waiting an additional {deployment_ready_wait}s for executors to connect..."
+    let executor_wait_timeout = Duration::from_secs(
+        std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120),
     );
 
-    tokio::time::sleep(Duration::from_secs(deployment_ready_wait)).await;
+    wait_for_scp_executor_count(&cloud, app_id, expected_executors, executor_wait_timeout).await;
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
@@ -1232,6 +1235,49 @@ async fn wait_for_local_sql_ready(
             Ok(response) if response.status().is_success() => return Ok(()),
             Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
+    }
+}
+
+/// Polls the Spice Cloud metrics API until the expected number of executors have connected,
+/// or the timeout expires. On timeout, logs a warning and returns (non-fatal).
+async fn wait_for_scp_executor_count(
+    cloud: &CloudClient,
+    app_id: i64,
+    expected_count: u64,
+    timeout: Duration,
+) {
+    eprintln!(
+        "[stdio] Deployment is ready, waiting up to {}s for {expected_count} executor(s) to connect...",
+        timeout.as_secs(),
+    );
+
+    let started = tokio::time::Instant::now();
+
+    loop {
+        if started.elapsed() > timeout {
+            eprintln!(
+                "[stdio] Timed out after {}s waiting for {expected_count} executor(s); proceeding anyway",
+                timeout.as_secs(),
+            );
+            return;
+        }
+
+        match cloud.get_app_metrics(app_id, None).await {
+            Ok(metrics) => {
+                if let Some(cluster) = &metrics.cluster
+                    && let Some(count) = cluster.active_executors_count
+                    && count >= expected_count
+                {
+                    eprintln!("[stdio] {count}/{expected_count} executor(s) connected");
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("[stdio] Metrics poll error (retrying): {e}");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
