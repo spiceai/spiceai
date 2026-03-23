@@ -256,7 +256,14 @@ impl TableProvider for LocationPruningListingTable {
         }
 
         if files.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(self.schema())));
+            // Apply the projection to the schema so that the EmptyExec output
+            // schema matches what the physical planner expects from the scan.
+            let schema = if let Some(proj) = projection {
+                Arc::new(self.schema().project(proj)?)
+            } else {
+                self.schema()
+            };
+            return Ok(Arc::new(EmptyExec::new(schema)));
         }
 
         let file_groups = vec![FileGroup::new(files)];
@@ -326,9 +333,9 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
             Expr::BinaryExpr(binary) => match binary.op {
                 Operator::Eq => {
                     let left_is_location =
-                        matches!(*binary.left, Expr::Column(ref c) if c.name == "location");
+                        matches!(*binary.left, Expr::Column(ref c) if c.name == "_location");
                     let right_is_location =
-                        matches!(*binary.right, Expr::Column(ref c) if c.name == "location");
+                        matches!(*binary.right, Expr::Column(ref c) if c.name == "_location");
 
                     let mut values = Vec::new();
                     if left_is_location && let Some(value) = literal_str(&binary.right) {
@@ -356,7 +363,7 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
                 }
                 _ => (Vec::new(), true),
             },
-            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") => {
+            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "_location") => {
                 if in_list.negated {
                     (Vec::new(), false)
                 } else {
@@ -532,13 +539,45 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
                 extension.unwrap_or(".tsv".to_string()),
             )),
-            (Some("json"), _) | (None, Some("json")) => Ok((
-                Some(self.get_json_format(dataset, params)?),
+            (Some("json"), _) => Ok((
+                Some(self.get_json_format(dataset, params, Format::Json)?),
                 extension.unwrap_or(".json".to_string()),
             )),
-            (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
-                Some(self.get_jsonl_format(dataset, params)?),
-                extension.unwrap_or(".jsonl".to_string()),
+            (None, Some("json")) => Ok((
+                Some(self.get_json_format(dataset, params, Format::Auto)?),
+                extension.unwrap_or(".json".to_string()),
+            )),
+            (Some("jsonl" | "ndjson" | "ldjson"), _) | (None, Some("jsonl" | "ndjson" | "ldjson")) => {
+                // If json_pointer or json_path is set, route through SpiceJsonFormat
+                // so the pointer extraction is applied (DataFusion's JsonFormat doesn't
+                // support json_pointer).
+                let has_pointer = matches!(
+                    params.get("json_pointer").expose(),
+                    ExposedParamLookup::Present(v) if !v.is_empty()
+                ) || matches!(
+                    params.get("json_path").expose(),
+                    ExposedParamLookup::Present(v) if !v.is_empty()
+                );
+                let default_ext = file_extension.as_deref().map_or(".jsonl", |e| match e {
+                    "ndjson" => ".ndjson",
+                    "ldjson" => ".ldjson",
+                    _ => ".jsonl",
+                });
+                if has_pointer {
+                    Ok((
+                        Some(self.get_json_format(dataset, params, Format::Auto)?),
+                        extension.unwrap_or_else(|| default_ext.to_string()),
+                    ))
+                } else {
+                    Ok((
+                        Some(self.get_jsonl_format(dataset, params)?),
+                        extension.unwrap_or_else(|| default_ext.to_string()),
+                    ))
+                }
+            },
+            (Some("soda" | "socrata"), _) => Ok((
+                Some(self.get_json_format(dataset, params, Format::Soda)?),
+                extension.unwrap_or(".json".to_string()),
             )),
             #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
@@ -551,6 +590,54 @@ pub trait ListingTableConnector: DataConnector {
                 )),
                 extension.unwrap_or(".parquet".to_string()),
             )),
+            (Some("auto"), ext) => {
+                match ext {
+                    Some("csv") => Ok((
+                        Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Csv)?),
+                        extension.unwrap_or(".csv".to_string()),
+                    )),
+                    Some("tsv") => Ok((
+                        Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
+                        extension.unwrap_or(".tsv".to_string()),
+                    )),
+                    Some("jsonl" | "ndjson" | "ldjson") => {
+                        let has_pointer = matches!(
+                            params.get("json_pointer").expose(),
+                            ExposedParamLookup::Present(v) if !v.is_empty()
+                        ) || matches!(
+                            params.get("json_path").expose(),
+                            ExposedParamLookup::Present(v) if !v.is_empty()
+                        );
+                        let default_ext = match ext {
+                            Some("ndjson") => ".ndjson",
+                            Some("ldjson") => ".ldjson",
+                            _ => ".jsonl",
+                        };
+                        if has_pointer {
+                            Ok((
+                                Some(self.get_json_format(dataset, params, Format::Auto)?),
+                                extension.unwrap_or_else(|| default_ext.to_string()),
+                            ))
+                        } else {
+                            Ok((
+                                Some(self.get_jsonl_format(dataset, params)?),
+                                extension.unwrap_or_else(|| default_ext.to_string()),
+                            ))
+                        }
+                    },
+                    Some("parquet") => Ok((
+                        Some(Arc::new(
+                            ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
+                        )),
+                        extension.unwrap_or(".parquet".to_string()),
+                    )),
+                    // For .json or unknown/no extension, use JSON with auto sub-format detection
+                    _ => Ok((
+                        Some(self.get_json_format(dataset, params, Format::Auto)?),
+                        extension.unwrap_or_else(|| ext.map_or(".json".to_string(), |e| format!(".{e}"))),
+                    )),
+                }
+            },
             (Some(format), _) => Ok((None, format!(".{format}"))),
             (_, _) => Err(
                     crate::dataconnector::DataConnectorError::InvalidConfiguration {
@@ -610,11 +697,12 @@ pub trait ListingTableConnector: DataConnector {
         &self,
         dataset: &Dataset,
         params: &Parameters,
+        default_format: Format,
     ) -> DataConnectorResult<Arc<SpiceJsonFormat>>
     where
         Self: Display,
     {
-        let mut format = SpiceJsonFormat::default();
+        let mut format = SpiceJsonFormat::default().with_format(default_format);
 
         if let ExposedParamLookup::Present(comp_as_str) =
             params.get("file_compression_type").expose()
@@ -644,16 +732,39 @@ pub trait ListingTableConnector: DataConnector {
             let json_format = json_format_str.parse::<Format>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "Invalid JSON format: {json_format_str}, supported formats are: 'jsonl', 'ndjson', 'array'"),
+                        "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_format(json_format);
+        }
+
+        if let ExposedParamLookup::Present(json_pointer) = params.get("json_pointer").expose() {
+            format = format.with_json_pointer(json_pointer.to_string());
+        } else if let ExposedParamLookup::Present(json_path) = params.get("json_path").expose() {
+            format = format.with_json_pointer(json_path.to_string());
         }
 
         if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose()
             && flatten_json.eq_ignore_ascii_case("true")
         {
             format = format.with_flatten_json(".".to_string());
+        }
+
+        if let ExposedParamLookup::Present(soda_metadata) = params.get("soda_metadata").expose() {
+            format = format.with_soda_metadata(soda_metadata.eq_ignore_ascii_case("enabled"));
+        }
+
+        // Validate: json_pointer is incompatible with file_format=soda.
+        // SODA responses carry their own schema in meta.view.columns and SodaReader
+        // handles data extraction internally — json_pointer cannot be applied.
+        if format.options().format == Format::Soda && format.options().json_pointer.is_some() {
+            return Err(
+                crate::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: "'json_pointer' cannot be used with 'file_format: soda'. SODA format extracts data from the response automatically.".to_string(),
+                },
+            );
         }
 
         Ok(Arc::new(format))
@@ -1925,7 +2036,7 @@ mod tests {
             .expect("register table");
 
         let df = ctx
-            .sql("SELECT value FROM test_table WHERE location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
+            .sql("SELECT value FROM test_table WHERE _location = 's3://bucket/prefix/day=2025-01-01/file.parquet'")
             .await
             .expect("execute query");
 
@@ -2048,7 +2159,7 @@ mod tests {
 
         // Test 1: SELECT with location first (this was failing before the fix)
         let df = ctx
-            .sql("SELECT location, day, compression FROM test_table")
+            .sql("SELECT _location, day, compression FROM test_table")
             .await
             .expect("execute query");
 
@@ -2062,7 +2173,7 @@ mod tests {
         // Verify column order is correct
         assert_eq!(
             result.schema().field(0).name(),
-            "location",
+            "_location",
             "first column should be location"
         );
         assert_eq!(
@@ -2110,7 +2221,7 @@ mod tests {
 
         // Test 2: SELECT with just location and day (was causing panic before fix)
         let df = ctx
-            .sql("SELECT location, day FROM test_table")
+            .sql("SELECT _location, day FROM test_table")
             .await
             .expect("execute query");
 
@@ -2119,7 +2230,7 @@ mod tests {
         assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
         assert_eq!(
             batches[0].schema().field(0).name(),
-            "location",
+            "_location",
             "first column should be location"
         );
         assert_eq!(
@@ -2130,7 +2241,7 @@ mod tests {
 
         // Test 3: SELECT with reversed order (day, location) - should also work
         let df = ctx
-            .sql("SELECT day, location FROM test_table")
+            .sql("SELECT day, _location FROM test_table")
             .await
             .expect("execute query");
 
@@ -2144,7 +2255,7 @@ mod tests {
         );
         assert_eq!(
             batches[0].schema().field(1).name(),
-            "location",
+            "_location",
             "second column should be location"
         );
     }
@@ -2367,7 +2478,7 @@ mod tests {
     fn test_extract_location_predicates_equality() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![col("location").eq(lit("s3://bucket/path/file.parquet"))];
+        let filters = vec![col("_location").eq(lit("s3://bucket/path/file.parquet"))];
         let values = extract_location_predicates(&filters);
         assert_eq!(
             values,
@@ -2379,7 +2490,7 @@ mod tests {
     fn test_extract_location_predicates_in_list() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![col("location").in_list(
+        let filters = vec![col("_location").in_list(
             vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
             false,
         )];
@@ -2398,7 +2509,7 @@ mod tests {
     fn test_extract_location_predicates_reversed_equality() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("location"))];
+        let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("_location"))];
         let values = extract_location_predicates(&filters);
         assert_eq!(
             values,
@@ -2411,10 +2522,10 @@ mod tests {
         use datafusion_expr::{col, lit};
 
         let filters = vec![
-            col("location")
+            col("_location")
                 .eq(lit("s3://bucket/a.parquet"))
                 .and(col("id").gt(lit(1)))
-                .or(col("location").eq(lit("s3://bucket/b.parquet"))),
+                .or(col("_location").eq(lit("s3://bucket/b.parquet"))),
         ];
         let values = extract_location_predicates(&filters);
         assert!(values.is_none(), "Location under OR should disable pruning");
@@ -2425,7 +2536,7 @@ mod tests {
         use datafusion_expr::{col, lit};
 
         let filters = vec![datafusion_expr::not(
-            col("location").eq(lit("s3://bucket/negated.parquet")),
+            col("_location").eq(lit("s3://bucket/negated.parquet")),
         )];
         let values = extract_location_predicates(&filters);
         assert!(
@@ -2441,7 +2552,7 @@ mod tests {
         let filters = vec![
             col("id")
                 .eq(lit(5))
-                .and(col("location").eq(lit("s3://bucket/only_location.parquet"))),
+                .and(col("_location").eq(lit("s3://bucket/only_location.parquet"))),
         ];
         let values = extract_location_predicates(&filters);
         assert_eq!(
@@ -2454,7 +2565,7 @@ mod tests {
     fn test_extract_location_predicates_not_in_list() {
         use datafusion_expr::{col, lit};
 
-        let filters = vec![col("location").in_list(
+        let filters = vec![col("_location").in_list(
             vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
             true,
         )];

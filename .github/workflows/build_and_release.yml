@@ -105,17 +105,17 @@ jobs:
                 runner: linuxRunner,
                 target_os: "linux",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
                 tags: ["default", "odbc"],
                 use_minio: useMinio,
+                is_tagged_release: isTaggedRelease,
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: macosRunner,
                 target_os: "darwin",
                 target_arch: "aarch64",
-                target_arch_go: "arm64",
                 tags: ["default", "metal"],
                 use_minio: false,
+                is_tagged_release: isTaggedRelease,
               }
             ];
 
@@ -126,18 +126,18 @@ jobs:
                 runner: isTaggedRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
                 target_os: "linux",
                 target_arch: "aarch64",
-                target_arch_go: "arm64",
                 tags: ["default"],
                 use_minio: false,
+                is_tagged_release: isTaggedRelease,
               });
               matrix.push({
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
                 tags: ["default"],
                 use_minio: false,
+                is_tagged_release: isTaggedRelease,
               });
             }
 
@@ -230,9 +230,16 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      ## Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
+      # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
+      # Non-release builds include postgres-accel for benchmark testing
       - name: Build spiced and spice CLI
-        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows'
+        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
+
+      # Release builds exclude optional accelerators from the distributed binary
+      - name: Build spiced and spice CLI (release)
+        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && matrix.target.is_tagged_release
         working-directory: bin/spiced
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
 
@@ -396,21 +403,21 @@ jobs:
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
@@ -418,7 +425,7 @@ jobs:
       # macOS metal variant
       - name: download artifacts - spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'darwin'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}

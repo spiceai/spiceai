@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Custom logical plan nodes for Cayenne DDL operations.
+//! Custom logical plan nodes for Cayenne DDL and DML operations.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -24,6 +24,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::DFSchemaRef;
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::sql::TableReference;
 
 /// Creates the shared output schema for DDL result nodes (single `result` column).
 fn ddl_output_schema() -> DFSchemaRef {
@@ -52,27 +53,93 @@ pub struct CayenneCreateTableNode {
     pub df_catalog_name: String,
     /// The `DataFusion` schema name (for registering the table provider).
     pub df_schema_name: String,
+    /// Optional validated partition expression for the new table.
+    pub partition_expr: Option<Expr>,
+    /// Original SQL text for the partition expression, preserved for forwarding.
+    pub partition_expr_sql: Option<String>,
+    /// Primary key column names extracted from SQL constraints.
+    pub primary_key: Vec<String>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
 
 impl CayenneCreateTableNode {
     #[must_use]
-    pub fn new(
+    pub fn builder(
         table_name: String,
         arrow_schema: Arc<Schema>,
-        if_not_exists: bool,
-        or_replace: bool,
         df_catalog_name: String,
         df_schema_name: String,
-    ) -> Self {
-        Self {
+    ) -> CayenneCreateTableNodeBuilder {
+        CayenneCreateTableNodeBuilder {
             table_name,
             arrow_schema,
-            if_not_exists,
-            or_replace,
             df_catalog_name,
             df_schema_name,
+            if_not_exists: false,
+            or_replace: false,
+            partition_expr: None,
+            partition_expr_sql: None,
+            primary_key: Vec::new(),
+        }
+    }
+}
+
+pub struct CayenneCreateTableNodeBuilder {
+    table_name: String,
+    arrow_schema: Arc<Schema>,
+    if_not_exists: bool,
+    or_replace: bool,
+    df_catalog_name: String,
+    df_schema_name: String,
+    partition_expr: Option<Expr>,
+    partition_expr_sql: Option<String>,
+    primary_key: Vec<String>,
+}
+
+impl CayenneCreateTableNodeBuilder {
+    #[must_use]
+    pub fn if_not_exists(mut self, if_not_exists: bool) -> Self {
+        self.if_not_exists = if_not_exists;
+        self
+    }
+
+    #[must_use]
+    pub fn or_replace(mut self, or_replace: bool) -> Self {
+        self.or_replace = or_replace;
+        self
+    }
+
+    #[must_use]
+    pub fn partition_expr(mut self, partition_expr: Option<Expr>) -> Self {
+        self.partition_expr = partition_expr;
+        self
+    }
+
+    #[must_use]
+    pub fn partition_expr_sql(mut self, partition_expr_sql: Option<String>) -> Self {
+        self.partition_expr_sql = partition_expr_sql;
+        self
+    }
+
+    #[must_use]
+    pub fn primary_key(mut self, primary_key: Vec<String>) -> Self {
+        self.primary_key = primary_key;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> CayenneCreateTableNode {
+        CayenneCreateTableNode {
+            table_name: self.table_name,
+            arrow_schema: self.arrow_schema,
+            if_not_exists: self.if_not_exists,
+            or_replace: self.or_replace,
+            df_catalog_name: self.df_catalog_name,
+            df_schema_name: self.df_schema_name,
+            partition_expr: self.partition_expr,
+            partition_expr_sql: self.partition_expr_sql,
+            primary_key: self.primary_key,
             output_schema: ddl_output_schema(),
         }
     }
@@ -83,6 +150,9 @@ impl Hash for CayenneCreateTableNode {
         self.table_name.hash(state);
         self.df_catalog_name.hash(state);
         self.df_schema_name.hash(state);
+        self.partition_expr.hash(state);
+        self.partition_expr_sql.hash(state);
+        self.primary_key.hash(state);
     }
 }
 
@@ -91,6 +161,9 @@ impl PartialEq for CayenneCreateTableNode {
         self.table_name == other.table_name
             && self.df_catalog_name == other.df_catalog_name
             && self.df_schema_name == other.df_schema_name
+            && self.partition_expr == other.partition_expr
+            && self.partition_expr_sql == other.partition_expr_sql
+            && self.primary_key == other.primary_key
     }
 }
 
@@ -116,7 +189,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        vec![]
+        self.partition_expr.iter().cloned().collect()
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -129,9 +202,19 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
 
     fn with_exprs_and_inputs(
         &self,
-        _exprs: Vec<Expr>,
+        exprs: Vec<Expr>,
         _inputs: Vec<LogicalPlan>,
     ) -> datafusion::error::Result<Self> {
+        let partition_expr = match exprs.as_slice() {
+            [] => None,
+            [expr] => Some(expr.clone()),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "CayenneCreateTableNode expects at most one partition expression".to_string(),
+                ));
+            }
+        };
+
         Ok(Self {
             table_name: self.table_name.clone(),
             arrow_schema: Arc::clone(&self.arrow_schema),
@@ -139,6 +222,9 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             or_replace: self.or_replace,
             df_catalog_name: self.df_catalog_name.clone(),
             df_schema_name: self.df_schema_name.clone(),
+            partition_expr,
+            partition_expr_sql: self.partition_expr_sql.clone(),
+            primary_key: self.primary_key.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }
@@ -321,6 +407,205 @@ impl UserDefinedLogicalNodeCore for CayenneDropTableNode {
             df_catalog_name: self.df_catalog_name.clone(),
             df_schema_name: self.df_schema_name.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
+        })
+    }
+}
+
+/// Logical plan node to forward `DELETE` DML operations to Cayenne table across relevant executors in distributed mode.
+#[derive(Debug)]
+pub struct DistributedCayenneDeleteNode {
+    /// Fully qualified table reference.
+    pub table_name: TableReference,
+    /// The input plan producing the delete filter/rows.
+    pub input: Arc<LogicalPlan>,
+    /// Output schema from the original DML statement.
+    pub output_schema: DFSchemaRef,
+    /// SQL text of the WHERE clause, if any.
+    pub filter_sql: Option<String>,
+}
+
+impl DistributedCayenneDeleteNode {
+    #[must_use]
+    pub fn new(
+        table_name: TableReference,
+        input: Arc<LogicalPlan>,
+        output_schema: DFSchemaRef,
+        filter_sql: Option<String>,
+    ) -> Self {
+        Self {
+            table_name,
+            input,
+            output_schema,
+            filter_sql,
+        }
+    }
+}
+
+impl Hash for DistributedCayenneDeleteNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.table_name.hash(state);
+        self.input.hash(state);
+        self.output_schema.hash(state);
+        self.filter_sql.hash(state);
+    }
+}
+
+impl PartialEq for DistributedCayenneDeleteNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.table_name == other.table_name
+            && self.input == other.input
+            && self.output_schema == other.output_schema
+            && self.filter_sql == other.filter_sql
+    }
+}
+
+impl Eq for DistributedCayenneDeleteNode {}
+
+impl PartialOrd for DistributedCayenneDeleteNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.table_name
+            .to_string()
+            .partial_cmp(&other.table_name.to_string())
+    }
+}
+
+impl UserDefinedLogicalNodeCore for DistributedCayenneDeleteNode {
+    fn name(&self) -> &'static str {
+        "CayenneDelete"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneDelete: {}", self.table_name)
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        let input = inputs.into_iter().next().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "CayenneDeleteNode requires exactly one input".to_string(),
+            )
+        })?;
+        Ok(Self {
+            table_name: self.table_name.clone(),
+            input: Arc::new(input),
+            output_schema: DFSchemaRef::clone(&self.output_schema),
+            filter_sql: self.filter_sql.clone(),
+        })
+    }
+}
+
+/// Logical plan node to forward `UPDATE` DML operations to Cayenne table across relevant executors in distributed mode.
+#[derive(Debug)]
+pub struct DistributedCayenneUpdateNode {
+    /// Fully qualified table reference.
+    pub table_name: TableReference,
+    /// The input plan producing the update assignments/filter.
+    pub input: Arc<LogicalPlan>,
+    /// Output schema from the original DML statement.
+    pub output_schema: DFSchemaRef,
+    /// SQL text of the WHERE clause, if any.
+    pub filter_sql: Option<String>,
+    /// SET assignments as `(column_name, value_sql)` pairs.
+    pub assignments_sql: Vec<(String, String)>,
+}
+
+impl DistributedCayenneUpdateNode {
+    #[must_use]
+    pub fn new(
+        table_name: TableReference,
+        input: Arc<LogicalPlan>,
+        output_schema: DFSchemaRef,
+        filter_sql: Option<String>,
+        assignments_sql: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            table_name,
+            input,
+            output_schema,
+            filter_sql,
+            assignments_sql,
+        }
+    }
+}
+
+impl Hash for DistributedCayenneUpdateNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.table_name.hash(state);
+        self.input.hash(state);
+        self.output_schema.hash(state);
+        self.filter_sql.hash(state);
+        self.assignments_sql.hash(state);
+    }
+}
+
+impl PartialEq for DistributedCayenneUpdateNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.table_name == other.table_name && self.input == other.input
+    }
+}
+
+impl Eq for DistributedCayenneUpdateNode {}
+
+impl PartialOrd for DistributedCayenneUpdateNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.table_name
+            .to_string()
+            .partial_cmp(&other.table_name.to_string())
+    }
+}
+
+impl UserDefinedLogicalNodeCore for DistributedCayenneUpdateNode {
+    fn name(&self) -> &'static str {
+        "CayenneUpdate"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneUpdate: {}", self.table_name)
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        let input = inputs.into_iter().next().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "CayenneUpdateNode requires exactly one input".to_string(),
+            )
+        })?;
+        Ok(Self {
+            table_name: self.table_name.clone(),
+            input: Arc::new(input),
+            output_schema: DFSchemaRef::clone(&self.output_schema),
+            filter_sql: self.filter_sql.clone(),
+            assignments_sql: self.assignments_sql.clone(),
         })
     }
 }

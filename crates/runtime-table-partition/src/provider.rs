@@ -211,6 +211,10 @@ impl PartitionTableProvider {
             .flat_map(|p| p.expression.column_refs())
             .collect()
     }
+    #[must_use]
+    pub fn creator(&self) -> &Arc<dyn PartitionCreator> {
+        &self.creator
+    }
 }
 
 #[async_trait]
@@ -1083,14 +1087,14 @@ mod tests {
 
         let partitions_data = vec![
             (
-                ScalarValue::Int32(Some(0)),
+                ScalarValue::Int64(Some(0)),
                 Arc::new(
                     MemTable::try_new(Arc::clone(&schema), vec![vec![batch0]])
                         .expect("failed to create MemTable"),
                 ) as Arc<dyn TableProvider>,
             ),
             (
-                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int64(Some(1)),
                 Arc::new(
                     MemTable::try_new(Arc::clone(&schema), vec![vec![batch1]])
                         .expect("failed to create MemTable"),

@@ -17,13 +17,24 @@ limitations under the License.
 //! Iceberg DDL support: analyzer rule, logical nodes, extension planner,
 //! and physical execution plans for `CREATE TABLE` / `DROP TABLE` on
 //! Iceberg-backed catalogs.
+//!
+//! Generic DDL infrastructure (option parsing, preprocessing, extension store)
+//! lives in [`super::ddl`]. This module re-exports it for backwards compatibility.
 
-pub mod acceleration_options;
 pub mod analyzer_rule;
 pub mod logical_nodes;
 pub mod physical_plans;
 pub mod planner;
-pub mod preprocess;
+
+/// Re-export generic DDL acceleration options from [`super::ddl::acceleration_options`].
+pub mod acceleration_options {
+    pub use crate::datafusion::ddl::acceleration_options::*;
+}
+
+/// Re-export generic DDL preprocessing from [`super::ddl::preprocess`].
+pub mod preprocess {
+    pub use crate::datafusion::ddl::preprocess::*;
+}
 
 use std::sync::{Arc, OnceLock, Weak};
 

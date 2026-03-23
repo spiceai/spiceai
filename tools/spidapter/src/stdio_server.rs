@@ -28,8 +28,10 @@ use spicepod::component::ComponentOrReference;
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth, Flight, Runtime, TelemetryConfig};
-use spicepod::param::Params;
+use spicepod::component::runtime::{
+    ApiKey, ApiKeyAuth, Auth, Flight, Runtime, Scheduler, TelemetryConfig,
+};
+use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
     AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
@@ -41,11 +43,14 @@ use uuid::Uuid;
 use crate::args::StdioArgs;
 use crate::commands;
 
-const SPIDAPTER_BACKEND_ENV: &str = "SPIDAPTER_BACKEND";
 const LOCAL_BIND_HOST: &str = "0.0.0.0";
 const LOCAL_CONNECT_HOST: &str = "127.0.0.1";
 const LOCAL_SPICED_BINARY: &str = "spiced";
 const LOCAL_SPICE_BINARY: &str = "spice";
+const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
+const SPIDAPTER_NUM_EXECUTORS_ENV: &str = "SPIDAPTER_NUM_EXECUTORS";
+const MAX_LOCAL_EXECUTORS: usize = 16;
+const LOCAL_EXECUTOR_REGISTRATION_METRIC_GRACE: Duration = Duration::from_secs(15);
 
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
@@ -80,7 +85,7 @@ impl RunState {
 
 struct LocalRunState {
     scheduler_child: Child,
-    executor_child: Child,
+    executor_children: Vec<Child>,
     flight_url: String,
     flight_api_key: Option<String>,
     sql_url: String,
@@ -89,40 +94,14 @@ struct LocalRunState {
 
 impl Drop for LocalRunState {
     fn drop(&mut self) {
-        let _ = self.executor_child.start_kill();
+        for child in &mut self.executor_children {
+            let _ = child.start_kill();
+        }
         let _ = self.scheduler_child.start_kill();
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum BackendMode {
-    Scp,
-    Local,
-}
-
-impl BackendMode {
-    fn from_env() -> Result<Self, String> {
-        let raw = match std::env::var(SPIDAPTER_BACKEND_ENV) {
-            Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => return Ok(Self::Scp),
-            Err(err) => {
-                return Err(format!("Failed to read {SPIDAPTER_BACKEND_ENV}: {err}"));
-            }
-        };
-
-        parse_backend_mode(&raw)
-    }
-}
-
-fn parse_backend_mode(raw_value: &str) -> Result<BackendMode, String> {
-    match raw_value.trim().to_ascii_lowercase().as_str() {
-        "" | "scp" => Ok(BackendMode::Scp),
-        "local" => Ok(BackendMode::Local),
-        value => Err(format!(
-            "Invalid {SPIDAPTER_BACKEND_ENV} value '{value}'. Supported values: scp, local"
-        )),
-    }
-}
+use crate::args::BackendMode;
 
 #[derive(Debug, Clone)]
 struct SetupConfig {
@@ -154,6 +133,22 @@ fn metadata_string(metadata: &HashMap<String, serde_json::Value>, key: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+/// Average non-`None` `f64` values extracted from pods.
+#[expect(clippy::cast_precision_loss)]
+fn avg_opt(
+    pods: &[&spice_cloud_client::types::PodMetrics],
+    f: fn(&spice_cloud_client::types::PodMetrics) -> Option<f64>,
+) -> Option<f64> {
+    let (sum, count) = pods.iter().fold((0.0, 0_u64), |(s, c), p| {
+        if let Some(v) = f(p) {
+            (s + v, c + 1)
+        } else {
+            (s, c)
+        }
+    });
+    (count > 0).then_some(sum / (count as f64))
 }
 
 /// Sum non-`None` `u64` values extracted from pods.
@@ -192,21 +187,15 @@ fn sum_opt_f64_as_u64(
 struct SpidapterHandler {
     /// Active runs keyed by run ID.
     runs: HashMap<Uuid, RunState>,
-    /// Spice Cloud API URL override (from CLI args).
-    api_url_override: Option<String>,
-    /// Timeout in seconds for deployment readiness.
-    ready_wait: u64,
-    /// Release channel for the spice.ai runtime image.
-    channel: Option<String>,
+    /// Full CLI args (includes all flags and env-var-backed configuration).
+    args: StdioArgs,
 }
 
 impl SpidapterHandler {
     fn new(args: &StdioArgs) -> Self {
         Self {
             runs: HashMap::new(),
-            api_url_override: args.spice_cloud_api_url.clone(),
-            ready_wait: args.ready_wait,
-            channel: args.channel.clone(),
+            args: args.clone(),
         }
     }
 }
@@ -226,26 +215,19 @@ impl Handler for SpidapterHandler {
         );
 
         let setup_config = SetupConfig::from_metadata(&metadata).set_etl_sink_type(etl_sink_type);
-        let backend = BackendMode::from_env()?;
+        let backend = self.args.backend;
 
         let state = match backend {
             BackendMode::Scp => {
-                provision_spice_cloud_app(
-                    run_id,
-                    self.api_url_override.as_deref(),
-                    self.ready_wait,
-                    self.channel.as_deref(),
-                    &setup_config,
-                    &datasets,
-                )
-                .await
+                provision_spice_cloud_app(run_id, &self.args, &setup_config, &datasets).await
             }
             BackendMode::Local => {
                 provision_local_spiced_cluster(
                     run_id,
-                    Duration::from_secs(self.ready_wait),
+                    Duration::from_secs(self.args.ready_wait),
                     &setup_config,
                     &datasets,
+                    &self.args,
                 )
                 .await
             }
@@ -287,6 +269,7 @@ impl Handler for SpidapterHandler {
         };
 
         self.runs.insert(run_id, state);
+
         Ok(response)
     }
 
@@ -309,30 +292,12 @@ impl Handler for SpidapterHandler {
                     ResourceMetrics::default()
                 } else {
                     ResourceMetrics {
-                        // Sum cumulative CPU seconds across all pods
-                        cpu_usage_percent: Some(
-                            pods.iter()
-                                .filter_map(|pod| pod.cpu_usage_percent)
-                                .sum::<f64>()
-                                .max(0.0),
-                        ),
-                        memory_usage_bytes: sum_opt_u64(&pods, |pod| pod.memory_usage_bytes),
-                        disk_read_bytes: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_read_bytes)
-                                .unwrap_or_default(),
-                        ),
-                        disk_write_bytes: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_write_bytes)
-                                .unwrap_or_default(),
-                        ),
-                        disk_read_iops: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_read_operations)
-                                .unwrap_or_default(),
-                        ),
-                        disk_write_iops: Some(
-                            sum_opt_f64_as_u64(&pods, |pod| pod.disk_write_operations)
-                                .unwrap_or_default(),
-                        ),
+                        cpu_usage_percent: avg_opt(&pods, |p| p.cpu_usage_percent),
+                        memory_usage_bytes: sum_opt_u64(&pods, |p| p.memory_usage_bytes),
+                        disk_read_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_read_bytes),
+                        disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
+                        disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations),
+                        disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations),
                     }
                 };
 
@@ -415,34 +380,41 @@ async fn post_setup_sink_action(
             .timeout(Duration::from_secs(60))
             .build()?;
 
-        let mut attempts = 0; // global attempt counter, not per-table, to avoid compounding retries
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
 
+            let mut attempts = 0;
+
             loop {
                 let mut request = sql_client.post(sql_url).body(statement.clone());
+                // Prefer non-streaming response path for DDL by setting row limit
+                request = request.header("X-Accept-Rows", "999");
                 if let Some(key) = api_key {
                     request = request.header("X-API-Key", key);
                 }
                 let response = request.send().await?;
 
-                if response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+                if status.is_success() {
                     break;
                 }
 
                 attempts += 1;
 
-                if attempts >= 3 {
-                    let status = response.status();
-                    let body = response.text().await?;
+                if attempts >= POST_SETUP_SQL_MAX_RETRIES {
                     return Err(anyhow::anyhow!(
-                        "Failed to execute post-setup SQL against {sql_url}: status={status}, sql={statement}, body={body}"
+                        "Failed to execute post-setup SQL against {sql_url} after {POST_SETUP_SQL_MAX_RETRIES} attempts: status={status}, sql={statement}, body={body}"
                     ));
                 }
 
                 let backoff_seconds = attempts * 2;
                 eprintln!(
-                    "[stdio] Post-setup SQL failed, retrying in {backoff_seconds}s (attempt {attempts}/3)"
+                    "[stdio] Post-setup SQL failed (status={status}, body={body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
                 );
                 sleep(Duration::from_secs(backoff_seconds)).await;
             }
@@ -478,10 +450,15 @@ fn generate_adbc_create_table_statement(
     dataset_name: &str,
     dataset: &DatasetConfig,
 ) -> anyhow::Result<String> {
+    let DatasetConfig {
+        schema,
+        primary_key_columns,
+        partition_columns,
+        ..
+    } = dataset;
     let quoted_dataset_name = quote_identifier(dataset_name);
 
-    let column_definitions = dataset
-        .schema
+    let column_definitions = schema
         .fields()
         .iter()
         .map(|field| {
@@ -499,15 +476,14 @@ fn generate_adbc_create_table_statement(
     }
 
     let mut table_elements = column_definitions;
-    if !dataset.primary_key_columns.is_empty() {
-        let schema_columns = dataset
-            .schema
+    if !primary_key_columns.is_empty() {
+        let schema_columns = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect::<HashSet<_>>();
 
-        for primary_key_column in &dataset.primary_key_columns {
+        for primary_key_column in primary_key_columns {
             if !schema_columns.contains(primary_key_column) {
                 return Err(anyhow::anyhow!(
                     "Dataset '{dataset_name}' has primary key column '{primary_key_column}' that is not present in the schema"
@@ -515,8 +491,7 @@ fn generate_adbc_create_table_statement(
             }
         }
 
-        let primary_keys = dataset
-            .primary_key_columns
+        let primary_keys = primary_key_columns
             .iter()
             .map(|column| quote_identifier(column))
             .collect::<Vec<_>>()
@@ -524,8 +499,21 @@ fn generate_adbc_create_table_statement(
         table_elements.push(format!("PRIMARY KEY ({primary_keys})"));
     }
 
+    if partition_columns.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "Dataset '{dataset_name}' specifies {} partition columns, but only a single partition column is supported",
+            partition_columns.len()
+        ));
+    }
+
+    let partition_clause = if partition_columns.is_empty() {
+        String::default()
+    } else {
+        format!("PARTITION BY ({})", partition_columns.join(", "))
+    };
+
     Ok(format!(
-        "CREATE TABLE spicebench.bench.{quoted_dataset_name} ({})",
+        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}) {partition_clause}",
         table_elements.join(", ")
     ))
 }
@@ -582,16 +570,20 @@ fn quote_identifier(identifier: &str) -> String {
 /// 6. Wait for the deployment to become ready
 async fn provision_spice_cloud_app(
     run_id: Uuid,
-    api_url_override: Option<&str>,
-    ready_wait: u64,
-    channel: Option<&str>,
+    args: &StdioArgs,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
-    let cloud = commands::build_cloud_client(api_url_override)?;
+    let cloud = commands::build_cloud_client(
+        Some(args.spice_cloud_api_url.as_str()),
+        args.api_key.as_deref(),
+    )?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = commands::flight_url_from_cname(&cname);
+    let flight_url = args
+        .flight_url
+        .clone()
+        .unwrap_or_else(|| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
@@ -601,15 +593,41 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
-    let (app_id, app_api_key) = commands::ensure_spice_cloud_app(&cloud, &app_name).await?;
+    let app_create_config = commands::AppCreateConfig {
+        app_memory_limit: args.app_memory_limit.clone(),
+        app_cpu_limit: args.app_cpu_limit.clone(),
+        app_cpu_request: args.app_cpu_request.clone(),
+        app_memory_request: args.app_memory_request.clone(),
+        app_replicas: args.app_replicas,
+        executor_replicas: args.executor_replicas,
+        executor_memory_limit: args.executor_memory_limit.clone(),
+        executor_cpu_limit: args.executor_cpu_limit.clone(),
+        executor_cpu_request: args.executor_cpu_request.clone(),
+        executor_memory_request: args.executor_memory_request.clone(),
+    };
+    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
 
-    let api_key = app_api_key.ok_or_else(|| {
+    // Fetch API key from the dedicated api-keys endpoint
+    let api_keys = cloud
+        .get_api_keys(app_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch API keys for app '{app_name}': {e}"))?;
+
+    let api_key = api_keys.api_key.ok_or_else(|| {
         anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
     })?;
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    let spicepod_yaml = generate_initial_spicepod(&run_id, setup_config, datasets, None)?;
+    let spicepod = generate_initial_spicepod(
+        &run_id,
+        setup_config,
+        datasets,
+        None,
+        args.scheduler_state_location.as_deref(),
+        args.aws_region.as_deref(),
+    )?;
+    let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
     eprintln!("[stdio] Uploading spicepod to app...");
@@ -626,7 +644,7 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] RUNNER secret set");
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, channel).await?;
+    commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -635,9 +653,22 @@ async fn provision_spice_cloud_app(
         &poll_client,
         &cname,
         &api_key,
-        Duration::from_secs(ready_wait),
+        Duration::from_secs(args.ready_wait),
     )
     .await?;
+
+    // after the deployment is reported "ready", wait for another 10 seconds (or SPIDAPTER_DEPLOYMENT_READY_WAIT seconds if set)
+    // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
+    let deployment_ready_wait = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    eprintln!(
+        "[stdio] Deployment is ready, waiting an additional {deployment_ready_wait}s for executors to connect..."
+    );
+
+    tokio::time::sleep(Duration::from_secs(deployment_ready_wait)).await;
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
@@ -652,14 +683,13 @@ async fn provision_spice_cloud_app(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LocalPorts {
     scheduler_http: u16,
     scheduler_flight: u16,
     scheduler_node: u16,
-    executor_http: u16,
-    executor_flight: u16,
-    executor_node: u16,
+    /// Per-executor ports: (http, flight, node)
+    executor_ports: Vec<(u16, u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -667,8 +697,8 @@ struct LocalPkiPaths {
     ca_cert: PathBuf,
     scheduler_cert: PathBuf,
     scheduler_key: PathBuf,
-    executor_cert: PathBuf,
-    executor_key: PathBuf,
+    /// Per-executor PKI: (cert, key)
+    executor_pki: Vec<(PathBuf, PathBuf)>,
 }
 
 async fn provision_local_spiced_cluster(
@@ -676,8 +706,11 @@ async fn provision_local_spiced_cluster(
     ready_wait: Duration,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
+    args: &StdioArgs,
 ) -> anyhow::Result<RunState> {
-    let ports = allocate_local_ports(LOCAL_BIND_HOST)?;
+    let num_exec = num_executors()?;
+    eprintln!("[stdio] local backend: provisioning cluster with {num_exec} executor(s)");
+    let ports = allocate_local_ports(LOCAL_BIND_HOST, num_exec)?;
 
     let working_dir = create_local_working_dir(run_id).await?;
     let local_flight_api_key = (setup_config.sink_type == Some(EtlSinkType::Adbc))
@@ -685,42 +718,51 @@ async fn provision_local_spiced_cluster(
 
     let setup_result = async {
         let scheduler_dir = working_dir.join("scheduler");
-        let executor_dir = working_dir.join("executor-0");
         tokio::fs::create_dir_all(&scheduler_dir).await?;
-        tokio::fs::create_dir_all(&executor_dir).await?;
 
-        let spicepod_yaml = generate_initial_spicepod(
+        let mut executor_dirs = Vec::with_capacity(num_exec);
+        for i in 0..num_exec {
+            let dir = working_dir.join(format!("executor-{i}"));
+            tokio::fs::create_dir_all(&dir).await?;
+            executor_dirs.push(dir);
+        }
+
+        let spicepod = generate_initial_spicepod(
             &run_id,
             setup_config,
             datasets,
             local_flight_api_key.as_deref(),
+            args.scheduler_state_location.as_deref(),
+            args.aws_region.as_deref(),
         )?;
-        let spicepod_path = write_local_spicepod(&spicepod_yaml, &working_dir).await?;
+        let spicepod_path = write_local_spicepod(&spicepod, &working_dir, "spicepod.yaml").await?;
 
         let run_id_str = run_id.to_string();
         let short_run_id = run_id_str.split('-').next().unwrap_or_default();
         let process_id = std::process::id();
         let scheduler_cert_name = format!("spidapter-scheduler-{short_run_id}-{process_id}");
-        let executor_cert_name = format!("spidapter-executor-{short_run_id}-{process_id}");
+        let executor_cert_names: Vec<String> = (0..num_exec)
+            .map(|i| format!("spidapter-executor{i}-{short_run_id}-{process_id}"))
+            .collect();
 
         let pki_paths = ensure_local_cluster_pki(
             LOCAL_SPICE_BINARY,
             LOCAL_CONNECT_HOST,
             &scheduler_cert_name,
-            &executor_cert_name,
+            &executor_cert_names,
         )
         .await?;
 
-        Ok::<(PathBuf, PathBuf, PathBuf, LocalPkiPaths), anyhow::Error>((
+        Ok::<(PathBuf, Vec<PathBuf>, PathBuf, LocalPkiPaths), anyhow::Error>((
             scheduler_dir,
-            executor_dir,
+            executor_dirs,
             spicepod_path,
             pki_paths,
         ))
     }
     .await;
 
-    let (scheduler_dir, executor_dir, spicepod_path, pki_paths) = match setup_result {
+    let (scheduler_dir, executor_dirs, spicepod_path, pki_paths) = match setup_result {
         Ok(result) => result,
         Err(error) => {
             let _ = cleanup_local_artifacts(&working_dir).await;
@@ -731,7 +773,7 @@ async fn provision_local_spiced_cluster(
     let scheduler_args = scheduler_spiced_args(
         LOCAL_BIND_HOST,
         LOCAL_CONNECT_HOST,
-        ports,
+        &ports,
         &pki_paths,
         spicepod_path.as_path(),
     );
@@ -764,35 +806,79 @@ async fn provision_local_spiced_cluster(
         return Err(error);
     }
 
-    let executor_args =
-        executor_spiced_args(LOCAL_BIND_HOST, LOCAL_CONNECT_HOST, ports, &pki_paths);
-    let mut executor_child = match spawn_local_spiced(
-        LOCAL_SPICED_BINARY,
-        &executor_dir,
-        &executor_args,
-        "executor",
-    ) {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
-            let _ = cleanup_local_artifacts(&working_dir).await;
-            return Err(error);
-        }
-    };
+    let executor_http_urls = ports
+        .executor_ports
+        .iter()
+        .take(num_exec)
+        .map(|ports| format!("http://{}:{}", LOCAL_CONNECT_HOST, ports.0))
+        .collect::<Vec<_>>();
 
+    let mut executor_children = Vec::with_capacity(num_exec);
+    for (i, executor_dir) in executor_dirs.iter().enumerate().take(num_exec) {
+        let (executor_cert, executor_key) = &pki_paths.executor_pki[i];
+        let executor_args = executor_spiced_args(
+            LOCAL_BIND_HOST,
+            LOCAL_CONNECT_HOST,
+            ports.scheduler_node,
+            ports.executor_ports[i],
+            &pki_paths.ca_cert,
+            executor_cert,
+            executor_key,
+        );
+        let label = format!("executor-{i}");
+        match spawn_local_spiced(LOCAL_SPICED_BINARY, executor_dir, &executor_args, &label) {
+            Ok(child) => executor_children.push(child),
+            Err(error) => {
+                for child in &mut executor_children {
+                    let _ = stop_child_process(child, "executor").await;
+                }
+                let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+                let _ = cleanup_local_artifacts(&working_dir).await;
+                return Err(error);
+            }
+        }
+    }
+
+    // Wait for at least the first executor to be SQL-reachable
     if let Err(error) = wait_for_local_sql_ready(
         &scheduler_sql_url,
         &mut scheduler_child,
-        &mut executor_child,
+        &mut executor_children[0],
         ready_wait,
         local_flight_api_key.as_deref(),
     )
     .await
     {
-        let _ = stop_child_process(&mut executor_child, "executor").await;
+        for child in &mut executor_children {
+            let _ = stop_child_process(child, "executor").await;
+        }
         let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
         let _ = cleanup_local_artifacts(&working_dir).await;
         return Err(error);
+    }
+
+    if num_exec > 1 {
+        let remaining = num_exec.saturating_sub(1);
+        eprintln!(
+            "[stdio] local backend: waiting for remaining {remaining} executor(s) to register with the scheduler..."
+        );
+        if let Err(error) = wait_for_local_executor_count(
+            &scheduler_http_url,
+            &executor_http_urls,
+            &mut scheduler_child,
+            &mut executor_children,
+            num_exec,
+            ready_wait,
+        )
+        .await
+        {
+            for child in &mut executor_children {
+                let _ = stop_child_process(child, "executor").await;
+            }
+            let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
+        }
     }
 
     if let Err(error) = post_setup_sink_action(
@@ -803,7 +889,9 @@ async fn provision_local_spiced_cluster(
     )
     .await
     {
-        let _ = stop_child_process(&mut executor_child, "executor").await;
+        for child in &mut executor_children {
+            let _ = stop_child_process(child, "executor").await;
+        }
         let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
         let _ = cleanup_local_artifacts(&working_dir).await;
         return Err(error);
@@ -811,7 +899,7 @@ async fn provision_local_spiced_cluster(
 
     Ok(RunState::Local(Box::new(LocalRunState {
         scheduler_child,
-        executor_child,
+        executor_children,
         flight_url: format!("grpc://{}:{}", LOCAL_CONNECT_HOST, ports.scheduler_flight),
         flight_api_key: local_flight_api_key,
         sql_url: scheduler_sql_url,
@@ -828,20 +916,59 @@ async fn create_local_working_dir(run_id: Uuid) -> anyhow::Result<PathBuf> {
     Ok(run_dir)
 }
 
-async fn write_local_spicepod(spicepod_yaml: &str, working_dir: &Path) -> anyhow::Result<PathBuf> {
-    let spicepod_path = working_dir.join("spicepod.yaml");
+async fn write_local_spicepod(
+    spicepod: &SpicepodDefinition,
+    working_dir: &Path,
+    file_name: &str,
+) -> anyhow::Result<PathBuf> {
+    let spicepod_yaml = serialize_spicepod(spicepod)?;
+    let spicepod_path = working_dir.join(file_name);
     tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
     Ok(spicepod_path)
 }
 
-fn allocate_local_ports(host: &str) -> anyhow::Result<LocalPorts> {
+fn serialize_spicepod(spicepod: &SpicepodDefinition) -> anyhow::Result<String> {
+    yaml::to_string(spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+}
+
+fn num_executors() -> anyhow::Result<usize> {
+    match std::env::var(SPIDAPTER_NUM_EXECUTORS_ENV) {
+        Ok(raw) => {
+            let parsed = raw.trim().parse::<usize>().map_err(|error| {
+                anyhow::anyhow!(
+                    "Invalid {SPIDAPTER_NUM_EXECUTORS_ENV} value '{raw}': {error}. Expected an integer in the range 1..={MAX_LOCAL_EXECUTORS}."
+                )
+            })?;
+
+            if !(1..=MAX_LOCAL_EXECUTORS).contains(&parsed) {
+                anyhow::bail!(
+                    "Invalid {SPIDAPTER_NUM_EXECUTORS_ENV} value '{parsed}'. Supported range for the local backend is 1..={MAX_LOCAL_EXECUTORS}."
+                );
+            }
+
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "Invalid {SPIDAPTER_NUM_EXECUTORS_ENV} value: expected valid UTF-8 in the range 1..={MAX_LOCAL_EXECUTORS}."
+        ),
+    }
+}
+
+fn allocate_local_ports(host: &str, num_executors: usize) -> anyhow::Result<LocalPorts> {
+    let mut executor_ports = Vec::with_capacity(num_executors);
+    for _ in 0..num_executors {
+        executor_ports.push((
+            reserve_local_port(host)?,
+            reserve_local_port(host)?,
+            reserve_local_port(host)?,
+        ));
+    }
     Ok(LocalPorts {
         scheduler_http: reserve_local_port(host)?,
         scheduler_flight: reserve_local_port(host)?,
         scheduler_node: reserve_local_port(host)?,
-        executor_http: reserve_local_port(host)?,
-        executor_flight: reserve_local_port(host)?,
-        executor_node: reserve_local_port(host)?,
+        executor_ports,
     })
 }
 
@@ -862,7 +989,7 @@ async fn ensure_local_cluster_pki(
     spice_cli_path: &str,
     host: &str,
     scheduler_cert_name: &str,
-    executor_cert_name: &str,
+    executor_cert_names: &[String],
 ) -> anyhow::Result<LocalPkiPaths> {
     let pki_dir = pki_dir()?;
     let ca_cert = pki_dir.join("ca.crt");
@@ -878,14 +1005,20 @@ async fn ensure_local_cluster_pki(
     }
 
     add_tls_certificate(spice_cli_path, scheduler_cert_name, host).await?;
-    add_tls_certificate(spice_cli_path, executor_cert_name, host).await?;
+    let mut executor_pki = Vec::with_capacity(executor_cert_names.len());
+    for executor_cert_name in executor_cert_names {
+        add_tls_certificate(spice_cli_path, executor_cert_name, host).await?;
+        executor_pki.push((
+            pki_dir.join(format!("{executor_cert_name}.crt")),
+            pki_dir.join(format!("{executor_cert_name}.key")),
+        ));
+    }
 
     Ok(LocalPkiPaths {
         ca_cert,
         scheduler_cert: pki_dir.join(format!("{scheduler_cert_name}.crt")),
         scheduler_key: pki_dir.join(format!("{scheduler_cert_name}.key")),
-        executor_cert: pki_dir.join(format!("{executor_cert_name}.crt")),
-        executor_key: pki_dir.join(format!("{executor_cert_name}.key")),
+        executor_pki,
     })
 }
 
@@ -940,7 +1073,7 @@ async fn run_spice_cli_command(binary_path: &str, args: Vec<String>) -> anyhow::
 fn scheduler_spiced_args(
     bind_host: &str,
     advertise_host: &str,
-    ports: LocalPorts,
+    ports: &LocalPorts,
     pki_paths: &LocalPkiPaths,
     spicepod_path: &Path,
 ) -> Vec<String> {
@@ -968,28 +1101,31 @@ fn scheduler_spiced_args(
 fn executor_spiced_args(
     bind_host: &str,
     scheduler_host: &str,
-    ports: LocalPorts,
-    pki_paths: &LocalPkiPaths,
+    scheduler_node_port: u16,
+    executor_ports: (u16, u16, u16),
+    ca_cert: &Path,
+    executor_cert: &Path,
+    executor_key: &Path,
 ) -> Vec<String> {
     vec![
         "--role".to_string(),
         "executor".to_string(),
         "--scheduler-address".to_string(),
-        format!("https://{scheduler_host}:{}", ports.scheduler_node),
+        format!("https://{scheduler_host}:{scheduler_node_port}"),
         "--http".to_string(),
-        format!("{bind_host}:{}", ports.executor_http),
+        format!("{bind_host}:{}", executor_ports.0),
         "--flight".to_string(),
-        format!("{bind_host}:{}", ports.executor_flight),
+        format!("{bind_host}:{}", executor_ports.1),
         "--node-bind-address".to_string(),
-        format!("{bind_host}:{}", ports.executor_node),
+        format!("{bind_host}:{}", executor_ports.2),
         "--node-advertise-address".to_string(),
         scheduler_host.to_string(),
         "--node-mtls-ca-certificate-file".to_string(),
-        pki_paths.ca_cert.display().to_string(),
+        ca_cert.display().to_string(),
         "--node-mtls-certificate-file".to_string(),
-        pki_paths.executor_cert.display().to_string(),
+        executor_cert.display().to_string(),
         "--node-mtls-key-file".to_string(),
-        pki_paths.executor_key.display().to_string(),
+        executor_key.display().to_string(),
     ]
 }
 
@@ -1078,6 +1214,79 @@ async fn wait_for_local_sql_ready(
     }
 }
 
+async fn wait_for_local_executor_count(
+    scheduler_http_url: &str,
+    executor_http_urls: &[String],
+    scheduler_child: &mut Child,
+    executor_children: &mut [Child],
+    expected_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let metrics_url = format!("{scheduler_http_url}/metrics");
+    let started = tokio::time::Instant::now();
+
+    loop {
+        ensure_process_is_running(scheduler_child, "scheduler")?;
+        for (idx, child) in executor_children.iter_mut().enumerate() {
+            ensure_process_is_running(child, &format!("executor-{idx}"))?;
+        }
+
+        if started.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "Timed out after {}s waiting for {expected_count} local executors to register via {metrics_url}",
+                timeout.as_secs()
+            ));
+        }
+
+        if let Ok(response) = client.get(&metrics_url).send().await
+            && response.status().is_success()
+            && let Ok(body) = response.text().await
+            && scheduler_active_executor_count(&body)
+                .is_some_and(|active_count| active_count >= expected_count)
+        {
+            return Ok(());
+        }
+
+        if started.elapsed() >= LOCAL_EXECUTOR_REGISTRATION_METRIC_GRACE
+            && all_local_executor_http_ready(&client, executor_http_urls).await
+        {
+            eprintln!(
+                "[stdio] local backend: scheduler executor-count metric unavailable; falling back to per-executor health checks"
+            );
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn all_local_executor_http_ready(
+    client: &reqwest::Client,
+    executor_http_urls: &[String],
+) -> bool {
+    for executor_http_url in executor_http_urls {
+        let ready_url = format!("{executor_http_url}/health");
+        match client.get(&ready_url).send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(_) | Err(_) => return false,
+        }
+    }
+
+    true
+}
+
+fn scheduler_active_executor_count(metrics_body: &str) -> Option<usize> {
+    metrics_body
+        .lines()
+        .filter(|line| line.starts_with("scheduler_active_executors_count"))
+        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|value| value.parse::<usize>().ok())
+        .max()
+}
+
 fn ensure_process_is_running(child: &mut Child, process_name: &str) -> anyhow::Result<()> {
     if let Some(status) = child.try_wait()? {
         return Err(anyhow::anyhow!(
@@ -1089,10 +1298,13 @@ fn ensure_process_is_running(child: &mut Child, process_name: &str) -> anyhow::R
 
 async fn teardown_local_run(local_state: &mut LocalRunState) -> anyhow::Result<()> {
     eprintln!(
-        "[stdio] teardown: stopping local executor process (sql endpoint: {})",
+        "[stdio] teardown: stopping {} local executor process(es) (sql endpoint: {})",
+        local_state.executor_children.len(),
         local_state.sql_url
     );
-    stop_child_process(&mut local_state.executor_child, "executor").await?;
+    for (i, child) in local_state.executor_children.iter_mut().enumerate() {
+        stop_child_process(child, &format!("executor-{i}")).await?;
+    }
 
     eprintln!("[stdio] teardown: stopping local scheduler process");
     stop_child_process(&mut local_state.scheduler_child, "scheduler").await?;
@@ -1134,13 +1346,14 @@ fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<String> {
+    aws_region: Option<&str>,
+) -> anyhow::Result<SpicepodDefinition> {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let region = setup_config
         .region
         .clone()
-        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| aws_region.map(ToString::to_string))
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
         .unwrap_or_else(|| "us-east-1".to_string());
 
@@ -1166,6 +1379,9 @@ fn generate_hive_spicepod(
         ]);
         if let Some(endpoint) = &setup_config.endpoint {
             param_map.insert("s3_endpoint".to_string(), endpoint.clone());
+            if endpoint.starts_with("http://") {
+                param_map.insert("allow_http".to_string(), "true".to_string());
+            }
         }
 
         let mut dataset = Dataset::new(from, dataset_name.as_str());
@@ -1175,7 +1391,6 @@ fn generate_hive_spicepod(
             engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
-            refresh_check_interval: Some("1s".to_string()),
             ..Acceleration::default()
         });
 
@@ -1184,10 +1399,10 @@ fn generate_hive_spicepod(
             .push(ComponentOrReference::Component(dataset));
     }
 
-    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+    Ok(spicepod)
 }
 
-fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> anyhow::Result<String> {
+fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -1216,26 +1431,59 @@ fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> anyhow
         Catalog::new("cayenne".to_string(), "spicebench".to_string())
             .with_access(AccessMode::ReadWriteCreate),
     ));
-    yaml::to_string(&spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
+    spicepod
 }
 
-/// Generate the spicepod YAML with individual dataset entries sourced from S3 parquet files.
+/// Generate the initial [`SpicepodDefinition`] for the benchmark run.
 fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
-) -> anyhow::Result<String> {
-    match setup_config.sink_type {
-        Some(EtlSinkType::Adbc) => generate_adbc_spicepod(run_id, flight_api_key),
-        _ => generate_hive_spicepod(run_id, setup_config, datasets),
+    scheduler_state_location: Option<&str>,
+    aws_region: Option<&str>,
+) -> anyhow::Result<SpicepodDefinition> {
+    let mut spicepod = match setup_config.sink_type {
+        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key)),
+        _ => generate_hive_spicepod(run_id, setup_config, datasets, aws_region),
+    }?;
+
+    if let Some(loc) = scheduler_state_location {
+        let mut path = loc.trim();
+        if let Some(p) = path.strip_suffix('/') {
+            path = p;
+        }
+        let state_location = format!("{path}/{run_id}");
+        if !path.is_empty() {
+            let mut sched = Scheduler {
+                state_location,
+                params: Some(Params::from_string_map(HashMap::from([(
+                    "s3_auth".to_string(),
+                    "key".to_string(),
+                )]))),
+                partition_management: None,
+            };
+
+            if let Some(region) = aws_region {
+                sched.params.as_mut().map(|p| {
+                    p.data.insert(
+                        "s3_region".to_string(),
+                        ParamValue::String(region.to_string()),
+                    )
+                });
+            }
+            spicepod.runtime.scheduler = Some(sched);
+        }
     }
+
+    Ok(spicepod)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use clap::ValueEnum;
     use std::sync::Arc;
 
     #[test]
@@ -1251,25 +1499,23 @@ mod tests {
 
     #[test]
     fn backend_mode_parser_defaults_to_scp() {
-        assert!(matches!(parse_backend_mode(""), Ok(BackendMode::Scp)));
-        assert!(matches!(parse_backend_mode("scp"), Ok(BackendMode::Scp)));
+        assert!(matches!(
+            BackendMode::from_str("scp", true),
+            Ok(BackendMode::Scp)
+        ));
     }
 
     #[test]
     fn backend_mode_parser_supports_local() {
         assert!(matches!(
-            parse_backend_mode("LOCAL"),
+            BackendMode::from_str("local", true),
             Ok(BackendMode::Local)
         ));
     }
 
     #[test]
     fn backend_mode_parser_rejects_unknown_values() {
-        let error = parse_backend_mode("unexpected").expect_err("invalid backend should fail");
-        assert!(
-            error.contains("Invalid SPIDAPTER_BACKEND value"),
-            "unexpected error: {error}"
-        );
+        BackendMode::from_str("unexpected", true).expect("'BackendMode' should be constructed");
     }
 
     #[test]
@@ -1292,20 +1538,33 @@ mod tests {
             },
         )]);
 
-        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None)
-            .expect("spicepod should generate");
+        let spicepod = generate_initial_spicepod(
+            &Uuid::nil(),
+            &setup_config,
+            &datasets,
+            None,
+            Some("s3://bucket/state"),
+            None,
+        )
+        .expect("spicepod should generate");
+        let spicepod_yaml =
+            serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
 
-        assert!(spicepod.contains("from: \"s3://bucket/path/my_table/\""));
-        assert!(spicepod.contains("name: my_table"));
-        assert!(spicepod.contains("file_format: parquet"));
-        assert!(spicepod.contains("s3_region: us-west-2"));
-        assert!(spicepod.contains("s3_endpoint: \"http://localhost:9000\""));
-        assert!(spicepod.contains("engine: cayenne"));
-        assert!(spicepod.contains("mode: file"));
-        assert!(spicepod.contains("refresh_mode: full"));
-        assert!(spicepod.contains("refresh_check_interval: 1s"));
-        assert!(spicepod.contains("telemetry:"));
-        assert!(spicepod.contains("enabled: false"));
+        assert!(spicepod_yaml.contains("from: \"s3://bucket/path/my_table/\""));
+        assert!(spicepod_yaml.contains("name: my_table"));
+        assert!(spicepod_yaml.contains("file_format: parquet"));
+        assert!(spicepod_yaml.contains("s3_region: us-west-2"));
+        assert!(spicepod_yaml.contains("s3_endpoint: \"http://localhost:9000\""));
+        assert!(spicepod_yaml.contains("allow_http: \"true\""));
+        assert!(spicepod_yaml.contains("engine: cayenne"));
+        assert!(spicepod_yaml.contains("mode: file"));
+        assert!(spicepod_yaml.contains("refresh_mode: full"));
+        assert!(spicepod_yaml.contains("telemetry:"));
+        assert!(spicepod_yaml.contains("enabled: false"));
+        assert!(spicepod_yaml.contains(
+            "state_location: \"s3://bucket/state/00000000-0000-0000-0000-000000000000\""
+        ));
+        assert!(spicepod_yaml.contains("s3_auth: key"));
     }
 
     #[test]
@@ -1328,8 +1587,9 @@ mod tests {
             },
         )]);
 
-        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None)
-            .expect_err("missing source should fail");
+        let err =
+            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, None, None)
+                .expect_err("missing source should fail");
         assert!(
             err.to_string().contains("missing_table"),
             "unexpected error: {err}"
@@ -1361,7 +1621,7 @@ mod tests {
         )
         .expect("statement should generate");
 
-        assert!(statement.contains("CREATE TABLE spicebench.bench.\"orders\""));
+        assert!(statement.contains("CREATE TABLE IF NOT EXISTS spicebench.bench.\"orders\""));
         assert!(statement.contains("\"id\" BIGINT NOT NULL"));
         assert!(statement.contains("\"name\" TEXT"));
         assert!(statement.contains("\"price\" DECIMAL(10, 2)"));
@@ -1413,6 +1673,80 @@ mod tests {
 
         assert!(
             err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_includes_partition_by() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string()],
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(
+            statement.contains("PARTITION BY (region)"),
+            "expected PARTITION BY clause in: {statement}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_allows_partition_column_not_in_schema() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let statement = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["missing_col".to_string()],
+            },
+        )
+        .expect("partition column not in schema should still succeed");
+
+        assert!(
+            statement.contains("PARTITION BY (missing_col)"),
+            "expected PARTITION BY clause in: {statement}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_errors_for_multiple_partition_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("country", DataType::Utf8, true),
+        ]));
+
+        let err = generate_adbc_create_table_statement(
+            "events",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/events/".to_string()),
+                primary_key_columns: Vec::new(),
+                time_column: None,
+                partition_columns: vec!["region".to_string(), "country".to_string()],
+            },
+        )
+        .expect_err("multiple partition columns should fail");
+
+        assert!(
+            err.to_string()
+                .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
     }

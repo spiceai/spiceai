@@ -200,7 +200,6 @@ secrets:
   #   name: aws
   #   params:
   #     aws_region: us-east-1
-
   # Keyring secret store (feature-gated)
   # - from: keyring:my_service
   #   name: keyring
@@ -300,7 +299,8 @@ catalogs:
     from: spice.ai
     params:
       spiceai_api_key: my-api-key
-      spiceai_flight_endpoint: https://flight.spiceai.io
+      # Canonical Spice.ai endpoint parameter used for Flight connections.
+      spiceai_endpoint: https://flight.spiceai.io
       spiceai_http_endpoint: https://api.spiceai.io
 
 # =============================================================================
@@ -1338,25 +1338,6 @@ embeddings:
   # File-based embeddings
   - name: file_embeddings
     from: file:models/embeddings.gguf
-
-# =============================================================================
-# EVALS
-# Evaluation configurations
-# =============================================================================
-evals:
-  - name: model_eval
-    description: Evaluate model quality
-    dataset: eval_dataset
-    scorers:
-      - accuracy
-      - f1_score
-      - bleu
-    dependsOn:
-      - openai_model
-    metrics:
-      metrics:
-        - name: eval.accuracy
-          enabled: true
 
 # =============================================================================
 # TOOLS

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{Read, ReadWrite};
+use crate::{Read, ReadWrite, sql_expr::to_sql_preserving_precedence};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -354,8 +354,12 @@ impl TableProvider for FlightTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+            match to_sql_preserving_precedence(filter) {
+                Ok(_) => {
+                    // Keep remote filtering for performance, but mark it inexact so
+                    // DataFusion re-applies the predicate locally for correctness.
+                    filter_push_down.push(TableProviderFilterPushDown::Inexact);
+                }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
         }
@@ -429,7 +433,7 @@ impl FlightExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| to_sql_preserving_precedence(f).map(|sql| format!("({sql})")))
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))

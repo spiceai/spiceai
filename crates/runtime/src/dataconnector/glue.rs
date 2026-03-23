@@ -37,7 +37,6 @@ use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 use crate::{
     component::dataset::Dataset,
     parameters::{ParameterSpec, Parameters},
-    register_data_connector,
 };
 
 use super::{
@@ -210,6 +209,7 @@ impl GlueDataConnector {
 
 impl GlueDataConnector {
     async fn config(&self) -> Result<SdkConfig, aws::Error> {
+        let iam_role_source = self.params.get("iam_role_source").expose().ok();
         let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
@@ -217,6 +217,7 @@ impl GlueDataConnector {
             "secret",
             "session_token",
             &self.params,
+            iam_role_source,
         )
         .await?
         .load()

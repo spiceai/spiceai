@@ -63,6 +63,7 @@ pub enum TestType {
     TextToSql,
     Streaming,
     StreamingCorrectness,
+    Schema,
 }
 
 impl TestType {
@@ -78,6 +79,7 @@ impl TestType {
             TestType::TextToSql => "testoperator_run_texttosql.yml",
             TestType::Streaming => "testoperator_run_streaming_bench.yml",
             TestType::StreamingCorrectness => "testoperator_run_streaming_correctness.yml",
+            TestType::Schema => "testoperator_run_schema.yml",
         }
     }
 }
@@ -94,6 +96,7 @@ impl Display for TestType {
             TestType::TextToSql => write!(f, "text_to_sql"),
             TestType::Streaming => write!(f, "streaming"),
             TestType::StreamingCorrectness => write!(f, "streaming_correctness"),
+            TestType::Schema => write!(f, "schema"),
         }
     }
 }

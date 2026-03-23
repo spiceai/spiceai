@@ -7,11 +7,6 @@ jobs:
   build:
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
-    env:
-      GOVER: 1.25.3
-      GOOS: ${{ matrix.target_os }}
-      GOARCH: ${{ matrix.target_arch_go }}
-
     strategy:
       matrix:
         include:
@@ -19,7 +14,6 @@ jobs:
             runner: 'spiceai-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
-            target_arch_go: 'amd64'
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -27,15 +21,9 @@ jobs:
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
+      - run: rustup toolchain install 1.93.1 --profile minimal
 
-      - run: rustup toolchain install stable --profile minimal
-
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -51,6 +39,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced and spice CLI
+        id: build-spiced
         uses: ./.github/actions/build-spiced
         with:
           build_cli: 'true'
@@ -61,21 +50,21 @@ jobs:
         if: matrix.target_os == 'darwin'
         run: |
           if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
+            rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /Users/spiceai/build/target/
           fi
 
       - name: Update build cache (Linux)
         if: matrix.target_os == 'linux'
         run: |
           if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
+            rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /home/spiceai/build/target/
           fi
 
       - name: Update build cache (Windows)
         if: matrix.target_os == 'windows'
         run: |
           if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+            Copy-Item -Recurse -Force "${{ steps.build-spiced.outputs.target_dir_relative }}/*" C:/spiceai/build/target
           }
 
   test_acceleration:
@@ -99,7 +88,6 @@ jobs:
             runner: 'ubuntu-22.04'
             target_os: 'linux'
             target_arch: 'x86_64'
-            target_arch_go: 'amd64'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -115,7 +103,7 @@ jobs:
           ls -l test/arrow-types/
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

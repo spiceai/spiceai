@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -597,6 +597,11 @@ impl ApiKey {
             }
         }
     }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_ref().is_empty()
+    }
 }
 
 impl<'de> Deserialize<'de> for ApiKey {
@@ -699,6 +704,19 @@ pub struct Scheduler {
     /// Partition management configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_management: Option<PartitionManagement>,
+}
+
+impl Scheduler {
+    /// Returns the configured `max_partitions_per_executor`, falling back to
+    /// the default when no `partition_management` section is present.
+    #[must_use]
+    pub fn max_partitions_per_executor(&self) -> usize {
+        self.partition_management
+            .as_ref()
+            .map_or(default_max_partitions_per_executor(), |pm| {
+                pm.max_partitions_per_executor
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

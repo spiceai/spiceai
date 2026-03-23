@@ -30,6 +30,7 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use opentelemetry::KeyValue;
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
 use tokio::sync::mpsc::{self, Sender};
@@ -39,6 +40,7 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
+    cluster::partition,
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
@@ -199,22 +201,41 @@ pub(crate) async fn handle(
         )));
     }
 
-    // Fast path: for scheduler -> executor Cayenne writes, forward raw FlightData
-    // directly to executor to avoid decode/re-encode overhead on scheduler.
-    if should_forward_raw_cayenne_write(&datafusion, &path).await {
-        use futures::stream;
+    // Fast path: for scheduler -> executor Cayenne writes, split by partition
+    // and forward to each executor.
+    if let Some(executor_registry) = datafusion.executor_registry.as_ref()
+        && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
+            "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
+        )))?
+        && matches!(
+            datafusion.cluster_config.effective_role(),
+            Some(ClusterRole::Scheduler)
+        )
+    {
+        if executor_registry.flight_sql_clients.read().await.is_empty() {
+            return Err(Status::unavailable(
+                "No executors available to write data to. Ensure that at least one executor is connected to the cluster and try again.",
+            ));
+        }
 
-        let inbound = futures::StreamExt::chain(
-            stream::once(async move { Ok(first_message.clone()) }),
+        let response = partition::write_through::forward_federated_partitioned_write(
+            executor_registry,
+            Arc::clone(&datafusion.ctx),
+            datafusion.io_runtime.clone(),
+            &path,
+            first_message,
             streaming_flight,
-        );
-        datafusion
-            .forward_flight_data_stream_to_executor(&path, inbound)
-            .await
-            .map_err(|e| Status::internal(format!("Write operation failed: {e}")))?;
+            &[partition_expression],
+        )
+        .await;
 
-        let output = futures::stream::iter(vec![Ok(PutResult::default())]);
-        return Ok(Response::new(Box::pin(output)));
+        if let Err(e) = datafusion.caching().invalidate_for_table(path.clone()) {
+            tracing::warn!(
+                "Failed to invalidate caches for distributed Flight DoPut table {path}: {e}"
+            );
+        }
+
+        return response.map_err(Into::into);
     }
 
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
@@ -250,33 +271,6 @@ pub(crate) async fn handle(
 fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
     datafusion.cluster_config.effective_role() == Some(ClusterRole::Executor)
         && datafusion.cluster_config.tls_config().is_some()
-}
-
-async fn should_forward_raw_cayenne_write(datafusion: &DataFusion, path: &TableReference) -> bool {
-    if datafusion.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
-        return false;
-    }
-
-    let Some(executor_registry) = datafusion.executor_registry.as_ref() else {
-        return false;
-    };
-
-    let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
-        return false;
-    };
-    if clients.is_empty() {
-        return false;
-    }
-    drop(clients);
-
-    let Some(table_provider) = datafusion.get_table(path).await else {
-        return false;
-    };
-
-    table_provider
-        .as_any()
-        .downcast_ref::<cayenne::CayenneTableProvider>()
-        .is_some()
 }
 
 fn normalize_path_table_reference(path: TableReference, datafusion: &DataFusion) -> TableReference {
@@ -380,7 +374,7 @@ fn create_response_stream(
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx).await;
+            yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
         }
 
         // Use a single pinned Sleep future that is reset on each received message,
@@ -440,7 +434,7 @@ fn create_response_stream(
                             };
 
                             // Only report errors; a success message is sent as the final step upon successful write completion
-                            if let Err(err) = handle_record_batch(new_batch, &batch_tx).await {
+                            if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
                                 yield Err(err);
                                 break;
                             }
@@ -476,8 +470,13 @@ fn create_response_stream(
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
+    path: &str,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
+
+    let labels = [KeyValue::new("dataset", path.to_string())];
+    metrics::DO_PUT_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+    metrics::DO_PUT_BYTES_WRITTEN.add(batch.get_array_memory_size() as u64, &labels);
 
     if let Err(e) = batch_tx.send(Ok(batch)).await {
         tracing::error!("Error sending record batch to write channel: {e}");

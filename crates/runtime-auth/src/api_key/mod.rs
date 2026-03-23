@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,7 +28,27 @@ pub struct ApiKeyAuth {
 impl ApiKeyAuth {
     #[must_use]
     pub fn new(api_keys: Vec<ApiKey>) -> Self {
-        Self { api_keys }
+        let mut filtered_keys = Vec::with_capacity(api_keys.len());
+        let mut dropped_empty_keys = 0usize;
+
+        for api_key in api_keys {
+            if api_key.is_empty() {
+                dropped_empty_keys += 1;
+            } else {
+                filtered_keys.push(api_key);
+            }
+        }
+
+        if dropped_empty_keys > 0 {
+            tracing::warn!(
+                dropped_empty_keys,
+                "Ignoring empty API key values to prevent insecure authentication bypass"
+            );
+        }
+
+        Self {
+            api_keys: filtered_keys,
+        }
     }
 }
 
@@ -41,6 +61,10 @@ impl HttpAuth for ApiKeyAuth {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
 
+        if api_key.is_empty() {
+            return Ok(AuthVerdict::Deny);
+        }
+
         if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) {
             Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
         } else {
@@ -51,6 +75,10 @@ impl HttpAuth for ApiKeyAuth {
 
 impl FlightBasicAuth for ApiKeyAuth {
     fn validate(&self, _username: &str, password: &str) -> Result<String, Error> {
+        if password.is_empty() {
+            return Err(Error::InvalidCredentials);
+        }
+
         if self.api_keys.iter().any(|key| key == password) {
             Ok(password.to_string())
         } else {
@@ -59,6 +87,10 @@ impl FlightBasicAuth for ApiKeyAuth {
     }
 
     fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error> {
+        if bearer_token.is_empty() {
+            return Ok(AuthVerdict::Deny);
+        }
+
         if let Some(api_key) = self.api_keys.iter().find(|key| *key == bearer_token) {
             Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
         } else {
@@ -76,6 +108,10 @@ impl GrpcAuth for ApiKeyAuth {
         let Ok(api_key) = api_key.to_str() else {
             return Ok(AuthVerdict::Deny);
         };
+
+        if api_key.is_empty() {
+            return Ok(AuthVerdict::Deny);
+        }
 
         if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) {
             Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
@@ -139,5 +175,17 @@ mod tests {
         let parts = create_request_parts(Some("key2"));
         let result = auth.http_verify(&parts);
         assert!(matches!(result, Ok(AuthVerdict::Allow(_))));
+    }
+
+    #[test]
+    fn test_empty_configured_key_is_ignored() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str(""), ApiKey::parse_str("valid-key")]);
+        let empty_key_parts = create_request_parts(Some(""));
+        let empty_key_result = auth.http_verify(&empty_key_parts);
+        assert!(matches!(empty_key_result, Ok(AuthVerdict::Deny)));
+
+        let valid_key_parts = create_request_parts(Some("valid-key"));
+        let valid_key_result = auth.http_verify(&valid_key_parts);
+        assert!(matches!(valid_key_result, Ok(AuthVerdict::Allow(_))));
     }
 }

@@ -19,9 +19,9 @@ limitations under the License.
 use clap::{Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, eval, init,
-    install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade,
-    version, workers,
+    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, init, install,
+    login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade, version,
+    workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -39,9 +39,9 @@ struct Cli {
     #[arg(long, global = true, env = "SPICE_API_KEY")]
     api_key: Option<String>,
 
-    /// Use cloud instance of Spice. Requires --api-key
-    #[arg(long, global = true)]
-    cloud: bool,
+    /// Use cloud instance of Spice in the specified region. Requires --api-key
+    #[arg(long, global = true, value_parser = ["us-east-1", "us-west-2"])]
+    cloud: Option<String>,
 
     /// HTTP endpoint of Spice
     #[arg(long, global = true, default_value = "http://127.0.0.1:8090")]
@@ -115,9 +115,6 @@ enum Commands {
     /// Manage Spice Cloud resources
     Cloud(cloud::CloudArgs),
 
-    /// Run model evaluation
-    Eval(eval::EvalArgs),
-
     /// Return traces for operations that occurred in Spice
     Trace(trace::TraceArgs),
 
@@ -176,7 +173,6 @@ fn is_json_output(cmd: &Commands) -> bool {
         Commands::Pods(a) => a.output == OutputFormat::Json,
         Commands::Workers(a) => a.output == OutputFormat::Json,
         Commands::Trace(a) => matches!(a.output, trace::OutputFormat::Json),
-        Commands::Eval(a) => a.output == OutputFormat::Json,
         Commands::Search(a) => a.output == OutputFormat::Json,
         Commands::Query(a) => a.output == OutputFormat::Json,
         Commands::Acceleration(AccelerationArgs {
@@ -210,7 +206,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     let ctx = RuntimeContext::with_args(
         Some(cli.http_endpoint),
         cli.api_key,
-        cli.cloud,
+        cli.cloud.as_deref(),
         cli.tls_root_certificate_file,
     )?;
 
@@ -306,11 +302,6 @@ fn run_cli(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(cloud::execute(&ctx, &args))?;
-        }
-        Commands::Eval(args) => {
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
-            rt.block_on(eval::execute(&ctx, &args))?;
         }
         Commands::Trace(args) => {
             let rt = tokio::runtime::Runtime::new()

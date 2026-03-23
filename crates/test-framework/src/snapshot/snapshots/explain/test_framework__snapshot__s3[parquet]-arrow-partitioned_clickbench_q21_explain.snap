@@ -1,0 +1,32 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q21"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: count(Int64(1)) AS count(*)                                                                                                           |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                               |
+|               |     Projection:                                                                                                                                   |
+|               |       Filter: hits.URL LIKE LargeUtf8("%google%")                                                                                                 |
+|               |         TableScan: hits projection=[URL], partial_filters=[hits.URL LIKE LargeUtf8("%google%")]                                                   |
+| physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as count(*)]                                                                                              |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                       |
+|               |     CoalescePartitionsExec                                                                                                                        |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                 |
+|               |         ProjectionExec: expr=[]                                                                                                                   |
+|               |           FilterExec: URL@0 LIKE %google%                                                                                                         |
+|               |             SchemaCastScanExec                                                                                                                    |
+|               |               PartitionedUnionExec                                                                                                                |
+|               |                 BytesProcessedExec                                                                                                                |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 109, 109, 122, 172, 454] |
+|               |                 BytesProcessedExec                                                                                                                |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 141, 186, 496] |
+|               |                 BytesProcessedExec                                                                                                                |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 24, 191]                |
+|               |                 BytesProcessedExec                                                                                                                |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[36, 36, 36, 36, 36, 35, 35, 35, 35, 35, 35, 35, 35, 36, 52, 269]                |
+|               |                 BytesProcessedExec                                                                                                                |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 79, 463]                |
+|               |                                                                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+

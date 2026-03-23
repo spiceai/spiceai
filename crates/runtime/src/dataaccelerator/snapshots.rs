@@ -109,7 +109,9 @@ pub(super) async fn download_snapshot_if_needed(
     }
 }
 
-pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSource>>) {
+pub(crate) async fn validate_snapshot_paths(
+    sources: Vec<Arc<dyn AccelerationSource>>,
+) -> Result<(), SharedAccelerationSnapshotError> {
     let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
     for source in sources {
@@ -141,13 +143,24 @@ pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSou
         }
     }
 
-    for (path, datasets) in paths.into_iter().filter(|(_, ds)| ds.len() > 1) {
-        tracing::warn!(
-            "Datasets [{}] are configured to use the same acceleration file path '{}' while snapshots are enabled. Each dataset must use a unique file path to prevent snapshot conflicts.",
-            datasets.join(", "),
-            path.display()
-        );
+    if let Some((path, datasets)) = paths.into_iter().find(|(_, ds)| ds.len() > 1) {
+        return Err(SharedAccelerationSnapshotError::DuckDbSharedFile {
+            datasets: datasets.join(", "),
+            path: path.display().to_string(),
+        });
     }
+
+    Ok(())
+}
+
+#[derive(Debug, Snafu)]
+pub enum SharedAccelerationSnapshotError {
+    #[snafu(display(
+        "DuckDB doesn't support snapshots for shared acceleration. \
+        Datasets [{datasets}] share the same file '{path}'. \
+        Configure datasets to point to different location using duckdb_file"
+    ))]
+    DuckDbSharedFile { datasets: String, path: String },
 }
 
 #[derive(Debug, Snafu)]
@@ -163,6 +176,16 @@ pub enum CayenneSnapshotValidationError {
         metadata_dir: String,
         enabled_datasets: String,
         disabled_datasets: String,
+    },
+
+    #[snafu(display(
+        "Cayenne doesn't support snapshots for shared acceleration. \
+        Datasets [{datasets}] share metadata directory '{metadata_dir}'. \
+        Only single dataset per spicepod is supported when snapshots are enabled"
+    ))]
+    SharedAcceleration {
+        metadata_dir: String,
+        datasets: String,
     },
 }
 
@@ -230,6 +253,14 @@ pub fn validate_cayenne_snapshot_consistency(
                 },
             );
         }
+
+        // If all datasets have snapshots enabled and there are multiple, that's an error
+        if !enabled.is_empty() && disabled.is_empty() && enabled.len() > 1 {
+            return Err(CayenneSnapshotValidationError::SharedAcceleration {
+                metadata_dir,
+                datasets: enabled.join(", "),
+            });
+        }
     }
 
     Ok(())
@@ -241,4 +272,165 @@ pub fn validate_cayenne_snapshot_consistency(
     _sources: &[Arc<dyn AccelerationSource>],
 ) -> Result<(), CayenneSnapshotValidationError> {
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg(not(windows))]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
+    use datafusion::sql::TableReference;
+    use runtime_acceleration::snapshot::SnapshotBehavior;
+    use spicepod::acceleration::SnapshotsCompaction;
+    use spicepod::component::snapshot::Snapshots;
+    use std::sync::Weak;
+
+    struct MockSource {
+        name: TableReference,
+        acceleration: Option<Acceleration>,
+    }
+
+    impl MockSource {
+        fn cayenne_with_metadata_dir(
+            name: &str,
+            metadata_dir: &str,
+            snapshots_enabled: bool,
+        ) -> Arc<dyn AccelerationSource> {
+            let mut accel = Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                ..Default::default()
+            };
+            accel
+                .params
+                .insert("cayenne_metadata_dir".to_string(), metadata_dir.to_string());
+            if snapshots_enabled {
+                let snapshots = Arc::new(Snapshots::default());
+                let secrets = Weak::new();
+                let handle = tokio::runtime::Handle::current();
+                accel.snapshot_behavior = SnapshotBehavior::Enabled(
+                    snapshots,
+                    secrets,
+                    handle,
+                    SnapshotsCompaction::Disabled,
+                );
+            }
+            Arc::new(MockSource {
+                name: TableReference::bare(name),
+                acceleration: Some(accel),
+            })
+        }
+    }
+
+    impl AccelerationSource for MockSource {
+        fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+            Arc::new(MockSource {
+                name: self.name.clone(),
+                acceleration: self.acceleration.clone(),
+            })
+        }
+
+        fn is_file_accelerated(&self) -> bool {
+            self.acceleration
+                .as_ref()
+                .is_some_and(|a| matches!(a.mode, Mode::File | Mode::FileCreate))
+        }
+
+        fn app(&self) -> Arc<app::App> {
+            unimplemented!("not needed for validation tests")
+        }
+
+        fn runtime(&self) -> Arc<crate::Runtime> {
+            unimplemented!("not needed for validation tests")
+        }
+
+        fn acceleration(&self) -> Option<&Acceleration> {
+            self.acceleration.as_ref()
+        }
+
+        fn name(&self) -> &TableReference {
+            &self.name
+        }
+
+        fn time_column(&self) -> Option<&str> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_shared_acceleration_with_snapshots_errors() {
+        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
+            MockSource::cayenne_with_metadata_dir("ds1", "/tmp/meta", true),
+            MockSource::cayenne_with_metadata_dir("ds2", "/tmp/meta", true),
+        ];
+
+        let result = validate_cayenne_snapshot_consistency(&sources);
+        assert!(result.is_err());
+        let err = result.expect_err("expected error");
+        assert!(
+            matches!(
+                err,
+                CayenneSnapshotValidationError::SharedAcceleration { .. }
+            ),
+            "Expected SharedAcceleration error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_inconsistent_snapshot_settings_errors() {
+        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
+            MockSource::cayenne_with_metadata_dir("ds1", "/tmp/meta", true),
+            MockSource::cayenne_with_metadata_dir("ds2", "/tmp/meta", false),
+        ];
+
+        let result = validate_cayenne_snapshot_consistency(&sources);
+        assert!(result.is_err());
+        let err = result.expect_err("expected error");
+        assert!(
+            matches!(
+                err,
+                CayenneSnapshotValidationError::InconsistentSnapshotSettings { .. }
+            ),
+            "Expected InconsistentSnapshotSettings error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_single_dataset_with_snapshots_ok() {
+        let sources: Vec<Arc<dyn AccelerationSource>> =
+            vec![MockSource::cayenne_with_metadata_dir(
+                "ds1",
+                "/tmp/meta",
+                true,
+            )];
+
+        let result = validate_cayenne_snapshot_consistency(&sources);
+        result.expect("expected Ok");
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_different_metadata_dirs_ok() {
+        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
+            MockSource::cayenne_with_metadata_dir("ds1", "/tmp/meta1", true),
+            MockSource::cayenne_with_metadata_dir("ds2", "/tmp/meta2", true),
+        ];
+
+        let result = validate_cayenne_snapshot_consistency(&sources);
+        result.expect("expected Ok");
+    }
+
+    #[tokio::test]
+    async fn test_cayenne_shared_dir_all_disabled_ok() {
+        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
+            MockSource::cayenne_with_metadata_dir("ds1", "/tmp/meta", false),
+            MockSource::cayenne_with_metadata_dir("ds2", "/tmp/meta", false),
+        ];
+
+        let result = validate_cayenne_snapshot_consistency(&sources);
+        result.expect("expected Ok");
+    }
 }

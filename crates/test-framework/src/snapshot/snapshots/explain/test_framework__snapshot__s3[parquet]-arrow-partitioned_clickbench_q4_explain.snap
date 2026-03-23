@@ -1,0 +1,26 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q4"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                        |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[avg(CAST(hits.UserID AS Float64))]]                                                                         |
+|               |   TableScan: hits projection=[UserID]                                                                                                       |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                                                                                  |
+|               |   CoalescePartitionsExec                                                                                                                    |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]                                                                            |
+|               |       SchemaCastScanExec                                                                                                                    |
+|               |         PartitionedUnionExec                                                                                                                |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 109, 109, 122, 172, 454] |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 141, 186, 496] |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 24, 191]                |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[36, 36, 36, 36, 36, 35, 35, 35, 35, 35, 35, 35, 35, 36, 52, 269]                |
+|               |           BytesProcessedExec                                                                                                                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 79, 463]                |
+|               |                                                                                                                                             |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------+

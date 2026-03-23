@@ -40,7 +40,6 @@ use crate::{
         parameters::aws::initiate_config_with_credentials,
     },
     parameters::{ParameterSpec, Parameters},
-    register_data_connector,
 };
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -164,6 +163,7 @@ impl IcebergDataConnector {
                 "s3_secret_access_key",
                 "s3_session_token",
                 &self.params,
+                self.params.get("s3_iam_role_source").expose().ok(),
             )
             .await
             .map_err(|e| Error::InvalidConfiguration {
