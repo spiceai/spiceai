@@ -676,11 +676,13 @@ mod tests {
 
         // Aggregate references __common_expr_1 at index 0 and l_returnflag at index 1
         let proj_schema = proj.schema();
-        let sum_expr =
-            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("__common_expr_1", 0))])
-                .schema(Arc::clone(&proj_schema))
-                .alias("sum(__common_expr_1)")
-                .build()?;
+        let sum_expr = AggregateExprBuilder::new(
+            sum_udaf(),
+            vec![Arc::new(Column::new("__common_expr_1", 0))],
+        )
+        .schema(Arc::clone(&proj_schema))
+        .alias("sum(__common_expr_1)")
+        .build()?;
 
         let agg = partial_aggregate(proj, &[(1, "l_returnflag")], vec![Arc::new(sum_expr)])?;
 

@@ -210,14 +210,14 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         let target_schema = self.schema();
         let column_mapping = query.column_mapping;
 
-        let stream =
-            query_to_stream(self.client.clone(), query.sql, Arc::clone(&self.cookie_store)).map(
-                move |result: std::result::Result<_, DataFusionError>| {
-                    result.and_then(|batch| {
-                        remap_batch(&batch, &column_mapping, &target_schema)
-                    })
-                },
-            );
+        let stream = query_to_stream(
+            self.client.clone(),
+            query.sql,
+            Arc::clone(&self.cookie_store),
+        )
+        .map(move |result: std::result::Result<_, DataFusionError>| {
+            result.and_then(|batch| remap_batch(&batch, &column_mapping, &target_schema))
+        });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -307,37 +307,28 @@ fn build_aggregate_sql(
             if func_name == "count" && exprs.is_empty() {
                 all_fragments.push(("COUNT(*)".to_string(), "COUNT(*)".to_string(), true));
             } else if func_name == "count" {
-                let arg_sql =
-                    physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "Failed to convert count arg to SQL".to_string(),
-                            )
-                        })?;
+                let arg_sql = physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
+                    .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to convert count arg to SQL".to_string())
+                })?;
                 let frag = format!("COUNT({arg_sql})");
                 let key = format!("COUNT({})", strip_outer_cast(&arg_sql));
                 all_fragments.push((frag, key, true));
             } else {
-                let arg_sql =
-                    physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "Failed to convert {func_name} arg to SQL"
-                            ))
-                        })?;
+                let arg_sql = physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
+                    .ok_or_else(|| {
+                    DataFusionError::Internal(format!("Failed to convert {func_name} arg to SQL"))
+                })?;
                 let upper = func_name.to_uppercase();
                 let frag = format!("{upper}({arg_sql})");
                 let key = format!("{upper}({})", strip_outer_cast(&arg_sql));
                 all_fragments.push((frag, key, true));
             }
         } else if func_name == "avg" {
-            let arg_sql =
-                physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "Failed to convert avg arg to SQL".to_string(),
-                        )
-                    })?;
+            let arg_sql = physical_expr_to_sql(&exprs[0], input_schema, column_substitutions)
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to convert avg arg to SQL".to_string())
+                })?;
             // AVG decomposes into SUM + COUNT.
             // Use SUM(col) (no CAST) as the dedup key so it merges with an
             // existing explicit SUM(col). The local side casts the Decimal
@@ -559,9 +550,7 @@ fn arrow_type_to_sql(dt: &datafusion::arrow::datatypes::DataType) -> Option<Stri
         DataType::UInt64 => Some("BIGINT".to_string()),
         DataType::Float32 => Some("FLOAT".to_string()),
         DataType::Float64 | DataType::Float16 => Some("DOUBLE".to_string()),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            Some("VARCHAR".to_string())
-        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some("VARCHAR".to_string()),
         DataType::Boolean => Some("BOOLEAN".to_string()),
         DataType::Decimal128(p, s) => Some(format!("DECIMAL({p},{s})")),
         DataType::Decimal256(p, s) => Some(format!("DECIMAL({p},{s})")),
