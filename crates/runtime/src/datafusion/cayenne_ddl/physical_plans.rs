@@ -43,6 +43,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
 use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
+use data_components::flightsql::FlightSqlClient;
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -63,6 +64,7 @@ use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
+use crate::datafusion::cayenne_ddl::create_table_if_not_exists;
 
 /// Builds a filesystem-safe partition label for persisted metadata and Hive-style paths.
 ///
@@ -96,7 +98,7 @@ fn partition_label_for_expr(partition_expr: &Expr) -> String {
 ///
 /// Returns a SQL type that `DataFusion`'s SQL parser can understand in a
 /// `CREATE TABLE` statement.
-fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
+pub(super) fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
     match dt {
         DataType::Boolean => Ok("BOOLEAN".to_string()),
         DataType::Int8 => Ok("TINYINT".to_string()),
@@ -145,33 +147,11 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
     let futures: Vec<_> = clients
         .iter()
         .map(|(executor_id, client)| {
-            let mut client = client.clone();
-            let sql = sql.to_string();
+            let client = client.clone();
             let executor_id = executor_id.clone();
+            let sql = sql.to_string();
             async move {
-                use futures::StreamExt;
-
-                let result: Result<(), String> = async {
-                    let flight_info = client
-                        .execute(sql.clone(), None)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    for endpoint in flight_info.endpoint {
-                        let Some(ticket) = endpoint.ticket else {
-                            continue;
-                        };
-
-                        let mut stream =
-                            client.do_get(ticket).await.map_err(|e| e.to_string())?;
-                        while let Some(batch) = stream.next().await {
-                            batch.map_err(|e| e.to_string())?;
-                        }
-                    }
-
-                    Ok(())
-                }
-                .await;
+                let result = forward_ddl_to_executor(sql.clone(), client).await;
 
                 match &result {
                     Ok(()) => {
@@ -190,7 +170,7 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
     // Release the read lock before awaiting the futures.
     drop(clients);
 
-    let results = futures::future::join_all(futures).await;
+    let results: Vec<bool> = futures::future::join_all(futures).await;
     let success_count = results.iter().filter(|&&ok| ok).count();
 
     if success_count == 0 && !results.is_empty() {
@@ -210,6 +190,35 @@ pub fn ddl_result_schema() -> SchemaRef {
         DataType::Utf8,
         false,
     )]))
+}
+
+pub async fn forward_ddl_to_executor(
+    sql: String,
+    mut client: FlightSqlClient,
+) -> Result<(), String> {
+    use futures::StreamExt;
+
+    let result: Result<(), String> = async {
+        let flight_info = client
+            .execute(sql.clone(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        for endpoint in flight_info.endpoint {
+            let Some(ticket) = endpoint.ticket else {
+                continue;
+            };
+
+            let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
+            while let Some(batch) = stream.next().await {
+                batch.map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+    result
 }
 
 /// Physical plan for creating a Cayenne table.
@@ -608,17 +617,17 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
             };
 
-            schema_provider.register_table(table_name.clone(), wrapped_provider)?;
+            schema_provider.register_table(table_name.clone(), Arc::clone(&wrapped_provider))?;
 
             // Initialize partition metadata so the scheduler can route queries by partition.
+            let table_ref = datafusion::sql::TableReference::full(
+                df_catalog_name.clone(),
+                df_schema_name.clone(),
+                table_name.clone(),
+            );
             if let Some(ref pe) = partition_expr
                 && let Some(ref registry) = executor_registry
             {
-                let table_ref = datafusion::sql::TableReference::full(
-                    df_catalog_name.clone(),
-                    df_schema_name.clone(),
-                    table_name.clone(),
-                );
                 let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
                 let pm = registry.federated_partition_manager();
                 if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
@@ -632,31 +641,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             // Forward the CREATE TABLE DDL to executor nodes
             if let Some(ref registry) = executor_registry {
-                let columns_sql: Vec<String> = arrow_schema
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        let null_str = if f.is_nullable() { "" } else { " NOT NULL" };
-                        let sql_type = arrow_datatype_to_sql(f.data_type())?;
-                        Ok(format!("\"{}\" {sql_type}{null_str}", f.name()))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?;
-
-                let mut table_elements = columns_sql;
-                if !primary_key.is_empty() {
-                    let pk_cols = primary_key
-                        .iter()
-                        .map(|c| format!("\"{c}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
-                }
-
-                let ddl_sql = format!(
-                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
-                    table_elements.join(", ")
-                );
-                forward_ddl_to_executors(registry, &ddl_sql).await?;
+                if let Some(ddl_sql) =
+                    create_table_if_not_exists(&table_ref, &wrapped_provider).await?
+                {
+                    forward_ddl_to_executors(registry, &ddl_sql).await?;
+                };
             }
 
             let batch = RecordBatch::try_new(

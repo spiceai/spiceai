@@ -31,21 +31,17 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
-use datafusion::{
-    prelude::Expr,
-    sql::{
-        TableReference,
-        sqlparser::{
-            ast::{Ident, ObjectNamePart, visit_relations_mut},
-            dialect::PostgreSqlDialect,
-            parser::Parser,
-        },
+use datafusion::sql::{
+    TableReference,
+    sqlparser::{
+        ast::{Ident, ObjectNamePart, visit_relations_mut},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
     },
 };
 
 use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
-use datafusion_proto::bytes::Serializeable;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -61,7 +57,6 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
@@ -75,10 +70,12 @@ use tonic::{
 };
 
 use crate::cluster::{
-    executor_registry::{ExecutorRegistry, TablePartitions},
-    {SchedulerPeers, partition::partition_value_to_bytes},
+    SchedulerPeers, executor_registry::ExecutorRegistry, partition::allocation_initial_partitions,
 };
-use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::datafusion::{
+    DataFusion, SPICE_RUNTIME_SCHEMA,
+    cayenne_ddl::{create_table_if_not_exists, physical_plans::forward_ddl_to_executor},
+};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
@@ -594,121 +591,54 @@ impl ClusterService for ClusterServiceImpl {
         };
 
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
-        match create_executor_flight_client(&executor_url, tls_config_opt) {
-            Ok(client) => {
-                let mut flight_client_registry =
-                    self.executor_registry.flight_sql_clients.write().await;
-                flight_client_registry.insert(executor_id.to_string(), client);
-            }
-            Err(e) => {
+        let client = create_executor_flight_client(&executor_url, tls_config_opt)
+            .inspect_err(|e| {
                 tracing::warn!(
                     "Failed to create Flight SQL client for executor {executor_id}: {e}"
                 );
-            }
-        }
+            })
+            .map_err(|e| Status::internal(format!("Failed to create Flight SQL client: {e}")))?;
+        let mut flight_client_registry = self.executor_registry.flight_sql_clients.write().await;
+        flight_client_registry.insert(executor_id.to_string(), client.clone());
 
-        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
-
-        let partition_manager = self.executor_registry().accelerations_partition_manager();
-        let app_guard = self.app.read().await;
-        let mut total_assigned: usize = 0;
-        if let Some(app) = app_guard.as_ref() {
-            let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
-                runtime::PartitionManagement::default().max_partitions_per_executor,
-                runtime::Scheduler::max_partitions_per_executor,
-            );
-
-            // Find accelerated datasets with partitioning
-            for table_ref in super::partition::accelerated_tables(app).keys() {
-                if total_assigned >= max_partitions_per_executor {
-                    tracing::debug!(
-                        "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
-                    );
-                    break;
-                }
-                let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
-
-                if partition_manager
-                    .get_cached_table_metadata(table_ref)
-                    .is_none()
-                {
-                    tracing::info!(
-                        "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
-                    );
-                    continue;
-                }
-                match partition_manager
-                    .allocate_partitions(table_ref, executor_id, remaining)
+        // Forward `CREATE TABLE IF NOT EXIST` DDL to executor.
+        #[cfg(not(windows))]
+        for table_ref in discover_cayenne_tables(&self.datafusion).await {
+            if let Some(table) = self.datafusion.get_table(&table_ref).await
+                && let Some(ddl_sql) = create_table_if_not_exists(&table_ref, &table)
                     .await
-                {
-                    Ok(result) => {
-                        let newly_assigned = result.newly_assigned.len();
-                        let partitions = result.all_assigned();
-                        if partitions.is_empty() {
-                            continue;
-                        }
-                        let mut items = Vec::with_capacity(partitions.len());
-                        for partition in &partitions {
-                            match partition_value_to_bytes(
-                                partition.clone(),
-                                table_ref,
-                                &self.datafusion,
-                            )
-                            .await
-                            {
-                                Ok(bytes) => items.push(bytes.to_vec()),
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to serialize partition expression for table {table_ref}: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        total_assigned += newly_assigned;
-                        table_partitions.insert(table_ref.to_string(), BytesArray { items });
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to allocate partitions for table {table_ref} to executor {executor_id}: {e}",
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
+                    })?
+            {
+                forward_ddl_to_executor(ddl_sql, client.clone())
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "Failed to apply DDL for table {table_ref} to executor {executor_id}: {e}"
                         );
-                    }
+                        Status::internal(e)
+                    })?;
+            }
+        }
+
+        let app_guard = self.app.read().await;
+        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
+        if let Some(app) = app_guard.as_ref() {
+            match allocation_initial_partitions(
+                executor_id,
+                &self.executor_registry().accelerations_partition_manager(),
+                app,
+                &self.datafusion,
+            )
+            .await
+            {
+                Ok(p) => table_partitions = p,
+                Err(e) => {
+                    tracing::warn!("Failed to allocate partitions to executor {executor_id}: {e}")
                 }
             }
-        }
-
-        // Register the allocated partitions in the executor registry so the scheduler knows where they are
-        {
-            let registry = self.datafusion.ctx.as_ref();
-            let mut partition_map: TablePartitions = table_partitions
-                .iter()
-                .map(|(tbl, sa)| {
-                    let exprs = sa
-                        .items
-                        .iter()
-                        .filter_map(
-                            |bytes| match Expr::from_bytes_with_registry(bytes, registry) {
-                                Ok(expr) => Some(expr),
-                                Err(e) => {
-                                    tracing::error!("Failed to deserialize expr: {e}");
-                                    None
-                                }
-                            },
-                        )
-                        .collect();
-                    (TableReference::parse_str(tbl), exprs)
-                })
-                .collect();
-
-            // Register Cayenne tables as single unpartitioned entries (empty filter expressions).
-            // This tells the scheduler that queries targeting these tables should be forwarded to this executor.
-            #[cfg(not(windows))]
-            for table_ref in discover_cayenne_tables(&self.datafusion).await {
-                partition_map.entry(table_ref).or_default();
-            }
-
-            let mut executor_partitions = self.executor_registry.partitions.write().await;
-            executor_partitions.insert(executor_id.to_string(), partition_map);
-        }
+        };
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
             table_partitions,
