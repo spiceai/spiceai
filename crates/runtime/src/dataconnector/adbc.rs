@@ -28,10 +28,11 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -113,7 +114,11 @@ pub struct AdbcFactory {
     /// Cache of initialized ADBC connectors keyed by a deterministic representation
     /// of their configuration. Datasets with identical ADBC config share a single
     /// connector instance and connection pool.
-    cache: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>>>,
+    ///
+    /// Uses `Weak` references so connectors are released when all datasets using
+    /// them are dropped, preventing the cache from keeping connections alive
+    /// indefinitely.
+    cache: Arc<parking_lot::Mutex<HashMap<String, Weak<dyn DataConnector>>>>,
 }
 
 impl std::fmt::Debug for AdbcFactory {
@@ -126,13 +131,19 @@ impl AdbcFactory {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: parking_lot::Mutex::new(HashMap::new()),
+            cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self::new()) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl Default for AdbcFactory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -173,26 +184,27 @@ impl DataConnectorFactory for AdbcFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let cache_key = compute_adbc_cache_key(&params);
-        let cell = {
-            let mut cache = self.cache.lock();
-            Arc::clone(
-                cache
-                    .entry(cache_key)
-                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-            )
+
+        // Check for a cached connector that is still alive.
+        let cached = {
+            let cache = self.cache.lock();
+            cache.get(&cache_key).and_then(Weak::upgrade)
         };
+        if let Some(connector) = cached {
+            return Box::pin(async move { Ok(connector) });
+        }
+
+        let cache = Arc::clone(&self.cache);
 
         Box::pin(async move {
-            let connector = cell
-                .get_or_try_init(|| async move {
-                    let driver_name = params
-                        .parameters
-                        .get("driver")
-                        .expose()
-                        .ok()
-                        .context(MissingAdbcDriverSnafu)
-                        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                            dataconnector: "adbc".to_string(),
+            let driver_name = params
+                .parameters
+                .get("driver")
+                .expose()
+                .ok()
+                .context(MissingAdbcDriverSnafu)
+                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
                     source: Box::new(e),
                 })?;
@@ -283,50 +295,56 @@ impl DataConnectorFactory for AdbcFactory {
 
             // Driver loading, database creation, and pool creation are all
             // synchronous FFI/IO operations — offload to a blocking thread.
-            let pool = tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
-                    let mut driver = ManagedDriver::load_from_name(
-                        &driver_location,
-                        None,
-                        AdbcVersion::V110,
-                        LOAD_FLAG_DEFAULT,
-                        None,
-                    )
-                    .context(UnableToLoadDriverSnafu {
+            let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+                let mut driver = ManagedDriver::load_from_name(
+                    &driver_location,
+                    None,
+                    AdbcVersion::V110,
+                    LOAD_FLAG_DEFAULT,
+                    None,
+                )
+                .context(UnableToLoadDriverSnafu {
+                    driver_location: driver_location.clone(),
+                })?;
+
+                let db = driver.new_database_with_opts(db_options).context(
+                    UnableToCreateDatabaseSnafu {
                         driver_location: driver_location.clone(),
+                        uri: uri_str.clone(),
+                    },
+                )?;
+
+                let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
+                    .with_max_size(pool_size)
+                    .with_min_idle(pool_min_idle);
+
+                if let Some(conn_opts) = conn_options {
+                    pool_builder = pool_builder.with_conn_options(conn_opts);
+                }
+
+                let pool = pool_builder
+                    .build()
+                    .context(UnableToCreateConnectionPoolSnafu {
+                        driver_location,
+                        uri: uri_str,
                     })?;
 
-                    let db = driver.new_database_with_opts(db_options).context(
-                        UnableToCreateDatabaseSnafu {
-                            driver_location: driver_location.clone(),
-                            uri: uri_str.clone(),
-                        },
-                    )?;
+                Ok(Arc::new(pool))
+            });
+            let abort_handle = init_handle.abort_handle();
 
-                    let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
-                        .with_max_size(pool_size)
-                        .with_min_idle(pool_min_idle);
-
-                    if let Some(conn_opts) = conn_options {
-                        pool_builder = pool_builder.with_conn_options(conn_opts);
-                    }
-
-                    let pool = pool_builder
-                        .build()
-                        .context(UnableToCreateConnectionPoolSnafu {
-                            driver_location,
-                            uri: uri_str,
-                        })?;
-
-                    Ok(Arc::new(pool))
-                }),
+            let pool = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                init_handle,
             )
             .await
-            .map_err(|_elapsed| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component.clone(),
-                source: "ADBC driver initialization timed out after 120 seconds".into(),
+            .map_err(|_elapsed| {
+                abort_handle.abort();
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: component.clone(),
+                    source: "ADBC driver initialization timed out after 120 seconds".into(),
+                }
             })?
             .map_err(|e| DataConnectorError::UnableToConnectInternal {
                 dataconnector: "adbc".to_string(),
@@ -343,7 +361,7 @@ impl DataConnectorFactory for AdbcFactory {
                     };
                     DataConnectorError::UnableToConnectInternal {
                         dataconnector: format!("adbc ({driver_name_owned})"),
-                        connector_component: component.clone(),
+                        connector_component: component,
                         source: format!("{error_string}. {hint}").into(),
                     }
                 } else {
@@ -357,14 +375,20 @@ impl DataConnectorFactory for AdbcFactory {
 
             let adbc_factory = AdbcTableFactory::new(pool);
 
-            Ok(Arc::new(Adbc {
+            let connector = Arc::new(Adbc {
                 adbc_factory: Some(adbc_factory),
                 driver_name: driver_name_owned,
-            }) as Arc<dyn DataConnector>)
-                })
-                .await?;
+            }) as Arc<dyn DataConnector>;
 
-            Ok(Arc::clone(connector))
+            // Store a Weak reference in the cache so the connector can be
+            // shared by future datasets with the same config, but released
+            // when all datasets using it are dropped.
+            {
+                let mut c = cache.lock();
+                c.insert(cache_key, Arc::downgrade(&connector));
+            }
+
+            Ok(connector)
         })
     }
 
@@ -412,7 +436,7 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
             // Hash secret values so plaintext credentials are not retained in memory.
             let mut hasher = DefaultHasher::new();
             v.hash(&mut hasher);
-            key.push_str(&format!("{:x}", hasher.finish()));
+            let _ = write!(key, "{:x}", hasher.finish());
         } else {
             key.push_str(v);
         }

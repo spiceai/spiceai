@@ -328,13 +328,18 @@ impl RuntimeStatus {
         self.shutdown_token.cancel();
     }
 
-    /// Returns the shutdown cancellation token.
+    /// Returns a child of the shutdown cancellation token.
+    ///
+    /// The returned token is cancelled when the runtime shuts down (via
+    /// `mark_shutdown`), but calling `cancel()` on it will **not** cancel
+    /// the runtime's own token. This preserves the invariant that only
+    /// `mark_shutdown` triggers a runtime-wide shutdown.
     ///
     /// Use `token.cancelled()` in `tokio::select!` to make async operations
     /// (e.g. backoff sleeps) immediately interruptible on shutdown.
     #[must_use]
-    pub fn shutdown_token(&self) -> &CancellationToken {
-        &self.shutdown_token
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.child_token()
     }
 
     /// Returns the status of a specific component by its full name.
