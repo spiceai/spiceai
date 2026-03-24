@@ -1,19 +1,20 @@
 #syntax=docker/dockerfile:1.7
 
 # Build the ADBC BigQuery driver from source
-ARG ADBC_BIGQUERY_VERSION=1.11.2
+ARG ADBC_BIGQUERY_COMMIT=047c2d1c37cdfdf37438aae549130952afc6982f
 ARG GO_VERSION=1.26.1
 ARG BASE_IMAGE=debian:bookworm-slim
 
 FROM golang:${GO_VERSION}-bookworm AS adbc-bigquery
-ARG ADBC_BIGQUERY_VERSION
+ARG ADBC_BIGQUERY_COMMIT
 RUN set -eu; \
     apt-get update && apt-get install -y --no-install-recommends git ca-certificates gcc libc6-dev && \
     rm -rf /var/lib/{apt,dpkg,cache,log}
 RUN set -eu; \
-    git clone --depth 1 --branch "go/v${ADBC_BIGQUERY_VERSION}" \
-      https://github.com/adbc-drivers/bigquery.git /src/bigquery; \
-    cd /src/bigquery/go; \
+    git clone https://github.com/adbc-drivers/bigquery.git /src/bigquery; \
+    cd /src/bigquery; \
+    git checkout "${ADBC_BIGQUERY_COMMIT}"; \
+    cd go; \
     CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
       -o /libadbc_driver_bigquery.so ./pkg/; \
     rm -f /libadbc_driver_bigquery.h; \
