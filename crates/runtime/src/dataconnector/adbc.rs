@@ -426,7 +426,11 @@ fn classify_adbc_error(
     error: Box<dyn std::error::Error + Send + Sync>,
     driver_name: &str,
     dataset: &Dataset,
-    fallback_variant: fn(String, ConnectorComponent, Box<dyn std::error::Error + Send + Sync>) -> DataConnectorError,
+    fallback_variant: fn(
+        String,
+        ConnectorComponent,
+        Box<dyn std::error::Error + Send + Sync>,
+    ) -> DataConnectorError,
 ) -> DataConnectorError {
     let error_string = error.to_string();
     if is_auth_or_permission_error(&error_string) {
@@ -441,11 +445,7 @@ fn classify_adbc_error(
             source: format!("{error_string}. {hint}").into(),
         }
     } else {
-        fallback_variant(
-            "adbc".to_string(),
-            ConnectorComponent::from(dataset),
-            error,
-        )
+        fallback_variant("adbc".to_string(), ConnectorComponent::from(dataset), error)
     }
 }
 
@@ -467,16 +467,13 @@ impl DataConnector for Adbc {
             .table_provider(table_reference, dialect)
             .await
             .map_err(|e| {
-                classify_adbc_error(
-                    e,
-                    &self.driver_name,
-                    dataset,
-                    |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+                classify_adbc_error(e, &self.driver_name, dataset, |dc, cc, src| {
+                    DataConnectorError::UnableToGetReadProvider {
                         dataconnector: dc,
                         connector_component: cc,
                         source: src,
-                    },
-                )
+                    }
+                })
             })
     }
 
@@ -492,16 +489,13 @@ impl DataConnector for Adbc {
                 .read_write_table_provider(table_reference, dialect)
                 .await
                 .map_err(|e| {
-                    classify_adbc_error(
-                        e,
-                        &self.driver_name,
-                        dataset,
-                        |dc, cc, src| DataConnectorError::UnableToGetReadWriteProvider {
+                    classify_adbc_error(e, &self.driver_name, dataset, |dc, cc, src| {
+                        DataConnectorError::UnableToGetReadWriteProvider {
                             dataconnector: dc,
                             connector_component: cc,
                             source: src,
-                        },
-                    )
+                        }
+                    })
                 }),
         )
     }
