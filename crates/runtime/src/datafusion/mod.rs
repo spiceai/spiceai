@@ -448,44 +448,37 @@ fn remap_constraints_to_refresh_schema(
     source_schema: &SchemaRef,
     refresh_schema: &SchemaRef,
 ) -> Option<Constraints> {
+    // Helper to remap column indices from source to refresh schema using bounds-checked lookups.
+    let remap_indices = |indices: &[usize]| -> Option<Vec<usize>> {
+        indices
+            .iter()
+            .map(|&idx| {
+                let field = source_schema.fields().get(idx)?;
+                refresh_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == field.name())
+            })
+            .collect()
+    };
+
+    // If any PrimaryKey constraint cannot be fully remapped, return None entirely
+    // to avoid creating a table with Unique-only constraints that downstream code
+    // might incorrectly treat as having upsert (on_conflict) capability.
+    let has_unmappable_pk = source_constraints.iter().any(|c| {
+        matches!(c, Constraint::PrimaryKey(indices) if remap_indices(indices).is_none())
+    });
+    if has_unmappable_pk {
+        return None;
+    }
+
     let remapped: Vec<Constraint> = source_constraints
         .iter()
         .filter_map(|constraint| match constraint {
             Constraint::PrimaryKey(indices) => {
-                let new_indices: Vec<usize> = indices
-                    .iter()
-                    .filter_map(|&idx| {
-                        let col_name = source_schema.field(idx).name();
-                        refresh_schema
-                            .fields()
-                            .iter()
-                            .position(|f| f.name() == col_name)
-                    })
-                    .collect();
-                // Only keep the constraint if ALL primary key columns are present
-                if new_indices.len() == indices.len() {
-                    Some(Constraint::PrimaryKey(new_indices))
-                } else {
-                    None
-                }
+                remap_indices(indices).map(Constraint::PrimaryKey)
             }
-            Constraint::Unique(indices) => {
-                let new_indices: Vec<usize> = indices
-                    .iter()
-                    .filter_map(|&idx| {
-                        let col_name = source_schema.field(idx).name();
-                        refresh_schema
-                            .fields()
-                            .iter()
-                            .position(|f| f.name() == col_name)
-                    })
-                    .collect();
-                if new_indices.len() == indices.len() {
-                    Some(Constraint::Unique(new_indices))
-                } else {
-                    None
-                }
-            }
+            Constraint::Unique(indices) => remap_indices(indices).map(Constraint::Unique),
         })
         .collect();
 
@@ -3542,6 +3535,54 @@ mod tests {
                 Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                     vec![0]
                 )]))
+            );
+        }
+
+        #[test]
+        fn remap_mixed_pk_and_unique_with_missing_pk_returns_none() {
+            // If PK can't be remapped, return None even if Unique can be remapped.
+            // This prevents downstream code from seeing Unique-only constraints
+            // and incorrectly deriving on_conflict upsert behavior.
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["email", "name"]);
+            let constraints = Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]),  // "id" - missing from refresh
+                Constraint::Unique(vec![1]),       // "email" - present in refresh
+            ]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(result, None, "Should return None when PK cannot be remapped");
+        }
+
+        #[test]
+        fn remap_out_of_bounds_index_returns_none() {
+            // Constraint with out-of-bounds index should not panic
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints =
+                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![99])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(result, None, "Out-of-bounds index should return None, not panic");
+        }
+
+        #[test]
+        fn remap_mixed_pk_and_unique_both_present() {
+            // When both PK and Unique can be remapped, both should be preserved
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["name", "id", "email"]);
+            let constraints = Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]),  // "id" → index 1 in refresh
+                Constraint::Unique(vec![1]),       // "email" → index 2 in refresh
+            ]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![
+                    Constraint::PrimaryKey(vec![1]),
+                    Constraint::Unique(vec![2]),
+                ]))
             );
         }
     }
