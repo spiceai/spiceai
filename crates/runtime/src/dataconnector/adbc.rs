@@ -253,9 +253,7 @@ impl DataConnectorFactory for AdbcFactory {
 
             // Driver loading, database creation, and pool creation are all
             // synchronous FFI/IO operations — offload to a blocking thread.
-            let pool = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+            let pool = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
                     let mut driver = ManagedDriver::load_from_name(
                         &driver_location,
                         None,
@@ -290,14 +288,8 @@ impl DataConnectorFactory for AdbcFactory {
                         })?;
 
                     Ok(Arc::new(pool))
-                }),
-            )
+                })
             .await
-            .map_err(|_| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component.clone(),
-                source: "ADBC driver initialization timed out after 60 seconds".into(),
-            })?
             .map_err(|e| DataConnectorError::UnableToConnectInternal {
                 dataconnector: "adbc".to_string(),
                 connector_component: component.clone(),

@@ -40,7 +40,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use crate::{
     component::dataset::Dataset,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
-    dataconnector::{DataConnector, DataConnectorError},
+    dataconnector::{ConnectorComponent, DataConnector, DataConnectorError},
     tracers::OnceTracer,
     warn_once,
 };
@@ -176,19 +176,24 @@ impl FederatedTable {
 
         // The only valid state at this point is Waiting, we've already checked Done above and we always set the state back to Done before exiting.
         match deferred_state_owned {
-            DeferredState::Waiting(rx) => {
-                // If the table provider is not available yet, wait for it to become available.
-                let Ok(table_provider) = rx.await else {
-                    unreachable!(
-                        "deferred task should not be dropped before sending the table provider"
-                    );
-                };
-                let _ = deferred_table_provider
-                    .table
-                    .set(Arc::clone(&table_provider));
-                *deferred_state_guard = DeferredState::Done;
-                table_provider
-            }
+            DeferredState::Waiting(rx) => match rx.await {
+                Ok(table_provider) => {
+                    let _ = deferred_table_provider
+                        .table
+                        .set(Arc::clone(&table_provider));
+                    *deferred_state_guard = DeferredState::Done;
+                    table_provider
+                }
+                Err(_) => {
+                    // The deferred task was cancelled (e.g. during shutdown) without
+                    // sending a provider. Return a minimal empty-schema provider so
+                    // callers do not panic.
+                    *deferred_state_guard = DeferredState::Done;
+                    Arc::new(datafusion::datasource::empty::EmptyTable::new(
+                        deferred_table_provider.schema(),
+                    ))
+                }
+            },
             DeferredState::InProgress | DeferredState::Done => {
                 unreachable!("deferred state should only be Waiting at this point");
             }
@@ -222,6 +227,7 @@ impl FederatedTable {
                     return Err(RetryError::permanent(
                         DataConnectorError::UnableToGetReadProvider {
                             dataconnector: "shutdown".to_string(),
+                            connector_component: ConnectorComponent::from(&dataset),
                             source: "Runtime is shutting down".into(),
                         },
                     ));
