@@ -411,3 +411,237 @@ fn partition_value_to_expr(
     }
     Ok(expr)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::{
+        arrow::datatypes::SchemaRef,
+        common::tree_node::TreeNode,
+        config::ConfigOptions,
+        datasource::{DefaultTableSource, MemTable},
+        logical_expr::{LogicalPlan, LogicalPlanBuilder},
+        prelude::{SessionContext, col},
+    };
+
+    /// A test partition provider that splits the table into `n` partitions,
+    /// each backed by a `MemTable` with the same schema.
+    #[derive(Debug)]
+    struct TestPartitionProvider {
+        n_partitions: usize,
+    }
+
+    impl TablePartitionProvider for TestPartitionProvider {
+        fn get_partitions(
+            &self,
+            _table: &TableReference,
+            schema: &SchemaRef,
+        ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
+            (0..self.n_partitions)
+                .map(|_| {
+                    let provider: Arc<dyn TableProvider> =
+                        Arc::new(MemTable::try_new(Arc::clone(schema), vec![vec![]]).unwrap());
+                    (provider, vec![])
+                })
+                .collect()
+        }
+
+        fn should_partition(&self, _tbl: &TableScan) -> bool {
+            true
+        }
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("order_number", DataType::Int64, false),
+            Field::new("phone", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, true),
+        ]))
+    }
+
+    fn create_rewrite(ctx: &SessionContext, n_partitions: usize) -> PartitionedTableScanRewrite {
+        PartitionedTableScanRewrite::new(
+            Arc::new(TestPartitionProvider { n_partitions }),
+            ctx,
+        )
+    }
+
+    fn register_table(ctx: &SessionContext, name: &str, schema: SchemaRef) {
+        ctx.register_table(name, Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()))
+            .unwrap();
+    }
+
+    fn table_source(schema: SchemaRef) -> Arc<DefaultTableSource> {
+        Arc::new(DefaultTableSource::new(Arc::new(
+            MemTable::try_new(schema, vec![vec![]]).unwrap(),
+        )))
+    }
+
+    /// Count how many nodes of a given type appear in the plan tree.
+    fn count_plan_nodes(plan: &LogicalPlan, predicate: fn(&LogicalPlan) -> bool) -> usize {
+        let mut count = 0;
+        plan.apply(|p| {
+            if predicate(p) {
+                count += 1;
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        count
+    }
+
+    #[test]
+    fn bare_table_scan_produces_union() {
+        let ctx = SessionContext::new();
+        let schema = test_schema();
+        register_table(&ctx, "sales", Arc::clone(&schema));
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(schema), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rewrite = create_rewrite(&ctx, 3);
+        let config = ConfigOptions::default();
+        let result = rewrite.analyze(plan, &config).unwrap();
+
+        // Should contain a Union with 3 sub-scans
+        let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
+        assert!(union_count >= 1, "Expected at least one Union node, plan: {result}");
+    }
+
+    #[test]
+    fn sort_pushed_into_union_legs() {
+        let ctx = SessionContext::new();
+        let schema = test_schema();
+        register_table(&ctx, "sales", Arc::clone(&schema));
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(Arc::clone(&schema)), None)
+            .unwrap()
+            .sort(vec![col("order_number").sort(true, false)])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rewrite = create_rewrite(&ctx, 2);
+        let config = ConfigOptions::default();
+        let result = rewrite.analyze(plan, &config).unwrap();
+
+        // Should have 3 Sort nodes: outer Sort + 2 pushed-down Sorts in Union legs
+        let sort_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Sort(_)));
+        assert_eq!(sort_count, 3, "Expected 3 Sort nodes (1 outer + 2 inner), plan: {result}");
+    }
+
+    #[test]
+    fn limit_and_sort_pushed_into_union_legs() {
+        let ctx = SessionContext::new();
+        let schema = test_schema();
+        register_table(&ctx, "sales", Arc::clone(&schema));
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(Arc::clone(&schema)), None)
+            .unwrap()
+            .sort(vec![col("order_number").sort(true, false)])
+            .unwrap()
+            .limit(0, Some(10))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rewrite = create_rewrite(&ctx, 2);
+        let config = ConfigOptions::default();
+        let result = rewrite.analyze(plan, &config).unwrap();
+
+        // Should have outer Sort + 2 inner Sorts = 3 Sort nodes
+        let sort_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Sort(_)));
+        assert_eq!(sort_count, 3, "Expected 3 Sort nodes, plan: {result}");
+
+        // Should have outer Limit + 2 inner Limits = 3 Limit nodes
+        let limit_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Limit(_)));
+        assert_eq!(limit_count, 3, "Expected 3 Limit nodes, plan: {result}");
+    }
+
+    #[test]
+    fn limit_without_sort_pushed_into_union_legs() {
+        let ctx = SessionContext::new();
+        let schema = test_schema();
+        register_table(&ctx, "sales", Arc::clone(&schema));
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(Arc::clone(&schema)), None)
+            .unwrap()
+            .limit(0, Some(5))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rewrite = create_rewrite(&ctx, 2);
+        let config = ConfigOptions::default();
+        let result = rewrite.analyze(plan, &config).unwrap();
+
+        // Should have outer Limit + 2 inner Limits = 3 Limit nodes
+        let limit_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Limit(_)));
+        assert_eq!(limit_count, 3, "Expected 3 Limit nodes, plan: {result}");
+    }
+
+    #[test]
+    fn single_partition_no_union() {
+        let ctx = SessionContext::new();
+        let schema = test_schema();
+        register_table(&ctx, "sales", Arc::clone(&schema));
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(schema), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rewrite = create_rewrite(&ctx, 1);
+        let config = ConfigOptions::default();
+        let result = rewrite.analyze(plan, &config).unwrap();
+
+        // Single partition: no Union
+        let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
+        assert_eq!(union_count, 0, "Single partition should not produce Union, plan: {result}");
+    }
+
+    #[test]
+    fn zero_partitions_produces_empty_relation() {
+        let ctx = SessionContext::new();
+        let schema = test_schema();
+        register_table(&ctx, "sales", Arc::clone(&schema));
+
+        let plan = LogicalPlanBuilder::scan("sales", table_source(schema), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let rewrite = create_rewrite(&ctx, 0);
+        let config = ConfigOptions::default();
+        let result = rewrite.analyze(plan, &config).unwrap();
+
+        let empty_count =
+            count_plan_nodes(&result, |p| matches!(p, LogicalPlan::EmptyRelation(_)));
+        assert_eq!(empty_count, 1, "Zero partitions should produce EmptyRelation, plan: {result}");
+    }
+
+    #[test]
+    fn pushed_down_fetch_no_skip() {
+        let fetch = lit(10i64);
+        let result = pushed_down_fetch(None, Some(&fetch));
+        assert_eq!(result, Some(Box::new(lit(10i64))));
+    }
+
+    #[test]
+    fn pushed_down_fetch_with_skip() {
+        let skip = lit(5i64);
+        let fetch = lit(10i64);
+        let result = pushed_down_fetch(Some(&skip), Some(&fetch));
+        // Should be skip + fetch = 15
+        assert_eq!(result, Some(Box::new(lit(15i64))));
+    }
+
+    #[test]
+    fn pushed_down_fetch_none_returns_none() {
+        let result = pushed_down_fetch(None, None);
+        assert_eq!(result, None);
+    }
+}
