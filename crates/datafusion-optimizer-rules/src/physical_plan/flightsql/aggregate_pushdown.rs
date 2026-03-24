@@ -177,7 +177,7 @@ fn skip_repartition_roundrobin(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Execut
 /// Skip through a `ProjectionExec` if present, returning a column substitution
 /// map that maps each output column index to the projection's source expression.
 ///
-/// DataFusion's common subexpression elimination (CSE) can insert a
+/// `DataFusion`'s common subexpression elimination (CSE) can insert a
 /// `ProjectionExec` between `AggregateExec(Partial)` and the scan to
 /// pre-compute shared sub-expressions (e.g. `l_extendedprice * (1 - l_discount)`
 /// → `__common_expr_1`). The aggregate then references these synthetic columns.

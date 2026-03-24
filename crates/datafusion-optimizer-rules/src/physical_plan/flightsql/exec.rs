@@ -315,7 +315,7 @@ fn remap_batch(
 ///
 /// Returns the SQL and a column mapping from output position → remote column index.
 ///
-/// DataFusion normalises `SUM(col)` and `SUM(CAST(col AS DOUBLE))` to the same
+/// `DataFusion` normalises `SUM(col)` and `SUM(CAST(col AS DOUBLE))` to the same
 /// internal aggregate name, causing a "duplicate field name" error on the remote
 /// side.  To avoid this we strip outer CASTs when computing a dedup key, emit
 /// each unique aggregate only once, and let [`remap_batch`] cast the result to
