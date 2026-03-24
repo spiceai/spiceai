@@ -464,7 +464,11 @@ impl DataAccelerator for DuckDBAccelerator {
                             )
                             && ds.name != source_name
                         {
-                            let mut params = accel.params.clone();
+                            let mut params = accel
+                                .params
+                                .as_ref()
+                                .map(|p| p.as_string_map())
+                                .unwrap_or_default();
                             let data_directory = params
                                 .remove("duckdb_data_dir")
                                 .unwrap_or_else(spice_data_base_path);
