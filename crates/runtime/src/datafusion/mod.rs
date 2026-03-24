@@ -3436,15 +3436,14 @@ mod tests {
             // Source PK: [0] (id) → Refresh PK: [1] (id)
             let source = schema(&["id", "created_at", "email"]);
             let refresh = schema(&["email", "id"]);
-            let constraints =
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
 
             let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
             assert_eq!(
                 result,
-                Some(Constraints::new_unverified(vec![
-                    Constraint::PrimaryKey(vec![1])
-                ]))
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![1]
+                )]))
             );
         }
 
@@ -3455,15 +3454,14 @@ mod tests {
             // Source PK: [0, 1] (id, org_id) → Refresh PK: [1, 2]
             let source = schema(&["id", "org_id", "name", "email"]);
             let refresh = schema(&["name", "id", "org_id"]);
-            let constraints =
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1])]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1])]);
 
             let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
             assert_eq!(
                 result,
-                Some(Constraints::new_unverified(vec![
-                    Constraint::PrimaryKey(vec![1, 2])
-                ]))
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![1, 2]
+                )]))
             );
         }
 
@@ -3473,8 +3471,7 @@ mod tests {
             // Refresh: name(0), email(1) — PK column "id" is missing
             let source = schema(&["id", "name", "email"]);
             let refresh = schema(&["name", "email"]);
-            let constraints =
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
 
             let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
             assert_eq!(result, None);
@@ -3485,15 +3482,14 @@ mod tests {
             // Source and refresh have the same schema
             let source = schema(&["id", "email"]);
             let refresh = schema(&["id", "email"]);
-            let constraints =
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
 
             let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
             assert_eq!(
                 result,
-                Some(Constraints::new_unverified(vec![
-                    Constraint::PrimaryKey(vec![0])
-                ]))
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0]
+                )]))
             );
         }
 
@@ -3501,15 +3497,14 @@ mod tests {
         fn remap_unique_constraint() {
             let source = schema(&["id", "email", "name"]);
             let refresh = schema(&["name", "email"]);
-            let constraints =
-                Constraints::new_unverified(vec![Constraint::Unique(vec![1])]);
+            let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![1])]);
 
             let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
             assert_eq!(
                 result,
-                Some(Constraints::new_unverified(vec![Constraint::Unique(
-                    vec![1]
-                )]))
+                Some(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    1
+                ])]))
             );
         }
 
@@ -3538,16 +3533,15 @@ mod tests {
             ]);
             let refresh = schema(&["id", "email"]);
             // Debezium sets PK on "id" column, index 0 in source schema
-            let constraints =
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
 
             let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
             // "id" is at index 0 in the refresh schema too
             assert_eq!(
                 result,
-                Some(Constraints::new_unverified(vec![
-                    Constraint::PrimaryKey(vec![0])
-                ]))
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0]
+                )]))
             );
         }
     }
