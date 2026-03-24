@@ -282,8 +282,8 @@ pub fn duckdb_file_path(
     }
 }
 
-/// Compute the DuckDB file path from raw spicepod acceleration params.
-/// Used when computing attach_databases from all configured (not yet initialized) sources.
+/// Compute the `DuckDB` file path from raw spicepod acceleration params.
+/// Used when computing `attach_databases` from all configured (not yet initialized) sources.
 fn duckdb_file_path_from_params(
     duckdb_factory: &DuckDBTableProviderFactory,
     accel: &spicepod::acceleration::Acceleration,
