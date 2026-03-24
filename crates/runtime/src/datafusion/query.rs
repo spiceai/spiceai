@@ -21,17 +21,14 @@ use ::cache::{
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
-use arrow::array::UInt64Array;
 use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
-    datasource::memory::MemorySourceConfig,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::dml::InsertOp,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
@@ -1529,198 +1526,15 @@ async fn create_update_physical_plan(
         ))
     })?;
 
-    let deletion_provider =
-        get_deletion_provider(Arc::clone(&table_provider)).ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "Table '{}' does not support UPDATE operations",
-                dml.table_name
-            ))
-        })?;
-
     let source_plan = session_state.create_physical_plan(&dml.input).await?;
     let filters = extract_dml_filters(&dml.input);
 
-    Ok(Arc::new(UpdateExec::new(
+    Ok(Arc::new(data_components::update::UpdateExec::new(
         source_plan,
         table_provider,
-        deletion_provider,
         session_state.clone(),
         filters,
     )))
-}
-
-struct UpdateExec {
-    source_plan: Arc<dyn ExecutionPlan>,
-    table_provider: Arc<dyn datafusion::datasource::TableProvider>,
-    deletion_provider: Arc<dyn data_components::delete::DeletionTableProvider>,
-    session_state: SessionState,
-    filters: Vec<Expr>,
-    properties: datafusion::physical_plan::PlanProperties,
-}
-
-impl UpdateExec {
-    fn new(
-        source_plan: Arc<dyn ExecutionPlan>,
-        table_provider: Arc<dyn datafusion::datasource::TableProvider>,
-        deletion_provider: Arc<dyn data_components::delete::DeletionTableProvider>,
-        session_state: SessionState,
-        filters: Vec<Expr>,
-    ) -> Self {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
-        ]));
-        let properties = datafusion::physical_plan::PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(Arc::clone(&schema)),
-            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
-        Self {
-            source_plan,
-            table_provider,
-            deletion_provider,
-            session_state,
-            filters,
-            properties,
-        }
-    }
-}
-
-impl std::fmt::Debug for UpdateExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UpdateExec").finish_non_exhaustive()
-    }
-}
-
-impl datafusion::physical_plan::DisplayAs for UpdateExec {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "UpdateExec")
-    }
-}
-
-impl ExecutionPlan for UpdateExec {
-    fn name(&self) -> &'static str {
-        "UpdateExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.source_plan]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
-                "UpdateExec requires exactly one child, got {}",
-                children.len()
-            )));
-        }
-
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            Arc::clone(&self.table_provider),
-            Arc::clone(&self.deletion_provider),
-            self.session_state.clone(),
-            self.filters.clone(),
-        )))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> std::result::Result<SendableRecordBatchStream, DataFusionError> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "UpdateExec only supports partition 0, got {partition}"
-            )));
-        }
-
-        let source_plan = Arc::clone(&self.source_plan);
-        let table_provider = Arc::clone(&self.table_provider);
-        let deletion_provider = Arc::clone(&self.deletion_provider);
-        let session_state = self.session_state.clone();
-        let filters = self.filters.clone();
-
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
-        ]));
-
-        let stream = futures::stream::once(async move {
-            use futures::TryStreamExt;
-
-            let source_stream = execute_stream(Arc::clone(&source_plan), Arc::clone(&context))?;
-            let updated_batches: Vec<RecordBatch> = source_stream.try_collect().await?;
-
-            // Normalize update output to match the target table schema (including nullability)
-            // before performing any destructive operation.
-            let target_schema = table_provider.schema();
-            let normalized_batches = updated_batches
-                .into_iter()
-                .map(|batch| {
-                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(DataFusionError::from)?;
-
-            let delete_plan = DeletionTableProvider::delete_from(
-                deletion_provider.as_ref(),
-                &session_state,
-                &filters,
-            )
-            .await?;
-            let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-            let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-
-            let deleted_count = delete_batches
-                .iter()
-                .flat_map(RecordBatch::columns)
-                .find_map(|arr| {
-                    arr.as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .and_then(|counts| counts.values().first().copied())
-                })
-                .unwrap_or(0);
-
-            if !normalized_batches.is_empty() {
-                let input_exec = MemorySourceConfig::try_new_exec(
-                    &[normalized_batches],
-                    Arc::clone(&target_schema),
-                    None,
-                )?;
-                let insert_plan = table_provider
-                    .insert_into(&session_state, input_exec, InsertOp::Append)
-                    .await?;
-                let insert_stream = execute_stream(insert_plan, Arc::clone(&context))?;
-                let _insert_batches: Vec<RecordBatch> = insert_stream.try_collect().await?;
-            }
-
-            let result = RecordBatch::try_from_iter_with_nullable(vec![(
-                "count",
-                Arc::new(UInt64Array::from(vec![deleted_count])) as arrow::array::ArrayRef,
-                false,
-            )])
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-            Ok(result)
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
 }
 
 #[cfg(test)]

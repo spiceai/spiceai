@@ -344,6 +344,21 @@ impl TableProvider for MemTable {
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.column_defaults.get(column)
     }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(MemDeletionSink::new(
+                self.batches.clone(),
+                self.schema(),
+                &filters,
+            )),
+            &self.schema(),
+        )))
+    }
 }
 
 /// Implements for writing to a [`MemTable`]
@@ -1059,17 +1074,10 @@ impl DataSink for MemSink {
 impl DeletionTableProvider for MemTable {
     async fn delete_from(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(MemDeletionSink::new(
-                self.batches.clone(),
-                self.schema(),
-                filters,
-            )),
-            &self.schema(),
-        )))
+        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 

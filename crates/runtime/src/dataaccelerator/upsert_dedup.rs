@@ -167,6 +167,14 @@ impl TableProvider for UpsertDedupTableProvider {
 
         self.inner.insert_into(state, dedup_exec, op).await
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        DeletionTableProvider::delete_from(self.deletion_provider.as_ref(), state, &filters).await
+    }
 }
 
 #[async_trait]
@@ -176,7 +184,7 @@ impl DeletionTableProvider for UpsertDedupTableProvider {
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        DeletionTableProvider::delete_from(self.deletion_provider.as_ref(), state, filters).await
+        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 

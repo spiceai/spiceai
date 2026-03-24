@@ -446,11 +446,18 @@ impl datafusion::datasource::TableProvider for IcebergDeletionProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.inner.insert_into(state, input, overwrite).await
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<datafusion::logical_expr::Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.delete_from_impl(state, &filters).await
+    }
 }
 
-#[async_trait]
-impl crate::delete::DeletionTableProvider for IcebergDeletionProvider {
-    async fn delete_from(
+impl IcebergDeletionProvider {
+    async fn delete_from_impl(
         &self,
         state: &dyn Session,
         filters: &[datafusion::logical_expr::Expr],
@@ -572,5 +579,16 @@ impl crate::delete::DeletionTableProvider for IcebergDeletionProvider {
             coalesced,
             equality_ids,
         )))
+    }
+}
+
+#[async_trait]
+impl crate::delete::DeletionTableProvider for IcebergDeletionProvider {
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: &[datafusion::logical_expr::Expr],
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.delete_from_impl(state, filters).await
     }
 }

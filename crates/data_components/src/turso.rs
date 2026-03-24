@@ -1199,23 +1199,31 @@ impl TableProvider for TursoTableProvider {
         // Wrap in DataSinkExec to execute the insertion
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(TursoDeletionSink::new(
+                Arc::clone(&self.pool),
+                self.table_name.clone(),
+                &filters,
+            )),
+            &self.schema(),
+        )))
+    }
 }
 
 #[async_trait]
 impl DeletionTableProvider for TursoTableProvider {
     async fn delete_from(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(TursoDeletionSink::new(
-                Arc::clone(&self.pool),
-                self.table_name.clone(),
-                filters,
-            )),
-            &self.schema(),
-        )))
+        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 

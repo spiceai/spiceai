@@ -391,6 +391,26 @@ impl TableProvider for PartitionTableProvider {
             .execute_insert(input, insert_op, &ctx)
             .await
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Collect all partitions that need deletion
+        let partitions = self.partitions.read().await;
+        let partition_list: Vec<_> = partitions.values().cloned().collect();
+        drop(partitions);
+
+        // Create a deletion sink that will iterate over all partitions
+        let deletion_sink = Arc::new(PartitionedDeletionSink::new(
+            partition_list,
+            filters,
+            state.task_ctx(),
+        ));
+
+        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
+    }
 }
 
 /// Implement `DeletionTableProvider` to support retention checks and delete operations
@@ -402,19 +422,7 @@ impl DeletionTableProvider for PartitionTableProvider {
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Collect all partitions that need deletion
-        let partitions = self.partitions.read().await;
-        let partition_list: Vec<_> = partitions.values().cloned().collect();
-        drop(partitions);
-
-        // Create a deletion sink that will iterate over all partitions
-        let deletion_sink = Arc::new(PartitionedDeletionSink::new(
-            partition_list,
-            filters.to_vec(),
-            state.task_ctx(),
-        ));
-
-        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
+        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 

@@ -4093,6 +4093,23 @@ impl TableProvider for CayenneTableProvider {
 
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if self.file_based_deletes_preferred(&filters) {
+            tracing::debug!(
+                "Table '{}': using file-based retention delete path",
+                self.table_metadata.table_name,
+            );
+            return self.delete_using_files(&filters);
+        }
+
+        // Default path: deletion vectors via CayenneDeletionSink
+        self.delete_using_deletion_vectors(&filters)
+    }
 }
 
 // Implement DeletionTableProvider for Cayenne
@@ -4100,19 +4117,10 @@ impl TableProvider for CayenneTableProvider {
 impl DeletionTableProvider for CayenneTableProvider {
     async fn delete_from(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        if self.file_based_deletes_preferred(filters) {
-            tracing::debug!(
-                "Table '{}': using file-based retention delete path",
-                self.table_metadata.table_name,
-            );
-            return self.delete_using_files(filters);
-        }
-
-        // Default path: deletion vectors via CayenneDeletionSink
-        self.delete_using_deletion_vectors(filters)
+        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 
