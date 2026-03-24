@@ -402,13 +402,13 @@ impl Runtime {
         // Test dataset connectivity by attempting to get a read provider.
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
-                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&data_connector)).await
+                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&data_connector), self.status.shutdown_token().clone()).await
             }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
                 if let Some(federated_table) =
-                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&data_connector)).await
+                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&data_connector), self.status.shutdown_token().clone()).await
                 {
                     tracing::warn!(
                         "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
@@ -658,7 +658,7 @@ impl Runtime {
             .build()
         })?;
         let federated_table =
-            FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector)).await;
+            FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector), self.status.shutdown_token().clone()).await;
 
         // Remove the schedule if the dataset has one, to prevent scheduling while the dataset is being updated.
         Arc::clone(&self)

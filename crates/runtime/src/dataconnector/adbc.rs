@@ -78,13 +78,28 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Adbc {
-    adbc_factory: AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
+    /// Wrapped in `Option` so `Drop` can move the factory to a blocking thread
+    /// for cleanup. ADBC drivers perform synchronous FFI calls during drop
+    /// (e.g. closing network sessions) that must not run on the async runtime.
+    adbc_factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
     driver_name: String,
 }
 
 impl std::fmt::Debug for Adbc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adbc").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Adbc {
+    fn drop(&mut self) {
+        if let Some(factory) = self.adbc_factory.take() {
+            // Offload the potentially-blocking FFI drop to a dedicated thread so it
+            // does not stall the Tokio runtime during shutdown.
+            std::thread::spawn(move || {
+                drop(factory);
+            });
+        }
     }
 }
 
@@ -313,7 +328,7 @@ impl DataConnectorFactory for AdbcFactory {
             let adbc_factory = AdbcTableFactory::new(pool);
 
             Ok(Arc::new(Adbc {
-                adbc_factory,
+                adbc_factory: Some(adbc_factory),
                 driver_name: driver_name_owned,
             }) as Arc<dyn DataConnector>)
         })
@@ -404,7 +419,7 @@ fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync
 
 /// Checks if an error message indicates an authentication or authorization failure.
 ///
-/// BigQuery's ADBC driver often returns `Status::Unknown` with auth details in the
+/// `BigQuery`'s ADBC driver often returns `Status::Unknown` with auth details in the
 /// message body rather than using `Status::Unauthenticated`/`Status::Unauthorized`,
 /// so we also inspect the error text.
 fn is_auth_or_permission_error(error_message: &str) -> bool {
@@ -421,7 +436,7 @@ fn is_auth_or_permission_error(error_message: &str) -> bool {
 }
 
 /// Classify a provider error into a more specific [`DataConnectorError`] for
-/// BigQuery auth/permission failures, falling back to `fallback_variant`.
+/// `BigQuery` auth/permission failures, falling back to `fallback_variant`.
 fn classify_adbc_error(
     error: Box<dyn std::error::Error + Send + Sync>,
     driver_name: &str,
@@ -461,9 +476,17 @@ impl DataConnector for Adbc {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let adbc_factory =
+            self.adbc_factory
+                .as_ref()
+                .ok_or_else(|| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: "ADBC connector has been shut down".into(),
+                })?;
         let table_reference = dataset.path().into();
         let dialect = dialect_for_driver(&self.driver_name);
-        self.adbc_factory
+        adbc_factory
             .table_provider(table_reference, dialect)
             .await
             .map_err(|e| {
@@ -481,11 +504,23 @@ impl DataConnector for Adbc {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        let adbc_factory =
+            self.adbc_factory
+                .as_ref()
+                .ok_or_else(|| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: "ADBC connector has been shut down".into(),
+                });
+        let adbc_factory = match adbc_factory {
+            Ok(f) => f,
+            Err(e) => return Some(Err(e)),
+        };
         let table_reference = dataset.path().into();
         let dialect = dialect_for_driver(&self.driver_name);
 
         Some(
-            self.adbc_factory
+            adbc_factory
                 .read_write_table_provider(table_reference, dialect)
                 .await
                 .map_err(|e| {

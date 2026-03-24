@@ -34,6 +34,7 @@ use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use tokio::sync::{RwLock, oneshot};
+use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
@@ -85,6 +86,7 @@ impl FederatedTable {
         dataset: Arc<Dataset>,
         table_provider: Arc<dyn TableProvider>,
         data_connector: Arc<dyn DataConnector>,
+        shutdown_token: CancellationToken,
     ) -> Self {
         let Some(checkpoint) = Self::get_checkpoint(Arc::clone(&dataset)).await else {
             // Either this is not an accelerated table or the checkpoint does not exist.
@@ -102,6 +104,7 @@ impl FederatedTable {
                 Arc::clone(&dataset),
                 data_connector,
                 accelerated_schema,
+                shutdown_token,
             ));
         }
 
@@ -115,6 +118,7 @@ impl FederatedTable {
     pub async fn new_deferred(
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
+        shutdown_token: CancellationToken,
     ) -> Option<Self> {
         let checkpoint = Self::get_checkpoint(Arc::clone(&dataset)).await?;
         let accelerated_schema = checkpoint.get_schema().await.ok()??;
@@ -123,6 +127,7 @@ impl FederatedTable {
             dataset,
             data_connector,
             accelerated_schema,
+            shutdown_token,
         )))
     }
 
@@ -201,6 +206,7 @@ impl FederatedTable {
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         schema: SchemaRef,
+        shutdown_token: CancellationToken,
     ) -> DeferredTableProvider {
         let dataset_name = dataset.name.clone();
         let accelerated_schema = Arc::clone(&schema);
@@ -211,7 +217,16 @@ impl FederatedTable {
 
             let tracer = OnceTracer::new();
             let data_connector = Arc::clone(&data_connector);
-            let table_provider_result = retry(retry_strategy, || async {
+            let retry_fut = retry(retry_strategy, || async {
+                if shutdown_token.is_cancelled() {
+                    return Err(RetryError::permanent(
+                        DataConnectorError::UnableToGetReadProvider {
+                            dataconnector: "shutdown".to_string(),
+                            source: "Runtime is shutting down".into(),
+                        },
+                    ));
+                }
+
                 match data_connector.read_provider(&dataset).await {
                     Ok(table_provider) => {
                         let federated_schema = table_provider.schema();
@@ -231,8 +246,17 @@ impl FederatedTable {
                     }
                     Err(e) => Err(RetryError::transient(e)),
                 }
-            })
-            .await;
+            });
+
+            // Use tokio::select! so that the retry loop is interrupted immediately
+            // when the runtime begins shutting down (e.g. on Ctrl-C).
+            let table_provider_result = tokio::select! {
+                result = retry_fut => result,
+                () = shutdown_token.cancelled() => {
+                    tracing::debug!("Deferred table provider for '{}' cancelled due to shutdown.", dataset.name);
+                    return;
+                }
+            };
 
             match table_provider_result {
                 Ok(table_provider) => {
