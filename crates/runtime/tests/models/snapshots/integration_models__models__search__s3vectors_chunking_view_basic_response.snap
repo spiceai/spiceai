@@ -6,15 +6,15 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.79,
+      "_score": 0.55,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\n2"
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
         ]
       },
       "primary_key": {
-        "id": 612
+        "id": 948
       }
     },
     {
@@ -30,27 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.5,
+      "_score": 0.53,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          " 2 = 8\\)"
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24"
         ]
       },
       "primary_key": {
-        "id": 1284
+        "id": 468
       }
     },
     {
-      "_score": 0.48,
+      "_score": 0.52,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\n2.75 + 27 \\times \\frac{1}{5} - 75 = 2.75 + 5.4 - 75 = 8.15 - 7"
+          "4, 2))^3 \\times 40}\\)"
         ]
       },
       "primary_key": {
-        "id": 1250
+        "id": 450
       }
     }
   ]
