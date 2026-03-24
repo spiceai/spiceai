@@ -17,13 +17,7 @@ limitations under the License.
 use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
 use crate::{
     App, Runtime,
-    component::{
-        dataset::{
-            Dataset,
-            acceleration::{Acceleration, Engine, Mode},
-        },
-        view::View,
-    },
+    component::dataset::acceleration::{Acceleration, Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     datafusion::{
         dialect::new_duckdb_dialect,
@@ -456,23 +450,32 @@ impl DataAccelerator for DuckDBAccelerator {
                 // enabling cross-table joins immediately without needing a restart.
                 let app = source.app();
                 let self_path = self.file_path(source)?;
+                let source_name = source.name().to_string();
                 let attach_databases: HashSet<String> = app
                     .datasets
                     .iter()
                     .filter_map(|ds| {
                         let accel = ds.acceleration.as_ref()?;
-                        if accel.engine == Engine::DuckDB
-                            && matches!(accel.mode, Mode::File | Mode::FileCreate)
-                            && ds.name != *source.name()
+                        if accel.engine.as_deref() == Some("duckdb")
+                            && matches!(
+                                accel.mode,
+                                spicepod::acceleration::Mode::File
+                                    | spicepod::acceleration::Mode::FileCreate
+                            )
+                            && ds.name != source_name
                         {
-                            let other_path =
-                                duckdb_file_path(&self.duckdb_factory, ds, "accelerated_duckdb")
-                                    .ok()?;
-                            if other_path != self_path {
-                                Some(other_path)
-                            } else {
-                                None
+                            let mut params = accel.params.clone();
+                            let data_directory = params
+                                .remove("duckdb_data_dir")
+                                .unwrap_or_else(spice_data_base_path);
+                            params.insert("data_directory".to_string(), data_directory);
+                            if let Some(duckdb_file) = params.remove("duckdb_file") {
+                                params.insert("duckdb_open".to_string(), duckdb_file);
                             }
+                            self.duckdb_factory
+                                .duckdb_file_path("accelerated_duckdb", &mut params)
+                                .ok()
+                                .filter(|p| p != &self_path)
                         } else {
                             None
                         }
