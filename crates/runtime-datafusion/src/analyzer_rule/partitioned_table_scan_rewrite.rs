@@ -447,8 +447,10 @@ mod tests {
         ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
             (0..self.n_partitions)
                 .map(|_| {
-                    let provider: Arc<dyn TableProvider> =
-                        Arc::new(MemTable::try_new(Arc::clone(schema), vec![vec![]]).expect("creating test MemTable"));
+                    let provider: Arc<dyn TableProvider> = Arc::new(
+                        MemTable::try_new(Arc::clone(schema), vec![vec![]])
+                            .expect("creating test MemTable"),
+                    );
                     (provider, vec![])
                 })
                 .collect()
