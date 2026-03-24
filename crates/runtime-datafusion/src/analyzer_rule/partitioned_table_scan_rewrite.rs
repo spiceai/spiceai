@@ -219,32 +219,32 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 // is now SubqueryAlias(Union(...)). We push Sort into each leg so each
                 // executor sorts locally, reducing the data sent to the coordinator.
                 LogicalPlan::Sort(sort) => {
-                    if let LogicalPlan::SubqueryAlias(alias) = sort.input.as_ref() {
-                        if let LogicalPlan::Union(union) = alias.input.as_ref() {
-                            let new_inputs: Vec<Arc<LogicalPlan>> = union
-                                .inputs
-                                .iter()
-                                .map(|leg| {
-                                    Arc::new(LogicalPlan::Sort(Sort {
-                                        expr: sort.expr.clone(),
-                                        input: Arc::clone(leg),
-                                        fetch: sort.fetch,
-                                    }))
-                                })
-                                .collect();
-                            let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
-                            let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                                Arc::new(new_union),
-                                alias.alias.clone(),
-                            )?);
-                            // Keep the outer Sort for correctness (merges sorted streams).
-                            let result = LogicalPlan::Sort(Sort {
-                                expr: sort.expr.clone(),
-                                input: Arc::new(new_alias),
-                                fetch: sort.fetch,
-                            });
-                            return Ok(Transformed::yes(result));
-                        }
+                    if let LogicalPlan::SubqueryAlias(alias) = sort.input.as_ref()
+                        && let LogicalPlan::Union(union) = alias.input.as_ref()
+                    {
+                        let new_inputs: Vec<Arc<LogicalPlan>> = union
+                            .inputs
+                            .iter()
+                            .map(|leg| {
+                                Arc::new(LogicalPlan::Sort(Sort {
+                                    expr: sort.expr.clone(),
+                                    input: Arc::clone(leg),
+                                    fetch: sort.fetch,
+                                }))
+                            })
+                            .collect();
+                        let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
+                        let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                            Arc::new(new_union),
+                            alias.alias.clone(),
+                        )?);
+                        // Keep the outer Sort for correctness (merges sorted streams).
+                        let result = LogicalPlan::Sort(Sort {
+                            expr: sort.expr.clone(),
+                            input: Arc::new(new_alias),
+                            fetch: sort.fetch,
+                        });
+                        return Ok(Transformed::yes(result));
                     }
                     Ok(Transformed::no(plan))
                 }
@@ -262,73 +262,70 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     // Pattern: Limit → Sort → SubqueryAlias → Union
                     // At this point Sort was already pushed down, so each Union leg
                     // has a Sort. We wrap each leg with Limit.
-                    if let LogicalPlan::Sort(sort) = limit.input.as_ref() {
-                        if let LogicalPlan::SubqueryAlias(alias) = sort.input.as_ref() {
-                            if let LogicalPlan::Union(union) = alias.input.as_ref() {
-                                let pushed_fetch = pushed_down_fetch(
-                                    limit.skip.as_deref(),
-                                    limit.fetch.as_deref(),
-                                );
-                                let new_inputs: Vec<Arc<LogicalPlan>> = union
-                                    .inputs
-                                    .iter()
-                                    .map(|leg| {
-                                        Arc::new(LogicalPlan::Limit(Limit {
-                                            skip: None,
-                                            fetch: pushed_fetch.clone(),
-                                            input: Arc::clone(leg),
-                                        }))
-                                    })
-                                    .collect();
-                                let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
-                                let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                                    Arc::new(new_union),
-                                    alias.alias.clone(),
-                                )?);
-                                // Keep outer Sort + Limit for correctness.
-                                let new_sort = LogicalPlan::Sort(Sort {
-                                    expr: sort.expr.clone(),
-                                    input: Arc::new(new_alias),
-                                    fetch: sort.fetch,
-                                });
-                                let result = LogicalPlan::Limit(Limit {
-                                    skip: limit.skip.clone(),
-                                    fetch: limit.fetch.clone(),
-                                    input: Arc::new(new_sort),
-                                });
-                                return Ok(Transformed::yes(result));
-                            }
-                        }
+                    if let LogicalPlan::Sort(sort) = limit.input.as_ref()
+                        && let LogicalPlan::SubqueryAlias(alias) = sort.input.as_ref()
+                        && let LogicalPlan::Union(union) = alias.input.as_ref()
+                    {
+                        let pushed_fetch =
+                            pushed_down_fetch(limit.skip.as_deref(), limit.fetch.as_deref());
+                        let new_inputs: Vec<Arc<LogicalPlan>> = union
+                            .inputs
+                            .iter()
+                            .map(|leg| {
+                                Arc::new(LogicalPlan::Limit(Limit {
+                                    skip: None,
+                                    fetch: pushed_fetch.clone(),
+                                    input: Arc::clone(leg),
+                                }))
+                            })
+                            .collect();
+                        let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
+                        let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                            Arc::new(new_union),
+                            alias.alias.clone(),
+                        )?);
+                        // Keep outer Sort + Limit for correctness.
+                        let new_sort = LogicalPlan::Sort(Sort {
+                            expr: sort.expr.clone(),
+                            input: Arc::new(new_alias),
+                            fetch: sort.fetch,
+                        });
+                        let result = LogicalPlan::Limit(Limit {
+                            skip: limit.skip.clone(),
+                            fetch: limit.fetch.clone(),
+                            input: Arc::new(new_sort),
+                        });
+                        return Ok(Transformed::yes(result));
                     }
 
                     // Pattern: Limit → SubqueryAlias → Union (no Sort)
-                    if let LogicalPlan::SubqueryAlias(alias) = limit.input.as_ref() {
-                        if let LogicalPlan::Union(union) = alias.input.as_ref() {
-                            let pushed_fetch =
-                                pushed_down_fetch(limit.skip.as_deref(), limit.fetch.as_deref());
-                            let new_inputs: Vec<Arc<LogicalPlan>> = union
-                                .inputs
-                                .iter()
-                                .map(|leg| {
-                                    Arc::new(LogicalPlan::Limit(Limit {
-                                        skip: None,
-                                        fetch: pushed_fetch.clone(),
-                                        input: Arc::clone(leg),
-                                    }))
-                                })
-                                .collect();
-                            let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
-                            let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                                Arc::new(new_union),
-                                alias.alias.clone(),
-                            )?);
-                            let result = LogicalPlan::Limit(Limit {
-                                skip: limit.skip.clone(),
-                                fetch: limit.fetch.clone(),
-                                input: Arc::new(new_alias),
-                            });
-                            return Ok(Transformed::yes(result));
-                        }
+                    if let LogicalPlan::SubqueryAlias(alias) = limit.input.as_ref()
+                        && let LogicalPlan::Union(union) = alias.input.as_ref()
+                    {
+                        let pushed_fetch =
+                            pushed_down_fetch(limit.skip.as_deref(), limit.fetch.as_deref());
+                        let new_inputs: Vec<Arc<LogicalPlan>> = union
+                            .inputs
+                            .iter()
+                            .map(|leg| {
+                                Arc::new(LogicalPlan::Limit(Limit {
+                                    skip: None,
+                                    fetch: pushed_fetch.clone(),
+                                    input: Arc::clone(leg),
+                                }))
+                            })
+                            .collect();
+                        let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
+                        let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                            Arc::new(new_union),
+                            alias.alias.clone(),
+                        )?);
+                        let result = LogicalPlan::Limit(Limit {
+                            skip: limit.skip.clone(),
+                            fetch: limit.fetch.clone(),
+                            input: Arc::new(new_alias),
+                        });
+                        return Ok(Transformed::yes(result));
                     }
 
                     Ok(Transformed::no(plan))
@@ -356,28 +353,28 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 fn pushed_down_fetch(skip: Option<&Expr>, fetch: Option<&Expr>) -> Option<Box<Expr>> {
     use datafusion::common::ScalarValue;
 
-    let fetch_expr = fetch?;
-
     /// Try to interpret a scalar literal as a non-negative u64.
     fn scalar_to_u64(sv: &ScalarValue) -> Option<u64> {
         match sv {
-            ScalarValue::Int64(Some(v)) if *v >= 0 => Some(*v as u64),
-            ScalarValue::Int32(Some(v)) if *v >= 0 => Some(*v as u64),
+            ScalarValue::Int64(Some(v)) if *v >= 0 => Some((*v).cast_unsigned()),
+            ScalarValue::Int32(Some(v)) if *v >= 0 => Some(u64::from((*v).cast_unsigned())),
             ScalarValue::UInt64(Some(v)) => Some(*v),
             ScalarValue::UInt32(Some(v)) => Some(u64::from(*v)),
             _ => None,
         }
     }
 
+    let fetch_expr = fetch?;
+
     match skip {
         // No OFFSET: push the original fetch expression as-is.
         None => Some(Box::new(fetch_expr.clone())),
         Some(skip_expr) => {
             // Both skip and fetch must be literal expressions we can safely add.
-            let (skip_sv, fetch_sv) = match (skip_expr, fetch_expr) {
-                (Expr::Literal(skip_sv, _), Expr::Literal(fetch_sv, _)) => (skip_sv, fetch_sv),
+            let (Expr::Literal(skip_sv, _), Expr::Literal(fetch_sv, _)) = (skip_expr, fetch_expr)
+            else {
                 // Non-literal OFFSET or LIMIT: cannot safely compute pushed-down fetch.
-                _ => return None,
+                return None;
             };
 
             let skip_u = scalar_to_u64(skip_sv)?;
@@ -385,11 +382,9 @@ fn pushed_down_fetch(skip: Option<&Expr>, fetch: Option<&Expr>) -> Option<Box<Ex
             let total = skip_u.checked_add(fetch_u)?;
 
             // Ensure the combined value fits into i64.
-            if total > i64::MAX as u64 {
-                return None;
-            }
+            let total_i64 = i64::try_from(total).ok()?;
 
-            Some(Box::new(lit(total as i64)))
+            Some(Box::new(lit(total_i64)))
         }
     }
 }
