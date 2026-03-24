@@ -643,16 +643,23 @@ impl BedrockConverse {
                         }
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        let msg = if err_str.contains("UnrecognizedClientException")
-                            || err_str.contains("InvalidSignatureException")
-                            || err_str.contains("AccessDeniedException")
-                            || err_str.contains("ExpiredTokenException")
-                            || err_str.contains("IncompleteSignature")
-                        {
-                            format!("Bedrock authentication failed. Check that your AWS credentials are valid and have permission to access Bedrock. Details: {err_str}")
-                        } else {
-                            format!("Bedrock error: {err_str}")
+                        let msg = match e.into_service_error() {
+                            Ok(service_err) => {
+                                format!("Bedrock service error: {service_err}")
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if err_str.contains("UnrecognizedClientException")
+                                    || err_str.contains("InvalidSignatureException")
+                                    || err_str.contains("AccessDeniedException")
+                                    || err_str.contains("ExpiredTokenException")
+                                    || err_str.contains("IncompleteSignature")
+                                {
+                                    format!("Bedrock authentication failed. Check that your AWS credentials are valid and have permission to access Bedrock. Details: {err_str}")
+                                } else {
+                                    format!("Bedrock error: {err_str}")
+                                }
+                            }
                         };
                         Some(Err(to_api_error(msg)))
                     }
