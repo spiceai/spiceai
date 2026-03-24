@@ -20,8 +20,9 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
+use crate::dataconnector::adbc::{build_db_options, dialect_for_driver};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
-use adbc_core::options::{AdbcVersion, OptionDatabase};
+use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
@@ -56,6 +57,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .description("Password for database authentication")
         .secret(),
+    ParameterSpec::component("driver_options").description(
+        "Semicolon-delimited driver-specific database options (e.g., 'key1=value1;key2=value2')",
+    ),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections in the connection pool.")
         .default("5"),
@@ -152,7 +156,7 @@ impl CatalogConnector for AdbcCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let pool = create_pool(&self.params).await.map_err(|e| {
+        let (driver_name, pool) = create_pool(&self.params).await.map_err(|e| {
             super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
@@ -166,6 +170,7 @@ impl CatalogConnector for AdbcCatalog {
             pool,
             table_factory,
             catalog.include.clone(),
+            driver_name,
         ));
 
         provider
@@ -181,24 +186,8 @@ impl CatalogConnector for AdbcCatalog {
     }
 }
 
-/// Builds the list of ADBC database options from connection parameters.
-fn build_db_options(
-    uri: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
-    if let Some(u) = username {
-        opts.push((OptionDatabase::Username, u.into()));
-    }
-    if let Some(p) = password {
-        opts.push((OptionDatabase::Password, p.into()));
-    }
-    opts
-}
-
 /// Creates an ADBC connection pool from connector parameters.
-async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDatabase>>> {
+async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<ManagedDatabase>>)> {
     let driver_name = params
         .parameters
         .get("driver")
@@ -220,7 +209,8 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
 
     let username = params.parameters.get("username").expose().ok();
     let password = params.parameters.get("password").expose().ok();
-    let db_options = build_db_options(&uri_str, username, password);
+    let driver_options = params.parameters.get("driver_options").expose().ok();
+    let db_options = build_db_options(&uri_str, username, password, driver_options);
 
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
@@ -243,6 +233,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
 
     let pool_size = parse_pool_param("connection_pool_size")?;
     let pool_min_idle = parse_pool_param("connection_pool_min_idle")?;
+    let driver_name = driver_name.to_string();
 
     if uri_str == ":memory:" || uri_str.contains("mode=memory") {
         return Err(Error::InMemoryUriNotSupported);
@@ -250,7 +241,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
 
     // Driver loading, database creation, and pool creation are all
     // synchronous FFI/IO operations — offload to a blocking thread.
-    tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+    tokio::task::spawn_blocking(move || -> Result<(String, Arc<ADBCPool<_>>)> {
         let mut driver = ManagedDriver::load_from_name(
             &driver_location,
             None,
@@ -279,7 +270,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<Arc<ADBCPool<ManagedDat
                 uri: uri_str,
             })?;
 
-        Ok(Arc::new(pool))
+        Ok((driver_name, Arc::new(pool)))
     })
     .await
     .map_err(|e| Error::PoolCreationTaskFailed {
@@ -296,6 +287,7 @@ struct AdbcCatalogProvider {
     table_factory: AdbcTableFactory<ManagedDatabase>,
     schemas: RwLock<HashMap<String, Arc<AdbcSchemaProvider>>>,
     include: Option<Arc<GlobSet>>,
+    driver_name: String,
 }
 
 impl std::fmt::Debug for AdbcCatalogProvider {
@@ -310,12 +302,14 @@ impl AdbcCatalogProvider {
         pool: Arc<ADBCPool<ManagedDatabase>>,
         table_factory: AdbcTableFactory<ManagedDatabase>,
         include: Option<GlobSet>,
+        driver_name: String,
     ) -> Self {
         Self {
             pool,
             table_factory,
             schemas: RwLock::new(HashMap::new()),
             include: include.map(Arc::new),
+            driver_name,
         }
     }
 
@@ -390,6 +384,8 @@ impl AdbcCatalogProvider {
     ) -> HashMap<String, Arc<dyn TableProvider>> {
         let mut tables = HashMap::new();
 
+        let dialect = dialect_for_driver(&self.driver_name);
+
         for table_name in table_names {
             let schema_with_table = format!("{schema_name}.{table_name}");
             if let Some(include) = &self.include
@@ -401,7 +397,11 @@ impl AdbcCatalogProvider {
 
             let table_ref = TableReference::partial(schema_name.to_owned(), table_name.clone());
 
-            match self.table_factory.table_provider(table_ref, None).await {
+            match self
+                .table_factory
+                .table_provider(table_ref, dialect.clone())
+                .await
+            {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
                 }
@@ -508,6 +508,7 @@ mod tests {
         assert!(param_names.contains(&"uri"));
         assert!(param_names.contains(&"username"));
         assert!(param_names.contains(&"password"));
+        assert!(param_names.contains(&"driver_options"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
     }
@@ -519,21 +520,5 @@ mod tests {
 
         let err = Error::MissingUri;
         assert_eq!(err.to_string(), "Missing required parameter: uri");
-    }
-
-    #[test]
-    fn test_build_db_options_uri_only() {
-        let opts = build_db_options("file:test.db", None, None);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-    }
-
-    #[test]
-    fn test_build_db_options_with_credentials() {
-        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"));
-        assert_eq!(opts.len(), 3);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(opts[1].0, OptionDatabase::Username);
-        assert_eq!(opts[2].0, OptionDatabase::Password);
     }
 }
