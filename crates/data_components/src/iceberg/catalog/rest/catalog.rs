@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use iceberg::{
     Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation,
-    TableIdent, io::CustomAwsCredentialLoader, table::Table,
+    TableIdent, table::Table,
 };
 use iceberg_catalog_rest::RestCatalog as IcebergRestCatalog;
 
@@ -34,16 +34,6 @@ impl RestCatalog {
     #[must_use]
     pub fn new(inner: IcebergRestCatalog) -> Self {
         Self { inner }
-    }
-
-    #[must_use]
-    pub fn with_file_io_extension(
-        self,
-        custom_credential_loader: CustomAwsCredentialLoader,
-    ) -> Self {
-        Self {
-            inner: self.inner.with_file_io_extension(custom_credential_loader),
-        }
     }
 }
 
