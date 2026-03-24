@@ -57,7 +57,7 @@ const PASS_THROUGH_EXEC_NAMES: &[&str] = &["CooperativeExec", "BytesProcessedExe
 
 /// A [`PhysicalOptimizerRule`] that pushes `AggregateExec(mode=Partial)` operations
 /// into `FlightSqlExec` SQL queries when the partial aggregate sits directly above
-/// partitioned FlightSQL scans (possibly with pass-through nodes in between).
+/// partitioned `FlightSQL` scans (possibly with pass-through nodes in between).
 #[derive(Debug, Default)]
 pub struct FlightSQLPartialAggregatePushdown {}
 

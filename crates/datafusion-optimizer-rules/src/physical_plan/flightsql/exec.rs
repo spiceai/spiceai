@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! [`PartialAggregationFlightSqlExec`] — an [`ExecutionPlan`] that pushes a partial
-//! aggregation into a FlightSQL query, replacing the original scan + local aggregation.
+//! aggregation into a `FlightSQL` query, replacing the original scan + local aggregation.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -119,7 +119,7 @@ struct SelectItem {
 }
 
 /// An [`ExecutionPlan`] that sends a SQL query with `GROUP BY` and aggregate functions
-/// to a FlightSQL endpoint, producing output that matches the partial aggregate state
+/// to a `FlightSQL` endpoint, producing output that matches the partial aggregate state
 /// schema expected by a downstream `AggregateExec(mode=Final*)`.
 ///
 /// Stores the structured components from the original `FlightSqlExec` (table reference,
@@ -139,7 +139,7 @@ pub struct PartialAggregationFlightSqlExec {
     output_schema: SchemaRef,
     /// Column substitution map from an intermediate `ProjectionExec` (CSE).
     ///
-    /// When DataFusion's common subexpression elimination inserts a `ProjectionExec`
+    /// When `DataFusion`'s common subexpression elimination inserts a `ProjectionExec`
     /// between the `AggregateExec(Partial)` and the scan, the aggregate may reference
     /// synthetic columns like `__common_expr_1`. This map resolves each column index
     /// in the aggregate's expressions back to the original physical expression from
@@ -147,7 +147,7 @@ pub struct PartialAggregationFlightSqlExec {
     ///
     /// Indexed by output column position of the `ProjectionExec`.
     column_substitutions: Vec<Arc<dyn PhysicalExpr>>,
-    /// The FlightSQL client.
+    /// The `FlightSQL` client.
     client: FlightSqlClient,
     /// Cookie store for authentication propagation.
     cookie_store: Arc<CookieStore>,
