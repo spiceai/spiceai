@@ -960,9 +960,14 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             let mut queries: Vec<Query> = remove_tpch_query!(
                 queries,
                 2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
+                4, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
                 6, // Rewritten: explicit BETWEEN 0.05 AND 0.07 to avoid libSQL float arithmetic precision issue; https://github.com/spiceai/spiceai/issues/9872
+                16, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
                 17, // Correlated scalar subquery not supported
-                20  // Correlated scalar subquery not supported
+                18, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+                20, // Correlated scalar subquery not supported
+                21, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+                22 // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
             );
             queries.extend(generate_tpch_queries_override!("turso", q6));
             queries
