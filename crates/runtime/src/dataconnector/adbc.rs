@@ -762,16 +762,13 @@ mod tests {
         let dataset = Dataset::new("bigquery:my_project.my_dataset.my_table", "my_table");
         let error: Box<dyn std::error::Error + Send + Sync> =
             "invalid_grant: reauth related error".into();
-        let result = classify_adbc_error(
-            error,
-            "bigquery",
-            &dataset,
-            |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+        let result = classify_adbc_error(error, "bigquery", &dataset, |dc, cc, src| {
+            DataConnectorError::UnableToGetReadProvider {
                 dataconnector: dc,
                 connector_component: cc,
                 source: src,
-            },
-        );
+            }
+        });
         let msg = result.to_string();
         assert!(
             msg.contains("BigQuery credentials"),
@@ -787,16 +784,13 @@ mod tests {
     fn test_classify_adbc_error_generic_auth() {
         let dataset = Dataset::new("adbc:snowflake://host/db", "my_table");
         let error: Box<dyn std::error::Error + Send + Sync> = "403 Forbidden".into();
-        let result = classify_adbc_error(
-            error,
-            "snowflake",
-            &dataset,
-            |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+        let result = classify_adbc_error(error, "snowflake", &dataset, |dc, cc, src| {
+            DataConnectorError::UnableToGetReadProvider {
                 dataconnector: dc,
                 connector_component: cc,
                 source: src,
-            },
-        );
+            }
+        });
         let msg = result.to_string();
         assert!(
             msg.contains("credentials are valid"),
@@ -812,16 +806,13 @@ mod tests {
     fn test_classify_adbc_error_non_auth_uses_fallback() {
         let dataset = Dataset::new("adbc:postgres://host/db", "my_table");
         let error: Box<dyn std::error::Error + Send + Sync> = "Connection refused".into();
-        let result = classify_adbc_error(
-            error,
-            "postgres",
-            &dataset,
-            |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+        let result = classify_adbc_error(error, "postgres", &dataset, |dc, cc, src| {
+            DataConnectorError::UnableToGetReadProvider {
                 dataconnector: dc,
                 connector_component: cc,
                 source: src,
-            },
-        );
+            }
+        });
         let msg = result.to_string();
         assert!(
             msg.contains("Connection refused"),
