@@ -48,6 +48,7 @@ use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex as TokioMutex;
 
 /// Result from file-based deletion, including metadata for post-delete cleanup.
 #[derive(Debug)]
@@ -106,6 +107,8 @@ pub struct FileBasedDeletionSink {
     table_path: String,
     /// Shared runtime environment for cache invalidation after file deletion.
     runtime_env: Arc<RuntimeEnv>,
+    /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
+    write_lock: Arc<TokioMutex<()>>,
 }
 
 impl FileBasedDeletionSink {
@@ -134,6 +137,7 @@ impl FileBasedDeletionSink {
         table_id: String,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
+        write_lock: Arc<TokioMutex<()>>,
     ) -> Self {
         Self {
             listing_table,
@@ -145,6 +149,7 @@ impl FileBasedDeletionSink {
             table_id,
             table_path,
             runtime_env,
+            write_lock,
         }
     }
 
@@ -402,6 +407,9 @@ impl FileBasedDeletionSink {
 #[async_trait]
 impl DeletionSink for FileBasedDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
+        let _write_guard = self.write_lock.lock().await;
+
         let result = self.delete_from_internal().await?;
 
         // Invalidate the list-files cache for snapshot directories where
