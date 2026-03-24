@@ -461,7 +461,7 @@ fn build_aggregate_sql(
 /// Strip an outer `CAST(... AS ...)` wrapper from a SQL fragment, returning the
 /// inner expression. If the fragment is not a CAST, return it unchanged.
 ///
-/// This is used as a deduplication key: DataFusion normalises `SUM(col)` and
+/// This is used as a deduplication key: `DataFusion` normalises `SUM(col)` and
 /// `SUM(CAST(col AS DOUBLE))` to the same internal aggregate, so we must treat
 /// them as duplicates.
 fn strip_outer_cast(sql: &str) -> &str {

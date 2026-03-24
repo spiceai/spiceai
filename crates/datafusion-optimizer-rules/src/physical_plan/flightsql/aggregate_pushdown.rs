@@ -216,7 +216,7 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 ///
 /// Recognised pass-through nodes (single input, no semantic change for pushdown):
 /// - `FilterExec` — the underlying `FlightSqlExec` already carries the filter in
-///   its SQL; the `FilterExec` is a redundant safety layer added by DataFusion.
+///   its SQL; the `FilterExec` is a redundant safety layer added by `DataFusion`.
 /// - `RepartitionExec` — only shuffles partitions, no data change.
 /// - Name-identified nodes in [`PASS_THROUGH_EXEC_NAMES`] (`CooperativeExec`,
 ///   `BytesProcessedExec`) — defined in upstream crates, not available for
