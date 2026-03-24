@@ -4118,6 +4118,7 @@ dependencies = [
  "datafusion",
  "linkme",
  "paste",
+ "reqwest 0.12.24",
  "runtime",
  "snafu",
  "token_provider",
