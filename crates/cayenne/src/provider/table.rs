@@ -415,6 +415,7 @@ impl CayenneTableProvider {
     }
 
     /// Return the primary key of the table as index(es) into the [`TableProvider::Schema`].
+    #[must_use]
     pub fn pk_column_indices(&self) -> &[usize] {
         // By construction, primary key is the only constraint.
         if let Some(Constraint::PrimaryKey(pk)) = self.constraints.first() {
