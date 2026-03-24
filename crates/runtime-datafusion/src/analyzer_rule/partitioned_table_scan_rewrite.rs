@@ -162,7 +162,8 @@ impl PartitionedTableScanRewrite {
         Ok(sub_scans)
     }
 
-    /// Build a `Union` (or single plan) from sub-scans, wrapped in a [`SubqueryAlias`].
+    /// Build a `Union` from sub-scans, wrapped in a [`SubqueryAlias`].
+    /// For a single partition, returns the sub-scan directly (no Union or alias).
     /// Returns `None` if there are no partitions (caller should produce an [`EmptyRelation`]).
     fn build_union_from_sub_scans(
         sub_scans: Vec<Arc<LogicalPlan>>,
@@ -366,21 +367,38 @@ fn pushed_down_fetch(skip: Option<&Expr>, fetch: Option<&Expr>) -> Option<Box<Ex
 
     let fetch_expr = fetch?;
 
+    /// Try to interpret a scalar literal as a non-negative u64.
+    fn scalar_to_u64(sv: &ScalarValue) -> Option<u64> {
+        match sv {
+            ScalarValue::Int64(Some(v)) if *v >= 0 => Some(*v as u64),
+            ScalarValue::Int32(Some(v)) if *v >= 0 => Some(*v as u64),
+            ScalarValue::UInt64(Some(v)) => Some(*v),
+            ScalarValue::UInt32(Some(v)) => Some(u64::from(*v)),
+            _ => None,
+        }
+    }
+
     match skip {
+        // No OFFSET: push the original fetch expression as-is.
         None => Some(Box::new(fetch_expr.clone())),
         Some(skip_expr) => {
-            // Try to evaluate skip + fetch for literal values.
-            if let (
-                Expr::Literal(ScalarValue::Int64(Some(s)), _),
-                Expr::Literal(ScalarValue::Int64(Some(f)), _),
-            ) = (skip_expr, fetch_expr)
-            {
-                Some(Box::new(lit(s + f)))
-            } else {
-                // Conservative: push fetch without accounting for skip.
-                // The outer Limit still applies the correct skip.
-                Some(Box::new(fetch_expr.clone()))
+            // Both skip and fetch must be literal expressions we can safely add.
+            let (skip_sv, fetch_sv) = match (skip_expr, fetch_expr) {
+                (Expr::Literal(skip_sv, _), Expr::Literal(fetch_sv, _)) => (skip_sv, fetch_sv),
+                // Non-literal OFFSET or LIMIT: cannot safely compute pushed-down fetch.
+                _ => return None,
+            };
+
+            let skip_u = scalar_to_u64(skip_sv)?;
+            let fetch_u = scalar_to_u64(fetch_sv)?;
+            let total = skip_u.checked_add(fetch_u)?;
+
+            // Ensure the combined value fits into i64.
+            if total > i64::MAX as u64 {
+                return None;
             }
+
+            Some(Box::new(lit(total as i64)))
         }
     }
 }
