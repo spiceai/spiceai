@@ -4,7 +4,7 @@ tests:
   #   spicepod_path: accelerated/file[parquet]-turso[file].yaml
   #   query_set: tpch
   #   query_overrides: turso
-  #   runner_type: spiceai-dev-runners
+  #   runner_type: spicehq-dev-runners
   #   ready_wait: 600
   #   validate_results: true
   throughput:
