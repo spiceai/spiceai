@@ -22,16 +22,16 @@ use std::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
-        Result, ToDFSchema,
         tree_node::{Transformed, TransformedResult},
+        Result, ToDFSchema,
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     execution::SessionState,
     logical_expr::{
-        EmptyRelation, Expr, Limit, LogicalPlan, LogicalPlanBuilder, Sort, SubqueryAlias,
-        TableScan, Union, lit,
+        lit, EmptyRelation, Expr, Limit, LogicalPlan, LogicalPlanBuilder, Sort, SubqueryAlias,
+        TableScan, Union,
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
@@ -232,14 +232,11 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                                     }))
                                 })
                                 .collect();
-                            let new_union =
-                                LogicalPlan::Union(Union::try_new(new_inputs)?);
-                            let new_alias = LogicalPlan::SubqueryAlias(
-                                SubqueryAlias::try_new(
-                                    Arc::new(new_union),
-                                    alias.alias.clone(),
-                                )?,
-                            );
+                            let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
+                            let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                                Arc::new(new_union),
+                                alias.alias.clone(),
+                            )?);
                             // Keep the outer Sort for correctness (merges sorted streams).
                             let result = LogicalPlan::Sort(Sort {
                                 expr: sort.expr.clone(),
@@ -283,14 +280,11 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                                         }))
                                     })
                                     .collect();
-                                let new_union =
-                                    LogicalPlan::Union(Union::try_new(new_inputs)?);
-                                let new_alias = LogicalPlan::SubqueryAlias(
-                                    SubqueryAlias::try_new(
-                                        Arc::new(new_union),
-                                        alias.alias.clone(),
-                                    )?,
-                                );
+                                let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
+                                let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                                    Arc::new(new_union),
+                                    alias.alias.clone(),
+                                )?);
                                 // Keep outer Sort + Limit for correctness.
                                 let new_sort = LogicalPlan::Sort(Sort {
                                     expr: sort.expr.clone(),
@@ -323,14 +317,11 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                                     }))
                                 })
                                 .collect();
-                            let new_union =
-                                LogicalPlan::Union(Union::try_new(new_inputs)?);
-                            let new_alias = LogicalPlan::SubqueryAlias(
-                                SubqueryAlias::try_new(
-                                    Arc::new(new_union),
-                                    alias.alias.clone(),
-                                )?,
-                            );
+                            let new_union = LogicalPlan::Union(Union::try_new(new_inputs)?);
+                            let new_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                                Arc::new(new_union),
+                                alias.alias.clone(),
+                            )?);
                             let result = LogicalPlan::Limit(Limit {
                                 skip: limit.skip.clone(),
                                 fetch: limit.fetch.clone(),
@@ -440,7 +431,7 @@ mod tests {
         config::ConfigOptions,
         datasource::{DefaultTableSource, MemTable},
         logical_expr::{LogicalPlan, LogicalPlanBuilder},
-        prelude::{SessionContext, col},
+        prelude::{col, SessionContext},
     };
 
     /// A test partition provider that splits the table into `n` partitions,
@@ -479,15 +470,15 @@ mod tests {
     }
 
     fn create_rewrite(ctx: &SessionContext, n_partitions: usize) -> PartitionedTableScanRewrite {
-        PartitionedTableScanRewrite::new(
-            Arc::new(TestPartitionProvider { n_partitions }),
-            ctx,
-        )
+        PartitionedTableScanRewrite::new(Arc::new(TestPartitionProvider { n_partitions }), ctx)
     }
 
     fn register_table(ctx: &SessionContext, name: &str, schema: SchemaRef) {
-        ctx.register_table(name, Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()))
-            .unwrap();
+        ctx.register_table(
+            name,
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
     }
 
     fn table_source(schema: SchemaRef) -> Arc<DefaultTableSource> {
@@ -526,7 +517,10 @@ mod tests {
 
         // Should contain a Union with 3 sub-scans
         let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
-        assert!(union_count >= 1, "Expected at least one Union node, plan: {result}");
+        assert!(
+            union_count >= 1,
+            "Expected at least one Union node, plan: {result}"
+        );
     }
 
     #[test]
@@ -548,7 +542,10 @@ mod tests {
 
         // Should have 3 Sort nodes: outer Sort + 2 pushed-down Sorts in Union legs
         let sort_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Sort(_)));
-        assert_eq!(sort_count, 3, "Expected 3 Sort nodes (1 outer + 2 inner), plan: {result}");
+        assert_eq!(
+            sort_count, 3,
+            "Expected 3 Sort nodes (1 outer + 2 inner), plan: {result}"
+        );
     }
 
     #[test]
@@ -618,7 +615,10 @@ mod tests {
 
         // Single partition: no Union
         let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
-        assert_eq!(union_count, 0, "Single partition should not produce Union, plan: {result}");
+        assert_eq!(
+            union_count, 0,
+            "Single partition should not produce Union, plan: {result}"
+        );
     }
 
     #[test]
@@ -636,9 +636,11 @@ mod tests {
         let config = ConfigOptions::default();
         let result = rewrite.analyze(plan, &config).unwrap();
 
-        let empty_count =
-            count_plan_nodes(&result, |p| matches!(p, LogicalPlan::EmptyRelation(_)));
-        assert_eq!(empty_count, 1, "Zero partitions should produce EmptyRelation, plan: {result}");
+        let empty_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::EmptyRelation(_)));
+        assert_eq!(
+            empty_count, 1,
+            "Zero partitions should produce EmptyRelation, plan: {result}"
+        );
     }
 
     #[test]
