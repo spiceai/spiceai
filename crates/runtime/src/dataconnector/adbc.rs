@@ -29,8 +29,9 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -112,7 +113,7 @@ pub struct AdbcFactory {
     /// Cache of initialized ADBC connectors keyed by a deterministic representation
     /// of their configuration. Datasets with identical ADBC config share a single
     /// connector instance and connection pool.
-    cache: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>>>,
+    cache: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>>>,
 }
 
 impl std::fmt::Debug for AdbcFactory {
@@ -125,7 +126,7 @@ impl AdbcFactory {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -173,7 +174,7 @@ impl DataConnectorFactory for AdbcFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let cache_key = compute_adbc_cache_key(&params);
         let cell = {
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.cache.lock();
             Arc::clone(
                 cache
                     .entry(cache_key)
@@ -395,12 +396,26 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         "username",
     ];
 
+    // Build a set of secret parameter names for O(1) lookup.
+    let secret_params: std::collections::HashSet<&str> = PARAMETERS
+        .iter()
+        .filter(|p| p.secret)
+        .map(|p| p.name)
+        .collect();
+
     let mut key = String::new();
     for k in &keys {
         let v = params.parameters.get(k).expose().ok().unwrap_or("");
         key.push_str(k);
         key.push('\0');
-        key.push_str(v);
+        if secret_params.contains(k) {
+            // Hash secret values so plaintext credentials are not retained in memory.
+            let mut hasher = DefaultHasher::new();
+            v.hash(&mut hasher);
+            key.push_str(&format!("{:x}", hasher.finish()));
+        } else {
+            key.push_str(v);
+        }
         key.push('\0');
     }
     key
