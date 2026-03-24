@@ -125,28 +125,16 @@ fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
     }
 }
 
-/// Forwards a DDL SQL statement to connected executor nodes.
+/// Forward a DDL statement (CREATE/DROP TABLE) to all connected executors.
 ///
-/// Iterates over [`ExecutorRegistry::flight_sql_clients`] and sends the SQL
-/// via `FlightSqlClient::execute`, then drains returned endpoints with `do_get`
-/// so the statement is actually executed on the remote executor.
-///
-/// Returns an error when at least one executor was targeted but all forwards failed.
-/// Forward a SQL statement to all connected executors.
-///
-/// When `require_all` is `false` (DDL operations like CREATE/DROP TABLE), the
-/// function succeeds as long as at least one executor processes the statement.
-///
-/// When `require_all` is `true` (DML operations like DELETE/UPDATE), **every**
-/// connected executor must succeed. Transient failures are retried up to
-/// `MAX_DML_RETRIES` times with an exponential back-off before the operation
-/// is considered failed.
+/// Succeeds as long as at least one executor processes the statement.
+/// DDL is idempotent and self-heals via periodic catalog refresh.
 async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
     forward_to_executors(executor_registry, sql, false).await
 }
 
-/// Forward a DML statement to all connected executors, requiring every
-/// executor to succeed (with retries for transient failures).
+/// Forward a DML statement (DELETE/UPDATE) to all connected executors,
+/// requiring every executor to succeed (with retries for transient failures).
 async fn forward_dml_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
     forward_to_executors(executor_registry, sql, true).await
 }
@@ -154,6 +142,12 @@ async fn forward_dml_to_executors(executor_registry: &ExecutorRegistry, sql: &st
 /// Maximum number of retry attempts for DML forwarding per executor.
 const MAX_DML_RETRIES: u32 = 3;
 
+/// Forward a SQL statement to all connected executors.
+///
+/// When `require_all` is `false`, succeeds if at least one executor processes
+/// the statement. When `true`, **every** executor must succeed; transient
+/// failures are retried up to [`MAX_DML_RETRIES`] times with exponential
+/// back-off.
 async fn forward_to_executors(
     executor_registry: &ExecutorRegistry,
     sql: &str,
