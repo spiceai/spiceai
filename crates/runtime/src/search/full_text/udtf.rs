@@ -101,6 +101,7 @@ impl TextSearchTableFuncArgs {
         let TextSearchTableFuncArgs { column, tbl, .. } = &self;
         let col: String = if let Some(col) = column {
             if !search_fields.contains(col) {
+
                 return Err(DataFusionError::Plan(format!(
                     "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}",
                     search_fields.join(", ")
