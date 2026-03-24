@@ -282,6 +282,29 @@ pub fn duckdb_file_path(
     }
 }
 
+/// Compute the DuckDB file path from raw spicepod acceleration params.
+/// Used when computing attach_databases from all configured (not yet initialized) sources.
+fn duckdb_file_path_from_params(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    accel: &spicepod::acceleration::Acceleration,
+) -> Option<String> {
+    let mut params = accel
+        .params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+    let data_directory = params
+        .remove("duckdb_data_dir")
+        .unwrap_or_else(spice_data_base_path);
+    params.insert("data_directory".to_string(), data_directory);
+    if let Some(duckdb_file) = params.remove("duckdb_file") {
+        params.insert("duckdb_open".to_string(), duckdb_file);
+    }
+    duckdb_factory
+        .duckdb_file_path("accelerated_duckdb", &mut params)
+        .ok()
+}
+
 impl Default for DuckDBAccelerator {
     fn default() -> Self {
         Self::new()
@@ -444,15 +467,14 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                // Use ALL configured datasets (not just initialized ones) to compute
-                // the attach_databases list. This ensures that when datasets are initialized
-                // sequentially, the first table's pool includes all other DuckDB files,
-                // enabling cross-table joins immediately without needing a restart.
+                // Use ALL configured datasets and views (not just initialized ones)
+                // to compute the attach_databases list. This ensures that when datasets
+                // are initialized sequentially, the first table's pool includes all
+                // other DuckDB files, enabling cross-table joins immediately.
                 let app = source.app();
                 let self_path = self.file_path(source)?;
                 let source_name = source.name().to_string();
-                // Collect (name, acceleration) pairs from both datasets and views
-                let accel_sources: Vec<(&str, &spicepod::acceleration::Acceleration)> = app
+                let attach_databases: HashSet<String> = app
                     .datasets
                     .iter()
                     .filter_map(|ds| {
@@ -465,12 +487,11 @@ impl DataAccelerator for DuckDBAccelerator {
                             .as_ref()
                             .map(|a| (v.name.as_str(), a))
                     }))
-                    .collect();
-
-                let attach_databases: HashSet<String> = accel_sources
-                    .into_iter()
                     .filter_map(|(name, accel)| {
-                        if accel.engine.as_deref() == Some("duckdb")
+                        if accel
+                            .engine
+                            .as_deref()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("duckdb"))
                             && matches!(
                                 accel.mode,
                                 spicepod::acceleration::Mode::File
@@ -478,21 +499,7 @@ impl DataAccelerator for DuckDBAccelerator {
                             )
                             && name != source_name
                         {
-                            let mut params = accel
-                                .params
-                                .as_ref()
-                                .map(spicepod::param::Params::as_string_map)
-                                .unwrap_or_default();
-                            let data_directory = params
-                                .remove("duckdb_data_dir")
-                                .unwrap_or_else(spice_data_base_path);
-                            params.insert("data_directory".to_string(), data_directory);
-                            if let Some(duckdb_file) = params.remove("duckdb_file") {
-                                params.insert("duckdb_open".to_string(), duckdb_file);
-                            }
-                            self.duckdb_factory
-                                .duckdb_file_path("accelerated_duckdb", &mut params)
-                                .ok()
+                            duckdb_file_path_from_params(&self.duckdb_factory, accel)
                                 .filter(|p| p != &self_path)
                         } else {
                             None
