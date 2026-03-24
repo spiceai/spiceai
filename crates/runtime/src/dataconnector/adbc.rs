@@ -30,7 +30,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -108,18 +108,30 @@ impl Drop for Adbc {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone)]
-pub struct AdbcFactory {}
+pub struct AdbcFactory {
+    /// Cache of initialized ADBC connectors keyed by a deterministic representation
+    /// of their configuration. Datasets with identical ADBC config share a single
+    /// connector instance and connection pool.
+    cache: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>>>,
+}
+
+impl std::fmt::Debug for AdbcFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdbcFactory").finish_non_exhaustive()
+    }
+}
 
 impl AdbcFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+        Arc::new(Self::new()) as Arc<dyn DataConnectorFactory>
     }
 }
 
@@ -159,15 +171,27 @@ impl DataConnectorFactory for AdbcFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let cache_key = compute_adbc_cache_key(&params);
+        let cell = {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                cache
+                    .entry(cache_key)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+
         Box::pin(async move {
-            let driver_name = params
-                .parameters
-                .get("driver")
-                .expose()
-                .ok()
-                .context(MissingAdbcDriverSnafu)
-                .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
+            let connector = cell
+                .get_or_try_init(async move {
+                    let driver_name = params
+                        .parameters
+                        .get("driver")
+                        .expose()
+                        .ok()
+                        .context(MissingAdbcDriverSnafu)
+                        .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
                     source: Box::new(e),
                 })?;
@@ -336,6 +360,10 @@ impl DataConnectorFactory for AdbcFactory {
                 adbc_factory: Some(adbc_factory),
                 driver_name: driver_name_owned,
             }) as Arc<dyn DataConnector>)
+                })
+                .await?;
+
+            Ok(Arc::clone(connector))
         })
     }
 
@@ -346,6 +374,36 @@ impl DataConnectorFactory for AdbcFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+}
+
+/// Computes a deterministic cache key from the ADBC connection parameters.
+/// Datasets with identical ADBC configuration produce the same key and share
+/// a single connector instance.
+fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
+    // All ADBC configuration parameters that determine connection identity,
+    // listed alphabetically for deterministic output.
+    let keys = [
+        "catalog",
+        "connection_pool_min_idle",
+        "connection_pool_size",
+        "driver",
+        "driver_options",
+        "driver_path",
+        "password",
+        "schema",
+        "uri",
+        "username",
+    ];
+
+    let mut key = String::new();
+    for k in &keys {
+        let v = params.parameters.get(k).expose().ok().unwrap_or("");
+        key.push_str(k);
+        key.push('\0');
+        key.push_str(v);
+        key.push('\0');
+    }
+    key
 }
 
 /// Builds the list of ADBC database options from connector parameters.
@@ -843,6 +901,85 @@ mod tests {
         assert!(
             !msg.contains("credentials"),
             "Should not mention credentials for non-auth error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_key_identical_configs_match() {
+        let dataset_a = test_dataset("adbc:bigquery/my_project.dataset.table_a", "table_a").await;
+        let dataset_b = test_dataset("adbc:bigquery/my_project.dataset.table_b", "table_b").await;
+
+        let make_params = |dataset: &Dataset| {
+            use runtime_parameters::Parameters;
+            use secrecy::SecretString;
+
+            let parameters = Parameters::new(
+                vec![
+                    ("driver".to_string(), SecretString::from("bigquery")),
+                    (
+                        "uri".to_string(),
+                        SecretString::from("grpc://bigquery.googleapis.com"),
+                    ),
+                    ("catalog".to_string(), SecretString::from("my_project")),
+                ],
+                "adbc",
+                PARAMETERS,
+            );
+
+            ConnectorParams {
+                parameters,
+                unsupported_type_action: None,
+                component: ConnectorComponent::from(dataset),
+                app: None,
+                runtime: None,
+                io_runtime: tokio::runtime::Handle::current(),
+            }
+        };
+
+        let params_a = make_params(&dataset_a);
+        let params_b = make_params(&dataset_b);
+
+        // Same config params → same cache key, despite different datasets
+        assert_eq!(
+            compute_adbc_cache_key(&params_a),
+            compute_adbc_cache_key(&params_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_key_different_configs_differ() {
+        let dataset = test_dataset("adbc:bigquery/my_project.dataset.table_a", "table_a").await;
+
+        let make_params = |uri: &str| {
+            use runtime_parameters::Parameters;
+            use secrecy::SecretString;
+
+            let parameters = Parameters::new(
+                vec![
+                    ("driver".to_string(), SecretString::from("bigquery")),
+                    ("uri".to_string(), SecretString::from(uri)),
+                ],
+                "adbc",
+                PARAMETERS,
+            );
+
+            ConnectorParams {
+                parameters,
+                unsupported_type_action: None,
+                component: ConnectorComponent::from(&dataset),
+                app: None,
+                runtime: None,
+                io_runtime: tokio::runtime::Handle::current(),
+            }
+        };
+
+        let params_a = make_params("grpc://bigquery.googleapis.com");
+        let params_b = make_params("grpc://other-endpoint.example.com");
+
+        // Different URIs → different cache keys
+        assert_ne!(
+            compute_adbc_cache_key(&params_a),
+            compute_adbc_cache_key(&params_b)
         );
     }
 }
