@@ -26,7 +26,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
-use datafusion_expr::{Expr, TableScan};
+use datafusion_expr::TableScan;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;

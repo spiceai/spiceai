@@ -99,19 +99,17 @@ pub async fn create_table_if_not_exists(
     let primary_key: Vec<String> = provider
         .constraints()
         .and_then(|c| {
-            c.iter()
-                .filter_map(|cc| {
-                    if let Constraint::PrimaryKey(v) = cc {
-                        Some(
-                            v.iter()
-                                .map(|i| table_schema.field(*i).name().clone())
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .next()
+            c.iter().find_map(|cc| {
+                if let Constraint::PrimaryKey(v) = cc {
+                    Some(
+                        v.iter()
+                            .map(|i| table_schema.field(*i).name().clone())
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            })
         })
         .unwrap_or_default();
 

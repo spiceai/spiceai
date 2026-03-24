@@ -172,7 +172,7 @@ pub(crate) async fn allocation_initial_partitions(
         let result = partition_manager
             .allocate_partitions(table_ref, executor_id, remaining)
             .await
-            .map_err(|e| Box::new(e))
+            .map_err(Box::new)
             .context(PartitionAllocationSnafu {
                 table: table_ref.to_string(),
             })?;

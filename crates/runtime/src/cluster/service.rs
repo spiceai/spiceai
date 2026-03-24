@@ -635,10 +635,10 @@ impl ClusterService for ClusterServiceImpl {
             {
                 Ok(p) => table_partitions = p,
                 Err(e) => {
-                    tracing::warn!("Failed to allocate partitions to executor {executor_id}: {e}")
+                    tracing::warn!("Failed to allocate partitions to executor {executor_id}: {e}");
                 }
             }
-        };
+        }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
             table_partitions,

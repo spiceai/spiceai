@@ -640,12 +640,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
             }
 
             // Forward the CREATE TABLE DDL to executor nodes
-            if let Some(ref registry) = executor_registry {
-                if let Some(ddl_sql) =
+            if let Some(ref registry) = executor_registry
+                && let Some(ddl_sql) =
                     create_table_if_not_exists(&table_ref, &wrapped_provider).await?
-                {
-                    forward_ddl_to_executors(registry, &ddl_sql).await?;
-                };
+            {
+                forward_ddl_to_executors(registry, &ddl_sql).await?;
             }
 
             let batch = RecordBatch::try_new(
