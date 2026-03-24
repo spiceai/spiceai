@@ -141,19 +141,13 @@ fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
 /// connected executor must succeed. Transient failures are retried up to
 /// `MAX_DML_RETRIES` times with an exponential back-off before the operation
 /// is considered failed.
-async fn forward_ddl_to_executors(
-    executor_registry: &ExecutorRegistry,
-    sql: &str,
-) -> DFResult<()> {
+async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
     forward_to_executors(executor_registry, sql, false).await
 }
 
 /// Forward a DML statement to all connected executors, requiring every
 /// executor to succeed (with retries for transient failures).
-async fn forward_dml_to_executors(
-    executor_registry: &ExecutorRegistry,
-    sql: &str,
-) -> DFResult<()> {
+async fn forward_dml_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
     forward_to_executors(executor_registry, sql, true).await
 }
 
@@ -180,7 +174,6 @@ async fn forward_to_executors(
             let client = client.clone();
             let sql = sql.to_string();
             let executor_id = executor_id.clone();
-            let require_all = require_all;
             async move {
                 let max_attempts = if require_all { MAX_DML_RETRIES + 1 } else { 1 };
                 let mut last_err: Option<String> = None;
@@ -274,7 +267,7 @@ async fn forward_to_executors(
     Ok(())
 }
 
-/// Send a single SQL statement to one executor via FlightSQL execute + do_get.
+/// Send a single SQL statement to one executor via `FlightSQL` execute + `do_get`.
 async fn forward_sql_to_executor(
     mut client: data_components::flightsql::FlightSqlClient,
     sql: &str,
