@@ -77,8 +77,8 @@ impl TableProvider for UnavailableTableProvider {
         Arc::clone(&self.schema)
     }
 
-    fn table_type(&self) -> datafusion::common::TableType {
-        datafusion::common::TableType::Base
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        datafusion::datasource::TableType::Base
     }
 
     async fn scan(

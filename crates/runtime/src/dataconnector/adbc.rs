@@ -757,9 +757,23 @@ mod tests {
         assert!(!is_auth_or_permission_error("timeout"));
     }
 
-    #[test]
-    fn test_classify_adbc_error_bigquery_auth() {
-        let dataset = Dataset::new("bigquery:my_project.my_dataset.my_table", "my_table");
+    async fn test_dataset(from: &str, name: &str) -> Dataset {
+        use crate::component::dataset::builder::DatasetBuilder;
+        use app::AppBuilder;
+
+        let app = AppBuilder::new("test_app").build();
+        let rt = crate::Runtime::builder().build().await;
+        DatasetBuilder::try_new(from.to_string(), name)
+            .expect("valid builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("valid dataset")
+    }
+
+    #[tokio::test]
+    async fn test_classify_adbc_error_bigquery_auth() {
+        let dataset = test_dataset("bigquery:my_project.my_dataset.my_table", "my_table").await;
         let error: Box<dyn std::error::Error + Send + Sync> =
             "invalid_grant: reauth related error".into();
         let result = classify_adbc_error(error, "bigquery", &dataset, |dc, cc, src| {
@@ -780,9 +794,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_classify_adbc_error_generic_auth() {
-        let dataset = Dataset::new("adbc:snowflake://host/db", "my_table");
+    #[tokio::test]
+    async fn test_classify_adbc_error_generic_auth() {
+        let dataset = test_dataset("adbc:snowflake://host/db", "my_table").await;
         let error: Box<dyn std::error::Error + Send + Sync> = "403 Forbidden".into();
         let result = classify_adbc_error(error, "snowflake", &dataset, |dc, cc, src| {
             DataConnectorError::UnableToGetReadProvider {
@@ -802,9 +816,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_classify_adbc_error_non_auth_uses_fallback() {
-        let dataset = Dataset::new("adbc:postgres://host/db", "my_table");
+    #[tokio::test]
+    async fn test_classify_adbc_error_non_auth_uses_fallback() {
+        let dataset = test_dataset("adbc:postgres://host/db", "my_table").await;
         let error: Box<dyn std::error::Error + Send + Sync> = "Connection refused".into();
         let result = classify_adbc_error(error, "postgres", &dataset, |dc, cc, src| {
             DataConnectorError::UnableToGetReadProvider {
