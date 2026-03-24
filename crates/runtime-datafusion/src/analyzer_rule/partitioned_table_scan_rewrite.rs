@@ -162,7 +162,10 @@ impl PartitionedTableScanRewrite {
         Ok(sub_scans)
     }
 
-    /// Build a `Union` from sub-scans, wrapped in a [`SubqueryAlias`].
+    /// Build a `Union` from sub-scans.
+    ///
+    /// For multiple partitions, the `Union` is wrapped in a [`SubqueryAlias`] that
+    /// preserves the original table name.
     /// For a single partition, returns the sub-scan directly (no Union or alias).
     /// Returns `None` if there are no partitions (caller should produce an [`EmptyRelation`]).
     fn build_union_from_sub_scans(
@@ -445,7 +448,7 @@ mod tests {
             (0..self.n_partitions)
                 .map(|_| {
                     let provider: Arc<dyn TableProvider> =
-                        Arc::new(MemTable::try_new(Arc::clone(schema), vec![vec![]]).unwrap());
+                        Arc::new(MemTable::try_new(Arc::clone(schema), vec![vec![]]).expect("creating test MemTable"));
                     (provider, vec![])
                 })
                 .collect()
@@ -471,14 +474,14 @@ mod tests {
     fn register_table(ctx: &SessionContext, name: &str, schema: SchemaRef) {
         ctx.register_table(
             name,
-            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("creating test MemTable")),
         )
-        .unwrap();
+        .expect("registering test table");
     }
 
     fn table_source(schema: SchemaRef) -> Arc<DefaultTableSource> {
         Arc::new(DefaultTableSource::new(Arc::new(
-            MemTable::try_new(schema, vec![vec![]]).unwrap(),
+            MemTable::try_new(schema, vec![vec![]]).expect("creating test MemTable"),
         )))
     }
 
@@ -491,7 +494,7 @@ mod tests {
             }
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
-        .unwrap();
+        .expect("traversing logical plan tree");
         count
     }
 
@@ -502,13 +505,13 @@ mod tests {
         register_table(&ctx, "sales", Arc::clone(&schema));
 
         let plan = LogicalPlanBuilder::scan("sales", table_source(schema), None)
-            .unwrap()
+            .expect("building scan")
             .build()
-            .unwrap();
+            .expect("building plan");
 
         let rewrite = create_rewrite(&ctx, 3);
         let config = ConfigOptions::default();
-        let result = rewrite.analyze(plan, &config).unwrap();
+        let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
         // Should contain a Union with 3 sub-scans
         let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
@@ -525,15 +528,15 @@ mod tests {
         register_table(&ctx, "sales", Arc::clone(&schema));
 
         let plan = LogicalPlanBuilder::scan("sales", table_source(Arc::clone(&schema)), None)
-            .unwrap()
+            .expect("building scan")
             .sort(vec![col("order_number").sort(true, false)])
-            .unwrap()
+            .expect("adding sort")
             .build()
-            .unwrap();
+            .expect("building plan");
 
         let rewrite = create_rewrite(&ctx, 2);
         let config = ConfigOptions::default();
-        let result = rewrite.analyze(plan, &config).unwrap();
+        let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
         // Should have 3 Sort nodes: outer Sort + 2 pushed-down Sorts in Union legs
         let sort_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Sort(_)));
@@ -550,17 +553,17 @@ mod tests {
         register_table(&ctx, "sales", Arc::clone(&schema));
 
         let plan = LogicalPlanBuilder::scan("sales", table_source(Arc::clone(&schema)), None)
-            .unwrap()
+            .expect("building scan")
             .sort(vec![col("order_number").sort(true, false)])
-            .unwrap()
+            .expect("adding sort")
             .limit(0, Some(10))
-            .unwrap()
+            .expect("adding limit")
             .build()
-            .unwrap();
+            .expect("building plan");
 
         let rewrite = create_rewrite(&ctx, 2);
         let config = ConfigOptions::default();
-        let result = rewrite.analyze(plan, &config).unwrap();
+        let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
         // Should have outer Sort + 2 inner Sorts = 3 Sort nodes
         let sort_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Sort(_)));
@@ -578,15 +581,15 @@ mod tests {
         register_table(&ctx, "sales", Arc::clone(&schema));
 
         let plan = LogicalPlanBuilder::scan("sales", table_source(Arc::clone(&schema)), None)
-            .unwrap()
+            .expect("building scan")
             .limit(0, Some(5))
-            .unwrap()
+            .expect("adding limit")
             .build()
-            .unwrap();
+            .expect("building plan");
 
         let rewrite = create_rewrite(&ctx, 2);
         let config = ConfigOptions::default();
-        let result = rewrite.analyze(plan, &config).unwrap();
+        let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
         // Should have outer Limit + 2 inner Limits = 3 Limit nodes
         let limit_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Limit(_)));
@@ -600,13 +603,13 @@ mod tests {
         register_table(&ctx, "sales", Arc::clone(&schema));
 
         let plan = LogicalPlanBuilder::scan("sales", table_source(schema), None)
-            .unwrap()
+            .expect("building scan")
             .build()
-            .unwrap();
+            .expect("building plan");
 
         let rewrite = create_rewrite(&ctx, 1);
         let config = ConfigOptions::default();
-        let result = rewrite.analyze(plan, &config).unwrap();
+        let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
         // Single partition: no Union
         let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
@@ -623,13 +626,13 @@ mod tests {
         register_table(&ctx, "sales", Arc::clone(&schema));
 
         let plan = LogicalPlanBuilder::scan("sales", table_source(schema), None)
-            .unwrap()
+            .expect("building scan")
             .build()
-            .unwrap();
+            .expect("building plan");
 
         let rewrite = create_rewrite(&ctx, 0);
         let config = ConfigOptions::default();
-        let result = rewrite.analyze(plan, &config).unwrap();
+        let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
         let empty_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::EmptyRelation(_)));
         assert_eq!(
