@@ -96,9 +96,14 @@ impl Drop for Adbc {
         if let Some(factory) = self.adbc_factory.take() {
             // Offload the potentially-blocking FFI drop to a dedicated thread so it
             // does not stall the Tokio runtime during shutdown.
-            std::thread::spawn(move || {
-                drop(factory);
-            });
+            if std::thread::Builder::new()
+                .name("adbc-cleanup".to_string())
+                .spawn(move || drop(factory))
+                .is_err()
+            {
+                tracing::warn!("Failed to spawn ADBC cleanup thread; dropping inline");
+                // Factory already moved into the failed spawn closure and is dropped there.
+            }
         }
     }
 }
@@ -750,5 +755,81 @@ mod tests {
         assert!(!is_auth_or_permission_error("Table not found"));
         assert!(!is_auth_or_permission_error("Connection reset by peer"));
         assert!(!is_auth_or_permission_error("timeout"));
+    }
+
+    #[test]
+    fn test_classify_adbc_error_bigquery_auth() {
+        let dataset = Dataset::new("bigquery:my_project.my_dataset.my_table", "my_table");
+        let error: Box<dyn std::error::Error + Send + Sync> =
+            "invalid_grant: reauth related error".into();
+        let result = classify_adbc_error(
+            error,
+            "bigquery",
+            &dataset,
+            |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dc,
+                connector_component: cc,
+                source: src,
+            },
+        );
+        let msg = result.to_string();
+        assert!(
+            msg.contains("BigQuery credentials"),
+            "Expected BigQuery-specific hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid_grant"),
+            "Expected original error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_adbc_error_generic_auth() {
+        let dataset = Dataset::new("adbc:snowflake://host/db", "my_table");
+        let error: Box<dyn std::error::Error + Send + Sync> = "403 Forbidden".into();
+        let result = classify_adbc_error(
+            error,
+            "snowflake",
+            &dataset,
+            |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dc,
+                connector_component: cc,
+                source: src,
+            },
+        );
+        let msg = result.to_string();
+        assert!(
+            msg.contains("credentials are valid"),
+            "Expected generic auth hint, got: {msg}"
+        );
+        assert!(
+            !msg.contains("BigQuery"),
+            "Should not mention BigQuery for non-BigQuery driver, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_adbc_error_non_auth_uses_fallback() {
+        let dataset = Dataset::new("adbc:postgres://host/db", "my_table");
+        let error: Box<dyn std::error::Error + Send + Sync> = "Connection refused".into();
+        let result = classify_adbc_error(
+            error,
+            "postgres",
+            &dataset,
+            |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dc,
+                connector_component: cc,
+                source: src,
+            },
+        );
+        let msg = result.to_string();
+        assert!(
+            msg.contains("Connection refused"),
+            "Expected original error in fallback, got: {msg}"
+        );
+        assert!(
+            !msg.contains("credentials"),
+            "Should not mention credentials for non-auth error, got: {msg}"
+        );
     }
 }

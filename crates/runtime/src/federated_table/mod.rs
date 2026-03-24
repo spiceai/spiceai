@@ -32,6 +32,7 @@ use std::sync::{Arc, OnceLock};
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
+use datafusion::common::DataFusionError;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +45,55 @@ use crate::{
     tracers::OnceTracer,
     warn_once,
 };
+
+/// A [`TableProvider`] that always returns an error when scanned.
+///
+/// Used as a fallback when the deferred provider task exits without producing
+/// a real table (e.g. during shutdown or after a task panic), so queries fail
+/// explicitly rather than silently returning zero rows.
+struct UnavailableTableProvider {
+    schema: SchemaRef,
+}
+
+impl UnavailableTableProvider {
+    fn new(schema: SchemaRef) -> Self {
+        Self { schema }
+    }
+}
+
+impl std::fmt::Debug for UnavailableTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnavailableTableProvider").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for UnavailableTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> datafusion::common::TableType {
+        datafusion::common::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::prelude::Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(DataFusionError::External(
+            "Data source unavailable: the connection to the federated source could not be established. The runtime may be shutting down or the source is unreachable."
+                .into(),
+        ))
+    }
+}
 
 #[derive(Debug)]
 pub enum FederatedTable {
@@ -185,11 +235,11 @@ impl FederatedTable {
                     table_provider
                 }
                 Err(_) => {
-                    // The deferred task was cancelled (e.g. during shutdown) without
-                    // sending a provider. Return a minimal empty-schema provider so
-                    // callers do not panic.
+                    // The deferred task was cancelled (e.g. during shutdown) or panicked
+                    // without sending a provider. Return a provider that errors on scan
+                    // so queries fail explicitly instead of silently returning zero rows.
                     *deferred_state_guard = DeferredState::Done;
-                    Arc::new(datafusion::datasource::empty::EmptyTable::new(
+                    Arc::new(UnavailableTableProvider::new(
                         deferred_table_provider.schema(),
                     ))
                 }
