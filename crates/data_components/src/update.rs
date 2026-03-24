@@ -23,6 +23,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
+use datafusion::execution::SessionState;
+use datafusion::physical_plan::execute_stream;
 use datafusion::{
     datasource::TableProvider,
     error::DataFusionError,
@@ -35,8 +37,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use datafusion::execution::SessionState;
-use datafusion::physical_plan::execute_stream;
 use datafusion_datasource::memory::MemorySourceConfig;
 
 /// An execution plan that implements UPDATE as delete + insert.
@@ -87,11 +87,7 @@ impl std::fmt::Debug for UpdateExec {
 }
 
 impl DisplayAs for UpdateExec {
-    fn fmt_as(
-        &self,
-        _t: DisplayFormatType,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "UpdateExec")
     }
 }
@@ -169,9 +165,7 @@ impl ExecutionPlan for UpdateExec {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(DataFusionError::from)?;
 
-            let delete_plan = table_provider
-                .delete_from(&session_state, filters)
-                .await?;
+            let delete_plan = table_provider.delete_from(&session_state, filters).await?;
             let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
             let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
 
