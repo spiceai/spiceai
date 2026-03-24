@@ -406,7 +406,7 @@ pub fn extract_filter_sql(plan: &LogicalPlan) -> DFResult<Option<String>> {
 /// Note: `DataFusion` may wrap unchanged columns in CAST expressions, which would
 /// not match the identity check and would be treated as assignments. In practice
 /// this is rare and harmless (it would SET the column to its own value).
-fn extract_update_assignments(
+pub fn extract_update_assignments(
     plan: &LogicalPlan,
     table_name: &TableReference,
 ) -> DFResult<Vec<(String, String)>> {
