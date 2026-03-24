@@ -2,7 +2,7 @@ name: build_nightly
 
 on:
   schedule:
-    - cron: '0 9 * * *' # Runs the workflow at 9:00 AM UTC (1AM PT) every day
+    - cron: '0 13,19,3 * * *' # Runs at 6AM, 12PM, 8PM PT
 
   workflow_dispatch:
     inputs:
