@@ -238,52 +238,76 @@ impl DataConnectorFactory for AdbcFactory {
 
             // Driver loading, database creation, and pool creation are all
             // synchronous FFI/IO operations — offload to a blocking thread.
-            let pool = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
-                let mut driver = ManagedDriver::load_from_name(
-                    &driver_location,
-                    None,
-                    AdbcVersion::V110,
-                    LOAD_FLAG_DEFAULT,
-                    None,
-                )
-                .context(UnableToLoadDriverSnafu {
-                    driver_location: driver_location.clone(),
-                })?;
-
-                let db = driver.new_database_with_opts(db_options).context(
-                    UnableToCreateDatabaseSnafu {
+            let pool = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+                    let mut driver = ManagedDriver::load_from_name(
+                        &driver_location,
+                        None,
+                        AdbcVersion::V110,
+                        LOAD_FLAG_DEFAULT,
+                        None,
+                    )
+                    .context(UnableToLoadDriverSnafu {
                         driver_location: driver_location.clone(),
-                        uri: uri_str.clone(),
-                    },
-                )?;
-
-                let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
-                    .with_max_size(pool_size)
-                    .with_min_idle(pool_min_idle);
-
-                if let Some(conn_opts) = conn_options {
-                    pool_builder = pool_builder.with_conn_options(conn_opts);
-                }
-
-                let pool = pool_builder
-                    .build()
-                    .context(UnableToCreateConnectionPoolSnafu {
-                        driver_location,
-                        uri: uri_str,
                     })?;
 
-                Ok(Arc::new(pool))
-            })
+                    let db = driver.new_database_with_opts(db_options).context(
+                        UnableToCreateDatabaseSnafu {
+                            driver_location: driver_location.clone(),
+                            uri: uri_str.clone(),
+                        },
+                    )?;
+
+                    let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
+                        .with_max_size(pool_size)
+                        .with_min_idle(pool_min_idle);
+
+                    if let Some(conn_opts) = conn_options {
+                        pool_builder = pool_builder.with_conn_options(conn_opts);
+                    }
+
+                    let pool = pool_builder
+                        .build()
+                        .context(UnableToCreateConnectionPoolSnafu {
+                            driver_location,
+                            uri: uri_str,
+                        })?;
+
+                    Ok(Arc::new(pool))
+                }),
+            )
             .await
+            .map_err(|_| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: component.clone(),
+                source: "ADBC driver initialization timed out after 60 seconds".into(),
+            })?
             .map_err(|e| DataConnectorError::UnableToConnectInternal {
                 dataconnector: "adbc".to_string(),
                 connector_component: component.clone(),
                 source: Box::new(e),
             })?
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component,
-                source: Box::new(e),
+            .map_err(|e| {
+                let error_string = e.to_string();
+                if is_auth_or_permission_error(&error_string) {
+                    let hint = if driver_name_owned == "bigquery" {
+                        "Verify your BigQuery credentials are valid, not expired, and have the required permissions. See: https://cloud.google.com/bigquery/docs/authentication"
+                    } else {
+                        "Verify the configured credentials are valid and have the required permissions."
+                    };
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("adbc ({driver_name_owned})"),
+                        connector_component: component.clone(),
+                        source: format!("{error_string}. {hint}").into(),
+                    }
+                } else {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "adbc".to_string(),
+                        connector_component: component,
+                        source: Box::new(e),
+                    }
+                }
             })?;
 
             let adbc_factory = AdbcTableFactory::new(pool);
@@ -378,6 +402,53 @@ fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync
     }
 }
 
+/// Checks if an error message indicates an authentication or authorization failure.
+///
+/// BigQuery's ADBC driver often returns `Status::Unknown` with auth details in the
+/// message body rather than using `Status::Unauthenticated`/`Status::Unauthorized`,
+/// so we also inspect the error text.
+fn is_auth_or_permission_error(error_message: &str) -> bool {
+    let lower = error_message.to_lowercase();
+    lower.contains("invalid_grant")
+        || lower.contains("reauth related error")
+        || lower.contains("unauthenticated")
+        || lower.contains("unauthorized")
+        || lower.contains("access denied")
+        || lower.contains("permission denied")
+        || lower.contains("forbidden")
+        || lower.contains("credentials")
+        || lower.contains("invalid credentials")
+}
+
+/// Classify a provider error into a more specific [`DataConnectorError`] for
+/// BigQuery auth/permission failures, falling back to `fallback_variant`.
+fn classify_adbc_error(
+    error: Box<dyn std::error::Error + Send + Sync>,
+    driver_name: &str,
+    dataset: &Dataset,
+    fallback_variant: fn(String, ConnectorComponent, Box<dyn std::error::Error + Send + Sync>) -> DataConnectorError,
+) -> DataConnectorError {
+    let error_string = error.to_string();
+    if is_auth_or_permission_error(&error_string) {
+        let hint = if driver_name == "bigquery" {
+            "Verify your BigQuery credentials are valid, not expired, and have the required permissions. See: https://cloud.google.com/bigquery/docs/authentication"
+        } else {
+            "Verify the configured credentials are valid and have the required permissions."
+        };
+        DataConnectorError::UnableToConnectInternal {
+            dataconnector: format!("adbc ({driver_name})"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: format!("{error_string}. {hint}").into(),
+        }
+    } else {
+        fallback_variant(
+            "adbc".to_string(),
+            ConnectorComponent::from(dataset),
+            error,
+        )
+    }
+}
+
 register_data_connector!("adbc", AdbcFactory);
 
 #[async_trait]
@@ -395,10 +466,17 @@ impl DataConnector for Adbc {
         self.adbc_factory
             .table_provider(table_reference, dialect)
             .await
-            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "adbc".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
+            .map_err(|e| {
+                classify_adbc_error(
+                    e,
+                    &self.driver_name,
+                    dataset,
+                    |dc, cc, src| DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: dc,
+                        connector_component: cc,
+                        source: src,
+                    },
+                )
             })
     }
 
@@ -413,10 +491,17 @@ impl DataConnector for Adbc {
             self.adbc_factory
                 .read_write_table_provider(table_reference, dialect)
                 .await
-                .map_err(|e| DataConnectorError::UnableToGetReadWriteProvider {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: e,
+                .map_err(|e| {
+                    classify_adbc_error(
+                        e,
+                        &self.driver_name,
+                        dataset,
+                        |dc, cc, src| DataConnectorError::UnableToGetReadWriteProvider {
+                            dataconnector: dc,
+                            connector_component: cc,
+                            source: src,
+                        },
+                    )
                 }),
         )
     }
@@ -609,5 +694,41 @@ mod tests {
             opts.get("adbc.connection.catalog"),
             Some(&"cat".to_string())
         );
+    }
+
+    #[test]
+    fn test_is_auth_or_permission_error_bigquery_invalid_grant() {
+        assert!(is_auth_or_permission_error(
+            r#"Unknown: [BigQuery] Get "https://bigquery.googleapis.com:443/bigquery/v2/projects/my-project/datasets/my_dataset/tables/my_table?alt=json&prettyPrint=false": auth: "invalid_grant" "reauth related error (invalid_rapt)" "https://support.google.com/a/answer/9368756""#
+        ));
+    }
+
+    #[test]
+    fn test_is_auth_or_permission_error_permission_denied() {
+        assert!(is_auth_or_permission_error(
+            "Permission denied on resource project my-project"
+        ));
+    }
+
+    #[test]
+    fn test_is_auth_or_permission_error_access_denied() {
+        assert!(is_auth_or_permission_error("Access Denied"));
+    }
+
+    #[test]
+    fn test_is_auth_or_permission_error_unauthenticated() {
+        assert!(is_auth_or_permission_error("Request is unauthenticated"));
+    }
+
+    #[test]
+    fn test_is_auth_or_permission_error_forbidden() {
+        assert!(is_auth_or_permission_error("403 Forbidden"));
+    }
+
+    #[test]
+    fn test_is_auth_or_permission_error_not_auth() {
+        assert!(!is_auth_or_permission_error("Table not found"));
+        assert!(!is_auth_or_permission_error("Connection reset by peer"));
+        assert!(!is_auth_or_permission_error("timeout"));
     }
 }

@@ -24,6 +24,7 @@ use std::{
 };
 
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
@@ -40,7 +41,7 @@ pub enum RuntimeReadyState {
     OnRegistration,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RuntimeStatus {
     /// Stores the current status of all components.
     statuses: Arc<RwLock<HashMap<String, ComponentStatus>>>,
@@ -52,6 +53,22 @@ pub struct RuntimeStatus {
     ready_state: Arc<RwLock<RuntimeReadyState>>,
     /// Per-component notifiers for status change subscriptions.
     notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
+    /// Cancellation token that is cancelled when the runtime is shutting down.
+    /// Used to make background retry loops promptly exit on shutdown.
+    shutdown_token: CancellationToken,
+}
+
+impl Default for RuntimeStatus {
+    fn default() -> Self {
+        Self {
+            statuses: Arc::new(RwLock::new(HashMap::new())),
+            ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
+            ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
+            notifiers: Arc::new(RwLock::new(HashMap::new())),
+            shutdown_token: CancellationToken::new(),
+        }
+    }
 }
 
 impl RuntimeStatus {
@@ -63,6 +80,7 @@ impl RuntimeStatus {
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             notifiers: Arc::new(RwLock::new(HashMap::new())),
+            shutdown_token: CancellationToken::new(),
         })
     }
 
@@ -307,6 +325,16 @@ impl RuntimeStatus {
     /// Sets the runtime to the shutting down state.
     pub fn mark_shutdown(&self) {
         self.is_shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_token.cancel();
+    }
+
+    /// Returns the shutdown cancellation token.
+    ///
+    /// Use `token.cancelled()` in `tokio::select!` to make async operations
+    /// (e.g. backoff sleeps) immediately interruptible on shutdown.
+    #[must_use]
+    pub fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown_token
     }
 
     /// Returns the status of a specific component by its full name.

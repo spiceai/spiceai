@@ -313,7 +313,17 @@ impl Runtime {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
-        let _ = retry(retry_strategy, || async {
+        let shutdown_token = runtime.status.shutdown_token().clone();
+        let retry_fut = retry(retry_strategy, || async {
+            // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
+            if runtime.status.is_shutdown() {
+                return Err(RetryError::permanent(
+                    crate::Error::UnableToInitializeDataConnector {
+                        source: "Runtime is shutting down".into(),
+                    },
+                ));
+            }
+
             let connector = match Arc::clone(&runtime)
                 .load_dataset_connector(Arc::clone(&ds))
                 .await
@@ -336,6 +346,15 @@ impl Runtime {
                 }
             };
 
+            // Check shutdown between connector load and registration.
+            if runtime.status.is_shutdown() {
+                return Err(RetryError::permanent(
+                    crate::Error::UnableToInitializeDataConnector {
+                        source: "Runtime is shutting down".into(),
+                    },
+                ));
+            }
+
             if let Err(err) = Arc::clone(&runtime)
                 .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
                 .await
@@ -348,8 +367,14 @@ impl Runtime {
             }
 
             Ok(())
-        })
-        .await;
+        });
+
+        // Use tokio::select! so that backoff sleeps inside `retry` are immediately
+        // interrupted when the runtime begins shutting down (e.g. on ctrl-c).
+        tokio::select! {
+            _ = retry_fut => {},
+            () = shutdown_token.cancelled() => {},
+        }
     }
 
     async fn register_loaded_dataset(
