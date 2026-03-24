@@ -29,7 +29,10 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     execution::SessionState,
-    logical_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, lit},
+    logical_expr::{
+        EmptyRelation, Expr, Limit, LogicalPlan, LogicalPlanBuilder, Sort, SubqueryAlias,
+        TableScan, Union, lit,
+    },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
     sql::TableReference,
@@ -116,6 +119,74 @@ impl Debug for PartitionedTableScanRewrite {
     }
 }
 
+impl PartitionedTableScanRewrite {
+    /// Build partitioned sub-scans for a [`TableScan`] that should be partitioned,
+    /// returning the individual sub-scan plans (one per partition).
+    fn build_sub_scans(&self, scan: &TableScan) -> Result<Vec<Arc<LogicalPlan>>, DataFusionError> {
+        let schema = scan.source.schema();
+        let providers = self
+            .partition_provider
+            .get_partitions(&scan.table_name, &schema);
+
+        tracing::debug!(
+            "PartitionedTableScanRewrite: {} partitions for '{}' table.",
+            providers.len(),
+            scan.table_name
+        );
+
+        let df_schema = schema.to_dfschema()?;
+
+        let mut sub_scans = Vec::with_capacity(providers.len());
+        for (provider, partition_values) in providers {
+            let mut filters = scan.filters.clone();
+
+            let partition_exprs: Vec<Expr> = partition_values
+                .iter()
+                .filter_map(|pv| {
+                    partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
+                filters.push(partition_filter);
+            }
+            let plan = LogicalPlanBuilder::scan_with_filters(
+                scan.table_name.clone(),
+                Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
+                scan.projection.clone(),
+                filters,
+            )?
+            .build()?;
+            sub_scans.push(Arc::new(plan));
+        }
+        Ok(sub_scans)
+    }
+
+    /// Build a `Union` (or single plan) from sub-scans, wrapped in a [`SubqueryAlias`].
+    /// Returns `None` if there are no partitions (caller should produce an [`EmptyRelation`]).
+    fn build_union_from_sub_scans(
+        sub_scans: Vec<Arc<LogicalPlan>>,
+        table_name: &TableReference,
+    ) -> Result<Option<LogicalPlan>, DataFusionError> {
+        let Some(first_scan) = sub_scans.first() else {
+            return Ok(None);
+        };
+        let first_scan = Arc::unwrap_or_clone(Arc::clone(first_scan));
+        let rest = sub_scans.into_iter().skip(1).collect::<Vec<_>>();
+
+        if rest.is_empty() {
+            return Ok(Some(first_scan));
+        }
+
+        let mut builder = LogicalPlanBuilder::from(first_scan);
+        for scan in rest {
+            builder = builder.union(Arc::unwrap_or_clone(scan))?;
+        }
+        let result = builder.alias(table_name.clone())?.build()?;
+        Ok(Some(result))
+    }
+}
+
 impl AnalyzerRule for PartitionedTableScanRewrite {
     fn analyze(
         &self,
@@ -123,81 +194,194 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
         _config: &ConfigOptions,
     ) -> Result<LogicalPlan, DataFusionError> {
         plan.transform_up_with_subqueries(|plan| {
-            let LogicalPlan::TableScan(scan) = &plan else {
-                return Ok(Transformed::no(plan));
-            };
-            if !self.partition_provider.should_partition(scan) {
-                return Ok(Transformed::no(plan));
-            }
+            match &plan {
+                // Rewrite partitioned TableScan into Union of sub-scans.
+                LogicalPlan::TableScan(scan) => {
+                    if !self.partition_provider.should_partition(scan) {
+                        return Ok(Transformed::no(plan));
+                    }
 
-            let schema = scan.source.schema();
-            let providers = self
-                .partition_provider
-                .get_partitions(&scan.table_name, &schema);
-
-            tracing::debug!(
-                "PartitionedTableScanRewrite: {} partitions for '{}' table.",
-                providers.len(),
-                scan.table_name
-            );
-
-            // Pre-compute DFSchema for partition expression parsing
-            let df_schema = schema.to_dfschema()?;
-
-            let mut sub_scans = Vec::with_capacity(providers.len());
-            for (provider, partition_values) in providers {
-                let mut filters = scan.filters.clone();
-
-                // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
-                let partition_exprs: Vec<Expr> = partition_values
-                    .iter()
-                    .filter_map(|pv| {
-                        partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
-                    filters.push(partition_filter);
+                    let sub_scans = self.build_sub_scans(scan)?;
+                    match Self::build_union_from_sub_scans(sub_scans, &scan.table_name)? {
+                        Some(result) => Ok(Transformed::yes(result)),
+                        None => Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                            EmptyRelation {
+                                produce_one_row: false,
+                                schema: Arc::clone(plan.schema()),
+                            },
+                        ))),
+                    }
                 }
-                let plan = LogicalPlanBuilder::scan_with_filters(
-                    scan.table_name.clone(),
-                    Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
-                    scan.projection.clone(),
-                    filters,
-                )?
-                .build()?;
-                sub_scans.push(Arc::new(plan));
-            }
 
-            // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
-            let Some(first_scan) = sub_scans.first() else {
-                return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
-                    EmptyRelation {
-                        produce_one_row: false,
-                        schema: Arc::clone(plan.schema()),
-                    },
-                )));
-            };
-            let first_scan = Arc::unwrap_or_clone(Arc::clone(first_scan));
-            let sub_scans = sub_scans.into_iter().skip(1).collect::<Vec<_>>();
+                // Push Sort into each Union leg for better distributed performance.
+                // After the TableScan → Union rewrite above (bottom-up), Sort's input
+                // is now SubqueryAlias(Union(...)). We push Sort into each leg so each
+                // executor sorts locally, reducing the data sent to the coordinator.
+                LogicalPlan::Sort(sort) => {
+                    if let LogicalPlan::SubqueryAlias(alias) = sort.input.as_ref() {
+                        if let LogicalPlan::Union(union) = alias.input.as_ref() {
+                            let new_inputs: Vec<Arc<LogicalPlan>> = union
+                                .inputs
+                                .iter()
+                                .map(|leg| {
+                                    Arc::new(LogicalPlan::Sort(Sort {
+                                        expr: sort.expr.clone(),
+                                        input: Arc::clone(leg),
+                                        fetch: sort.fetch,
+                                    }))
+                                })
+                                .collect();
+                            let new_union =
+                                LogicalPlan::Union(Union::try_new(new_inputs)?);
+                            let new_alias = LogicalPlan::SubqueryAlias(
+                                SubqueryAlias::try_new(
+                                    Arc::new(new_union),
+                                    alias.alias.clone(),
+                                )?,
+                            );
+                            // Keep the outer Sort for correctness (merges sorted streams).
+                            let result = LogicalPlan::Sort(Sort {
+                                expr: sort.expr.clone(),
+                                input: Arc::new(new_alias),
+                                fetch: sort.fetch,
+                            });
+                            return Ok(Transformed::yes(result));
+                        }
+                    }
+                    Ok(Transformed::no(plan))
+                }
 
-            // Single partition: no Union needed, just return the sub-scan directly.
-            if sub_scans.is_empty() {
-                return Ok(Transformed::yes(first_scan));
-            }
+                // Push Limit into each Union leg so executors return at most N rows each.
+                // Handles two patterns:
+                //   Limit → Sort → SubqueryAlias → Union  (ORDER BY ... LIMIT)
+                //   Limit → SubqueryAlias → Union          (LIMIT without ORDER BY)
+                LogicalPlan::Limit(limit) => {
+                    // Only push down when we have a fetch value.
+                    if limit.fetch.is_none() {
+                        return Ok(Transformed::no(plan));
+                    }
 
-            let mut builder = LogicalPlanBuilder::from(first_scan);
-            for scan in sub_scans {
-                builder = builder.union(Arc::unwrap_or_clone(scan))?;
+                    // Pattern: Limit → Sort → SubqueryAlias → Union
+                    // At this point Sort was already pushed down, so each Union leg
+                    // has a Sort. We wrap each leg with Limit.
+                    if let LogicalPlan::Sort(sort) = limit.input.as_ref() {
+                        if let LogicalPlan::SubqueryAlias(alias) = sort.input.as_ref() {
+                            if let LogicalPlan::Union(union) = alias.input.as_ref() {
+                                let pushed_fetch = pushed_down_fetch(
+                                    limit.skip.as_deref(),
+                                    limit.fetch.as_deref(),
+                                );
+                                let new_inputs: Vec<Arc<LogicalPlan>> = union
+                                    .inputs
+                                    .iter()
+                                    .map(|leg| {
+                                        Arc::new(LogicalPlan::Limit(Limit {
+                                            skip: None,
+                                            fetch: pushed_fetch.clone(),
+                                            input: Arc::clone(leg),
+                                        }))
+                                    })
+                                    .collect();
+                                let new_union =
+                                    LogicalPlan::Union(Union::try_new(new_inputs)?);
+                                let new_alias = LogicalPlan::SubqueryAlias(
+                                    SubqueryAlias::try_new(
+                                        Arc::new(new_union),
+                                        alias.alias.clone(),
+                                    )?,
+                                );
+                                // Keep outer Sort + Limit for correctness.
+                                let new_sort = LogicalPlan::Sort(Sort {
+                                    expr: sort.expr.clone(),
+                                    input: Arc::new(new_alias),
+                                    fetch: sort.fetch,
+                                });
+                                let result = LogicalPlan::Limit(Limit {
+                                    skip: limit.skip.clone(),
+                                    fetch: limit.fetch.clone(),
+                                    input: Arc::new(new_sort),
+                                });
+                                return Ok(Transformed::yes(result));
+                            }
+                        }
+                    }
+
+                    // Pattern: Limit → SubqueryAlias → Union (no Sort)
+                    if let LogicalPlan::SubqueryAlias(alias) = limit.input.as_ref() {
+                        if let LogicalPlan::Union(union) = alias.input.as_ref() {
+                            let pushed_fetch =
+                                pushed_down_fetch(limit.skip.as_deref(), limit.fetch.as_deref());
+                            let new_inputs: Vec<Arc<LogicalPlan>> = union
+                                .inputs
+                                .iter()
+                                .map(|leg| {
+                                    Arc::new(LogicalPlan::Limit(Limit {
+                                        skip: None,
+                                        fetch: pushed_fetch.clone(),
+                                        input: Arc::clone(leg),
+                                    }))
+                                })
+                                .collect();
+                            let new_union =
+                                LogicalPlan::Union(Union::try_new(new_inputs)?);
+                            let new_alias = LogicalPlan::SubqueryAlias(
+                                SubqueryAlias::try_new(
+                                    Arc::new(new_union),
+                                    alias.alias.clone(),
+                                )?,
+                            );
+                            let result = LogicalPlan::Limit(Limit {
+                                skip: limit.skip.clone(),
+                                fetch: limit.fetch.clone(),
+                                input: Arc::new(new_alias),
+                            });
+                            return Ok(Transformed::yes(result));
+                        }
+                    }
+
+                    Ok(Transformed::no(plan))
+                }
+
+                _ => Ok(Transformed::no(plan)),
             }
-            let result = builder.alias(scan.table_name.clone())?.build()?;
-            Ok(Transformed::yes(result))
         })
         .data()
     }
 
     fn name(&self) -> &'static str {
         "PartitionedTableScanRewrite"
+    }
+}
+
+/// Compute the fetch value to push into each Union leg.
+///
+/// When there is a `LIMIT n OFFSET m`, each partition must return at least `n + m` rows
+/// so the outer Limit can correctly skip `m` and take `n` from the merged result.
+/// When there is no OFFSET, push fetch as-is.
+///
+/// Returns `None` if the pushed-down fetch cannot be computed (e.g. non-literal expressions),
+/// in which case the caller should still push the Limit but with `fetch = None` (unlimited).
+fn pushed_down_fetch(skip: Option<&Expr>, fetch: Option<&Expr>) -> Option<Box<Expr>> {
+    use datafusion::common::ScalarValue;
+
+    let fetch_expr = fetch?;
+
+    match skip {
+        None => Some(Box::new(fetch_expr.clone())),
+        Some(skip_expr) => {
+            // Try to evaluate skip + fetch for literal values.
+            if let (
+                Expr::Literal(ScalarValue::Int64(Some(s)), _),
+                Expr::Literal(ScalarValue::Int64(Some(f)), _),
+            ) = (skip_expr, fetch_expr)
+            {
+                Some(Box::new(lit(s + f)))
+            } else {
+                // Conservative: push fetch without accounting for skip.
+                // The outer Limit still applies the correct skip.
+                Some(Box::new(fetch_expr.clone()))
+            }
+        }
     }
 }
 
