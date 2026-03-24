@@ -18,18 +18,6 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.53,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
-        ]
-      },
-      "primary_key": {
-        "id": 484
-      }
-    },
-    {
       "_score": 0.52,
       "dataset": "qs_view",
       "matches": {
@@ -46,11 +34,23 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since there are 50 equal numbers, each number is equal to \\("
+          "Since there are 4 distinct letters, the number of arrangement"
         ]
       },
       "primary_key": {
-        "id": 507
+        "id": 362
+      }
+    },
+    {
+      "_score": 0.49,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
+        ]
+      },
+      "primary_key": {
+        "id": 451
       }
     }
   ]

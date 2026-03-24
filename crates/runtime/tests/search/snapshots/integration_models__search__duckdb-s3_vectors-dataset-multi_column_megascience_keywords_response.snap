@@ -25,14 +25,14 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
+          "The smallest number in the book is typically $\\boxed{1}$, as counting books usually start from this number."
         ],
         "question": [
-          "How many numbers between 0 and 60 are even multiples of 5?"
+          "What is the smallest number in the book \"Things You Can Count in This Counting Book\"?"
         ]
       },
       "primary_key": {
-        "id": 470
+        "id": 1152
       }
     },
     {
@@ -40,11 +40,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+          "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
         ]
       },
       "primary_key": {
-        "id": 458
+        "id": 42
       }
     },
     {
@@ -52,11 +52,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
-          "Calculate the number of permutations of 14 items taken 4 at a time."
+          "If \\(a + b + c + \\ldots + z = 100\\), where \\(a, b, c, \\ldots, z\\) are 50 equal numbers, what is the value of each number?"
         ]
       },
       "primary_key": {
-        "id": 41
+        "id": 507
       }
     }
   ]
