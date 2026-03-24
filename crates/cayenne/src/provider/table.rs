@@ -2701,6 +2701,7 @@ impl CayenneTableProvider {
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
             Arc::clone(self.context.runtime_env()),
+            None, // Already under write_lock from write_all_append
         );
 
         let deleted_count =
@@ -2937,16 +2938,23 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Refresh in-memory query state from a freshly opened provider for the same table.
+    /// Refresh in-memory query state by reloading from the catalog (source of truth).
     ///
     /// This keeps existing `Arc<CayenneTableProvider>` handles usable after catalog refreshes
     /// by updating mutable state in place instead of swapping provider objects.
     ///
+    /// Acquires the write lock to prevent racing with in-progress writes/deletes. While holding
+    /// the lock, reloads deletion vectors, protected snapshots, and the listing table
+    /// directly from the catalog — NOT from the `source` provider, which may contain
+    /// stale state captured before the lock was acquired.
+    ///
+    /// The `source` parameter is used to validate that the table ID matches.
+    ///
     /// # Errors
     ///
     /// Returns an error if `source` refers to a different table (mismatched table IDs)
-    /// or if updating internal deletion/listing state fails.
-    pub fn refresh_from(&self, source: &Self) -> Result<()> {
+    /// or if reloading from the catalog fails.
+    pub async fn refresh(&self, source: &Self) -> Result<()> {
         if self.table_metadata.table_id != source.table_metadata.table_id {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
@@ -2957,46 +2965,37 @@ impl CayenneTableProvider {
             });
         }
 
-        self.pk_deletion_strategy.refresh_from(
-            &source.pk_deletion_strategy,
-            &self.table_metadata.table_name,
-        )?;
+        // Acquire the write lock so no insert/delete is in-flight while we reload state.
+        let _write_guard = self.write_lock.lock().await;
 
-        let refreshed_listing_table = {
-            let guard = source
-                .listing_table
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: LISTING_TABLE_LOCK_POISONED,
-                })?;
-            Arc::clone(&guard)
-        };
+        // Reload deletion vectors from the catalog (SQLite) — the source of truth.
+        // This picks up any deletions committed by writes that completed after the
+        // source provider was opened.
+        let fresh_strategy = Self::load_deletion_vectors_all(
+            &self.table_metadata.table_id,
+            Arc::clone(&self.catalog),
+            self.pk_deletion_strategy.strategy(),
+        )
+        .await
+        .map_err(|e| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: format!("Failed to reload deletion vectors during refresh: {e}"),
+        })?;
 
-        {
-            let mut guard = self
-                .listing_table
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: LISTING_TABLE_LOCK_POISONED,
-                })?;
-            *guard = refreshed_listing_table;
-        }
+        self.pk_deletion_strategy
+            .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
 
-        let refreshed_snapshot_id = source.get_current_snapshot_id()?;
-        self.update_current_snapshot_id(&refreshed_snapshot_id)?;
-
-        let refreshed_protected_snapshots = {
-            let guard = source
-                .protected_snapshots
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
-                })?;
-            guard.clone()
-        };
+        // Reload protected snapshots from the catalog.
+        let fresh_protected_snapshots = Self::load_protected_snapshots(
+            Arc::clone(&self.catalog),
+            &self.table_metadata.table_id,
+            &self.pk_deletion_strategy,
+        )
+        .await
+        .map_err(|e| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: format!("Failed to reload protected snapshots during refresh: {e}"),
+        })?;
 
         {
             let mut guard = self
@@ -3006,11 +3005,25 @@ impl CayenneTableProvider {
                     table: self.table_metadata.table_name.clone(),
                     lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
                 })?;
-            *guard = refreshed_protected_snapshots;
+            *guard = fresh_protected_snapshots;
         }
+
+        // Reload the current snapshot ID from the catalog.
+        let fresh_metadata = self
+            .catalog
+            .get_table(&self.table_metadata.table_name)
+            .await
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("Failed to reload table metadata during refresh: {e}"),
+            })?;
+        self.update_current_snapshot_id(&fresh_metadata.current_snapshot_id)?;
+
+        // Rebuild the listing table from the fresh snapshot ID on disk.
+        self.refresh_listing_table()?;
 
         tracing::debug!(
-            "Refreshed in-memory state for table {} from freshly opened provider",
+            "Refreshed in-memory state for table {} from catalog",
             self.table_metadata.table_name
         );
 
@@ -4140,6 +4153,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_id.clone(),
                 self.table_metadata.path.clone(),
                 Arc::clone(self.context.runtime_env()),
+                Arc::clone(&self.write_lock),
             )),
             &self.table_metadata.schema,
         )))
@@ -4168,6 +4182,7 @@ impl CayenneTableProvider {
                 self.pk_column_indices.clone(),
                 snapshot_tables,
                 Arc::clone(self.context.runtime_env()),
+                Some(Arc::clone(&self.write_lock)),
             )),
             &self.table_metadata.schema,
         )))
