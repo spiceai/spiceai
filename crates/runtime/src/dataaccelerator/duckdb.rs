@@ -450,39 +450,34 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                let datasets: Vec<Arc<Dataset>> = Arc::clone(&source.runtime())
-                    .get_initialized_datasets(&source.app(), crate::LogErrors(false))
-                    .await;
-
-                let views: Vec<Arc<View>> = Arc::clone(&source.runtime())
-                    .get_initialized_views(&source.app(), crate::LogErrors(false))
-                    .await;
-
+                // Use ALL configured datasets (not just initialized ones) to compute
+                // the attach_databases list. This ensures that when datasets are initialized
+                // sequentially, the first table's pool includes all other DuckDB files,
+                // enabling cross-table joins immediately without needing a restart.
+                let app = source.app();
                 let self_path = self.file_path(source)?;
-                let attach_databases = datasets
-                    .into_iter()
-                    .map(|ds| ds as Arc<dyn AccelerationSource>)
-                    .chain(
-                        views
-                            .into_iter()
-                            .map(|view| view as Arc<dyn AccelerationSource>),
-                    )
-                    .filter_map(|other_source| {
-                        if other_source.acceleration().is_some_and(|a| {
-                            a.engine == Engine::DuckDB
-                                && matches!(a.mode, Mode::File | Mode::FileCreate)
-                        }) {
-                            if other_source.name() == source.name() {
-                                None
+                let attach_databases: HashSet<String> = app
+                    .datasets
+                    .iter()
+                    .filter_map(|ds| {
+                        let accel = ds.acceleration.as_ref()?;
+                        if accel.engine == Engine::DuckDB
+                            && matches!(accel.mode, Mode::File | Mode::FileCreate)
+                            && ds.name != *source.name()
+                        {
+                            let other_path =
+                                duckdb_file_path(&self.duckdb_factory, ds, "accelerated_duckdb")
+                                    .ok()?;
+                            if other_path != self_path {
+                                Some(other_path)
                             } else {
-                                let other_path = self.file_path(other_source.as_ref());
-                                other_path.ok().filter(|p| p != &self_path)
+                                None
                             }
                         } else {
                             None
                         }
                     })
-                    .collect::<HashSet<_>>(); // collect unique paths using HashSet
+                    .collect();
 
                 if !attach_databases.is_empty() {
                     cmd.options.insert(
