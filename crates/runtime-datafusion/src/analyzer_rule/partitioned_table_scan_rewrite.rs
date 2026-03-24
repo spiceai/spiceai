@@ -22,16 +22,16 @@ use std::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
-        tree_node::{Transformed, TransformedResult},
         Result, ToDFSchema,
+        tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     execution::SessionState,
     logical_expr::{
-        lit, EmptyRelation, Expr, Limit, LogicalPlan, LogicalPlanBuilder, Sort, SubqueryAlias,
-        TableScan, Union,
+        EmptyRelation, Expr, Limit, LogicalPlan, LogicalPlanBuilder, Sort, SubqueryAlias,
+        TableScan, Union, lit,
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
@@ -431,7 +431,7 @@ mod tests {
         config::ConfigOptions,
         datasource::{DefaultTableSource, MemTable},
         logical_expr::{LogicalPlan, LogicalPlanBuilder},
-        prelude::{col, SessionContext},
+        prelude::{SessionContext, col},
     };
 
     /// A test partition provider that splits the table into `n` partitions,
