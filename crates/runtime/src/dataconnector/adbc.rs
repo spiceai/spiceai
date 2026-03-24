@@ -183,7 +183,7 @@ impl DataConnectorFactory for AdbcFactory {
 
         Box::pin(async move {
             let connector = cell
-                .get_or_try_init(async move {
+                .get_or_try_init(|| async move {
                     let driver_name = params
                         .parameters
                         .get("driver")
