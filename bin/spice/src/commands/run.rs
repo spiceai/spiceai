@@ -186,7 +186,10 @@ fn resolve_endpoint(
     flight_endpoint: Option<&str>,
 ) -> Result<(Option<String>, Option<String>)> {
     let Some(ep) = endpoint else {
-        return Ok((http_endpoint.map(String::from), flight_endpoint.map(String::from)));
+        return Ok((
+            http_endpoint.map(String::from),
+            flight_endpoint.map(String::from),
+        ));
     };
 
     if ep.starts_with("http://") || ep.starts_with("https://") {
@@ -201,8 +204,7 @@ fn resolve_endpoint(
         ensure!(
             flight_endpoint.is_none(),
             InvalidArgumentSnafu {
-                message:
-                    "--endpoint with grpc:// scheme cannot be combined with --flight-endpoint"
+                message: "--endpoint with grpc:// scheme cannot be combined with --flight-endpoint"
             }
         );
         let addr = ep
