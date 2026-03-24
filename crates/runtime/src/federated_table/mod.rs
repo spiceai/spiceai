@@ -226,15 +226,14 @@ impl FederatedTable {
 
         // The only valid state at this point is Waiting, we've already checked Done above and we always set the state back to Done before exiting.
         match deferred_state_owned {
-            DeferredState::Waiting(rx) => match rx.await {
-                Ok(table_provider) => {
+            DeferredState::Waiting(rx) => {
+                if let Ok(table_provider) = rx.await {
                     let _ = deferred_table_provider
                         .table
                         .set(Arc::clone(&table_provider));
                     *deferred_state_guard = DeferredState::Done;
                     table_provider
-                }
-                Err(_) => {
+                } else {
                     // The deferred task was cancelled (e.g. during shutdown) or panicked
                     // without sending a provider. Return a provider that errors on scan
                     // so queries fail explicitly instead of silently returning zero rows.
@@ -245,7 +244,7 @@ impl FederatedTable {
                     *deferred_state_guard = DeferredState::Done;
                     unavailable
                 }
-            },
+            }
             DeferredState::InProgress | DeferredState::Done => {
                 unreachable!("deferred state should only be Waiting at this point");
             }
