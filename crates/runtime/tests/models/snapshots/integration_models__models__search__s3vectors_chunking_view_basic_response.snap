@@ -18,30 +18,6 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.78,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " is 2."
-        ]
-      },
-      "primary_key": {
-        "id": 349
-      }
-    },
-    {
-      "_score": 0.55,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 948
-      }
-    },
-    {
       "_score": 0.55,
       "dataset": "qs_view",
       "matches": {
@@ -51,6 +27,30 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
+      }
+    },
+    {
+      "_score": 0.5,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " 2 = 8\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 1284
+      }
+    },
+    {
+      "_score": 0.48,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\n2.75 + 27 \\times \\frac{1}{5} - 75 = 2.75 + 5.4 - 75 = 8.15 - 7"
+        ]
+      },
+      "primary_key": {
+        "id": 1250
       }
     }
   ]
