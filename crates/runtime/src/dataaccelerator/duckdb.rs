@@ -451,23 +451,37 @@ impl DataAccelerator for DuckDBAccelerator {
                 let app = source.app();
                 let self_path = self.file_path(source)?;
                 let source_name = source.name().to_string();
-                let attach_databases: HashSet<String> = app
+                // Collect (name, acceleration) pairs from both datasets and views
+                let accel_sources: Vec<(&str, &spicepod::acceleration::Acceleration)> = app
                     .datasets
                     .iter()
                     .filter_map(|ds| {
-                        let accel = ds.acceleration.as_ref()?;
+                        ds.acceleration
+                            .as_ref()
+                            .map(|a| (ds.name.as_str(), a))
+                    })
+                    .chain(app.views.iter().filter_map(|v| {
+                        v.acceleration
+                            .as_ref()
+                            .map(|a| (v.name.as_str(), a))
+                    }))
+                    .collect();
+
+                let attach_databases: HashSet<String> = accel_sources
+                    .into_iter()
+                    .filter_map(|(name, accel)| {
                         if accel.engine.as_deref() == Some("duckdb")
                             && matches!(
                                 accel.mode,
                                 spicepod::acceleration::Mode::File
                                     | spicepod::acceleration::Mode::FileCreate
                             )
-                            && ds.name != source_name
+                            && name != source_name
                         {
                             let mut params = accel
                                 .params
                                 .as_ref()
-                                .map(|p| p.as_string_map())
+                                .map(spicepod::param::Params::as_string_map)
                                 .unwrap_or_default();
                             let data_directory = params
                                 .remove("duckdb_data_dir")

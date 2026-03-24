@@ -293,6 +293,7 @@ impl Runtime {
     }
 
     #[cfg(feature = "duckdb")]
+    #[allow(dead_code)]
     pub(crate) async fn get_initialized_views(
         self: Arc<Self>,
         app: &Arc<App>,
