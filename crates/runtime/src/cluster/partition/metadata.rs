@@ -131,7 +131,7 @@ impl TablePartitionMetadata {
             partitions: Vec::new(),
             schema_version: 1,
             updated_at,
-            partition_expressions: Vec::new(),
+            partition_expressions,
         }
     }
 
