@@ -477,16 +477,12 @@ impl DataAccelerator for DuckDBAccelerator {
                 let attach_databases: HashSet<String> = app
                     .datasets
                     .iter()
-                    .filter_map(|ds| {
-                        ds.acceleration
-                            .as_ref()
-                            .map(|a| (ds.name.as_str(), a))
-                    })
-                    .chain(app.views.iter().filter_map(|v| {
-                        v.acceleration
-                            .as_ref()
-                            .map(|a| (v.name.as_str(), a))
-                    }))
+                    .filter_map(|ds| ds.acceleration.as_ref().map(|a| (ds.name.as_str(), a)))
+                    .chain(
+                        app.views
+                            .iter()
+                            .filter_map(|v| v.acceleration.as_ref().map(|a| (v.name.as_str(), a))),
+                    )
                     .filter_map(|(name, accel)| {
                         if accel
                             .engine
