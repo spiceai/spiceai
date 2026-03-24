@@ -295,7 +295,6 @@ Model sources define `ParameterSpec` arrays in separate modules:
 - `openai` - OpenAI API parameters
 - `azure` - Azure OpenAI parameters
 - `anthropic` - Anthropic API parameters
-- `perplexity` - Perplexity API parameters
 - `xai` - xAI API parameters
 - `bedrock` - AWS Bedrock parameters
 - `databricks` - Databricks model parameters
