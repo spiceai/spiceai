@@ -468,14 +468,13 @@ impl DataConnector for Adbc {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let adbc_factory =
-            self.adbc_factory
-                .as_ref()
-                .ok_or_else(|| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: "ADBC connector has been shut down".into(),
-                })?;
+        let adbc_factory = self.adbc_factory.as_ref().ok_or_else(|| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "ADBC connector has been shut down".into(),
+            }
+        })?;
         let table_reference = dataset.path().into();
         let dialect = dialect_for_driver(&self.driver_name);
         adbc_factory
