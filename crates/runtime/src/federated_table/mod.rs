@@ -41,7 +41,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use crate::{
     component::dataset::Dataset,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
-    dataconnector::{ConnectorComponent, DataConnector, DataConnectorError},
+    dataconnector::{DataConnector, DataConnectorError},
     tracers::OnceTracer,
     warn_once,
 };
@@ -53,11 +53,15 @@ use crate::{
 /// explicitly rather than silently returning zero rows.
 struct UnavailableTableProvider {
     schema: SchemaRef,
+    dataset_name: String,
 }
 
 impl UnavailableTableProvider {
-    fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+    fn new(schema: SchemaRef, dataset_name: String) -> Self {
+        Self {
+            schema,
+            dataset_name,
+        }
     }
 }
 
@@ -89,8 +93,11 @@ impl TableProvider for UnavailableTableProvider {
         _limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         Err(DataFusionError::External(
-            "Data source unavailable: the connection to the federated source could not be established. The runtime may be shutting down or the source is unreachable."
-                .into(),
+            format!(
+                "Data source unavailable for '{}': the connection to the federated source could not be established. The runtime may be shutting down or the source is unreachable.",
+                self.dataset_name
+            )
+            .into(),
         ))
     }
 }
@@ -117,6 +124,7 @@ pub struct DeferredTableProvider {
     state: RwLock<DeferredState>,
     table: OnceLock<Arc<dyn TableProvider>>,
     schema: SchemaRef,
+    dataset_name: String,
 }
 
 impl DeferredTableProvider {
@@ -237,9 +245,11 @@ impl FederatedTable {
                     // The deferred task was cancelled (e.g. during shutdown) or panicked
                     // without sending a provider. Return a provider that errors on scan
                     // so queries fail explicitly instead of silently returning zero rows.
-                    let unavailable: Arc<dyn TableProvider> = Arc::new(
-                        UnavailableTableProvider::new(deferred_table_provider.schema()),
-                    );
+                    let unavailable: Arc<dyn TableProvider> =
+                        Arc::new(UnavailableTableProvider::new(
+                            deferred_table_provider.schema(),
+                            deferred_table_provider.dataset_name.clone(),
+                        ));
                     let _ = deferred_table_provider.table.set(Arc::clone(&unavailable));
                     *deferred_state_guard = DeferredState::Done;
                     unavailable
@@ -265,6 +275,7 @@ impl FederatedTable {
         shutdown_token: CancellationToken,
     ) -> DeferredTableProvider {
         let dataset_name = dataset.name.clone();
+        let dataset_name_str = dataset_name.to_string();
         let accelerated_schema = Arc::clone(&schema);
 
         let (tx, rx) = oneshot::channel();
@@ -274,16 +285,6 @@ impl FederatedTable {
             let tracer = OnceTracer::new();
             let data_connector = Arc::clone(&data_connector);
             let retry_fut = retry(retry_strategy, || async {
-                if shutdown_token.is_cancelled() {
-                    return Err(RetryError::permanent(
-                        DataConnectorError::UnableToGetReadProvider {
-                            dataconnector: "shutdown".to_string(),
-                            connector_component: ConnectorComponent::from(&dataset),
-                            source: "Runtime is shutting down".into(),
-                        },
-                    ));
-                }
-
                 match data_connector.read_provider(&dataset).await {
                     Ok(table_provider) => {
                         let federated_schema = table_provider.schema();
@@ -338,6 +339,7 @@ impl FederatedTable {
             state: RwLock::new(DeferredState::Waiting(rx)),
             schema,
             table: OnceLock::new(),
+            dataset_name: dataset_name_str,
         }
     }
 
