@@ -238,10 +238,12 @@ impl FederatedTable {
                     // The deferred task was cancelled (e.g. during shutdown) or panicked
                     // without sending a provider. Return a provider that errors on scan
                     // so queries fail explicitly instead of silently returning zero rows.
+                    let unavailable: Arc<dyn TableProvider> = Arc::new(
+                        UnavailableTableProvider::new(deferred_table_provider.schema()),
+                    );
+                    let _ = deferred_table_provider.table.set(Arc::clone(&unavailable));
                     *deferred_state_guard = DeferredState::Done;
-                    Arc::new(UnavailableTableProvider::new(
-                        deferred_table_provider.schema(),
-                    ))
+                    unavailable
                 }
             },
             DeferredState::InProgress | DeferredState::Done => {
