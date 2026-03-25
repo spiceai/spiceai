@@ -16164,6 +16164,7 @@ dependencies = [
  "datafusion-optimizer-rules",
  "futures",
  "globset",
+ "insta",
  "itertools 0.14.0",
  "object_store",
  "opentelemetry",

@@ -1,0 +1,7 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/partitioned_table_scan_rewrite.rs
+expression: formatted
+---
+Limit: skip=0, fetch=5
+  Sort: test_table.id ASC NULLS LAST
+    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
