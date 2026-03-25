@@ -1585,6 +1585,8 @@ mod tests {
             executor_cpu_limit: None,
             executor_cpu_request: None,
             executor_memory_request: None,
+            app_storage_size_gb: None,
+            executor_storage_size_gb: None,
             scheduler_state_location: Some("s3://bucket/state".to_string()),
             aws_region: None,
             cayenne_data_dir: None,
