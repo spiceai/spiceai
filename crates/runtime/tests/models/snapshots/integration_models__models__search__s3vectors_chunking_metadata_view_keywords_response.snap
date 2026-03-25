@@ -18,23 +18,11 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.46,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
-        ]
-      },
-      "primary_key": {
-        "id": 362
-      }
-    },
-    {
-      "_score": 0.48,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The even multiples of 5 between 0 and 60 are the multiples of 1"
+          "0: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers"
         ]
       },
       "primary_key": {
@@ -42,15 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.47,
+      "_score": 0.45,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\n$28 - 14 = 14$  \nThus, the missing number is $\\boxed{14}$"
+          "4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)"
         ]
       },
       "primary_key": {
-        "id": 622
+        "id": 458
+      }
+    },
+    {
+      "_score": 0.44,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "To find the sum of 18 and 11, add the two numbers: \\(18 + 11 "
+        ]
+      },
+      "primary_key": {
+        "id": 1168
       }
     }
   ]

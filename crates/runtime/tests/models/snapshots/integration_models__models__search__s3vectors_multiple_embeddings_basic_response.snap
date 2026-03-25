@@ -55,14 +55,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+          "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40."
         ],
         "question": [
-          "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
+          "How many groups of 5 are in 40?"
         ]
       },
       "primary_key": {
-        "id": 458
+        "id": 465
       }
     }
   ]

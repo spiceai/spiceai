@@ -19,8 +19,8 @@ expression: resp?
     "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.519
   },
   {
-    "id": 458,
-    "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.504
+    "id": 465,
+    "answer": "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40.",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.506
   }
 ]

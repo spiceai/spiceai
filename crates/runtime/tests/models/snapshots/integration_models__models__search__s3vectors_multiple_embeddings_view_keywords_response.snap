@@ -10,6 +10,21 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
+          "To find the missing number, divide 24 by 6:\n\\[ 24 \\div 6 = 4 \\]\nThus, the missing number is \\(\\boxed{4}\\)."
+        ],
+        "question": [
+          "Find the missing number: \\( \\Box \\times 6 = 24 \\)."
+        ]
+      },
+      "primary_key": {
+        "id": 352
+      }
+    },
+    {
+      "_score": 0.03,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
           "The first four prime numbers are 2, 3, 5, and 7. Their sum is \\(2 + 3 + 5 + 7 = \\boxed{17}\\)."
         ],
         "question": [
@@ -25,38 +40,26 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The least whole number greater than 95,999 is obtained by adding 1 to 95,999, which gives $\\boxed{96,\\!000}$."
+          "The set \\(A\\) has 4 elements, so the number of subsets is \\(2^{4} = 16\\). \n\n\\boxed{16}"
         ],
         "question": [
-          "What is the least whole number that is greater than 95,999?"
+          "Find the number of subsets of the set \\(A = \\{\\text{Thriller, Hotel California, The Beatles White Album, Led Zepplin IV}\\}\\)."
         ]
       },
       "primary_key": {
-        "id": 973
+        "id": 360
       }
     },
     {
       "_score": 0.01,
       "dataset": "qs_view",
       "matches": {
-        "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+        "question": [
+          "Calculate the number of permutations of 14 items taken 4 at a time."
         ]
       },
       "primary_key": {
-        "id": 291
-      }
-    },
-    {
-      "_score": 0.01,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "To find the sum of 47 and 21, add the two numbers together:  \n47 + 21 = 68.  \nThus, the sum is \\(\\boxed{68}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 1170
+        "id": 41
       }
     }
   ]

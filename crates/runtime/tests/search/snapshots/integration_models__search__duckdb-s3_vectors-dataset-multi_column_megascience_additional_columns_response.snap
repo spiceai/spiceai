@@ -26,6 +26,24 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.03,
       "data": {
+        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        ],
+        "question": [
+          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+        ]
+      },
+      "primary_key": {
+        "id": 189
+      }
+    },
+    {
+      "_score": 0.03,
+      "data": {
         "question": "What is the fifth root of 32?"
       },
       "dataset": "spice.public.qs",
@@ -42,33 +60,21 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.01,
+      "_score": 0.03,
       "data": {
-        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
+        "question": "How many groups of 2 are in 14?"
       },
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
-        ]
-      },
-      "primary_key": {
-        "id": 708
-      }
-    },
-    {
-      "_score": 0.01,
-      "data": {
-        "question": "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
+          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+        ],
         "question": [
-          "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
+          "How many groups of 2 are in 14?"
         ]
       },
       "primary_key": {
-        "id": 191
+        "id": 462
       }
     }
   ]

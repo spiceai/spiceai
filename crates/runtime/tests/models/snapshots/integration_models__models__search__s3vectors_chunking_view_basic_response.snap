@@ -6,15 +6,27 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.79,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
+          "\n2"
         ]
       },
       "primary_key": {
-        "id": 948
+        "id": 612
+      }
+    },
+    {
+      "_score": 0.78,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " is 2."
+        ]
+      },
+      "primary_key": {
+        "id": 349
       }
     },
     {
@@ -39,18 +51,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 468
-      }
-    },
-    {
-      "_score": 0.52,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "4, 2))^3 \\times 40}\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 450
       }
     }
   ]

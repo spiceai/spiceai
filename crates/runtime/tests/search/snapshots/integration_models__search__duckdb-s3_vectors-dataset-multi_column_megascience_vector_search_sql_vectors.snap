@@ -10,21 +10,21 @@ description: "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3
     "_score": 0.539
   },
   {
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
+    "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
+    "_score": 0.537
+  },
+  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
     "_score": 0.528
   },
   {
-    "id": 191,
-    "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]",
+    "id": 462,
+    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.521
-  },
-  {
-    "id": 41,
-    "answer": "\\[\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024}\n\\]",
-    "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.501
+    "_score": 0.519
   }
 ]

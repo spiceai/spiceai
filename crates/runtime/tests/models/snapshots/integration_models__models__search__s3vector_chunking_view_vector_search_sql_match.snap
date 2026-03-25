@@ -4,9 +4,14 @@ expression: resp?
 ---
 [
   {
-    "id": 948,
-    "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
+    "id": 612,
+    "_match": "\n2",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.796
+  },
+  {
+    "id": 349,
+    "_match": " is 2.",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.785
   },
   {
     "id": 1277,
@@ -14,13 +19,8 @@ expression: resp?
     "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
-    "id": 830,
-    "_match": "\n\\( 232 \\times 0.14 = 32.48 \\)",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.521
-  },
-  {
-    "id": 949,
-    "_match": "The fifth term is \\( 2 \\times 2^{4} = 32 \\)",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.515
+    "id": 468,
+    "_match": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.538
   }
 ]

@@ -52,11 +52,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
-          "Calculate the number of permutations of 14 items taken 4 at a time."
+          "If \\(a + b + c + \\ldots + z = 100\\), where \\(a, b, c, \\ldots, z\\) are 50 equal numbers, what is the value of each number?"
         ]
       },
       "primary_key": {
-        "id": 41
+        "id": 507
       }
     }
   ]

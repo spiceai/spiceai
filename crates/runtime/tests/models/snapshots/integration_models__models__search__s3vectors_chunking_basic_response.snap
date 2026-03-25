@@ -6,18 +6,6 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.78,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          " is 2."
-        ]
-      },
-      "primary_key": {
-        "id": 349
-      }
-    },
-    {
       "_score": 0.55,
       "dataset": "qs",
       "matches": {
@@ -42,15 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.51,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "\n\\( 232 \\times 0.14 = 32.48 \\)"
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 507
+      }
+    },
+    {
+      "_score": 0.51,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The fifth term is \\( 2 \\times 2^{4} = 32 \\)"
+        ]
+      },
+      "primary_key": {
+        "id": 949
       }
     }
   ]

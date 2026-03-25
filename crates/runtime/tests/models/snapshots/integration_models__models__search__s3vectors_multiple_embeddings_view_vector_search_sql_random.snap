@@ -7,12 +7,12 @@ expression: resp?
     "subject": "math"
   },
   {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  },
+  {
     "subject": "medicine"
-  },
-  {
-    "subject": "math"
-  },
-  {
-    "subject": "math"
   }
 ]

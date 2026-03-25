@@ -6,18 +6,6 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.79,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "\n2"
-        ]
-      },
-      "primary_key": {
-        "id": 612
-      }
-    },
-    {
       "_score": 0.78,
       "dataset": "qs",
       "matches": {
@@ -51,6 +39,18 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
+      }
+    },
+    {
+      "_score": 0.53,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "\nd) $2-|-6| = 2 - 6 = -4"
+        ]
+      },
+      "primary_key": {
+        "id": 708
       }
     }
   ]

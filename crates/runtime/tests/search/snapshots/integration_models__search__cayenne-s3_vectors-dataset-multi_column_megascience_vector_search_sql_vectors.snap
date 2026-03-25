@@ -16,15 +16,15 @@ description: "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3
     "_score": 0.528
   },
   {
-    "id": 191,
-    "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]",
+    "id": 462,
+    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.521
+    "_score": 0.519
   },
   {
-    "id": 244,
-    "answer": "\\[\n-5 - 2(-3)^2 = -5 - 2(9) = -5 - 18 = \\boxed{-23}\n\\]",
+    "id": 41,
+    "answer": "\\[\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024}\n\\]",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.493
+    "_score": 0.501
   }
 ]

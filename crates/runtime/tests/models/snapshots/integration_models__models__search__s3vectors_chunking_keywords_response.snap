@@ -22,11 +22,23 @@ expression: normalize_search_response(resp)
       "dataset": "qs",
       "matches": {
         "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {
-        "id": 362
+        "id": 507
+      }
+    },
+    {
+      "_score": 0.49,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
+        ]
+      },
+      "primary_key": {
+        "id": 451
       }
     },
     {
@@ -39,18 +51,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 556
-      }
-    },
-    {
-      "_score": 0.49,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          " numbers:  \n1.80  \n+ 0.27  \n------  \n2.0"
-        ]
-      },
-      "primary_key": {
-        "id": 21
       }
     }
   ]

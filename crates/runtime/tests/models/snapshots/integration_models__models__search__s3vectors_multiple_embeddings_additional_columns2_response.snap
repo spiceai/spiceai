@@ -44,34 +44,37 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.03,
       "data": {
-        "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
-        ],
-        "question": [
-          "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
-        ]
-      },
-      "primary_key": {
-        "id": 458
-      }
-    },
-    {
-      "_score": 0.01,
-      "data": {
         "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
       },
       "dataset": "qs",
       "matches": {
+        "answer": [
+          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+        ],
         "question": [
           "How many groups of 2 are in 14?"
         ]
       },
       "primary_key": {
         "id": 462
+      }
+    },
+    {
+      "_score": 0.03,
+      "data": {
+        "answer": "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40."
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40."
+        ],
+        "question": [
+          "How many groups of 5 are in 40?"
+        ]
+      },
+      "primary_key": {
+        "id": 465
       }
     }
   ]

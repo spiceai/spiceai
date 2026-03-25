@@ -1,13 +1,8 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
-  {
-    "id": 612,
-    "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\)."
-  },
   {
     "id": 349,
     "answer": "The missing factor is \\(\\boxed{2}\\).  \n\n(Explanation: Since \\( 21 \\times 2 = 42 \\), the missing factor is 2.)"
@@ -19,5 +14,9 @@ snapshot_kind: text
   {
     "id": 1277,
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+  },
+  {
+    "id": 708,
+    "answer": "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
   }
 ]

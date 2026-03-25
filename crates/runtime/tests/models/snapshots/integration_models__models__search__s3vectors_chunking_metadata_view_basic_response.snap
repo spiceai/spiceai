@@ -14,18 +14,6 @@ expression: normalize_search_response(resp)
         ]
       },
       "primary_key": {
-        "id": 948
-      }
-    },
-    {
-      "_score": 0.55,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
-        ]
-      },
-      "primary_key": {
         "id": 1277
       }
     },
@@ -42,15 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.53,
+      "_score": 0.51,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\"
+          "The fifth term is \\( 2 \\times 2^{4} = 32 \\)"
         ]
       },
       "primary_key": {
-        "id": 189
+        "id": 949
+      }
+    },
+    {
+      "_score": 0.5,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " 2 = 8\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 1284
       }
     }
   ]

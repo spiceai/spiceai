@@ -12,11 +12,11 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
   },
   {
-    "id": 191,
-    "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
+    "id": 462,
+    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
   },
   {
-    "id": 244,
-    "answer": "\\[\n-5 - 2(-3)^2 = -5 - 2(9) = -5 - 18 = \\boxed{-23}\n\\]"
+    "id": 41,
+    "answer": "\\[\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024}\n\\]"
   }
 ]

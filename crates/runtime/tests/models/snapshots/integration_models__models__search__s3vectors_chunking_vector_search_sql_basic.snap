@@ -4,11 +4,6 @@ expression: resp?
 ---
 [
   {
-    "id": 349,
-    "answer": "The missing factor is \\(\\boxed{2}\\).  \n\n(Explanation: Since \\( 21 \\times 2 = 42 \\), the missing factor is 2.)",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.785
-  },
-  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.556
@@ -19,8 +14,13 @@ expression: resp?
     "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.556
   },
   {
-    "id": 830,
-    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.524
+    "id": 507,
+    "answer": "Since there are 50 equal numbers, each number is equal to \\(\\frac{100}{50} = \\boxed{2}\\).",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.515
+  },
+  {
+    "id": 949,
+    "answer": "The fifth term is \\( 2 \\times 2^{4} = 32 \\).  \nThe nth term is \\( 2 \\times 2^{n-1} = \\boxed{2^n} \\).",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.515
   }
 ]

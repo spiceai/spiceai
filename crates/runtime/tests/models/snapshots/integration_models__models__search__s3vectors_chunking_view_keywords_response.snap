@@ -18,39 +18,39 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "4, 2))^3 \\times 40}\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 450
-      }
-    },
-    {
-      "_score": 0.51,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
-        ]
-      },
-      "primary_key": {
-        "id": 362
-      }
-    },
-    {
       "_score": 0.49,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
+          " numbers:  \n1.80  \n+ 0.27  \n------  \n2.0"
         ]
       },
       "primary_key": {
-        "id": 451
+        "id": 21
+      }
+    },
+    {
+      "_score": 0.46,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\n\\[ 12 \\times 12 = 144 \\"
+        ]
+      },
+      "primary_key": {
+        "id": 42
+      }
+    },
+    {
+      "_score": 0.46,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "0: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers"
+        ]
+      },
+      "primary_key": {
+        "id": 470
       }
     }
   ]
