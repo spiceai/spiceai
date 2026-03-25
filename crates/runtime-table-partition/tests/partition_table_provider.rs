@@ -1959,7 +1959,7 @@ impl PartitionCreator for NonDeletablePartitionCreator {
     }
 }
 
-/// Test deletion with empty filters deletes all rows (DataFusion's MemTable treats
+/// Test deletion with empty filters deletes all rows (`DataFusion`'s `MemTable` treats
 /// empty filters as "match all").
 #[tokio::test]
 async fn test_deletion_with_empty_filters_deletes_all() -> Result<(), Box<dyn std::error::Error>> {

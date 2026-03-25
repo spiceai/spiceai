@@ -4118,9 +4118,9 @@ impl TableProvider for CayenneTableProvider {
         filters: Vec<Expr>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let schema = self.schema();
-        let table_source = Arc::new(datafusion::datasource::DefaultTableSource::new(
-            Arc::new(self.clone_for_write()),
-        ));
+        let table_source = Arc::new(datafusion::datasource::DefaultTableSource::new(Arc::new(
+            self.clone_for_write(),
+        )));
         let mut plan =
             datafusion_expr::LogicalPlanBuilder::scan("__update_source", table_source, None)?
                 .build()?;
