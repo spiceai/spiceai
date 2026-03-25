@@ -6,15 +6,15 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.79,
+      "_score": 0.78,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "\n2"
+          " is 2."
         ]
       },
       "primary_key": {
-        "id": 612
+        "id": 349
       }
     },
     {
@@ -42,15 +42,15 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.53,
+      "_score": 0.52,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24"
+          "\n\\( 232 \\times 0.14 = 32.48 \\)"
         ]
       },
       "primary_key": {
-        "id": 468
+        "id": 830
       }
     }
   ]
