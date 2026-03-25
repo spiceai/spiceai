@@ -29,7 +29,7 @@ use datafusion::{
     common::ParamValues,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan},
+    logical_expr::LogicalPlan,
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
