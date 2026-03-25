@@ -1564,6 +1564,32 @@ mod tests {
     use clap::ValueEnum;
     use std::sync::Arc;
 
+    fn test_stdio_args() -> StdioArgs {
+        StdioArgs {
+            verbose: false,
+            spice_cloud_api_url: "https://api.spice.ai".to_string(),
+            ready_wait: 600,
+            channel: None,
+            api_key: None,
+            backend: BackendMode::Scp,
+            flight_url: None,
+            app_memory_limit: None,
+            app_cpu_limit: None,
+            app_cpu_request: None,
+            app_memory_request: None,
+            app_replicas: None,
+            executor_replicas: 1,
+            executor_memory_limit: None,
+            executor_cpu_limit: None,
+            executor_cpu_request: None,
+            executor_memory_request: None,
+            scheduler_state_location: Some("s3://bucket/state".to_string()),
+            aws_region: None,
+            cayenne_data_dir: None,
+            cayenne_metadata_dir: None,
+        }
+    }
+
     #[test]
     fn setup_config_parses_metadata() {
         let metadata = HashMap::from([(
@@ -1616,14 +1642,8 @@ mod tests {
             },
         )]);
 
-        let spicepod = generate_initial_spicepod(
-            &Uuid::nil(),
-            &setup_config,
-            &datasets,
-            None,
-            Some("s3://bucket/state"),
-            None,
-        )
+        let args = test_stdio_args();
+        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
         .expect("spicepod should generate");
         let spicepod_yaml =
             serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
@@ -1665,9 +1685,9 @@ mod tests {
             },
         )]);
 
-        let err =
-            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, None, None)
-                .expect_err("missing source should fail");
+        let args = test_stdio_args();
+        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+            .expect_err("missing source should fail");
         assert!(
             err.to_string().contains("missing_table"),
             "unexpected error: {err}"
