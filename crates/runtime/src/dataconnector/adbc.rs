@@ -109,8 +109,8 @@ impl Drop for Adbc {
 /// Returns a sender for offloading ADBC factory cleanup to a dedicated
 /// background thread. The worker thread is created once (on first use) and
 /// processes drop work sequentially, avoiding unbounded thread spawns.
-fn adbc_cleanup_sender(
-) -> &'static std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
+fn adbc_cleanup_sender()
+-> &'static std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
     static SENDER: OnceLock<
         std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
     > = OnceLock::new();
@@ -202,9 +202,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 impl AdbcFactory {
     /// Performs the actual ADBC driver initialization.
-    async fn init_connector(
-        params: ConnectorParams,
-    ) -> super::NewDataConnectorResult {
+    async fn init_connector(params: ConnectorParams) -> super::NewDataConnectorResult {
         let driver_name = params
             .parameters
             .get("driver")
@@ -315,12 +313,13 @@ impl AdbcFactory {
                 driver_location: driver_location.clone(),
             })?;
 
-            let db = driver.new_database_with_opts(db_options).context(
-                UnableToCreateDatabaseSnafu {
-                    driver_location: driver_location.clone(),
-                    uri: uri_str.clone(),
-                },
-            )?;
+            let db =
+                driver
+                    .new_database_with_opts(db_options)
+                    .context(UnableToCreateDatabaseSnafu {
+                        driver_location: driver_location.clone(),
+                        uri: uri_str.clone(),
+                    })?;
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
@@ -341,41 +340,38 @@ impl AdbcFactory {
         });
         let abort_handle = init_handle.abort_handle();
 
-        let pool = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            init_handle,
-        )
-        .await
-        .map_err(|_elapsed| {
-            abort_handle.abort();
-            DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component.clone(),
-                source: "ADBC driver initialization timed out after 120 seconds".into(),
-            }
-        })?
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "adbc".to_string(),
-            connector_component: component.clone(),
-            source: Box::new(e),
-        })?
-        .map_err(|e| {
-            let error_string = e.to_string();
-            if is_auth_or_permission_error(&error_string) {
-                let hint = auth_permission_hint(&driver_name_owned);
-                DataConnectorError::UnableToConnectInternal {
-                    dataconnector: format!("adbc ({driver_name_owned})"),
-                    connector_component: component,
-                    source: format!("{error_string}. {hint}").into(),
-                }
-            } else {
+        let pool = tokio::time::timeout(std::time::Duration::from_secs(120), init_handle)
+            .await
+            .map_err(|_elapsed| {
+                abort_handle.abort();
                 DataConnectorError::UnableToConnectInternal {
                     dataconnector: "adbc".to_string(),
-                    connector_component: component,
-                    source: Box::new(e),
+                    connector_component: component.clone(),
+                    source: "ADBC driver initialization timed out after 120 seconds".into(),
                 }
-            }
-        })?;
+            })?
+            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: component.clone(),
+                source: Box::new(e),
+            })?
+            .map_err(|e| {
+                let error_string = e.to_string();
+                if is_auth_or_permission_error(&error_string) {
+                    let hint = auth_permission_hint(&driver_name_owned);
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("adbc ({driver_name_owned})"),
+                        connector_component: component,
+                        source: format!("{error_string}. {hint}").into(),
+                    }
+                } else {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "adbc".to_string(),
+                        connector_component: component,
+                        source: Box::new(e),
+                    }
+                }
+            })?;
 
         let adbc_factory = AdbcTableFactory::new(pool);
 
@@ -413,9 +409,7 @@ impl DataConnectorFactory for AdbcFactory {
         Box::pin(async move {
             // get_or_try_init ensures only one initialization runs at a time
             // per key — concurrent callers await the same future.
-            let result = cell
-                .get_or_try_init(|| Self::init_connector(params))
-                .await;
+            let result = cell.get_or_try_init(|| Self::init_connector(params)).await;
 
             result.map(Arc::clone)
         })
