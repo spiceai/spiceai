@@ -38,7 +38,6 @@ use cayenne::{
 
 use common::TestFixture;
 
-
 use datafusion::datasource::TableProvider;
 
 use datafusion::execution::context::SessionContext;
@@ -491,8 +490,7 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
 
     // Delete another row with reopened table
     let filter2 = col("id").eq(lit(5i64));
-    let plan2 =
-        table2.delete_from(&ctx2.state(), vec![filter2]).await?;
+    let plan2 = table2.delete_from(&ctx2.state(), vec![filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     // Verify count
@@ -566,8 +564,7 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
             .await?,
     );
     let filter2 = col("value").eq(lit(1i64));
-    let plan2 =
-        table2.delete_from(&ctx2.state(), vec![filter2]).await?;
+    let plan2 = table2.delete_from(&ctx2.state(), vec![filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     ctx2.register_table(

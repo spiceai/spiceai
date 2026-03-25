@@ -28,7 +28,6 @@ use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
 };
 
-
 use datafusion::datasource::TableProvider;
 
 use datafusion::execution::context::SessionContext;
@@ -113,7 +112,8 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider.delete_from(&ctx.state(), vec![filter])
+    let plan = table_provider
+        .delete_from(&ctx.state(), vec![filter])
         .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
