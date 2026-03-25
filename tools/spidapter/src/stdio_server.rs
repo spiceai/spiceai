@@ -599,11 +599,13 @@ async fn provision_spice_cloud_app(
         app_cpu_request: args.app_cpu_request.clone(),
         app_memory_request: args.app_memory_request.clone(),
         app_replicas: args.app_replicas,
+        app_storage_size_gb: args.app_storage_size_gb,
         executor_replicas: args.executor_replicas,
         executor_memory_limit: args.executor_memory_limit.clone(),
         executor_cpu_limit: args.executor_cpu_limit.clone(),
         executor_cpu_request: args.executor_cpu_request.clone(),
         executor_memory_request: args.executor_memory_request.clone(),
+        executor_storage_size_gb: args.executor_storage_size_gb,
     };
     let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
 
@@ -1583,6 +1585,8 @@ mod tests {
             executor_cpu_limit: None,
             executor_cpu_request: None,
             executor_memory_request: None,
+            app_storage_size_gb: None,
+            executor_storage_size_gb: None,
             scheduler_state_location: Some("s3://bucket/state".to_string()),
             aws_region: None,
             cayenne_data_dir: None,
