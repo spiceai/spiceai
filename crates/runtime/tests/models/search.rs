@@ -125,6 +125,7 @@ impl SearchTestCase {
             body,
             name: self.name.clone(),
             skip: self.skip,
+            redact_tied_results: self.redact_tied_results,
         }
     }
 }
