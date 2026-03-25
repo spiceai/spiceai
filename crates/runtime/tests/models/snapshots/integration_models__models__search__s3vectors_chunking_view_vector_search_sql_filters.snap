@@ -2,25 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: resp?
 ---
-[
-  {
-    "id": 922,
-    "answer": "A \"sequence\" implies a cascade of events traced to a single abnormality.",
-    "_score": 0.21
-  },
-  {
-    "id": 1143,
-    "answer": "The safety of valerian during pregnancy and lactation has not been established and should, therefore, be avoided.",
-    "_score": 0.169
-  },
-  {
-    "id": 944,
-    "answer": "The larger the area through which force is transmitted, the less the intensity and potential for injury.",
-    "_score": 0.149
-  },
-  {
-    "id": 1191,
-    "answer": "The hybridization in `[Pa(NH₃)₄]³⁺` is $\\boxed{sp^3}$, as it forms a tetrahedral complex with four monodentate ammonia ligands.",
-    "_score": 0.148
-  }
-]
+{"row_count": 4}

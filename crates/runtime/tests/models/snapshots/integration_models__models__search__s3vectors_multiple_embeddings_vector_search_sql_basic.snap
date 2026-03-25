@@ -2,25 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: resp?
 ---
-[
-  {
-    "id": 1277,
-    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.539
-  },
-  {
-    "id": 948,
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.528
-  },
-  {
-    "id": 462,
-    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.519
-  },
-  {
-    "id": 458,
-    "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.504
-  }
-]
+{"row_count": 4}

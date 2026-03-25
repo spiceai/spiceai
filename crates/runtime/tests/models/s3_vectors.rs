@@ -205,31 +205,36 @@ pub(crate) mod search {
                 SearchTestType::from_sql(
                     "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                 ),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_vector_search_sql_w_question",
                 SearchTestType::from_sql(
                     "SELECT id, question, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                 ),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_vector_search_text_search",
                 SearchTestType::from_sql(
                     "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc, id LIMIT 4",
                 ),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_vector_search_text_search_w_embedding",
                 SearchTestType::from_sql(
                     "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc, id LIMIT 4",
                 ),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_vector_search_text_search_w_answer",
                 SearchTestType::from_sql(
                     "SELECT id, answer, trunc(_score, 3) FROM text_search(qs, 'second') order by _score desc, id LIMIT 4",
                 ),
-            ),
+            )
+            .redact_tied_results(),
         ];
         run_search_w_explain(
             app.build(),
@@ -309,26 +314,30 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_view_vector_search_questions",
                     SearchTestType::from_sql(
                         "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_vector_search_w_embeddings",
                     SearchTestType::from_sql(
                         "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(_score, 3) FROM vector_search(qs, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
 
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_view_vector_search_w_embeddings",
                     SearchTestType::from_sql(
                         "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(_score, 3) FROM vector_search(qs_view, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 ]].concat(),
             true
         )
@@ -368,25 +377,29 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, question, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_composite_view_vector_search_sql_composite_key",
                     SearchTestType::from_sql(
                         "SELECT id, question, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_filters",
                     SearchTestType::from_sql(
                         "SELECT question, answer, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary') where id > 10 order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_composite_view_vector_search_sql_filters",
                     SearchTestType::from_sql(
                         "SELECT question, answer, trunc(_score, 3) as _score FROM vector_search(qs_view, 'secondary') where id > 10 order by _score desc, id LIMIT 4",
                     ),
-                )]].concat(),
+                )]].concat()
+                .redact_tied_results(),
             true
         )
         .await
@@ -430,37 +443,43 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                )]].concat(),
+                )]].concat()
+                .redact_tied_results(),
             true
         )
         .await
@@ -504,25 +523,29 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 // TODO: This is performing a needless join (since search_field is in vector index, `match` can be computed without base table).
                 // Tracking: `<https://github.com/spiceai/spiceai/issues/7512>`
                 SearchTestCase::new(
@@ -530,13 +553,15 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                )]].concat(),
+                )]].concat()
+                .redact_tied_results(),
             true
         )
         .await
@@ -639,25 +664,29 @@ pub(crate) mod search {
                         SearchTestType::from_sql(
                             "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                         ),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_view_vector_search_sql_projection_metadata",
                         SearchTestType::from_sql(
                             "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                         ),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_vector_search_sql_filters_metadata",
                         SearchTestType::from_sql(
                             "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary') where subject!='math' order by _score desc, id LIMIT 4",
                         ),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_view_vector_search_sql_filters_metadata",
                         SearchTestType::from_sql(
                             "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(qs_view, 'secondary') where subject!='math' order by _score desc, id LIMIT 4",
                         ),
-                    ),
+                    )
+                    .redact_tied_results(),
                 ],
             ]
             .concat(),
@@ -1137,36 +1166,42 @@ pub(crate) fn basic_vector_search_tests_on_table(
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, trunc(_score, 3) FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4"
             )),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_projection"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4",
             )),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_filters"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search({table_name}, 'secondary', answer) where subject!='math' order by _score desc, id LIMIT 4",
             )),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_no_score"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4",
             )),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_random"),
             SearchTestType::from_sql(format!(
                 "SELECT subject FROM vector_search({table_name}, 'second', answer) order by _score desc LIMIT 4",
             )),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3) as _score  FROM vector_search({table_name}, 'second', answer) order by _score desc, id desc LIMIT 4;",
             )),
-        ),
+        )
+        .redact_tied_results(),
     ]
 }

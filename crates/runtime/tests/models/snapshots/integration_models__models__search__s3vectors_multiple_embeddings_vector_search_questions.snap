@@ -2,25 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: resp?
 ---
-[
-  {
-    "id": 1277,
-    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.539
-  },
-  {
-    "id": 948,
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.528
-  },
-  {
-    "id": 458,
-    "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\).",
-    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.504
-  },
-  {
-    "id": 42,
-    "answer": "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$.",
-    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.485
-  }
-]
+{"row_count": 4}

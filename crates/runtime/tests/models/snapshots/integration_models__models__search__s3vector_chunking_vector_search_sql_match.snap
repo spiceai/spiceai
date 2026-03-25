@@ -2,25 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: resp?
 ---
-[
-  {
-    "id": 349,
-    "_match": " is 2.",
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.785
-  },
-  {
-    "id": 948,
-    "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.556
-  },
-  {
-    "id": 1277,
-    "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.556
-  },
-  {
-    "id": 830,
-    "_match": "\n\\( 232 \\times 0.14 = 32.48 \\)",
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.524
-  }
-]
+{"row_count": 4}

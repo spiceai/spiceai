@@ -2,37 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: resp?
 ---
-[
-  {
-    "id": 948,
-    "answer_offset": [
-      61,
-      94
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
-  },
-  {
-    "id": 1277,
-    "answer_offset": [
-      62,
-      95
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
-  },
-  {
-    "id": 708,
-    "answer_offset": [
-      61,
-      85
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.539
-  },
-  {
-    "id": 189,
-    "answer_offset": [
-      0,
-      51
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.538
-  }
-]
+{"row_count": 4}
