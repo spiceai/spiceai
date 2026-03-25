@@ -1,0 +1,5 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/partitioned_table_scan_rewrite.rs
+expression: formatted
+---
+EmptyRelation: rows=0
