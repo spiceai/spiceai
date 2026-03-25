@@ -238,11 +238,10 @@ fn push_limit_into_union_legs(plan: LogicalPlan) -> Result<LogicalPlan, DataFusi
             LogicalPlan::Limit(limit) => {
                 let inner_fetch = resolve_fetch(limit);
                 let inner_skip = resolve_skip(limit);
-                if inner_fetch.is_none() {
+                let Some(fetch) = inner_fetch else {
                     // No fetch means no meaningful limit to push down.
                     return Ok(Transformed::no(plan));
-                }
-                let fetch = inner_fetch.unwrap();
+                };
                 // The per-leg limit is skip + fetch so that after the outer Limit
                 // applies the skip, we still have enough rows.
                 let per_leg_fetch = inner_skip.unwrap_or(0).saturating_add(fetch);
@@ -291,8 +290,10 @@ fn push_limit_into_union_legs(plan: LogicalPlan) -> Result<LogicalPlan, DataFusi
 
             // Pattern 3: Sort(fetch=Some) -> SubqueryAlias -> Union
             // DataFusion can fold Limit into Sort.fetch. Handle that case too.
-            LogicalPlan::Sort(sort) if sort.fetch.is_some() => {
-                let fetch = sort.fetch.unwrap();
+            LogicalPlan::Sort(sort) => {
+                let Some(fetch) = sort.fetch else {
+                    return Ok(Transformed::no(plan));
+                };
                 if let Some(union_inputs) = unwrap_subquery_alias_union(sort.input.as_ref()) {
                     let new_inputs = push_sort_limit_into_legs(union_inputs, &sort.expr, fetch)?;
                     let new_union = rebuild_union_alias(sort.input.as_ref(), new_inputs)?;
@@ -315,10 +316,10 @@ fn push_limit_into_union_legs(plan: LogicalPlan) -> Result<LogicalPlan, DataFusi
 
 /// If `plan` is `SubqueryAlias -> Union`, return the union inputs.
 fn unwrap_subquery_alias_union(plan: &LogicalPlan) -> Option<&[Arc<LogicalPlan>]> {
-    if let LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) = plan {
-        if let LogicalPlan::Union(Union { inputs, .. }) = input.as_ref() {
-            return Some(inputs);
-        }
+    if let LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) = plan
+        && let LogicalPlan::Union(Union { inputs, .. }) = input.as_ref()
+    {
+        return Some(inputs);
     }
     None
 }
@@ -370,7 +371,9 @@ fn push_limit_into_legs(
         .map(|leg| {
             let limited = LogicalPlan::Limit(Limit {
                 skip: None,
-                fetch: Some(Box::new(lit(per_leg_fetch as i64))),
+                fetch: Some(Box::new(lit(
+                    i64::try_from(per_leg_fetch).unwrap_or(i64::MAX)
+                ))),
                 input: Arc::clone(leg),
             });
             Ok(Arc::new(limited))
