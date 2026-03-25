@@ -127,14 +127,34 @@ pub(super) fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
     }
 }
 
-/// Forwards a DDL SQL statement to connected executor nodes.
+/// Forward a DDL statement (CREATE/DROP TABLE) to all connected executors.
 ///
-/// Iterates over [`ExecutorRegistry::flight_sql_clients`] and sends the SQL
-/// via `FlightSqlClient::execute`, then drains returned endpoints with `do_get`
-/// so the statement is actually executed on the remote executor.
-///
-/// Returns an error when at least one executor was targeted but all forwards failed.
+/// Succeeds as long as at least one executor processes the statement.
+/// DDL is idempotent and self-heals via periodic catalog refresh.
 async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
+    forward_to_executors(executor_registry, sql, false).await
+}
+
+/// Forward a DML statement (DELETE/UPDATE) to all connected executors,
+/// requiring every executor to succeed (with retries for transient failures).
+async fn forward_dml_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
+    forward_to_executors(executor_registry, sql, true).await
+}
+
+/// Maximum number of retry attempts for DML forwarding per executor.
+const MAX_DML_RETRIES: u32 = 3;
+
+/// Forward a SQL statement to all connected executors.
+///
+/// When `require_all` is `false`, succeeds if at least one executor processes
+/// the statement. When `true`, **every** executor must succeed; transient
+/// failures are retried up to [`MAX_DML_RETRIES`] times with exponential
+/// back-off.
+async fn forward_to_executors(
+    executor_registry: &ExecutorRegistry,
+    sql: &str,
+    require_all: bool,
+) -> DFResult<()> {
     let clients = executor_registry.flight_sql_clients.read().await;
     if clients.is_empty() {
         tracing::debug!(
@@ -151,18 +171,56 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
             let executor_id = executor_id.clone();
             let sql = sql.to_string();
             async move {
-                let result = forward_ddl_to_executor(sql.clone(), client).await;
+                let max_attempts = if require_all { MAX_DML_RETRIES + 1 } else { 1 };
+                let mut last_err: Option<String> = None;
 
-                match &result {
-                    Ok(()) => {
-                        tracing::debug!(executor_id, sql, "Forwarded Cayenne DDL to executor");
+                for attempt in 0..max_attempts {
+                    if attempt > 0 {
+                        let backoff = std::time::Duration::from_millis(100 * 2u64.pow(attempt - 1));
+                        tracing::debug!(
+                            executor_id,
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            "Retrying DML forward to executor"
+                        );
+                        tokio::time::sleep(backoff).await;
                     }
-                    Err(e) => {
-                        tracing::warn!(executor_id, sql, error = %e, "Failed to forward Cayenne DDL to executor");
+
+                    let result = forward_sql_to_executor(client.clone(), &sql).await;
+                    match result {
+                        Ok(()) => {
+                            if attempt > 0 {
+                                tracing::info!(
+                                    executor_id,
+                                    attempt,
+                                    sql,
+                                    "DML forwarded to executor after retry"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    executor_id,
+                                    sql,
+                                    "Forwarded Cayenne DDL/DML to executor"
+                                );
+                            }
+                            return (executor_id, Ok(()));
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                        }
                     }
                 }
 
-                result.is_ok()
+                let err_msg = last_err.unwrap_or_else(|| "unknown error".to_string());
+                tracing::warn!(
+                    executor_id,
+                    sql,
+                    error = %err_msg,
+                    attempts = max_attempts,
+                    require_all,
+                    "Failed to forward Cayenne DDL/DML to executor"
+                );
+                (executor_id, Err(err_msg))
             }
         })
         .collect();
@@ -170,13 +228,62 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
     // Release the read lock before awaiting the futures.
     drop(clients);
 
-    let results: Vec<bool> = futures::future::join_all(futures).await;
-    let success_count = results.iter().filter(|&&ok| ok).count();
+    let results = futures::future::join_all(futures).await;
+    let total = results.len();
+    let mut failed_executors: Vec<(String, String)> = Vec::new();
+    let mut success_count = 0usize;
 
-    if success_count == 0 && !results.is_empty() {
+    for (executor_id, result) in results {
+        match result {
+            Ok(()) => success_count += 1,
+            Err(e) => failed_executors.push((executor_id, e)),
+        }
+    }
+
+    if require_all && !failed_executors.is_empty() {
+        let executor_errors: Vec<String> = failed_executors
+            .iter()
+            .map(|(id, e)| format!("{id}: {e}"))
+            .collect();
+        return Err(DataFusionError::Execution(format!(
+            "DML forwarding failed on {}/{} executor(s): [{}]. SQL: {}",
+            failed_executors.len(),
+            total,
+            executor_errors.join("; "),
+            sql
+        )));
+    }
+
+    if success_count == 0 && total > 0 {
         return Err(DataFusionError::Execution(format!(
             "Failed to forward Cayenne DDL to any executor: {sql}"
         )));
+    }
+
+    Ok(())
+}
+
+/// Send a single SQL statement to one executor via `FlightSQL` execute + `do_get`.
+pub async fn forward_sql_to_executor(
+    mut client: data_components::flightsql::FlightSqlClient,
+    sql: &str,
+) -> Result<(), String> {
+    use futures::StreamExt;
+
+    let flight_info = client
+        .execute(sql.to_string(), None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for endpoint in flight_info.endpoint {
+        let Some(ticket) = endpoint.ticket else {
+            continue;
+        };
+
+        let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
+        while let Some(batch) = stream.next().await {
+            batch.map_err(|e| e.to_string())?;
+        }
     }
 
     Ok(())
@@ -1099,7 +1206,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
             if let Some(ref filter) = filter_sql {
                 let _ = write!(sql, " WHERE {filter}");
             }
-            forward_ddl_to_executors(registry, &sql).await?;
+            forward_dml_to_executors(registry, &sql).await?;
 
             RecordBatch::try_new(
                 result_schema,
@@ -1235,7 +1342,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
                 if let Some(ref filter) = filter_sql {
                     let _ = write!(sql, " WHERE {filter}");
                 }
-                forward_ddl_to_executors(registry, &sql).await?;
+                forward_dml_to_executors(registry, &sql).await?;
             }
 
             RecordBatch::try_new(

@@ -74,7 +74,7 @@ use crate::cluster::{
 };
 use crate::datafusion::{
     DataFusion, SPICE_RUNTIME_SCHEMA,
-    cayenne_ddl::{create_table_if_not_exists, physical_plans::forward_ddl_to_executor},
+    cayenne_ddl::{create_table_if_not_exists, physical_plans::forward_sql_to_executor},
 };
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
@@ -611,7 +611,7 @@ impl ClusterService for ClusterServiceImpl {
                         Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
                     })?
             {
-                forward_ddl_to_executor(ddl_sql, client.clone())
+                forward_sql_to_executor(client.clone(), &ddl_sql)
                     .await
                     .map_err(|e| {
                         tracing::warn!(
