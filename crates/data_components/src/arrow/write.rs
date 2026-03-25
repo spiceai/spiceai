@@ -350,13 +350,11 @@ impl TableProvider for MemTable {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(MemDeletionSink::new(
-                self.batches.clone(),
-                self.schema(),
-                &filters,
-            )),
-        )))
+        Ok(Arc::new(DeletionExec::new(Arc::new(MemDeletionSink::new(
+            self.batches.clone(),
+            self.schema(),
+            &filters,
+        )))))
     }
 }
 

@@ -1205,13 +1205,9 @@ impl TableProvider for TursoTableProvider {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(TursoDeletionSink::new(
-                Arc::clone(&self.pool),
-                self.table_name.clone(),
-                &filters,
-            )),
-        )))
+        Ok(Arc::new(DeletionExec::new(Arc::new(
+            TursoDeletionSink::new(Arc::clone(&self.pool), self.table_name.clone(), &filters),
+        ))))
     }
 }
 
