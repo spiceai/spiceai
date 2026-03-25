@@ -697,3 +697,10 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         _ => false,
     }
 }
+
+/// Checks if an anonymous Flight client can connect to an address.
+pub async fn can_connect(flight_addr: impl Into<String>) -> Result<()> {
+    let url = flight_addr.into();
+    FlightClient::try_new(url.into(), Credentials::anonymous(), None, None).await?;
+    Ok(())
+}

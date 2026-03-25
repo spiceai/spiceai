@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use csv::Writer;
-use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 
@@ -161,20 +160,9 @@ fn convert_details_to_csv(
 }
 
 async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
-    tracing::trace!("Checking flight status at {flight_addr}");
-    match FlightClient::try_new(
-        format!("http://{flight_addr}").into(),
-        Credentials::anonymous(),
-        None,
-        None,
-    )
-    .await
-    {
-        Ok(_) => ComponentStatus::Ready,
-        Err(e) => {
-            tracing::error!("Error connecting to flight when checking status: {e}");
-            ComponentStatus::error_with_message(e.to_string())
-        }
+    match flight_client::can_connect(format!("http://{flight_addr}")).await {
+        Ok(()) => ComponentStatus::Ready,
+        Err(e) => ComponentStatus::error_with_message(e.to_string()),
     }
 }
 

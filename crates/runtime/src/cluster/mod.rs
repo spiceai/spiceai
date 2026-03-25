@@ -1326,18 +1326,26 @@ pub async fn initialize_cluster_executor(
     });
 
     Ok(async move {
-        let _ = rx_ready
-            .await
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
+        let flight_addr = rt.datafusion().cluster_config.node_advertise_url();
+
+        // Wait for our own flight service to be operational.
+        util::retry(
+            FibonacciBackoffBuilder::new().max_retries(None).build(),
+            || async {
+                flight_client::can_connect(flight_addr.clone())
+                    .await
+                    .map_err(|e| util::RetryError::Transient {
+                        err: e,
+                        retry_after: None,
+                    })
+            },
+        );
 
         // Get initial allocation of Accelerated table partitions.
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
-        //
-        // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
         let initial_partitions = executor_request_initial_partitions(
             cluster_client.clone(),
-            rt.datafusion().cluster_config.node_advertise_url(),
+            flight_addr,
             rt.datafusion().ctx.as_ref(),
         )
         .await
@@ -1345,11 +1353,6 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
-        tracing::debug!(
-            "For executor={:?}, initial accelerated table partitions={:?}",
-            rt.datafusion().cluster_config.node_advertise_url(),
-            initial_partitions.clone()
-        );
         rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
