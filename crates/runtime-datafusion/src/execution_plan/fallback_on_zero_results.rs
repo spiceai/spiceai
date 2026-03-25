@@ -18,6 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -36,6 +37,27 @@ use std::sync::Arc;
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
 
 use super::TableScanParams;
+
+/// Run the physical optimizer rules from [`SessionState`] on the given [`ExecutionPlan`].
+///
+/// This mirrors the optimization pass that `DefaultPhysicalPlanner::optimize_physical_plan`
+/// performs when creating a plan through the normal query pipeline. Calling it explicitly
+/// is necessary when a plan is constructed outside that pipeline (e.g. via a direct
+/// `TableProvider::scan` call in the fallback path).
+fn optimize_physical_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    session_state: &SessionState,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let config = session_state.config_options();
+    session_state
+        .physical_optimizers()
+        .iter()
+        .try_fold(plan, |plan, rule| {
+            rule.optimize(plan, config).map_err(|e| {
+                DataFusionError::Context(rule.name().to_string(), Box::new(e))
+            })
+        })
+}
 
 /// [`FallbackAsyncTableProvider`] is a generic function type that allows the deferred construction of a [`TableProvider`].
 pub type FallbackAsyncTableProvider = Arc<
@@ -222,6 +244,32 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                     }
                 };
 
+                // Run DataFusion's physical optimizer on the fallback plan.
+                // Without this, rules like `EnforceDistribution` won't split
+                // single file groups into multiple parallel partitions, leading
+                // to significantly slower scans (see issue #9926).
+                let fallback_plan =
+                    match optimize_physical_plan(fallback_plan, &scan_params.state) {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            let error_stream = RecordBatchStreamAdapter::new(
+                                schema,
+                                stream::once(async move { Err(e) }),
+                            );
+                            return Box::pin(error_stream) as SendableRecordBatchStream;
+                        }
+                    };
+
+                // After optimization, the plan may have multiple partitions.
+                // Coalesce them into a single output stream since this executor
+                // advertises a single partition.
+                let fallback_plan: Arc<dyn ExecutionPlan> =
+                    if fallback_plan.output_partitioning().partition_count() > 1 {
+                        Arc::new(CoalescePartitionsExec::new(fallback_plan))
+                    } else {
+                        fallback_plan
+                    };
+
                 match fallback_plan.execute(0, context) {
                     Ok(stream) => stream,
                     Err(e) => {
@@ -344,6 +392,197 @@ mod tests {
 
             assert_eq!(collected_result.len(), 1);
             assert_eq!(batch().num_rows(), collected_result[0].num_rows());
+        }
+    }
+
+    mod optimize_physical_plan_tests {
+        use super::*;
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+
+        fn batch() -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["foo", "bar", "baz"])),
+                ],
+            )
+            .expect("record batch should not panic")
+        }
+
+        /// A memory exec with multiple partitions to verify the optimizer
+        /// processes the plan (e.g. `EnforceDistribution` may repartition).
+        fn multi_partition_memory_exec() -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(
+                    &[vec![batch()], vec![batch()], vec![batch()]],
+                    schema(),
+                    None,
+                )
+                .expect("memory exec should not panic"),
+            )))
+        }
+
+        #[test]
+        fn test_optimize_physical_plan_runs_rules() {
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            // Verify that there are physical optimizer rules configured
+            assert!(
+                !state.physical_optimizers().is_empty(),
+                "SessionState should have default physical optimizer rules"
+            );
+
+            let plan = multi_partition_memory_exec();
+            let optimized =
+                optimize_physical_plan(plan, &state).expect("optimization should succeed");
+
+            // The optimized plan should be a valid execution plan
+            assert!(optimized.schema().fields().len() == 2);
+        }
+
+        #[test]
+        fn test_optimize_physical_plan_single_partition() {
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![batch()]], schema(), None)
+                    .expect("memory exec should not panic"),
+            )));
+
+            let optimized =
+                optimize_physical_plan(plan, &state).expect("optimization should succeed");
+
+            // The optimized plan should preserve the schema
+            assert_eq!(optimized.schema().fields().len(), 2);
+        }
+    }
+
+    mod fallback_applies_physical_optimization {
+        use datafusion::catalog::{MemTable, TableProvider};
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+
+        use super::*;
+
+        fn batch() -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["foo", "bar", "baz"])),
+                ],
+            )
+            .expect("record batch should not panic")
+        }
+
+        fn empty_memory_exec() -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![]], schema(), None)
+                    .expect("memory exec should not panic"),
+            )))
+        }
+
+        /// Create a fallback table provider with multiple partitions.
+        /// This is key: with the fix, the physical optimizer should process
+        /// the multi-partition plan, and then CoalescePartitionsExec should
+        /// merge them back to a single output stream.
+        fn multi_partition_table_provider() -> Arc<dyn TableProvider> {
+            Arc::new(
+                MemTable::try_new(
+                    schema(),
+                    vec![vec![batch()], vec![batch()], vec![batch()]],
+                )
+                .expect("memtable should not panic"),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_fallback_with_multi_partition_provider_returns_all_rows() {
+            let ctx = SessionContext::new();
+
+            let exec = FallbackOnZeroResultsScanExec::new(
+                TableReference::bare("test"),
+                empty_memory_exec(),
+                create_fallback_provider(multi_partition_table_provider()),
+                TableScanParams {
+                    state: ctx.state(),
+                    projection: None,
+                    filters: vec![],
+                    limit: None,
+                },
+            );
+
+            let result_stream = exec
+                .execute(0, ctx.task_ctx())
+                .expect("should create stream successfully");
+            let collected_result = datafusion::physical_plan::common::collect(result_stream)
+                .await
+                .expect("should be able to collect results");
+
+            let total_rows: usize = collected_result.iter().map(|b| b.num_rows()).sum();
+            // 3 partitions x 3 rows = 9 total rows
+            assert_eq!(total_rows, 9);
+        }
+    }
+
+    mod explain_snapshot_tests {
+        use super::*;
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+
+        fn batch() -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["foo", "bar", "baz"])),
+                ],
+            )
+            .expect("record batch should not panic")
+        }
+
+        #[test]
+        fn test_optimize_physical_plan_preserves_schema_and_runs_rules() {
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            // Create a plan with 4 partitions
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(
+                    &[
+                        vec![batch()],
+                        vec![batch()],
+                        vec![batch()],
+                        vec![batch()],
+                    ],
+                    schema(),
+                    None,
+                )
+                .expect("memory exec should not panic"),
+            )));
+
+            let before_partitions = plan.output_partitioning().partition_count();
+            assert_eq!(before_partitions, 4);
+
+            let optimized =
+                optimize_physical_plan(plan, &state).expect("optimization should succeed");
+
+            // Schema must be preserved after optimization
+            assert_eq!(optimized.schema().fields().len(), 2);
+            assert_eq!(optimized.schema().field(0).name(), "a");
+            assert_eq!(optimized.schema().field(1).name(), "b");
+
+            // The plan should still be valid and executable
+            let display = datafusion::physical_plan::displayable(optimized.as_ref())
+                .indent(false)
+                .to_string();
+
+            // The display should contain DataSourceExec (the underlying scan)
+            assert!(
+                display.contains("DataSourceExec"),
+                "Optimized plan should still contain DataSourceExec, got: {display}"
+            );
         }
     }
 
