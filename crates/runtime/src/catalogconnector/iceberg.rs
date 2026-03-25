@@ -638,6 +638,20 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
     }
 }
 
+/// Infers a default `StorageFactory` from the iceberg properties.
+///
+/// If any `gcs.*` property is present, returns a GCS factory; otherwise defaults to S3.
+fn default_storage_factory_from_props(props: &HashMap<String, String>) -> Arc<dyn StorageFactory> {
+    if props.keys().any(|k| k.starts_with("gcs.")) {
+        Arc::new(OpenDalStorageFactory::Gcs)
+    } else {
+        Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        })
+    }
+}
+
 /// Builds an `IcebergRestCatalog` from a base URI and properties.
 pub async fn get_rest_catalog(
     base_uri: String,
@@ -645,11 +659,9 @@ pub async fn get_rest_catalog(
     storage_factory: Option<Arc<dyn StorageFactory>>,
 ) -> Result<IcebergRestCatalog> {
     props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
-    let mut builder = RestCatalogBuilder::default();
-    if let Some(factory) = storage_factory {
-        builder = builder.with_storage_factory(factory);
-    }
-    builder
+    let factory = storage_factory.unwrap_or_else(|| default_storage_factory_from_props(&props));
+    RestCatalogBuilder::default()
+        .with_storage_factory(factory)
         .load("rest", props)
         .await
         .context(UnableToBuildCatalogSnafu)

@@ -139,6 +139,7 @@ mod tests {
     use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_datafusion::IcebergTableProvider;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
     use std::sync::Arc;
 
     use super::*;
@@ -154,6 +155,10 @@ mod tests {
     async fn test_rest_catalog() {
         let catalog = RestCatalog::new(
             RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "s3".to_string(),
+                    customized_credential_load: None,
+                }))
                 .load(
                     "rest",
                     HashMap::from([

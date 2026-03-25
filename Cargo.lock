@@ -5297,6 +5297,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
+ "iceberg-storage-opendal",
  "iceberg_test_utils",
  "imap",
  "indexmap 2.13.0",
