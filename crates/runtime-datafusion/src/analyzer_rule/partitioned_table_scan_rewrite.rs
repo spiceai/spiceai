@@ -163,8 +163,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     let partition_exprs: Vec<Expr> = partition_values
                         .iter()
                         .filter_map(|pv| {
-                            partition_value_to_expr(pv, &df_schema, &self.session_state)
-                                .transpose()
+                            partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 
@@ -251,16 +250,11 @@ fn push_limit_into_union_legs(plan: LogicalPlan) -> Result<LogicalPlan, DataFusi
                 match limit.input.as_ref() {
                     // Pattern 1: Limit -> Sort -> SubqueryAlias -> Union
                     LogicalPlan::Sort(sort) => {
-                        if let Some(union_inputs) =
-                            unwrap_subquery_alias_union(sort.input.as_ref())
+                        if let Some(union_inputs) = unwrap_subquery_alias_union(sort.input.as_ref())
                         {
-                            let new_inputs = push_sort_limit_into_legs(
-                                union_inputs,
-                                &sort.expr,
-                                per_leg_fetch,
-                            )?;
-                            let new_union =
-                                rebuild_union_alias(sort.input.as_ref(), new_inputs)?;
+                            let new_inputs =
+                                push_sort_limit_into_legs(union_inputs, &sort.expr, per_leg_fetch)?;
+                            let new_union = rebuild_union_alias(sort.input.as_ref(), new_inputs)?;
                             let new_sort = LogicalPlan::Sort(Sort {
                                 expr: sort.expr.clone(),
                                 input: Arc::new(new_union),
@@ -278,13 +272,10 @@ fn push_limit_into_union_legs(plan: LogicalPlan) -> Result<LogicalPlan, DataFusi
                     }
                     // Pattern 2: Limit -> SubqueryAlias -> Union (no sort)
                     subquery_alias_plan => {
-                        if let Some(union_inputs) =
-                            unwrap_subquery_alias_union(subquery_alias_plan)
+                        if let Some(union_inputs) = unwrap_subquery_alias_union(subquery_alias_plan)
                         {
-                            let new_inputs =
-                                push_limit_into_legs(union_inputs, per_leg_fetch)?;
-                            let new_union =
-                                rebuild_union_alias(subquery_alias_plan, new_inputs)?;
+                            let new_inputs = push_limit_into_legs(union_inputs, per_leg_fetch)?;
+                            let new_union = rebuild_union_alias(subquery_alias_plan, new_inputs)?;
                             let new_plan = LogicalPlan::Limit(Limit {
                                 skip: limit.skip.clone(),
                                 fetch: limit.fetch.clone(),
@@ -303,8 +294,7 @@ fn push_limit_into_union_legs(plan: LogicalPlan) -> Result<LogicalPlan, DataFusi
             LogicalPlan::Sort(sort) if sort.fetch.is_some() => {
                 let fetch = sort.fetch.unwrap();
                 if let Some(union_inputs) = unwrap_subquery_alias_union(sort.input.as_ref()) {
-                    let new_inputs =
-                        push_sort_limit_into_legs(union_inputs, &sort.expr, fetch)?;
+                    let new_inputs = push_sort_limit_into_legs(union_inputs, &sort.expr, fetch)?;
                     let new_union = rebuild_union_alias(sort.input.as_ref(), new_inputs)?;
                     let new_plan = LogicalPlan::Sort(Sort {
                         expr: sort.expr.clone(),
