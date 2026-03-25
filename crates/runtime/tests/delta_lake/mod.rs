@@ -338,10 +338,19 @@ async fn query_delta_lake_with_timestamp_pruning() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let dataset_path = "s3://spiceai-public-datasets/delta_test_datasets/firewall_events/";
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_firewall_events.zip",
+                "delta_firewall_events",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
 
             let app = AppBuilder::new("delta_lake_timestamp_pruning")
-                .with_dataset(make_delta_lake_dataset(dataset_path, "events", false))
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/firewall_events"),
+                    "events",
+                    false,
+                ))
                 .build();
 
             configure_test_datafusion();
