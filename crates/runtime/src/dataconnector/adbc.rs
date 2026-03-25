@@ -140,10 +140,11 @@ pub struct AdbcFactory {
     /// a deterministic representation of their configuration. Datasets with
     /// identical ADBC config share a single connector instance and connection pool.
     ///
-    /// Each entry is an `Arc<tokio::sync::OnceCell<...>>` so only one initialization
-    /// runs per key — concurrent callers await the same future instead of racing.
-    /// The `Weak` inside prevents the cache from keeping connections alive
-    /// indefinitely: once all strong references are dropped the connector is released.
+    /// Each entry is an `Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>` so only
+    /// one initialization runs per key — concurrent callers await the same future
+    /// instead of racing. Because the cache holds a strong `Arc` to the connector,
+    /// connectors and their pools are kept alive for the lifetime of the process
+    /// (or until the cache entry is explicitly cleared elsewhere).
     cache: ConnectorCache,
 }
 
@@ -301,6 +302,13 @@ impl AdbcFactory {
 
         // Driver loading, database creation, and pool creation are all
         // synchronous FFI/IO operations — offload to a blocking thread.
+        //
+        // Note: aborting a `spawn_blocking` task is best-effort and will not
+        // reliably stop the underlying blocking FFI call. If the timeout below
+        // fires, the driver initialization may continue running in the
+        // background. The timeout bounds only the *await*, not the actual
+        // blocking execution. Use driver-level/connect-level timeouts where
+        // the driver supports them for stricter cancellation.
         let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
             let mut driver = ManagedDriver::load_from_name(
                 &driver_location,
@@ -395,10 +403,12 @@ impl DataConnectorFactory for AdbcFactory {
 
         // Get or insert a OnceCell for this key. This ensures only one
         // initialization runs per key — concurrent callers share the cell.
+        // Note: we intentionally do NOT evict entries here. Calling
+        // `cell.get().is_some()` would remove cells where initialization is
+        // still in-flight (`OnceCell` not yet set), breaking the single-init
+        // guarantee and causing duplicate connector/pool initializations.
         let cell = {
             let mut cache = self.cache.lock();
-            // Evict entries whose connector has been dropped.
-            cache.retain(|_, cell| cell.get().is_some());
             Arc::clone(
                 cache
                     .entry(cache_key)
