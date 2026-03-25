@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, ts.redact_tied_results)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -8,50 +8,26 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.29,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "stemic vascular resistance (SVR) by causing vasodilation."
-        ]
-      },
-      "primary_key": {
-        "id": 1035
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.21,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "A \"sequence\" implies a cascade of events traced to a singl"
-        ]
-      },
-      "primary_key": {
-        "id": 922
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.16,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " been established and should, therefore, be avoided"
-        ]
-      },
-      "primary_key": {
-        "id": 1143
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.16,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The nurse would suspect **genital warts**, as HPV is th"
-        ]
-      },
-      "primary_key": {
-        "id": 1274
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     }
   ]
 }

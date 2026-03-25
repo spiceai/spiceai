@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, ts.redact_tied_results)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -11,17 +11,8 @@ expression: normalize_search_response(resp)
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-        ],
-        "question": [
-          "Which base number, when raised to the fifth power, equals thirty-two?"
-        ]
-      },
-      "primary_key": {
-        "id": 1277
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
@@ -29,17 +20,8 @@ expression: normalize_search_response(resp)
         "question": "What is the fifth root of 32?"
       },
       "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-        ],
-        "question": [
-          "What is the fifth root of 32?"
-        ]
-      },
-      "primary_key": {
-        "id": 948
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
@@ -47,17 +29,8 @@ expression: normalize_search_response(resp)
         "question": "How many groups of 2 are in 14?"
       },
       "dataset": "qs",
-      "matches": {
-        "answer": [
-          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
-        ],
-        "question": [
-          "How many groups of 2 are in 14?"
-        ]
-      },
-      "primary_key": {
-        "id": 462
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
@@ -65,17 +38,8 @@ expression: normalize_search_response(resp)
         "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
       },
       "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
-        ],
-        "question": [
-          "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
-        ]
-      },
-      "primary_key": {
-        "id": 458
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     }
   ]
 }

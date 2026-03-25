@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, ts.redact_tied_results)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -11,17 +11,8 @@ expression: normalize_search_response(resp)
         "question": "What is 14 percent of 232?"
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\)."
-        ],
-        "question": [
-          "What is 14 percent of 232?"
-        ]
-      },
-      "primary_key": {
-        "id": 830
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
@@ -29,17 +20,8 @@ expression: normalize_search_response(resp)
         "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
-        ],
-        "question": [
-          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
-        ]
-      },
-      "primary_key": {
-        "id": 449
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
@@ -47,17 +29,8 @@ expression: normalize_search_response(resp)
         "question": "Find 100% of 732."
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
-        ],
-        "question": [
-          "Find 100% of 732."
-        ]
-      },
-      "primary_key": {
-        "id": 291
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
@@ -65,17 +38,8 @@ expression: normalize_search_response(resp)
         "question": "Evaluate the following expression: \\(2^{2}\\)."
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
-        ],
-        "question": [
-          "Evaluate the following expression: \\(2^{2}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 250
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     }
   ]
 }

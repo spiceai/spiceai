@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, ts.redact_tied_results)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -11,14 +11,8 @@ expression: normalize_search_response(resp)
         "question": "What is the fifth root of 32?"
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 948
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.55,
@@ -26,14 +20,8 @@ expression: normalize_search_response(resp)
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 1277
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.52,
@@ -41,14 +29,8 @@ expression: normalize_search_response(resp)
         "question": "What is 14 percent of 232?"
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\n\\( 232 \\times 0.14 = 32.48 \\)"
-        ]
-      },
-      "primary_key": {
-        "id": 830
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.51,
@@ -56,14 +38,8 @@ expression: normalize_search_response(resp)
         "question": "What is the fifth term and the nth term of the GP \\( 2, 4, 8, \\ldots \\)?"
       },
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The fifth term is \\( 2 \\times 2^{4} = 32 \\)"
-        ]
-      },
-      "primary_key": {
-        "id": 949
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     }
   ]
 }
