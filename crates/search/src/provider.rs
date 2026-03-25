@@ -591,10 +591,10 @@ impl TableProvider for SearchQueryProvider {
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // SearchQueryProvider nodes are expanded into their full logical plan by
-        // SearchQueryAnalyzerRule during the analysis phase; scan() should never be reached.
+        // SearchQueryOptimizerRule during the optimization phase; scan() should never be reached.
         Err(DataFusionError::Internal(
-            "SearchQueryProvider::scan() was called, but SearchQueryAnalyzerRule should have \
-             expanded this node before physical planning. Ensure SearchQueryAnalyzerRule is \
+            "SearchQueryProvider::scan() was called, but SearchQueryOptimizerRule should have \
+             expanded this node before physical planning. Ensure SearchQueryOptimizerRule is \
              registered in the DataFusion session."
                 .to_string(),
         ))

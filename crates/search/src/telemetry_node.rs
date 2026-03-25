@@ -17,7 +17,7 @@ limitations under the License.
 //! Logical extension node and physical execution wrapper for search telemetry tracking.
 //!
 //! [`SearchTelemetryNode`] is a transparent logical plan wrapper produced by
-//! [`SearchQueryAnalyzerRule`] when a [`SearchQueryProvider`] has a `scan_callback`.
+//! [`SearchQueryOptimizerRule`] when a [`SearchQueryProvider`] has a `scan_callback`.
 //! It carries the callback through logical planning to physical planning, where
 //! [`SearchTelemetryExec`] fires it on the first `poll_next` of partition 0.
 
