@@ -39,7 +39,6 @@ use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 
 use crate::catalogconnector::PartitionAwareCatalog;
 
@@ -520,11 +519,7 @@ impl CayenneSchemaProvider {
     fn cayenne_table_from_provider(
         provider: &Arc<dyn TableProvider>,
     ) -> Option<&CayenneTableProvider> {
-        let adapter = provider
-            .as_any()
-            .downcast_ref::<DeletionTableProviderAdapter>()?;
-        adapter
-            .source()
+        provider
             .as_any()
             .downcast_ref::<CayenneTableProvider>()
     }
@@ -564,11 +559,7 @@ impl CayenneSchemaProvider {
 
                 match builder.open(table_name).await {
                     Ok(provider) => {
-                        let provider = Arc::new(provider);
-                        let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                        Ok(Some(Arc::new(DeletionTableProviderAdapter::new(
-                            deletion_provider,
-                        ))))
+                        Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                     }
                     Err(e) => {
                         tracing::warn!("Failed to open Cayenne table '{table_name}': {e}");

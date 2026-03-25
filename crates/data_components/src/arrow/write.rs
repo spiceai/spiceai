@@ -49,7 +49,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::delete::{DeletionExec, DeletionSink};
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
 /// A wrapper around `XxHash3_64` that uses a fixed seed (0) for deterministic hashing.
@@ -1070,17 +1070,6 @@ impl DataSink for MemSink {
     }
 }
 
-#[async_trait]
-impl DeletionTableProvider for MemTable {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        TableProvider::delete_from(self, state, filters.to_vec()).await
-    }
-}
-
 struct MemDeletionSink {
     batches: Vec<PartitionData>,
     schema: SchemaRef,
@@ -1164,7 +1153,7 @@ mod tests {
     };
     use datafusion_table_providers::util::{on_conflict::OnConflict, test::MockExec};
 
-    use crate::{arrow::write::MemTable, delete::DeletionTableProvider};
+    use crate::arrow::write::MemTable;
 
     fn create_batch_with_string_columns(data: &[(&str, Vec<&str>)]) -> (RecordBatch, SchemaRef) {
         let fields: Vec<_> = data
@@ -1710,7 +1699,7 @@ mod tests {
             None,
         )));
 
-        let plan = DeletionTableProvider::delete_from(&table, &state, &[filter])
+        let plan = TableProvider::delete_from(&table, &state, vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -2152,7 +2141,7 @@ mod tests {
         let filter1 = col("category").eq(lit("A"));
         let filter2 = col("id").eq(lit("4"));
 
-        let plan = DeletionTableProvider::delete_from(&table, &state, &[filter1, filter2])
+        let plan = TableProvider::delete_from(&table, &state, vec![filter1, filter2])
             .await
             .expect("deletion should succeed");
 

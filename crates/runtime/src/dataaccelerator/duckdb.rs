@@ -590,7 +590,7 @@ pub(crate) async fn create_table_provider(
     };
 
     // Wrap with upsert deduplication if needed
-    let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+    let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
         duckdb_writer,
         &cmd.options,
         cmd.constraints.clone(),
@@ -615,7 +615,6 @@ pub(crate) async fn create_table_provider(
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,
-        delete_provider,
         read_provider,
         schema_metadata,
     ));

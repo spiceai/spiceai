@@ -148,7 +148,7 @@ use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
-use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use crate::delete::{DeletionExec, DeletionSink};
 
 /// Conversion constants for timestamp storage and conversion.
 ///
@@ -1213,17 +1213,6 @@ impl TableProvider for TursoTableProvider {
             )),
             &self.schema(),
         )))
-    }
-}
-
-#[async_trait]
-impl DeletionTableProvider for TursoTableProvider {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 

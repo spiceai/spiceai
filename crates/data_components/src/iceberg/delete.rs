@@ -344,7 +344,7 @@ impl ExecutionPlan for IcebergDeleteExec {
     }
 }
 
-/// Wrapper that makes an `IcebergTableProvider` support `DeletionTableProvider`.
+/// Wrapper that makes an `IcebergTableProvider` support `DELETE FROM`.
 ///
 /// This is registered as the table provider when the Iceberg data connector
 /// supports writes, enabling `DELETE FROM` SQL statements.
@@ -582,13 +582,3 @@ impl IcebergDeletionProvider {
     }
 }
 
-#[async_trait]
-impl crate::delete::DeletionTableProvider for IcebergDeletionProvider {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[datafusion::logical_expr::Expr],
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.delete_from_impl(state, filters).await
-    }
-}

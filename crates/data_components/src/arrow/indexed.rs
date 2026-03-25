@@ -968,18 +968,6 @@ impl ExecutionPlan for IndexedLookupExec {
     }
 }
 
-// Implement DeletionTableProvider by delegating to inner MemTable
-#[async_trait]
-impl crate::delete::DeletionTableProvider for IndexedMemTable {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        TableProvider::delete_from(self, state, filters.to_vec()).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

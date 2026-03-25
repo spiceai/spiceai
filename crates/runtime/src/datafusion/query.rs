@@ -35,7 +35,6 @@ use datafusion::{
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
 };
-use datafusion_expr::expr_rewriter::unnormalize_col;
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
 use tokio::time::Instant;
@@ -74,7 +73,6 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
@@ -738,89 +736,6 @@ impl Query {
                         }
                     };
                     (stream, df_plan)
-                } else if let LogicalPlan::Dml(dml) = &*plan
-                    && matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete)
-                {
-                    // DELETE operations need special handling because DataFusion doesn't
-                    // support DELETE natively. We intercept the DML Delete plan, extract
-                    // the filter predicates, and delegate to the DeletionTableProvider.
-                    let delete_plan =
-                        match create_delete_physical_plan(dml, &ctx.df, &session).await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                let e = find_datafusion_root(e);
-                                let error_code = ErrorCode::from(&e);
-                                handle_error!(
-                                    tracker,
-                                    &request_context,
-                                    error_code,
-                                    e,
-                                    UnableToExecuteQuery
-                                )
-                            }
-                        };
-
-                    let task_ctx = Arc::new(TaskContext::from(&session));
-                    let stream = match execute_stream_preserving_output_order(
-                        Arc::clone(&delete_plan),
-                        task_ctx,
-                    ) {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            let error_code = ErrorCode::from(&e);
-                            handle_error!(
-                                tracker,
-                                &request_context,
-                                error_code,
-                                e,
-                                UnableToExecuteQuery
-                            )
-                        }
-                    };
-                    (stream, delete_plan)
-                } else if let LogicalPlan::Dml(dml) = &*plan
-                    && matches!(&dml.op, datafusion::logical_expr::WriteOp::Update)
-                {
-                    // UPDATE operations are rewritten to an execution plan that:
-                    // 1) materializes updated rows from the DML input,
-                    // 2) deletes matched rows,
-                    // 3) inserts updated rows back.
-                    let update_plan =
-                        match create_update_physical_plan(dml, &ctx.df, &session).await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                let e = find_datafusion_root(e);
-                                let error_code = ErrorCode::from(&e);
-                                handle_error!(
-                                    tracker,
-                                    &request_context,
-                                    error_code,
-                                    e,
-                                    UnableToExecuteQuery
-                                )
-                            }
-                        };
-
-                    let task_ctx = Arc::new(TaskContext::from(&session));
-                    let stream = match execute_stream_preserving_output_order(
-                        Arc::clone(&update_plan),
-                        task_ctx,
-                    ) {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            let error_code = ErrorCode::from(&e);
-                            handle_error!(
-                                tracker,
-                                &request_context,
-                                error_code,
-                                e,
-                                UnableToExecuteQuery
-                            )
-                        }
-                    };
-                    (stream, update_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
                     let physical_plan = match session.create_physical_plan(&plan).await {
@@ -1422,119 +1337,6 @@ fn reconcile_stream_nullability(
             })
         }),
     ))
-}
-
-/// Creates a physical execution plan for a `DELETE FROM` DML statement.
-///
-/// `DataFusion` does not natively support `DELETE` operations, so we intercept
-/// the logical `DmlStatement` with `WriteOp::Delete`, extract the filter
-/// predicate from the source plan, look up the table's `DeletionTableProvider`,
-/// and call `delete_from` to produce the physical plan.
-///
-/// The source plan in the `DmlStatement` is either:
-/// - `Filter(predicate, TableScan)` — when `DELETE FROM t WHERE <predicate>`
-/// - `TableScan` — when `DELETE FROM t` (no WHERE clause)
-async fn create_delete_physical_plan(
-    dml: &datafusion::logical_expr::DmlStatement,
-    df: &Arc<DataFusion>,
-    session_state: &SessionState,
-) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    use crate::config::ClusterRole;
-
-    // In distributed mode (scheduler with executors), forward the DELETE to
-    // executor nodes instead of executing locally. The data lives on executors.
-    if let Some(ref executor_registry) = df.executor_registry
-        && matches!(
-            df.cluster_config.effective_role(),
-            Some(ClusterRole::Scheduler)
-        )
-        && df
-            .get_table_partition_expr(&dml.table_name)
-            .await?
-            .is_some()
-    {
-        let filter_sql = super::cayenne_ddl::analyzer_rule::extract_filter_sql(&dml.input)?;
-        let result_schema = super::cayenne_ddl::physical_plans::ddl_result_schema();
-        return Ok(Arc::new(
-            super::cayenne_ddl::physical_plans::DistributedCayenneDeleteExec::new(
-                dml.table_name.clone(),
-                Some(Arc::clone(executor_registry)),
-                filter_sql,
-                Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                    result_schema,
-                )),
-            ),
-        ));
-    }
-
-    // Extract filter expressions from the source plan
-    let filters = extract_dml_filters(&dml.input);
-
-    // Look up the table provider
-    let table_provider = df.get_table(&dml.table_name).await.ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "Table '{}' not found for DELETE operation",
-            dml.table_name
-        ))
-    })?;
-
-    // Get the DeletionTableProvider
-    let deletion_provider = get_deletion_provider(table_provider).ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "Table '{}' does not support DELETE operations",
-            dml.table_name
-        ))
-    })?;
-
-    DeletionTableProvider::delete_from(deletion_provider.as_ref(), session_state, &filters).await
-}
-
-/// Extract filter expressions from a DML source logical plan.
-///
-/// The source plan is generally `Filter(predicate, scan)`, and for `UPDATE`
-/// may be wrapped as `Projection(Filter(...))`.
-/// Returns the individual conjunctive filter expressions, or an empty
-/// vec if there is no WHERE clause.
-fn extract_dml_filters(source: &LogicalPlan) -> Vec<Expr> {
-    use datafusion_expr::utils::split_conjunction_owned;
-
-    match source {
-        LogicalPlan::Filter(filter) => {
-            split_conjunction_owned(unnormalize_col(filter.predicate.clone()))
-        }
-        LogicalPlan::Projection(projection) => extract_dml_filters(projection.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => extract_dml_filters(alias.input.as_ref()),
-        _ => vec![],
-    }
-}
-
-/// Create a physical execution plan for an `UPDATE` statement.
-///
-/// The returned plan executes update semantics as:
-/// 1) materialize updated rows from `dml.input`,
-/// 2) delete matched source rows,
-/// 3) insert updated rows with append mode.
-async fn create_update_physical_plan(
-    dml: &datafusion::logical_expr::DmlStatement,
-    df: &Arc<DataFusion>,
-    session_state: &SessionState,
-) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    let table_provider = df.get_table(&dml.table_name).await.ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "Table '{}' not found for UPDATE operation",
-            dml.table_name
-        ))
-    })?;
-
-    let source_plan = session_state.create_physical_plan(&dml.input).await?;
-    let filters = extract_dml_filters(&dml.input);
-
-    Ok(Arc::new(data_components::update::UpdateExec::new(
-        source_plan,
-        table_provider,
-        session_state.clone(),
-        filters,
-    )))
 }
 
 #[cfg(test)]

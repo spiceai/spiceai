@@ -37,7 +37,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionTableProvider};
+use data_components::delete::DeletionExec;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -4109,18 +4109,6 @@ impl TableProvider for CayenneTableProvider {
 
         // Default path: deletion vectors via CayenneDeletionSink
         self.delete_using_deletion_vectors(&filters)
-    }
-}
-
-// Implement DeletionTableProvider for Cayenne
-#[async_trait]
-impl DeletionTableProvider for CayenneTableProvider {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        TableProvider::delete_from(self, state, filters.to_vec()).await
     }
 }
 
