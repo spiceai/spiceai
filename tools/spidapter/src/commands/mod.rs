@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,11 +34,13 @@ pub(crate) struct AppCreateConfig {
     pub app_cpu_request: Option<String>,
     pub app_memory_request: Option<String>,
     pub app_replicas: Option<i32>,
+    pub app_storage_size_gb: Option<f64>,
     pub executor_replicas: i32,
     pub executor_memory_limit: Option<String>,
     pub executor_cpu_limit: Option<String>,
     pub executor_cpu_request: Option<String>,
     pub executor_memory_request: Option<String>,
+    pub executor_storage_size_gb: Option<f64>,
 }
 
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
@@ -167,6 +169,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             config.executor_cpu_request.as_deref(),
             config.executor_memory_request.as_deref(),
         )),
+        storage_size_gb: config.executor_storage_size_gb,
     });
 
     let create_result = cloud
@@ -186,11 +189,15 @@ pub(crate) async fn ensure_spice_cloud_app(
         .await;
 
     match create_result {
-        Ok(app) => Ok(app.id),
+        Ok(app) => {
+            apply_storage_config(cloud, app.id, config).await?;
+            Ok(app.id)
+        }
         Err(spice_cloud_client::error::Error::Conflict { .. }) => {
             // Race condition — another caller created it; re-fetch
             let apps = cloud.list_apps().await?;
             if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
+                apply_storage_config(cloud, app.id, config).await?;
                 return Ok(app.id);
             }
             Err(anyhow::anyhow!(
@@ -201,6 +208,46 @@ pub(crate) async fn ensure_spice_cloud_app(
             "Failed to create Spice Cloud app '{app_name}': {e}"
         )),
     }
+}
+
+/// Apply storage configuration to an app via the update API if any storage
+/// sizes are configured.
+async fn apply_storage_config(
+    cloud: &CloudClient,
+    app_id: i64,
+    config: &AppCreateConfig,
+) -> anyhow::Result<()> {
+    let has_storage =
+        config.app_storage_size_gb.is_some() || config.executor_storage_size_gb.is_some();
+
+    if !has_storage {
+        return Ok(());
+    }
+
+    let executor = config.executor_storage_size_gb.map(|size| AppExecutor {
+        replicas: None,
+        resources: None,
+        storage_size_gb: Some(size),
+    });
+
+    cloud
+        .update_app(
+            app_id,
+            &UpdateAppRequest {
+                description: None,
+                visibility: None,
+                replicas: None,
+                image_tag: None,
+                region: None,
+                spicepod: None,
+                resources: None,
+                executor,
+                storage_size_gb: config.app_storage_size_gb,
+            },
+        )
+        .await?;
+
+    Ok(())
 }
 
 pub(crate) async fn resolve_default_cname(cloud: &CloudClient) -> anyhow::Result<String> {
@@ -259,6 +306,7 @@ pub(crate) async fn apply_spicepod_to_app(
                 spicepod: Some(spicepod_yaml.to_string()),
                 resources: None,
                 executor: None,
+                storage_size_gb: None,
             },
         )
         .await?;
