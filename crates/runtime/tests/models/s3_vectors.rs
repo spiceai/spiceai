@@ -35,7 +35,9 @@ pub(crate) mod search {
             get_mega_science_dataset, get_mega_science_view,
             hf::get_model_to_vec_embeddings,
             s3_vectors::{
-                basic_vector_search_tests, basic_vector_search_tests_on_table, delete_index,
+                basic_vector_search_tests, basic_vector_search_tests_on_table,
+                fuzzy_basic_vector_search_tests, fuzzy_basic_vector_search_tests_on_table,
+                delete_index,
                 vectors_filterable_col,
             },
             search::{
@@ -277,8 +279,8 @@ pub(crate) mod search {
         run_search_w_explain(
             app.build(),
             [
-                basic_vector_search_tests("s3vectors_multiple_embeddings"),
-                basic_vector_search_tests_on_table("s3vectors_multiple_embeddings_view", "qs_view"),
+                fuzzy_basic_vector_search_tests("s3vectors_multiple_embeddings"),
+                fuzzy_basic_vector_search_tests_on_table("s3vectors_multiple_embeddings_view", "qs_view"),
                 vec![
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_additional_columns2",
@@ -288,7 +290,7 @@ pub(crate) mod search {
                         "datasets": ["qs"],
                         "additional_columns": ["answer"],
                     })),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_view_additional_columns2",
                     SearchTestType::Http(json!({
@@ -297,32 +299,31 @@ pub(crate) mod search {
                         "datasets": ["qs_view"],
                         "additional_columns": ["answer"],
                     })),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_vector_search_questions",
                     SearchTestType::from_sql(
                         "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_view_vector_search_questions",
                     SearchTestType::from_sql(
                         "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_vector_search_w_embeddings",
                     SearchTestType::from_sql(
                         "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(_score, 3) FROM vector_search(qs, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
-
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_view_vector_search_w_embeddings",
                     SearchTestType::from_sql(
                         "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(_score, 3) FROM vector_search(qs_view, 'second', question) order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 ]].concat(),
             true
         )
@@ -416,45 +417,46 @@ pub(crate) mod search {
 
         run_search_w_explain(
             app.build(),
-            [basic_vector_search_tests("s3vectors_chunking_metadata"),
-                basic_vector_search_tests_on_table("s3vectors_chunking_metadata_view", "qs_view"),
+            [fuzzy_basic_vector_search_tests("s3vectors_chunking_metadata"),
+                fuzzy_basic_vector_search_tests_on_table("s3vectors_chunking_metadata_view", "qs_view"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                )]].concat(),
+                ).fuzzy(),
+                ]].concat(),
             true
         )
         .await
@@ -490,33 +492,33 @@ pub(crate) mod search {
         run_search_w_explain(
             app.build(),
             [
-                basic_vector_search_tests("s3vectors_chunking"),
-                basic_vector_search_tests_on_table("s3vectors_chunking_view", "qs_view"),
+                fuzzy_basic_vector_search_tests("s3vectors_chunking"),
+                fuzzy_basic_vector_search_tests_on_table("s3vectors_chunking_view", "qs_view"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score DESC, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 // TODO: This is performing a needless join (since search_field is in vector index, `match` can be computed without base table).
                 // Tracking: `<https://github.com/spiceai/spiceai/issues/7512>`
                 SearchTestCase::new(
@@ -524,13 +526,14 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
-                ),
+                ).fuzzy(),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                )]].concat(),
+                ).fuzzy(),
+                ]].concat(),
             true
         )
         .await
@@ -1078,20 +1081,46 @@ pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestC
     basic_vector_search_tests_on_table(prefix, "qs")
 }
 
+/// Like [`basic_vector_search_tests`] but uses fuzzy (structural) validation instead
+/// of exact snapshot comparison. Use for tests with non-deterministic embedding results
+/// (e.g., chunking, RRF/multiple embeddings) where exact scores and content vary between runs.
+pub(crate) fn fuzzy_basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
+    fuzzy_basic_vector_search_tests_on_table(prefix, "qs")
+}
+
+pub(crate) fn fuzzy_basic_vector_search_tests_on_table(
+    prefix: &'static str,
+    table_name: &'static str,
+) -> Vec<SearchTestCase> {
+    basic_vector_search_tests_impl(prefix, table_name, true)
+}
+
 pub(crate) fn basic_vector_search_tests_on_table(
     prefix: &'static str,
     table_name: &'static str,
 ) -> Vec<SearchTestCase> {
+    basic_vector_search_tests_impl(prefix, table_name, false)
+}
+
+fn basic_vector_search_tests_impl(
+    prefix: &'static str,
+    table_name: &'static str,
+    fuzzy: bool,
+) -> Vec<SearchTestCase> {
+    let make = |name: String, body: SearchTestType| -> SearchTestCase {
+        let tc = SearchTestCase::new(name, body);
+        if fuzzy { tc.fuzzy() } else { tc }
+    };
     vec![
-        SearchTestCase::new(
+        make(
             format!("{prefix}_basic"),
             SearchTestType::Http(json!({
                 "text": "second",
-                "limit": 2,
+                "limit": 4,
                 "datasets": [table_name],
             })),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_keywords"),
             SearchTestType::Http(json!({
                 "text": "second",
@@ -1100,7 +1129,7 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "keywords": ["number"],
             })),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_additional_columns"),
             SearchTestType::Http(json!({
                 "text": "second",
@@ -1109,7 +1138,7 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "additional_columns": ["question"],
             })),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_with_where"),
             SearchTestType::Http(json!({
                 "text": "secondary",
@@ -1118,37 +1147,37 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "limit": 4,
             })),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_vector_search_sql_basic"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, trunc(_score, 3) FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4"
             )),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_vector_search_sql_projection"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4",
             )),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_vector_search_sql_filters"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search({table_name}, 'secondary', answer) where subject!='math' order by _score desc, id LIMIT 4",
             )),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_vector_search_sql_no_score"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4",
             )),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_vector_search_sql_random"),
             SearchTestType::from_sql(format!(
                 "SELECT subject FROM vector_search({table_name}, 'second', answer) order by _score desc LIMIT 4",
             )),
         ),
-        SearchTestCase::new(
+        make(
             format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::from_sql(format!(
                 "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3) as _score  FROM vector_search({table_name}, 'second', answer) order by _score desc, id desc LIMIT 4;",
