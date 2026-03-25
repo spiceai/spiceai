@@ -531,7 +531,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
-    use data_components::delete::DeletionTableProviderAdapter;
     use datafusion::datasource::TableProvider;
 
     use std::sync::Arc;
@@ -871,8 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_change_delete_returns_data_written() {
-        let adapter = Arc::new(DeletionTableProviderAdapter::new(make_mem_table()));
-        let task = make_refresh_task(adapter as Arc<dyn TableProvider>);
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
         assert_eq!(

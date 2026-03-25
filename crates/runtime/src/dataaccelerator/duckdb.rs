@@ -800,7 +800,6 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -1163,9 +1162,6 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -1174,10 +1170,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1193,10 +1189,10 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1224,17 +1220,14 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1258,17 +1251,14 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await

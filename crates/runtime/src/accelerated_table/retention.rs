@@ -228,8 +228,8 @@ mod tests {
         array::{BooleanArray, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::{arrow::write::MemTable, delete::DeletionTableProviderAdapter};
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use data_components::arrow::write::MemTable;
+    use datafusion::{catalog::TableProvider, physical_plan::collect, prelude::SessionContext};
     use tokio::time::{Duration, sleep};
 
     fn create_test_schema() -> Arc<Schema> {
@@ -303,8 +303,7 @@ mod tests {
         let mem_table =
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
-        let accelerator = Arc::new(DeletionTableProviderAdapter::new(Arc::new(mem_table)))
-            as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
 
         // Create retention configuration
         let retention_delete_expr = retention_sql.map(|sql| {
