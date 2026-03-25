@@ -31,6 +31,7 @@ use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 
 use datafusion_physical_plan::collect;
