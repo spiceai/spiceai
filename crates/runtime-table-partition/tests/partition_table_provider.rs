@@ -1959,9 +1959,10 @@ impl PartitionCreator for NonDeletablePartitionCreator {
     }
 }
 
-/// Test deletion with partitions that don't support deletion (should return 0 and log warning)
+/// Test deletion with empty filters deletes all rows (DataFusion's MemTable treats
+/// empty filters as "match all").
 #[tokio::test]
-async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_deletion_with_empty_filters_deletes_all() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("region", DataType::Utf8, false),
@@ -1993,7 +1994,7 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
     df.write_table("test_table", DataFrameWriteOptions::new())
         .await?;
 
-    // Get the table provider and call delete_from
+    // Get the table provider and call delete_from with empty filters
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
         .as_any()
@@ -2006,7 +2007,7 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
 
-    // Should return 0 since the partition doesn't support deletion
+    // Empty filters = delete all rows
     assert_eq!(result.len(), 1, "Expected 1 result batch");
     let count_col = result[0]
         .column_by_name("count")
@@ -2017,8 +2018,8 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
         .expect("Expected UInt64Array");
     assert_eq!(
         count_array.value(0),
-        0,
-        "Expected 0 deleted rows from non-deletable partition"
+        3,
+        "Expected all 3 rows deleted with empty filters"
     );
 
     Ok(())
