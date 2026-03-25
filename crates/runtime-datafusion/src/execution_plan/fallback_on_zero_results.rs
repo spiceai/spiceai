@@ -53,9 +53,8 @@ fn optimize_physical_plan(
         .physical_optimizers()
         .iter()
         .try_fold(plan, |plan, rule| {
-            rule.optimize(plan, config).map_err(|e| {
-                DataFusionError::Context(rule.name().to_string(), Box::new(e))
-            })
+            rule.optimize(plan, config)
+                .map_err(|e| DataFusionError::Context(rule.name().to_string(), Box::new(e)))
         })
 }
 
@@ -490,11 +489,8 @@ mod tests {
         /// merge them back to a single output stream.
         fn multi_partition_table_provider() -> Arc<dyn TableProvider> {
             Arc::new(
-                MemTable::try_new(
-                    schema(),
-                    vec![vec![batch()], vec![batch()], vec![batch()]],
-                )
-                .expect("memtable should not panic"),
+                MemTable::try_new(schema(), vec![vec![batch()], vec![batch()], vec![batch()]])
+                    .expect("memtable should not panic"),
             )
         }
 
@@ -550,12 +546,7 @@ mod tests {
             // Create a plan with 4 partitions
             let plan: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
                 MemorySourceConfig::try_new(
-                    &[
-                        vec![batch()],
-                        vec![batch()],
-                        vec![batch()],
-                        vec![batch()],
-                    ],
+                    &[vec![batch()], vec![batch()], vec![batch()], vec![batch()]],
                     schema(),
                     None,
                 )
