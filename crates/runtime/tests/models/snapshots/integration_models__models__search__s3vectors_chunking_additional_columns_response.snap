@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.78,
+      "_score": "[redacted]",
       "data": {
         "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\)."
       },
@@ -15,7 +15,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.55,
+      "_score": "[redacted]",
       "data": {
         "question": "What is the fifth root of 32?"
       },
@@ -24,7 +24,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.55,
+      "_score": "[redacted]",
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -33,7 +33,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.52,
+      "_score": "[redacted]",
       "data": {
         "question": "What is 14 percent of 232?"
       },

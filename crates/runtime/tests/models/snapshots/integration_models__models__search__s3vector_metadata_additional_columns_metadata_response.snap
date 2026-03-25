@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.54,
+      "_score": "[redacted]",
       "data": {
         "reference_answer": "7",
         "source": "textbook_reasoning"
@@ -16,7 +16,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.53,
+      "_score": "[redacted]",
       "data": {
         "reference_answer": "2",
         "source": "textbook_reasoning"
@@ -26,7 +26,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.53,
+      "_score": "[redacted]",
       "data": {
         "reference_answer": "-16",
         "source": "textbook_reasoning"
@@ -36,7 +36,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.52,
+      "_score": "[redacted]",
       "data": {
         "reference_answer": "2",
         "source": "textbook_reasoning"

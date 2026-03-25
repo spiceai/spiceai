@@ -6,25 +6,25 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.28,
+      "_score": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.24,
+      "_score": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.23,
+      "_score": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.2,
+      "_score": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

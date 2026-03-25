@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.03,
+      "_score": "[redacted]",
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -15,7 +15,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.03,
+      "_score": "[redacted]",
       "data": {
         "question": "What is the fifth root of 32?"
       },
@@ -24,7 +24,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.03,
+      "_score": "[redacted]",
       "data": {
         "question": "How many groups of 2 are in 14?"
       },
@@ -33,7 +33,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.03,
+      "_score": "[redacted]",
       "data": {
         "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
       },

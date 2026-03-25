@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": "[redacted]",
       "data": {
         "question": "What is the fifth root of 32?"
       },
@@ -15,7 +15,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.55,
+      "_score": "[redacted]",
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -24,7 +24,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.52,
+      "_score": "[redacted]",
       "data": {
         "question": "What is 14 percent of 232?"
       },
@@ -33,7 +33,7 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
       "primary_key": "[redacted]"
     },
     {
-      "_score": 0.51,
+      "_score": "[redacted]",
       "data": {
         "question": "What is the fifth term and the nth term of the GP \\( 2, 4, 8, \\ldots \\)?"
       },

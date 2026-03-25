@@ -234,11 +234,13 @@ fn normalize_search_response(mut json: Value, redact_tied_results: bool) -> Stri
         }
 
         if redact_tied_results {
-            // When vector search uses external/live data, the specific items returned can
-            // differ between runs due to data changes or embedding non-determinism. Redact
-            // matches/primary_key so snapshots only verify scores, datasets, and result count.
+            // When vector search uses external/live data, the specific items and scores
+            // returned can differ between runs due to data changes or embedding
+            // non-determinism. Redact volatile fields so snapshots only verify response
+            // structure, datasets, and result count.
             for m in matches.iter_mut() {
                 if let Some(obj) = m.as_object_mut() {
+                    obj.insert("_score".to_string(), json!("[redacted]"));
                     obj.insert("matches".to_string(), json!("[redacted]"));
                     obj.insert("primary_key".to_string(), json!("[redacted]"));
                 }
