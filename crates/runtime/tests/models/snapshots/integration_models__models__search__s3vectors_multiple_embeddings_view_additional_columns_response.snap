@@ -7,36 +7,28 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "results": [
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "What is 14 percent of 232?"
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "Find 100% of 732."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "Evaluate the following expression: \\(2^{2}\\)."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

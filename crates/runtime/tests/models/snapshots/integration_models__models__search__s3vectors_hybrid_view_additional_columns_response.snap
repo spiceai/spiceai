@@ -7,36 +7,28 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "results": [
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

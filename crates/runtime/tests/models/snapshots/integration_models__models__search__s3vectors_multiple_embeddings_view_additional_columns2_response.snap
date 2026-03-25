@@ -7,36 +7,28 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "results": [
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\)."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

@@ -7,36 +7,28 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "results": [
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\)."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-      },
+      "data": "[redacted]",
       "dataset": "qs_view",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

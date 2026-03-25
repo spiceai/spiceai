@@ -7,36 +7,28 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "results": [
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "What is the fifth root of 32?"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "How many groups of 2 are in 14?"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

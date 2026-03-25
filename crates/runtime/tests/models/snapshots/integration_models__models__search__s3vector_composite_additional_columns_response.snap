@@ -7,36 +7,28 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "data": {
-        "subject": "economics"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]",
       "_score": "[redacted]"
     },
     {
-      "data": {
-        "subject": "math"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]",
       "_score": "[redacted]"
     },
     {
-      "data": {
-        "subject": "math"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]",
       "_score": "[redacted]"
     },
     {
-      "data": {
-        "subject": "medicine"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]",

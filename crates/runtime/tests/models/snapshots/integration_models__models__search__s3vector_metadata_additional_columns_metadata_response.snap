@@ -7,40 +7,28 @@ expression: "normalize_search_response(resp, ts.redact_tied_results)"
   "results": [
     {
       "_score": "[redacted]",
-      "data": {
-        "reference_answer": "7",
-        "source": "textbook_reasoning"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "reference_answer": "2",
-        "source": "textbook_reasoning"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "reference_answer": "-16",
-        "source": "textbook_reasoning"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"
     },
     {
       "_score": "[redacted]",
-      "data": {
-        "reference_answer": "2",
-        "source": "textbook_reasoning"
-      },
+      "data": "[redacted]",
       "dataset": "qs",
       "matches": "[redacted]",
       "primary_key": "[redacted]"

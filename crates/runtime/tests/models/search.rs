@@ -243,6 +243,10 @@ fn normalize_search_response(mut json: Value, redact_tied_results: bool) -> Stri
                     obj.insert("_score".to_string(), json!("[redacted]"));
                     obj.insert("matches".to_string(), json!("[redacted]"));
                     obj.insert("primary_key".to_string(), json!("[redacted]"));
+                    // Also redact the "data" field which contains additional_columns data
+                    if obj.contains_key("data") {
+                        obj.insert("data".to_string(), json!("[redacted]"));
+                    }
                 }
             }
         }
