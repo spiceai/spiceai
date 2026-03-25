@@ -651,8 +651,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         ))
                     })?;
 
-                    Arc::new(partition_provider)
-                        as Arc<dyn datafusion::catalog::TableProvider>
+                    Arc::new(partition_provider) as Arc<dyn datafusion::catalog::TableProvider>
                 } else {
                     // Non-partitioned: open the table we just created
                     let builder = CayenneTableProviderBuilder::new(
@@ -664,8 +663,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             "Failed to open Cayenne table '{table_name}': {e}"
                         ))
                     })?;
-                    Arc::new(provider)
-                        as Arc<dyn datafusion::catalog::TableProvider>
+                    Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>
                 };
 
             // Ensure the schema exists, creating it on demand if needed

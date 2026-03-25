@@ -136,9 +136,7 @@ impl super::AcceleratedTable {
                     default_runtime_env(io_runtime.clone()),
                 );
 
-                let plan = accelerator
-                    .delete_from(&ctx.state(), vec![expr])
-                    .await;
+                let plan = accelerator.delete_from(&ctx.state(), vec![expr]).await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {
                         Err(e) => {

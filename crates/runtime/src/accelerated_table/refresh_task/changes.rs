@@ -304,8 +304,8 @@ impl RefreshTask {
                 .accelerator
                 .delete_from(&session_state, vec![combined])
                 .await
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
             collect(delete_plan, ctx.task_ctx())
                 .await
                 .map_err(find_datafusion_root)

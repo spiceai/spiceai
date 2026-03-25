@@ -581,4 +581,3 @@ impl IcebergDeletionProvider {
         )))
     }
 }
-

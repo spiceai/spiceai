@@ -365,10 +365,7 @@ impl DataAccelerator for SqliteAccelerator {
             cmd.constraints.clone(),
         );
 
-        let table_provider = Arc::new(PolyTableProvider::new(
-            write_provider,
-            read_provider,
-        ));
+        let table_provider = Arc::new(PolyTableProvider::new(write_provider, read_provider));
 
         Ok(table_provider)
     }

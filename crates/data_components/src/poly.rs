@@ -40,10 +40,7 @@ pub struct PolyTableProvider {
 }
 
 impl PolyTableProvider {
-    pub fn new(
-        write: Arc<dyn TableProvider>,
-        fed: Arc<dyn TableProvider>,
-    ) -> Self {
+    pub fn new(write: Arc<dyn TableProvider>, fed: Arc<dyn TableProvider>) -> Self {
         PolyTableProvider {
             write,
             fed,

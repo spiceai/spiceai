@@ -519,9 +519,7 @@ impl CayenneSchemaProvider {
     fn cayenne_table_from_provider(
         provider: &Arc<dyn TableProvider>,
     ) -> Option<&CayenneTableProvider> {
-        provider
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        provider.as_any().downcast_ref::<CayenneTableProvider>()
     }
 
     fn clear_tables(&self) {
@@ -558,9 +556,7 @@ impl CayenneSchemaProvider {
                     CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env));
 
                 match builder.open(table_name).await {
-                    Ok(provider) => {
-                        Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
-                    }
+                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
                     Err(e) => {
                         tracing::warn!("Failed to open Cayenne table '{table_name}': {e}");
                         Ok(None)
