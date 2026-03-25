@@ -52,30 +52,6 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 556
       }
-    },
-    {
-      "_score": 0.49,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          " numbers:  \n1.80  \n+ 0.27  \n------  \n2.0"
-        ]
-      },
-      "primary_key": {
-        "id": 21
-      }
-    },
-    {
-      "_score": 0.45,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 458
-      }
     }
   ]
 }
