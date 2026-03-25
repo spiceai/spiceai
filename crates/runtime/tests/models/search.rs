@@ -434,7 +434,7 @@ fn validate_search_response_structure(resp: &Value, test_name: &str) -> Result<(
     for (i, result) in results.iter().enumerate() {
         let score = result
             .get("_score")
-            .and_then(|s| s.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .ok_or_else(|| anyhow::anyhow!("{test_name}: result[{i}] missing numeric '_score'"))?;
         assert!(
             score <= prev_score,
