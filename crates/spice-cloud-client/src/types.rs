@@ -57,6 +57,8 @@ pub struct AppExecutor {
     pub replicas: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -71,6 +73,8 @@ pub struct AppConfig {
     pub executor: Option<AppExecutor>,
     pub region: Option<String>,
     pub node_group: Option<String>,
+    pub storage_size_gb: Option<f64>,
+    /// Deprecated: Use `storage_size_gb` instead.
     pub storage_claim_size_gb: Option<f64>,
 }
 
@@ -134,6 +138,8 @@ pub struct UpdateAppRequest {
     pub resources: Option<AppResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<AppExecutor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_size_gb: Option<f64>,
 }
 
 // ============================================================================
