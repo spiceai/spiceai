@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion::{assert_batches_eq, physical_plan::collect, prelude::*, sql::TableReference};
+use datafusion::{assert_batches_eq, datasource::TableProvider, physical_plan::collect, prelude::*, sql::TableReference};
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
