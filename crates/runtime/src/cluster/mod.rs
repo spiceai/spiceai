@@ -30,7 +30,6 @@ use crate::{
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
-use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::TableReference;
