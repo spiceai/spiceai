@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -102,6 +102,14 @@ pub struct StdioArgs {
     /// Memory request for the Spice Cloud executor pod (e.g. `256Mi`).
     #[arg(long, env = "SPIDAPTER_EXECUTOR_MEMORY_REQUEST")]
     pub executor_memory_request: Option<String>,
+
+    /// PVC block storage size in GB for the Spice Cloud app (scheduler) pod (e.g. `10`).
+    #[arg(long, env = "SPIDAPTER_APP_STORAGE_SIZE_GB")]
+    pub app_storage_size_gb: Option<f64>,
+
+    /// PVC block storage size in GB for the Spice Cloud executor pod (e.g. `5`).
+    #[arg(long, env = "SPIDAPTER_EXECUTOR_STORAGE_SIZE_GB")]
+    pub executor_storage_size_gb: Option<f64>,
 
     /// S3 URL prefix for the spiced scheduler state location (e.g. `s3://bucket/state`).
     #[arg(long, env = "SCHEDULER_STATE_LOCATION")]
