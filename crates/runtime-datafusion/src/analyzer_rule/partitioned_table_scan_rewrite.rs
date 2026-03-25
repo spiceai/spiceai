@@ -164,9 +164,10 @@ impl PartitionedTableScanRewrite {
 
     /// Build a `Union` from sub-scans.
     ///
-    /// For multiple partitions, the `Union` is wrapped in a [`SubqueryAlias`] that
-    /// preserves the original table name.
-    /// For a single partition, returns the sub-scan directly (no Union or alias).
+    /// The result is always wrapped in a [`SubqueryAlias`] that preserves the
+    /// original table name, regardless of the number of partitions.
+    /// For multiple partitions the alias wraps a `Union`; for a single partition
+    /// the alias wraps the sub-scan directly.
     /// Returns `None` if there are no partitions (caller should produce an [`EmptyRelation`]).
     fn build_union_from_sub_scans(
         sub_scans: Vec<Arc<LogicalPlan>>,
@@ -179,7 +180,10 @@ impl PartitionedTableScanRewrite {
         let rest = sub_scans.into_iter().skip(1).collect::<Vec<_>>();
 
         if rest.is_empty() {
-            return Ok(Some(first_scan));
+            let result = LogicalPlanBuilder::from(first_scan)
+                .alias(table_name.clone())?
+                .build()?;
+            return Ok(Some(result));
         }
 
         let mut builder = LogicalPlanBuilder::from(first_scan);
@@ -351,8 +355,14 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 /// so the outer Limit can correctly skip `m` and take `n` from the merged result.
 /// When there is no OFFSET, push fetch as-is.
 ///
-/// Returns `None` if the pushed-down fetch cannot be computed (e.g. non-literal expressions),
-/// in which case the caller should still push the Limit but with `fetch = None` (unlimited).
+/// Returns `None` when the pushed-down fetch cannot be computed, including:
+/// - `fetch` is `None` (no LIMIT clause)
+/// - OFFSET or LIMIT contains a non-literal expression
+/// - OFFSET or LIMIT contains a negative or unrecognized scalar value
+/// - `skip + fetch` overflows `u64` or does not fit in `i64`
+///
+/// When `None` is returned the caller should still push a Limit but with `fetch = None`
+/// (unlimited), so each partition returns all its rows for the outer Limit to handle.
 fn pushed_down_fetch(skip: Option<&Expr>, fetch: Option<&Expr>) -> Option<Box<Expr>> {
     use datafusion::common::ScalarValue;
 
@@ -613,11 +623,17 @@ mod tests {
         let config = ConfigOptions::default();
         let result = rewrite.analyze(plan, &config).expect("analyzing plan");
 
-        // Single partition: no Union
+        // Single partition: no Union, but still wrapped in SubqueryAlias
         let union_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::Union(_)));
         assert_eq!(
             union_count, 0,
             "Single partition should not produce Union, plan: {result}"
+        );
+        let alias_count =
+            count_plan_nodes(&result, |p| matches!(p, LogicalPlan::SubqueryAlias(_)));
+        assert_eq!(
+            alias_count, 1,
+            "Single partition should still be wrapped in SubqueryAlias, plan: {result}"
         );
     }
 
