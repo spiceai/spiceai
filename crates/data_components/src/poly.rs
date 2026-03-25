@@ -159,4 +159,13 @@ impl TableProvider for PolyTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.write.delete_from(state, filters).await
     }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.update(state, assignments, filters).await
+    }
 }
