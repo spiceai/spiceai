@@ -18,7 +18,7 @@ async-compression = { version = "0.4", features = [
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-blake3 = "1.5"
+blake3.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
@@ -35,7 +35,7 @@ tracing.workspace = true
 twox-hash = { workspace = true }
 
 [dev-dependencies]
-blake3 = "1.8"
+blake3.workspace = true
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 rand = "0.8"
 rstest = "0.25.0"

@@ -25,7 +25,7 @@ use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-use sha2::{Digest, Sha256};
+
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -465,10 +465,10 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         key.push_str(k);
         key.push('\0');
         if secret_params.contains(k) {
-            // Use SHA-256 for secret values so plaintext credentials are not
+            // Use BLAKE3 for secret values so plaintext credentials are not
             // retained in memory and the digest is not reversible.
-            let digest = Sha256::digest(v.as_bytes());
-            let _ = write!(key, "{digest:x}");
+            let digest = blake3::hash(v.as_bytes());
+            let _ = write!(key, "{digest}");
         } else {
             key.push_str(v);
         }
