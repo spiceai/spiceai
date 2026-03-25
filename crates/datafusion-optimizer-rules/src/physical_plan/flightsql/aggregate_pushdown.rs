@@ -547,12 +547,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_pushdown_preserves_filters_in_where() -> Result<()> {
-        let schema = lineitem_schema();
         use datafusion::logical_expr::{col, lit};
+
+        let schema = lineitem_schema();
         let filter = col("l_shipdate").gt(lit(ScalarValue::Int64(Some(100))));
         let union_input = make_union(vec![
-            make_flight_exec(&schema, "foo.foo.lineitem", &[filter.clone()]),
-            make_flight_exec(&schema, "foo.foo.lineitem", &[filter]),
+            make_flight_exec(&schema, "foo.foo.lineitem", std::slice::from_ref(&filter)),
+            make_flight_exec(&schema, "foo.foo.lineitem", std::slice::from_ref(&filter)),
         ]);
 
         let sum_expr =

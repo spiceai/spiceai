@@ -738,7 +738,7 @@ mod tests {
         let mapping = vec![5];
         let result = remap_batch(&batch, &mapping, &target_schema);
         assert!(result.is_err(), "should error on out-of-bounds index");
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("should error on out-of-bounds index").to_string();
         assert!(
             err_msg.contains("index 5"),
             "error should mention the bad index: {err_msg}"
