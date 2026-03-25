@@ -35,9 +35,8 @@ pub(crate) mod search {
             get_mega_science_dataset, get_mega_science_view,
             hf::get_model_to_vec_embeddings,
             s3_vectors::{
-                basic_vector_search_tests, basic_vector_search_tests_on_table,
+                basic_vector_search_tests, basic_vector_search_tests_on_table, delete_index,
                 fuzzy_basic_vector_search_tests, fuzzy_basic_vector_search_tests_on_table,
-                delete_index,
                 vectors_filterable_col,
             },
             search::{

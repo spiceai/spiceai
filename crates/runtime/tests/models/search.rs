@@ -442,7 +442,10 @@ pub(crate) async fn run_search_w_explain(
                         let resp = resp?;
                         if ts.fuzzy {
                             // For fuzzy SQL tests, just verify we got a non-error response
-                            assert!(resp.is_array() || resp.is_object(), "{test_name}: expected valid SQL response");
+                            assert!(
+                                resp.is_array() || resp.is_object(),
+                                "{test_name}: expected valid SQL response"
+                            );
                         } else {
                             insta::assert_json_snapshot!(test_name.clone(), resp);
                         }
