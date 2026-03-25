@@ -131,13 +131,14 @@ impl IcebergCatalog {
             }
         });
 
-        let operator = build_opendal_operator(catalog_id, &props)
-            .map_err(|e| super::Error::InvalidConfiguration {
+        let operator = build_opendal_operator(catalog_id, &props).map_err(|e| {
+            super::Error::InvalidConfiguration {
                 connector: "iceberg".into(),
                 message: format!("Failed to build opendal operator for Hadoop Catalog: {e}"),
                 connector_component: ConnectorComponent::from(catalog),
                 source: e,
-            })?;
+            }
+        })?;
 
         // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
         let catalog_builder = HadoopCatalogBuilder::default()
@@ -327,51 +328,52 @@ impl CatalogConnector for IcebergCatalog {
             }
         }
 
-        let storage_factory: Option<Arc<dyn StorageFactory>> = if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
+        let storage_factory: Option<Arc<dyn StorageFactory>> =
+            if let Some(endpoint) = props.get("s3.endpoint") {
+                verify_s3_endpoint(endpoint).await.map_err(|e| {
+                    super::Error::InvalidConfiguration {
+                        connector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        source: Box::new(e),
+                    }
+                })?;
+
+                let aws_sdk_config = initiate_config_with_credentials(
+                    "IcebergCatalogConnector",
+                    "s3_region",
+                    "s3_access_key_id",
+                    "s3_secret_access_key",
+                    "s3_session_token",
+                    &self.params,
+                    self.params.get("s3_iam_role_source").expose().ok(),
+                )
                 .await
                 .map_err(|e| super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
                     message: e.to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
-                })?;
-
-            let aws_sdk_config = initiate_config_with_credentials(
-                "IcebergCatalogConnector",
-                "s3_region",
-                "s3_access_key_id",
-                "s3_secret_access_key",
-                "s3_session_token",
-                &self.params,
-                self.params.get("s3_iam_role_source").expose().ok(),
-            )
-            .await
-            .map_err(|e| super::Error::InvalidConfiguration {
-                connector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?
-            .load()
-            .await;
-
-            let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
-                .map_err(|e| super::Error::InvalidConfiguration {
-                    connector: "iceberg".into(),
-                    message: e.to_string(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    source: Box::new(e),
                 })?
-                .into_custom_loader();
+                .load()
+                .await;
 
-            Some(Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: "s3".to_string(),
-                customized_credential_load: Some(custom_loader),
-            }) as Arc<dyn StorageFactory>)
-        } else {
-            None
-        };
+                let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
+                    .map_err(|e| super::Error::InvalidConfiguration {
+                        connector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        source: Box::new(e),
+                    })?
+                    .into_custom_loader();
+
+                Some(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "s3".to_string(),
+                    customized_credential_load: Some(custom_loader),
+                }) as Arc<dyn StorageFactory>)
+            } else {
+                None
+            };
 
         if catalog_id.starts_with("file://")
             || catalog_id.starts_with("s3://")
@@ -777,6 +779,8 @@ pub(crate) fn build_opendal_operator(
     warehouse_url: &str,
     props: &HashMap<String, String>,
 ) -> std::result::Result<Operator, Box<dyn std::error::Error + Send + Sync>> {
+    use opendal::Configurator;
+
     if warehouse_url.starts_with("s3://") || warehouse_url.starts_with("s3a://") {
         let parsed = Url::parse(warehouse_url)?;
         let bucket = parsed
@@ -785,11 +789,15 @@ pub(crate) fn build_opendal_operator(
 
         let mut config = opendal::services::S3Config::default();
         config.bucket = bucket.to_string();
+        config.root = Some(parsed.path().to_string());
 
         if let Some(endpoint) = props.get("s3.endpoint") {
             config.endpoint = Some(endpoint.clone());
         }
-        if let Some(region) = props.get("s3.region").or_else(|| props.get("client.region")) {
+        if let Some(region) = props
+            .get("s3.region")
+            .or_else(|| props.get("client.region"))
+        {
             config.region = Some(region.clone());
         }
         if let Some(key_id) = props.get("s3.access-key-id") {
@@ -802,7 +810,6 @@ pub(crate) fn build_opendal_operator(
             config.session_token = Some(token.clone());
         }
 
-        use opendal::Configurator;
         let builder = config.into_builder();
         Ok(Operator::new(builder)?.finish())
     } else if warehouse_url.starts_with("gs://") || warehouse_url.starts_with("gcs://") {
@@ -812,18 +819,22 @@ pub(crate) fn build_opendal_operator(
             .host_str()
             .ok_or("GCS URL must have a bucket (host)")?
             .to_string();
+        config.root = Some(parsed.path().to_string());
 
         if let Some(cred) = props.get("gcs.credentials-json") {
             config.credential = Some(cred.clone());
         }
 
-        use opendal::Configurator;
         let builder = config.into_builder();
         Ok(Operator::new(builder)?.finish())
     } else if warehouse_url.starts_with("file://") || warehouse_url.starts_with('/') {
-        use opendal::Configurator;
         let mut config = opendal::services::FsConfig::default();
-        config.root = Some("/".to_string());
+        if let Ok(parsed) = Url::parse(warehouse_url) {
+            config.root = Some(parsed.path().to_string());
+        } else {
+            // Bare path like /data/warehouse
+            config.root = Some(warehouse_url.to_string());
+        }
         let builder = config.into_builder();
         Ok(Operator::new(builder)?.finish())
     } else {
@@ -1110,5 +1121,47 @@ mod tests {
         let parsed_url = Url::parse(url).expect("Failed to parse URL");
         let warehouse = get_warehouse(&parsed_url);
         assert_eq!(warehouse, None);
+    }
+
+    #[test]
+    fn test_build_opendal_operator_s3() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("s3://my-bucket/prefix/warehouse", &props);
+        assert!(op.is_ok(), "S3 operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_s3a() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("s3a://my-bucket/prefix/warehouse", &props);
+        assert!(op.is_ok(), "S3A operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_gcs() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("gs://my-bucket/prefix", &props);
+        assert!(op.is_ok(), "GCS operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_file_url() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("file:///tmp", &props);
+        assert!(op.is_ok(), "File operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_bare_path() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("/tmp", &props);
+        assert!(op.is_ok(), "Bare path operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_unsupported_scheme() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("ftp://my-host/path", &props);
+        assert!(op.is_err(), "Unsupported scheme should fail");
     }
 }

@@ -147,51 +147,52 @@ impl IcebergDataConnector {
             }
         }
 
-        let storage_factory: Option<Arc<dyn StorageFactory>> = if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
+        let storage_factory: Option<Arc<dyn StorageFactory>> =
+            if let Some(endpoint) = props.get("s3.endpoint") {
+                verify_s3_endpoint(endpoint)
+                    .await
+                    .map_err(|e| Error::InvalidConfiguration {
+                        dataconnector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    })?;
+
+                let aws_sdk_config = initiate_config_with_credentials(
+                    "IcebergDataConnector",
+                    "s3_region",
+                    "s3_access_key_id",
+                    "s3_secret_access_key",
+                    "s3_session_token",
+                    &self.params,
+                    self.params.get("s3_iam_role_source").expose().ok(),
+                )
                 .await
                 .map_err(|e| Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
                     message: e.to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
-                })?;
-
-            let aws_sdk_config = initiate_config_with_credentials(
-                "IcebergDataConnector",
-                "s3_region",
-                "s3_access_key_id",
-                "s3_secret_access_key",
-                "s3_session_token",
-                &self.params,
-                self.params.get("s3_iam_role_source").expose().ok(),
-            )
-            .await
-            .map_err(|e| Error::InvalidConfiguration {
-                dataconnector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?
-            .load()
-            .await;
-
-            let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
-                .map_err(|e| Error::InvalidConfiguration {
-                    dataconnector: "iceberg".into(),
-                    message: e.to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
                 })?
-                .into_custom_loader();
+                .load()
+                .await;
 
-            Some(Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: "s3".to_string(),
-                customized_credential_load: Some(custom_loader),
-            }) as Arc<dyn StorageFactory>)
-        } else {
-            None
-        };
+                let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
+                    .map_err(|e| Error::InvalidConfiguration {
+                        dataconnector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    })?
+                    .into_custom_loader();
+
+                Some(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "s3".to_string(),
+                    customized_credential_load: Some(custom_loader),
+                }) as Arc<dyn StorageFactory>)
+            } else {
+                None
+            };
 
         if source.starts_with("file://")
             || source.starts_with("s3://")
@@ -238,13 +239,13 @@ impl IcebergDataConnector {
 
         props.extend(new_props);
 
-        let catalog_client = get_rest_catalog(base_uri, props, storage_factory.clone()).await.map_err(|e| {
-            Error::UnableToGetReadProvider {
+        let catalog_client = get_rest_catalog(base_uri, props, storage_factory.clone())
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
-            }
-        })?;
+            })?;
 
         let catalog_client: Arc<dyn Catalog> = Arc::new(catalog_client);
 
@@ -308,8 +309,8 @@ impl IcebergDataConnector {
             }
         });
 
-        // Build an opendal operator for directory listing
-        let operator = crate::catalogconnector::iceberg::build_opendal_operator(source, &props)
+        // Build an opendal operator for directory listing (scoped to the warehouse root, not the table URL)
+        let operator = crate::catalogconnector::iceberg::build_opendal_operator(&base_uri, &props)
             .map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),

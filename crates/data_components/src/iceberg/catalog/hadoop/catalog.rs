@@ -465,16 +465,35 @@ impl Catalog for HadoopCatalog {
 }
 
 impl HadoopCatalog {
-    async fn get_directories(&self, root: &str) -> Result<Vec<Entry>> {
-        let mut directories = Vec::new();
-        let entries = self
-            .operator
-            .list(root)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to list directory: {e}")))?;
+    /// Converts a full URL path (e.g., `s3://bucket/prefix/namespace/`) to a path
+    /// relative to the opendal operator root. The operator root is configured to match
+    /// the warehouse root path, so stripping the `warehouse_root` prefix yields the
+    /// correct operator-relative path.
+    fn to_operator_path(&self, full_path: &str) -> String {
+        match full_path.strip_prefix(&self.warehouse_root) {
+            Some("") => "/".to_string(),
+            Some(relative) => relative.to_string(),
+            None => full_path.to_string(),
+        }
+    }
 
-        for entry in entries {
-            if entry.metadata().is_dir() && !root.ends_with(entry.path()) {
+    async fn get_directories(&self, root: &str) -> Result<Vec<Entry>> {
+        let op_path = self.to_operator_path(root);
+        let mut directories = Vec::new();
+        let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to list directory: {e}"),
+            )
+        })?;
+
+        while let Some(entry) = lister.try_next().await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to read directory entry: {e}"),
+            )
+        })? {
+            if entry.metadata().is_dir() {
                 directories.push(entry);
             }
         }
@@ -488,38 +507,33 @@ impl HadoopCatalog {
         metadata_mode: MetadataMode,
     ) -> Result<bool> {
         let data_dir = format!("{path}/data/");
-        let exists = self
-            .operator
-            .exists(&data_dir)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to check existence: {e}")))?;
-        if !exists {
+        let op_path = self.to_operator_path(&data_dir);
+        let is_data_dir = match self.operator.stat(&op_path).await {
+            Ok(m) => m.is_dir(),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to stat: {e}"),
+                ));
+            }
+        };
+        if !is_data_dir {
             return Ok(false);
         }
-        let stat = self
-            .operator
-            .stat(&data_dir)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to stat: {e}")))?;
-        Ok(stat.is_dir() && self.directory_has_metadata(path, metadata_mode).await?)
+        self.directory_has_metadata(path, metadata_mode).await
     }
 
     async fn directory_exists(&self, path: &str) -> Result<bool> {
-        let exists = self
-            .operator
-            .exists(path)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to check existence: {e}")))?;
-        if !exists {
-            return Ok(false);
+        let op_path = self.to_operator_path(path);
+        match self.operator.stat(&op_path).await {
+            Ok(m) => Ok(m.is_dir()),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to stat: {e}"),
+            )),
         }
-
-        let stat = self
-            .operator
-            .stat(path)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to stat: {e}")))?;
-        Ok(stat.is_dir())
     }
 
     async fn directory_has_metadata(
@@ -528,38 +542,44 @@ impl HadoopCatalog {
         metadata_mode: MetadataMode,
     ) -> Result<bool> {
         let metadata_directory = format!("{path}/metadata/");
-        let exists = self
-            .operator
-            .exists(&metadata_directory)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to check existence: {e}")))?;
-        if !exists {
-            return Ok(false);
+        let op_path = self.to_operator_path(&metadata_directory);
+
+        // Check if the metadata directory exists
+        match self.operator.stat(&op_path).await {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) | Err(_) => return Ok(false),
         }
 
-        let entries = self
-            .operator
-            .list(&metadata_directory)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to list directory: {e}")))?;
-        for entry in entries {
-            if entry.metadata().is_file() {
-                let (metadata_file, fail_if_exact_missing) = match metadata_mode {
-                    MetadataMode::Infer => (None, false),
-                    MetadataMode::ExactOrInfer(ref metadata_file) => (Some(metadata_file), false),
-                    MetadataMode::Exact(ref metadata_file) => (Some(metadata_file), true),
-                };
+        let (metadata_file, fail_if_exact_missing) = match &metadata_mode {
+            MetadataMode::Infer => (None, false),
+            MetadataMode::ExactOrInfer(metadata_file) => (Some(metadata_file.as_str()), false),
+            MetadataMode::Exact(metadata_file) => (Some(metadata_file.as_str()), true),
+        };
 
-                if let Some(metadata_file) = metadata_file {
-                    if entry.name() == metadata_file {
+        let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to list directory: {e}"),
+            )
+        })?;
+
+        while let Some(entry) = lister.try_next().await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to read metadata entry: {e}"),
+            )
+        })? {
+            if entry.metadata().is_file() {
+                if let Some(mf) = metadata_file {
+                    // Compare by filename — metadata_file may be a full path or just a name
+                    let mf_name = mf.rsplit('/').next().unwrap_or(mf);
+                    if entry.name() == mf_name {
                         return Ok(true);
-                    } else if fail_if_exact_missing {
-                        return Ok(false);
                     }
                 }
 
-                // Naive check if the file is a metadata file
-                if entry.name().ends_with(".metadata.json") {
+                // For non-Exact modes, any .metadata.json file qualifies
+                if !fail_if_exact_missing && entry.name().ends_with(".metadata.json") {
                     return Ok(true);
                 }
             }
@@ -627,15 +647,21 @@ impl HadoopCatalog {
                     table = table_identifier.name
                 );
 
-                let mut lister = self.operator
-                    .lister(&metadata_directory)
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to list metadata directory: {e}")))?;
+                let op_path = self.to_operator_path(&metadata_directory);
+                let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to list metadata directory: {e}"),
+                    )
+                })?;
                 let mut latest_metadata_file: Option<Entry> = None;
-                while let Some(entry) = lister.try_next().await.map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to read metadata entry: {e}")))? {
-                    if entry.metadata().is_file()
-                        && entry.name().ends_with(".metadata.json")
-                    {
+                while let Some(entry) = lister.try_next().await.map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to read metadata entry: {e}"),
+                    )
+                })? {
+                    if entry.metadata().is_file() && entry.name().ends_with(".metadata.json") {
                         if let Some(latest_file) = &latest_metadata_file {
                             match (
                                 latest_file.metadata().last_modified(),
