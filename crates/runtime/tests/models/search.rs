@@ -76,6 +76,9 @@ pub struct SearchTestCase {
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
+    /// When true, validate response structure instead of exact snapshot comparison.
+    /// Use for tests with non-deterministic embedding results (e.g., chunking, RRF).
+    pub fuzzy: bool,
 }
 
 impl SearchTestCase {
@@ -85,6 +88,7 @@ impl SearchTestCase {
             body,
             should_fail: false,
             skip: false,
+            fuzzy: false,
         }
     }
 
@@ -95,6 +99,11 @@ impl SearchTestCase {
 
     pub fn skip(mut self) -> Self {
         self.skip = true;
+        self
+    }
+
+    pub fn fuzzy(mut self) -> Self {
+        self.fuzzy = true;
         self
     }
 
@@ -115,6 +124,7 @@ impl SearchTestCase {
             body,
             name: self.name.clone(),
             skip: self.skip,
+            fuzzy: self.fuzzy,
         }
     }
 }
@@ -163,9 +173,14 @@ pub async fn run_search_test(
         return Ok(());
     }
 
-    let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
+    let resp: Value = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
     assert_search_response_primary_keys(base_url, &ts.name, &resp).await?;
-    assert_search_response_snapshot(&ts.name, resp);
+
+    if ts.fuzzy {
+        validate_search_response_structure(&resp, &ts.name)?;
+    } else {
+        assert_search_response_snapshot(&ts.name, resp);
+    }
 
     Ok(())
 }
@@ -396,6 +411,54 @@ fn json_value_to_text(value: &Value) -> Result<String, anyhow::Error> {
     }
 }
 
+/// Validates the structure of a search response without checking exact content.
+/// Used for tests with non-deterministic embedding results where exact snapshot
+/// matching would be flaky.
+fn validate_search_response_structure(resp: &Value, test_name: &str) -> Result<(), anyhow::Error> {
+    let results = resp
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| anyhow::anyhow!("{test_name}: response missing 'results' array"))?;
+
+    assert!(
+        !results.is_empty(),
+        "{test_name}: expected non-empty results"
+    );
+
+    assert!(
+        resp.get("duration_ms").is_some(),
+        "{test_name}: response missing 'duration_ms'"
+    );
+
+    let mut prev_score = f64::MAX;
+    for (i, result) in results.iter().enumerate() {
+        let score = result
+            .get("_score")
+            .and_then(|s| s.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("{test_name}: result[{i}] missing numeric '_score'"))?;
+        assert!(
+            score <= prev_score,
+            "{test_name}: results not in descending score order at index {i}"
+        );
+        prev_score = score;
+
+        assert!(
+            result.get("dataset").and_then(|d| d.as_str()).is_some(),
+            "{test_name}: result[{i}] missing 'dataset'"
+        );
+        assert!(
+            result.get("matches").and_then(|m| m.as_object()).is_some(),
+            "{test_name}: result[{i}] missing 'matches' object"
+        );
+        assert!(
+            result.get("primary_key").is_some(),
+            "{test_name}: result[{i}] missing 'primary_key'"
+        );
+    }
+
+    Ok(())
+}
+
 pub(crate) fn item_tpcds_dataset_w_embeddings(
     ds_name: &str,
     model: &str,
@@ -544,9 +607,15 @@ pub(crate) async fn run_search_w_explain(
                             continue;
                         }
 
-                        insta::assert_json_snapshot!(test_name.clone(), resp?);
+                        let resp = resp?;
+                        if ts.fuzzy {
+                            // For fuzzy SQL tests, just verify we got a non-error response
+                            assert!(resp.is_array() || resp.is_object(), "{test_name}: expected valid SQL response");
+                        } else {
+                            insta::assert_json_snapshot!(test_name.clone(), resp);
+                        }
 
-                        if explain_sql {
+                        if explain_sql && !ts.fuzzy {
                             let c: Vec<arrow::record_batch::RecordBatch> = client
                                 .sql(format!("EXPLAIN {sql}").as_str())
                                 .await?
