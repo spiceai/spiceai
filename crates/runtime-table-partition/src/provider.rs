@@ -409,7 +409,7 @@ impl TableProvider for PartitionTableProvider {
             state.task_ctx(),
         ));
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
+        Ok(Arc::new(DeletionExec::new(deletion_sink)))
     }
 }
 

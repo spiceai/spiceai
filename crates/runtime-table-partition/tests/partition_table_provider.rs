@@ -1535,10 +1535,7 @@ impl TableProvider for DeletablePartitionMemTable {
             count_to_delete: 10,
         });
 
-        Ok(Arc::new(DeletionExec::new(
-            deletion_sink,
-            &self.mem_table.schema(),
-        )))
+        Ok(Arc::new(DeletionExec::new(deletion_sink)))
     }
 }
 

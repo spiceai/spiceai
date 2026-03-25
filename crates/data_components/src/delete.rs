@@ -19,7 +19,7 @@ use std::{any::Any, error::Error, sync::Arc};
 
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, Schema},
 };
 use async_trait::async_trait;
 use datafusion::{
@@ -44,9 +44,14 @@ pub struct DeletionExec {
 }
 
 impl DeletionExec {
-    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
+    pub fn new(deletion_sink: Arc<dyn DeletionSink>) -> Self {
+        let count_schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(schema)),
+            EquivalenceProperties::new(count_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,

@@ -356,7 +356,6 @@ impl TableProvider for MemTable {
                 self.schema(),
                 &filters,
             )),
-            &self.schema(),
         )))
     }
 }

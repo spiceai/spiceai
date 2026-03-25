@@ -1211,7 +1211,6 @@ impl TableProvider for TursoTableProvider {
                 self.table_name.clone(),
                 &filters,
             )),
-            &self.schema(),
         )))
     }
 }

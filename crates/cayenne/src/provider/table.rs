@@ -4151,7 +4151,6 @@ impl CayenneTableProvider {
                 Arc::clone(self.context.runtime_env()),
                 Arc::clone(&self.write_lock),
             )),
-            &self.table_metadata.schema,
         )))
     }
 
@@ -4180,7 +4179,6 @@ impl CayenneTableProvider {
                 Arc::clone(self.context.runtime_env()),
                 Some(Arc::clone(&self.write_lock)),
             )),
-            &self.table_metadata.schema,
         )))
     }
 
