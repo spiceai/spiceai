@@ -120,7 +120,7 @@ pub struct CreateAppRequest {
     pub executor: Option<AppExecutor>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
