@@ -71,11 +71,11 @@ use std::env;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock, oneshot};
+use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
@@ -158,7 +158,6 @@ fn spawn_scheduler_poll_loop(
     client_tls_config: Option<ClientTlsConfig>,
     executor: Arc<Executor>,
     codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
-    readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
     available_task_slots: Arc<tokio::sync::Semaphore>,
 ) -> SchedulerPollHandle {
@@ -255,43 +254,23 @@ fn spawn_scheduler_poll_loop(
                 .max_encoding_message_size(usize::MAX)
                 .max_decoding_message_size(usize::MAX);
 
-            let (tx_ready, rx_ready) = oneshot::channel();
-            let readiness_sender = Arc::clone(&readiness_sender);
-            let readiness_task = tokio::spawn(async move {
-                if let Ok(executor_id) = rx_ready.await {
-                    let sender = if let Ok(mut sender) = readiness_sender.lock() {
-                        sender.take()
-                    } else {
-                        tracing::warn!(
-                            "Readiness sender lock poisoned while handling executor readiness"
-                        );
-                        None
-                    };
-                    if let Some(sender) = sender {
-                        let _ = sender.send(executor_id);
-                    }
-                }
-            });
-
             let poll_future = execution_loop::poll_loop(
                 scheduler,
                 Arc::clone(&executor),
                 codec.clone(),
-                Some(tx_ready),
+                None,
                 poll_now_notify.clone(),
                 Some(Arc::clone(&available_task_slots)),
             );
 
             tokio::select! {
                 () = token.cancelled() => {
-                    readiness_task.abort();
                     tracing::debug!(
                         "Stopping scheduler poll loop for {scheduler_address} (cancelled)"
                     );
                     break;
                 }
                 result = poll_future => {
-                    readiness_task.abort();
                     if let Err(err) = result {
                         tracing::warn!(
                             "Scheduler poll loop ended for {scheduler_address}: {err}"
@@ -348,7 +327,6 @@ fn update_scheduler_pollers(
     client_tls_config: Option<&ClientTlsConfig>,
     executor: &Arc<Executor>,
     codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
-    readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<&Arc<Notify>>,
     available_task_slots: &Arc<tokio::sync::Semaphore>,
 ) {
@@ -377,7 +355,6 @@ fn update_scheduler_pollers(
             client_tls_config.cloned(),
             Arc::clone(executor),
             codec.clone(),
-            Arc::clone(readiness_sender),
             poll_now_notify.cloned(),
             Arc::clone(available_task_slots),
         );
@@ -1199,9 +1176,6 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    let (tx_ready, rx_ready) = oneshot::channel::<String>();
-    let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
-
     // Create the shared semaphore for task slot management across all scheduler poll loops.
     // This semaphore will be passed to each poll loop so the busy state can be tracked
     // and shared across nodes in the scheduler shared state location metadata.
@@ -1273,7 +1247,6 @@ pub async fn initialize_cluster_executor(
             client_tls_config_for_manager.as_ref(),
             &executor_for_manager,
             &codec_for_manager,
-            &readiness_sender,
             Some(&poll_now_notify),
             &available_task_slots_for_manager,
         );
@@ -1315,7 +1288,6 @@ pub async fn initialize_cluster_executor(
                             client_tls_config_for_manager.as_ref(),
                             &executor_for_manager,
                             &codec_for_manager,
-                            &readiness_sender,
                             Some(&poll_now_notify),
                             &available_task_slots_for_manager,
                         );
