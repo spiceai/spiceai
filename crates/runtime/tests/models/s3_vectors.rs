@@ -398,8 +398,9 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT question, answer, trunc(_score, 3) as _score FROM vector_search(qs_view, 'secondary') where id > 10 order by _score desc, id LIMIT 4",
                     ),
-                )]].concat()
+                )
                 .redact_tied_results(),
+                ]].concat(),
             true
         )
         .await
@@ -478,8 +479,9 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                )]].concat()
+                )
                 .redact_tied_results(),
+                ]].concat(),
             true
         )
         .await
@@ -560,8 +562,9 @@ pub(crate) mod search {
                     SearchTestType::from_sql(
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
-                )]].concat()
+                )
                 .redact_tied_results(),
+                ]].concat(),
             true
         )
         .await
