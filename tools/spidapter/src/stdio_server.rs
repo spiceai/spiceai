@@ -1478,10 +1478,35 @@ fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> Spicep
         ..Runtime::default()
     };
 
-    spicepod.catalogs.push(ComponentOrReference::Component(
-        Catalog::new("cayenne".to_string(), "spicebench".to_string())
-            .with_access(AccessMode::ReadWriteCreate),
-    ));
+    let mut cayenne_catalog = Catalog::new("cayenne".to_string(), "spicebench".to_string())
+        .with_access(AccessMode::ReadWriteCreate);
+
+    let cayenne_data_dir = std::env::var("SPIDAPTER_CAYENNE_DATA_DIR").ok();
+    let cayenne_metadata_dir = std::env::var("SPIDAPTER_CAYENNE_METADATA_DIR").ok();
+
+    if let Some(cayenne_data_dir) = &cayenne_data_dir {
+        cayenne_catalog.params = Some(Params::from_string_map(HashMap::from([(
+            "cayenne_data_dir".to_string(),
+            cayenne_data_dir.clone(),
+        )])));
+    }
+
+    if let Some(cayenne_metadata_dir) = &cayenne_metadata_dir {
+        cayenne_catalog
+            .params
+            .get_or_insert_with(|| Params {
+                data: HashMap::new(),
+            })
+            .data
+            .insert(
+                "cayenne_metadata_dir".to_string(),
+                ParamValue::String(cayenne_metadata_dir.clone()),
+            );
+    }
+
+    spicepod
+        .catalogs
+        .push(ComponentOrReference::Component(cayenne_catalog));
     spicepod
 }
 
