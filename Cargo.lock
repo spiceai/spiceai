@@ -6225,7 +6225,7 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 [[package]]
 name = "delta_kernel"
 version = "0.18.2"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=9d26fb3662d2edb8f382d4d0f7899c303549f0d0#9d26fb3662d2edb8f382d4d0f7899c303549f0d0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=47034733a0477f72e4f6abbbf6a27d0da069860a#47034733a0477f72e4f6abbbf6a27d0da069860a"
 dependencies = [
  "arrow",
  "bytes",
@@ -6255,7 +6255,7 @@ dependencies = [
 [[package]]
 name = "delta_kernel_derive"
 version = "0.18.2"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=9d26fb3662d2edb8f382d4d0f7899c303549f0d0#9d26fb3662d2edb8f382d4d0f7899c303549f0d0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=47034733a0477f72e4f6abbbf6a27d0da069860a#47034733a0477f72e4f6abbbf6a27d0da069860a"
 dependencies = [
  "proc-macro2",
  "quote",
