@@ -895,7 +895,8 @@ mod tests {
             ["# col_name", "data_type", "comment"]
         ]));
 
-        let schema = schema_from_json(&response, "test_table").expect("should stop at clustering marker");
+        let schema =
+            schema_from_json(&response, "test_table").expect("should stop at clustering marker");
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "name");
@@ -907,7 +908,8 @@ mod tests {
             "status": { "state": "SUCCEEDED" }
         });
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail without result");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
             "unexpected error: {err}"
@@ -921,7 +923,8 @@ mod tests {
             "result": {}
         });
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail without data_array");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without data_array");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
             "unexpected error: {err}"
@@ -935,7 +938,8 @@ mod tests {
             "result": { "data_array": "not_an_array" }
         });
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail when data_array is string");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail when data_array is string");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
             "unexpected error: {err}"
@@ -946,7 +950,8 @@ mod tests {
     fn test_schema_from_json_row_not_array() {
         let response = make_schema_response(&json!(["not_an_array"]));
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on non-array row");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on non-array row");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("is not an array")),
             "unexpected error: {err}"
@@ -968,7 +973,8 @@ mod tests {
     fn test_schema_from_json_column_name_not_string() {
         let response = make_schema_response(&json!([[123, "int", "NO"]]));
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on non-string col name");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string col name");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[0] is not a string")),
             "unexpected error: {err}"
@@ -979,7 +985,8 @@ mod tests {
     fn test_schema_from_json_data_type_not_string() {
         let response = make_schema_response(&json!([["id", 42, "NO"]]));
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on non-string data type");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string data type");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[1] is not a string")),
             "unexpected error: {err}"
@@ -990,7 +997,8 @@ mod tests {
     fn test_schema_from_json_nullable_not_string() {
         let response = make_schema_response(&json!([["id", "int", true]]));
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on non-string nullable");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string nullable");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[2] is not a string")),
             "unexpected error: {err}"
@@ -1009,7 +1017,8 @@ mod tests {
             ["g", "int", "anything_else"]
         ]));
 
-        let schema = schema_from_json(&response, "test_table").expect("should parse nullable variations");
+        let schema =
+            schema_from_json(&response, "test_table").expect("should parse nullable variations");
         assert!(schema.field(0).is_nullable());
         assert!(schema.field(1).is_nullable());
         assert!(schema.field(2).is_nullable());
@@ -1030,7 +1039,8 @@ mod tests {
             "result": { "data_array": [] }
         });
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on FAILED status");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on FAILED status");
         assert!(
             matches!(&err, Error::QueryFailure { message } if message.contains("table not found")),
             "unexpected error: {err}"
@@ -1044,7 +1054,8 @@ mod tests {
             "statement_id": "test-stmt-id"
         });
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on PENDING status");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on PENDING status");
         assert!(
             matches!(&err, Error::InvalidWarehouseState { .. }),
             "unexpected error: {err}"
@@ -1055,7 +1066,8 @@ mod tests {
     fn test_schema_from_json_unsupported_type() {
         let response = make_schema_response(&json!([["col", "TOTALLY_FAKE_TYPE", "NO"]]));
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail on unsupported type");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on unsupported type");
         assert!(
             matches!(&err, Error::ParseError { .. }),
             "unexpected error: {err}"
@@ -1068,7 +1080,8 @@ mod tests {
         let response =
             make_schema_response(&json!([["id", "int", "NO", "extra_col", "another_extra"]]));
 
-        let schema = schema_from_json(&response, "test_table").expect("should parse with extra columns");
+        let schema =
+            schema_from_json(&response, "test_table").expect("should parse with extra columns");
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "id");
     }
@@ -1079,7 +1092,8 @@ mod tests {
             "result": { "data_array": [["id", "int", "NO"]] }
         });
 
-        let err = schema_from_json(&response, "test_table").expect_err("should fail without status");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without status");
         assert!(
             matches!(&err, Error::MissingJsonField { field } if field == "status.state"),
             "unexpected error: {err}"
@@ -1445,10 +1459,8 @@ mod tests {
     #[test]
     fn test_schema_from_json_happy_path_with_dataset_name() {
         // Ensure the dataset_name parameter doesn't affect successful parsing.
-        let response = make_schema_response(&json!([
-            ["id", "int", "NO"],
-            ["name", "string", "YES"]
-        ]));
+        let response =
+            make_schema_response(&json!([["id", "int", "NO"], ["name", "string", "YES"]]));
 
         let schema = schema_from_json(&response, "catalog.schema.users")
             .expect("should parse schema successfully");
