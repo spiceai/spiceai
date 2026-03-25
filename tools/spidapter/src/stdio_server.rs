@@ -1643,8 +1643,9 @@ mod tests {
         )]);
 
         let args = test_stdio_args();
-        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
-        .expect("spicepod should generate");
+        let spicepod =
+            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+                .expect("spicepod should generate");
         let spicepod_yaml =
             serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
 
