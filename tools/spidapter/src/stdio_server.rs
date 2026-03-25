@@ -619,14 +619,7 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    let spicepod = generate_initial_spicepod(
-        &run_id,
-        setup_config,
-        datasets,
-        None,
-        args.scheduler_state_location.as_deref(),
-        args.aws_region.as_deref(),
-    )?;
+    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None, args)?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
@@ -739,8 +732,7 @@ async fn provision_local_spiced_cluster(
             setup_config,
             datasets,
             local_flight_api_key.as_deref(),
-            args.scheduler_state_location.as_deref(),
-            args.aws_region.as_deref(),
+            args,
         )?;
         let spicepod_path = write_local_spicepod(&spicepod, &working_dir, "spicepod.yaml").await?;
 
@@ -1453,7 +1445,11 @@ fn generate_hive_spicepod(
     Ok(spicepod)
 }
 
-fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> SpicepodDefinition {
+fn generate_adbc_spicepod(
+    run_id: &Uuid,
+    flight_api_key: Option<&str>,
+    args: &StdioArgs,
+) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -1481,27 +1477,31 @@ fn generate_adbc_spicepod(run_id: &Uuid, flight_api_key: Option<&str>) -> Spicep
     let mut cayenne_catalog = Catalog::new("cayenne".to_string(), "spicebench".to_string())
         .with_access(AccessMode::ReadWriteCreate);
 
-    let cayenne_data_dir = std::env::var("SPIDAPTER_CAYENNE_DATA_DIR").ok();
-    let cayenne_metadata_dir = std::env::var("SPIDAPTER_CAYENNE_METADATA_DIR").ok();
+    let mut params_map = HashMap::new();
 
-    if let Some(cayenne_data_dir) = &cayenne_data_dir {
-        cayenne_catalog.params = Some(Params::from_string_map(HashMap::from([(
-            "cayenne_data_dir".to_string(),
-            cayenne_data_dir.clone(),
-        )])));
+    if let Some(cayenne_data_dir) = &args
+        .cayenne_data_dir
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        params_map.insert("cayenne_data_dir".to_string(), cayenne_data_dir.clone());
     }
 
-    if let Some(cayenne_metadata_dir) = &cayenne_metadata_dir {
-        cayenne_catalog
-            .params
-            .get_or_insert_with(|| Params {
-                data: HashMap::new(),
-            })
-            .data
-            .insert(
-                "cayenne_metadata_dir".to_string(),
-                ParamValue::String(cayenne_metadata_dir.clone()),
-            );
+    if let Some(cayenne_metadata_dir) = &args
+        .cayenne_metadata_dir
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        params_map.insert(
+            "cayenne_metadata_dir".to_string(),
+            cayenne_metadata_dir.clone(),
+        );
+    }
+
+    if !params_map.is_empty() {
+        cayenne_catalog.params = Some(Params::from_string_map(params_map));
     }
 
     spicepod
@@ -1516,11 +1516,13 @@ fn generate_initial_spicepod(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
-    scheduler_state_location: Option<&str>,
-    aws_region: Option<&str>,
+    args: &StdioArgs,
 ) -> anyhow::Result<SpicepodDefinition> {
+    let scheduler_state_location = args.scheduler_state_location.as_deref();
+    let aws_region = args.aws_region.as_deref();
+
     let mut spicepod = match setup_config.sink_type {
-        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key)),
+        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key, args)),
         _ => generate_hive_spicepod(run_id, setup_config, datasets, aws_region),
     }?;
 

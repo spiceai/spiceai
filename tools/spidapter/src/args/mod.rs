@@ -111,4 +111,12 @@ pub struct StdioArgs {
     /// Falls back to `AWS_DEFAULT_REGION` environment variable if not set.
     #[arg(long, env = "AWS_REGION")]
     pub aws_region: Option<String>,
+
+    /// Cayenne Catalog data directory
+    #[arg(long, env = "SPIDAPTER_CAYENNE_DATA_DIR")]
+    pub cayenne_data_dir: Option<String>,
+
+    /// Cayenne Catalog metadata directory
+    #[arg(long, env = "SPIDAPTER_CAYENNE_METADATA_DIR")]
+    pub cayenne_metadata_dir: Option<String>,
 }
