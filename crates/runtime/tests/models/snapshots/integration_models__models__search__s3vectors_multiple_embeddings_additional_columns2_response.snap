@@ -8,24 +8,6 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.03,
       "data": {
-        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
-        ],
-        "question": [
-          "How many multiples of 4 are there between 1 and 30? List them and count the total."
-        ]
-      },
-      "primary_key": {
-        "id": 468
-      }
-    },
-    {
-      "_score": 0.03,
-      "data": {
         "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "dataset": "qs",
@@ -44,24 +26,6 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.03,
       "data": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-        ],
-        "question": [
-          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 189
-      }
-    },
-    {
-      "_score": 0.03,
-      "data": {
         "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "dataset": "qs",
@@ -75,6 +39,39 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 948
+      }
+    },
+    {
+      "_score": 0.03,
+      "data": {
+        "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+        ],
+        "question": [
+          "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
+        ]
+      },
+      "primary_key": {
+        "id": 458
+      }
+    },
+    {
+      "_score": 0.01,
+      "data": {
+        "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "How many groups of 2 are in 14?"
+        ]
+      },
+      "primary_key": {
+        "id": 462
       }
     }
   ]
