@@ -25,14 +25,14 @@ use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -96,29 +96,55 @@ impl std::fmt::Debug for Adbc {
 impl Drop for Adbc {
     fn drop(&mut self) {
         if let Some(factory) = self.adbc_factory.take() {
-            // Offload the potentially-blocking FFI drop to a dedicated thread so it
-            // does not stall the Tokio runtime during shutdown.
-            if std::thread::Builder::new()
-                .name("adbc-cleanup".to_string())
-                .spawn(move || drop(factory))
-                .is_err()
-            {
-                tracing::warn!("Failed to spawn ADBC cleanup thread; dropping inline");
-                // Factory already moved into the failed spawn closure and is dropped there.
+            // Send to the dedicated cleanup thread so we don't stall the Tokio
+            // runtime. If the channel is disconnected (worker has exited), drop
+            // inline as a last resort.
+            if adbc_cleanup_sender().send(factory).is_err() {
+                tracing::warn!("ADBC cleanup channel closed; dropping inline");
             }
         }
     }
 }
 
+/// Returns a sender for offloading ADBC factory cleanup to a dedicated
+/// background thread. The worker thread is created once (on first use) and
+/// processes drop work sequentially, avoiding unbounded thread spawns.
+fn adbc_cleanup_sender(
+) -> &'static std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
+    static SENDER: OnceLock<
+        std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    > = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>();
+        if std::thread::Builder::new()
+            .name("adbc-cleanup".to_string())
+            .spawn(move || {
+                for factory in rx {
+                    drop(factory);
+                }
+            })
+            .is_err()
+        {
+            tracing::warn!("Failed to spawn ADBC cleanup thread; cleanup will happen inline.");
+        }
+        tx
+    })
+}
+
+type ConnectorCache =
+    parking_lot::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>>>;
+
 pub struct AdbcFactory {
-    /// Cache of initialized ADBC connectors keyed by a deterministic representation
-    /// of their configuration. Datasets with identical ADBC config share a single
-    /// connector instance and connection pool.
+    /// Cache of in-flight or completed ADBC connector initializations keyed by
+    /// a deterministic representation of their configuration. Datasets with
+    /// identical ADBC config share a single connector instance and connection pool.
     ///
-    /// Uses `Weak` references so connectors are released when all datasets using
-    /// them are dropped, preventing the cache from keeping connections alive
-    /// indefinitely.
-    cache: Arc<parking_lot::Mutex<HashMap<String, Weak<dyn DataConnector>>>>,
+    /// Each entry is an `Arc<tokio::sync::OnceCell<...>>` so only one initialization
+    /// runs per key — concurrent callers await the same future instead of racing.
+    /// The `Weak` inside prevents the cache from keeping connections alive
+    /// indefinitely: once all strong references are dropped the connector is released.
+    cache: ConnectorCache,
 }
 
 impl std::fmt::Debug for AdbcFactory {
@@ -131,7 +157,7 @@ impl AdbcFactory {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            cache: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -174,6 +200,192 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("1"),
 ];
 
+impl AdbcFactory {
+    /// Performs the actual ADBC driver initialization.
+    async fn init_connector(
+        params: ConnectorParams,
+    ) -> super::NewDataConnectorResult {
+        let driver_name = params
+            .parameters
+            .get("driver")
+            .expose()
+            .ok()
+            .context(MissingAdbcDriverSnafu)
+            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: params.component.clone(),
+                source: Box::new(e),
+            })?;
+
+        let driver_name_owned = driver_name.to_string();
+        let driver_path = params.parameters.get("driver_path").expose().ok();
+        let driver_location = driver_path.unwrap_or(driver_name).to_string();
+
+        let uri = params
+            .parameters
+            .get("uri")
+            .expose()
+            .ok()
+            .context(MissingAdbcUriSnafu)
+            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: params.component.clone(),
+                source: Box::new(e),
+            })?;
+
+        let uri_str = uri.to_string();
+
+        let username = params.parameters.get("username").expose().ok();
+        let password = params.parameters.get("password").expose().ok();
+        let driver_options = params.parameters.get("driver_options").expose().ok();
+        let db_options = build_db_options(&uri_str, username, password, driver_options);
+
+        let catalog = params
+            .parameters
+            .get("catalog")
+            .expose()
+            .ok()
+            .map(String::from);
+        let schema = params
+            .parameters
+            .get("schema")
+            .expose()
+            .ok()
+            .map(String::from);
+
+        let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
+
+        let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
+            match params.parameters.get(name).expose().ok() {
+                Some(v) => {
+                    let parsed = v.parse::<u32>().map_err(|_| Error::InvalidPoolParameter {
+                        name: name.to_string(),
+                        value: v.to_string(),
+                    })?;
+                    if parsed == 0 {
+                        return Err(Error::InvalidPoolParameter {
+                            name: name.to_string(),
+                            value: v.to_string(),
+                        });
+                    }
+                    Ok(Some(parsed))
+                }
+                None => Ok(None),
+            }
+        };
+
+        let pool_size = parse_pool_param("connection_pool_size").map_err(|e| {
+            DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "adbc".to_string(),
+                connector_component: params.component.clone(),
+                source: Box::new(e),
+            }
+        })?;
+        let pool_min_idle = parse_pool_param("connection_pool_min_idle").map_err(|e| {
+            DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "adbc".to_string(),
+                connector_component: params.component.clone(),
+                source: Box::new(e),
+            }
+        })?;
+
+        let component = params.component.clone();
+
+        if uri_str == ":memory:" || uri_str.contains("mode=memory") {
+            let err: Box<dyn std::error::Error + Send + Sync> =
+                Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: component,
+                    message: "In-memory database URIs (e.g., ':memory:') are not supported because each pooled connection creates an isolated database, leading to data inconsistency".to_string(),
+                });
+            return Err(err);
+        }
+
+        // Driver loading, database creation, and pool creation are all
+        // synchronous FFI/IO operations — offload to a blocking thread.
+        let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
+            let mut driver = ManagedDriver::load_from_name(
+                &driver_location,
+                None,
+                AdbcVersion::V110,
+                LOAD_FLAG_DEFAULT,
+                None,
+            )
+            .context(UnableToLoadDriverSnafu {
+                driver_location: driver_location.clone(),
+            })?;
+
+            let db = driver.new_database_with_opts(db_options).context(
+                UnableToCreateDatabaseSnafu {
+                    driver_location: driver_location.clone(),
+                    uri: uri_str.clone(),
+                },
+            )?;
+
+            let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
+                .with_max_size(pool_size)
+                .with_min_idle(pool_min_idle);
+
+            if let Some(conn_opts) = conn_options {
+                pool_builder = pool_builder.with_conn_options(conn_opts);
+            }
+
+            let pool = pool_builder
+                .build()
+                .context(UnableToCreateConnectionPoolSnafu {
+                    driver_location,
+                    uri: uri_str,
+                })?;
+
+            Ok(Arc::new(pool))
+        });
+        let abort_handle = init_handle.abort_handle();
+
+        let pool = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            init_handle,
+        )
+        .await
+        .map_err(|_elapsed| {
+            abort_handle.abort();
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "adbc".to_string(),
+                connector_component: component.clone(),
+                source: "ADBC driver initialization timed out after 120 seconds".into(),
+            }
+        })?
+        .map_err(|e| DataConnectorError::UnableToConnectInternal {
+            dataconnector: "adbc".to_string(),
+            connector_component: component.clone(),
+            source: Box::new(e),
+        })?
+        .map_err(|e| {
+            let error_string = e.to_string();
+            if is_auth_or_permission_error(&error_string) {
+                let hint = auth_permission_hint(&driver_name_owned);
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: format!("adbc ({driver_name_owned})"),
+                    connector_component: component,
+                    source: format!("{error_string}. {hint}").into(),
+                }
+            } else {
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: component,
+                    source: Box::new(e),
+                }
+            }
+        })?;
+
+        let adbc_factory = AdbcTableFactory::new(pool);
+
+        Ok(Arc::new(Adbc {
+            adbc_factory: Some(adbc_factory),
+            driver_name: driver_name_owned,
+        }) as Arc<dyn DataConnector>)
+    }
+}
+
 impl DataConnectorFactory for AdbcFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -185,213 +397,29 @@ impl DataConnectorFactory for AdbcFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let cache_key = compute_adbc_cache_key(&params);
 
-        // Check for a cached connector that is still alive.
-        let cached = {
-            let cache = self.cache.lock();
-            cache.get(&cache_key).and_then(Weak::upgrade)
+        // Get or insert a OnceCell for this key. This ensures only one
+        // initialization runs per key — concurrent callers share the cell.
+        let cell = {
+            let mut cache = self.cache.lock();
+            // Evict entries whose connector has been dropped.
+            cache.retain(|_, cell| cell.get().is_some());
+            Arc::clone(
+                cache
+                    .entry(cache_key)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
         };
-        if let Some(connector) = cached {
-            return Box::pin(async move { Ok(connector) });
-        }
-
-        let cache = Arc::clone(&self.cache);
 
         Box::pin(async move {
-            let driver_name = params
-                .parameters
-                .get("driver")
-                .expose()
-                .ok()
-                .context(MissingAdbcDriverSnafu)
-                .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Box::new(e),
-                })?;
+            // get_or_try_init ensures only one initialization runs at a time
+            // per key — concurrent callers await the same future.
+            let result = cell
+                .get_or_try_init(|| Self::init_connector(params))
+                .await;
 
-            let driver_name_owned = driver_name.to_string();
-            let driver_path = params.parameters.get("driver_path").expose().ok();
-            let driver_location = driver_path.unwrap_or(driver_name).to_string();
-
-            let uri = params
-                .parameters
-                .get("uri")
-                .expose()
-                .ok()
-                .context(MissingAdbcUriSnafu)
-                .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Box::new(e),
-                })?;
-
-            let uri_str = uri.to_string();
-
-            let username = params.parameters.get("username").expose().ok();
-            let password = params.parameters.get("password").expose().ok();
-            let driver_options = params.parameters.get("driver_options").expose().ok();
-            let db_options = build_db_options(&uri_str, username, password, driver_options);
-
-            let catalog = params
-                .parameters
-                .get("catalog")
-                .expose()
-                .ok()
-                .map(String::from);
-            let schema = params
-                .parameters
-                .get("schema")
-                .expose()
-                .ok()
-                .map(String::from);
-
-            let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
-
-            let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
-                match params.parameters.get(name).expose().ok() {
-                    Some(v) => {
-                        let parsed = v.parse::<u32>().map_err(|_| Error::InvalidPoolParameter {
-                            name: name.to_string(),
-                            value: v.to_string(),
-                        })?;
-                        if parsed == 0 {
-                            return Err(Error::InvalidPoolParameter {
-                                name: name.to_string(),
-                                value: v.to_string(),
-                            });
-                        }
-                        Ok(Some(parsed))
-                    }
-                    None => Ok(None),
-                }
-            };
-
-            let pool_size = parse_pool_param("connection_pool_size").map_err(|e| {
-                DataConnectorError::InvalidConfigurationSourceOnly {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Box::new(e),
-                }
-            })?;
-            let pool_min_idle = parse_pool_param("connection_pool_min_idle").map_err(|e| {
-                DataConnectorError::InvalidConfigurationSourceOnly {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Box::new(e),
-                }
-            })?;
-
-            let component = params.component.clone();
-
-            if uri_str == ":memory:" || uri_str.contains("mode=memory") {
-                let err: Box<dyn std::error::Error + Send + Sync> =
-                    Box::new(DataConnectorError::InvalidConfigurationNoSource {
-                        dataconnector: "adbc".to_string(),
-                        connector_component: component,
-                        message: "In-memory database URIs (e.g., ':memory:') are not supported because each pooled connection creates an isolated database, leading to data inconsistency".to_string(),
-                    });
-                return Err(err);
-            }
-
-            // Driver loading, database creation, and pool creation are all
-            // synchronous FFI/IO operations — offload to a blocking thread.
-            let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
-                let mut driver = ManagedDriver::load_from_name(
-                    &driver_location,
-                    None,
-                    AdbcVersion::V110,
-                    LOAD_FLAG_DEFAULT,
-                    None,
-                )
-                .context(UnableToLoadDriverSnafu {
-                    driver_location: driver_location.clone(),
-                })?;
-
-                let db = driver.new_database_with_opts(db_options).context(
-                    UnableToCreateDatabaseSnafu {
-                        driver_location: driver_location.clone(),
-                        uri: uri_str.clone(),
-                    },
-                )?;
-
-                let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
-                    .with_max_size(pool_size)
-                    .with_min_idle(pool_min_idle);
-
-                if let Some(conn_opts) = conn_options {
-                    pool_builder = pool_builder.with_conn_options(conn_opts);
-                }
-
-                let pool = pool_builder
-                    .build()
-                    .context(UnableToCreateConnectionPoolSnafu {
-                        driver_location,
-                        uri: uri_str,
-                    })?;
-
-                Ok(Arc::new(pool))
-            });
-            let abort_handle = init_handle.abort_handle();
-
-            let pool = tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                init_handle,
-            )
-            .await
-            .map_err(|_elapsed| {
-                abort_handle.abort();
-                DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: component.clone(),
-                    source: "ADBC driver initialization timed out after 120 seconds".into(),
-                }
-            })?
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component.clone(),
-                source: Box::new(e),
-            })?
-            .map_err(|e| {
-                let error_string = e.to_string();
-                if is_auth_or_permission_error(&error_string) {
-                    let hint = if driver_name_owned == "bigquery" {
-                        "Verify your BigQuery credentials are valid, not expired, and have the required permissions. See: https://cloud.google.com/bigquery/docs/authentication"
-                    } else {
-                        "Verify the configured credentials are valid and have the required permissions."
-                    };
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("adbc ({driver_name_owned})"),
-                        connector_component: component,
-                        source: format!("{error_string}. {hint}").into(),
-                    }
-                } else {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "adbc".to_string(),
-                        connector_component: component,
-                        source: Box::new(e),
-                    }
-                }
-            })?;
-
-            let adbc_factory = AdbcTableFactory::new(pool);
-
-            let connector = Arc::new(Adbc {
-                adbc_factory: Some(adbc_factory),
-                driver_name: driver_name_owned,
-            }) as Arc<dyn DataConnector>;
-
-            // Store a Weak reference in the cache so the connector can be
-            // shared by future datasets with the same config, but released
-            // when all datasets using it are dropped.
-            {
-                let mut c = cache.lock();
-                c.insert(cache_key, Arc::downgrade(&connector));
-            }
-
-            Ok(connector)
+            result.map(Arc::clone)
         })
     }
-
     fn prefix(&self) -> &'static str {
         "adbc"
     }
@@ -400,6 +428,9 @@ impl DataConnectorFactory for AdbcFactory {
         PARAMETERS
     }
 }
+
+/// Cached set of secret parameter names — built once from the static PARAMETERS.
+static SECRET_PARAMS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
 
 /// Computes a deterministic cache key from the ADBC connection parameters.
 /// Datasets with identical ADBC configuration produce the same key and share
@@ -420,12 +451,13 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         "username",
     ];
 
-    // Build a set of secret parameter names for O(1) lookup.
-    let secret_params: std::collections::HashSet<&str> = PARAMETERS
-        .iter()
-        .filter(|p| p.secret)
-        .map(|p| p.name)
-        .collect();
+    let secret_params = SECRET_PARAMS.get_or_init(|| {
+        PARAMETERS
+            .iter()
+            .filter(|p| p.secret)
+            .map(|p| p.name)
+            .collect()
+    });
 
     let mut key = String::new();
     for k in &keys {
@@ -433,10 +465,10 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         key.push_str(k);
         key.push('\0');
         if secret_params.contains(k) {
-            // Hash secret values so plaintext credentials are not retained in memory.
-            let mut hasher = DefaultHasher::new();
-            v.hash(&mut hasher);
-            let _ = write!(key, "{:x}", hasher.finish());
+            // Use SHA-256 for secret values so plaintext credentials are not
+            // retained in memory and the digest is not reversible.
+            let digest = Sha256::digest(v.as_bytes());
+            let _ = write!(key, "{digest:x}");
         } else {
             key.push_str(v);
         }
@@ -537,6 +569,15 @@ fn is_auth_or_permission_error(error_message: &str) -> bool {
         || lower.contains("invalid credentials")
 }
 
+/// Returns a driver-specific hint for auth/permission errors.
+fn auth_permission_hint(driver_name: &str) -> &'static str {
+    if driver_name == "bigquery" {
+        "Verify your BigQuery credentials are valid, not expired, and have the required permissions. See: https://cloud.google.com/bigquery/docs/authentication"
+    } else {
+        "Verify the configured credentials are valid and have the required permissions."
+    }
+}
+
 /// Classify a provider error into a more specific [`DataConnectorError`] for
 /// `BigQuery` auth/permission failures, falling back to `fallback_variant`.
 fn classify_adbc_error(
@@ -551,11 +592,7 @@ fn classify_adbc_error(
 ) -> DataConnectorError {
     let error_string = error.to_string();
     if is_auth_or_permission_error(&error_string) {
-        let hint = if driver_name == "bigquery" {
-            "Verify your BigQuery credentials are valid, not expired, and have the required permissions. See: https://cloud.google.com/bigquery/docs/authentication"
-        } else {
-            "Verify the configured credentials are valid and have the required permissions."
-        };
+        let hint = auth_permission_hint(driver_name);
         DataConnectorError::UnableToConnectInternal {
             dataconnector: format!("adbc ({driver_name})"),
             connector_component: ConnectorComponent::from(dataset),

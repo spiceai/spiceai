@@ -92,13 +92,10 @@ impl TableProvider for UnavailableTableProvider {
         _filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        Err(DataFusionError::External(
-            format!(
-                "Data source unavailable for '{}': the connection to the federated source could not be established. The runtime may be shutting down or the source is unreachable.",
-                self.dataset_name
-            )
-            .into(),
-        ))
+        Err(DataFusionError::Execution(format!(
+            "Data source unavailable for '{}': the connection to the federated source could not be established. The runtime may be shutting down or the source is unreachable.",
+            self.dataset_name
+        )))
     }
 }
 
