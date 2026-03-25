@@ -408,7 +408,7 @@ pub(crate) async fn run_search_w_explain(
                         if ts.redact_tied_results {
                             // For SQL tests against live S3 data, only verify structure
                             let resp = resp?;
-                            let row_count = resp.as_array().map_or(0, |a| a.len());
+                            let row_count = resp.as_array().map_or(0, <[_]>::len);
                             insta::assert_snapshot!(
                                 test_name.clone(),
                                 format!("{{\"row_count\": {row_count}}}")
