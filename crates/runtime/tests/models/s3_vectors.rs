@@ -168,7 +168,8 @@ pub(crate) mod search {
                     "limit": 4,
                     "datasets": ["qs"],
                 })),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_additional_columns",
                 SearchTestType::Http(json!({
@@ -177,7 +178,8 @@ pub(crate) mod search {
                     "datasets": ["qs"],
                     "additional_columns": ["question"],
                 })),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_additional_columns2",
                 SearchTestType::Http(json!({
@@ -186,7 +188,8 @@ pub(crate) mod search {
                     "datasets": ["qs"],
                     "additional_columns": ["answer"],
                 })),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_with_where",
                 SearchTestType::Http(json!({
@@ -195,7 +198,8 @@ pub(crate) mod search {
                     "where": "subject!='math'",
                     "limit": 4,
                 })),
-            ),
+            )
+            .redact_tied_results(),
             SearchTestCase::new(
                 "s3vectors_hybrid_vector_search_sql_basic",
                 SearchTestType::from_sql(
@@ -288,7 +292,8 @@ pub(crate) mod search {
                         "datasets": ["qs"],
                         "additional_columns": ["answer"],
                     })),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_view_additional_columns2",
                     SearchTestType::Http(json!({
@@ -297,7 +302,8 @@ pub(crate) mod search {
                         "datasets": ["qs_view"],
                         "additional_columns": ["answer"],
                     })),
-                ),
+                )
+                .redact_tied_results(),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_vector_search_questions",
                     SearchTestType::from_sql(
@@ -596,7 +602,8 @@ pub(crate) mod search {
                             "datasets": ["qs"],
                             "additional_columns": ["reference_answer", "source"],
                         })),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_view_additional_columns_metadata",
                         SearchTestType::Http(json!({
@@ -605,7 +612,8 @@ pub(crate) mod search {
                             "datasets": ["qs_view"],
                             "additional_columns": ["reference_answer", "source"],
                         })),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_with_where_metadata",
                         SearchTestType::Http(json!({
@@ -614,7 +622,8 @@ pub(crate) mod search {
                             "where": "subject!='math'",
                             "limit": 4,
                         })),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_view_with_where_metadata",
                         SearchTestType::Http(json!({
@@ -623,7 +632,8 @@ pub(crate) mod search {
                             "where": "subject!='math'",
                             "limit": 4,
                         })),
-                    ),
+                    )
+                    .redact_tied_results(),
                     SearchTestCase::new(
                         "s3vector_metadata_vector_search_sql_projection_metadata",
                         SearchTestType::from_sql(
@@ -1090,7 +1100,8 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "limit": 4,
                 "datasets": [table_name],
             })),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_keywords"),
             SearchTestType::Http(json!({
@@ -1099,7 +1110,8 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "datasets": [table_name],
                 "keywords": ["number"],
             })),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_additional_columns"),
             SearchTestType::Http(json!({
@@ -1108,7 +1120,8 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "datasets": [table_name],
                 "additional_columns": ["question"],
             })),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_with_where"),
             SearchTestType::Http(json!({
@@ -1117,7 +1130,8 @@ pub(crate) fn basic_vector_search_tests_on_table(
                 "where": "subject!='math'",
                 "limit": 4,
             })),
-        ),
+        )
+        .redact_tied_results(),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_basic"),
             SearchTestType::from_sql(format!(

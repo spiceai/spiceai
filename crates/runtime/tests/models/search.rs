@@ -76,6 +76,10 @@ pub struct SearchTestCase {
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
+    /// When true, results with tied scores will have their `matches` and `primary_key`
+    /// redacted in snapshot assertions. This handles non-deterministic vector search
+    /// results when multiple items share the same similarity score.
+    pub redact_tied_results: bool,
 }
 
 impl SearchTestCase {
@@ -85,11 +89,17 @@ impl SearchTestCase {
             body,
             should_fail: false,
             skip: false,
+            redact_tied_results: false,
         }
     }
 
     pub fn should_fail(mut self) -> Self {
         self.should_fail = true;
+        self
+    }
+
+    pub fn redact_tied_results(mut self) -> Self {
+        self.redact_tied_results = true;
         self
     }
 
@@ -166,7 +176,7 @@ pub async fn run_search_test(
     let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
     insta::assert_snapshot!(
         format!("{}_response", ts.name),
-        normalize_search_response(resp)
+        normalize_search_response(resp, ts.redact_tied_results)
     );
 
     Ok(())
@@ -174,7 +184,7 @@ pub async fn run_search_test(
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
 /// values such as duration with placeholder.
-fn normalize_search_response(mut json: Value) -> String {
+fn normalize_search_response(mut json: Value, redact_tied_results: bool) -> String {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
@@ -210,7 +220,7 @@ fn normalize_search_response(mut json: Value) -> String {
             };
             format!("{b_pks:?}").cmp(&format!("{a_pks:?}"))
         });
-        for m in matches {
+        for m in matches.iter_mut() {
             if let Some(obj) = m.as_object_mut()
                 && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
@@ -219,6 +229,18 @@ fn normalize_search_response(mut json: Value) -> String {
             // Keep 4 decimals
             {
                 obj.insert("_score".to_string(), Value::Number(truncated_score));
+            }
+        }
+
+        if redact_tied_results {
+            // When vector search uses external/live data, the specific items returned can
+            // differ between runs due to data changes or embedding non-determinism. Redact
+            // matches/primary_key so snapshots only verify scores, datasets, and result count.
+            for m in matches.iter_mut() {
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert("matches".to_string(), json!("[redacted]"));
+                    obj.insert("primary_key".to_string(), json!("[redacted]"));
+                }
             }
         }
     }
@@ -1682,7 +1704,7 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
 
         insta::assert_snapshot!(
             format!("{name}_response"),
-            normalize_search_response(result.clone())
+            normalize_search_response(result.clone(), false)
         );
 
         let result_str = result

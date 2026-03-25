@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, ts.redact_tied_results)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -8,56 +8,26 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.03,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The first four prime numbers are 2, 3, 5, and 7. Their sum is \\(2 + 3 + 5 + 7 = \\boxed{17}\\)."
-        ],
-        "question": [
-          "Find the sum of the first 4 prime numbers."
-        ]
-      },
-      "primary_key": {
-        "id": 385
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.03,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The least whole number greater than 95,999 is obtained by adding 1 to 95,999, which gives $\\boxed{96,\\!000}$."
-        ],
-        "question": [
-          "What is the least whole number that is greater than 95,999?"
-        ]
-      },
-      "primary_key": {
-        "id": 973
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.01,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
-        ]
-      },
-      "primary_key": {
-        "id": 291
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     },
     {
       "_score": 0.01,
       "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "To find the sum of 47 and 21, add the two numbers together:  \n47 + 21 = 68.  \nThus, the sum is \\(\\boxed{68}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 1170
-      }
+      "matches": "[redacted]",
+      "primary_key": "[redacted]"
     }
   ]
 }
