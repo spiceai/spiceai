@@ -629,8 +629,7 @@ mod tests {
             union_count, 0,
             "Single partition should not produce Union, plan: {result}"
         );
-        let alias_count =
-            count_plan_nodes(&result, |p| matches!(p, LogicalPlan::SubqueryAlias(_)));
+        let alias_count = count_plan_nodes(&result, |p| matches!(p, LogicalPlan::SubqueryAlias(_)));
         assert_eq!(
             alias_count, 1,
             "Single partition should still be wrapped in SubqueryAlias, plan: {result}"
