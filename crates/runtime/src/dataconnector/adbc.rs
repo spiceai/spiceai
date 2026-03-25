@@ -99,8 +99,13 @@ impl Drop for Adbc {
             // Send to the dedicated cleanup thread so we don't stall the Tokio
             // runtime. If the channel is disconnected (worker has exited), drop
             // inline as a last resort.
-            if adbc_cleanup_sender().send(factory).is_err() {
-                tracing::warn!("ADBC cleanup channel closed; dropping inline");
+            match adbc_cleanup_sender().send(factory) {
+                Ok(()) => {}
+                Err(err) => {
+                    tracing::warn!("ADBC cleanup channel closed; dropping inline");
+                    // Explicitly drop the factory so the fallback is unambiguous.
+                    drop(err.0);
+                }
             }
         }
     }
@@ -143,8 +148,10 @@ pub struct AdbcFactory {
     /// Each entry is an `Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>` so only
     /// one initialization runs per key — concurrent callers await the same future
     /// instead of racing. Because the cache holds a strong `Arc` to the connector,
-    /// connectors and their pools are kept alive for the lifetime of the process
-    /// (or until the cache entry is explicitly cleared elsewhere).
+    /// connectors and their pools are kept alive for as long as this factory
+    /// instance is alive (typically the lifetime of the process). Cache entries
+    /// are not evicted automatically; each distinct ADBC config will remain
+    /// cached, trading higher memory usage for connector and pool reuse.
     cache: ConnectorCache,
 }
 
@@ -468,9 +475,10 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         let v = params.parameters.get(k).expose().ok().unwrap_or("");
         key.push_str(k);
         key.push('\0');
-        if secret_params.contains(k) {
-            // Use BLAKE3 for secret values so plaintext credentials are not
-            // retained in memory and the digest is not reversible.
+        if secret_params.contains(k) || *k == "driver_options" {
+            // Use BLAKE3 for secret values and driver_options (which can
+            // contain sensitive values like tokens) so plaintext credentials
+            // are not retained in memory and the digest is not reversible.
             let digest = blake3::hash(v.as_bytes());
             let _ = write!(key, "{digest}");
         } else {
