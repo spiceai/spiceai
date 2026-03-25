@@ -28,30 +28,6 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 361
       }
-    },
-    {
-      "_score": 0.01,
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "How many groups of 2 are in 14?"
-        ]
-      },
-      "primary_key": {
-        "id": 462
-      }
-    },
-    {
-      "_score": 0.01,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 1277
-      }
     }
   ]
 }

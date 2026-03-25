@@ -34,36 +34,6 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 948
       }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
-        ],
-        "question": [
-          "How many groups of 2 are in 14?"
-        ]
-      },
-      "primary_key": {
-        "id": 462
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
-        ],
-        "question": [
-          "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
-        ]
-      },
-      "primary_key": {
-        "id": 458
-      }
     }
   ]
 }

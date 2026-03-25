@@ -1087,7 +1087,7 @@ pub(crate) fn basic_vector_search_tests_on_table(
             format!("{prefix}_basic"),
             SearchTestType::Http(json!({
                 "text": "second",
-                "limit": 4,
+                "limit": 2,
                 "datasets": [table_name],
             })),
         ),

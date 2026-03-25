@@ -34,36 +34,6 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 449
       }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
-        ],
-        "question": [
-          "Find 100% of 732."
-        ]
-      },
-      "primary_key": {
-        "id": 291
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
-        ],
-        "question": [
-          "Evaluate the following expression: \\(2^{2}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 250
-      }
     }
   ]
 }
