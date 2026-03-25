@@ -235,6 +235,32 @@ impl DuckDBAccelerator {
     }
 }
 
+/// Remap user-facing DuckDB acceleration params (`duckdb_data_dir`, `duckdb_file`)
+/// to the keys expected by `DuckDBTableProviderFactory` (`data_directory`, `duckdb_open`).
+/// Returns `true` if `duckdb_data_dir` was explicitly set by the user.
+fn munge_duckdb_params(params: &mut HashMap<String, String>) -> bool {
+    let mut had_duckdb_data_dir = true;
+    let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
+        had_duckdb_data_dir = false;
+        spice_data_base_path()
+    });
+    params.insert("data_directory".to_string(), data_directory);
+
+    if let Some(duckdb_file) = params.remove("duckdb_file") {
+        if had_duckdb_data_dir {
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
+                );
+            });
+        }
+        params.insert("duckdb_open".to_string(), duckdb_file);
+    }
+
+    had_duckdb_data_dir
+}
+
 /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` acceleration for this acceleration source
 ///
 /// # Parameters
@@ -253,24 +279,7 @@ pub fn duckdb_file_path(
         })
     } else if let Some(acceleration) = source.acceleration().as_ref() {
         let mut params = acceleration.params.clone();
-        let mut using_duckdb_data_dir = true;
-        let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
-            using_duckdb_data_dir = false;
-            spice_data_base_path()
-        });
-        params.insert("data_directory".to_string(), data_directory);
-
-        if let Some(duckdb_file) = params.remove("duckdb_file") {
-            if using_duckdb_data_dir {
-                static WARN_ONCE: Once = Once::new();
-                WARN_ONCE.call_once(|| {
-                    tracing::warn!(
-                        "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
-                    );
-                });
-            }
-            params.insert("duckdb_open".to_string(), duckdb_file);
-        }
+        munge_duckdb_params(&mut params);
 
         duckdb_factory
             .duckdb_file_path(default_db_name, &mut params)
@@ -293,13 +302,7 @@ fn duckdb_file_path_from_params(
         .as_ref()
         .map(spicepod::param::Params::as_string_map)
         .unwrap_or_default();
-    let data_directory = params
-        .remove("duckdb_data_dir")
-        .unwrap_or_else(spice_data_base_path);
-    params.insert("data_directory".to_string(), data_directory);
-    if let Some(duckdb_file) = params.remove("duckdb_file") {
-        params.insert("duckdb_open".to_string(), duckdb_file);
-    }
+    munge_duckdb_params(&mut params);
     duckdb_factory
         .duckdb_file_path("accelerated_duckdb", &mut params)
         .ok()
