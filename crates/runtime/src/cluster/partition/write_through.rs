@@ -381,7 +381,7 @@ async fn route_batch_and_assign_unseen(
     {
         let total_partitioned: usize = entries.iter().map(|(_, _, b)| b.num_rows()).sum();
         if total_partitioned != unmatched.num_rows() {
-            tracing::warn!(
+            tracing::debug!(
                 table = %path,
                 unmatched_rows = unmatched.num_rows(),
                 partitioned_rows = total_partitioned,
@@ -473,7 +473,7 @@ async fn route_batch_and_assign_unseen(
                 executor_id: executor_id.clone(),
             })?;
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 executor_id,
                 rows = sub_batch.num_rows(),
                 table = %path,
