@@ -440,7 +440,7 @@ mod tests {
         prelude::SessionContext,
     };
 
-    /// A mock partition provider that creates `n` partitions for any table named "test_table".
+    /// A mock partition provider that creates `n` partitions for any table named `test_table`.
     #[derive(Debug)]
     struct MockPartitionProvider {
         num_partitions: usize,
@@ -456,7 +456,8 @@ mod tests {
             (0..self.num_partitions)
                 .map(|i| {
                     let provider: Arc<dyn TableProvider> = Arc::new(
-                        MemTable::try_new(Arc::clone(&self.schema), vec![vec![]]).unwrap(),
+                        MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])
+                            .expect("valid test setup"),
                     );
                     let mut pv = HashMap::new();
                     pv.insert("partition_id".to_string(), i.to_string());
@@ -478,11 +479,13 @@ mod tests {
         ]))
     }
 
+    #[expect(clippy::unused_async, reason = "called from async tests")]
     async fn setup_ctx(num_partitions: usize) -> (SessionContext, Arc<MockPartitionProvider>) {
         let schema = test_schema();
         let ctx = SessionContext::new();
-        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap();
-        ctx.register_table("test_table", Arc::new(table)).unwrap();
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("valid test setup");
+        ctx.register_table("test_table", Arc::new(table))
+            .expect("valid test setup");
 
         let provider = Arc::new(MockPartitionProvider {
             num_partitions,
@@ -503,16 +506,18 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // Should produce a SubqueryAlias wrapping a Union of 2 sub-scans
@@ -535,20 +540,22 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .sort(vec![datafusion::prelude::col("id").sort(true, false)])
-        .unwrap()
+        .expect("valid test setup")
         .limit(0, Some(5))
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // The outer Limit + Sort should still be present
@@ -581,20 +588,22 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .sort(vec![datafusion::prelude::col("id").sort(true, false)])
-        .unwrap()
+        .expect("valid test setup")
         .limit(10, Some(5))
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // Per-leg fetch should be skip + fetch = 10 + 5 = 15
@@ -615,18 +624,20 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .limit(0, Some(5))
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // The outer Limit should still be present
@@ -655,18 +666,20 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .sort(vec![datafusion::prelude::col("id").sort(true, false)])
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // Only 1 Sort node (the outer one), no pushdown
@@ -688,20 +701,22 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .sort(vec![datafusion::prelude::col("id").sort(true, false)])
-        .unwrap()
+        .expect("valid test setup")
         .limit(0, Some(5))
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // No Union for single partition
@@ -721,16 +736,18 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         assert!(
@@ -748,28 +765,31 @@ mod tests {
 
         // Register another table that won't be partitioned
         let schema = test_schema();
-        let other_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap();
+        let other_table =
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("valid test setup");
         ctx.register_table("other_table", Arc::new(other_table))
-            .unwrap();
+            .expect("valid test setup");
 
         let plan = LogicalPlanBuilder::scan(
             "other_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("other_table").await.unwrap(),
+                ctx.table_provider("other_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .sort(vec![datafusion::prelude::col("id").sort(true, false)])
-        .unwrap()
+        .expect("valid test setup")
         .limit(0, Some(5))
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
         let before = format_plan(&plan);
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let after = format_plan(&result);
 
         assert_eq!(before, after, "Non-partitioned table should be unchanged");
@@ -783,20 +803,22 @@ mod tests {
         let plan = LogicalPlanBuilder::scan(
             "test_table",
             Arc::new(DefaultTableSource::new(
-                ctx.table_provider("test_table").await.unwrap(),
+                ctx.table_provider("test_table")
+                    .await
+                    .expect("valid test setup"),
             )),
             None,
         )
-        .unwrap()
+        .expect("valid test setup")
         .sort(vec![datafusion::prelude::col("id").sort(true, false)])
-        .unwrap()
+        .expect("valid test setup")
         .limit(0, Some(10))
-        .unwrap()
+        .expect("valid test setup")
         .build()
-        .unwrap();
+        .expect("valid test setup");
 
         let config = ConfigOptions::default();
-        let result = rule.analyze(plan, &config).unwrap();
+        let result = rule.analyze(plan, &config).expect("valid test setup");
         let formatted = format_plan(&result);
 
         // With 3 partitions, LogicalPlanBuilder::union() creates nested unions:

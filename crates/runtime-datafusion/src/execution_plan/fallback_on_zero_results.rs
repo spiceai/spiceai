@@ -485,7 +485,7 @@ mod tests {
 
         /// Create a fallback table provider with multiple partitions.
         /// This is key: with the fix, the physical optimizer should process
-        /// the multi-partition plan, and then CoalescePartitionsExec should
+        /// the multi-partition plan, and then `CoalescePartitionsExec` should
         /// merge them back to a single output stream.
         fn multi_partition_table_provider() -> Arc<dyn TableProvider> {
             Arc::new(
@@ -517,7 +517,7 @@ mod tests {
                 .await
                 .expect("should be able to collect results");
 
-            let total_rows: usize = collected_result.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = collected_result.iter().map(RecordBatch::num_rows).sum();
             // 3 partitions x 3 rows = 9 total rows
             assert_eq!(total_rows, 9);
         }
