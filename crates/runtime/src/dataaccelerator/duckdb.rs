@@ -235,7 +235,7 @@ impl DuckDBAccelerator {
     }
 }
 
-/// Remap user-facing DuckDB acceleration params (`duckdb_data_dir`, `duckdb_file`)
+/// Remap user-facing `DuckDB` acceleration params (`duckdb_data_dir`, `duckdb_file`)
 /// to the keys expected by `DuckDBTableProviderFactory` (`data_directory`, `duckdb_open`).
 /// Returns `true` if `duckdb_data_dir` was explicitly set by the user.
 fn munge_duckdb_params(params: &mut HashMap<String, String>) -> bool {
