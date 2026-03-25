@@ -4,23 +4,23 @@ expression: resp?
 ---
 [
   {
-    "id": 1015,
-    "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-    "_score": 0.306
+    "id": 1268,
+    "answer": "The gall bladder is stimulated to empty by the release of cholecystokinin (CCK) from the duodenum in response to food entry.",
+    "_score": 0.28
   },
   {
-    "id": 821,
-    "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*).",
-    "_score": 0.229
+    "id": 972,
+    "answer": "Buckthorn may cause hypokalemia and enhance the effects of cardiac glycosides; concurrent use should be avoided.",
+    "_score": 0.208
   },
   {
-    "id": 432,
-    "answer": "Elands access high foliage by breaking off branches with their horns.",
-    "_score": 0.222
+    "id": 444,
+    "answer": "Rubella is transmitted via respiratory droplets or direct contact leading to congenital infection (control method: Im).",
+    "_score": 0.18
   },
   {
-    "id": 8,
-    "answer": "The prefix \"kilo-\" (k) represents a multiplier of 1000. Therefore, 2.2 kV is equal to \\(2.2 \\times 1000 = \\boxed{2200}\\) V.",
-    "_score": 0.214
+    "id": 530,
+    "answer": "$\\boxed{C}$ (result in a further fall in BP since the arterial chemoreflex is sympathoexcitatory)",
+    "_score": 0.175
   }
 ]

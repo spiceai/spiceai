@@ -10,14 +10,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The first four prime numbers are 2, 3, 5, and 7. Their sum is \\(2 + 3 + 5 + 7 = \\boxed{17}\\)."
+          "The total number of students is the sum of female and male students:  \n\\[ t = 22 + 18 = \\boxed{40} \\]"
         ],
         "question": [
-          "Find the sum of the first 4 prime numbers."
+          "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
         ]
       },
       "primary_key": {
-        "id": 385
+        "id": 787
       }
     },
     {
@@ -25,14 +25,26 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The least whole number greater than 95,999 is obtained by adding 1 to 95,999, which gives $\\boxed{96,\\!000}$."
+          "To find the missing number, subtract 9 from 16:  \n$16 - 9 = 7$  \nThus, the correct number is $\\boxed{7}$."
         ],
         "question": [
-          "What is the least whole number that is greater than 95,999?"
+          "Replace the $\\square$ with the whole number that will make the subtraction true:  \n$16 - \\square = 9$"
         ]
       },
       "primary_key": {
-        "id": 973
+        "id": 621
+      }
+    },
+    {
+      "_score": 0.01,
+      "dataset": "qs_view",
+      "matches": {
+        "question": [
+          "Is 87,762 divisible by 10? (Recall that a number is divisible by 10 if its last digit is 0.)"
+        ]
+      },
+      "primary_key": {
+        "id": 558
       }
     },
     {
@@ -40,23 +52,11 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+          "The product of two negative numbers is positive. Therefore:\n$$\n(-1)(-17) = 1 \\times 17 = \\boxed{17}\n$$"
         ]
       },
       "primary_key": {
-        "id": 291
-      }
-    },
-    {
-      "_score": 0.01,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "To find the sum of 47 and 21, add the two numbers together:  \n47 + 21 = 68.  \nThus, the sum is \\(\\boxed{68}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 1170
+        "id": 656
       }
     }
   ]

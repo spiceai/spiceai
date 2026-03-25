@@ -4,13 +4,6 @@ expression: resp?
 ---
 [
   {
-    "id": 349,
-    "answer": "The missing factor is \\(\\boxed{2}\\).  \n\n(Explanation: Since \\( 21 \\times 2 = 42 \\), the missing factor is 2.)",
-    "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\).",
-    "subject": "math",
-    "_score": 0.785
-  },
-  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
@@ -25,10 +18,17 @@ expression: resp?
     "_score": 0.556
   },
   {
-    "id": 830,
-    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
-    "question": "What is 14 percent of 232?",
+    "id": 484,
+    "answer": "The number 36 is $\\boxed{\\text{composite}}$ because it has divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18).",
+    "question": "Identify the given number as prime, composite, or neither: 36.",
     "subject": "math",
-    "_score": 0.524
+    "_score": 0.535
+  },
+  {
+    "id": 949,
+    "answer": "The fifth term is \\( 2 \\times 2^{4} = 32 \\).  \nThe nth term is \\( 2 \\times 2^{n-1} = \\boxed{2^n} \\).",
+    "question": "What is the fifth term and the nth term of the GP \\( 2, 4, 8, \\ldots \\)?",
+    "subject": "math",
+    "_score": 0.515
   }
 ]

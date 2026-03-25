@@ -40,6 +40,21 @@ expression: normalize_search_response(resp)
       "dataset": "qs",
       "matches": {
         "answer": [
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+        ],
+        "question": [
+          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+        ]
+      },
+      "primary_key": {
+        "id": 449
+      }
+    },
+    {
+      "_score": 0.03,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
           "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
         ],
         "question": [
@@ -48,21 +63,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1193
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$"
-        ],
-        "question": [
-          "Is 5 years of follow-up sufficient for a patient treated for thymomas?"
-        ]
-      },
-      "primary_key": {
-        "id": 551
       }
     }
   ]

@@ -25,14 +25,14 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The smallest number in the book is typically $\\boxed{1}$, as counting books usually start from this number."
+          "The number 36 is $\\boxed{\\text{composite}}$ because it has divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)."
         ],
         "question": [
-          "What is the smallest number in the book \"Things You Can Count in This Counting Book\"?"
+          "Identify the given number as prime, composite, or neither: 36."
         ]
       },
       "primary_key": {
-        "id": 1152
+        "id": 484
       }
     },
     {
@@ -40,23 +40,23 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "Yes, because the last two digits (48) form a number that is divisible by 4 (48 ÷ 4 = 12). $\\boxed{\\text{Yes}}$"
+          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
         ]
       },
       "primary_key": {
-        "id": 556
+        "id": 458
       }
     },
     {
       "_score": 0.01,
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "If \\(a + b + c + \\ldots + z = 100\\), where \\(a, b, c, \\ldots, z\\) are 50 equal numbers, what is the value of each number?"
+        "answer": [
+          "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
         ]
       },
       "primary_key": {
-        "id": 507
+        "id": 42
       }
     }
   ]

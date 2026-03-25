@@ -4,9 +4,9 @@ expression: resp?
 ---
 [
   {
-    "id": 830,
-    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
-    "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.476
+    "id": 464,
+    "answer": "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25.",
+    "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.519
   },
   {
     "id": 449,
@@ -14,13 +14,13 @@ expression: resp?
     "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.446
   },
   {
-    "id": 291,
-    "answer": "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$.",
-    "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.438
+    "id": 368,
+    "answer": "The principal square root of 361 is 19 because $19 \\times 19 = 361$. Thus, $\\boxed{19}$.",
+    "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.44
   },
   {
-    "id": 250,
-    "answer": "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]",
-    "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.424
+    "id": 186,
+    "answer": "Substitute \\( y = 2 \\) into the expression:  \n\\( 10 - (2)^2 = 10 - 4 = \\boxed{6} \\).",
+    "trunc(vector_search(qs_view, Utf8(\"second\"), answer)._score,Int64(3))": 0.435
   }
 ]

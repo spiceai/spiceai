@@ -20,19 +20,19 @@ expression: resp?
     "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
-    "id": 708,
-    "answer_offset": [
-      61,
-      85
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.539
-  },
-  {
-    "id": 189,
+    "id": 468,
     "answer_offset": [
       0,
-      51
+      61
     ],
     "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.538
+  },
+  {
+    "id": 484,
+    "answer_offset": [
+      59,
+      122
+    ],
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.535
   }
 ]

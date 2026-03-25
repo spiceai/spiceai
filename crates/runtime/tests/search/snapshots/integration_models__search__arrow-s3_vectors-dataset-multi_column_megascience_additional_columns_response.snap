@@ -44,31 +44,31 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.01,
       "data": {
-        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
         ]
       },
       "primary_key": {
-        "id": 189
+        "id": 468
       }
     },
     {
       "_score": 0.01,
       "data": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": [
-          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+        "question": [
+          "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
         ]
       },
       "primary_key": {
-        "id": 462
+        "id": 708
       }
     }
   ]

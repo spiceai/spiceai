@@ -10,14 +10,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\)."
+          "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25."
         ],
         "question": [
-          "What is 14 percent of 232?"
+          "How many groups of 5 are in 25?"
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 464
       }
     },
     {
@@ -40,14 +40,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+          "The principal square root of 361 is 19 because $19 \\times 19 = 361$. Thus, $\\boxed{19}$."
         ],
         "question": [
-          "Find 100% of 732."
+          "Find the principal square root of 361."
         ]
       },
       "primary_key": {
-        "id": 291
+        "id": 368
       }
     },
     {
@@ -55,14 +55,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
+          "Substitute \\( y = 2 \\) into the expression:  \n\\( 10 - (2)^2 = 10 - 4 = \\boxed{6} \\)."
         ],
         "question": [
-          "Evaluate the following expression: \\(2^{2}\\)."
+          "Evaluate the expression \\( 10 - y^2 \\), where \\( y = 2 \\)."
         ]
       },
       "primary_key": {
-        "id": 250
+        "id": 186
       }
     }
   ]

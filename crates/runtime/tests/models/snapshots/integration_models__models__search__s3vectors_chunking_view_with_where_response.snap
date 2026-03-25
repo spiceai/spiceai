@@ -6,51 +6,51 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.29,
+      "_score": 0.34,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "stemic vascular resistance (SVR) by causing vasodilation."
+          "The presence of fibrinolysin in the reagents can partially o"
         ]
       },
       "primary_key": {
-        "id": 1035
+        "id": 938
       }
     },
     {
-      "_score": 0.21,
+      "_score": 0.27,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "A \"sequence\" implies a cascade of events traced to a singl"
+          "More than 10 years of follow-up is required, as late recurrence"
         ]
       },
       "primary_key": {
-        "id": 922
+        "id": 449
       }
     },
     {
-      "_score": 0.16,
+      "_score": 0.22,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          " been established and should, therefore, be avoided"
+          "Pedunculagin and alchemillin have astringent and wound-healin"
         ]
       },
       "primary_key": {
-        "id": 1143
+        "id": 1015
       }
     },
     {
-      "_score": 0.16,
+      "_score": 0.22,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The nurse would suspect **genital warts**, as HPV is th"
+          "Elands access high foliage by breaking off branches with thei"
         ]
       },
       "primary_key": {
-        "id": 1274
+        "id": 432
       }
     }
   ]

@@ -6,39 +6,27 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.22,
+      "_score": 0.27,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          " various forms of *tinea*, such as athlete's foot (*tinea pedis*"
+          " entry"
         ]
       },
       "primary_key": {
-        "id": 821
+        "id": 1268
       }
     },
     {
-      "_score": 0.22,
+      "_score": 0.2,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Elands access high foliage by breaking off branches with thei"
+          " cardiac glycosides; concurrent use should be avoided"
         ]
       },
       "primary_key": {
-        "id": 432
-      }
-    },
-    {
-      "_score": 0.21,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " V"
-        ]
-      },
-      "primary_key": {
-        "id": 8
+        "id": 972
       }
     },
     {
@@ -46,11 +34,23 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The body profile of Menidae is very deep and resembles a fla"
+          " contact leading to congenital infection (control method: Im)"
         ]
       },
       "primary_key": {
-        "id": 1193
+        "id": 444
+      }
+    },
+    {
+      "_score": 0.17,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " chemoreflex is sympathoexcitatory"
+        ]
+      },
+      "primary_key": {
+        "id": 530
       }
     }
   ]
