@@ -33,5 +33,6 @@ url.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+insta.workspace = true
 object_store.workspace = true
 tokio.workspace = true
