@@ -70,7 +70,7 @@ use tonic::{
 };
 
 use crate::cluster::{
-    SchedulerPeers, executor_registry::ExecutorRegistry, partition::allocation_initial_partitions,
+    SchedulerPeers, executor_registry::ExecutorRegistry, partition::allocate_initial_partitions,
 };
 use crate::datafusion::{
     DataFusion, SPICE_RUNTIME_SCHEMA,
@@ -606,13 +606,11 @@ impl ClusterService for ClusterServiceImpl {
 
         // Forward `CREATE TABLE IF NOT EXISTS` DDL to executor.
         #[cfg(not(windows))]
-        for table_ref in discover_cayenne_tables(&self.datafusion) {
+        for table_ref in discover_cayenne_tables(&self.datafusion).await {
             if let Some(table) = self.datafusion.get_table(&table_ref).await {
-                let ddl_sql = create_table_if_not_exists(&table_ref, &table)
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
-                    })?;
+                let ddl_sql = create_table_if_not_exists(&table_ref, &table).map_err(|e| {
+                    Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
+                })?;
                 forward_sql_to_executor(client.clone(), &ddl_sql)
                     .await
                     .map_err(|e| {
@@ -745,36 +743,72 @@ async fn notify_scheduler_executor_shutdown(
 }
 /// Discovers all Cayenne table references registered in the `DataFusion` catalog.
 ///
-/// Iterates through all catalogs, identifies Cayenne-backed catalogs, and returns
-/// fully qualified [`TableReference`]s for each table found.
+/// Iterates through all catalogs, identifies Cayenne-backed catalogs, and queries
+/// the underlying metadata catalog to discover all tables — including those not yet
+/// loaded into the in-memory schema cache.
 #[cfg(not(windows))]
-fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
-    datafusion
-        .ctx
-        .catalog_names()
-        .iter()
-        // Get Cayenne Catalogs
-        .filter_map(|c| {
-            let catalog = datafusion.ctx.catalog(&c)?;
-            crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref())
-                .then_some((c, catalog))
-        })
-        // Get all schemas in catalogs
-        .flat_map(|(c_name, c)| {
-            c.schema_names()
-                .iter()
-                .map(|s| (c.schema(s), c_name.clone(), s.clone()))
-                .collect::<Vec<_>>()
-        })
-        .filter_map(|(s, c_name, s_name)| Some((s?, c_name, s_name)))
-        // Get full table references
-        .flat_map(|(s, c_name, s_name)| {
-            s.table_names()
-                .iter()
-                .map(|t| TableReference::full(c_name.as_str(), s_name.as_str(), t.as_str()))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>()
+async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+
+    let mut tables = Vec::new();
+
+    for c_name in &datafusion.ctx.catalog_names() {
+        let Some(catalog) = datafusion.ctx.catalog(c_name) else {
+            continue;
+        };
+        if !crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()) {
+            continue;
+        }
+
+        for s_name in &catalog.schema_names() {
+            let Some(schema) = catalog.schema(s_name) else {
+                continue;
+            };
+
+            // Attempt to downcast to CayenneSchemaProvider to query the metadata catalog
+            // for all table names, including those not yet loaded into the in-memory cache.
+            if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
+                let ns_prefix = format!("{}/", cayenne_schema.namespace());
+                match cayenne_schema.metadata_catalog().list_table_names().await {
+                    Ok(full_names) => {
+                        for full_name in &full_names {
+                            let short_name =
+                                full_name.strip_prefix(&ns_prefix).unwrap_or(full_name);
+                            tables.push(TableReference::full(
+                                c_name.as_str(),
+                                s_name.as_str(),
+                                short_name,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to list Cayenne tables for schema {c_name}.{s_name}: {e}"
+                        );
+                        // Fall back to in-memory cache
+                        for t in &schema.table_names() {
+                            tables.push(TableReference::full(
+                                c_name.as_str(),
+                                s_name.as_str(),
+                                t.as_str(),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                // Not a CayenneSchemaProvider; use the default table_names()
+                for t in &schema.table_names() {
+                    tables.push(TableReference::full(
+                        c_name.as_str(),
+                        s_name.as_str(),
+                        t.as_str(),
+                    ));
+                }
+            }
+        }
+    }
+
+    tables
 }
 
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.

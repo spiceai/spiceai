@@ -299,35 +299,6 @@ pub fn ddl_result_schema() -> SchemaRef {
     )]))
 }
 
-pub async fn forward_ddl_to_executor(
-    sql: String,
-    mut client: FlightSqlClient,
-) -> Result<(), String> {
-    use futures::StreamExt;
-
-    let result: Result<(), String> = async {
-        let flight_info = client
-            .execute(sql.clone(), None)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        for endpoint in flight_info.endpoint {
-            let Some(ticket) = endpoint.ticket else {
-                continue;
-            };
-
-            let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
-            while let Some(batch) = stream.next().await {
-                batch.map_err(|e| e.to_string())?;
-            }
-        }
-
-        Ok(())
-    }
-    .await;
-    result
-}
-
 /// Physical plan for creating a Cayenne table.
 ///
 /// Executes the following steps:
@@ -748,7 +719,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             // Forward the CREATE TABLE DDL to executor nodes
             if let Some(ref registry) = executor_registry {
-                let ddl_sql = create_table_if_not_exists(&table_ref, &wrapped_provider).await?;
+                let ddl_sql = create_table_if_not_exists(&table_ref, &wrapped_provider)?;
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
             }
 

@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, TableProvider};
 use datafusion::common::Constraint;
+use datafusion::common::utils::quote_identifier;
 use datafusion::error::DataFusionError;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 
@@ -72,8 +73,10 @@ pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn Partiti
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)
 }
 
-/// Constructs a  `CREATE TABLE IF NOT EXISTS` DDL SQL query for the provided [`TableReference`].
-pub async fn create_table_if_not_exists(
+/// Constructs a `CREATE TABLE IF NOT EXISTS` DDL SQL query for the provided [`TableReference`].
+///
+/// Identifier quoting escapes embedded double-quotes to prevent SQL injection.
+pub fn create_table_if_not_exists(
     tbl: &TableReference,
     provider: &Arc<dyn TableProvider>,
 ) -> Result<String, DataFusionError> {
@@ -92,7 +95,10 @@ pub async fn create_table_if_not_exists(
         .map(|f| {
             let null_str = if f.is_nullable() { "" } else { " NOT NULL" };
             let sql_type = arrow_datatype_to_sql(f.data_type())?;
-            Ok::<String, DataFusionError>(format!("\"{}\" {sql_type}{null_str}", f.name()))
+            Ok::<String, DataFusionError>(format!(
+                "{} {sql_type}{null_str}",
+                quote_identifier(f.name())
+            ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut table_elements = columns_sql;
@@ -102,8 +108,10 @@ pub async fn create_table_if_not_exists(
         .and_then(|c| {
             c.iter().find_map(|cc| {
                 if let Constraint::PrimaryKey(v) = cc {
+                    let num_fields = table_schema.fields().len();
                     Some(
                         v.iter()
+                            .filter(|i| **i < num_fields)
                             .map(|i| table_schema.field(*i).name().clone())
                             .collect(),
                     )
@@ -117,14 +125,17 @@ pub async fn create_table_if_not_exists(
     if !primary_key.is_empty() {
         let pk_cols = primary_key
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|c| quote_identifier(c))
             .collect::<Vec<_>>()
             .join(", ");
         table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
     }
 
     Ok(format!(
-        "CREATE TABLE IF NOT EXISTS \"{catalog}\".\"{schema}\".\"{table}\" ({})",
+        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({})",
+        quote_identifier(&catalog),
+        quote_identifier(&schema),
+        quote_identifier(&table),
         table_elements.join(", ")
     ))
 }

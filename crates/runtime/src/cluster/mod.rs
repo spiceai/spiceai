@@ -1303,13 +1303,16 @@ pub async fn initialize_cluster_executor(
         // Wait for our own flight service to be operational.
         util::retry(
             FibonacciBackoffBuilder::new().max_retries(None).build(),
-            || async {
-                flight_client::can_connect(format!("http://{flight_addr}"))
-                    .await
-                    .map_err(|e| util::RetryError::Transient {
-                        err: e,
-                        retry_after: None,
+            || {
+                let addr = flight_addr.clone();
+                async move {
+                    flight_client::can_connect(addr).await.map_err(|e| {
+                        util::RetryError::Transient {
+                            err: e,
+                            retry_after: None,
+                        }
                     })
+                }
             },
         )
         .await

@@ -3809,7 +3809,11 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        Some(&self.constraints)
+        if self.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.constraints)
+        }
     }
 
     async fn scan(
