@@ -230,20 +230,21 @@ async fn test_app_crud_lifecycle() {
         "description should be updated"
     );
 
-    // --- Delete ---
     client
         .delete_app(app_id)
         .await
         .expect("delete_app should succeed");
 
     // --- Confirm deleted (expect 404) ---
-    let err = client
-        .get_app_by_id(app_id)
-        .await
-        .expect_err("get_app_by_id after delete should fail");
     assert!(
-        matches!(err, Error::NotFound { .. }),
-        "expected NotFound after deletion, got: {err:?}"
+        matches!(
+            client
+                .get_app_by_id(app_id)
+                .await
+                .expect_err("get_app_by_id after delete should fail"),
+            Error::NotFound { .. }
+        ),
+        "expected NotFound after deletion"
     );
 }
 
