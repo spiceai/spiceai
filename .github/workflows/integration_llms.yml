@@ -78,6 +78,12 @@ jobs:
 
               return matrix.filter(m => m.name === name);
             }
+
+            // On pull_request, only run tests that don't require secrets
+            if (context.eventName === 'pull_request') {
+              return matrix.filter(m => !m.needs_env);
+            }
+
             return matrix;
 
   build:
