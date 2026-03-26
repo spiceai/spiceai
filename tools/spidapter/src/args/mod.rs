@@ -127,4 +127,12 @@ pub struct StdioArgs {
     /// Cayenne Catalog metadata directory
     #[arg(long, env = "SPIDAPTER_CAYENNE_METADATA_DIR")]
     pub cayenne_metadata_dir: Option<String>,
+
+    /// Ephemeral storage limit for pods (e.g. `50Gi`).
+    #[arg(long, env = "SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB")]
+    pub ephemeral_storage_limit_gb: Option<String>,
+
+    /// Spice Cloud organization tag to apply to created app
+    #[arg(long, env = "SPIDAPTER_ORGANIZATION_TAG")]
+    pub organization_tag: Option<String>,
 }
