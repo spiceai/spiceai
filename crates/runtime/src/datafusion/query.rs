@@ -1522,39 +1522,6 @@ async fn create_update_physical_plan(
     df: &Arc<DataFusion>,
     session_state: &SessionState,
 ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    use crate::config::ClusterRole;
-
-    // In distributed mode (scheduler with executors), forward the UPDATE to
-    // executor nodes instead of executing locally. The data lives on executors.
-    if let Some(ref executor_registry) = df.executor_registry
-        && matches!(
-            df.cluster_config.effective_role(),
-            Some(ClusterRole::Scheduler)
-        )
-        && df
-            .get_table_partition_expr(&dml.table_name)
-            .await?
-            .is_some()
-    {
-        let filter_sql = super::cayenne_ddl::analyzer_rule::extract_filter_sql(&dml.input)?;
-        let assignments_sql = super::cayenne_ddl::analyzer_rule::extract_update_assignments(
-            &dml.input,
-            &dml.table_name,
-        )?;
-        let result_schema = super::cayenne_ddl::physical_plans::ddl_result_schema();
-        return Ok(Arc::new(
-            super::cayenne_ddl::physical_plans::DistributedCayenneUpdateExec::new(
-                dml.table_name.clone(),
-                Some(Arc::clone(executor_registry)),
-                filter_sql,
-                assignments_sql,
-                Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                    result_schema,
-                )),
-            ),
-        ));
-    }
-
     let table_provider = df.get_table(&dml.table_name).await.ok_or_else(|| {
         DataFusionError::Plan(format!(
             "Table '{}' not found for UPDATE operation",
