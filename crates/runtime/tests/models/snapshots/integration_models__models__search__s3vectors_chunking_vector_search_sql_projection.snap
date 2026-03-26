@@ -1,16 +1,8 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
-  {
-    "id": 612,
-    "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
-    "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words.",
-    "subject": "math",
-    "_score": 0.793
-  },
   {
     "id": 349,
     "answer": "The missing factor is \\(\\boxed{2}\\).  \n\n(Explanation: Since \\( 21 \\times 2 = 42 \\), the missing factor is 2.)",
@@ -31,5 +23,12 @@ snapshot_kind: text
     "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
     "_score": 0.556
+  },
+  {
+    "id": 830,
+    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
+    "question": "What is 14 percent of 232?",
+    "subject": "math",
+    "_score": 0.524
   }
 ]

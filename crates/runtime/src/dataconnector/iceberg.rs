@@ -23,8 +23,9 @@ use async_trait::async_trait;
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
-use iceberg::{Catalog, NamespaceIdent, TableIdent, io::CustomAwsCredentialLoader};
+use iceberg::{Catalog, NamespaceIdent, TableIdent, io::StorageFactory};
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use util::concat_arrays;
 
@@ -146,48 +147,52 @@ impl IcebergDataConnector {
             }
         }
 
-        let custom_credential_loader = if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
+        let storage_factory: Option<Arc<dyn StorageFactory>> =
+            if let Some(endpoint) = props.get("s3.endpoint") {
+                verify_s3_endpoint(endpoint)
+                    .await
+                    .map_err(|e| Error::InvalidConfiguration {
+                        dataconnector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    })?;
+
+                let aws_sdk_config = initiate_config_with_credentials(
+                    "IcebergDataConnector",
+                    "s3_region",
+                    "s3_access_key_id",
+                    "s3_secret_access_key",
+                    "s3_session_token",
+                    &self.params,
+                    self.params.get("s3_iam_role_source").expose().ok(),
+                )
                 .await
                 .map_err(|e| Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
                     message: e.to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
-                })?;
+                })?
+                .load()
+                .await;
 
-            let aws_sdk_config = initiate_config_with_credentials(
-                "IcebergDataConnector",
-                "s3_region",
-                "s3_access_key_id",
-                "s3_secret_access_key",
-                "s3_session_token",
-                &self.params,
-                self.params.get("s3_iam_role_source").expose().ok(),
-            )
-            .await
-            .map_err(|e| Error::InvalidConfiguration {
-                dataconnector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?
-            .load()
-            .await;
-
-            Some(
-                S3CredentialProvider::from_config(&aws_sdk_config)
+                let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
                     .map_err(|e| Error::InvalidConfiguration {
                         dataconnector: "iceberg".into(),
                         message: e.to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source: Box::new(e),
                     })?
-                    .into_custom_loader(),
-            )
-        } else {
-            None
-        };
+                    .into_custom_loader();
+
+                Some(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "s3".to_string(),
+                    customized_credential_load: Some(custom_loader),
+                }) as Arc<dyn StorageFactory>)
+            } else {
+                None
+            };
 
         if source.starts_with("file://")
             || source.starts_with("s3://")
@@ -204,7 +209,7 @@ impl IcebergDataConnector {
 
             return IcebergDataConnector::load_hadoop_catalog(
                 props,
-                custom_credential_loader,
+                storage_factory,
                 dataset,
                 source,
                 metadata_mode,
@@ -234,16 +239,13 @@ impl IcebergDataConnector {
 
         props.extend(new_props);
 
-        let mut catalog_client = get_rest_catalog(base_uri, props).await.map_err(|e| {
-            Error::UnableToGetReadProvider {
+        let catalog_client = get_rest_catalog(base_uri, props, storage_factory.clone())
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
-            }
-        })?;
-        if let Some(custom_loader) = custom_credential_loader {
-            catalog_client = catalog_client.with_file_io_extension(custom_loader);
-        }
+            })?;
 
         let catalog_client: Arc<dyn Catalog> = Arc::new(catalog_client);
 
@@ -274,7 +276,7 @@ impl IcebergDataConnector {
 
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
-        custom_credential_loader: Option<CustomAwsCredentialLoader>,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
         dataset: &Dataset,
         source: &str,
         metadata_mode: MetadataMode,
@@ -292,14 +294,35 @@ impl IcebergDataConnector {
         let table_name_str = table_name.clone();
         let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
 
-        let mut catalog_builder = HadoopCatalogBuilder::default()
+        // Determine storage factory from scheme if not explicitly provided
+        let factory = storage_factory.unwrap_or_else(|| {
+            if source.starts_with("gs://") || source.starts_with("gcs://") {
+                Arc::new(OpenDalStorageFactory::Gcs)
+            } else if source.starts_with("s3://") || source.starts_with("s3a://") {
+                let scheme = source.split("://").next().unwrap_or("s3").to_string();
+                Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: scheme,
+                    customized_credential_load: None,
+                })
+            } else {
+                Arc::new(iceberg::io::LocalFsStorageFactory) as Arc<dyn StorageFactory>
+            }
+        });
+
+        // Build an opendal operator for directory listing (scoped to the warehouse root, not the table URL)
+        let operator = crate::catalogconnector::iceberg::build_opendal_operator(&base_uri, &props)
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            })?;
+
+        let catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(base_uri)
             .with_metadata_mode(metadata_mode)
+            .with_storage_factory(factory)
+            .with_operator(operator)
             .with_properties(props);
-
-        if let Some(custom_loader) = custom_credential_loader {
-            catalog_builder = catalog_builder.with_file_io_extension(custom_loader);
-        }
 
         let catalog_client: Arc<dyn Catalog> =
             Arc::new(catalog_builder.build().await.map_err(|e| {

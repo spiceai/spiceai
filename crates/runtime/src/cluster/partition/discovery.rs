@@ -28,9 +28,10 @@ use datafusion::sql::sqlparser::{
     dialect::GenericDialect,
     parser::Parser,
 };
-use datafusion::{execution::SessionStateBuilder, prelude::SessionContext, sql::TableReference};
+use datafusion::{prelude::SessionContext, sql::TableReference};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
+use util::session_state::builder_from_existing;
 
 /// Query the source table provider for partition values for a given table.
 ///
@@ -145,9 +146,7 @@ async fn execute_partition_discovery_query(
         });
     };
 
-    let ctx = SessionContext::new_with_state(
-        SessionStateBuilder::new_from_existing(df.ctx.state()).build(),
-    );
+    let ctx = SessionContext::new_with_state(builder_from_existing(&df.ctx.state()).build());
 
     let provider = acc.table_provider().await;
     let schema = provider.schema();

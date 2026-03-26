@@ -33,11 +33,13 @@ use data_components::{
         provider::IcebergCatalogProvider,
     },
 };
-use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
+use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
 };
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use opendal::Operator;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::fmt::Write;
@@ -110,19 +112,41 @@ impl IcebergCatalog {
 
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
-        custom_credential_loader: Option<CustomAwsCredentialLoader>,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
         catalog: &Catalog,
         catalog_id: &str,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
+        // Determine storage factory from scheme if not explicitly provided
+        let factory = storage_factory.unwrap_or_else(|| {
+            if catalog_id.starts_with("gs://") || catalog_id.starts_with("gcs://") {
+                Arc::new(OpenDalStorageFactory::Gcs)
+            } else if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
+                let scheme = catalog_id.split("://").next().unwrap_or("s3").to_string();
+                Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: scheme,
+                    customized_credential_load: None,
+                })
+            } else {
+                Arc::new(iceberg::io::LocalFsStorageFactory) as Arc<dyn StorageFactory>
+            }
+        });
+
+        let operator = build_opendal_operator(catalog_id, &props).map_err(|e| {
+            super::Error::InvalidConfiguration {
+                connector: "iceberg".into(),
+                message: format!("Failed to build opendal operator for Hadoop Catalog: {e}"),
+                connector_component: ConnectorComponent::from(catalog),
+                source: e,
+            }
+        })?;
+
         // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
-        let mut catalog_builder = HadoopCatalogBuilder::default()
+        let catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(catalog_id)
             .with_metadata_mode(MetadataMode::Infer)
+            .with_storage_factory(factory)
+            .with_operator(operator)
             .with_properties(props);
-
-        if let Some(loader) = custom_credential_loader {
-            catalog_builder = catalog_builder.with_file_io_extension(loader);
-        }
 
         let hadoop_catalog =
             catalog_builder
@@ -304,48 +328,52 @@ impl CatalogConnector for IcebergCatalog {
             }
         }
 
-        let custom_credential_loader = if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
+        let storage_factory: Option<Arc<dyn StorageFactory>> =
+            if let Some(endpoint) = props.get("s3.endpoint") {
+                verify_s3_endpoint(endpoint).await.map_err(|e| {
+                    super::Error::InvalidConfiguration {
+                        connector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        source: Box::new(e),
+                    }
+                })?;
+
+                let aws_sdk_config = initiate_config_with_credentials(
+                    "IcebergCatalogConnector",
+                    "s3_region",
+                    "s3_access_key_id",
+                    "s3_secret_access_key",
+                    "s3_session_token",
+                    &self.params,
+                    self.params.get("s3_iam_role_source").expose().ok(),
+                )
                 .await
                 .map_err(|e| super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
                     message: e.to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
-                })?;
+                })?
+                .load()
+                .await;
 
-            let aws_sdk_config = initiate_config_with_credentials(
-                "IcebergCatalogConnector",
-                "s3_region",
-                "s3_access_key_id",
-                "s3_secret_access_key",
-                "s3_session_token",
-                &self.params,
-                self.params.get("s3_iam_role_source").expose().ok(),
-            )
-            .await
-            .map_err(|e| super::Error::InvalidConfiguration {
-                connector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?
-            .load()
-            .await;
-
-            Some(
-                S3CredentialProvider::from_config(&aws_sdk_config)
+                let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
                     .map_err(|e| super::Error::InvalidConfiguration {
                         connector: "iceberg".into(),
                         message: e.to_string(),
                         connector_component: ConnectorComponent::from(catalog),
                         source: Box::new(e),
                     })?
-                    .into_custom_loader(),
-            )
-        } else {
-            None
-        };
+                    .into_custom_loader();
+
+                Some(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "s3".to_string(),
+                    customized_credential_load: Some(custom_loader),
+                }) as Arc<dyn StorageFactory>)
+            } else {
+                None
+            };
 
         if catalog_id.starts_with("file://")
             || catalog_id.starts_with("s3://")
@@ -355,7 +383,7 @@ impl CatalogConnector for IcebergCatalog {
         {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
-                custom_credential_loader,
+                storage_factory,
                 catalog,
                 &catalog_id,
             )
@@ -377,11 +405,8 @@ impl CatalogConnector for IcebergCatalog {
         };
 
         props.extend(new_props);
-        let catalog_config = get_rest_catalog(base_uri, props).await?;
-        let mut catalog_client = RestCatalog::new(catalog_config);
-        if let Some(loader) = custom_credential_loader {
-            catalog_client = catalog_client.with_file_io_extension(loader);
-        }
+        let catalog_config = get_rest_catalog(base_uri, props, storage_factory.clone()).await?;
+        let catalog_client = RestCatalog::new(catalog_config);
 
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
@@ -613,13 +638,30 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
     }
 }
 
+/// Infers a default `StorageFactory` from the iceberg properties.
+///
+/// If any `gcs.*` property is present, returns a GCS factory; otherwise defaults to S3.
+fn default_storage_factory_from_props(props: &HashMap<String, String>) -> Arc<dyn StorageFactory> {
+    if props.keys().any(|k| k.starts_with("gcs.")) {
+        Arc::new(OpenDalStorageFactory::Gcs)
+    } else {
+        Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        })
+    }
+}
+
 /// Builds an `IcebergRestCatalog` from a base URI and properties.
 pub async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,
+    storage_factory: Option<Arc<dyn StorageFactory>>,
 ) -> Result<IcebergRestCatalog> {
     props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
+    let factory = storage_factory.unwrap_or_else(|| default_storage_factory_from_props(&props));
     RestCatalogBuilder::default()
+        .with_storage_factory(factory)
         .load("rest", props)
         .await
         .context(UnableToBuildCatalogSnafu)
@@ -742,6 +784,74 @@ pub fn parse_hadoop_table_url(
     }
 
     Ok((base_uri, namespace, table_name.to_string()))
+}
+
+/// Builds an opendal `Operator` for directory listing operations from a warehouse URL and properties.
+pub(crate) fn build_opendal_operator(
+    warehouse_url: &str,
+    props: &HashMap<String, String>,
+) -> std::result::Result<Operator, Box<dyn std::error::Error + Send + Sync>> {
+    use opendal::Configurator;
+
+    if warehouse_url.starts_with("s3://") || warehouse_url.starts_with("s3a://") {
+        let parsed = Url::parse(warehouse_url)?;
+        let bucket = parsed
+            .host_str()
+            .ok_or("S3 URL must have a bucket (host)")?;
+
+        let mut config = opendal::services::S3Config::default();
+        config.bucket = bucket.to_string();
+        config.root = Some(parsed.path().to_string());
+
+        if let Some(endpoint) = props.get("s3.endpoint") {
+            config.endpoint = Some(endpoint.clone());
+        }
+        if let Some(region) = props
+            .get("s3.region")
+            .or_else(|| props.get("client.region"))
+        {
+            config.region = Some(region.clone());
+        }
+        if let Some(key_id) = props.get("s3.access-key-id") {
+            config.access_key_id = Some(key_id.clone());
+        }
+        if let Some(secret) = props.get("s3.secret-access-key") {
+            config.secret_access_key = Some(secret.clone());
+        }
+        if let Some(token) = props.get("s3.session-token") {
+            config.session_token = Some(token.clone());
+        }
+
+        let builder = config.into_builder();
+        Ok(Operator::new(builder)?.finish())
+    } else if warehouse_url.starts_with("gs://") || warehouse_url.starts_with("gcs://") {
+        let mut config = opendal::services::GcsConfig::default();
+        let parsed = Url::parse(warehouse_url)?;
+        config.bucket = parsed
+            .host_str()
+            .ok_or("GCS URL must have a bucket (host)")?
+            .to_string();
+        config.root = Some(parsed.path().to_string());
+
+        if let Some(cred) = props.get("gcs.credentials-json") {
+            config.credential = Some(cred.clone());
+        }
+
+        let builder = config.into_builder();
+        Ok(Operator::new(builder)?.finish())
+    } else if warehouse_url.starts_with("file://") || warehouse_url.starts_with('/') {
+        let mut config = opendal::services::FsConfig::default();
+        if let Ok(parsed) = Url::parse(warehouse_url) {
+            config.root = Some(parsed.path().to_string());
+        } else {
+            // Bare path like /data/warehouse
+            config.root = Some(warehouse_url.to_string());
+        }
+        let builder = config.into_builder();
+        Ok(Operator::new(builder)?.finish())
+    } else {
+        Err(format!("Unsupported scheme in warehouse URL: {warehouse_url}").into())
+    }
 }
 
 #[cfg(test)]
@@ -1023,5 +1133,47 @@ mod tests {
         let parsed_url = Url::parse(url).expect("Failed to parse URL");
         let warehouse = get_warehouse(&parsed_url);
         assert_eq!(warehouse, None);
+    }
+
+    #[test]
+    fn test_build_opendal_operator_s3() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("s3://my-bucket/prefix/warehouse", &props);
+        assert!(op.is_ok(), "S3 operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_s3a() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("s3a://my-bucket/prefix/warehouse", &props);
+        assert!(op.is_ok(), "S3A operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_gcs() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("gs://my-bucket/prefix", &props);
+        assert!(op.is_ok(), "GCS operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_file_url() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("file:///tmp", &props);
+        assert!(op.is_ok(), "File operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_bare_path() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("/tmp", &props);
+        assert!(op.is_ok(), "Bare path operator should be created: {op:?}");
+    }
+
+    #[test]
+    fn test_build_opendal_operator_unsupported_scheme() {
+        let props = HashMap::new();
+        let op = build_opendal_operator("ftp://my-host/path", &props);
+        assert!(op.is_err(), "Unsupported scheme should fail");
     }
 }

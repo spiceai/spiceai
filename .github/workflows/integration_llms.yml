@@ -59,7 +59,7 @@ jobs:
                 name: 'hosted',
                 needs_env: true,
                 runner: 'spiceai-macos',
-                model_allowlist: 'anthropic,bedrock,openai,xai,perplexity'
+                model_allowlist: 'anthropic,bedrock,openai,xai'
               }
             ];
 
@@ -138,7 +138,6 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
-          SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
@@ -153,10 +152,6 @@ jobs:
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
               echo "Error: 'SPICE_XAI_API_KEY' is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
               exit 1
             fi
             export SPICE_BEDROCK_REGION="us-east-1"

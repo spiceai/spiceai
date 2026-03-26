@@ -66,6 +66,11 @@ pub enum Error {
     UnableToRetrieveSchema { reason: String },
 
     #[snafu(display(
+        "The dataset '{dataset_name}' in Databricks has no columns. Verify the table exists and has at least one column."
+    ))]
+    NoColumnsInDataset { dataset_name: String },
+
+    #[snafu(display(
         "Warehouse is not ready (state: '{state}'). Verify the warehouse state and try again later."
     ))]
     InvalidWarehouseState { state: String },
@@ -235,7 +240,7 @@ impl SqlWarehouseApi {
         let payload = self.create_schema_payload(table)?;
         let response = self.execute_sql_statement(&token, &payload).await?;
         let response = self.wait_for_statement_completion(&token, response).await?;
-        schema_from_json(&response)
+        schema_from_json(&response, &table.to_string())
     }
 
     fn create_schema_payload(&self, table: &TableReference) -> Result<Value, Error> {
@@ -548,7 +553,7 @@ struct ExternalLink {
     next_chunk_internal_link: Option<String>,
 }
 
-fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
+fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef, Error> {
     tracing::trace!("Parsing schema definition from Databricks JSON response: {json_value}");
 
     SqlWarehouseApi::verify_response_status(json_value)?;
@@ -558,7 +563,10 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
         .and_then(|r| r.get("data_array"))
         .and_then(|d| d.as_array())
         .ok_or_else(|| Error::UnableToRetrieveSchema {
-            reason: "result.data_array".to_string(),
+            reason: format!(
+                "The response for dataset '{dataset_name}' is missing 'result.data_array'. \
+                 Verify the table exists and the SQL warehouse is responding correctly."
+            ),
         })?;
 
     let mut fields = Vec::new();
@@ -610,6 +618,12 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
         let field: Field = Field::new(col_name, data_type, nullable);
 
         fields.push(field);
+    }
+
+    if fields.is_empty() {
+        return Err(Error::NoColumnsInDataset {
+            dataset_name: dataset_name.to_string(),
+        });
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -807,7 +821,7 @@ mod tests {
             ["amount", "double", "NO"]
         ]));
 
-        let schema = schema_from_json(&response).expect("should parse schema");
+        let schema = schema_from_json(&response, "test_table").expect("should parse schema");
         assert_eq!(schema.fields().len(), 3);
 
         assert_eq!(schema.field(0).name(), "id");
@@ -836,7 +850,7 @@ mod tests {
             ["col_decimal", "decimal(10,2)", "YES"]
         ]));
 
-        let schema = schema_from_json(&response).expect("should parse schema");
+        let schema = schema_from_json(&response, "test_table").expect("should parse schema");
         assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
         assert_eq!(schema.field(1).data_type(), &DataType::Int16);
@@ -855,8 +869,21 @@ mod tests {
     fn test_schema_from_json_empty_table() {
         let response = make_schema_response(&json!([]));
 
-        let schema = schema_from_json(&response).expect("should parse empty schema");
-        assert_eq!(schema.fields().len(), 0);
+        let err = schema_from_json(&response, "my_catalog.my_schema.my_table")
+            .expect_err("should fail on empty schema");
+        assert!(
+            matches!(&err, Error::NoColumnsInDataset { dataset_name } if dataset_name == "my_catalog.my_schema.my_table"),
+            "unexpected error: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my_catalog.my_schema.my_table"),
+            "error should contain dataset name: {msg}"
+        );
+        assert!(
+            msg.contains("has no columns"),
+            "error should mention no columns: {msg}"
+        );
     }
 
     #[test]
@@ -868,7 +895,8 @@ mod tests {
             ["# col_name", "data_type", "comment"]
         ]));
 
-        let schema = schema_from_json(&response).expect("should stop at clustering marker");
+        let schema =
+            schema_from_json(&response, "test_table").expect("should stop at clustering marker");
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "name");
@@ -880,9 +908,10 @@ mod tests {
             "status": { "state": "SUCCEEDED" }
         });
 
-        let err = schema_from_json(&response).expect_err("should fail without result");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason == "result.data_array"),
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
             "unexpected error: {err}"
         );
     }
@@ -894,9 +923,10 @@ mod tests {
             "result": {}
         });
 
-        let err = schema_from_json(&response).expect_err("should fail without data_array");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without data_array");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason == "result.data_array"),
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
             "unexpected error: {err}"
         );
     }
@@ -908,9 +938,10 @@ mod tests {
             "result": { "data_array": "not_an_array" }
         });
 
-        let err = schema_from_json(&response).expect_err("should fail when data_array is string");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail when data_array is string");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason == "result.data_array"),
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
             "unexpected error: {err}"
         );
     }
@@ -919,7 +950,8 @@ mod tests {
     fn test_schema_from_json_row_not_array() {
         let response = make_schema_response(&json!(["not_an_array"]));
 
-        let err = schema_from_json(&response).expect_err("should fail on non-array row");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on non-array row");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("is not an array")),
             "unexpected error: {err}"
@@ -930,7 +962,7 @@ mod tests {
     fn test_schema_from_json_row_too_short() {
         let response = make_schema_response(&json!([["id", "int"]]));
 
-        let err = schema_from_json(&response).expect_err("should fail on short row");
+        let err = schema_from_json(&response, "test_table").expect_err("should fail on short row");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("lacks column_name")),
             "unexpected error: {err}"
@@ -941,7 +973,8 @@ mod tests {
     fn test_schema_from_json_column_name_not_string() {
         let response = make_schema_response(&json!([[123, "int", "NO"]]));
 
-        let err = schema_from_json(&response).expect_err("should fail on non-string col name");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string col name");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[0] is not a string")),
             "unexpected error: {err}"
@@ -952,7 +985,8 @@ mod tests {
     fn test_schema_from_json_data_type_not_string() {
         let response = make_schema_response(&json!([["id", 42, "NO"]]));
 
-        let err = schema_from_json(&response).expect_err("should fail on non-string data type");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string data type");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[1] is not a string")),
             "unexpected error: {err}"
@@ -963,7 +997,8 @@ mod tests {
     fn test_schema_from_json_nullable_not_string() {
         let response = make_schema_response(&json!([["id", "int", true]]));
 
-        let err = schema_from_json(&response).expect_err("should fail on non-string nullable");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string nullable");
         assert!(
             matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[2] is not a string")),
             "unexpected error: {err}"
@@ -982,7 +1017,8 @@ mod tests {
             ["g", "int", "anything_else"]
         ]));
 
-        let schema = schema_from_json(&response).expect("should parse nullable variations");
+        let schema =
+            schema_from_json(&response, "test_table").expect("should parse nullable variations");
         assert!(schema.field(0).is_nullable());
         assert!(schema.field(1).is_nullable());
         assert!(schema.field(2).is_nullable());
@@ -1003,7 +1039,8 @@ mod tests {
             "result": { "data_array": [] }
         });
 
-        let err = schema_from_json(&response).expect_err("should fail on FAILED status");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on FAILED status");
         assert!(
             matches!(&err, Error::QueryFailure { message } if message.contains("table not found")),
             "unexpected error: {err}"
@@ -1017,7 +1054,8 @@ mod tests {
             "statement_id": "test-stmt-id"
         });
 
-        let err = schema_from_json(&response).expect_err("should fail on PENDING status");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on PENDING status");
         assert!(
             matches!(&err, Error::InvalidWarehouseState { .. }),
             "unexpected error: {err}"
@@ -1028,7 +1066,8 @@ mod tests {
     fn test_schema_from_json_unsupported_type() {
         let response = make_schema_response(&json!([["col", "TOTALLY_FAKE_TYPE", "NO"]]));
 
-        let err = schema_from_json(&response).expect_err("should fail on unsupported type");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on unsupported type");
         assert!(
             matches!(&err, Error::ParseError { .. }),
             "unexpected error: {err}"
@@ -1041,7 +1080,8 @@ mod tests {
         let response =
             make_schema_response(&json!([["id", "int", "NO", "extra_col", "another_extra"]]));
 
-        let schema = schema_from_json(&response).expect("should parse with extra columns");
+        let schema =
+            schema_from_json(&response, "test_table").expect("should parse with extra columns");
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "id");
     }
@@ -1052,7 +1092,8 @@ mod tests {
             "result": { "data_array": [["id", "int", "NO"]] }
         });
 
-        let err = schema_from_json(&response).expect_err("should fail without status");
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without status");
         assert!(
             matches!(&err, Error::MissingJsonField { field } if field == "status.state"),
             "unexpected error: {err}"
@@ -1356,5 +1397,75 @@ mod tests {
             matches!(&err, Error::MissingJsonField { field } if field == "statement_id"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_schema_from_json_no_columns_error_includes_dataset_name() {
+        let response = make_schema_response(&json!([]));
+
+        let err = schema_from_json(&response, "my_catalog.my_schema.orders")
+            .expect_err("should fail when no columns");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my_catalog.my_schema.orders"),
+            "error should contain the full dataset name: {msg}"
+        );
+        assert!(
+            msg.contains("has no columns"),
+            "error should mention 'has no columns': {msg}"
+        );
+        assert!(
+            msg.contains("Verify the table exists"),
+            "error should suggest verifying table existence: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_only_clustering_metadata_returns_no_columns_error() {
+        // When the data_array only contains clustering metadata markers,
+        // no real columns are parsed and we should get a NoColumnsInDataset error.
+        let response = make_schema_response(&json!([
+            ["# Clustering Information", "", ""],
+            ["# col_name", "data_type", "comment"]
+        ]));
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail when only clustering metadata present");
+        assert!(
+            matches!(&err, Error::NoColumnsInDataset { dataset_name } if dataset_name == "test_table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_result_error_is_actionable() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" }
+        });
+
+        let err = schema_from_json(&response, "catalog.schema.my_orders")
+            .expect_err("should fail without result");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("catalog.schema.my_orders"),
+            "error should contain dataset name: {msg}"
+        );
+        assert!(
+            msg.contains("Verify the table exists"),
+            "error should suggest verifying table: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_happy_path_with_dataset_name() {
+        // Ensure the dataset_name parameter doesn't affect successful parsing.
+        let response =
+            make_schema_response(&json!([["id", "int", "NO"], ["name", "string", "YES"]]));
+
+        let schema = schema_from_json(&response, "catalog.schema.users")
+            .expect("should parse schema successfully");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
     }
 }
