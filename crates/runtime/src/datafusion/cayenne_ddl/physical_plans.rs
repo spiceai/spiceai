@@ -1561,8 +1561,8 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
     }
 }
 
-/// Schema for DML count results — single `count` column with UInt64 type,
-/// matching DataFusion's standard DML output format.
+/// Schema for DML count results — single `count` column with `UInt64` type,
+/// matching `DataFusion`'s standard DML output format.
 fn dml_count_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "count",
