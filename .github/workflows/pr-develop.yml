@@ -84,13 +84,13 @@ jobs:
         env:
           BRANCH: spiceai-52
 
-      # Build and Test (exclude packages with secret-dependent tests)
+      # Build and Test (exclude nfs and secret-dependent packages)
       - name: Build CLI and run nextest
         if: steps.check.outputs.relevant_changes == 'true'
         run: make build-cli nextest
         env:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-          NEXTEST_FLAG: "-E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
+          NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
 
       - name: Build testoperator
         if: steps.check.outputs.relevant_changes == 'true'
