@@ -4125,12 +4125,7 @@ impl TableProvider for CayenneTableProvider {
             datafusion_expr::LogicalPlanBuilder::scan("__update_source", table_source, None)?
                 .build()?;
 
-        if !filters.is_empty() {
-            let combined = filters
-                .clone()
-                .into_iter()
-                .reduce(Expr::and)
-                .expect("filters is non-empty");
+        if let Some(combined) = filters.clone().into_iter().reduce(Expr::and) {
             plan = datafusion_expr::LogicalPlanBuilder::from(plan)
                 .filter(combined)?
                 .build()?;
