@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -36,6 +37,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
+use crate::parameters::Parameters;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -73,6 +75,11 @@ pub enum Error {
         uri: String,
         source: datafusion_table_providers::sql::db_connection_pool::Error,
     },
+
+    #[snafu(display(
+        "Invalid 'query_federation' value '{value}'. Expected 'enabled' or 'disabled'."
+    ))]
+    InvalidQueryFederation { value: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -128,6 +135,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
         .default("1"),
+    ParameterSpec::runtime("query_federation")
+        .description("Enable or disable query federation for this connector. Valid values: 'enabled' (default), 'disabled'.")
+        .default("enabled"),
 ];
 
 impl DataConnectorFactory for AdbcFactory {
@@ -189,6 +199,15 @@ impl DataConnectorFactory for AdbcFactory {
                 .map(String::from);
 
             let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
+
+            let federation_enabled =
+                is_query_federation_enabled(&params.parameters).map_err(|e| {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "adbc".to_string(),
+                        connector_component: params.component.clone(),
+                        source: Box::new(e),
+                    }
+                })?;
 
             let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
                 match params.parameters.get(name).expose().ok() {
@@ -259,7 +278,8 @@ impl DataConnectorFactory for AdbcFactory {
 
                 let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                     .with_max_size(pool_size)
-                    .with_min_idle(pool_min_idle);
+                    .with_min_idle(pool_min_idle)
+                    .with_join_push_down(JoinPushDown::AllowedFor(uri_str.clone()));
 
                 if let Some(conn_opts) = conn_options {
                     pool_builder = pool_builder.with_conn_options(conn_opts);
@@ -286,7 +306,8 @@ impl DataConnectorFactory for AdbcFactory {
                 source: Box::new(e),
             })?;
 
-            let adbc_factory = AdbcTableFactory::new(pool);
+            let adbc_factory =
+                AdbcTableFactory::new(pool).with_federation_enabled(federation_enabled);
 
             Ok(Arc::new(Adbc {
                 adbc_factory,
@@ -419,6 +440,19 @@ impl DataConnector for Adbc {
                     source: e,
                 }),
         )
+    }
+}
+
+/// Returns whether query federation is enabled based on the `query_federation` parameter.
+/// Defaults to `true` (enabled) when the parameter is absent.
+fn is_query_federation_enabled(params: &Parameters) -> Result<bool> {
+    match params.get("query_federation").expose().ok() {
+        None | Some("enabled") => Ok(true),
+        Some("disabled") => Ok(false),
+        Some(other) => InvalidQueryFederationSnafu {
+            value: other.to_string(),
+        }
+        .fail(),
     }
 }
 
@@ -609,5 +643,41 @@ mod tests {
             opts.get("adbc.connection.catalog"),
             Some(&"cat".to_string())
         );
+    }
+
+    fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
+        use secrecy::SecretString;
+        Parameters::new(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), SecretString::from(v.to_string())))
+                .collect(),
+            "adbc",
+            PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn test_query_federation_enabled() {
+        let params = make_params(vec![("query_federation", "enabled")]);
+        assert!(is_query_federation_enabled(&params).expect("to parse"));
+    }
+
+    #[test]
+    fn test_query_federation_disabled() {
+        let params = make_params(vec![("query_federation", "disabled")]);
+        assert!(!is_query_federation_enabled(&params).expect("to parse"));
+    }
+
+    #[test]
+    fn test_query_federation_missing_defaults_enabled() {
+        let params = make_params(vec![]);
+        assert!(is_query_federation_enabled(&params).expect("to parse"));
+    }
+
+    #[test]
+    fn test_query_federation_invalid_value() {
+        let params = make_params(vec![("query_federation", "invalid")]);
+        is_query_federation_enabled(&params).expect_err("should error on invalid value");
     }
 }

@@ -32,6 +32,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::adbc::AdbcTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -264,6 +265,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
             .with_min_idle(pool_min_idle)
+            .with_join_push_down(JoinPushDown::AllowedFor(uri_str.clone()))
             .build()
             .context(UnableToCreateConnectionPoolSnafu {
                 driver_location,
