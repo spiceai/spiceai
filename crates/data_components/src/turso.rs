@@ -123,7 +123,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{
         TableReference,
-        sqlparser::ast::{self as sqlast, VisitMut},
+        sqlparser::ast::{self as sqlast, VisitMut, VisitorMut},
         unparser::{
             Unparser,
             dialect::{
@@ -318,6 +318,127 @@ impl Dialect for TursoDialect {
         }
         self.inner
             .scalar_function_to_sql_overrides(unparser, func_name, args)
+    }
+}
+
+/// AST visitor that rewrites `BETWEEN` expressions with numeric bounds to use
+/// explicit `CAST(... AS REAL)` comparisons.
+///
+/// # Problem
+///
+/// Turso/libSQL (like SQLite) stores decimal values as REAL, but when the SQL
+/// unparser generates `BETWEEN` expressions with numeric literals, the database
+/// may perform text-based comparisons instead of numeric ones, leading to
+/// incorrect results. For example, TPCH Q6's `l_discount BETWEEN 0.06 AND 0.08`
+/// can return wrong results because text comparison of decimal values differs
+/// from numeric comparison.
+///
+/// # Solution
+///
+/// This visitor rewrites:
+/// ```sql
+/// expr BETWEEN low AND high
+/// ```
+/// into:
+/// ```sql
+/// CAST(expr AS REAL) >= CAST(low AS REAL) AND CAST(expr AS REAL) <= CAST(high AS REAL)
+/// ```
+///
+/// For `NOT BETWEEN`, the operators are inverted (`<` and `>`).
+///
+/// This ensures that all comparisons are performed numerically via REAL (float64),
+/// which matches how Turso stores decimal values.
+///
+/// Unlike the SQLite accelerator which uses `decimal_cmp()` (a custom SQLite extension),
+/// Turso does not have that extension available, so CAST to REAL is used instead.
+#[derive(Default)]
+struct TursoBetweenVisitor;
+
+impl TursoBetweenVisitor {
+    /// Checks whether an expression contains numeric values (literals or arithmetic
+    /// on numeric literals) that would benefit from CAST to REAL.
+    fn is_numeric_expr(expr: &sqlast::Expr) -> bool {
+        match expr {
+            sqlast::Expr::Value(sqlast::ValueWithSpan {
+                value: sqlast::Value::Number(_, _),
+                ..
+            }) => true,
+            sqlast::Expr::BinaryOp { left, op, right } => {
+                matches!(
+                    op,
+                    sqlast::BinaryOperator::Plus | sqlast::BinaryOperator::Minus
+                ) && Self::is_numeric_expr(left)
+                    && Self::is_numeric_expr(right)
+            }
+            sqlast::Expr::Nested(inner) => Self::is_numeric_expr(inner),
+            _ => false,
+        }
+    }
+
+    /// Wraps an expression in `CAST(expr AS REAL)`.
+    fn cast_to_real(expr: sqlast::Expr) -> sqlast::Expr {
+        sqlast::Expr::Cast {
+            kind: sqlast::CastKind::Cast,
+            expr: Box::new(expr),
+            data_type: sqlast::DataType::Real,
+            format: None,
+        }
+    }
+}
+
+impl VisitorMut for TursoBetweenVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut sqlast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let sqlast::Expr::Between {
+            expr: input_expr,
+            negated,
+            low,
+            high,
+        } = expr
+        {
+            if Self::is_numeric_expr(low) && Self::is_numeric_expr(high) {
+                let negated = *negated;
+                let cast_expr_left = Self::cast_to_real(*input_expr.clone());
+                let cast_expr_right = Self::cast_to_real(*input_expr.clone());
+                let cast_low = Self::cast_to_real(*low.clone());
+                let cast_high = Self::cast_to_real(*high.clone());
+
+                let (low_op, high_op, combine_op) = if negated {
+                    (
+                        sqlast::BinaryOperator::Lt,
+                        sqlast::BinaryOperator::Gt,
+                        sqlast::BinaryOperator::Or,
+                    )
+                } else {
+                    (
+                        sqlast::BinaryOperator::GtEq,
+                        sqlast::BinaryOperator::LtEq,
+                        sqlast::BinaryOperator::And,
+                    )
+                };
+
+                let lhs = sqlast::Expr::BinaryOp {
+                    left: Box::new(cast_expr_left),
+                    op: low_op,
+                    right: Box::new(cast_low),
+                };
+
+                let rhs = sqlast::Expr::BinaryOp {
+                    left: Box::new(cast_expr_right),
+                    op: high_op,
+                    right: Box::new(cast_high),
+                };
+
+                *expr = sqlast::Expr::BinaryOp {
+                    left: Box::new(lhs),
+                    op: combine_op,
+                    right: Box::new(rhs),
+                };
+            }
+        }
+
+        std::ops::ControlFlow::Continue(())
     }
 }
 
@@ -1108,12 +1229,17 @@ impl TursoTableProvider {
     /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL literals to
     /// `CAST(date/datetime(col, modifier) AS TEXT)` calls.
     ///
-    /// Note: Unlike the SQLite accelerator, we do NOT run `SQLiteBetweenVisitor`
-    /// here. That visitor rewrites `BETWEEN` into `decimal_cmp()` calls which is not supported by Turso.
+    /// Also runs [`TursoBetweenVisitor`] to rewrite `BETWEEN` expressions with numeric
+    /// bounds into explicit comparisons using `CAST(... AS REAL)`. This is needed because
+    /// Turso (like SQLite) can perform text-based comparisons on decimal values stored as
+    /// REAL, producing incorrect results. Unlike the SQLite accelerator which uses
+    /// `decimal_cmp()`, Turso does not have that extension, so we use CAST to REAL instead.
     fn turso_ast_analyzer() -> AstAnalyzerRule {
         Box::new(|mut ast| {
             let mut interval_visitor = SQLiteIntervalVisitor::default();
             let _ = ast.visit(&mut interval_visitor);
+            let mut between_visitor = TursoBetweenVisitor::default();
+            let _ = ast.visit(&mut between_visitor);
             Ok(ast)
         })
     }
@@ -1448,10 +1574,16 @@ impl TursoExec {
         } else {
             let dialect = TursoDialect::new();
             let unparser = Unparser::new(&dialect);
+            let mut between_visitor = TursoBetweenVisitor::default();
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| {
+                    unparser.expr_to_sql(f).map(|mut ast| {
+                        let _ = ast.visit(&mut between_visitor);
+                        format!("{ast}")
+                    })
+                })
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -1597,10 +1729,16 @@ impl DeletionSink for TursoDeletionSink {
         } else {
             let dialect = TursoDialect::new();
             let unparser = Unparser::new(&dialect);
+            let mut between_visitor = TursoBetweenVisitor::default();
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .map(|f| {
+                    unparser.expr_to_sql(f).map(|mut ast| {
+                        let _ = ast.visit(&mut between_visitor);
+                        format!("{ast}")
+                    })
+                })
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -2110,4 +2248,186 @@ fn scalar_value_to_turso(
     };
 
     Ok(turso_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::sql::sqlparser::ast::{self as sqlast, VisitMut};
+
+    /// Helper to create a numeric literal expression.
+    fn num(s: &str) -> sqlast::Expr {
+        sqlast::Expr::Value(sqlast::Value::Number(s.to_string(), false).into())
+    }
+
+    /// Helper to create an identifier expression.
+    fn ident(s: &str) -> sqlast::Expr {
+        sqlast::Expr::Identifier(sqlast::Ident::new(s))
+    }
+
+    /// Helper to create a CAST(expr AS REAL) expression.
+    fn cast_real(expr: sqlast::Expr) -> sqlast::Expr {
+        sqlast::Expr::Cast {
+            kind: sqlast::CastKind::Cast,
+            expr: Box::new(expr),
+            data_type: sqlast::DataType::Real,
+            format: None,
+        }
+    }
+
+    #[test]
+    fn test_between_numeric_bounds_rewritten_to_cast_real() {
+        // col BETWEEN 0.06 AND 0.08
+        // should become: CAST(col AS REAL) >= CAST(0.06 AS REAL) AND CAST(col AS REAL) <= CAST(0.08 AS REAL)
+        let mut expr = sqlast::Expr::Between {
+            expr: Box::new(ident("l_discount")),
+            negated: false,
+            low: Box::new(num("0.06")),
+            high: Box::new(num("0.08")),
+        };
+
+        let mut visitor = TursoBetweenVisitor::default();
+        let _ = expr.visit(&mut visitor);
+
+        let expected = sqlast::Expr::BinaryOp {
+            left: Box::new(sqlast::Expr::BinaryOp {
+                left: Box::new(cast_real(ident("l_discount"))),
+                op: sqlast::BinaryOperator::GtEq,
+                right: Box::new(cast_real(num("0.06"))),
+            }),
+            op: sqlast::BinaryOperator::And,
+            right: Box::new(sqlast::Expr::BinaryOp {
+                left: Box::new(cast_real(ident("l_discount"))),
+                op: sqlast::BinaryOperator::LtEq,
+                right: Box::new(cast_real(num("0.08"))),
+            }),
+        };
+
+        assert_eq!(format!("{expr}"), format!("{expected}"));
+    }
+
+    #[test]
+    fn test_not_between_numeric_bounds_rewritten() {
+        // col NOT BETWEEN 1 AND 3
+        // should become: CAST(col AS REAL) < CAST(1 AS REAL) OR CAST(col AS REAL) > CAST(3 AS REAL)
+        let mut expr = sqlast::Expr::Between {
+            expr: Box::new(ident("price")),
+            negated: true,
+            low: Box::new(num("1")),
+            high: Box::new(num("3")),
+        };
+
+        let mut visitor = TursoBetweenVisitor::default();
+        let _ = expr.visit(&mut visitor);
+
+        let expected = sqlast::Expr::BinaryOp {
+            left: Box::new(sqlast::Expr::BinaryOp {
+                left: Box::new(cast_real(ident("price"))),
+                op: sqlast::BinaryOperator::Lt,
+                right: Box::new(cast_real(num("1"))),
+            }),
+            op: sqlast::BinaryOperator::Or,
+            right: Box::new(sqlast::Expr::BinaryOp {
+                left: Box::new(cast_real(ident("price"))),
+                op: sqlast::BinaryOperator::Gt,
+                right: Box::new(cast_real(num("3"))),
+            }),
+        };
+
+        assert_eq!(format!("{expr}"), format!("{expected}"));
+    }
+
+    #[test]
+    fn test_between_string_bounds_not_rewritten() {
+        // col BETWEEN 'a' AND 'z' should NOT be rewritten (string bounds)
+        let original = sqlast::Expr::Between {
+            expr: Box::new(ident("name")),
+            negated: false,
+            low: Box::new(sqlast::Expr::Value(
+                sqlast::Value::SingleQuotedString("a".to_string()).into(),
+            )),
+            high: Box::new(sqlast::Expr::Value(
+                sqlast::Value::SingleQuotedString("z".to_string()).into(),
+            )),
+        };
+        let mut expr = original.clone();
+
+        let mut visitor = TursoBetweenVisitor::default();
+        let _ = expr.visit(&mut visitor);
+
+        // Should remain unchanged
+        assert_eq!(format!("{expr}"), format!("{original}"));
+    }
+
+    #[test]
+    fn test_between_mixed_bounds_not_rewritten() {
+        // col BETWEEN 'a' AND 3 should NOT be rewritten (mixed bounds)
+        let original = sqlast::Expr::Between {
+            expr: Box::new(ident("col")),
+            negated: false,
+            low: Box::new(sqlast::Expr::Value(
+                sqlast::Value::SingleQuotedString("a".to_string()).into(),
+            )),
+            high: Box::new(num("3")),
+        };
+        let mut expr = original.clone();
+
+        let mut visitor = TursoBetweenVisitor::default();
+        let _ = expr.visit(&mut visitor);
+
+        assert_eq!(format!("{expr}"), format!("{original}"));
+    }
+
+    #[test]
+    fn test_between_arithmetic_bounds_rewritten() {
+        // col BETWEEN 0.06 - 0.01 AND 0.06 + 0.01
+        let mut expr = sqlast::Expr::Between {
+            expr: Box::new(ident("l_discount")),
+            negated: false,
+            low: Box::new(sqlast::Expr::BinaryOp {
+                left: Box::new(num("0.06")),
+                op: sqlast::BinaryOperator::Minus,
+                right: Box::new(num("0.01")),
+            }),
+            high: Box::new(sqlast::Expr::BinaryOp {
+                left: Box::new(num("0.06")),
+                op: sqlast::BinaryOperator::Plus,
+                right: Box::new(num("0.01")),
+            }),
+        };
+
+        let mut visitor = TursoBetweenVisitor::default();
+        let _ = expr.visit(&mut visitor);
+
+        // Should be rewritten (both bounds are numeric expressions)
+        let formatted = format!("{expr}");
+        assert!(
+            formatted.contains("CAST"),
+            "Expected CAST in output, got: {formatted}"
+        );
+        assert!(
+            formatted.contains("REAL"),
+            "Expected REAL in output, got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_between_output_sql_format() {
+        // Verify the exact SQL output format
+        let mut expr = sqlast::Expr::Between {
+            expr: Box::new(ident("l_discount")),
+            negated: false,
+            low: Box::new(num("0.06")),
+            high: Box::new(num("0.08")),
+        };
+
+        let mut visitor = TursoBetweenVisitor::default();
+        let _ = expr.visit(&mut visitor);
+
+        let sql = format!("{expr}");
+        assert_eq!(
+            sql,
+            "CAST(l_discount AS REAL) >= CAST(0.06 AS REAL) AND CAST(l_discount AS REAL) <= CAST(0.08 AS REAL)"
+        );
+    }
 }
