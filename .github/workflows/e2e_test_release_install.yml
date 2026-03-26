@@ -8,8 +8,6 @@ on:
         required: false
         type: string
         default: ''
-  merge_group:
-    types: [checks_requested]
   pull_request:
     paths:
       - 'install/install.sh'
