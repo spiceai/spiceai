@@ -140,6 +140,18 @@ pub enum Error {
     UpstreamExecution {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display(
+        "Row count mismatch after partitioning unmatched rows for table {table}: expected {expected} but got {actual}"
+    ))]
+    PartitionRowCountMismatch {
+        table: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[snafu(display("No sender for assigned executor {executor_id} for table {table}"))]
+    NoSenderForExecutor { executor_id: String, table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -241,7 +253,7 @@ pub(crate) async fn forward_partitioned_batches(
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
             partition_manager
-                .initialize_blank_metadata(path)
+                .initialize_metadata(path, raw_partition_by.to_vec())
                 .await
                 .map_err(|source| Error::CreateMetadata {
                     table: path.to_string(),
@@ -418,6 +430,18 @@ async fn route_batch_and_assign_unseen(
         })
         .collect();
 
+    {
+        let total_partitioned: usize = entries.iter().map(|(_, _, b)| b.num_rows()).sum();
+        ensure!(
+            total_partitioned == unmatched.num_rows(),
+            PartitionRowCountMismatchSnafu {
+                table: path.to_string(),
+                expected: unmatched.num_rows(),
+                actual: total_partitioned,
+            }
+        );
+    }
+
     if entries.is_empty() {
         return Ok(());
     }
@@ -496,11 +520,15 @@ async fn route_batch_and_assign_unseen(
         }
 
         // Forward the rows.
-        if let Some(tx) = senders.get(&executor_id) {
-            tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
+        let tx = senders
+            .get(&executor_id)
+            .ok_or_else(|| Error::NoSenderForExecutor {
                 executor_id: executor_id.clone(),
+                table: path.to_string(),
             })?;
-        }
+        tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
+            executor_id: executor_id.clone(),
+        })?;
     }
 
     Ok(())
@@ -565,13 +593,23 @@ async fn route_matched_and_collect_unmatched(
             continue;
         }
 
+        // If there is no active sender for this executor (e.g. it disconnected),
+        // leave the matched rows in `remaining` so they are treated as unmatched
+        // and re-assigned to a connected executor. This prevents silent data loss.
+        let Some(tx) = senders.get(executor_id) else {
+            tracing::warn!(
+                executor_id,
+                rows = matched_count,
+                "Skipping send to disconnected executor; rows will be re-assigned"
+            );
+            continue;
+        };
+
         let filtered =
             arrow::compute::filter_record_batch(&remaining, mask).context(FilterBatchSnafu)?;
-        if let Some(tx) = senders.get(executor_id) {
-            tx.send(filtered).await.map_err(|_| Error::SendBatch {
-                executor_id: executor_id.clone(),
-            })?;
-        }
+        tx.send(filtered).await.map_err(|_| Error::SendBatch {
+            executor_id: executor_id.clone(),
+        })?;
 
         // If every remaining row was matched, nothing left to process.
         if matched_count == remaining.num_rows() {
@@ -582,6 +620,14 @@ async fn route_matched_and_collect_unmatched(
         let negated = arrow::compute::not(mask).context(FilterBatchSnafu)?;
         remaining =
             arrow::compute::filter_record_batch(&remaining, &negated).context(FilterBatchSnafu)?;
+    }
+
+    if remaining.num_rows() > 0 {
+        tracing::debug!(
+            total_rows = batch.num_rows(),
+            unmatched_rows = remaining.num_rows(),
+            "Some rows did not match any executor filter; routing to new partition assignments"
+        );
     }
 
     Ok(remaining)

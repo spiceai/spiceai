@@ -41,6 +41,8 @@ pub(crate) struct AppCreateConfig {
     pub executor_cpu_request: Option<String>,
     pub executor_memory_request: Option<String>,
     pub executor_storage_size_gb: Option<f64>,
+    pub ephemeral_storage_limit_gb: Option<String>,
+    pub organization_tag: Option<String>,
 }
 
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
@@ -109,6 +111,7 @@ fn resources_over(
     cpu_limit: Option<&str>,
     cpu_request: Option<&str>,
     memory_request: Option<&str>,
+    ephemeral_storage_limit: Option<&str>,
 ) -> AppResources {
     let memory_limit_val = memory_limit
         .map(ToString::to_string)
@@ -125,7 +128,7 @@ fn resources_over(
         limits: AppResourceLimits {
             cpu: cpu_limit_val,
             memory: memory_limit_val,
-            ephemeral_storage: None,
+            ephemeral_storage: ephemeral_storage_limit.map(ToString::to_string),
         },
         requests: if cpu_request_val.is_some() || memory_request_val.is_some() {
             Some(AppResourceRequests {
@@ -157,6 +160,7 @@ pub(crate) async fn ensure_spice_cloud_app(
         config.app_cpu_limit.as_deref(),
         config.app_cpu_request.as_deref(),
         config.app_memory_request.as_deref(),
+        config.ephemeral_storage_limit_gb.as_deref(),
     );
 
     // Executor — same resource defaults as scheduler; each field overridable independently.
@@ -168,6 +172,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             config.executor_cpu_limit.as_deref(),
             config.executor_cpu_request.as_deref(),
             config.executor_memory_request.as_deref(),
+            config.ephemeral_storage_limit_gb.as_deref(),
         )),
         storage_size_gb: config.executor_storage_size_gb,
     });
@@ -178,10 +183,15 @@ pub(crate) async fn ensure_spice_cloud_app(
             description: None,
             visibility: "private".to_string(),
             cname: Some(cname),
-            tags: Some(BTreeMap::from([(
-                "kind".to_string(),
-                "cluster".to_string(),
-            )])),
+            tags: {
+                let mut tags = BTreeMap::from([
+                    ("kind".to_string(), "cluster".to_string()),
+                ]);
+                if let Some(org) = &config.organization_tag {
+                    tags.insert("organization".to_string(), org.clone());
+                }
+                Some(tags)
+            },
             replicas: config.app_replicas,
             resources: Some(resources),
             executor,
