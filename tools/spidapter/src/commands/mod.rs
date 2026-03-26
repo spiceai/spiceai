@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,23 +20,45 @@ use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
     types::{
-        AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
+        AppExecutor, AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
         CreateDeploymentRequest, UpdateAppRequest,
     },
 };
 
 pub(crate) mod secrets;
 
+/// Resource and replica configuration for creating a Spice Cloud app.
+pub(crate) struct AppCreateConfig {
+    pub app_memory_limit: Option<String>,
+    pub app_cpu_limit: Option<String>,
+    pub app_cpu_request: Option<String>,
+    pub app_memory_request: Option<String>,
+    pub app_replicas: Option<i32>,
+    pub app_storage_size_gb: Option<f64>,
+    pub executor_replicas: i32,
+    pub executor_memory_limit: Option<String>,
+    pub executor_cpu_limit: Option<String>,
+    pub executor_cpu_request: Option<String>,
+    pub executor_memory_request: Option<String>,
+    pub executor_storage_size_gb: Option<f64>,
+}
+
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
     api_url_override
-        .map(ToString::to_string)
-        .or_else(|| std::env::var("SPICE_CLOUD_API_URL").ok())
-        .unwrap_or_else(|| "https://api.spice.ai".to_string())
+        .map_or_else(|| "https://api.spice.ai".to_string(), ToString::to_string)
         .trim_end_matches('/')
         .to_string()
 }
 
-pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
+/// Resolve the Spice Cloud API token.
+///
+/// Uses `api_key_override` when provided; otherwise falls back to the
+/// `SPICEAI_API_KEY`, `SPICE_API_KEY`, `SPICE_SPICEAI_API_KEY`, and
+/// `SPICE_SPICEAI_TOKEN` environment variables (in that order).
+pub(crate) fn spice_cloud_token(api_key_override: Option<&str>) -> anyhow::Result<String> {
+    if let Some(key) = api_key_override {
+        return Ok(key.to_string());
+    }
     std::env::var("SPICEAI_API_KEY")
         .or_else(|_| std::env::var("SPICE_API_KEY"))
         .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
@@ -48,25 +70,107 @@ pub(crate) fn spice_cloud_token() -> anyhow::Result<String> {
         })
 }
 
-/// Build a [`CloudClient`] from an optional API URL override and environment token.
-pub(crate) fn build_cloud_client(api_url_override: Option<&str>) -> anyhow::Result<CloudClient> {
+/// Build a [`CloudClient`] from an optional API URL override, optional API key
+/// override, and environment token fallback.
+pub(crate) fn build_cloud_client(
+    api_url_override: Option<&str>,
+    api_key_override: Option<&str>,
+) -> anyhow::Result<CloudClient> {
     let base_url = spice_cloud_base_url(api_url_override);
-    let token = spice_cloud_token()?;
+    let token = spice_cloud_token(api_key_override)?;
     Ok(CloudClient::new(&base_url)?
         .with_token(token)
         .with_timeout(Duration::from_secs(600))?)
 }
 
+/// Default resource allocation shared by scheduler and executor when no overrides are provided.
+fn default_resources() -> AppResources {
+    AppResources {
+        limits: AppResourceLimits {
+            cpu: None,
+            memory: "16Gi".to_string(),
+            ephemeral_storage: None,
+        },
+        requests: Some(AppResourceRequests {
+            cpu: Some("0.1".to_string()),
+            memory: Some("256Mi".to_string()),
+        }),
+    }
+}
+
+/// Build an [`AppResources`] by merging explicit overrides on top of a set of
+/// base (default) resources.
+///
+/// Each field is overridden independently: only the values that are `Some`
+/// replace the corresponding field in `base`.
+fn resources_over(
+    base: AppResources,
+    memory_limit: Option<&str>,
+    cpu_limit: Option<&str>,
+    cpu_request: Option<&str>,
+    memory_request: Option<&str>,
+) -> AppResources {
+    let memory_limit_val = memory_limit
+        .map(ToString::to_string)
+        .unwrap_or(base.limits.memory);
+    let cpu_limit_val = cpu_limit.map(ToString::to_string).or(base.limits.cpu);
+    let cpu_request_val = cpu_request
+        .map(ToString::to_string)
+        .or(base.requests.as_ref().and_then(|r| r.cpu.clone()));
+    let memory_request_val = memory_request
+        .map(ToString::to_string)
+        .or(base.requests.as_ref().and_then(|r| r.memory.clone()));
+
+    AppResources {
+        limits: AppResourceLimits {
+            cpu: cpu_limit_val,
+            memory: memory_limit_val,
+            ephemeral_storage: None,
+        },
+        requests: if cpu_request_val.is_some() || memory_request_val.is_some() {
+            Some(AppResourceRequests {
+                cpu: cpu_request_val,
+                memory: memory_request_val,
+            })
+        } else {
+            None
+        },
+    }
+}
+
 pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
-) -> anyhow::Result<(i64, Option<String>)> {
+    config: &AppCreateConfig,
+) -> anyhow::Result<i64> {
     let apps = cloud.list_apps().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
-        return Ok((app.id, app.api_key));
+        return Ok(app.id);
     }
 
     let cname = resolve_default_cname(cloud).await?;
+
+    // App (scheduler) resources — start from defaults, then apply any overrides.
+    let resources = resources_over(
+        default_resources(),
+        config.app_memory_limit.as_deref(),
+        config.app_cpu_limit.as_deref(),
+        config.app_cpu_request.as_deref(),
+        config.app_memory_request.as_deref(),
+    );
+
+    // Executor — same resource defaults as scheduler; each field overridable independently.
+    let executor = Some(AppExecutor {
+        replicas: Some(config.executor_replicas),
+        resources: Some(resources_over(
+            default_resources(),
+            config.executor_memory_limit.as_deref(),
+            config.executor_cpu_limit.as_deref(),
+            config.executor_cpu_request.as_deref(),
+            config.executor_memory_request.as_deref(),
+        )),
+        storage_size_gb: config.executor_storage_size_gb,
+    });
 
     let create_result = cloud
         .create_app(&CreateAppRequest {
@@ -78,27 +182,23 @@ pub(crate) async fn ensure_spice_cloud_app(
                 "kind".to_string(),
                 "cluster".to_string(),
             )])),
-            resources: Some(AppResources {
-                limits: AppResourceLimits {
-                    cpu: None,
-                    memory: "32Gi".to_string(),
-                    ephemeral_storage: None,
-                },
-                requests: Some(AppResourceRequests {
-                    cpu: Some("0.1".to_string()),
-                    memory: Some("256Mi".to_string()),
-                }),
-            }),
+            replicas: config.app_replicas,
+            resources: Some(resources),
+            executor,
         })
         .await;
 
     match create_result {
-        Ok(app) => Ok((app.id, app.api_key)),
+        Ok(app) => {
+            apply_storage_config(cloud, app.id, config).await?;
+            Ok(app.id)
+        }
         Err(spice_cloud_client::error::Error::Conflict { .. }) => {
             // Race condition — another caller created it; re-fetch
             let apps = cloud.list_apps().await?;
             if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
-                return Ok((app.id, app.api_key));
+                apply_storage_config(cloud, app.id, config).await?;
+                return Ok(app.id);
             }
             Err(anyhow::anyhow!(
                 "App '{app_name}' not found after conflict on create"
@@ -108,6 +208,46 @@ pub(crate) async fn ensure_spice_cloud_app(
             "Failed to create Spice Cloud app '{app_name}': {e}"
         )),
     }
+}
+
+/// Apply storage configuration to an app via the update API if any storage
+/// sizes are configured.
+async fn apply_storage_config(
+    cloud: &CloudClient,
+    app_id: i64,
+    config: &AppCreateConfig,
+) -> anyhow::Result<()> {
+    let has_storage =
+        config.app_storage_size_gb.is_some() || config.executor_storage_size_gb.is_some();
+
+    if !has_storage {
+        return Ok(());
+    }
+
+    let executor = config.executor_storage_size_gb.map(|size| AppExecutor {
+        replicas: None,
+        resources: None,
+        storage_size_gb: Some(size),
+    });
+
+    cloud
+        .update_app(
+            app_id,
+            &UpdateAppRequest {
+                description: None,
+                visibility: None,
+                replicas: None,
+                image_tag: None,
+                region: None,
+                spicepod: None,
+                resources: None,
+                executor,
+                storage_size_gb: config.app_storage_size_gb,
+            },
+        )
+        .await?;
+
+    Ok(())
 }
 
 pub(crate) async fn resolve_default_cname(cloud: &CloudClient) -> anyhow::Result<String> {
@@ -165,6 +305,8 @@ pub(crate) async fn apply_spicepod_to_app(
                 region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
                 resources: None,
+                executor: None,
+                storage_size_gb: None,
             },
         )
         .await?;

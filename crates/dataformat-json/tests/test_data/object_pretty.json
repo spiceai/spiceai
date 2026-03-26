@@ -1,0 +1,9 @@
+{
+  "name": "Alice",
+  "age": 30,
+  "address": {
+    "city": "Wonderland",
+    "zip": "12345"
+  },
+  "tags": ["curious", "adventurous"]
+}

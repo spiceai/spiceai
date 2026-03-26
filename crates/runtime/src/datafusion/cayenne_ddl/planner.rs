@@ -26,9 +26,13 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
-use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
+use super::logical_nodes::{
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
+    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+};
 use super::physical_plans::{
-    CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
+    CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDropTableExec,
+    DistributedCayenneDeleteExec, DistributedCayenneUpdateExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 
@@ -67,15 +71,21 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
         let catalog_list = Arc::<dyn CatalogProviderList>::clone(session_state.catalog_list());
 
         if let Some(create) = node.as_any().downcast_ref::<CayenneCreateTableNode>() {
-            return Ok(Some(Arc::new(CayenneCreateTableExec::new(
-                create.table_name.clone(),
-                Arc::clone(&create.arrow_schema),
-                create.if_not_exists,
-                create.df_catalog_name.clone(),
-                create.df_schema_name.clone(),
-                catalog_list,
-                self.executor_registry.clone(),
-            ))));
+            return Ok(Some(Arc::new(
+                CayenneCreateTableExecBuilder::new(
+                    create.table_name.clone(),
+                    Arc::clone(&create.arrow_schema),
+                    create.df_catalog_name.clone(),
+                    create.df_schema_name.clone(),
+                    create.primary_key.clone(),
+                    catalog_list,
+                )
+                .if_not_exists(create.if_not_exists)
+                .executor_registry(self.executor_registry.clone())
+                .partition_expr(create.partition_expr.clone())
+                .partition_expr_sql(create.partition_expr_sql.clone())
+                .build(),
+            )));
         }
 
         if let Some(create_schema) = node.as_any().downcast_ref::<CayenneCreateSchemaNode>() {
@@ -95,6 +105,35 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 drop.df_schema_name.clone(),
                 catalog_list,
                 self.executor_registry.clone(),
+            ))));
+        }
+
+        if let Some(delete) = node.as_any().downcast_ref::<DistributedCayenneDeleteNode>() {
+            let input = _physical_inputs.first().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "DistributedCayenneDeleteNode requires exactly one physical input".to_string(),
+                )
+            })?;
+            return Ok(Some(Arc::new(DistributedCayenneDeleteExec::new(
+                delete.table_name.clone(),
+                self.executor_registry.clone(),
+                delete.filter_sql.clone(),
+                Arc::clone(input),
+            ))));
+        }
+
+        if let Some(update) = node.as_any().downcast_ref::<DistributedCayenneUpdateNode>() {
+            let input = _physical_inputs.first().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "DistributedCayenneUpdateNode requires exactly one physical input".to_string(),
+                )
+            })?;
+            return Ok(Some(Arc::new(DistributedCayenneUpdateExec::new(
+                update.table_name.clone(),
+                self.executor_registry.clone(),
+                update.filter_sql.clone(),
+                update.assignments_sql.clone(),
+                Arc::clone(input),
             ))));
         }
 

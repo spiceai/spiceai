@@ -65,6 +65,7 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
+adbc = ["runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
@@ -76,6 +77,7 @@ cuda = ["runtime/cuda"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
+    "adbc",
     "duckdb",
     "postgres",
     "sqlite",

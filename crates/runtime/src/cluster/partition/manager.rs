@@ -60,6 +60,26 @@ pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AllocationResult {
+    pub previously_assigned: Vec<PartitionValue>,
+    pub newly_assigned: Vec<PartitionValue>,
+}
+
+impl AllocationResult {
+    #[must_use]
+    pub fn all_assigned(self) -> Vec<PartitionValue> {
+        let mut all = self.previously_assigned;
+        all.extend(self.newly_assigned);
+        all
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.previously_assigned.len() + self.newly_assigned.len()
+    }
+}
+
 impl PartitionManager {
     /// Creates a new partition manager with the given object store.
     ///
@@ -69,6 +89,12 @@ impl PartitionManager {
         Self {
             state: ObjectState::new(store).with_prefix(PARTITION_PREFIX),
         }
+    }
+
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.state = self.state.with_prefix(prefix);
+        self
     }
 
     /// Get partition metadata for a table from object store.
@@ -95,12 +121,29 @@ impl PartitionManager {
 
     /// Initialize a blank partition metadata file for a table.
     ///
-    /// This acts as a temporary lock during scheduler startup. If the file already exists,
-    /// this is a no-op and returns `Ok(false)`.
+    /// For acceleration table partitions this acts as a temporary lock during scheduler startup (other
+    ///  schedulers will not re-initialize, since a file exists, even if blank). If the file already
+    /// exists, this is a no-op and returns `Ok(false)`.
     pub async fn initialize_blank_metadata(&self, table: &TableReference) -> Result<bool> {
+        self.initialize_metadata(table, Vec::new()).await
+    }
+
+    /// Initialize partition metadata for a table with the given partition expression SQL strings.
+    ///
+    /// If the file already exists, this is a no-op and returns `Ok(false)`.
+    pub async fn initialize_metadata(
+        &self,
+        table: &TableReference,
+        partition_expressions: Vec<String>,
+    ) -> Result<bool> {
+        // If its cached, can avoid insert operation. Optimisation to reduce object store calls.
+        if self.get_cached_table_metadata(table).is_some() {
+            return Ok(false);
+        }
         let key = table.to_string();
         let now_ms = now_ms()?;
-        let metadata = TablePartitionMetadata::blank(table.to_string(), now_ms);
+        let mut metadata = TablePartitionMetadata::blank(table.to_string(), now_ms);
+        metadata.partition_expressions = partition_expressions;
 
         match self
             .state
@@ -116,10 +159,13 @@ impl PartitionManager {
     /// Update partition metadata with discovered partitions, all marked as unassigned.
     ///
     /// This replaces the partitions list with the provided partition values.
+    /// If `partition_expressions` is non-empty, it also sets the SQL expression strings
+    /// (only when currently empty, to avoid overwriting values set during table creation).
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
         partition_values: Vec<HashMap<String, String>>,
+        partition_expressions: Vec<String>,
     ) -> Result<()> {
         let key = table.to_string();
         let now_ms = now_ms()?;
@@ -134,20 +180,22 @@ impl PartitionManager {
             .map(PartitionMetadata::new)
             .collect();
         metadata.updated_at = now_ms;
+        if metadata.partition_expressions.is_empty() {
+            metadata.partition_expressions = partition_expressions;
+        }
 
         self.write_metadata(&key, metadata).await
     }
 
     /// Allocates unassigned partitions to an executor.
     ///
-    /// Returns the list of allocated partitions.
     /// Uses OCC to atomically update metadata.
     pub async fn allocate_partitions(
         &self,
         table: &TableReference,
         executor_id: &str,
         limit: usize,
-    ) -> Result<Vec<PartitionValue>> {
+    ) -> Result<AllocationResult> {
         let key = table.to_string();
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
@@ -160,39 +208,44 @@ impl PartitionManager {
                 .await?
                 .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
-            let mut allocated: Vec<_> = metadata
-                .partitions
-                .iter()
-                .filter_map(|p| {
-                    if p.is_assigned_to(executor_id) {
-                        Some(p.partition_value.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut result = AllocationResult {
+                newly_assigned: vec![],
+                previously_assigned: metadata
+                    .partitions
+                    .iter()
+                    .filter_map(|p| {
+                        if p.is_assigned_to(executor_id) {
+                            Some(p.partition_value.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            };
             let mut changes = false;
 
             for partition in &mut metadata.partitions {
-                if allocated.len() >= limit {
+                if result.count() >= limit {
                     break;
                 }
 
                 if !partition.is_assigned() {
                     partition.assign_to(executor_id.to_string(), now_ms);
-                    allocated.push(partition.partition_value.clone());
+                    result
+                        .newly_assigned
+                        .push(partition.partition_value.clone());
                     changes = true;
                 }
             }
 
             if !changes {
-                return Ok(allocated);
+                return Ok(result);
             }
 
             metadata.updated_at = now_ms;
 
             match self.write_metadata(&key, metadata).await {
-                Ok(()) => return Ok(allocated),
+                Ok(()) => return Ok(result),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
                         tokio::time::sleep(delay).await;
@@ -268,6 +321,73 @@ impl PartitionManager {
         self.state.refresh().await.context(MetadataAccessSnafu {
             table: String::from("<refresh>"),
         })
+    }
+
+    /// Adds new partitions to a table's metadata and assigns each to its
+    /// respective executor in a single OCC write. If a partition already exists,
+    /// it is assigned (or left as-is if already assigned to the same executor).
+    ///
+    /// `assignments` is a list of (`partition_value`, `executor_id`) tuples.
+    pub async fn add_and_assign_partitions(
+        &self,
+        table: &TableReference,
+        assignments: &[(&PartitionValue, &str)],
+    ) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+
+        let key = table.to_string();
+        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
+            .max_retries(Some(5))
+            .build();
+
+        loop {
+            let now_ms = now_ms()?;
+            let mut metadata = self
+                .get_table_metadata(table)
+                .await?
+                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
+
+            let mut changes = false;
+
+            for &(partition_value, executor_id) in assignments {
+                let existing = metadata
+                    .partitions
+                    .iter_mut()
+                    .find(|p| p.partition_value == *partition_value);
+
+                if let Some(p) = existing {
+                    if !p.is_assigned_to(executor_id) {
+                        p.assign_to(executor_id.to_string(), now_ms);
+                        changes = true;
+                    }
+                } else {
+                    let mut new_partition = PartitionMetadata::new(partition_value.clone());
+                    new_partition.assign_to(executor_id.to_string(), now_ms);
+                    metadata.add_partition(new_partition);
+                    changes = true;
+                }
+            }
+
+            if !changes {
+                return Ok(());
+            }
+
+            metadata.updated_at = now_ms;
+
+            match self.write_metadata(&key, metadata).await {
+                Ok(()) => return Ok(()),
+                Err(Error::ConcurrentModification { .. }) => {
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(Error::ConcurrentModification { table: key.clone() });
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.

@@ -17,8 +17,8 @@ limitations under the License.
 //! Turso implementation of the metastore backend.
 
 use super::{
-    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreValue, QueryParams,
-    QueryRowParams,
+    duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
+    MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
+use turso_shared::JOURNAL_MODE_SQL_LITERAL;
+
+const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 
 /// Turso-based metastore backend.
 pub struct TursoMetastore {
@@ -113,7 +116,20 @@ impl TursoMetastore {
                 message: format!("Failed to set busy timeout: {e}"),
             })?;
 
-        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
+        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set journal mode: {e}"),
+            })?;
+
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to enable foreign keys: {e}"),
+            })?;
+
+        // NORMAL synchronous mode: safe with MVCC, more performant than FULL
         conn.execute("PRAGMA synchronous = NORMAL", ())
             .await
             .map_err(|e| CatalogError::Database {
@@ -134,8 +150,7 @@ impl TursoMetastore {
     /// Schema for the `cayenne_table` table.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_uuid TEXT NOT NULL,
+            table_id TEXT PRIMARY KEY,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
@@ -149,11 +164,16 @@ impl TursoMetastore {
         )
     ";
 
+    const TABLE_NAME_UNIQUE_INDEX_DDL: &'static str = r"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_table_name_unique
+        ON cayenne_table(table_name)
+    ";
+
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            delete_file_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -172,8 +192,8 @@ impl TursoMetastore {
     /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            partition_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             partition_columns_json TEXT NOT NULL,
             partition_values_json TEXT NOT NULL,
             partition_key TEXT NOT NULL,
@@ -195,8 +215,8 @@ impl TursoMetastore {
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            insert_record_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -211,7 +231,7 @@ impl TursoMetastore {
     /// <= the delete file's `sequence_number`.
     const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
-            table_id INTEGER NOT NULL,
+            table_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -315,7 +335,7 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
 /// Convert Turso errors to `CatalogError`, distinguishing constraint violations.
 fn convert_turso_error(e: turso::Error) -> CatalogError {
     match e {
-        // turso 0.4.x uses dedicated Constraint variant for constraint violations
+        // turso exposes a dedicated Constraint variant for constraint violations
         turso::Error::Constraint(ref msg) => CatalogError::ConstraintViolation {
             message: msg.clone(),
         },
@@ -332,8 +352,9 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
+            Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,
@@ -344,6 +365,12 @@ impl MetastoreBackend for TursoMetastore {
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
+            })?;
+
+        conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: duplicate_delete_file_index_error_message("Turso/libSQL", e),
             })?;
 
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored

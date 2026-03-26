@@ -22,7 +22,6 @@ limitations under the License.
 use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
     PROTECTED_SNAPSHOTS_LOCK_POISONED, STAGING_DIR_NAME, STAGING_WAL_FILENAME,
-    WRITE_SEMAPHORE_CLOSED,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -44,7 +43,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::sink::DataSinkExec;
-use datafusion::execution::context::{SessionContext, SessionState};
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
@@ -352,8 +351,8 @@ impl CayenneTableProvider {
 
     /// Returns the table ID from the catalog.
     #[must_use]
-    pub(crate) fn table_id(&self) -> i64 {
-        self.table_metadata.table_id
+    pub(crate) fn table_id(&self) -> &str {
+        &self.table_metadata.table_id
     }
 
     /// Returns a reference to the write lock for serializing insert operations.
@@ -373,7 +372,7 @@ impl CayenneTableProvider {
     pub(crate) fn snapshot_dir_path_for(&self, snapshot_id: &str) -> std::path::PathBuf {
         Self::snapshot_dir_path(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             snapshot_id,
         )
     }
@@ -383,7 +382,7 @@ impl CayenneTableProvider {
     /// This clears any existing delete files since overwrite replaces all data.
     pub(crate) async fn commit_overwrite(&self, new_snapshot_id: &str) -> CatalogResult<()> {
         self.catalog
-            .commit_compaction(self.table_metadata.table_id, new_snapshot_id)
+            .commit_compaction(&self.table_metadata.table_id, new_snapshot_id)
             .await
     }
 
@@ -393,7 +392,7 @@ impl CayenneTableProvider {
     pub(crate) fn update_listing_table_for_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             new_snapshot_id,
         );
 
@@ -439,17 +438,17 @@ impl CayenneTableProvider {
             {
                 tracing::warn!(
                     "Failed to cleanup old S3 snapshots for table {}: {err}",
-                    self.table_metadata.table_id
+                    &self.table_metadata.table_id
                 );
             }
         } else {
             let table_path = self.table_metadata.path.clone();
-            let table_id = self.table_metadata.table_id;
+            let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = Self::cleanup_old_snapshots_blocking(
                     &table_path,
-                    table_id,
+                    &table_id,
                     &current_snapshot,
                     &protected_snapshot_ids,
                 ) {
@@ -473,11 +472,11 @@ impl CayenneTableProvider {
     /// * `snapshot_id` - The snapshot identifier
     pub(super) fn snapshot_dir_path(
         table_path: &str,
-        table_id: i64,
+        table_id: &str,
         snapshot_id: &str,
     ) -> std::path::PathBuf {
         std::path::PathBuf::from(table_path)
-            .join(table_id.to_string())
+            .join(table_id)
             .join(snapshot_id)
     }
 
@@ -528,7 +527,7 @@ impl CayenneTableProvider {
 
         let snapshot_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             snapshot_id,
         );
 
@@ -698,7 +697,7 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table (local path or S3 URL)
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_url(table_path: &str, table_id: i64, snapshot_id: &str) -> String {
+    fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
         if table_path.starts_with("s3://") {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
@@ -742,7 +741,7 @@ impl CayenneTableProvider {
             // Local FS: remove and recreate the directory
             let staging_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 STAGING_DIR_NAME,
             );
             match tokio::fs::remove_dir_all(&staging_dir).await {
@@ -781,12 +780,12 @@ impl CayenneTableProvider {
     async fn move_staging_files_local(&self, current_snapshot: &str) -> Result<()> {
         let staging_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             STAGING_DIR_NAME,
         );
         let target_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             current_snapshot,
         );
 
@@ -977,11 +976,11 @@ impl CayenneTableProvider {
     /// It must be called from within `tokio::task::spawn_blocking`.
     fn cleanup_old_snapshots_blocking(
         table_path: &str,
-        table_id: i64,
+        table_id: &str,
         current_snapshot_id: &str,
         protected_snapshot_ids: &HashSet<String>,
     ) -> CatalogResult<()> {
-        let table_dir = std::path::PathBuf::from(table_path).join(table_id.to_string());
+        let table_dir = std::path::PathBuf::from(table_path).join(table_id);
 
         // Check if table directory exists
         if !table_dir.exists() {
@@ -1120,7 +1119,7 @@ impl CayenneTableProvider {
         // All tables have a snapshot ID (created on table initialization)
         let snapshot_dir_url = Self::snapshot_dir_url(
             &table_metadata.path,
-            table_metadata.table_id,
+            &table_metadata.table_id,
             &table_metadata.current_snapshot_id,
         );
 
@@ -1175,10 +1174,10 @@ impl CayenneTableProvider {
         // Load deletion vectors and insert records once at initialization
         // to avoid repeated SQLite queries on every scan.
         // Returns the fully constructed PkDeletionStrategy with embedded caches.
-        let table_id = table_metadata.table_id;
+        let table_id = table_metadata.table_id.clone();
         let catalog_for_load = Arc::clone(&catalog);
         let pk_deletion_strategy =
-            Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy_kind)
+            Self::load_deletion_vectors_all(&table_id, catalog_for_load, pk_deletion_strategy_kind)
                 .await?;
 
         let listing_table = Self::create_listing_table(
@@ -1192,7 +1191,7 @@ impl CayenneTableProvider {
         // Protected snapshots are those with sequence > max_delete_sequence.
         // They contain data written after deletions and should skip deletion filtering.
         let protected_snapshots =
-            Self::load_protected_snapshots(Arc::clone(&catalog), table_id, &pk_deletion_strategy)
+            Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
 
         // Register the S3 object store in the shared RuntimeEnv once during
@@ -1298,7 +1297,7 @@ impl CayenneTableProvider {
 
         // Write data to the new snapshot
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .write_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
             .await?;
 
         tracing::debug!(
@@ -1311,7 +1310,7 @@ impl CayenneTableProvider {
         // Record the snapshot's sequence number in the catalog
         self.catalog
             .set_snapshot_sequence(
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &new_snapshot_id,
                 sequence_number,
             )
@@ -1369,28 +1368,27 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Write a stream of record batches to a specific snapshot directory, chunking into
-    /// parallel writes for efficiency.
+    /// Write a stream of record batches to a specific snapshot directory.
     ///
-    /// This is used during compaction operations where data needs to be written to a
-    /// new snapshot.
+    /// This is used during compaction operations where data needs to be persisted
+    /// to a new snapshot.
     ///
     /// # Arguments
     ///
     /// * `stream` - The stream of record batches to write
-    /// * `target_size_bytes` - Target size for each output file in bytes
+    /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
     ///
     /// # Returns
     ///
-    /// A tuple of (total rows written, number of files written)
+    /// A tuple of (total rows written, number of writer operations)
     ///
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
-    pub(crate) async fn chunk_and_write_parallel_to_snapshot(
+    pub(crate) async fn write_to_snapshot(
         &self,
-        mut stream: SendableRecordBatchStream,
+        stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         snapshot_id: &str,
     ) -> Result<(u64, usize)> {
@@ -1400,7 +1398,7 @@ impl CayenneTableProvider {
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             snapshot_id,
         );
 
@@ -1412,100 +1410,45 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        // Create session context once with object store registered (if S3),
-        // then share the session state across all parallel write tasks.
+        // Create session context once with object store registered (if S3).
         let session_state = Arc::new(self.create_session_context().state());
-
-        // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let semaphore = Arc::clone(self.context.upload_semaphore());
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
         let start_time = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let total_bytes_written = Arc::new(AtomicUsize::new(0));
-        let files_written = Arc::new(AtomicUsize::new(0));
-        let mut write_tasks = tokio::task::JoinSet::new();
+        let total_rows_written = Arc::new(AtomicU64::new(0));
 
         // Log when starting S3 upload process
         if is_s3_storage {
             tracing::info!(
-                "Starting S3 upload to snapshot {} for table {} (target chunk size: {})",
+                "Starting S3 upload to snapshot {} for table {} (writer target file size: {})",
                 snapshot_id,
                 self.table_metadata.table_name,
                 format_bytes(target_size_bytes)
             );
         }
 
-        // Pre-allocate chunk vector with estimated capacity
-        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
-        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
-        let mut current_size = 0usize;
-        let mut total_rows = 0u64;
-        let mut chunk_count = 0usize;
+        let tracked_schema = Arc::clone(&self.table_metadata.schema);
+        let tracked_stream = {
+            let total_bytes_written = Arc::clone(&total_bytes_written);
+            let total_rows_written = Arc::clone(&total_rows_written);
+            let last_progress_ms = Arc::clone(&last_progress_ms);
+            let table_name = self.table_metadata.table_name.clone();
+            let start = start_time;
 
-        let snapshot_listing_table = Arc::new(snapshot_listing_table);
+            stream.map(move |batch_result| {
+                if let Ok(batch) = &batch_result {
+                    total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                    total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-
-            let batch_size = batch.get_array_memory_size();
-
-            // If adding this batch would exceed target size and we have data, write current chunk
-            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
-                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|_| {
-                    Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: WRITE_SEMAPHORE_CLOSED,
-                    }
-                })?;
-
-                let chunk_to_write = std::mem::replace(
-                    &mut current_chunk,
-                    Vec::with_capacity(estimated_batches_per_chunk),
-                );
-                let chunk_size = current_size;
-                current_size = 0;
-                chunk_count += 1;
-
-                let listing_table_clone = Arc::clone(&snapshot_listing_table);
-                let total_bytes = Arc::clone(&total_bytes_written);
-                let files_count = Arc::clone(&files_written);
-                let progress_time = Arc::clone(&last_progress_ms);
-                let is_s3 = is_s3_storage;
-                let table_name = self.table_metadata.table_name.clone();
-                let start = start_time;
-                let current_chunk_num = chunk_count;
-                let state = Arc::clone(&session_state);
-
-                if is_s3 {
-                    tracing::info!(
-                        "Starting S3 upload for {} chunk {} ({})...",
-                        table_name,
-                        current_chunk_num,
-                        format_bytes(chunk_size)
-                    );
-                }
-
-                write_tasks.spawn(async move {
-                    let result = Self::write_chunk_to_listing_table(
-                        &listing_table_clone,
-                        chunk_to_write,
-                        &state,
-                    )
-                    .await;
-
-                    if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
-                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
-
+                    if is_s3_storage {
                         let elapsed = start.elapsed();
                         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = progress_time.load(Ordering::Relaxed);
-                        let should_log =
-                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
-                        if should_log {
-                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                        let last_logged = last_progress_ms.load(Ordering::Relaxed);
+                        if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
+                            let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
                             let throughput = if elapsed.as_secs_f64() > 0.0 {
                                 #[expect(clippy::cast_precision_loss)]
                                 let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
@@ -1514,75 +1457,37 @@ impl CayenneTableProvider {
                                 "calculating...".to_string()
                             };
                             tracing::info!(
-                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                "S3 upload for {}: streamed {} in {:.1}s, {}",
                                 table_name,
-                                file_num,
                                 format_bytes(bytes_so_far),
                                 elapsed.as_secs_f64(),
                                 throughput
                             );
-                            progress_time.store(elapsed_ms, Ordering::Relaxed);
+                            last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
                         }
                     }
-
-                    drop(permit);
-                    result
-                });
-            }
-
-            current_size += batch_size;
-            current_chunk.push(batch);
-        }
-
-        // Write final chunk if non-empty
-        if !current_chunk.is_empty() {
-            let permit =
-                Arc::clone(&semaphore)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: WRITE_SEMAPHORE_CLOSED,
-                    })?;
-
-            chunk_count += 1;
-            let final_chunk_size = current_size;
-
-            let listing_table_clone = Arc::clone(&snapshot_listing_table);
-            let total_bytes = Arc::clone(&total_bytes_written);
-            let files_count = Arc::clone(&files_written);
-            let is_s3 = is_s3_storage;
-            let state = Arc::clone(&session_state);
-
-            write_tasks.spawn(async move {
-                let result =
-                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk, &state)
-                        .await;
-
-                if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
-                    files_count.fetch_add(1, Ordering::Relaxed);
                 }
+                batch_result
+            })
+        };
 
-                drop(permit);
-                result
-            });
-        }
+        let tracked_stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&tracked_schema), tracked_stream);
+        let stream_exec = Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
 
-        // Wait for all writes to complete and collect row counts
-        while let Some(result) = write_tasks.join_next().await {
-            let row_count = result.map_err(|e| Error::TaskPanicked {
-                table: self.table_metadata.table_name.clone(),
-                source: e,
-            })??;
-            total_rows += row_count;
-        }
+        let insert_plan = snapshot_listing_table
+            .insert_into(session_state.as_ref(), stream_exec, InsertOp::Append)
+            .await?;
+
+        collect(insert_plan, session_state.task_ctx()).await?;
+
+        let total_rows = total_rows_written.load(Ordering::Relaxed);
+        let writer_ops = usize::from(total_rows > 0); // 1 writer op if we wrote any rows, otherwise 0
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
             let elapsed = start_time.elapsed();
             let total_bytes = total_bytes_written.load(Ordering::Relaxed);
-            let files_count = files_written.load(Ordering::Relaxed);
             let throughput = if elapsed.as_secs_f64() > 0.0 {
                 #[expect(clippy::cast_precision_loss)]
                 let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
@@ -1591,57 +1496,18 @@ impl CayenneTableProvider {
                 "N/A".to_string()
             };
             tracing::info!(
-                "Completed S3 upload for {} to snapshot {}: {} rows in {} files ({}) in {:.1}s, {}",
+                "Completed S3 upload for {} to snapshot {}: {} rows across {} writer operation(s) ({}) in {:.1}s, {}",
                 self.table_metadata.table_name,
                 snapshot_id,
                 total_rows,
-                files_count,
+                writer_ops,
                 format_bytes(total_bytes),
                 elapsed.as_secs_f64(),
                 throughput
             );
         }
 
-        Ok((total_rows, chunk_count))
-    }
-
-    /// Write a chunk of record batches to a specific `ListingTable`.
-    ///
-    /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
-    ///
-    /// # Arguments
-    ///
-    /// * `listing_table` - The listing table to write to
-    /// * `chunk` - Record batches to write
-    /// * `state` - Shared session state (with object store already registered for S3)
-    async fn write_chunk_to_listing_table(
-        listing_table: &ListingTable,
-        chunk: Vec<RecordBatch>,
-        state: &SessionState,
-    ) -> Result<u64> {
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let schema = chunk[0].schema();
-        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
-
-        // Create a stream from the chunk batches
-        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
-        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-        let stream_exec = Arc::new(StreamingExec::new(
-            Arc::clone(&schema),
-            Box::pin(chunk_stream),
-        ));
-
-        let insert_plan = listing_table
-            .insert_into(state, stream_exec, InsertOp::Append)
-            .await?;
-
-        collect(insert_plan, state.task_ctx()).await?;
-
-        Ok(row_count)
+        Ok((total_rows, writer_ops))
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -1822,7 +1688,7 @@ impl CayenneTableProvider {
         for (snapshot_id, max_delete_seq_at_creation) in &protected_snapshots {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 snapshot_id,
             );
 
@@ -2292,7 +2158,7 @@ impl CayenneTableProvider {
         // the next delete will be properly filtered.
         let delete_sequence = self
             .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Failed to get delete sequence number: {err}"),
@@ -2370,7 +2236,7 @@ impl CayenneTableProvider {
         if !pk_bytes_list_for_insert_records.is_empty() {
             self.catalog
                 .add_insert_records_batch(
-                    self.table_metadata.table_id,
+                    &self.table_metadata.table_id,
                     pk_bytes_list_for_insert_records,
                     insert_sequence,
                 )
@@ -2620,7 +2486,7 @@ impl CayenneTableProvider {
             if is_s3 {
                 let snapshot_url = Self::snapshot_dir_url(
                     &self.table_metadata.path,
-                    self.table_metadata.table_id,
+                    &self.table_metadata.table_id,
                     &new_snapshot_id,
                 );
 
@@ -2687,11 +2553,7 @@ impl CayenneTableProvider {
         }
 
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel_to_snapshot(
-                sorted_stream,
-                target_size_bytes,
-                &new_snapshot_id,
-            )
+            .write_to_snapshot(sorted_stream, target_size_bytes, &new_snapshot_id)
             .await?;
 
         if total_rows == 0 {
@@ -2721,7 +2583,7 @@ impl CayenneTableProvider {
         // the catalog yet, avoiding an inconsistent state.
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             &new_snapshot_id,
         );
         let new_listing_table = Self::create_listing_table(
@@ -2839,6 +2701,7 @@ impl CayenneTableProvider {
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
             Arc::clone(self.context.runtime_env()),
+            None, // Already under write_lock from write_all_append
         );
 
         let deleted_count =
@@ -2869,7 +2732,7 @@ impl CayenneTableProvider {
     /// Returns an error if deletion vectors cannot be loaded from the catalog.
     async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
         let fresh_strategy = Self::load_deletion_vectors_all(
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
         )
@@ -3075,6 +2938,98 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Refresh in-memory query state by reloading from the catalog (source of truth).
+    ///
+    /// This keeps existing `Arc<CayenneTableProvider>` handles usable after catalog refreshes
+    /// by updating mutable state in place instead of swapping provider objects.
+    ///
+    /// Acquires the write lock to prevent racing with in-progress writes/deletes. While holding
+    /// the lock, reloads deletion vectors, protected snapshots, and the listing table
+    /// directly from the catalog — NOT from the `source` provider, which may contain
+    /// stale state captured before the lock was acquired.
+    ///
+    /// The `source` parameter is used to validate that the table ID matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `source` refers to a different table (mismatched table IDs)
+    /// or if reloading from the catalog fails.
+    pub async fn refresh(&self, source: &Self) -> Result<()> {
+        if self.table_metadata.table_id != source.table_metadata.table_id {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "Cannot refresh table {} from different table {}",
+                    self.table_metadata.table_id, source.table_metadata.table_id,
+                ),
+            });
+        }
+
+        // Acquire the write lock so no insert/delete is in-flight while we reload state.
+        let _write_guard = self.write_lock.lock().await;
+
+        // Reload deletion vectors from the catalog (SQLite) — the source of truth.
+        // This picks up any deletions committed by writes that completed after the
+        // source provider was opened.
+        let fresh_strategy = Self::load_deletion_vectors_all(
+            &self.table_metadata.table_id,
+            Arc::clone(&self.catalog),
+            self.pk_deletion_strategy.strategy(),
+        )
+        .await
+        .map_err(|e| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: format!("Failed to reload deletion vectors during refresh: {e}"),
+        })?;
+
+        self.pk_deletion_strategy
+            .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
+
+        // Reload protected snapshots from the catalog.
+        let fresh_protected_snapshots = Self::load_protected_snapshots(
+            Arc::clone(&self.catalog),
+            &self.table_metadata.table_id,
+            &self.pk_deletion_strategy,
+        )
+        .await
+        .map_err(|e| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: format!("Failed to reload protected snapshots during refresh: {e}"),
+        })?;
+
+        {
+            let mut guard = self
+                .protected_snapshots
+                .write()
+                .map_err(|_| Error::LockPoisoned {
+                    table: self.table_metadata.table_name.clone(),
+                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
+                })?;
+            *guard = fresh_protected_snapshots;
+        }
+
+        // Reload the current snapshot ID from the catalog.
+        let fresh_metadata = self
+            .catalog
+            .get_table(&self.table_metadata.table_name)
+            .await
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("Failed to reload table metadata during refresh: {e}"),
+            })?;
+        self.update_current_snapshot_id(&fresh_metadata.current_snapshot_id)?;
+
+        // Rebuild the listing table from the fresh snapshot ID on disk.
+        self.refresh_listing_table()?;
+
+        tracing::debug!(
+            "Refreshed in-memory state for table {} from catalog",
+            self.table_metadata.table_name
+        );
+
+        Ok(())
+    }
+
     /// Delete rows matching the given primary key values.
     ///
     /// # Errors
@@ -3137,7 +3092,7 @@ impl CayenneTableProvider {
         let current_snapshot = self.get_current_snapshot_id()?;
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
-            self.table_metadata.table_id,
+            &self.table_metadata.table_id,
             &current_snapshot,
         );
 
@@ -3215,7 +3170,7 @@ impl CayenneTableProvider {
     ///
     /// The fully constructed `PkDeletionStrategy` with all caches populated.
     async fn load_deletion_vectors_all(
-        table_id: i64,
+        table_id: &str,
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
@@ -3394,7 +3349,7 @@ impl CayenneTableProvider {
     /// They contain data written after deletions and should skip deletion filtering.
     async fn load_protected_snapshots(
         catalog: Arc<dyn MetadataCatalog>,
-        table_id: i64,
+        table_id: &str,
         strategy: &PkDeletionStrategyWithCache,
     ) -> CatalogResult<HashMap<String, i64>> {
         // Only PK-based strategies support sequence-ordered snapshot protection.
@@ -3519,7 +3474,7 @@ impl CayenneTableProvider {
             // Create listing table for this snapshot
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &snapshot_id,
             );
 
@@ -4117,7 +4072,7 @@ impl TableProvider for CayenneTableProvider {
             })?;
             let snapshot_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &current_snapshot,
             );
             Self::ensure_snapshot_dir_exists(&snapshot_dir)
@@ -4195,9 +4150,10 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.protected_snapshots),
-                self.table_metadata.table_id,
+                self.table_metadata.table_id.clone(),
                 self.table_metadata.path.clone(),
                 Arc::clone(self.context.runtime_env()),
+                Arc::clone(&self.write_lock),
             )),
             &self.table_metadata.schema,
         )))
@@ -4226,6 +4182,7 @@ impl CayenneTableProvider {
                 self.pk_column_indices.clone(),
                 snapshot_tables,
                 Arc::clone(self.context.runtime_env()),
+                Some(Arc::clone(&self.write_lock)),
             )),
             &self.table_metadata.schema,
         )))
@@ -4250,7 +4207,7 @@ impl CayenneTableProvider {
         for (snapshot_id, _) in protected_snapshots {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
-                self.table_metadata.table_id,
+                &self.table_metadata.table_id,
                 &snapshot_id,
             );
 

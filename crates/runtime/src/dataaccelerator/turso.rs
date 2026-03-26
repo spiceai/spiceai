@@ -553,10 +553,10 @@ impl DataAccelerator for TursoAccelerator {
                 DataType::Binary | DataType::LargeBinary => "BLOB",
                 // Boolean maps to INTEGER (0/1)
                 DataType::Boolean => "INTEGER",
-                // Temporal types map to INTEGER
+                // Similar to SQLite Date types stored as `date_text` (ISO-8601 strings) for correct comparison semantics, like o_orderdate > '1894-01-01';
+                DataType::Date32 | DataType::Date64 => "date_text",
+                // Other temporal types map to INTEGER
                 DataType::Timestamp(_, _)
-                | DataType::Date32
-                | DataType::Date64
                 | DataType::Time32(_)
                 | DataType::Time64(_)
                 | DataType::Duration(_)
@@ -706,6 +706,23 @@ mod tests {
     use datafusion_table_providers::util::test::MockExec;
     use std::collections::HashMap;
 
+    fn cleanup_turso_test_files(path: &str) {
+        let db_path = std::path::Path::new(path);
+        let mut candidates = vec![db_path.to_path_buf()];
+
+        if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name()) {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut sidecar = file_name.to_os_string();
+                sidecar.push(suffix);
+                candidates.push(parent.join(sidecar));
+            }
+        }
+
+        for candidate in candidates {
+            std::fs::remove_file(candidate).ok();
+        }
+    }
+
     #[tokio::test]
     async fn test_turso_file_initialization() {
         let app = app::AppBuilder::new("test").build();
@@ -728,6 +745,11 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
+        let path = accelerator
+            .file_path(&dataset)
+            .expect("path should be derivable");
+        cleanup_turso_test_files(&path);
+
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
@@ -737,11 +759,10 @@ mod tests {
 
         assert!(accelerator.is_initialized(&dataset));
 
-        let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
 
         // cleanup
-        std::fs::remove_file(&path).ok();
+        cleanup_turso_test_files(&path);
     }
 
     #[tokio::test]
@@ -1168,6 +1189,10 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
+        let file_path = accelerator
+            .file_path(&dataset)
+            .expect("should derive default file path");
+        cleanup_turso_test_files(&file_path);
 
         // Initialize the accelerator
         accelerator
@@ -1182,10 +1207,6 @@ mod tests {
         );
 
         // Get the file path
-        let file_path = accelerator
-            .file_path(&dataset)
-            .expect("should have file path");
-
         // Verify the file was created at the default location
         assert!(
             std::path::Path::new(&file_path).exists(),
@@ -1262,7 +1283,7 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3, "should have 3 rows");
 
         // Clean up
-        std::fs::remove_file(&file_path).ok();
+        cleanup_turso_test_files(&file_path);
     }
 
     #[tokio::test]

@@ -498,7 +498,7 @@ impl QuerySet {
     #[must_use]
     pub fn get_row_count_validation_skip_queries(
         &self,
-        _overrides: Option<QueryOverrides>,
+        overrides: Option<QueryOverrides>,
         scale_factor: f64,
     ) -> Vec<&'static str> {
         match self {
@@ -513,7 +513,7 @@ impl QuerySet {
             }
             QuerySet::Tpcds => {
                 // TPCDS queries that return 0 rows and should skip row count validation
-                vec![
+                let mut skip = vec![
                     "tpcds_q8",
                     "tpcds_q29",
                     "tpcds_q37",
@@ -522,9 +522,47 @@ impl QuerySet {
                     "tpcds_q54",
                     "tpcds_q58",
                     "tpcds_q76",
+                ];
+                if matches!(overrides, Some(QueryOverrides::SQLite)) {
+                    // SQLite uses SF 0.01 as test data and many queries return 0 rows at that scale, so skip additional queries for SQLite
+                    skip.extend_from_slice(&[
+                        "tpcds_q4",
+                        "tpcds_q10",
+                        "tpcds_q15",
+                        "tpcds_q19",
+                        "tpcds_q20",
+                        "tpcds_q25",
+                        "tpcds_q30",
+                        "tpcds_q31",
+                        "tpcds_q40",
+                        "tpcds_q64",
+                        "tpcds_q65",
+                        "tpcds_q71",
+                        "tpcds_q73",
+                        "tpcds_q82",
+                        "tpcds_q84",
+                        "tpcds_q85",
+                        "tpcds_q91",
+                        "tpcds_q93",
+                    ]);
+                }
+                skip
+            }
+            QuerySet::Clickbench => {
+                // ClickBench queries that currently return 0 rows and should skip row count validation
+                // https://github.com/spiceai/spiceai/issues/8802
+                vec![
+                    "clickbench_q20",
+                    "clickbench_q37",
+                    "clickbench_q38",
+                    "clickbench_q39",
+                    "clickbench_q40",
+                    "clickbench_q41",
+                    "clickbench_q42",
+                    "clickbench_q43",
                 ]
             }
-            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Scenario { .. } => vec![],
         }
     }
 }
@@ -565,8 +603,13 @@ pub enum QueryOverrides {
     IcebergHadoop,
     SpicecloudCatalog,
     GlueCatalog,
+    PostgresCatalog,
+    MysqlCatalog,
+    MSSqlCatalog,
     Spicecloud,
     DynamoDB,
+    Arrow,
+    Turso,
 }
 
 impl QueryOverrides {
@@ -581,6 +624,8 @@ impl QueryOverrides {
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
             "dynamodb" => Some(Self::DynamoDB),
+            "arrow" => Some(Self::Arrow),
+            "turso" => Some(Self::Turso),
             _ => None,
         }
     }
@@ -754,12 +799,121 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             simple_q6,
             simple_q7
         ),
+        Some(QueryOverrides::PostgresCatalog) => generate_tpch_queries_override!(
+            "postgres_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
+        Some(QueryOverrides::MysqlCatalog) => generate_tpch_queries_override!(
+            "mysql_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
+        Some(QueryOverrides::MSSqlCatalog) => generate_tpch_queries_override!(
+            "mssql_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
         Some(QueryOverrides::DuckDBPartitioned) => remove_tpch_query!(
             queries,
             17, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/8384
             20, // Physical plan does not support logical expression ScalarSubquery(<subquery>); https://github.com/spiceai/spiceai/issues/8384
             21  // Binder Error; https://github.com/spiceai/spiceai/issues/8384
         ),
+        Some(QueryOverrides::Turso) => {
+            let mut queries: Vec<Query> = remove_tpch_query!(
+                queries,
+                2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
+                4, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+                6, // Rewritten: explicit BETWEEN 0.05 AND 0.07 to avoid libSQL float arithmetic precision issue; https://github.com/spiceai/spiceai/issues/9872
+                16, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+                17, // Correlated scalar subquery not supported
+                18, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+                20, // Correlated scalar subquery not supported
+                21, // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+                22 // Federation fails for cross-provider subquery filters; https://github.com/spiceai/spiceai/issues/9879
+            );
+            queries.extend(generate_tpch_queries_override!("turso", q6));
+            queries
+        }
         _ => queries,
     }
 }
@@ -853,6 +1007,9 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
             queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
             64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
+        ),
+        Some(QueryOverrides::Arrow) => remove_tpcds_query!(
+            queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),
         Some(_) | None => queries,
     }

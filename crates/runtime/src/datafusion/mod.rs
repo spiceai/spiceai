@@ -64,7 +64,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::common::ToDFSchema;
+use datafusion::common::{Constraint, Constraints, ToDFSchema};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
@@ -78,7 +78,6 @@ use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use query::QueryBuilder;
 #[cfg(any(
@@ -108,7 +107,6 @@ use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
-use tokio_stream::wrappers::ReceiverStream;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -119,6 +117,7 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
+pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -265,6 +264,19 @@ pub enum Error {
 
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
+
+    #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
+    CatalogNotPartitionAware { catalog: String },
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {catalog}.{schema}.{table}: {source}"
+    ))]
+    UnableToReadPartitionMetadata {
+        catalog: String,
+        schema: String,
+        table: String,
+        source: Box<crate::catalogconnector::Error>,
+    },
 
     #[snafu(display("Unable to get {schema} schema: {}", format_datafusion_error(source)))]
     UnableToGetSchema {
@@ -424,6 +436,57 @@ fn validate_distributed_engine(
     Ok(())
 }
 
+/// Remap constraint column indices from the source schema to the refresh schema.
+///
+/// When `refresh_sql` selects a subset or reordered set of columns, the primary key
+/// column indices in the source constraints no longer match the refresh schema.
+/// This function maps column names from source indices to their positions in the
+/// refresh schema. Returns `None` if any primary key column is missing from the
+/// refresh schema.
+fn remap_constraints_to_refresh_schema(
+    source_constraints: &Constraints,
+    source_schema: &SchemaRef,
+    refresh_schema: &SchemaRef,
+) -> Option<Constraints> {
+    // Helper to remap column indices from source to refresh schema using bounds-checked lookups.
+    let remap_indices = |indices: &[usize]| -> Option<Vec<usize>> {
+        indices
+            .iter()
+            .map(|&idx| {
+                let field = source_schema.fields().get(idx)?;
+                refresh_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == field.name())
+            })
+            .collect()
+    };
+
+    // If any PrimaryKey constraint cannot be fully remapped, return None entirely
+    // to avoid creating a table with Unique-only constraints that downstream code
+    // might incorrectly treat as having upsert (on_conflict) capability.
+    let has_unmappable_pk = source_constraints
+        .iter()
+        .any(|c| matches!(c, Constraint::PrimaryKey(indices) if remap_indices(indices).is_none()));
+    if has_unmappable_pk {
+        return None;
+    }
+
+    let remapped: Vec<Constraint> = source_constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            Constraint::PrimaryKey(indices) => remap_indices(indices).map(Constraint::PrimaryKey),
+            Constraint::Unique(indices) => remap_indices(indices).map(Constraint::Unique),
+        })
+        .collect();
+
+    if remapped.is_empty() {
+        None
+    } else {
+        Some(Constraints::new_unverified(remapped))
+    }
+}
+
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
@@ -462,8 +525,8 @@ pub struct DataFusion {
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
-    /// Shared store for DDL table options from `CREATE TABLE ... WITH (acceleration.*, dataset.*)`.
-    ddl_options_store: iceberg_ddl::acceleration_options::SharedDdlOptionsStore,
+    /// Shared store for DDL extensions from `CREATE TABLE` statements.
+    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -820,14 +883,14 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns a reference to the shared DDL options store.
+    /// Returns a reference to the shared DDL extension store.
     ///
-    /// Used by the query execution path to insert options extracted from
-    /// `CREATE TABLE ... WITH (acceleration.*, dataset.*)` statements, which
-    /// are then consumed by the `IcebergDdlAnalyzerRule`.
+    /// Used by the query execution path to insert extensions extracted from
+    /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
+    /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_options_store(&self) -> &iceberg_ddl::acceleration_options::SharedDdlOptionsStore {
-        &self.ddl_options_store
+    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+        &self.ddl_extension_store
     }
 
     /// Returns the shared weak self-reference holder.
@@ -861,6 +924,104 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
+    #[must_use]
+    pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+
+        #[cfg(not(windows))]
+        {
+            self.ctx
+                .catalog(catalog_name)
+                .is_some_and(|catalog| cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = catalog_name;
+            false
+        }
+    }
+
+    /// Returns the partition expression string for a table by querying the catalog provider.
+    ///
+    /// Delegates to the catalog provider's [`PartitionAwareCatalog`] implementation,
+    /// which reads from the catalog's persistent metadata store (e.g. Cayenne's `SQLite`),
+    /// and returns a SQL partition expression as a string.
+    ///
+    /// This function does not parse or validate the returned string into a `DataFusion`
+    /// [`Expr`]; callers that require a parsed expression must perform that parsing
+    /// themselves against the table's schema.
+    ///
+    /// When the catalog returns an auto-generated label like `"expr0"` (used for function
+    /// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
+    /// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
+    pub async fn get_table_partition_expr(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<Option<String>, DataFusionError> {
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+        if let Some(catalog) = self.resolve_catalog_provider(table_reference)
+            && let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref())
+            && let Some(expr_string) = aware
+                .table_partition_expr(schema_name, table_reference.table())
+                .await
+                .boxed()
+                .map_err(DataFusionError::External)?
+        {
+            let resolved = self
+                .resolve_partition_label(&expr_string, table_reference)
+                .await?
+                .unwrap_or(expr_string);
+            return Ok(Some(resolved));
+        }
+        Ok(None)
+    }
+
+    /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
+    /// the original SQL expression string from the partition manager metadata.
+    async fn resolve_partition_label(
+        &self,
+        label: &str,
+        table_reference: &TableReference,
+    ) -> Result<Option<String>, DataFusionError> {
+        let Some(Ok(idx)) = label.strip_prefix("expr").map(str::parse::<usize>) else {
+            return Ok(None);
+        };
+        let Some(ref executor_registry) = self.executor_registry else {
+            return Ok(None);
+        };
+
+        let Some(metadata) = executor_registry
+            .federated_partition_manager()
+            .get_table_metadata(table_reference)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+        else {
+            return Ok(None);
+        };
+        Ok(metadata.partition_expressions.get(idx).cloned())
+    }
+
+    /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
+    pub async fn sql_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        let df_schema = self
+            .get_table(tbl)
+            .await
+            .ok_or(DataFusionError::Plan(format!(
+                "Table not found for SQL expression: {tbl}"
+            )))?
+            .schema()
+            .try_into()?;
+
+        self.ctx.parse_sql_expr(expr, &df_schema)
     }
 
     pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
@@ -1059,16 +1220,6 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        // In distributed scheduler mode, forward Cayenne table writes to an executor
-        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
-            let streaming_update = StreamingDataUpdate::try_from(data_update)
-                .map_err(find_datafusion_root)
-                .context(UnableToCreateStreamingUpdateSnafu)?;
-            return self
-                .forward_write_to_executor(table_reference, streaming_update)
-                .await;
-        }
-
         let overwrite = match data_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1098,6 +1249,18 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
+        // Invalidate cached query state for this table.
+        // Both results and logical plans can become stale after a write:
+        // - results cache may otherwise replay pre-write answers
+        // - plans cache may hold stale `Arc<dyn TableProvider>` references
+        //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
+        //   caches) no longer reflects the latest write.
+        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+            tracing::warn!(
+                "Failed to invalidate caches for table {table_reference} after write: {e}"
+            );
+        }
+
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
@@ -1126,13 +1289,6 @@ impl DataFusion {
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
 
-        // In distributed scheduler mode, forward Cayenne table writes to an executor
-        if self.should_forward_cayenne_write(table_reference, &*table_provider) {
-            return self
-                .forward_write_to_executor(table_reference, streaming_update)
-                .await;
-        }
-
         let overwrite = match streaming_update.update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
@@ -1158,358 +1314,17 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
-        Ok(())
-    }
-
-    /// Returns `true` if this is a scheduler node and the table is a Cayenne table,
-    /// meaning the write should be forwarded to an executor.
-    fn should_forward_cayenne_write(
-        &self,
-        _table_reference: &TableReference,
-        table_provider: &dyn TableProvider,
-    ) -> bool {
-        // Only forward if we have an executor registry (i.e., we are a scheduler)
-        let Some(executor_registry) = &self.executor_registry else {
-            return false;
-        };
-
-        // Check if the table provider is a CayenneTableProvider
-        if table_provider
-            .as_any()
-            .downcast_ref::<cayenne::CayenneTableProvider>()
-            .is_none()
-        {
-            return false;
+        // Invalidate cached query state for this table.
+        // Both results and logical plans can become stale after a write:
+        // - results cache may otherwise replay pre-write answers
+        // - plans cache may hold stale `Arc<dyn TableProvider>` references
+        //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
+        //   caches) no longer reflects the latest write.
+        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+            tracing::warn!(
+                "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
+            );
         }
-
-        // Check if there are any connected executors with flight clients
-        let Ok(clients) = executor_registry.flight_sql_clients.try_read() else {
-            return false;
-        };
-        !clients.is_empty()
-    }
-
-    /// Forwards a streaming write to an executor node via Flight `DoPut`.
-    async fn forward_write_to_executor(
-        &self,
-        table_reference: &TableReference,
-        streaming_update: StreamingDataUpdate,
-    ) -> Result<()> {
-        let Some(executor_registry) = self.executor_registry.as_ref() else {
-            return NoExecutorsAvailableSnafu {
-                table_name: table_reference.to_string(),
-            }
-            .fail();
-        };
-
-        // Get an executor's FlightSqlClient
-        let (executor_id, client) = {
-            let clients = executor_registry.flight_sql_clients.read().await;
-            let Some((executor_id, client)) = clients.iter().next() else {
-                tracing::error!(
-                    "No executors available to forward Cayenne write for table {table_reference}"
-                );
-                return NoExecutorsAvailableSnafu {
-                    table_name: table_reference.to_string(),
-                }
-                .fail();
-            };
-            (executor_id.clone(), client.clone())
-        };
-
-        tracing::debug!("Forwarding Cayenne write for table {table_reference} to executor");
-
-        // Resolve the table reference to a fully qualified form so the executor
-        // can locate it regardless of its default catalog/schema settings.
-        let resolved = table_reference
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-        let descriptor_path = vec![
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        ];
-        let resolved_table = TableReference::full(
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        );
-
-        // Register before the write to minimize post-write routing races.
-        self.register_forwarded_table_partition(executor_registry, &executor_id, resolved_table)
-            .await;
-
-        let schema = streaming_update.data.schema();
-        let stream = streaming_update.data;
-
-        // Build a flight data stream from the record batches.
-        let flight_data_encoder = arrow_flight::encode::FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::unfold(stream, |mut s| async move {
-                match s.next().await {
-                    Some(Ok(batch)) => Some((Ok(batch), s)),
-                    Some(Err(e)) => Some((
-                        Err(arrow_flight::error::FlightError::Arrow(
-                            arrow_schema::ArrowError::ExternalError(Box::new(e)),
-                        )),
-                        s,
-                    )),
-                    None => None,
-                }
-            }));
-
-        // Stream directly into the executor's `DoPut` without buffering.
-        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
-        let (encode_result_tx, encode_result_rx) =
-            tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-        let io_runtime = self.io_runtime.clone();
-
-        io_runtime.spawn(async move {
-            let mut first = true;
-            let mut flight_data_encoder = Box::pin(flight_data_encoder);
-            loop {
-                match flight_data_encoder.next().await {
-                    Some(Ok(mut fd)) => {
-                        if first {
-                            fd.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_path(
-                                descriptor_path.clone(),
-                            ));
-                            first = false;
-                        }
-
-                        if tx.send(fd).await.is_err() {
-                            let _ = encode_result_tx.send(Ok(()));
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        let _ = encode_result_tx.send(Err(e.to_string()));
-                        break;
-                    }
-                    None => {
-                        let _ = encode_result_tx.send(Ok(()));
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Forward the authorization header from the original request so the
-        // executor can validate the caller's credentials.
-        let auth_header = runtime_request_context::RequestContext::current(
-            runtime_request_context::AsyncMarker::new().await,
-        )
-        .authorization_header()
-        .map(str::to_string);
-
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
-        if let Some(auth_value) = auth_header
-            && let Ok(val) = auth_value.parse()
-        {
-            request.metadata_mut().insert("authorization", val);
-        }
-
-        let table_name = table_reference.to_string();
-        let mut inner_client = client.into_inner();
-        let response =
-            inner_client
-                .do_put(request)
-                .await
-                .map_err(|e| Error::UnableToExecuteTableInsert {
-                    table_name: table_name.clone(),
-                    source: DataFusionError::External(Box::new(e)),
-                })?;
-
-        // Wait for the server to acknowledge.
-        response
-            .into_inner()
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_name.clone(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
-
-        match encode_result_rx.await {
-            Ok(Ok(())) | Err(_) => {}
-            Ok(Err(e)) => {
-                return Err(Error::UnableToExecuteTableInsert {
-                    table_name,
-                    source: DataFusionError::Execution(format!(
-                        "Failed to encode forwarded Flight stream: {e}"
-                    )),
-                });
-            }
-        }
-
-        tracing::debug!(
-            "Successfully forwarded Cayenne write for table {table_reference} to executor"
-        );
-
-        Ok(())
-    }
-
-    async fn register_forwarded_table_partition(
-        &self,
-        executor_registry: &ExecutorRegistry,
-        executor_id: &str,
-        resolved_table: TableReference,
-    ) {
-        let mut partitions = executor_registry.partitions.write().await;
-        partitions
-            .entry(executor_id.to_string())
-            .or_default()
-            .entry(resolved_table)
-            .or_default();
-    }
-
-    /// Forwards a raw `FlightData` stream to an executor via Flight `DoPut`.
-    ///
-    /// This avoids scheduler-side decode/re-encode overhead and is used as a fast path
-    /// for scheduler -> executor Cayenne write-through ingestion.
-    pub(crate) async fn forward_flight_data_stream_to_executor<S>(
-        &self,
-        table_reference: &TableReference,
-        inbound_stream: S,
-    ) -> Result<()>
-    where
-        S: futures::Stream<Item = std::result::Result<arrow_flight::FlightData, tonic::Status>>
-            + Send
-            + 'static,
-    {
-        let Some(executor_registry) = self.executor_registry.as_ref() else {
-            return NoExecutorsAvailableSnafu {
-                table_name: table_reference.to_string(),
-            }
-            .fail();
-        };
-
-        // Get an executor's FlightSqlClient
-        let (executor_id, client) = {
-            let clients = executor_registry.flight_sql_clients.read().await;
-            let Some((executor_id, client)) = clients.iter().next() else {
-                tracing::error!(
-                    "No executors available to forward Cayenne write for table {table_reference}"
-                );
-                return NoExecutorsAvailableSnafu {
-                    table_name: table_reference.to_string(),
-                }
-                .fail();
-            };
-            (executor_id.clone(), client.clone())
-        };
-
-        tracing::debug!(
-            "Forwarding raw Cayenne DoPut stream for table {table_reference} to executor"
-        );
-
-        let resolved = table_reference
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-        let descriptor_path = vec![
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        ];
-        let resolved_table = TableReference::full(
-            resolved.catalog.to_string(),
-            resolved.schema.to_string(),
-            resolved.table.to_string(),
-        );
-
-        // Register before the write to minimize post-write routing races.
-        self.register_forwarded_table_partition(executor_registry, &executor_id, resolved_table)
-            .await;
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<arrow_flight::FlightData>(64);
-        let (copy_result_tx, copy_result_rx) =
-            tokio::sync::oneshot::channel::<std::result::Result<(), tonic::Status>>();
-
-        let io_runtime = self.io_runtime.clone();
-        io_runtime.spawn(async move {
-            let mut inbound_stream = Box::pin(inbound_stream);
-            let mut is_first = true;
-            loop {
-                match inbound_stream.next().await {
-                    Some(Ok(mut fd)) => {
-                        if is_first {
-                            if let Some(descriptor) = fd.flight_descriptor.as_mut() {
-                                descriptor.path.clone_from(&descriptor_path);
-                            } else {
-                                fd.flight_descriptor =
-                                    Some(arrow_flight::FlightDescriptor::new_path(
-                                        descriptor_path.clone(),
-                                    ));
-                            }
-                            is_first = false;
-                        }
-
-                        if tx.send(fd).await.is_err() {
-                            let _ = copy_result_tx.send(Ok(()));
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        let _ = copy_result_tx.send(Err(e));
-                        break;
-                    }
-                    None => {
-                        let _ = copy_result_tx.send(Ok(()));
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Forward the authorization header from the original request so the
-        // executor can validate the caller's credentials when configured.
-        let auth_header = runtime_request_context::RequestContext::current(
-            runtime_request_context::AsyncMarker::new().await,
-        )
-        .authorization_header()
-        .map(str::to_string);
-
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
-        if let Some(auth_value) = auth_header
-            && let Ok(val) = auth_value.parse()
-        {
-            request.metadata_mut().insert("authorization", val);
-        }
-
-        let table_name = table_reference.to_string();
-        let mut inner_client = client.into_inner();
-        let response =
-            inner_client
-                .do_put(request)
-                .await
-                .map_err(|e| Error::UnableToExecuteTableInsert {
-                    table_name: table_name.clone(),
-                    source: DataFusionError::External(Box::new(e)),
-                })?;
-
-        // Wait for the server to acknowledge.
-        response
-            .into_inner()
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| Error::UnableToExecuteTableInsert {
-                table_name: table_name.clone(),
-                source: DataFusionError::External(Box::new(e)),
-            })?;
-
-        match copy_result_rx.await {
-            Ok(Ok(())) | Err(_) => {}
-            Ok(Err(e)) => {
-                return Err(Error::UnableToExecuteTableInsert {
-                    table_name,
-                    source: DataFusionError::External(Box::new(e)),
-                });
-            }
-        }
-
-        tracing::debug!(
-            "Successfully forwarded raw Cayenne DoPut stream for table {table_reference} to executor"
-        );
 
         Ok(())
     }
@@ -1627,12 +1442,12 @@ impl DataFusion {
             let (parsed, schema) = refresh_sql::parse_refresh_sql(
                 dataset.name.clone(),
                 sql_str.as_str(),
-                source_schema,
+                Arc::clone(&source_schema),
             )
             .context(RefreshSqlSnafu)?;
             (Some(parsed), schema)
         } else {
-            (None, source_schema)
+            (None, Arc::clone(&source_schema))
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1650,20 +1465,24 @@ impl DataFusion {
             );
         }
 
-        // Determine if we should pass constraints to the accelerator
-        // Only pass constraints if not using refresh_sql (schema might have different column ordering)
+        // Get source constraints (primary keys) for upsert behavior.
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let use_constraints = parsed_refresh_sql.is_none();
+        let source_constraints = match &*source_table_provider {
+            FederatedTable::Immediate(table_provider) => table_provider.constraints(),
+            FederatedTable::Deferred(_) => None,
+        };
 
-        let constraints = if use_constraints {
-            match &*source_table_provider {
-                FederatedTable::Immediate(table_provider) => table_provider.constraints(),
-                FederatedTable::Deferred(_) => None,
-            }
+        // When refresh_sql is used, the accelerated table has a different schema than
+        // the source. Remap constraint column indices from the source schema to the
+        // refresh schema so that upsert/on_conflict still works correctly.
+        let constraints = if parsed_refresh_sql.is_some() {
+            source_constraints.and_then(|c| {
+                remap_constraints_to_refresh_schema(c, &source_schema, &refresh_schema)
+            })
         } else {
-            None
+            source_constraints.cloned()
         };
 
         // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
@@ -1678,7 +1497,7 @@ impl DataFusion {
             .create_accelerator_table(
                 dataset.name.clone(),
                 Arc::clone(&refresh_schema),
-                constraints,
+                constraints.as_ref(),
                 &acceleration_settings,
                 secrets,
                 Some(dataset),
@@ -2501,6 +2320,7 @@ impl DataFusion {
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
+        builder.zero_results_action(acceleration.on_zero_results.clone());
         if acceleration.disable_federation {
             builder.disable_federation();
         }
@@ -2634,42 +2454,44 @@ impl DataFusion {
     }
 
     /// Create or get a logical plan from the query
-    async fn get_or_create_logical_plan(
+    pub(crate) async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
-        key: &RawCacheKey,
+        cache_key_opt: Option<&RawCacheKey>,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let plans_cache = self.plans_cache_provider();
+        let plans_cache = if let Some(cache_key) = cache_key_opt {
+            let plans_cache = self.plans_cache_provider();
 
-        if let Some(cache) = plans_cache.as_ref()
-            && let Some(plan) = cache.get_raw_key(&key.as_u64()).await
-        {
-            tracing::trace!("using cached plan for {sql}");
-            return Ok(plan);
-        }
+            if let Some(cache) = plans_cache.as_ref()
+                && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
+            {
+                tracing::trace!("using cached plan for {sql}");
+                return Ok(plan);
+            }
+            plans_cache
+        } else {
+            None
+        };
 
-        // Pre-process CREATE TABLE ... WITH (acceleration.*, dataset.*) before planning.
-        // This extracts DDL table options, stores them for the analyzer rule,
-        // and returns modified SQL without the WITH clause.
-        let preprocessed = iceberg_ddl::preprocess::preprocess_create_table_with_options(
-            sql,
-            &self.ddl_options_store,
-        )?;
+        // Pre-process CREATE TABLE statements to extract DDL extensions
+        // (WITH options, PARTITION BY) before planning.
+        let preprocessed =
+            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
         let (effective_sql, store_key) = match &preprocessed {
-            iceberg_ddl::preprocess::PreprocessResult::Modified {
+            ddl::preprocess::PreprocessResult::Modified {
                 sql: modified,
                 store_key,
-            } => (modified.as_str(), Some(store_key.as_str())),
-            iceberg_ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
+            } => (modified.as_str(), Some(store_key)),
+            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
         let plan = match session.create_logical_plan(effective_sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 if let Some(store_key) = store_key {
-                    iceberg_ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_options_store,
+                    ddl::preprocess::cleanup_preprocessed_ddl_options(
+                        &self.ddl_extension_store,
                         store_key,
                     )?;
                 }
@@ -2677,9 +2499,11 @@ impl DataFusion {
             }
         };
 
-        if let Some(cache) = plans_cache {
+        if let Some(cache) = plans_cache
+            && let Some(cache_key) = cache_key_opt
+        {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
         }
 
         Ok(plan)
@@ -3029,7 +2853,7 @@ mod tests {
 
         let session = df.ctx.state();
 
-        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
             .await
             .expect("logical plan");
 
@@ -3042,7 +2866,7 @@ mod tests {
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
-        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
             .await
             .expect("logical plan");
 
@@ -3579,6 +3403,190 @@ mod tests {
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
                 .expect("cayenne should be allowed when not in distributed mode");
+        }
+    }
+
+    mod remap_constraints_tests {
+        use super::*;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{Constraint, Constraints};
+
+        fn schema(fields: &[&str]) -> SchemaRef {
+            Arc::new(Schema::new(
+                fields
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Utf8, true))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        #[test]
+        fn remap_pk_with_reordered_columns() {
+            // Source: id(0), created_at(1), email(2)
+            // Refresh: email(0), id(1)
+            // Source PK: [0] (id) → Refresh PK: [1] (id)
+            let source = schema(&["id", "created_at", "email"]);
+            let refresh = schema(&["email", "id"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![1]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_composite_pk() {
+            // Source: id(0), org_id(1), name(2), email(3)
+            // Refresh: name(0), id(1), org_id(2)
+            // Source PK: [0, 1] (id, org_id) → Refresh PK: [1, 2]
+            let source = schema(&["id", "org_id", "name", "email"]);
+            let refresh = schema(&["name", "id", "org_id"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![1, 2]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_pk_missing_column_returns_none() {
+            // Source: id(0), name(1), email(2)
+            // Refresh: name(0), email(1) — PK column "id" is missing
+            let source = schema(&["id", "name", "email"]);
+            let refresh = schema(&["name", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn remap_same_schema_preserves_indices() {
+            // Source and refresh have the same schema
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_unique_constraint() {
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["name", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![1])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    1
+                ])]))
+            );
+        }
+
+        #[test]
+        fn remap_no_constraints_returns_none() {
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints = Constraints::new_unverified(vec![]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn remap_debezium_refresh_sql_scenario() {
+            // Simulates the exact scenario from issue #9035:
+            // Debezium source: users table with all columns
+            // refresh_sql: SELECT id, email FROM users
+            let source = schema(&[
+                "id",
+                "created_at",
+                "updated_at",
+                "name",
+                "email",
+                "password_hash",
+            ]);
+            let refresh = schema(&["id", "email"]);
+            // Debezium sets PK on "id" column, index 0 in source schema
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            // "id" is at index 0 in the refresh schema too
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_mixed_pk_and_unique_with_missing_pk_returns_none() {
+            // If PK can't be remapped, return None even if Unique can be remapped.
+            // This prevents downstream code from seeing Unique-only constraints
+            // and incorrectly deriving on_conflict upsert behavior.
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["email", "name"]);
+            let constraints = Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]), // "id" - missing from refresh
+                Constraint::Unique(vec![1]),     // "email" - present in refresh
+            ]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result, None,
+                "Should return None when PK cannot be remapped"
+            );
+        }
+
+        #[test]
+        fn remap_out_of_bounds_index_returns_none() {
+            // Constraint with out-of-bounds index should not panic
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![99])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result, None,
+                "Out-of-bounds index should return None, not panic"
+            );
+        }
+
+        #[test]
+        fn remap_mixed_pk_and_unique_both_present() {
+            // When both PK and Unique can be remapped, both should be preserved
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["name", "id", "email"]);
+            let constraints = Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]), // "id" → index 1 in refresh
+                Constraint::Unique(vec![1]),     // "email" → index 2 in refresh
+            ]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![
+                    Constraint::PrimaryKey(vec![1]),
+                    Constraint::Unique(vec![2]),
+                ]))
+            );
         }
     }
 }

@@ -407,7 +407,7 @@ mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::ExecutorRegistry;
+pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
 pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
@@ -817,6 +817,14 @@ pub(crate) async fn initialize_cluster_scheduler_future(
 
     if let Some(config) = app.runtime.scheduler.clone() {
         if let Some(partition_manager) = rt.partition_manager() {
+            // Validate all accelerated datasets/views have partition keys
+            // for distributed partition management.
+            partition::validate_partition_keys(&app).map_err(|e| {
+                crate::Error::FailedToStartClusterScheduler {
+                    source: Box::new(e),
+                }
+            })?;
+
             // Initialize partition metadata for all accelerated tables
             if let Err(err) = partition::initialize_partition_metadata(
                 rt.datafusion(),
@@ -1006,6 +1014,20 @@ pub async fn initialize_cluster_executor(
     let app_def: App = serde_json::from_str(&app_json)
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
+
+    // Resolve executor settings from the scheduler's app definition before the
+    // executor Flight server starts.
+    if let Some(ref telemetry_config) = rt.telemetry_config {
+        let _ = telemetry_config.set(app_def.runtime.telemetry.clone());
+    }
+    rt.rate_limits.set_flight_write_enabled(
+        app_def
+            .runtime
+            .flight
+            .clone()
+            .unwrap_or_default()
+            .do_put_rate_limit_enabled,
+    );
 
     // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
     // Otherwise fall back to temp_directory from query config or system temp dir

@@ -16,16 +16,28 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use arrow_schema::Schema;
 use bytes::Bytes;
-use datafusion::{error::DataFusionError, sql::TableReference};
-use datafusion_expr::{Expr, lit};
+use datafusion::{
+    common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
+};
+use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 
 use crate::datafusion::DataFusion;
 
-/// A specific set of values for partitioning keys.
-/// For example, if a table is partitioned by "date" and "region", a `PartitionValue` might be {"date": "2024-01-01", "region": "us-east"}.
+/// A specific value for partitioning keys.
+/// For example, if a table is partitioned by:
+///  - "date"
+///  - "region"
+///
+/// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
+/// ```json
+/// {"date": "2024-01-01", "region": "us-east"}
+/// {"date": "2024-01-01", "region": "us-west"}
+/// {"date": "2024-01-02", "region": "us-east"}
+/// ```
 pub type PartitionValue = HashMap<String, String>;
 
 /// Metadata for a single partition of an accelerated table
@@ -104,6 +116,11 @@ pub struct TablePartitionMetadata {
     pub schema_version: u32,
     /// Last updated timestamp (milliseconds since UNIX epoch)
     pub updated_at: u128,
+    /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
+    /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
+    /// original SQL expression for query routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_expressions: Vec<String>,
 }
 
 impl TablePartitionMetadata {
@@ -114,6 +131,7 @@ impl TablePartitionMetadata {
             partitions: Vec::new(),
             schema_version,
             updated_at,
+            partition_expressions: Vec::new(),
         }
     }
 
@@ -132,5 +150,52 @@ impl TablePartitionMetadata {
             .iter()
             .filter(|p| !p.is_assigned())
             .collect()
+    }
+
+    /// Returns a mapping of executor IDs to the partition expressions they contain.
+    pub fn all_executor_partitions(
+        &self,
+        ctx: &Arc<SessionContext>,
+        table_schema: &Arc<Schema>,
+    ) -> Result<HashMap<String, Vec<Expr>>, DataFusionError> {
+        let df_schema = DFSchema::try_from(Arc::clone(table_schema))?;
+        let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
+        for PartitionMetadata {
+            partition_value,
+            assigned_executors,
+            ..
+        } in &self.partitions
+        {
+            // Build a single AND-combined predicate for this partition:
+            //   key1 = val1 AND key2 = val2 AND ...
+            let partition_predicate = partition_value
+                .iter()
+                .map(|(proj, lit)| {
+                    // Ensure lit is same type as proj
+                    let col = ctx.parse_sql_expr(proj, &df_schema)?;
+                    let col_type = col.get_type(&df_schema)?;
+                    let mut lit = ctx.parse_sql_expr(lit, &df_schema)?;
+                    if let Expr::Literal(ref s, None) = lit
+                        && s.data_type() != col_type
+                    {
+                        lit = lit.cast_to(&col_type, &df_schema)?;
+                    }
+                    Ok(col.eq(lit))
+                })
+                .collect::<Result<Vec<Expr>, DataFusionError>>()?
+                .into_iter()
+                .reduce(Expr::and);
+
+            let Some(partition_predicate) = partition_predicate else {
+                continue;
+            };
+
+            for executor in assigned_executors {
+                map.entry(executor.clone())
+                    .or_default()
+                    .push(partition_predicate.clone());
+            }
+        }
+        Ok(map)
     }
 }

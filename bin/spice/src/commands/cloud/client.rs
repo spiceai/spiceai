@@ -138,7 +138,9 @@ impl CloudClient {
             visibility: visibility.to_string(),
             cname: None,
             tags: None,
+            replicas: None,
             resources: None,
+            executor: None,
         };
         self.inner.create_app(&request).await.map_err(into_cli)
     }
@@ -159,8 +161,7 @@ impl CloudClient {
             replicas,
             image_tag: image_tag.map(String::from),
             region: region.map(String::from),
-            spicepod: None,
-            resources: None,
+            ..Default::default()
         };
         self.inner
             .update_app(app.id, &request)

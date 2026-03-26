@@ -73,6 +73,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     let table =
         CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
             .await?;
+    let table_id = table.metadata().table_id.clone();
     println!("✓ Table created");
 
     // 3. Register with DataFusion context
@@ -101,7 +102,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check how many snapshot subdirectories exist before overwrite
     // Directory structure: [data_path]/[table_id]/[snapshot_id]/
-    let table_dir = data_path.join("1"); // table_id = 1
+    let table_dir = data_path.join(&table_id);
     let snapshots_before = snapshot_dirs(&table_dir);
     println!("✓ Snapshots before overwrite: {}", snapshots_before.len());
 
@@ -220,6 +221,7 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
     let table =
         CayenneTableProvider::create_table(Arc::clone(&catalog), table_options, ctx.runtime_env())
             .await?;
+    let table_id = table.metadata().table_id.clone();
     println!("✓ Table created");
 
     // 3. Register with DataFusion context
@@ -234,7 +236,7 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
     println!("✓ Initial data inserted (2 rows)");
 
     // 5. Get initial snapshot count
-    let table_dir = data_path.join("1"); // table_id = 1
+    let table_dir = data_path.join(&table_id);
     let snapshots_after_insert = snapshot_dirs(&table_dir);
     println!(
         "✓ Snapshots after initial insert: {}",

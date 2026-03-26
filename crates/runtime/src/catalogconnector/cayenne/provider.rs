@@ -29,7 +29,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use cayenne::metadata::VortexConfig;
-use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -40,6 +40,8 @@ use crate::parameters::Parameters;
 use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
 use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
+
+use crate::catalogconnector::PartitionAwareCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -277,6 +279,30 @@ impl CatalogProvider for CayenneCatalogProvider {
 }
 
 #[async_trait]
+impl PartitionAwareCatalog for CayenneCatalogProvider {
+    async fn table_partition_expr(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::catalogconnector::Result<Option<String>> {
+        let metadata_table_name = format!("{schema_name}/{table_name}");
+        let metadata = self
+            .catalog
+            .get_table(&metadata_table_name)
+            .await
+            .map_err(
+                |source| crate::catalogconnector::Error::PartitionMetadataRead {
+                    schema_name: schema_name.to_string(),
+                    table_name: table_name.to_string(),
+                    source: Box::new(source),
+                },
+            )?;
+
+        Ok(metadata.partition_column)
+    }
+}
+
+#[async_trait]
 impl RefreshableCatalogProvider for CayenneCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let table_names = self.catalog.list_table_names().await.unwrap_or_else(|e| {
@@ -297,16 +323,46 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
             }
         }
 
+        let existing_schemas = match self.schemas.read() {
+            Ok(schemas) => schemas.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
         let mut new_schemas: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
         for (ns, full_names) in &grouped {
-            let schema_provider = CayenneSchemaProvider::try_new(
+            let refreshed_schema = CayenneSchemaProvider::try_new(
                 Arc::clone(&self.catalog),
                 ns,
                 full_names,
                 Arc::clone(&self.runtime_env),
             )
             .await?;
-            new_schemas.insert(ns.clone(), Arc::new(schema_provider));
+
+            if let Some(existing_schema) = existing_schemas.get(ns)
+                && let Some(existing_cayenne_schema) = existing_schema
+                    .as_any()
+                    .downcast_ref::<CayenneSchemaProvider>()
+            {
+                existing_cayenne_schema
+                    .refresh_from(&refreshed_schema)
+                    .await;
+                new_schemas.insert(ns.clone(), Arc::clone(existing_schema));
+            } else {
+                new_schemas.insert(ns.clone(), Arc::new(refreshed_schema));
+            }
+        }
+
+        for (ns, existing_schema) in &existing_schemas {
+            if grouped.contains_key(ns) {
+                continue;
+            }
+
+            if let Some(existing_cayenne_schema) = existing_schema
+                .as_any()
+                .downcast_ref::<CayenneSchemaProvider>()
+            {
+                existing_cayenne_schema.clear_tables();
+            }
         }
 
         if !new_schemas.is_empty() {
@@ -401,6 +457,80 @@ impl CayenneSchemaProvider {
             runtime_env,
             tables: RwLock::new(HashMap::new()),
         }
+    }
+
+    fn tables_snapshot(&self) -> HashMap<String, Arc<dyn TableProvider>> {
+        match self.tables.read() {
+            Ok(tables) => tables.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn replace_tables(&self, tables: HashMap<String, Arc<dyn TableProvider>>) {
+        match self.tables.write() {
+            Ok(mut existing_tables) => *existing_tables = tables,
+            Err(poisoned) => *poisoned.into_inner() = tables,
+        }
+    }
+
+    async fn refresh_from(&self, source: &Self) {
+        let existing_tables = self.tables_snapshot();
+        let refreshed_tables = source.tables_snapshot();
+        let mut merged_tables = HashMap::with_capacity(refreshed_tables.len());
+
+        for (table_name, refreshed_provider) in refreshed_tables {
+            let provider_to_use = if let Some(existing_provider) = existing_tables.get(&table_name)
+            {
+                if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider)
+                    .await
+                {
+                    Arc::clone(existing_provider)
+                } else {
+                    refreshed_provider
+                }
+            } else {
+                refreshed_provider
+            };
+
+            merged_tables.insert(table_name, provider_to_use);
+        }
+
+        self.replace_tables(merged_tables);
+    }
+
+    async fn refresh_table_provider_in_place(
+        existing_provider: &Arc<dyn TableProvider>,
+        refreshed_provider: &Arc<dyn TableProvider>,
+    ) -> bool {
+        let Some(existing_cayenne) = Self::cayenne_table_from_provider(existing_provider) else {
+            return false;
+        };
+        let Some(refreshed_cayenne) = Self::cayenne_table_from_provider(refreshed_provider) else {
+            return false;
+        };
+
+        if let Err(err) = existing_cayenne.refresh(refreshed_cayenne).await {
+            tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
+            return false;
+        }
+
+        true
+    }
+
+    fn cayenne_table_from_provider(
+        provider: &Arc<dyn TableProvider>,
+    ) -> Option<&CayenneTableProvider> {
+        let adapter = provider
+            .as_any()
+            .downcast_ref::<DeletionTableProviderAdapter>()?;
+        adapter
+            .source()
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
+    }
+
+    fn clear_tables(&self) {
+        self.replace_tables(HashMap::new());
     }
 
     /// Returns a reference to the underlying Cayenne metadata catalog.

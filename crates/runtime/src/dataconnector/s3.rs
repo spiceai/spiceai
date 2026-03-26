@@ -26,7 +26,6 @@ use super::{
 
 use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
 };
 
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
@@ -133,14 +132,20 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region").secret(),
             ParameterSpec::component("endpoint").secret(),
+            ParameterSpec::component("url_style")
+                .description("Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.")
+                .one_of(&["vhost", "path"]),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
             ParameterSpec::component("session_token").secret(),
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
+            ParameterSpec::component("iam_role_source")
+                .description("IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+                .one_of(&["auto", "metadata", "env"]),
             ParameterSpec::component("versioning")
-                .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
+                .description("Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled"),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
@@ -187,25 +192,28 @@ impl DataConnectorFactory for S3Factory {
             }
 
             // Initialize AWS SDK credentials for IAM role authentication.
-            // Skip initialization for 'public' and 'key' auth methods which use explicit credentials.
-            // Default to 'public' if no auth method is specified.
-            let auth = params
-                .parameters
-                .get("auth")
-                .expose()
-                .ok()
-                .unwrap_or("public");
-
-            match auth {
-                "public" | "key" => {
-                    // Skip AWS SDK initialization - use explicit auth method directly
-                }
-                _ => {
-                    // Initialize AWS SDK for IAM role or any other auth method
-                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-                        tracing::warn!(
-                            "Unable to initialize AWS credentials for S3 connector: {err}"
-                        );
+            // Skip initialization only for 'public' and 'key' auth methods which use
+            // explicit credentials. When auth is unset, attempt to load credentials from
+            // the environment (including IRSA web identity tokens, ECS container credentials,
+            // and IMDS) so that IAM-based access works by default.
+            if let Some("public" | "key") = params.parameters.get("auth").expose().ok() {
+                // Skip AWS SDK initialization - use explicit auth method directly
+            } else {
+                let iam_role_source = params.parameters.get("iam_role_source").expose().ok();
+                match iam_role_source {
+                    Some("metadata" | "env") => {
+                        // Restricted IAM role source - build a custom config instead
+                        // of using the global SDK config. The object store registry
+                        // will handle the restricted source when building credentials.
+                    }
+                    _ => {
+                        // Initialize global AWS SDK for default credential chain.
+                        if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                        {
+                            tracing::warn!(
+                                "Unable to initialize AWS credentials for S3 connector: {err}"
+                            );
+                        }
                     }
                 }
             }
@@ -275,12 +283,14 @@ impl ListingTableConnector for S3 {
             vec![
                 "region",
                 "endpoint",
+                "url_style",
                 "key",
                 "secret",
                 "client_timeout",
                 "allow_http",
                 "auth",
                 "session_token",
+                "iam_role_source",
             ],
         )));
 
@@ -325,3 +335,133 @@ impl ListingTableConnector for S3 {
 }
 
 register_data_connector!("s3", S3Factory);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        builder::RuntimeBuilder,
+        component::dataset::{Dataset, builder::DatasetBuilder},
+    };
+    use app::AppBuilder;
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    fn create_test_connector(params: Parameters) -> S3 {
+        S3 {
+            params,
+            runtime: None,
+            tokio_io_runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
+        Parameters::try_new(
+            "s3_test",
+            params,
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid S3 test parameters")
+    }
+
+    async fn create_test_dataset(from: &str) -> Dataset {
+        DatasetBuilder::try_new(from.to_string(), "test")
+            .expect("dataset builder should be created")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
+            .build()
+            .expect("dataset should be built")
+    }
+
+    #[tokio::test]
+    async fn test_url_style_not_set_omits_fragment() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        // When url_style is not set, it should not appear in fragments (auto-detect at runtime)
+        let fragment = object_store_url.fragment().unwrap_or("");
+        assert!(
+            !fragment.contains("url_style"),
+            "url_style should not be in fragment when not set, got: {fragment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_url_style_vhost_is_included_in_fragments() {
+        let params = create_test_parameters(vec![(
+            "s3_url_style".to_string(),
+            "vhost".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(object_store_url.fragment(), Some("url_style=vhost"));
+    }
+
+    #[tokio::test]
+    async fn test_url_style_path_is_included_in_fragments() {
+        let params = create_test_parameters(vec![(
+            "s3_url_style".to_string(),
+            "path".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(object_store_url.fragment(), Some("url_style=path"));
+    }
+
+    #[tokio::test]
+    async fn test_iam_role_source_included_in_fragments_when_set() {
+        let params = create_test_parameters(vec![(
+            "s3_iam_role_source".to_string(),
+            "metadata".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        assert_eq!(
+            object_store_url.fragment(),
+            Some("iam_role_source=metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iam_role_source_omitted_from_fragments_when_unset() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let object_store_url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("object store URL should be constructed");
+
+        let fragment = object_store_url.fragment().unwrap_or("");
+        assert!(
+            !fragment.contains("iam_role_source"),
+            "iam_role_source should not be in fragment when not set, got: {fragment}"
+        );
+    }
+}

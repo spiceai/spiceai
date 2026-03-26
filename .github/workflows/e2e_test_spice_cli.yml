@@ -64,19 +64,16 @@ jobs:
                 runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64",
-                target_arch_go: "arm64",
               }, {
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
               }
             ];
             return matrix;
@@ -162,7 +159,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -303,7 +300,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -400,7 +397,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -434,8 +431,25 @@ jobs:
           build-path: ./build
 
       - name: Run spice install
+        if: matrix.target.target_os != 'windows'
         run: |
           spice install
+
+      - name: Validate native Windows spice install guidance
+        if: matrix.target.target_os == 'windows'
+        shell: pwsh
+        run: |
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $installOutput = (& spice install 2>&1 | Out-String)
+          Write-Host $installOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice install unexpectedly succeeded on native Windows"
+          }
+          if (-not $installOutput.Contains($expected)) {
+            throw "spice install did not print the expected WSL guidance"
+          }
+
+          exit 0
 
       - name: Run spice version
         run: |
@@ -462,7 +476,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -502,25 +516,27 @@ jobs:
           # time to download runtime
           sleep 60
 
-      - name: Start spice runtime
+      - name: Validate native Windows spice run guidance
         if: matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
-          Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.stdout.log" -RedirectStandardError "spice.stderr.log"
-          # time to download runtime
-          Start-Sleep -Seconds 60
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $runOutput = (& spice run 2>&1 | Out-String)
+          Write-Host $runOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice run unexpectedly succeeded on native Windows"
+          }
+          if (-not $runOutput.Contains($expected)) {
+            throw "spice run did not print the expected WSL guidance"
+          }
+
+          exit 0
 
       - name: Stop spice and check logs
         if: always() && matrix.target.target_os != 'windows'
         run: |
           killall spice || true
           cat spice.log
-
-      - name: Stop spice and check logs
-        if: always() && matrix.target.target_os == 'windows'
-        shell: pwsh
-        run: |
-          Get-Process -Name spice -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Get-Content spice.stdout.log, spice.stderr.log
 
       - name: Run spice version
         run: |
@@ -545,14 +561,13 @@ jobs:
             runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
-            target_arch_go: 'arm64'
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -593,14 +608,13 @@ jobs:
             runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
-            target_arch_go: 'arm64'
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -630,7 +644,11 @@ jobs:
       - name: Install expect (macOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          brew install expect
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
 
       - name: Make expect scripts executable
         run: |

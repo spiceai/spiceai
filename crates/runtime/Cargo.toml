@@ -9,6 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+adbc_core = { workspace = true, optional = true }
+adbc_driver_manager = { workspace = true, optional = true }
 app = { path = "../app" }
 arrow.workspace = true
 arrow-csv.workspace = true
@@ -28,7 +30,7 @@ aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
-axum-extra = { version = "0.10.1", features = ["typed-header"] }
+axum-extra = { version = "0.12.5", features = ["typed-header"] }
 ballista-core = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-scheduler = { workspace = true }
@@ -41,7 +43,7 @@ chunking = { path = "../chunking" }
 clap.workspace = true
 csv = "1.3.0"
 dashmap = "6.1.0"
-data_components = { path = "../data_components" }
+data_components = { path = "../data_components", features = ["flightsql"] }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
@@ -238,7 +240,6 @@ repl = { path = "../repl" }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
-yaml = { path = "../yaml" }
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tar = "0.4"
@@ -246,10 +247,13 @@ tempfile.workspace = true
 test-framework = { path = "../test-framework" }
 tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
+rusqlite = { workspace = true }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+yaml = { path = "../yaml" }
 
 [features]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc", "datafusion-table-providers/adbc"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
@@ -325,7 +329,11 @@ sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
-snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
+snowflake = [
+    "dep:snowflake-api",
+    "db_connection_pool/snowflake",
+    "data_components/snowflake",
+]
 spark = ["data_components/spark_connect"]
 sqlite = [
     "dep:tokio-rusqlite",

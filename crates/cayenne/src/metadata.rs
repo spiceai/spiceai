@@ -23,10 +23,8 @@ use serde::{Deserialize, Serialize};
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
-    /// Unique identifier for this table
-    pub table_id: i64,
-    /// UUID for this table (for external references)
-    pub table_uuid: String,
+    /// Unique identifier for this table (`UUIDv7`)
+    pub table_id: String,
     /// Name of the table
     pub table_name: String,
     /// Path to the table's data directory
@@ -69,10 +67,10 @@ pub struct TableMetadata {
 pub struct DataFile {
     /// Unique identifier for this data file
     pub data_file_id: i64,
-    /// Table this file belongs to
-    pub table_id: i64,
+    /// Table this file belongs to (`UUIDv7`)
+    pub table_id: String,
     /// Partition this file belongs to (None for non-partitioned tables)
-    pub partition_id: Option<i64>,
+    pub partition_id: Option<String>,
     /// Ordering of this file within the table
     pub file_order: i64,
     /// Path to the directory containing the `ListingTable`'s Vortex files
@@ -109,10 +107,10 @@ pub enum DeletionType {
 /// Represents a deletion vector file tracking deleted rows.
 #[derive(Debug, Clone)]
 pub struct DeleteFile {
-    /// Unique identifier for this delete file
-    pub delete_file_id: i64,
-    /// Table this delete file belongs to
-    pub table_id: i64,
+    /// Unique identifier for this delete file (`UUIDv7`)
+    pub delete_file_id: String,
+    /// Table this delete file belongs to (`UUIDv7`)
+    pub table_id: String,
     /// Path of the data file this deletion vector applies to (for position-based deletions).
     /// `None` for key-based deletions which apply to the entire table.
     /// For position-based deletions, row IDs are relative to this specific data file.
@@ -147,10 +145,10 @@ pub struct DeleteFile {
 /// corresponds to the i-th partition value.
 #[derive(Debug, Clone)]
 pub struct PartitionMetadata {
-    /// Unique identifier for this partition
-    pub partition_id: i64,
-    /// Table this partition belongs to
-    pub table_id: i64,
+    /// Unique identifier for this partition (`UUIDv7`)
+    pub partition_id: String,
+    /// Table this partition belongs to (`UUIDv7`)
+    pub table_id: String,
     /// Names of the partition columns (ordered).
     /// For a single partition column, this is a single-element vector.
     /// For composite partitions like `partition_by: [year, month]`, this contains
@@ -187,14 +185,14 @@ impl PartitionMetadata {
     /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).
     #[must_use]
     pub fn new_single(
-        table_id: i64,
+        table_id: String,
         partition_column: String,
         partition_value: String,
         path: String,
         path_is_relative: bool,
     ) -> Self {
         Self {
-            partition_id: 0,
+            partition_id: String::new(),
             table_id,
             partition_columns: vec![partition_column],
             partition_values: vec![partition_value],
@@ -208,14 +206,14 @@ impl PartitionMetadata {
     /// Creates a new `PartitionMetadata` for composite partition columns.
     #[must_use]
     pub fn new_composite(
-        table_id: i64,
+        table_id: String,
         partition_columns: Vec<String>,
         partition_values: Vec<String>,
         path: String,
         path_is_relative: bool,
     ) -> Self {
         Self {
-            partition_id: 0,
+            partition_id: String::new(),
             table_id,
             partition_columns,
             partition_values,

@@ -167,7 +167,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -181,7 +181,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: Dockerfile-release
@@ -236,7 +236,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -250,7 +250,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: Dockerfile-release
@@ -286,7 +286,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -300,7 +300,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: Dockerfile-cuda-release
@@ -335,14 +335,14 @@ jobs:
     steps:
       - name: Download AMD64 artifacts
         if: needs.setup.outputs.run_amd64 == 'true'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: images-amd64
           path: /tmp
 
       - name: Download ARM64 artifacts
         if: needs.setup.outputs.run_arm64 == 'true'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: images-arm64
           path: /tmp
@@ -352,7 +352,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Start local registry
         run: |
@@ -360,7 +360,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -368,7 +368,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -448,7 +448,7 @@ jobs:
       SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
     steps:
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: images-amd64-cuda
           path: /tmp
@@ -458,7 +458,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Start local registry
         run: |
@@ -466,7 +466,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -474,7 +474,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

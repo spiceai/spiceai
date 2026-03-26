@@ -38,9 +38,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::{
-    component::dataset::Dataset, federated_table::FederatedTable, register_data_connector,
-};
+use crate::{component::dataset::Dataset, federated_table::FederatedTable};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -445,8 +443,9 @@ pub fn subscribe_to_append_stream(
 
 pub struct SpiceAIChangeCommiter {}
 
+#[async_trait]
 impl CommitChange for SpiceAIChangeCommiter {
-    fn commit(&self) -> Result<(), CommitError> {
+    async fn commit(&self) -> Result<(), CommitError> {
         // Noop
         Ok(())
     }

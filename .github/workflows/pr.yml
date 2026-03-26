@@ -70,7 +70,7 @@ jobs:
   # Run Rust linting
   lint-rust:
     name: Rust Lint
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     needs: check_changes
 
     steps:
@@ -81,7 +81,7 @@ jobs:
 
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -134,13 +134,11 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  # Build and test after linting passes
+  # Build and test
   build-test:
     name: Build and Test
     runs-on: spiceai-dev-runners
-    needs: [check_changes, lint-rust]
-    env:
-      GOVER: 1.25.5
+    needs: [check_changes]
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -150,7 +148,7 @@ jobs:
 
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -159,13 +157,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'

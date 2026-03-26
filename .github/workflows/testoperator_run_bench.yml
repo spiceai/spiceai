@@ -22,6 +22,12 @@ on:
           - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
+          - 'scenario'
+      scenario_query_file:
+        description: 'Path to scenario query file (required when query_set is scenario)'
+        required: false
+        type: string
+        default: ''
       query_overrides:
         description: 'Query overrides'
         required: false
@@ -48,6 +54,11 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'dynamodb'
+          - 'arrow'
+          - 'postgres-catalog'
+          - 'mysql-catalog'
+          - 'mssql-catalog'
+          - 'turso'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -297,6 +308,7 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
+            ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
@@ -358,13 +370,14 @@ jobs:
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
-          
+
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
+            ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \

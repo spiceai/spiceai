@@ -73,6 +73,7 @@ struct SearchRequest {
 #[derive(Deserialize, Serialize)]
 struct SearchMatch {
     matches: HashMap<String, StringOrSlice>,
+    #[serde(rename = "_score", alias = "score")]
     score: f64,
     dataset: String,
     #[serde(default)]
@@ -369,4 +370,30 @@ fn format_matches(matches: &HashMap<String, StringOrSlice>) -> String {
     }
 
     texts.join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchResponse;
+
+    #[test]
+    fn deserializes_search_results_with_underscored_score() {
+        let response = serde_json::from_str::<SearchResponse>(
+            r#"{
+                "results": [
+                    {
+                        "matches": {"body": "Spice runtime error"},
+                        "_score": 0.98,
+                        "dataset": "spice.public.issues",
+                        "primary_key": {"id": 1}
+                    }
+                ],
+                "duration_ms": 12
+            }"#,
+        )
+        .expect("search response with _score should deserialize");
+
+        assert_eq!(response.results.len(), 1);
+        assert!((response.results[0].score - 0.98).abs() < f64::EPSILON);
+    }
 }
