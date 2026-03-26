@@ -551,7 +551,7 @@ mod tests {
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2891>.
     ///
     /// Arrow Dictionary-encoded columns (used for enums/categoricals) must be
-    /// transparently unpacked to their value types before reaching the SQLite
+    /// transparently unpacked to their value types before reaching the `SQLite`
     /// accelerator, which does not support Dictionary encoding.
     #[tokio::test]
     async fn test_sqlite_dictionary_type_round_trip() {

@@ -1671,7 +1671,7 @@ mod tests {
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.
     ///
     /// Arrow Dictionary-encoded columns (enums) must be transparently unpacked
-    /// to their value types before reaching the DuckDB accelerator.
+    /// to their value types before reaching the `DuckDB` accelerator.
     #[tokio::test]
     async fn test_duckdb_dictionary_type_round_trip() {
         use arrow::array::StringDictionaryBuilder;
