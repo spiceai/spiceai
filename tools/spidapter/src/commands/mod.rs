@@ -178,10 +178,10 @@ pub(crate) async fn ensure_spice_cloud_app(
             description: None,
             visibility: "private".to_string(),
             cname: Some(cname),
-            tags: Some(BTreeMap::from([(
-                "kind".to_string(),
-                "cluster".to_string(),
-            )])),
+            tags: Some(BTreeMap::from([
+                ("kind".to_string(), "cluster".to_string()),
+                ("organization".to_string(), "spicehq".to_string()),
+            ])),
             replicas: config.app_replicas,
             resources: Some(resources),
             executor,
