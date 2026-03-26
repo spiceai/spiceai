@@ -216,7 +216,7 @@ object_store = { version = "0.12.4", features = [
     "azure",
     "http",
 ] }
-odbc-api = { version = "20" }
+odbc-api = { version = "23" }
 opendal = { version = "0.55", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
 opentelemetry = { version = "0.31", default-features = false, features = [
     "metrics",
