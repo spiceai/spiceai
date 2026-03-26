@@ -1520,8 +1520,8 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                             }
                             Ok(_) => None,
                             Err(e) => Some(Err(
-                                crate::cluster::partition::write_through::Error::DecodeBatch {
-                                    source: arrow_schema::ArrowError::ExternalError(Box::new(e)),
+                                crate::cluster::partition::write_through::Error::UpstreamExecution {
+                                    source: e,
                                 },
                             )),
                         }

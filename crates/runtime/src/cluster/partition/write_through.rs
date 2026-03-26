@@ -135,6 +135,11 @@ pub enum Error {
 
     #[snafu(display("Failed to persist partition assignment: {source}"))]
     PersistAssignment { source: Box<super::manager::Error> },
+
+    #[snafu(display("Upstream execution error: {source}"))]
+    UpstreamExecution {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

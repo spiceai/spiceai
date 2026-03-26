@@ -555,7 +555,11 @@ impl Hash for DistributedCayenneUpdateNode {
 
 impl PartialEq for DistributedCayenneUpdateNode {
     fn eq(&self, other: &Self) -> bool {
-        self.table_name == other.table_name && self.input == other.input
+        self.table_name == other.table_name
+            && self.input == other.input
+            && self.output_schema == other.output_schema
+            && self.filter_sql == other.filter_sql
+            && self.assignments_sql == other.assignments_sql
     }
 }
 
@@ -647,7 +651,9 @@ impl Hash for DistributedCayenneInsertNode {
 
 impl PartialEq for DistributedCayenneInsertNode {
     fn eq(&self, other: &Self) -> bool {
-        self.table_name == other.table_name && self.input == other.input
+        self.table_name == other.table_name
+            && self.input == other.input
+            && self.output_schema == other.output_schema
     }
 }
 
