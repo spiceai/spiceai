@@ -88,7 +88,7 @@ version = "2.0.0-unstable"
 adbc_core = "0.21.0"
 adbc_driver_manager = "0.21.0"
 ahash = "0.8.12"
-anyhow = "1.0.99"
+anyhow = "1.0.102"
 arrow = { version = "57.0.0", features = ["prettyprint"] }
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"
