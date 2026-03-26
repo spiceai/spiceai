@@ -221,6 +221,12 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     }
                 };
 
+                if partition_expr.is_none() {
+                    return Err(DataFusionError::Plan(format!(
+                        "CREATE TABLE on Cayenne catalog '{catalog_name}' requires a PARTITION BY clause. Example: CREATE TABLE {catalog_name}.{schema_name}.{table_name} (...) PARTITION BY column_name"
+                    )));
+                }
+
                 let node = CayenneCreateTableNode::builder(
                     table_name,
                     arrow_schema,

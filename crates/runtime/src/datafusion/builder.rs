@@ -646,7 +646,12 @@ pub(crate) fn default_extension_planners(
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
         #[cfg(not(windows))]
-        Arc::new(super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(executor_registry, Some(io_runtime))),
+        Arc::new(
+            super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(
+                executor_registry,
+                Some(io_runtime),
+            ),
+        ),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]

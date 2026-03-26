@@ -1467,16 +1467,17 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
             }
 
             // Resolve the partition expression for this table.
-            let partition_expr =
-                crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
-                    &ctx, registry, &table_name,
-                )
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "Failed to resolve partition expression for table '{table_name}': {e}"
-                    ))
-                })?;
+            let partition_expr = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
+                &ctx,
+                registry,
+                &table_name,
+            )
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to resolve partition expression for table '{table_name}': {e}"
+                ))
+            })?;
 
             let Some(partition_expr) = partition_expr else {
                 return Err(DataFusionError::Execution(format!(
