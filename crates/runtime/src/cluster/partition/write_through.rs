@@ -172,7 +172,7 @@ pub(crate) async fn forward_federated_partitioned_write(
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
             partition_manager
-                .initialize_blank_metadata(path)
+                .initialize_metadata(path, raw_partition_by.to_vec())
                 .await
                 .map_err(|source| Error::CreateMetadata {
                     table: path.to_string(),
