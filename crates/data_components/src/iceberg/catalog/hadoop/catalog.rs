@@ -134,18 +134,26 @@ impl HadoopCatalogBuilder {
                 )
             })?;
 
-            // Verify the warehouse root exists using the file_io (which handles full paths)
-            let root_input = file_io.new_input(&warehouse_root).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid warehouse root: {e}"),
-                )
-            })?;
-            if !root_input.exists().await? {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Warehouse root '{warehouse_root}' does not exist"),
-                ));
+            // Verify the warehouse root exists and is a directory using the operator
+            match operator.stat("/").await {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Warehouse root '{warehouse_root}' is not a directory"),
+                    ));
+                }
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Warehouse root '{warehouse_root}' does not exist"),
+                    ));
+                }
+                Err(e) => {
+                    // Some backends (e.g., S3 with virtual directories) may not support stat on root;
+                    // log and proceed rather than failing.
+                    tracing::debug!("Unable to verify warehouse root directory: {e}");
+                }
             }
 
             let cloned_warehouse_root = warehouse_root.clone();
@@ -451,7 +459,7 @@ impl Catalog for HadoopCatalog {
 
             if self
                 .directory_has_metadata_and_data(
-                    &format!("{path}/{table_name}", table_name = table_ident.name),
+                    &format!("{path}{table_name}", table_name = table_ident.name),
                     self.metadata_mode.clone(),
                 )
                 .await?
@@ -478,7 +486,10 @@ impl HadoopCatalog {
     }
 
     async fn get_directories(&self, root: &str) -> Result<Vec<Entry>> {
-        let op_path = self.to_operator_path(root);
+        let mut op_path = self.to_operator_path(root);
+        if !op_path.ends_with('/') {
+            op_path.push('/');
+        }
         let mut directories = Vec::new();
         let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
             Error::new(
@@ -506,6 +517,7 @@ impl HadoopCatalog {
         path: &str,
         metadata_mode: MetadataMode,
     ) -> Result<bool> {
+        let path = path.trim_end_matches('/');
         let data_dir = format!("{path}/data/");
         let op_path = self.to_operator_path(&data_dir);
         let is_data_dir = match self.operator.stat(&op_path).await {
@@ -541,13 +553,21 @@ impl HadoopCatalog {
         path: &str,
         metadata_mode: MetadataMode,
     ) -> Result<bool> {
+        let path = path.trim_end_matches('/');
         let metadata_directory = format!("{path}/metadata/");
         let op_path = self.to_operator_path(&metadata_directory);
 
         // Check if the metadata directory exists
         match self.operator.stat(&op_path).await {
             Ok(m) if m.is_dir() => {}
-            Ok(_) | Err(_) => return Ok(false),
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to stat metadata directory: {e}"),
+                ));
+            }
         }
 
         let (metadata_file, fail_if_exact_missing) = match &metadata_mode {

@@ -367,8 +367,9 @@ impl CatalogConnector for IcebergCatalog {
                     })?
                     .into_custom_loader();
 
+                let configured_scheme = if catalog_id.starts_with("s3a://") { "s3a" } else { "s3" }.to_string();
                 Some(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: "s3".to_string(),
+                    configured_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>)
             } else {
@@ -702,7 +703,7 @@ pub fn parse_hadoop_table_url(
     let parsed = Url::parse(url).context(UrlParseSnafu)?;
 
     match parsed.scheme() {
-        "file" | "s3a" => {} // OK
+        "file" | "s3" | "s3a" | "gs" | "gcs" => {} // OK
         other => {
             return InvalidSchemeSnafu {
                 scheme: other.to_string(),
@@ -787,6 +788,11 @@ pub fn parse_hadoop_table_url(
 }
 
 /// Builds an opendal `Operator` for directory listing operations from a warehouse URL and properties.
+///
+/// Note: When `s3.endpoint` is set, the `StorageFactory` (used for FileIO) may use AWS SDK credential
+/// resolution (including IAM roles), while this operator uses static credentials from properties or
+/// opendal's built-in credential chain. In most deployments (EC2, ECS, env vars) these resolve
+/// identically, but custom IAM role assumptions via `s3_iam_role_source` will not propagate here.
 pub(crate) fn build_opendal_operator(
     warehouse_url: &str,
     props: &HashMap<String, String>,
@@ -911,6 +917,33 @@ mod tests {
         let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
         result.expect_err("should error parsing url");
+
+        // should support s3:// scheme
+        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("s3://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse s3:// Hadoop table URL");
+        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        // should support gs:// scheme
+        let url = "gs://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("gs://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse gs:// Hadoop table URL");
+        assert_eq!(base_uri, "gs://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        // should support gcs:// scheme
+        let url = "gcs://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("gcs://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse gcs:// Hadoop table URL");
+        assert_eq!(base_uri, "gcs://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
     }
 
     #[test]

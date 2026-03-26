@@ -186,8 +186,9 @@ impl IcebergDataConnector {
                     })?
                     .into_custom_loader();
 
+                let configured_scheme = if source.starts_with("s3a://") { "s3a" } else { "s3" }.to_string();
                 Some(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: "s3".to_string(),
+                    configured_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>)
             } else {
