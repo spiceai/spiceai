@@ -8,24 +8,6 @@ on:
     branches:
       - develop
   workflow_dispatch:
-    inputs:
-      profile_option:
-        description: 'Which Rust build profile to use? (Default is lint)'
-        required: false
-        type: choice
-        options:
-          - 'lint'
-          - 'release'
-          - 'release-lto'
-        default: 'lint'
-      update_snapshots:
-        description: 'Update the snapshots?'
-        required: false
-        default: 'no'
-        type: choice
-        options:
-          - 'always'
-          - 'no'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'develop' && github.sha || 'any-sha' }}
@@ -33,7 +15,7 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
-  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
+  RUST_PROFILE: lint
   # CI performance optimizations
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
@@ -127,7 +109,6 @@ jobs:
           AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
       - name: Build testoperator
         if: steps.check.outputs.relevant_changes == 'true'
@@ -147,8 +128,4 @@ jobs:
             exit 1
           fi
 
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+
