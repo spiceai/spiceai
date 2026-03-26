@@ -72,10 +72,11 @@ pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn Partiti
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)
 }
 
+/// Constructs a  `CREATE TABLE IF NOT EXISTS` DDL SQL query for the provided [`TableReference`].
 pub async fn create_table_if_not_exists(
     tbl: &TableReference,
     provider: &Arc<dyn TableProvider>,
-) -> Result<Option<String>, DataFusionError> {
+) -> Result<String, DataFusionError> {
     let ResolvedTableReference {
         catalog,
         schema,
@@ -122,8 +123,8 @@ pub async fn create_table_if_not_exists(
         table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
     }
 
-    Ok(Some(format!(
+    Ok(format!(
         "CREATE TABLE IF NOT EXISTS \"{catalog}\".\"{schema}\".\"{table}\" ({})",
         table_elements.join(", ")
-    )))
+    ))
 }

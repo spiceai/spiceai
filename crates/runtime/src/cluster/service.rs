@@ -57,7 +57,7 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
@@ -603,14 +603,13 @@ impl ClusterService for ClusterServiceImpl {
 
         // Forward `CREATE TABLE IF NOT EXIST` DDL to executor.
         #[cfg(not(windows))]
-        for table_ref in discover_cayenne_tables(&self.datafusion).await {
-            if let Some(table) = self.datafusion.get_table(&table_ref).await
-                && let Some(ddl_sql) = create_table_if_not_exists(&table_ref, &table)
+        for table_ref in discover_cayenne_tables(&self.datafusion) {
+            if let Some(table) = self.datafusion.get_table(&table_ref).await {
+                let ddl_sql = create_table_if_not_exists(&table_ref, &table)
                     .await
                     .map_err(|e| {
                         Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
-                    })?
-            {
+                    })?;
                 forward_sql_to_executor(client.clone(), &ddl_sql)
                     .await
                     .map_err(|e| {
@@ -744,69 +743,35 @@ async fn notify_scheduler_executor_shutdown(
 /// Discovers all Cayenne table references registered in the `DataFusion` catalog.
 ///
 /// Iterates through all catalogs, identifies Cayenne-backed catalogs, and returns
-/// fully qualified [`TableReference`]s for each table found. These are used to
-/// register unpartitioned entries in the executor's partition map so that queries
-/// for Cayenne tables are forwarded to the executor.
+/// fully qualified [`TableReference`]s for each table found.
 #[cfg(not(windows))]
-async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
-    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
-    use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
-
-    let mut tables = Vec::new();
-    let mut seen = HashSet::new();
-    for catalog_name in datafusion.ctx.catalog_names() {
-        let Some(catalog) = datafusion.ctx.catalog(&catalog_name) else {
-            continue;
-        };
-        if !is_cayenne_catalog(catalog.as_ref()) {
-            continue;
-        }
-        for schema_name in catalog.schema_names() {
-            let Some(schema) = catalog.schema(&schema_name) else {
-                continue;
-            };
-
-            // Prefer metadata-catalog discovery to avoid relying on in-memory schema cache.
-            if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
-                let namespace_prefix = format!("{}/", cayenne_schema.namespace());
-                match cayenne_schema.metadata_catalog().list_table_names().await {
-                    Ok(all_table_names) => {
-                        for full_name in all_table_names {
-                            let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
-                                continue;
-                            };
-                            let key = (
-                                catalog_name.clone(),
-                                schema_name.clone(),
-                                short_name.to_string(),
-                            );
-                            if seen.insert(key.clone()) {
-                                tables.push(TableReference::full(key.0, key.1, key.2));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to list Cayenne metadata tables for {catalog_name}.{schema_name}: {e}"
-                        );
-                    }
-                }
-                continue;
-            }
-
-            for table_name in schema.table_names() {
-                let key = (
-                    catalog_name.clone(),
-                    schema_name.clone(),
-                    table_name.clone(),
-                );
-                if seen.insert(key.clone()) {
-                    tables.push(TableReference::full(key.0, key.1, key.2));
-                }
-            }
-        }
-    }
-    tables
+fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+    datafusion
+        .ctx
+        .catalog_names()
+        .iter()
+        // Get Cayenne Catalogs
+        .filter_map(|c| {
+            let catalog = datafusion.ctx.catalog(&c)?;
+            crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref())
+                .then_some((c, catalog))
+        })
+        // Get all schemas in catalogs
+        .flat_map(|(c_name, c)| {
+            c.schema_names()
+                .iter()
+                .map(|s| (c.schema(s), c_name.clone(), s.clone()))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(s, c_name, s_name)| Some((s?, c_name, s_name)))
+        // Get full table references
+        .flat_map(|(s, c_name, s_name)| {
+            s.table_names()
+                .iter()
+                .map(|t| TableReference::full(c_name.as_str(), s_name.as_str(), t.as_str()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
 }
 
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
