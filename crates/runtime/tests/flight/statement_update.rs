@@ -44,7 +44,10 @@ use tonic::transport::Channel;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
+    utils::{
+        register_test_connectors, runtime_ready_check, test_request_context,
+        test_resolved_cluster_config, wait_until_true,
+    },
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -112,6 +115,7 @@ async fn start_cayenne_flight_app(
         rt_builder
             .with_app(app)
             .with_runtime_config(api_config.clone())
+            .with_resolved_cluster_config(test_resolved_cluster_config())
             .build()
             .await,
     );

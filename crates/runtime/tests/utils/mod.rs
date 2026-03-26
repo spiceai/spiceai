@@ -715,3 +715,17 @@ async fn do_register_test_connectors() {
 
     tracing::debug!("Completed connector registration for tests");
 }
+
+/// Creates a [`ResolvedClusterConfig`] suitable for integration tests that need
+/// Cayenne DDL/DML support.  Uses the `Executor` role so that:
+///   - `is_distributed = true`  → DDL checks pass
+///   - `apply_distributed_nodes = false` → DML is **not** rewritten to distributed
+///     forwarding nodes (no real scheduler is running)
+pub(crate) fn test_resolved_cluster_config() -> runtime::cluster::ResolvedClusterConfig {
+    use runtime::config::{ClusterConfig, ClusterRole};
+    let mut cluster_cfg = ClusterConfig::default().with_role(ClusterRole::Executor);
+    cluster_cfg.allow_insecure_connections = true;
+    cluster_cfg.node_advertise_address = Some("127.0.0.1".to_string());
+    runtime::cluster::ResolvedClusterConfig::try_new(cluster_cfg)
+        .expect("test cluster config should be valid")
+}
