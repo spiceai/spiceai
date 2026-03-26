@@ -18,7 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -222,7 +222,28 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                     }
                 };
 
-                match fallback_plan.execute(0, context) {
+                // Run the physical optimizer on the fallback plan. Without this,
+                // rules like `EnforceDistribution` won't split single file groups 
+                // into multiple parallel partitions, leading to slower scans
+                let fallback_optimized_plan =
+                    match optimize_fallback_plan(fallback_plan, &scan_params.state) {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            let error_stream = RecordBatchStreamAdapter::new(
+                                schema,
+                                stream::once(async move { Err(e) }),
+                            );
+                            return Box::pin(error_stream) as SendableRecordBatchStream;
+                        }
+                    };
+
+                tracing::trace!(
+                    "FallbackOnZeroResultsScanExec fallback plan for \"{}\":\n{}",
+                    table_name,
+                    datafusion::physical_plan::displayable(fallback_optimized_plan.as_ref()).indent(true),
+                );
+
+                match fallback_optimized_plan.execute(0, context) {
                     Ok(stream) => stream,
                     Err(e) => {
                         // If the fallback plan fails, return an error
@@ -243,6 +264,39 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
         Ok(Box::pin(stream_adapter))
     }
+}
+
+/// Run the physical optimizer rules from [`SessionState`] on the given [`ExecutionPlan`],
+/// then coalesce back to a single partition if the optimizer produced multiple.
+///
+/// This mirrors the optimization pass that `DefaultPhysicalPlanner::optimize_physical_plan`
+/// performs when creating a plan through the normal query pipeline. Calling it explicitly
+/// is necessary when a plan is constructed outside that pipeline (e.g. via a direct
+/// `TableProvider::scan` call in the fallback path).
+///
+/// The result is always a single-partition plan: if the optimizer (e.g. `EnforceDistribution`)
+/// splits the scan into multiple partitions, a [`CoalescePartitionsExec`] is added on top
+/// because [`FallbackOnZeroResultsScanExec`] expects to produce exactly one output stream.
+fn optimize_fallback_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    session_state: &SessionState,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let config = session_state.config_options();
+    let mut optimized =
+        session_state
+            .physical_optimizers()
+            .iter()
+            .try_fold(plan, |plan, rule| {
+                rule.optimize(plan, config.as_ref())
+                    .map_err(|e| DataFusionError::Context(rule.name().to_string(), Box::new(e)))
+            })?;
+
+    // Coalesce back to a single partition since FallbackOnZeroResultsScanExec outputs one stream
+    if optimized.output_partitioning().partition_count() > 1 {
+        optimized = Arc::new(CoalescePartitionsExec::new(optimized));
+    }
+
+    Ok(optimized)
 }
 
 mod metrics {
@@ -344,6 +398,68 @@ mod tests {
 
             assert_eq!(collected_result.len(), 1);
             assert_eq!(batch().num_rows(), collected_result[0].num_rows());
+        }
+    }
+
+    mod optimize_physical_plan_tests {
+        use super::*;
+        use datafusion::datasource::listing::PartitionedFile;
+        use datafusion::datasource::physical_plan::{
+            FileGroup, FileScanConfigBuilder, ParquetSource,
+        };
+        use datafusion::execution::config::SessionConfig;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion_datasource::source::DataSourceExec;
+        use object_store::path::Path;
+
+        /// Creates a `DataSourceExec` with a single `FileGroup` containing `n` fake parquet files.
+        fn single_group_parquet_exec(n: usize) -> Arc<dyn ExecutionPlan> {
+            let files: Vec<PartitionedFile> = (0..n)
+                .map(|i| {
+                    PartitionedFile::from(object_store::ObjectMeta {
+                        location: Path::from(format!("file_{i}.parquet")),
+                        last_modified: chrono::DateTime::UNIX_EPOCH,
+                        size: 1024,
+                        e_tag: None,
+                        version: None,
+                    })
+                })
+                .collect();
+
+            let table_schema = datafusion_datasource::TableSchema::new(schema(), Vec::new());
+            let parquet_source = ParquetSource::new(table_schema);
+            let config = FileScanConfigBuilder::new(
+                ObjectStoreUrl::parse("file:///").expect("valid url"),
+                Arc::new(parquet_source),
+            )
+            .with_file_group(FileGroup::new(files))
+            .build();
+
+            DataSourceExec::from_data_source(config)
+        }
+
+        #[test]
+        fn test_optimizer_splits_single_file_group() {
+            let plan = single_group_parquet_exec(16);
+            assert_eq!(
+                plan.output_partitioning().partition_count(),
+                1,
+                "pre-optimization plan should have 1 partition"
+            );
+
+            let config = SessionConfig::new()
+                .with_target_partitions(4)
+                .with_repartition_file_min_size(0);
+            let ctx = SessionContext::new_with_config(config);
+            let state = ctx.state();
+
+            let optimized =
+                optimize_fallback_plan(plan, &state).expect("optimization should succeed");
+
+            let plan_display = datafusion::physical_plan::displayable(optimized.as_ref())
+                .indent(true)
+                .to_string();
+            insta::assert_snapshot!(plan_display);
         }
     }
 
