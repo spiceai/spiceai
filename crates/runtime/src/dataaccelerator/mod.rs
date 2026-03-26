@@ -227,9 +227,20 @@ impl AcceleratorEngineRegistry {
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
 
-        // Normalize Dictionary-encoded types to their value types for accelerator
-        // engines that do not support Arrow Dictionary encoding (e.g. DuckDB, SQLite).
-        let schema = if arrow_tools::schema::has_dictionary_types(&schema) {
+        // Normalize Dictionary-encoded types to their value types only for
+        // accelerator engines that do not natively support Arrow Dictionary
+        // encoding (DuckDB, SQLite, Turso).  Other engines (Arrow, Cayenne,
+        // PostgreSQL) handle Dictionary types natively and benefit from the
+        // compact encoding.
+        let needs_dictionary_normalization = matches!(
+            engine.to_unpartitioned(),
+            acceleration::Engine::DuckDB
+                | acceleration::Engine::Sqlite
+                | acceleration::Engine::Turso
+        );
+        let schema = if needs_dictionary_normalization
+            && arrow_tools::schema::has_dictionary_types(&schema)
+        {
             let normalized = arrow_tools::schema::normalize_dictionary_types(&schema);
             tracing::debug!(
                 "Normalized Arrow Dictionary types in schema for {engine} acceleration"

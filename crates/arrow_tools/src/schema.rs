@@ -162,7 +162,7 @@ pub fn normalize_dictionary_types(schema: &Schema) -> Schema {
             if &new_type == field.data_type() {
                 field.as_ref().clone()
             } else {
-                Field::new(field.name(), new_type, field.is_nullable())
+                field.as_ref().clone().with_data_type(new_type)
             }
         })
         .collect();
@@ -170,19 +170,65 @@ pub fn normalize_dictionary_types(schema: &Schema) -> Schema {
     Schema::new_with_metadata(transformed_fields, schema.metadata().clone())
 }
 
-/// Returns `true` if `schema` contains any `Dictionary`-encoded fields.
+/// Returns `true` if `schema` contains any `Dictionary`-encoded fields,
+/// including inside nested container types (List, Struct, Map, etc.).
 #[must_use]
 pub fn has_dictionary_types(schema: &Schema) -> bool {
     schema
         .fields()
         .iter()
-        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+        .any(|f| data_type_contains_dictionary(f.data_type()))
 }
 
-/// Recursively replaces `Dictionary(_, value_type)` with `value_type`.
+/// Recursively checks whether a `DataType` contains any `Dictionary` encoding.
+fn data_type_contains_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => data_type_contains_dictionary(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|f| data_type_contains_dictionary(f.data_type())),
+        _ => false,
+    }
+}
+
+/// Recursively replaces `Dictionary(_, value_type)` with `value_type`,
+/// descending into nested container types (List, Struct, Map, etc.).
 fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
     match data_type {
         DataType::Dictionary(_, value_type) => normalize_dictionary_data_type(value_type.as_ref()),
+        DataType::List(field) => {
+            let inner = normalize_dictionary_data_type(field.data_type());
+            DataType::List(Arc::new(field.as_ref().clone().with_data_type(inner)))
+        }
+        DataType::LargeList(field) => {
+            let inner = normalize_dictionary_data_type(field.data_type());
+            DataType::LargeList(Arc::new(field.as_ref().clone().with_data_type(inner)))
+        }
+        DataType::FixedSizeList(field, size) => {
+            let inner = normalize_dictionary_data_type(field.data_type());
+            DataType::FixedSizeList(Arc::new(field.as_ref().clone().with_data_type(inner)), *size)
+        }
+        DataType::Map(field, sorted) => {
+            let inner = normalize_dictionary_data_type(field.data_type());
+            DataType::Map(
+                Arc::new(field.as_ref().clone().with_data_type(inner)),
+                *sorted,
+            )
+        }
+        DataType::Struct(fields) => {
+            let new_fields: Vec<Field> = fields
+                .iter()
+                .map(|f| {
+                    let inner = normalize_dictionary_data_type(f.data_type());
+                    f.as_ref().clone().with_data_type(inner)
+                })
+                .collect();
+            DataType::Struct(new_fields.into())
+        }
         other => other.clone(),
     }
 }
