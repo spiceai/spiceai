@@ -2613,18 +2613,15 @@ async fn resolve_table_partition_expr(
     // Resolve auto-generated labels (e.g. "expr0") from partition manager metadata.
     if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
         && let Some(executor_registry) = executor_registry
-    {
-        if let Some(metadata) = executor_registry
+        && let Some(metadata) = executor_registry
             .federated_partition_manager()
             .get_table_metadata(table_reference)
             .await
             .boxed()
             .map_err(DataFusionError::External)?
-        {
-            if let Some(original) = metadata.partition_expressions.get(idx) {
-                return Ok(Some(original.clone()));
-            }
-        }
+        && let Some(original) = metadata.partition_expressions.get(idx)
+    {
+        return Ok(Some(original.clone()));
     }
 
     Ok(Some(expr_string))

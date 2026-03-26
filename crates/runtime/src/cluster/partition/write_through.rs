@@ -200,10 +200,10 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     let decode_schema = Arc::clone(&schema);
     let batch_stream = async_stream::try_stream! {
-        if let Some(batch) = first_batch {
-            if batch.num_rows() > 0 {
-                yield batch;
-            }
+        if let Some(batch) = first_batch
+            && batch.num_rows() > 0
+        {
+            yield batch;
         }
         while let Some(result) = streaming_flight.next().await {
             let batch = flight_data_to_arrow_batch(
