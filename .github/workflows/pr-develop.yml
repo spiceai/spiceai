@@ -25,7 +25,7 @@ env:
 
 jobs:
   pr-develop:
-    name: Lint, Build, and Test
+    name: Lint, Build, and Test (Develop)
     runs-on: spiceai-macos
 
     steps:
@@ -84,12 +84,13 @@ jobs:
         env:
           BRANCH: spiceai-52
 
-      # Build and Test
+      # Build and Test (exclude packages with secret-dependent tests)
       - name: Build CLI and run nextest
         if: steps.check.outputs.relevant_changes == 'true'
         run: make build-cli nextest
         env:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
+          NEXTEST_FLAG: "-E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
 
       - name: Build testoperator
         if: steps.check.outputs.relevant_changes == 'true'
@@ -104,5 +105,3 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
-
-
