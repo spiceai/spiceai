@@ -210,7 +210,10 @@ fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
         }
         DataType::FixedSizeList(field, size) => {
             let inner = normalize_dictionary_data_type(field.data_type());
-            DataType::FixedSizeList(Arc::new(field.as_ref().clone().with_data_type(inner)), *size)
+            DataType::FixedSizeList(
+                Arc::new(field.as_ref().clone().with_data_type(inner)),
+                *size,
+            )
         }
         DataType::Map(field, sorted) => {
             let inner = normalize_dictionary_data_type(field.data_type());
