@@ -1222,9 +1222,11 @@ impl CayenneTableProvider {
             context,
             pk_deletion_strategy,
             pk_row_converter,
-            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(
-                pk_column_indices,
-            )]),
+            constraints: if has_primary_key {
+                Constraints::new_unverified(vec![Constraint::PrimaryKey(pk_column_indices)])
+            } else {
+                Constraints::default()
+            },
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),

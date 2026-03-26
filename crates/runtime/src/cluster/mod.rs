@@ -1311,7 +1311,11 @@ pub async fn initialize_cluster_executor(
                         retry_after: None,
                     })
             },
-        );
+        )
+        .await
+        .map_err(|err| FailedToStartClusterExecutor {
+            source: format!("Failed to connect to local Flight service: {err}").into(),
+        })?;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;

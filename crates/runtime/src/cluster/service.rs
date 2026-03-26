@@ -598,10 +598,13 @@ impl ClusterService for ClusterServiceImpl {
                 );
             })
             .map_err(|e| Status::internal(format!("Failed to create Flight SQL client: {e}")))?;
-        let mut flight_client_registry = self.executor_registry.flight_sql_clients.write().await;
-        flight_client_registry.insert(executor_id.to_string(), client.clone());
+        {
+            let mut flight_client_registry =
+                self.executor_registry.flight_sql_clients.write().await;
+            flight_client_registry.insert(executor_id.to_string(), client.clone());
+        }
 
-        // Forward `CREATE TABLE IF NOT EXIST` DDL to executor.
+        // Forward `CREATE TABLE IF NOT EXISTS` DDL to executor.
         #[cfg(not(windows))]
         for table_ref in discover_cayenne_tables(&self.datafusion) {
             if let Some(table) = self.datafusion.get_table(&table_ref).await {
@@ -624,7 +627,7 @@ impl ClusterService for ClusterServiceImpl {
         let app_guard = self.app.read().await;
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
         if let Some(app) = app_guard.as_ref() {
-            match allocation_initial_partitions(
+            match allocate_initial_partitions(
                 executor_id,
                 &self.executor_registry().accelerations_partition_manager(),
                 app,

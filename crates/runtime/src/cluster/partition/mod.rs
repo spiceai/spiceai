@@ -54,7 +54,7 @@ pub enum Error {
         source: Box<manager::Error>,
     },
 
-    #[snafu(display("Failed to allocation partitions for table {table}: {source}"))]
+    #[snafu(display("Failed to allocate partitions for table {table}: {source}"))]
     PartitionAllocation {
         table: String,
         source: Box<manager::Error>,
@@ -136,7 +136,7 @@ pub fn get_partition_filter_exprs(
     vec![combined]
 }
 
-pub(crate) async fn allocation_initial_partitions(
+pub(crate) async fn allocate_initial_partitions(
     executor_id: &str,
     partition_manager: &Arc<PartitionManager>,
     app: &Arc<App>,
