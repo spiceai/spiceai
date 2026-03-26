@@ -109,7 +109,7 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "7d5d317
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.14"
+aws-config = "1.8.15"
 aws-credential-types = "1.2.13"
 aws-runtime = "1.7.1"
 aws-sdk-bedrockruntime = "1.126.0"
