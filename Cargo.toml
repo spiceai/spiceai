@@ -192,11 +192,12 @@ hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 httpdate = "1.0"
 humantime = "2.1.0"
-iceberg = "0.8.0"
-iceberg-catalog-glue = "0.8.0"
-iceberg-catalog-rest = "0.8.0"
-iceberg-datafusion = "0.8.0"
-iceberg_test_utils = "0.8.0"
+iceberg = "0.9.0"
+iceberg-catalog-glue = "0.9.0"
+iceberg-catalog-rest = "0.9.0"
+iceberg-datafusion = "0.9.0"
+iceberg-storage-opendal = { version = "0.9.0", features = ["opendal-s3", "opendal-gcs", "opendal-fs"] }
+iceberg_test_utils = "0.9.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
@@ -216,6 +217,7 @@ object_store = { version = "0.12.4", features = [
     "http",
 ] }
 odbc-api = { version = "20" }
+opendal = { version = "0.55", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
 opentelemetry = { version = "0.31", default-features = false, features = [
     "metrics",
     "trace",
@@ -396,7 +398,7 @@ ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", re
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ad88031f002aec4ec63dc1fabd81dfd3cf69fb22" } # spiceai-52
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ad88031f002aec4ec63dc1fabd81dfd3cf69fb22" } # spiceai-52
 
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "9d26fb3662d2edb8f382d4d0f7899c303549f0d0" } # spiceai-0.18.2
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
@@ -405,11 +407,12 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" }              # spiceai-52
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" } # spiceai-52
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" } # spiceai-52
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" }   # spiceai-52
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6dc788084d94bcd90e61d26c496fb7056ae7a9c4" }   # spiceai-52
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6c9b9709c572fe40484ec00aa969d1f62f2b0fe7" }              # spiceai-52
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6c9b9709c572fe40484ec00aa969d1f62f2b0fe7" } # spiceai-52
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6c9b9709c572fe40484ec00aa969d1f62f2b0fe7" } # spiceai-52
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6c9b9709c572fe40484ec00aa969d1f62f2b0fe7" }   # spiceai-52
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6c9b9709c572fe40484ec00aa969d1f62f2b0fe7" } # spiceai-52
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "6c9b9709c572fe40484ec00aa969d1f62f2b0fe7" }   # spiceai-52
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
