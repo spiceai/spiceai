@@ -84,7 +84,6 @@ pub async fn get_available_models_hint(
                 }
             }
         }
-        ModelSource::Perplexity => Box::new(llms::perplexity::PerplexityModelLister::new()),
         ModelSource::SpiceAI => match llms::spiceai::SpiceAiModelLister::from_params(params) {
             Ok(lister) => Box::new(lister),
             Err(e) => {
@@ -110,15 +109,6 @@ mod tests {
         let params = HashMap::new();
         let result = get_available_models_hint(&ModelSource::OpenAi, &params).await;
         assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_perplexity_returns_known_models() {
-        let params = HashMap::new();
-        let result = get_available_models_hint(&ModelSource::Perplexity, &params).await;
-        assert!(result.is_some());
-        let hint = result.expect("test: perplexity should return models");
-        assert!(hint.contains("sonar"));
     }
 
     #[tokio::test]

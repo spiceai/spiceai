@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
   {
@@ -15,13 +14,13 @@ snapshot_kind: text
     "_score": 0.303
   },
   {
-    "id": 551,
-    "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
-    "_score": 0.292
-  },
-  {
     "id": 1035,
     "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
     "_score": 0.291
+  },
+  {
+    "id": 1268,
+    "answer": "The gall bladder is stimulated to empty by the release of cholecystokinin (CCK) from the duodenum in response to food entry.",
+    "_score": 0.28
   }
 ]

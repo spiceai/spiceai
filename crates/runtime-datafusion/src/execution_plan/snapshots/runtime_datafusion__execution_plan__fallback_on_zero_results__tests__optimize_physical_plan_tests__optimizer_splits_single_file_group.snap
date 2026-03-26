@@ -1,0 +1,6 @@
+---
+source: crates/runtime-datafusion/src/execution_plan/fallback_on_zero_results.rs
+expression: plan_display
+---
+CoalescePartitionsExec
+  DataSourceExec: file_groups={4 groups: [[file_0.parquet:0..1024, file_1.parquet:0..1024, file_2.parquet:0..1024, file_3.parquet:0..1024], [file_4.parquet:0..1024, file_5.parquet:0..1024, file_6.parquet:0..1024, file_7.parquet:0..1024], [file_8.parquet:0..1024, file_9.parquet:0..1024, file_10.parquet:0..1024, file_11.parquet:0..1024], [file_12.parquet:0..1024, file_13.parquet:0..1024, file_14.parquet:0..1024, file_15.parquet:0..1024]]}, projection=[a, b], file_type=parquet
