@@ -234,6 +234,13 @@ async fn sql_request_to_traces(ctx: &RuntimeContext, sql: &str) -> Result<Vec<Ta
             source: e,
         })?;
 
+    // Check for authentication errors (401/403) before other status handling
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        || response.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        return Err(crate::error::UnauthorizedSnafu.build());
+    }
+
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();

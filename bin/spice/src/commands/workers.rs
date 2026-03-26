@@ -17,7 +17,7 @@ limitations under the License.
 //! Workers command implementation - lists workers loaded by the runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::{WorkerInfo, WorkerListResponse};
@@ -63,12 +63,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &WorkersArgs) -> Result<()> {
         .build()
     })?;
 
-    if !response.status().is_success() {
-        return Err(RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build());
-    }
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
 
     let worker_response: WorkerListResponse = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
