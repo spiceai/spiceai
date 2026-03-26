@@ -41,7 +41,7 @@ use runtime_table_partition::expression::validate_partition_expression;
 use super::is_cayenne_catalog;
 use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
 };
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -92,7 +92,14 @@ pub struct CayenneDdlAnalyzerRule {
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     ddl_options: SharedDdlExtensionStore,
+    /// When `true`, DML targeting Cayenne catalogs is rewritten into distributed
+    /// extension nodes that forward operations to executors. Only `true` for the
+    /// scheduler role.
     apply_distributed_nodes: bool,
+    /// When `true`, the runtime is running in some cluster role (Scheduler or
+    /// Executor). Cayenne catalogs require distributed mode — standalone
+    /// (non-distributed) Cayenne usage is not supported.
+    is_distributed: bool,
 }
 
 impl fmt::Debug for CayenneDdlAnalyzerRule {
@@ -110,6 +117,7 @@ impl CayenneDdlAnalyzerRule {
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
         ddl_options: SharedDdlExtensionStore,
         apply_distributed_nodes: bool,
+        is_distributed: bool,
     ) -> Self {
         Self {
             session_state,
@@ -117,6 +125,7 @@ impl CayenneDdlAnalyzerRule {
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
             ddl_options,
             apply_distributed_nodes,
+            is_distributed,
         }
     }
 
@@ -159,6 +168,12 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 if !self.is_cayenne_backed(&catalog_name) {
                     return Ok(plan);
+                }
+
+                if !self.is_distributed {
+                    return Err(DataFusionError::Plan(format!(
+                        "CREATE TABLE on Cayenne catalog '{catalog_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
+                    )));
                 }
 
                 let schema_name = create
@@ -206,6 +221,12 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     }
                 };
 
+                if partition_expr.is_none() {
+                    return Err(DataFusionError::Plan(format!(
+                        "CREATE TABLE on Cayenne catalog '{catalog_name}' requires a PARTITION BY clause. Example: CREATE TABLE {catalog_name}.{schema_name}.{table_name} (...) PARTITION BY column_name"
+                    )));
+                }
+
                 let node = CayenneCreateTableNode::builder(
                     table_name,
                     arrow_schema,
@@ -238,6 +259,12 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     return Ok(plan);
                 }
 
+                if !self.is_distributed {
+                    return Err(DataFusionError::Plan(format!(
+                        "DROP TABLE on Cayenne catalog '{catalog_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
+                    )));
+                }
+
                 let schema_name = drop
                     .name
                     .schema()
@@ -263,16 +290,22 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 output_schema,
                 ..
             }) => {
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
                 let catalog_name = table_name
                     .catalog()
                     .unwrap_or(SPICE_DEFAULT_CATALOG)
                     .to_string();
 
                 if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.is_distributed {
+                    return Err(DataFusionError::Plan(format!(
+                        "DELETE on Cayenne catalog table '{table_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
+                    )));
+                }
+
+                if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
 
@@ -294,16 +327,22 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 output_schema,
                 ..
             }) => {
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
                 let catalog_name = table_name
                     .catalog()
                     .unwrap_or(SPICE_DEFAULT_CATALOG)
                     .to_string();
 
                 if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.is_distributed {
+                    return Err(DataFusionError::Plan(format!(
+                        "UPDATE on Cayenne catalog table '{table_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
+                    )));
+                }
+
+                if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
 
@@ -322,6 +361,40 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     node: Arc::new(node),
                 }))
             }
+            LogicalPlan::Dml(DmlStatement {
+                input,
+                table_name,
+                op: WriteOp::Insert(_),
+                output_schema,
+                ..
+            }) => {
+                let catalog_name = table_name
+                    .catalog()
+                    .unwrap_or(SPICE_DEFAULT_CATALOG)
+                    .to_string();
+
+                if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.is_distributed {
+                    return Err(DataFusionError::Plan(format!(
+                        "INSERT on Cayenne catalog table '{table_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
+                    )));
+                }
+
+                if !self.apply_distributed_nodes {
+                    return Ok(plan);
+                }
+
+                Ok(LogicalPlan::Extension(Extension {
+                    node: Arc::new(DistributedCayenneInsertNode::new(
+                        table_name.clone(),
+                        Arc::clone(input),
+                        Arc::clone(output_schema),
+                    )),
+                }))
+            }
             LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(create)) => {
                 let (catalog_name, schema_name) =
                     parse_qualified_schema_name(create.schema_name.as_str());
@@ -332,6 +405,12 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 if !self.is_cayenne_backed(&catalog_name) {
                     return Ok(plan);
+                }
+
+                if !self.is_distributed {
+                    return Err(DataFusionError::Plan(format!(
+                        "CREATE SCHEMA on Cayenne catalog '{catalog_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
+                    )));
                 }
 
                 let node =
@@ -406,7 +485,7 @@ pub fn extract_filter_sql(plan: &LogicalPlan) -> DFResult<Option<String>> {
 /// Note: `DataFusion` may wrap unchanged columns in CAST expressions, which would
 /// not match the identity check and would be treated as assignments. In practice
 /// this is rare and harmless (it would SET the column to its own value).
-fn extract_update_assignments(
+pub(crate) fn extract_update_assignments(
     plan: &LogicalPlan,
     table_name: &TableReference,
 ) -> DFResult<Vec<(String, String)>> {

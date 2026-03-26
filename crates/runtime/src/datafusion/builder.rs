@@ -302,6 +302,7 @@ impl DataFusionBuilder {
                 ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
                     Arc::clone(&datafusion_ref),
                     self.executor_registry.clone(),
+                    self.io_runtime.clone(),
                 )),
             ))
             .with_runtime_env(runtime_env(
@@ -472,6 +473,9 @@ impl DataFusionBuilder {
                 self.cluster_config.as_ref().is_some_and(|cfg| {
                     matches!(cfg.effective_role(), Some(ClusterRole::Scheduler))
                 }),
+                self.cluster_config
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.effective_role().is_some()),
             ),
         ));
 
@@ -638,6 +642,7 @@ pub(crate) fn runtime_env(
 pub(crate) fn default_extension_planners(
     datafusion_ref: super::iceberg_ddl::SharedDataFusionRef,
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
@@ -645,7 +650,12 @@ pub(crate) fn default_extension_planners(
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
         #[cfg(not(windows))]
-        Arc::new(super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(executor_registry)),
+        Arc::new(
+            super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(
+                executor_registry,
+                Some(io_runtime),
+            ),
+        ),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]
