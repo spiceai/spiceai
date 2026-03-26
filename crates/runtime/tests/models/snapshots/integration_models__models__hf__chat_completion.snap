@@ -5,11 +5,20 @@ expression: "normalize_chat_completion_response(response, true)"
 {
   "choices": [
     {
-      "finish_reason": "stop",
+      "finish_reason": "tool_calls",
       "index": 0,
       "message": {
-        "content": "content_val",
-        "role": "assistant"
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"query\":\"|oo count(* from taxi_trips)\"}",
+              "name": "exec"
+            },
+            "id": "call-186bde15-ce6b-4a6f-ba66-36683fe58f67",
+            "type": "function"
+          }
+        ]
       }
     }
   ],
