@@ -1688,12 +1688,12 @@ mod tests {
         ]));
 
         // Normalize the schema (Dictionary -> Utf8).
-        let accel_schema =
-            Arc::new(arrow_tools::schema::normalize_dictionary_types(&source_schema));
+        let accel_schema = Arc::new(arrow_tools::schema::normalize_dictionary_types(
+            &source_schema,
+        ));
         assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
 
-        let df_schema =
-            ToDFSchema::to_dfschema_ref(Arc::clone(&accel_schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&accel_schema)).expect("df schema");
 
         let external_table = CreateExternalTable {
             schema: df_schema,
