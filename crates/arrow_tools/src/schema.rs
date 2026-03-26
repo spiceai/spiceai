@@ -144,6 +144,49 @@ pub fn expand_views_schema(schema: &Schema) -> Schema {
     Schema::new(transformed_fields)
 }
 
+/// Replaces Arrow `Dictionary`-encoded fields with the dictionary's value type.
+///
+/// Data accelerators such as DuckDB and SQLite do not natively support Arrow
+/// Dictionary types.  By unpacking the dictionary encoding at the schema level
+/// (and later casting the data via `arrow_cast::cast`), the downstream
+/// accelerator receives only primitive types it can handle.
+///
+/// For example, `Dictionary(Int32, Utf8)` is normalised to `Utf8`.
+#[must_use]
+pub fn normalize_dictionary_types(schema: &Schema) -> Schema {
+    let transformed_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let new_type = normalize_dictionary_data_type(field.data_type());
+            if &new_type == field.data_type() {
+                field.as_ref().clone()
+            } else {
+                Field::new(field.name(), new_type, field.is_nullable())
+            }
+        })
+        .collect();
+
+    Schema::new_with_metadata(transformed_fields, schema.metadata().clone())
+}
+
+/// Returns `true` if `schema` contains any `Dictionary`-encoded fields.
+#[must_use]
+pub fn has_dictionary_types(schema: &Schema) -> bool {
+    schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+}
+
+/// Recursively replaces `Dictionary(_, value_type)` with `value_type`.
+fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Dictionary(_, value_type) => normalize_dictionary_data_type(value_type.as_ref()),
+        other => other.clone(),
+    }
+}
+
 pub fn set_computed_columns_meta<S: ::std::hash::BuildHasher>(
     schema: &mut Schema,
     computed_columns_meta: &HashMap<String, Vec<String>, S>,
@@ -391,5 +434,80 @@ mod tests {
 
         let diff = schema_difference(&schema, &schema);
         assert!(diff.is_none());
+    }
+
+    #[test]
+    fn test_normalize_dictionary_types() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "category",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::LargeUtf8)),
+                false,
+            ),
+        ]);
+
+        let normalized = normalize_dictionary_types(&schema);
+
+        assert_eq!(normalized.field(0).data_type(), &DataType::Int64);
+        assert_eq!(normalized.field(1).data_type(), &DataType::Utf8);
+        assert!(normalized.field(1).is_nullable());
+        assert_eq!(normalized.field(2).data_type(), &DataType::Utf8);
+        assert_eq!(normalized.field(3).data_type(), &DataType::LargeUtf8);
+        assert!(!normalized.field(3).is_nullable());
+    }
+
+    #[test]
+    fn test_has_dictionary_types() {
+        let no_dict_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        assert!(!has_dictionary_types(&no_dict_schema));
+
+        let dict_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]);
+        assert!(has_dictionary_types(&dict_schema));
+    }
+
+    #[test]
+    fn test_normalize_schema_without_dictionary_is_noop() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        assert_eq!(schema, normalized);
+    }
+
+    #[test]
+    fn test_normalize_preserves_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("key".to_string(), "value".to_string());
+        let schema = Schema::new_with_metadata(
+            vec![Field::new(
+                "col",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            )],
+            metadata.clone(),
+        );
+
+        let normalized = normalize_dictionary_types(&schema);
+        assert_eq!(normalized.metadata(), &metadata);
+        assert_eq!(normalized.field(0).data_type(), &DataType::Utf8);
     }
 }
