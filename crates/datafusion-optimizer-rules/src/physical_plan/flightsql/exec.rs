@@ -249,9 +249,14 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "PartialAggregationFlightSqlExec only supports 1 partition, got partition {partition}"
+            )));
+        }
         let query = self.build_query()?;
         let target_schema = self.schema();
         let column_mapping = query.column_mapping;
@@ -331,13 +336,17 @@ fn build_aggregate_sql(
     let mut all_fragments: Vec<SqlFragment> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
-    // Group-by columns — no alias needed
-    for (_expr, name) in group_by.expr() {
-        let quoted = quote_ident(name);
-        group_by_cols.push(quoted.clone());
+    // Group-by columns / expressions — no alias needed. Generate SQL from the
+    // physical expression so that non-trivial group-bys (e.g. date_trunc(...))
+    // are correctly pushed down.
+    for (expr, _name) in group_by.expr() {
+        let expr_sql = physical_expr_to_sql(expr, column_substitutions).ok_or_else(|| {
+            DataFusionError::Internal("Failed to convert group-by expression to SQL".to_string())
+        })?;
+        group_by_cols.push(expr_sql.clone());
         all_fragments.push(SqlFragment {
-            sql: quoted.clone(),
-            dedup_key: quoted,
+            sql: expr_sql.clone(),
+            dedup_key: expr_sql,
             needs_alias: false,
         });
     }
@@ -355,6 +364,12 @@ fn build_aggregate_sql(
                     needs_alias: true,
                 });
             } else if func_name == "count" {
+                if exprs.len() != 1 {
+                    return Err(DataFusionError::Internal(format!(
+                        "Expected 1 argument for count, got {}",
+                        exprs.len()
+                    )));
+                }
                 let arg_sql =
                     physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
                         DataFusionError::Internal("Failed to convert count arg to SQL".to_string())
@@ -365,6 +380,12 @@ fn build_aggregate_sql(
                     needs_alias: true,
                 });
             } else {
+                if exprs.len() != 1 {
+                    return Err(DataFusionError::Internal(format!(
+                        "Expected 1 argument for {func_name}, got {}",
+                        exprs.len()
+                    )));
+                }
                 let arg_sql =
                     physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
                         DataFusionError::Internal(format!(
@@ -379,6 +400,12 @@ fn build_aggregate_sql(
                 });
             }
         } else if func_name == "avg" {
+            if exprs.len() != 1 {
+                return Err(DataFusionError::Internal(format!(
+                    "Expected 1 argument for avg, got {}",
+                    exprs.len()
+                )));
+            }
             let arg_sql =
                 physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
                     DataFusionError::Internal("Failed to convert avg arg to SQL".to_string())
@@ -584,7 +611,10 @@ fn scalar_to_sql(value: &datafusion::scalar::ScalarValue) -> Option<String> {
         }
         ScalarValue::Utf8(Some(v))
         | ScalarValue::LargeUtf8(Some(v))
-        | ScalarValue::Utf8View(Some(v)) => Some(format!("'{v}'")),
+        | ScalarValue::Utf8View(Some(v)) => {
+            let escaped = v.replace('\'', "''");
+            Some(format!("'{escaped}'"))
+        }
         ScalarValue::Boolean(Some(v)) => Some(v.to_string()),
         ScalarValue::Null => Some("NULL".to_string()),
         _ => None,
@@ -613,7 +643,8 @@ fn arrow_type_to_sql(dt: &datafusion::arrow::datatypes::DataType) -> Option<Stri
 }
 
 fn quote_ident(name: &str) -> String {
-    format!("\"{name}\"")
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{escaped}\"")
 }
 
 #[cfg(test)]
