@@ -17,7 +17,7 @@ limitations under the License.
 //! Forwards writes to each relevant executor based on their assigned partitions.
 //! This is used for partitioned tables that are written to via the coordinator.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
@@ -33,11 +33,11 @@ use datafusion::{
     sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
-use futures::TryStreamExt as _;
+use futures::{Stream, TryStreamExt as _};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::mpsc::{self, Sender};
-use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream};
+use tokio_stream::{StreamExt, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Response, Streaming};
 
 use crate::{
@@ -136,6 +136,11 @@ pub enum Error {
     #[snafu(display("Failed to persist partition assignment: {source}"))]
     PersistAssignment { source: Box<super::manager::Error> },
 
+    #[snafu(display("Upstream execution error: {source}"))]
+    UpstreamExecution {
+        source: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display(
         "Row count mismatch after partitioning unmatched rows for table {table}: expected {expected} but got {actual}"
     ))]
@@ -170,6 +175,9 @@ type ExecutorFilter = (ExecutorId, Arc<dyn datafusion::physical_plan::PhysicalEx
 /// Rows with partition values not yet assigned to any executor are assigned
 /// to the least-loaded executor. The assignment is persisted to the partition
 /// metadata store before the rows are forwarded.
+///
+/// Batches are decoded and routed incrementally from the Flight stream to
+/// avoid materializing the full payload in memory.
 pub(crate) async fn forward_federated_partitioned_write(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
@@ -179,6 +187,67 @@ pub(crate) async fn forward_federated_partitioned_write(
     mut streaming_flight: Peekable<Streaming<FlightData>>,
     raw_partition_by: &[String],
 ) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
+    let schema = Arc::new(
+        try_schema_from_flatbuffer_bytes(&first_message.data_header).context(DecodeSchemaSnafu)?,
+    );
+
+    let dictionaries_by_id = Arc::new(HashMap::new());
+
+    // Decode the first message and build a streaming iterator that yields
+    // each subsequent FlightData message as a RecordBatch without buffering.
+    let first_batch =
+        flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id).ok();
+
+    let decode_schema = Arc::clone(&schema);
+    let batch_stream = async_stream::try_stream! {
+        if let Some(batch) = first_batch {
+            if batch.num_rows() > 0 {
+                yield batch;
+            }
+        }
+        while let Some(result) = streaming_flight.next().await {
+            let batch = flight_data_to_arrow_batch(
+                &result.context(StreamReadSnafu)?,
+                Arc::clone(&decode_schema),
+                &dictionaries_by_id,
+            )
+            .context(DecodeBatchSnafu)?;
+            if batch.num_rows() > 0 {
+                yield batch;
+            }
+        }
+    };
+
+    forward_partitioned_batches(
+        executor_registry,
+        ctx,
+        io_runtime,
+        path,
+        &schema,
+        Box::pin(batch_stream),
+        raw_partition_by,
+    )
+    .await?;
+
+    Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+        PutResult::default(),
+    )]))))
+}
+
+/// Core partition-aware batch routing logic shared by the Flight `DoPut` path
+/// and the SQL `INSERT INTO` path.
+///
+/// Accepts an async stream of [`RecordBatch`] and routes each batch to the
+/// correct executor as it arrives, avoiding full materialization in memory.
+pub(crate) async fn forward_partitioned_batches(
+    executor_registry: &ExecutorRegistry,
+    ctx: Arc<datafusion::prelude::SessionContext>,
+    io_runtime: tokio::runtime::Handle,
+    path: &TableReference,
+    schema: &SchemaRef,
+    mut batches: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
+    raw_partition_by: &[String],
+) -> Result<()> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_table_metadata(path).await {
         Ok(Some(metadata)) => metadata,
@@ -219,14 +288,10 @@ pub(crate) async fn forward_federated_partitioned_write(
         .all_executor_partitions(&ctx, &target_schema)
         .context(ResolvePartitionsSnafu)?;
 
-    let schema = Arc::new(
-        try_schema_from_flatbuffer_bytes(&first_message.data_header).context(DecodeSchemaSnafu)?,
-    );
-
-    let mut executor_filters = build_executor_filters(&partitions_by_executor, &schema)?;
+    let mut executor_filters = build_executor_filters(&partitions_by_executor, schema)?;
 
     // Parse partition_by expressions into physical exprs for splitting unmatched rows.
-    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, &schema)?;
+    let partition_phys_exprs = build_partition_physical_exprs(&partition_by, schema)?;
 
     let tbl = path
         .clone()
@@ -250,14 +315,17 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     let partition_manager = executor_registry.federated_partition_manager();
 
-    // Decode and route the first message.
-    let dictionaries_by_id = Arc::new(HashMap::new());
+    // Route each batch through partition filters to the appropriate executor.
     let mut routing_error: Option<Error> = None;
-
-    if let Ok(batch) =
-        flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)
-        && batch.num_rows() > 0
-        && let Err(e) = route_batch_and_assign_unseen(
+    while let Some(batch_result) = StreamExt::next(&mut batches).await {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                routing_error = Some(e);
+                break;
+            }
+        };
+        if let Err(e) = route_batch_and_assign_unseen(
             &batch,
             &mut executor_filters,
             &senders,
@@ -268,35 +336,9 @@ pub(crate) async fn forward_federated_partitioned_write(
             path,
         )
         .await
-    {
-        routing_error = Some(e);
-    }
-
-    // Decode and route the rest of the stream.
-    if routing_error.is_none() {
-        while let Some(result) = streaming_flight.next().await {
-            let batch = flight_data_to_arrow_batch(
-                &result.context(StreamReadSnafu)?,
-                Arc::clone(&schema),
-                &dictionaries_by_id,
-            )
-            .context(DecodeBatchSnafu)?;
-            if batch.num_rows() > 0
-                && let Err(e) = route_batch_and_assign_unseen(
-                    &batch,
-                    &mut executor_filters,
-                    &senders,
-                    &partition_phys_exprs,
-                    raw_partition_by,
-                    &mut partitions_by_executor,
-                    &partition_manager,
-                    path,
-                )
-                .await
-            {
-                routing_error = Some(e);
-                break;
-            }
+        {
+            routing_error = Some(e);
+            break;
         }
     }
 
@@ -331,9 +373,7 @@ pub(crate) async fn forward_federated_partitioned_write(
         return Err(route_err);
     }
 
-    Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
-        PutResult::default(),
-    )]))))
+    Ok(())
 }
 
 /// Routes a [`RecordBatch`] of data to one or more executors' [`Sender<RecordBatch>`], based on the executor filter
