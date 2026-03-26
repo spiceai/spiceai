@@ -264,7 +264,6 @@ default = [
     "keyring-secret-store",
     "aws-secrets-manager",
     "sharepoint",
-    "delta_lake",
     "bedrock",
 ]
 delta_lake = ["data_components/delta_lake"]

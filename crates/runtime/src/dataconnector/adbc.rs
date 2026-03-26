@@ -202,10 +202,10 @@ impl DataConnectorFactory for AdbcFactory {
 
             let federation_enabled =
                 is_query_federation_enabled(&params.parameters).map_err(|e| {
-                    DataConnectorError::UnableToConnectInternal {
+                    DataConnectorError::InvalidConfigurationNoSource {
                         dataconnector: "adbc".to_string(),
                         connector_component: params.component.clone(),
-                        source: Box::new(e),
+                        message: e.to_string(),
                     }
                 })?;
 
