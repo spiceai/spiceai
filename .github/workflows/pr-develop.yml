@@ -57,12 +57,6 @@ jobs:
         if: steps.check.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
-      - name: Set up sccache
-        if: steps.check.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-
       - name: Install Protoc
         if: steps.check.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -82,9 +76,6 @@ jobs:
         if: steps.check.outputs.relevant_changes == 'true'
         run: make lint-rust
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Validate datafusion-table-providers commit
@@ -98,25 +89,11 @@ jobs:
         if: steps.check.outputs.relevant_changes == 'true'
         run: make build-cli nextest
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
-          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
-          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
-          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
-          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 
       - name: Build testoperator
         if: steps.check.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features --locked
-
-      - name: Show sccache stats
-        if: ${{ steps.check.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
         if: steps.check.outputs.relevant_changes == 'true'
