@@ -1304,7 +1304,7 @@ pub async fn initialize_cluster_executor(
         util::retry(
             FibonacciBackoffBuilder::new().max_retries(None).build(),
             || async {
-                flight_client::can_connect(flight_addr.clone())
+                flight_client::can_connect(format!("http://{flight_addr}"))
                     .await
                     .map_err(|e| util::RetryError::Transient {
                         err: e,
@@ -1312,6 +1312,11 @@ pub async fn initialize_cluster_executor(
                     })
             },
         );
+
+        // Bind the already-fetched app and initialize secrets for object store configuration
+        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
+
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
 
         // Get initial allocation of Accelerated table partitions.
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
@@ -1326,11 +1331,6 @@ pub async fn initialize_cluster_executor(
                 .into(),
         })?;
         rt.set_partition_assignments(initial_partitions).await;
-
-        // Bind the already-fetched app and initialize secrets for object store configuration
-        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
-
-        executor_bind_object_stores(Arc::clone(&rt)).await?;
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);
 
