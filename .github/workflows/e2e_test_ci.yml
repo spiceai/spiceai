@@ -1,8 +1,6 @@
 name: E2E Test CI
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - trunk
