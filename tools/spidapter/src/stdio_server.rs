@@ -606,6 +606,8 @@ async fn provision_spice_cloud_app(
         executor_cpu_request: args.executor_cpu_request.clone(),
         executor_memory_request: args.executor_memory_request.clone(),
         executor_storage_size_gb: args.executor_storage_size_gb,
+        ephemeral_storage_limit_gb: args.ephemeral_storage_limit_gb.clone(),
+        organization_tag: args.organization_tag.clone(),
     };
     let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
 
