@@ -919,14 +919,16 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::BigQuery) => {
             let mut queries: Vec<Query> = remove_tpch_query!(
                 queries,
+                1, // Rewritten: CAST sum_charge to FLOAT64 to avoid BIGNUMERIC overflow in ADBC Decimal128(38,27); https://github.com/spiceai/spiceai/issues/9971
                 2, // Unsupported subquery with table in join predicate; https://github.com/spiceai/spiceai/issues/9954
                 6, // Rewritten: explicit BETWEEN 0.05 AND 0.07 to avoid BigQuery float arithmetic precision issue
                 16, // IN subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
                 17, // Unsupported subquery with table in join predicate; https://github.com/spiceai/spiceai/issues/9954
                 18, // IN subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
+                20, // IN subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
                 21 // EXISTS subquery not supported inside join predicate; https://github.com/spiceai/spiceai/issues/9954
             );
-            queries.extend(generate_tpch_queries_override!("bigquery", q6));
+            queries.extend(generate_tpch_queries_override!("bigquery", q1, q6));
             queries
         }
         _ => queries,
