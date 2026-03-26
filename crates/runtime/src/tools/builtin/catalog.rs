@@ -38,7 +38,6 @@ use super::{
     search::SearchTool,
     sql::SqlTool,
     table_schema::TableSchemaTool,
-    web_search::WebSearchTool,
 };
 
 #[derive(Debug, Snafu)]
@@ -82,7 +81,6 @@ impl BuiltinToolCatalog {
 
     pub(crate) fn is_builtin_tool(name: &str) -> bool {
         [
-            "websearch",
             "get_readiness",
             "search",
             "table_schema",
@@ -107,7 +105,6 @@ impl BuiltinToolCatalog {
         // Get default description if none is provided
         let description = match (id, description) {
             (_, Some(desc)) => desc, // Use provided description if available
-            ("websearch", None) => "Search the web for information",
             ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
             ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
             ("table_schema", None) => "Get the schema of the Spice.ai dataset",
@@ -145,10 +142,6 @@ impl BuiltinToolCatalog {
             };
 
         match id {
-            "websearch" => Ok(Arc::new(
-                WebSearchTool::try_new(name, Some(description), params)
-                    .context(FailedToConstructToolSnafu { id: id.to_string() })?,
-            )),
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
                 Arc::clone(&self.rt),
                 Some(name),

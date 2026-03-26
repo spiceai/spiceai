@@ -161,9 +161,7 @@ impl CloudClient {
             replicas,
             image_tag: image_tag.map(String::from),
             region: region.map(String::from),
-            spicepod: None,
-            resources: None,
-            executor: None,
+            ..Default::default()
         };
         self.inner
             .update_app(app.id, &request)

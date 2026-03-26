@@ -1248,20 +1248,6 @@ models:
       system_prompt: You are a helpful assistant.
 
   # ---------------------------------------------------------------------------
-  # Perplexity model
-  # ---------------------------------------------------------------------------
-  - name: perplexity_model
-    from: perplexity:llama-3.1-sonar-large-128k-online
-    params:
-      perplexity_auth_token: pplx-token
-      perplexity_return_images: 'true'
-      perplexity_return_related_questions: 'true'
-      perplexity_search_domain_filter: '["example.com"]'
-      perplexity_search_recency_filter: week
-      tools: auto
-      system_prompt: You are a search assistant.
-
-  # ---------------------------------------------------------------------------
   # xAI model
   # ---------------------------------------------------------------------------
   - name: xai_model
@@ -1344,20 +1330,6 @@ embeddings:
 # All tool types
 # =============================================================================
 tools:
-  # Web search tool
-  - name: web_search
-    from: websearch
-    description: Search the web for information
-    params:
-      engine: perplexity
-    env:
-      API_KEY: ${SEARCH_API_KEY}
-    dependsOn: []
-    metrics:
-      metrics:
-        - name: tool.invocations
-          enabled: true
-
   # Built-in tools
   - name: list_datasets
     from: builtin:list_datasets
