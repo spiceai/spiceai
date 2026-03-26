@@ -528,29 +528,29 @@ mod tests {
     #[test]
     fn test_time_format_case_insensitive_iso8601() {
         // Uppercase ISO8601 (original format)
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: ISO8601
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
 
         // Lowercase iso8601
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: iso8601
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
 
         // Mixed case Iso8601
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: Iso8601
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
     }
@@ -558,70 +558,70 @@ mod tests {
     #[test]
     fn test_time_format_case_insensitive_other_variants() {
         // Uppercase TIMESTAMP
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: TIMESTAMP
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::Timestamp));
 
         // Mixed case Unix_Seconds
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: Unix_Seconds
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::UnixSeconds));
 
         // Uppercase UNIX_MILLIS
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: UNIX_MILLIS
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
 
         // Mixed case Timestamptz
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: Timestamptz
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::Timestamptz));
 
         // Uppercase DATE
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: DATE
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::Date));
     }
 
     #[test]
     fn test_time_format_invalid_value() {
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_format: invalid_format
-        "#;
+        ";
         let result: Result<Dataset, _> = yaml::from_str(yaml);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
     fn test_time_partition_format_case_insensitive() {
         // Verify time_partition_format also benefits from case-insensitive parsing
-        let yaml = r#"
+        let yaml = r"
             name: test
             from: test
             time_partition_format: iso8601
-        "#;
+        ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_partition_format, Some(TimeFormat::ISO8601));
     }
