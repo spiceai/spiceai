@@ -215,9 +215,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let response = reqwest::get(mock_server.uri()).await.unwrap();
+        let response = reqwest::get(mock_server.uri())
+            .await
+            .expect("GET request should succeed");
         let result = check_response(response, &mock_server.uri()).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected successful response: {result:?}");
     }
 
     #[tokio::test]
@@ -228,10 +230,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let response = reqwest::get(mock_server.uri()).await.unwrap();
+        let response = reqwest::get(mock_server.uri())
+            .await
+            .expect("GET request should succeed");
         let result = check_response(response, &mock_server.uri()).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            panic!("expected Unauthorized error for 401 response");
+        };
         assert!(
             matches!(err, Error::Unauthorized),
             "Expected Unauthorized, got: {err}"
@@ -250,10 +255,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let response = reqwest::get(mock_server.uri()).await.unwrap();
+        let response = reqwest::get(mock_server.uri())
+            .await
+            .expect("GET request should succeed");
         let result = check_response(response, &mock_server.uri()).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            panic!("expected Unauthorized error for 403 response");
+        };
         assert!(
             matches!(err, Error::Unauthorized),
             "Expected Unauthorized for 403, got: {err}"
@@ -268,10 +276,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let response = reqwest::get(mock_server.uri()).await.unwrap();
+        let response = reqwest::get(mock_server.uri())
+            .await
+            .expect("GET request should succeed");
         let result = check_response(response, &mock_server.uri()).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            panic!("expected RuntimeUnavailable error for 503 response");
+        };
         assert!(
             matches!(err, Error::RuntimeUnavailable { .. }),
             "Expected RuntimeUnavailable for 503, got: {err}"
@@ -288,10 +299,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let response = reqwest::get(mock_server.uri()).await.unwrap();
+        let response = reqwest::get(mock_server.uri())
+            .await
+            .expect("GET request should succeed");
         let result = check_response(response, &mock_server.uri()).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            panic!("expected RuntimeHttp error for 404 response");
+        };
         assert!(
             matches!(err, Error::RuntimeHttp { status: 404, .. }),
             "Expected RuntimeHttp with status 404, got: {err}"
