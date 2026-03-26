@@ -1,12 +1,16 @@
 name: check all features
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - trunk
     paths:
       - '**/Cargo.toml'
   pull_request:
+    branches:
+      - trunk
     paths:
       - '**/Cargo.toml'
   workflow_dispatch:

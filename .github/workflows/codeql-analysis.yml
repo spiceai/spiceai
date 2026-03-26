@@ -1,9 +1,16 @@
 name: 'CodeQL'
 
 on:
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
   push:
     branches: [trunk, release-*]
+    paths-ignore:
+      - 'docs/**'
+      - '.github/**'
+  pull_request:
+    branches: [trunk]
     paths-ignore:
       - 'docs/**'
       - '.github/**'

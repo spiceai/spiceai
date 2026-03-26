@@ -1,11 +1,15 @@
 name: Makefile Targets
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - trunk
       - release/*
-
+  pull_request:
+    branches:
+      - trunk
   workflow_dispatch:
 
 concurrency:
