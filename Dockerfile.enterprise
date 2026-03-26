@@ -1,7 +1,7 @@
 #syntax=docker/dockerfile:1.2
 
 # Build the ADBC BigQuery driver from source
-ARG ADBC_BIGQUERY_COMMIT=977097c362d9fd53f5dd2f407b98366406c0b8d0
+ARG ADBC_BIGQUERY_COMMIT=fe83ac26d43bffeaf28844bcf5fef303b1bdf345
 ARG GO_VERSION=1.26.1
 ARG RUST_VERSION=1.93.1
 
