@@ -137,7 +137,7 @@ jobs:
   # Build and test
   build-test:
     name: Build and Test
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     needs: [check_changes]
 
     steps:
