@@ -18132,10 +18132,13 @@ dependencies = [
 name = "spice-cloud-client"
 version = "2.0.0-unstable"
 dependencies = [
+ "insta",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
  "snafu",
+ "tokio",
+ "uuid 1.21.0",
 ]
 
 [[package]]

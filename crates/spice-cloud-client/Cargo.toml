@@ -13,3 +13,8 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+
+[dev-dependencies]
+insta = { workspace = true, features = ["filters", "json"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1", features = ["v4"] }
