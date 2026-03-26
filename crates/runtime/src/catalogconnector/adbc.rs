@@ -20,7 +20,7 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::dataconnector::adbc::{build_db_options, dialect_for_driver};
+use crate::dataconnector::adbc::{build_db_options, build_join_context, dialect_for_driver};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
@@ -213,6 +213,8 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     let driver_options = params.parameters.get("driver_options").expose().ok();
     let db_options = build_db_options(&uri_str, username, password, driver_options);
 
+    let join_context = build_join_context(&uri_str, username, None, None);
+
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
             Some(v) => {
@@ -265,7 +267,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
             .with_min_idle(pool_min_idle)
-            .with_join_push_down(JoinPushDown::AllowedFor(uri_str.clone()))
+            .with_join_push_down(JoinPushDown::AllowedFor(join_context))
             .build()
             .context(UnableToCreateConnectionPoolSnafu {
                 driver_location,
