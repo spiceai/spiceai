@@ -59,6 +59,7 @@ on:
           - 'mysql-catalog'
           - 'mssql-catalog'
           - 'turso'
+          - 'bigquery'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true

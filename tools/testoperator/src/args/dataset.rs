@@ -175,6 +175,9 @@ pub enum QueryOverridesArg {
     Arrow,
     #[serde(rename = "turso")]
     Turso,
+    #[serde(rename = "bigquery")]
+    #[value(name = "bigquery")]
+    BigQuery,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -288,6 +291,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
             QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
             QueryOverridesArg::Turso => QueryOverrides::Turso,
+            QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
         }
     }
 }
