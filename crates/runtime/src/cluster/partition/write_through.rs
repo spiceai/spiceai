@@ -135,6 +135,18 @@ pub enum Error {
 
     #[snafu(display("Failed to persist partition assignment: {source}"))]
     PersistAssignment { source: Box<super::manager::Error> },
+
+    #[snafu(display(
+        "Row count mismatch after partitioning unmatched rows for table {table}: expected {expected} but got {actual}"
+    ))]
+    PartitionRowCountMismatch {
+        table: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[snafu(display("No sender for assigned executor {executor_id} for table {table}"))]
+    NoSenderForExecutor { executor_id: String, table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -380,14 +392,14 @@ async fn route_batch_and_assign_unseen(
 
     {
         let total_partitioned: usize = entries.iter().map(|(_, _, b)| b.num_rows()).sum();
-        if total_partitioned != unmatched.num_rows() {
-            tracing::debug!(
-                table = %path,
-                unmatched_rows = unmatched.num_rows(),
-                partitioned_rows = total_partitioned,
-                "Row count mismatch after partitioning unmatched rows; some data may be lost"
-            );
-        }
+        ensure!(
+            total_partitioned == unmatched.num_rows(),
+            PartitionRowCountMismatchSnafu {
+                table: path.to_string(),
+                expected: unmatched.num_rows(),
+                actual: total_partitioned,
+            }
+        );
     }
 
     if entries.is_empty() {
@@ -468,18 +480,15 @@ async fn route_batch_and_assign_unseen(
         }
 
         // Forward the rows.
-        if let Some(tx) = senders.get(&executor_id) {
-            tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
+        let tx = senders
+            .get(&executor_id)
+            .ok_or_else(|| Error::NoSenderForExecutor {
                 executor_id: executor_id.clone(),
+                table: path.to_string(),
             })?;
-        } else {
-            tracing::debug!(
-                executor_id,
-                rows = sub_batch.num_rows(),
-                table = %path,
-                "No sender for assigned executor; rows will be lost"
-            );
-        }
+        tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
+            executor_id: executor_id.clone(),
+        })?;
     }
 
     Ok(())
