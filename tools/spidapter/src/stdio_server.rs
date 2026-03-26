@@ -1595,6 +1595,8 @@ mod tests {
             aws_region: None,
             cayenne_data_dir: None,
             cayenne_metadata_dir: None,
+            ephemeral_storage_limit_gb: None,
+            organization_tag: None,
         }
     }
 
