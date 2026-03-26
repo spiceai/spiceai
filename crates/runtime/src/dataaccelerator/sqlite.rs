@@ -630,7 +630,19 @@ mod tests {
             .await
             .expect("insert should succeed");
 
-        // Verify data was written (count row returns 1 batch with row count)
         assert!(!result.is_empty());
+
+        // Verify the data can be read back with the expected row count.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back data");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "should have 3 rows");
     }
 }
