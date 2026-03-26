@@ -447,7 +447,8 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 ### PR Process
 
-- Branch from `trunk`, link issue, add tests
+- Branch from `develop` and target PRs to the `develop` branch (not `trunk`). Only specific `develop` → `trunk` merges go directly to `trunk`.
+- Link issue, add tests
 - Follow style guides: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`
 
 ## Common Patterns
