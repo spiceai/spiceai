@@ -1485,28 +1485,44 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 )));
             };
 
-            // Materialize the INSERT source plan into record batches.
-            let mut stream = input.execute(partition, task_ctx)?;
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            let mut total_rows: u64 = 0;
-
-            while let Some(result) = futures::StreamExt::next(&mut stream).await {
-                let batch = result?;
-                total_rows += batch.num_rows() as u64;
-                if batch.num_rows() > 0 {
-                    batches.push(batch);
-                }
-            }
-
-            if batches.is_empty() {
-                return RecordBatch::try_new(
-                    result_schema,
-                    vec![Arc::new(arrow::array::UInt64Array::from(vec![0_u64]))],
-                )
-                .map_err(Into::into);
-            }
-
-            let schema = batches[0].schema();
+            // Stream batches from the INSERT source plan directly through
+            // the partition write-through path, counting rows as they flow.
+            let input_schema = input.schema();
+            let child_stream = input.execute(partition, task_ctx)?;
+            let row_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let row_counter = Arc::clone(&row_count);
+            let counting_stream: std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = std::result::Result<
+                                RecordBatch,
+                                crate::cluster::partition::write_through::Error,
+                            >,
+                        > + Send,
+                >,
+            > = Box::pin(futures::StreamExt::filter_map(
+                child_stream,
+                move |result| {
+                    let counter = Arc::clone(&row_counter);
+                    async move {
+                        match result {
+                            Ok(batch) if batch.num_rows() > 0 => {
+                                counter.fetch_add(
+                                    batch.num_rows() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                Some(Ok(batch))
+                            }
+                            Ok(_) => None,
+                            Err(e) => Some(Err(
+                                crate::cluster::partition::write_through::Error::DecodeBatch {
+                                    source: arrow_schema::ArrowError::ExternalError(Box::new(e)),
+                                },
+                            )),
+                        }
+                    }
+                },
+            ));
 
             // Route batches through the partition write-through path.
             crate::cluster::partition::write_through::forward_partitioned_batches(
@@ -1514,8 +1530,8 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 Arc::clone(&ctx),
                 io_runtime,
                 &table_name,
-                &schema,
-                batches,
+                &input_schema,
+                counting_stream,
                 &[partition_expr],
             )
             .await
@@ -1525,6 +1541,7 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 ))
             })?;
 
+            let total_rows = row_count.load(std::sync::atomic::Ordering::Relaxed);
             RecordBatch::try_new(
                 result_schema,
                 vec![Arc::new(arrow::array::UInt64Array::from(vec![total_rows]))],
