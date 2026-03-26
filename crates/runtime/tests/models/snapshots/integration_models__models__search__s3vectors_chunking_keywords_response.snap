@@ -18,18 +18,6 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.51,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
-        ]
-      },
-      "primary_key": {
-        "id": 362
-      }
-    },
-    {
       "_score": 0.49,
       "dataset": "qs",
       "matches": {
@@ -42,15 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.49,
+      "_score": 0.45,
       "dataset": "qs",
       "matches": {
         "answer": [
-          " numbers:  \n1.80  \n+ 0.27  \n------  \n2.0"
+          "4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)"
         ]
       },
       "primary_key": {
-        "id": 21
+        "id": 458
+      }
+    },
+    {
+      "_score": 0.44,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          " two places to the left. Thus, $31.5 \\div 100 = \\boxed{0.315}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1122
       }
     }
   ]

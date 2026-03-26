@@ -36,33 +36,33 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.53,
       "data": {
-        "question": "What is 14 percent of 232?"
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\n\\( 232 \\times 0.14 = 32.48 \\)"
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24"
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 468
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.53,
       "data": {
-        "question": "What is the fifth term and the nth term of the GP \\( 2, 4, 8, \\ldots \\)?"
+        "question": "Identify the given number as prime, composite, or neither: 36."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The fifth term is \\( 2 \\times 2^{4} = 32 \\)"
+          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
         ]
       },
       "primary_key": {
-        "id": 949
+        "id": 484
       }
     }
   ]

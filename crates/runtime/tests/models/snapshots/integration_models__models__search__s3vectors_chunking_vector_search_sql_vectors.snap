@@ -22,9 +22,9 @@ expression: resp?
     "_score": 0.556
   },
   {
-    "id": 830,
-    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
+    "id": 708,
+    "answer": "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.524
+    "_score": 0.54
   }
 ]

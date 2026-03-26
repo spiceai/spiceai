@@ -4,27 +4,27 @@ expression: resp?
 ---
 [
   {
+    "id": 612,
+    "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
+    "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
+    "_score": 0.796
+  },
+  {
     "id": 1277,
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
     "_score": 0.556
   },
   {
-    "id": 948,
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.556
-  },
-  {
-    "id": 708,
-    "answer": "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$",
-    "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.539
-  },
-  {
     "id": 189,
     "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
     "_score": 0.538
+  },
+  {
+    "id": 484,
+    "answer": "The number 36 is $\\boxed{\\text{composite}}$ because it has divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18).",
+    "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
+    "_score": 0.535
   }
 ]

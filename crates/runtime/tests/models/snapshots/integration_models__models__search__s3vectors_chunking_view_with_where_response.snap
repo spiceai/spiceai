@@ -6,15 +6,39 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.29,
+      "_score": 0.27,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "stemic vascular resistance (SVR) by causing vasodilation."
+          " entry"
         ]
       },
       "primary_key": {
-        "id": 1035
+        "id": 1268
+      }
+    },
+    {
+      "_score": 0.22,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " various forms of *tinea*, such as athlete's foot (*tinea pedis*"
+        ]
+      },
+      "primary_key": {
+        "id": 821
+      }
+    },
+    {
+      "_score": 0.21,
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " V"
+        ]
+      },
+      "primary_key": {
+        "id": 8
       }
     },
     {
@@ -27,30 +51,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 922
-      }
-    },
-    {
-      "_score": 0.16,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " been established and should, therefore, be avoided"
-        ]
-      },
-      "primary_key": {
-        "id": 1143
-      }
-    },
-    {
-      "_score": 0.16,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The nurse would suspect **genital warts**, as HPV is th"
-        ]
-      },
-      "primary_key": {
-        "id": 1274
       }
     }
   ]

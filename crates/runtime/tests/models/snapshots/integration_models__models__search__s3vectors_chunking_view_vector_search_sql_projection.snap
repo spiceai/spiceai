@@ -18,17 +18,17 @@ expression: resp?
     "_score": 0.556
   },
   {
-    "id": 468,
-    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
-    "question": "How many multiples of 4 are there between 1 and 30? List them and count the total.",
+    "id": 484,
+    "answer": "The number 36 is $\\boxed{\\text{composite}}$ because it has divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18).",
+    "question": "Identify the given number as prime, composite, or neither: 36.",
     "subject": "math",
-    "_score": 0.538
+    "_score": 0.535
   },
   {
-    "id": 450,
-    "answer": "The number of such 7-card hands is \\(\\boxed{C(13, 3) \\times (C(4, 2))^3 \\times 40}\\).",
-    "question": "How many 7-card hands dealt are there with three pairs (each of a different kind, plus a seventh card of a different kind)?",
+    "id": 830,
+    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
+    "question": "What is 14 percent of 232?",
     "subject": "math",
-    "_score": 0.528
+    "_score": 0.521
   }
 ]

@@ -8,6 +8,24 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.03,
       "data": {
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        ],
+        "question": [
+          "How many multiples of 4 are there between 1 and 30? List them and count the total."
+        ]
+      },
+      "primary_key": {
+        "id": 468
+      }
+    },
+    {
+      "_score": 0.03,
+      "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "spice.public.qs",
@@ -42,27 +60,15 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.01,
-      "data": {
-        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
-        ]
-      },
-      "primary_key": {
-        "id": 708
-      }
-    },
-    {
-      "_score": 0.01,
+      "_score": 0.03,
       "data": {
         "question": "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
       },
       "dataset": "spice.public.qs",
       "matches": {
+        "answer": [
+          "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
+        ],
         "question": [
           "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
         ]

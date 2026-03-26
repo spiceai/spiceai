@@ -10,21 +10,21 @@ expression: resp?
     "_score": 0.539
   },
   {
+    "id": 468,
+    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
+    "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
+    "_score": 0.539
+  },
+  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
     "_score": 0.528
   },
   {
-    "id": 462,
-    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
+    "id": 465,
+    "answer": "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40.",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.519
-  },
-  {
-    "id": 458,
-    "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\).",
-    "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.504
+    "_score": 0.506
   }
 ]

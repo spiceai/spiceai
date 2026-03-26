@@ -51,18 +51,18 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.53,
       "data": {
-        "question": "What is 14 percent of 232?"
+        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "\n\\( 232 \\times 0.14 = 32.48 \\)"
+          "\nd) $2-|-6| = 2 - 6 = -4"
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 708
       }
     }
   ]

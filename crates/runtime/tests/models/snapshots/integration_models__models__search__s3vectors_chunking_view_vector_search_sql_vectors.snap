@@ -22,9 +22,9 @@ expression: resp?
     "_score": 0.538
   },
   {
-    "id": 450,
-    "answer": "The number of such 7-card hands is \\(\\boxed{C(13, 3) \\times (C(4, 2))^3 \\times 40}\\).",
+    "id": 484,
+    "answer": "The number 36 is $\\boxed{\\text{composite}}$ because it has divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18).",
     "array_length(vector_search(qs_view, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.528
+    "_score": 0.535
   }
 ]

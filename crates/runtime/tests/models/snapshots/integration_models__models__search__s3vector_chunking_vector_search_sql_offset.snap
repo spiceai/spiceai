@@ -28,11 +28,11 @@ expression: resp?
     "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
-    "id": 830,
+    "id": 708,
     "answer_offset": [
-      44,
-      74
+      61,
+      85
     ],
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.524
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.54
   }
 ]

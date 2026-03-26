@@ -40,11 +40,11 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
+          "Yes, because the last two digits (48) form a number that is divisible by 4 (48 ÷ 4 = 12). $\\boxed{\\text{Yes}}$"
         ]
       },
       "primary_key": {
-        "id": 42
+        "id": 556
       }
     },
     {
