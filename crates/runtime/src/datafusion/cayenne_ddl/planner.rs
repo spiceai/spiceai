@@ -28,11 +28,11 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
 use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
 };
 use super::physical_plans::{
     CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDropTableExec,
-    DistributedCayenneDeleteExec, DistributedCayenneUpdateExec,
+    DistributedCayenneDeleteExec, DistributedCayenneInsertExec, DistributedCayenneUpdateExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 
@@ -43,18 +43,25 @@ use crate::cluster::executor_registry::ExecutorRegistry;
 #[derive(Debug)]
 pub struct CayenneDdlExtensionPlanner {
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    io_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl CayenneDdlExtensionPlanner {
     #[must_use]
-    pub fn new(executor_registry: Option<Arc<ExecutorRegistry>>) -> Self {
-        Self { executor_registry }
+    pub fn new(
+        executor_registry: Option<Arc<ExecutorRegistry>>,
+        io_runtime: Option<tokio::runtime::Handle>,
+    ) -> Self {
+        Self {
+            executor_registry,
+            io_runtime,
+        }
     }
 }
 
 impl Default for CayenneDdlExtensionPlanner {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
@@ -133,6 +140,29 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 self.executor_registry.clone(),
                 update.filter_sql.clone(),
                 update.assignments_sql.clone(),
+                Arc::clone(input),
+            ))));
+        }
+
+        if let Some(insert) = node.as_any().downcast_ref::<DistributedCayenneInsertNode>() {
+            let input = _physical_inputs.first().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "DistributedCayenneInsertNode requires exactly one physical input".to_string(),
+                )
+            })?;
+            let io_runtime = self.io_runtime.clone().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "DistributedCayenneInsertExec requires an IO runtime handle".to_string(),
+                )
+            })?;
+            let ctx = Arc::new(datafusion::prelude::SessionContext::new_with_state(
+                session_state.clone(),
+            ));
+            return Ok(Some(Arc::new(DistributedCayenneInsertExec::new(
+                insert.table_name.clone(),
+                self.executor_registry.clone(),
+                ctx,
+                io_runtime,
                 Arc::clone(input),
             ))));
         }
