@@ -112,7 +112,7 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
-adbc = ["datafusion-table-providers/adbc"]
+adbc = ["datafusion-table-providers/adbc-federation"]
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
 databricks = [
     "delta_lake",
