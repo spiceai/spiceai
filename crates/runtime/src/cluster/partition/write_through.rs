@@ -35,7 +35,7 @@ use datafusion::{
 use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
 use futures::TryStreamExt as _;
 use runtime_request_context::{AsyncMarker, RequestContext};
-use snafu::{ResultExt, Snafu};
+use snafu::{ensure, ResultExt, Snafu};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Response, Streaming};
