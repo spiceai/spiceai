@@ -1351,6 +1351,203 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
     }
 }
 
+/// Physical plan to forward `INSERT` DML operations to a Cayenne table across
+/// relevant executors in distributed mode, using partition-aware batch routing.
+///
+/// Materializes the input source plan into [`RecordBatch`]es and routes them
+/// to executors via the same partition write-through path used by Flight `DoPut`.
+pub struct DistributedCayenneInsertExec {
+    table_name: datafusion::sql::TableReference,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    ctx: Arc<datafusion::prelude::SessionContext>,
+    io_runtime: tokio::runtime::Handle,
+    /// The child physical plan producing the rows to insert.
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for DistributedCayenneInsertExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneInsertExec")
+            .field("table_name", &self.table_name.to_string())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DistributedCayenneInsertExec {
+    #[must_use]
+    pub fn new(
+        table_name: datafusion::sql::TableReference,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
+        ctx: Arc<datafusion::prelude::SessionContext>,
+        io_runtime: tokio::runtime::Handle,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let schema = dml_count_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            table_name,
+            executor_registry,
+            ctx,
+            io_runtime,
+            input,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for DistributedCayenneInsertExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneInsertExec: {}", self.table_name)
+    }
+}
+
+impl ExecutionPlan for DistributedCayenneInsertExec {
+    fn name(&self) -> &'static str {
+        "CayenneInsertExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let input = children.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal("CayenneInsertExec requires exactly one child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(
+            self.table_name.clone(),
+            self.executor_registry.clone(),
+            Arc::clone(&self.ctx),
+            self.io_runtime.clone(),
+            input,
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let executor_registry = self.executor_registry.clone();
+        let ctx = Arc::clone(&self.ctx);
+        let io_runtime = self.io_runtime.clone();
+        let input = Arc::clone(&self.input);
+        let result_schema = dml_count_schema();
+        let task_ctx = context;
+
+        let stream = futures::stream::once(async move {
+            let Some(ref registry) = executor_registry else {
+                return Err(DataFusionError::Execution(format!(
+                    "INSERT on '{table_name}' cannot be forwarded: no executor registry available"
+                )));
+            };
+
+            if registry.flight_sql_clients.read().await.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "INSERT on '{table_name}' cannot be forwarded: no executors are currently connected"
+                )));
+            }
+
+            // Resolve the partition expression for this table.
+            let partition_expr =
+                crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
+                    &ctx, registry, &table_name,
+                )
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to resolve partition expression for table '{table_name}': {e}"
+                    ))
+                })?;
+
+            let Some(partition_expr) = partition_expr else {
+                return Err(DataFusionError::Execution(format!(
+                    "INSERT on '{table_name}' cannot be forwarded: table has no partition expression. Cayenne tables require PARTITION BY for distributed writes."
+                )));
+            };
+
+            // Materialize the INSERT source plan into record batches.
+            let mut stream = input.execute(partition, task_ctx)?;
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut total_rows: u64 = 0;
+
+            while let Some(result) = futures::StreamExt::next(&mut stream).await {
+                let batch = result?;
+                total_rows += batch.num_rows() as u64;
+                if batch.num_rows() > 0 {
+                    batches.push(batch);
+                }
+            }
+
+            if batches.is_empty() {
+                return RecordBatch::try_new(
+                    result_schema,
+                    vec![Arc::new(arrow::array::UInt64Array::from(vec![0_u64]))],
+                )
+                .map_err(Into::into);
+            }
+
+            let schema = batches[0].schema();
+
+            // Route batches through the partition write-through path.
+            crate::cluster::partition::write_through::forward_partitioned_batches(
+                registry,
+                Arc::clone(&ctx),
+                io_runtime,
+                &table_name,
+                &schema,
+                batches,
+                &[partition_expr],
+            )
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to forward INSERT batches for table '{table_name}': {e}"
+                ))
+            })?;
+
+            RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(arrow::array::UInt64Array::from(vec![total_rows]))],
+            )
+            .map_err(Into::into)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            dml_count_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Schema for DML count results — single `count` column with UInt64 type,
+/// matching DataFusion's standard DML output format.
+fn dml_count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::logical_expr::col;

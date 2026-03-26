@@ -1006,6 +1006,57 @@ impl DataFusion {
         Ok(metadata.partition_expressions.get(idx).cloned())
     }
 
+    /// Returns the partition expression string for a table using only a `SessionContext`
+    /// and `ExecutorRegistry`, without requiring a full `DataFusion` reference.
+    ///
+    /// This is used by `DistributedCayenneInsertExec` which is constructed from the
+    /// extension planner and only has access to the session context.
+    pub async fn get_table_partition_expr_from_ctx(
+        ctx: &datafusion::prelude::SessionContext,
+        executor_registry: &ExecutorRegistry,
+        table_reference: &TableReference,
+    ) -> Result<Option<String>, DataFusionError> {
+        let catalog_name = match table_reference {
+            TableReference::Bare { .. } | TableReference::Partial { .. } => SPICE_DEFAULT_CATALOG,
+            TableReference::Full { catalog, .. } => catalog,
+        };
+        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+
+        let Some(catalog) = ctx.catalog(catalog_name) else {
+            return Ok(None);
+        };
+
+        let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref()) else {
+            return Ok(None);
+        };
+
+        let Some(expr_string) = aware
+            .table_partition_expr(schema_name, table_reference.table())
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+        else {
+            return Ok(None);
+        };
+
+        // Resolve auto-generated labels from partition manager metadata.
+        if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>) {
+            if let Ok(Some(metadata)) = executor_registry
+                .federated_partition_manager()
+                .get_table_metadata(table_reference)
+                .await
+                .boxed()
+                .map_err(DataFusionError::External)
+            {
+                if let Some(original) = metadata.partition_expressions.get(idx) {
+                    return Ok(Some(original.clone()));
+                }
+            }
+        }
+
+        Ok(Some(expr_string))
+    }
+
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
     pub async fn sql_expr(
         &self,

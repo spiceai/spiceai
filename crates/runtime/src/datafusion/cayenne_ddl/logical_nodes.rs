@@ -609,3 +609,93 @@ impl UserDefinedLogicalNodeCore for DistributedCayenneUpdateNode {
         })
     }
 }
+
+/// Logical plan node to forward `INSERT` DML operations to a Cayenne table
+/// across relevant executors in distributed mode, using partition-aware routing.
+#[derive(Debug)]
+pub struct DistributedCayenneInsertNode {
+    /// Fully qualified table reference.
+    pub table_name: TableReference,
+    /// The input plan producing the rows to insert.
+    pub input: Arc<LogicalPlan>,
+    /// Output schema from the original DML statement.
+    pub output_schema: DFSchemaRef,
+}
+
+impl DistributedCayenneInsertNode {
+    #[must_use]
+    pub fn new(
+        table_name: TableReference,
+        input: Arc<LogicalPlan>,
+        output_schema: DFSchemaRef,
+    ) -> Self {
+        Self {
+            table_name,
+            input,
+            output_schema,
+        }
+    }
+}
+
+impl Hash for DistributedCayenneInsertNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.table_name.hash(state);
+        self.input.hash(state);
+        self.output_schema.hash(state);
+    }
+}
+
+impl PartialEq for DistributedCayenneInsertNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.table_name == other.table_name && self.input == other.input
+    }
+}
+
+impl Eq for DistributedCayenneInsertNode {}
+
+impl PartialOrd for DistributedCayenneInsertNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.table_name
+            .to_string()
+            .partial_cmp(&other.table_name.to_string())
+    }
+}
+
+impl UserDefinedLogicalNodeCore for DistributedCayenneInsertNode {
+    fn name(&self) -> &'static str {
+        "CayenneInsert"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneInsert: {}", self.table_name)
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        let input = inputs.into_iter().next().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "CayenneInsertNode requires exactly one input".to_string(),
+            )
+        })?;
+        Ok(Self {
+            table_name: self.table_name.clone(),
+            input: Arc::new(input),
+            output_schema: DFSchemaRef::clone(&self.output_schema),
+        })
+    }
+}
