@@ -421,8 +421,12 @@ mod tests {
         // Verify all text content is preserved (no data loss).
         let reassembled: String = chunks.join("");
         let original_no_ws: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        let reassembled_no_ws: String = reassembled.chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(original_no_ws, reassembled_no_ws, "Chunking should preserve all non-whitespace content");
+        let reassembled_no_ws: String =
+            reassembled.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            original_no_ws, reassembled_no_ws,
+            "Chunking should preserve all non-whitespace content"
+        );
     }
 
     #[test]
@@ -514,7 +518,10 @@ mod tests {
         let text = "abcdefghijklmnop"; // 16 chars, single word
         let chunks: Vec<_> = chunker.chunks(text).collect();
 
-        assert!(chunks.len() > 1, "Long word should be split into multiple chunks");
+        assert!(
+            chunks.len() > 1,
+            "Long word should be split into multiple chunks"
+        );
         for chunk in &chunks {
             assert!(
                 Characters.size(chunk) <= target,
