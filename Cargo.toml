@@ -398,7 +398,7 @@ ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", re
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ad88031f002aec4ec63dc1fabd81dfd3cf69fb22" } # spiceai-52
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "ad88031f002aec4ec63dc1fabd81dfd3cf69fb22" } # spiceai-52
 
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "9d26fb3662d2edb8f382d4d0f7899c303549f0d0" } # spiceai-0.18.2
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
