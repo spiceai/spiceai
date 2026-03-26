@@ -29,7 +29,7 @@ use crate::param::Params;
 use crate::semantic::Column;
 use crate::vector::VectorStore;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TimeFormat {
@@ -41,6 +41,34 @@ pub enum TimeFormat {
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
+}
+
+impl<'de> serde::Deserialize<'de> for TimeFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "timestamp" => Ok(TimeFormat::Timestamp),
+            "timestamptz" => Ok(TimeFormat::Timestamptz),
+            "unix_seconds" => Ok(TimeFormat::UnixSeconds),
+            "unix_millis" => Ok(TimeFormat::UnixMillis),
+            "iso8601" => Ok(TimeFormat::ISO8601),
+            "date" => Ok(TimeFormat::Date),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &[
+                    "timestamp",
+                    "timestamptz",
+                    "unix_seconds",
+                    "unix_millis",
+                    "ISO8601",
+                    "date",
+                ],
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for TimeFormat {
@@ -495,5 +523,106 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.unsupported_type_action, None);
+    }
+
+    #[test]
+    fn test_time_format_case_insensitive_iso8601() {
+        // Uppercase ISO8601 (original format)
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: ISO8601
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+
+        // Lowercase iso8601
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: iso8601
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+
+        // Mixed case Iso8601
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: Iso8601
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+    }
+
+    #[test]
+    fn test_time_format_case_insensitive_other_variants() {
+        // Uppercase TIMESTAMP
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: TIMESTAMP
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::Timestamp));
+
+        // Mixed case Unix_Seconds
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: Unix_Seconds
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixSeconds));
+
+        // Uppercase UNIX_MILLIS
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: UNIX_MILLIS
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
+
+        // Mixed case Timestamptz
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: Timestamptz
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::Timestamptz));
+
+        // Uppercase DATE
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: DATE
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::Date));
+    }
+
+    #[test]
+    fn test_time_format_invalid_value() {
+        let yaml = r#"
+            name: test
+            from: test
+            time_format: invalid_format
+        "#;
+        let result: Result<Dataset, _> = yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_time_partition_format_case_insensitive() {
+        // Verify time_partition_format also benefits from case-insensitive parsing
+        let yaml = r#"
+            name: test
+            from: test
+            time_partition_format: iso8601
+        "#;
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_partition_format, Some(TimeFormat::ISO8601));
     }
 }
