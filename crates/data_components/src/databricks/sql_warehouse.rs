@@ -70,7 +70,10 @@ pub enum Error {
     #[snafu(display(
         "Failed to load the table '{dataset_name}' from Databricks: unexpected schema response format. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
-    UnexpectedSchemaResponse { dataset_name: String, reason: String },
+    UnexpectedSchemaResponse {
+        dataset_name: String,
+        reason: String,
+    },
 
     #[snafu(display(
         "The dataset '{dataset_name}' in Databricks has no columns. Verify the table exists and has at least one column."
@@ -586,9 +589,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
         if row_array.len() < 3 {
             return Err(Error::UnexpectedSchemaResponse {
                 dataset_name: dataset_name.to_string(),
-                reason: format!(
-                    "data_array[{i}] has fewer than 3 fields"
-                ),
+                reason: format!("data_array[{i}] has fewer than 3 fields"),
             });
         }
 
@@ -605,12 +606,13 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
             break;
         }
 
-        let data_type_str = row_array[1]
-            .as_str()
-            .ok_or_else(|| Error::UnexpectedSchemaResponse {
-                dataset_name: dataset_name.to_string(),
-                reason: format!("data_array[{i}][1] (data type) is not a string"),
-            })?;
+        let data_type_str =
+            row_array[1]
+                .as_str()
+                .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                    dataset_name: dataset_name.to_string(),
+                    reason: format!("data_array[{i}][1] (data type) is not a string"),
+                })?;
 
         let data_type = datatypes::Parser::new(data_type_str)
             .parse()
