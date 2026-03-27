@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.03,
+      "_score": 0.0327,
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -24,7 +24,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0322,
       "data": {
         "question": "What is the fifth root of 32?"
       },
@@ -42,39 +42,39 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0317,
       "data": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "How many groups of 5 are in 40?"
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+          "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40."
         ],
         "question": [
-          "How many groups of 2 are in 14?"
+          "How many groups of 5 are in 40?"
         ]
       },
       "primary_key": {
-        "id": 462
+        "id": 465
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0312,
       "data": {
-        "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
+        "question": "Evaluate the expression: \\(-5 - 2x^2\\), where \\( x = -3 \\)."
       },
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+          "\\[\n-5 - 2(-3)^2 = -5 - 2(9) = -5 - 18 = \\boxed{-23}\n\\]"
         ],
         "question": [
-          "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
+          "Evaluate the expression: \\(-5 - 2x^2\\), where \\( x = -3 \\)."
         ]
       },
       "primary_key": {
-        "id": 458
+        "id": 244
       }
     }
   ]

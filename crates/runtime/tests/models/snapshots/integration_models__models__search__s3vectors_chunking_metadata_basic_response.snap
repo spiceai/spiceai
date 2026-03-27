@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.5559,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.55,
+      "_score": 0.5559,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -30,27 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.53,
+      "_score": 0.536,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24"
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\"
         ]
       },
       "primary_key": {
-        "id": 468
+        "id": 189
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.5349,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024"
+          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
         ]
       },
       "primary_key": {
-        "id": 41
+        "id": 484
       }
     }
   ]

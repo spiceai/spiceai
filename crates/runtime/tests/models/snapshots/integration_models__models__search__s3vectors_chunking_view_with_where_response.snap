@@ -6,51 +6,51 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.29,
+      "_score": 0.2799,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "stemic vascular resistance (SVR) by causing vasodilation."
+          " entry"
         ]
       },
       "primary_key": {
-        "id": 1035
+        "id": 1268
       }
     },
     {
-      "_score": 0.21,
+      "_score": 0.2141,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "A \"sequence\" implies a cascade of events traced to a singl"
+          " V"
         ]
       },
       "primary_key": {
-        "id": 922
+        "id": 8
       }
     },
     {
-      "_score": 0.16,
+      "_score": 0.2082,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          " been established and should, therefore, be avoided"
+          " cardiac glycosides; concurrent use should be avoided"
         ]
       },
       "primary_key": {
-        "id": 1143
+        "id": 972
       }
     },
     {
-      "_score": 0.16,
+      "_score": 0.1698,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The nurse would suspect **genital warts**, as HPV is th"
+          "Dermatomycosis is caused by fungal infections, specificall"
         ]
       },
       "primary_key": {
-        "id": 1274
+        "id": 821
       }
     }
   ]

@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.5559,
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,31 +18,31 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.5144,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {
-        "id": 362
+        "id": 507
       }
     },
     {
-      "_score": 0.48,
+      "_score": 0.4914,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The even multiples of 5 between 0 and 60 are the multiples of 1"
+          " numbers:  \n1.80  \n+ 0.27  \n------  \n2.0"
         ]
       },
       "primary_key": {
-        "id": 470
+        "id": 21
       }
     },
     {
-      "_score": 0.47,
+      "_score": 0.4756,
       "dataset": "qs_view",
       "matches": {
         "answer": [

@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.61,
+      "_score": 0.6104,
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.59,
+      "_score": 0.5983,
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": [

@@ -25,21 +25,6 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-        ],
-        "question": [
-          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 189
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
           "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
@@ -55,14 +40,26 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
+          "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25."
         ],
         "question": [
-          "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
+          "How many groups of 5 are in 25?"
         ]
       },
       "primary_key": {
-        "id": 191
+        "id": 464
+      }
+    },
+    {
+      "_score": 0.01,
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": [
+          "Evaluate the expression: \\(-5 - 2x^2\\), where \\( x = -3 \\)."
+        ]
+      },
+      "primary_key": {
+        "id": 244
       }
     }
   ]

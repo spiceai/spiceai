@@ -4,23 +4,23 @@ expression: resp?
 ---
 [
   {
-    "id": 922,
-    "answer": "A \"sequence\" implies a cascade of events traced to a single abnormality.",
-    "_score": 0.21
+    "id": 1268,
+    "answer": "The gall bladder is stimulated to empty by the release of cholecystokinin (CCK) from the duodenum in response to food entry.",
+    "_score": 0.28
   },
   {
-    "id": 1143,
-    "answer": "The safety of valerian during pregnancy and lactation has not been established and should, therefore, be avoided.",
-    "_score": 0.169
+    "id": 8,
+    "answer": "The prefix \"kilo-\" (k) represents a multiplier of 1000. Therefore, 2.2 kV is equal to \\(2.2 \\times 1000 = \\boxed{2200}\\) V.",
+    "_score": 0.214
   },
   {
-    "id": 944,
-    "answer": "The larger the area through which force is transmitted, the less the intensity and potential for injury.",
-    "_score": 0.149
+    "id": 972,
+    "answer": "Buckthorn may cause hypokalemia and enhance the effects of cardiac glycosides; concurrent use should be avoided.",
+    "_score": 0.208
   },
   {
-    "id": 1191,
-    "answer": "The hybridization in `[Pa(NH₃)₄]³⁺` is $\\boxed{sp^3}$, as it forms a tetrahedral complex with four monodentate ammonia ligands.",
-    "_score": 0.148
+    "id": 821,
+    "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*).",
+    "_score": 0.17
   }
 ]

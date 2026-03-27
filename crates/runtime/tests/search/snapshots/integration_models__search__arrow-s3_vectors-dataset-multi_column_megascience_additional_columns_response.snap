@@ -42,33 +42,39 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.01,
+      "_score": 0.03,
       "data": {
-        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
-        "question": [
-          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 189
-      }
-    },
-    {
-      "_score": 0.01,
-      "data": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "How many groups of 5 are in 25?"
       },
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+          "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25."
+        ],
+        "question": [
+          "How many groups of 5 are in 25?"
         ]
       },
       "primary_key": {
-        "id": 462
+        "id": 464
+      }
+    },
+    {
+      "_score": 0.03,
+      "data": {
+        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
+        ],
+        "question": [
+          "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
+        ]
+      },
+      "primary_key": {
+        "id": 708
       }
     }
   ]

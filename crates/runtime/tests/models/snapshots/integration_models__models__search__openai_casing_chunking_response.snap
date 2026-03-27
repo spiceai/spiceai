@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.78,
+      "_score": 0.7866,
       "dataset": "clickbench_chunking",
       "matches": {
         "Referer": [
@@ -15,7 +15,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.78,
+      "_score": 0.7866,
       "dataset": "clickbench_chunking",
       "matches": {
         "Referer": [

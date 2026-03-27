@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.5559,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.53,
+      "_score": 0.5349,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -30,27 +30,27 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.4957,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "4, 2))^3 \\times 40}\\)"
+          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
         ]
       },
       "primary_key": {
-        "id": 450
+        "id": 451
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.4951,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "Since there are 50 equal numbers, each number is equal to \\("
+          "Yes, because the last two digits (48) form a number that i"
         ]
       },
       "primary_key": {
-        "id": 507
+        "id": 556
       }
     }
   ]

@@ -6,75 +6,75 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.03,
+      "_score": 0.0327,
       "data": {
-        "question": "What is 14 percent of 232?"
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\)."
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "What is 14 percent of 232?"
+          "Which base number, when raised to the fifth power, equals thirty-two?"
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 1277
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0322,
       "data": {
-        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
         ],
         "question": [
-          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
         ]
       },
       "primary_key": {
-        "id": 449
+        "id": 189
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0317,
       "data": {
-        "question": "Find 100% of 732."
+        "question": "What is the fifth root of 32?"
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "Find 100% of 732."
+          "What is the fifth root of 32?"
         ]
       },
       "primary_key": {
-        "id": 291
+        "id": 948
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0312,
       "data": {
-        "question": "Evaluate the following expression: \\(2^{2}\\)."
+        "question": "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
+          "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
         ],
         "question": [
-          "Evaluate the following expression: \\(2^{2}\\)."
+          "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
         ]
       },
       "primary_key": {
-        "id": 250
+        "id": 191
       }
     }
   ]

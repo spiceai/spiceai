@@ -8,15 +8,15 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
   },
   {
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+  },
+  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
   },
   {
-    "id": 191,
-    "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
-  },
-  {
-    "id": 244,
-    "answer": "\\[\n-5 - 2(-3)^2 = -5 - 2(9) = -5 - 18 = \\boxed{-23}\n\\]"
+    "id": 464,
+    "answer": "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25."
   }
 ]

@@ -4,20 +4,6 @@ expression: resp?
 ---
 [
   {
-    "id": 612,
-    "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
-    "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words.",
-    "subject": "math",
-    "_score": 0.796
-  },
-  {
-    "id": 349,
-    "answer": "The missing factor is \\(\\boxed{2}\\).  \n\n(Explanation: Since \\( 21 \\times 2 = 42 \\), the missing factor is 2.)",
-    "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\).",
-    "subject": "math",
-    "_score": 0.785
-  },
-  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
@@ -30,5 +16,19 @@ expression: resp?
     "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
     "_score": 0.556
+  },
+  {
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
+    "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
+    "subject": "math",
+    "_score": 0.536
+  },
+  {
+    "id": 484,
+    "answer": "The number 36 is $\\boxed{\\text{composite}}$ because it has divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18).",
+    "question": "Identify the given number as prime, composite, or neither: 36.",
+    "subject": "math",
+    "_score": 0.535
   }
 ]

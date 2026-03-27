@@ -6,7 +6,37 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.7961,
+      "data": {
+        "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\n2"
+        ]
+      },
+      "primary_key": {
+        "id": 612
+      }
+    },
+    {
+      "_score": 0.785,
+      "data": {
+        "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\)."
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " is 2."
+        ]
+      },
+      "primary_key": {
+        "id": 349
+      }
+    },
+    {
+      "_score": 0.5559,
       "data": {
         "question": "What is the fifth root of 32?"
       },
@@ -21,7 +51,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.55,
+      "_score": 0.5559,
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -33,36 +63,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      }
-    },
-    {
-      "_score": 0.52,
-      "data": {
-        "question": "What is 14 percent of 232?"
-      },
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\n\\( 232 \\times 0.14 = 32.48 \\)"
-        ]
-      },
-      "primary_key": {
-        "id": 830
-      }
-    },
-    {
-      "_score": 0.51,
-      "data": {
-        "question": "What is the fifth term and the nth term of the GP \\( 2, 4, 8, \\ldots \\)?"
-      },
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The fifth term is \\( 2 \\times 2^{4} = 32 \\)"
-        ]
-      },
-      "primary_key": {
-        "id": 949
       }
     }
   ]

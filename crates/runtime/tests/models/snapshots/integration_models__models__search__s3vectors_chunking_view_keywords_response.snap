@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.5559,
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,19 +18,19 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.5152,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "4, 2))^3 \\times 40}\\)"
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {
-        "id": 450
+        "id": 507
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.512,
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -42,15 +42,15 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.49,
+      "_score": 0.4439,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
+          " = 6 \\times 5 \\times 4 \\times 3 \\times 2 \\times 1 = \\boxed{720}\\"
         ]
       },
       "primary_key": {
-        "id": 451
+        "id": 477
       }
     }
   ]

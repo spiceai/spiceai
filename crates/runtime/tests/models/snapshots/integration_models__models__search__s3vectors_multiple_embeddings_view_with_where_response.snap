@@ -6,63 +6,63 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.03,
+      "_score": 0.0327,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
+          "Tin vessels are not used for packing in cold countries because tin becomes brittle at low temperatures."
         ],
         "question": [
-          "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?"
+          "Why are tin vessels not used for packing in cold countries?"
         ]
       },
       "primary_key": {
-        "id": 1015
+        "id": 1301
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0322,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
+          "No. Planning describes the tasks that must be carried out, and scheduling adds a time factor."
         ],
         "question": [
-          "What causes dermatomycosis, and what are some examples of this condition?"
+          "Do planning and scheduling mean the same thing? (Yes | No)"
         ]
       },
       "primary_key": {
-        "id": 821
+        "id": 116
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0317,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+          "$\\boxed{\\text{Pyruvate}}$ is not an intermediate of the TCA cycle. It is converted to acetyl-CoA, which then enters the cycle."
         ],
         "question": [
-          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+          "Which compound is not an intermediate of the TCA cycle?"
         ]
       },
       "primary_key": {
-        "id": 449
+        "id": 1279
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.0312,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
+          "Elands access high foliage by breaking off branches with their horns."
         ],
         "question": [
-          "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
+          "How do elands access high foliage?"
         ]
       },
       "primary_key": {
-        "id": 1193
+        "id": 432
       }
     }
   ]

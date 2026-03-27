@@ -14,9 +14,9 @@ description: "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs, 'second
     "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.528
   },
   {
-    "id": 462,
-    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
-    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.519
+    "id": 464,
+    "answer": "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25.",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer)._score,Int64(3))": 0.518
   },
   {
     "id": 244,
