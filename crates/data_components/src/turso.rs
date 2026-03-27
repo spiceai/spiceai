@@ -396,46 +396,46 @@ impl VisitorMut for TursoBetweenVisitor {
             low,
             high,
         } = expr
+        && Self::is_numeric_expr(low)
+        && Self::is_numeric_expr(high)
         {
-            if Self::is_numeric_expr(low) && Self::is_numeric_expr(high) {
-                let negated = *negated;
-                let cast_expr_left = Self::cast_to_real(*input_expr.clone());
-                let cast_expr_right = Self::cast_to_real(*input_expr.clone());
-                let cast_low = Self::cast_to_real(*low.clone());
-                let cast_high = Self::cast_to_real(*high.clone());
+            let negated = *negated;
+            let cast_expr_left = Self::cast_to_real(*input_expr.clone());
+            let cast_expr_right = Self::cast_to_real(*input_expr.clone());
+            let cast_low = Self::cast_to_real(*low.clone());
+            let cast_high = Self::cast_to_real(*high.clone());
 
-                let (low_op, high_op, combine_op) = if negated {
-                    (
-                        sqlast::BinaryOperator::Lt,
-                        sqlast::BinaryOperator::Gt,
-                        sqlast::BinaryOperator::Or,
-                    )
-                } else {
-                    (
-                        sqlast::BinaryOperator::GtEq,
-                        sqlast::BinaryOperator::LtEq,
-                        sqlast::BinaryOperator::And,
-                    )
-                };
+            let (low_op, high_op, combine_op) = if negated {
+                (
+                    sqlast::BinaryOperator::Lt,
+                    sqlast::BinaryOperator::Gt,
+                    sqlast::BinaryOperator::Or,
+                )
+            } else {
+                (
+                    sqlast::BinaryOperator::GtEq,
+                    sqlast::BinaryOperator::LtEq,
+                    sqlast::BinaryOperator::And,
+                )
+            };
 
-                let lhs = sqlast::Expr::BinaryOp {
-                    left: Box::new(cast_expr_left),
-                    op: low_op,
-                    right: Box::new(cast_low),
-                };
+            let lhs = sqlast::Expr::BinaryOp {
+                left: Box::new(cast_expr_left),
+                op: low_op,
+                right: Box::new(cast_low),
+            };
 
-                let rhs = sqlast::Expr::BinaryOp {
-                    left: Box::new(cast_expr_right),
-                    op: high_op,
-                    right: Box::new(cast_high),
-                };
+            let rhs = sqlast::Expr::BinaryOp {
+                left: Box::new(cast_expr_right),
+                op: high_op,
+                right: Box::new(cast_high),
+            };
 
-                *expr = sqlast::Expr::BinaryOp {
-                    left: Box::new(lhs),
-                    op: combine_op,
-                    right: Box::new(rhs),
-                };
-            }
+            *expr = sqlast::Expr::BinaryOp {
+                left: Box::new(lhs),
+                op: combine_op,
+                right: Box::new(rhs),
+            };
         }
 
         std::ops::ControlFlow::Continue(())
