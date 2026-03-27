@@ -53,6 +53,29 @@ use super::{
     middleware::rate_limit::RateLimiterExtension,
 };
 
+/// Default idle timeout for `DoPut` streams (in seconds).
+const DEFAULT_DO_PUT_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// `app_metadata` value used to mark a `FlightData` message as a keepalive.
+///
+/// Write-through encoder tasks send these periodically on idle partition
+/// streams to prevent the executor's `DoPut` idle timeout from firing.
+pub const KEEPALIVE_APP_METADATA: &[u8] = b"spice-keepalive";
+
+/// Returns the configured `DoPut` idle timeout duration.
+///
+/// Reads `SPICE_DO_PUT_IDLE_TIMEOUT_SECS` from the environment, falling back
+/// to [`DEFAULT_DO_PUT_IDLE_TIMEOUT_SECS`].
+pub fn do_put_idle_timeout() -> Duration {
+    std::env::var("SPICE_DO_PUT_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or_else(
+            || Duration::from_secs(DEFAULT_DO_PUT_IDLE_TIMEOUT_SECS),
+            Duration::from_secs,
+        )
+}
+
 pub(crate) async fn handle(
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
@@ -392,15 +415,16 @@ fn create_response_stream(
 
         // Use a single pinned Sleep future that is reset on each received message,
         // rather than creating a new timer allocation on every loop iteration.
-        let idle_timeout = Duration::from_secs(120);
+        let idle_timeout = do_put_idle_timeout();
         let deadline = tokio::time::sleep(idle_timeout);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
                 () = &mut deadline => {
-                    tracing::error!("Timeout: no record batch received within 120 seconds");
-                    yield Err(Status::deadline_exceeded("Timeout: no record batch received within 120 seconds"));
+                    let secs = idle_timeout.as_secs();
+                    tracing::error!("Timeout: no record batch received within {secs} seconds");
+                    yield Err(Status::deadline_exceeded(format!("Timeout: no record batch received within {secs} seconds")));
                     break;
                 }
                 // Poll the writing task to check if it has completed with an error while processing the data
@@ -432,6 +456,13 @@ fn create_response_stream(
                         Some(Ok(message)) => {
                             // Reset the idle timeout on each received message
                             deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+
+                            // Skip keepalive messages — they exist only to reset the
+                            // idle timer on write-through partition streams.
+                            if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA {
+                                tracing::trace!("Received keepalive on DoPut stream for {path}");
+                                continue;
+                            }
 
                             let new_batch = match flight_data_to_arrow_batch(
                                 &message,

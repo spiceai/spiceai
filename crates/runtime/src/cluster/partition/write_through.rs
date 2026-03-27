@@ -774,6 +774,11 @@ async fn spawn_executor_forwarding_tasks(
 
 /// Encodes `RecordBatch`es from `rx` as `FlightData` and sends them via `DoPut`
 /// to a specific executor.
+///
+/// A background encoder task periodically sends keepalive `FlightData` messages
+/// when no real data arrives within one-third of the executor's `DoPut` idle
+/// timeout. This prevents the executor from timing out write-through streams
+/// for partitions that receive data infrequently.
 async fn forward_batches_to_executor(
     client: data_components::flightsql::FlightSqlClient,
     rx: mpsc::Receiver<RecordBatch>,
@@ -788,7 +793,15 @@ async fn forward_batches_to_executor(
 
     let encoder_schema = Arc::clone(&schema);
     let adapt_schema = Arc::clone(&schema);
-    io_runtime.spawn(async move {
+
+    // Keepalive interval: send a heartbeat at 1/3 of the executor idle timeout
+    // so the executor never reaches its deadline while a write-through is active.
+    // Clamp to a minimum non-zero duration to avoid a tight loop when the
+    // idle timeout is very small (e.g. in tests with 1-2s timeouts).
+    let keepalive_interval =
+        (crate::flight::do_put_idle_timeout() / 3).max(std::time::Duration::from_millis(100));
+
+    let encoder_handle = io_runtime.spawn(async move {
         let mut flight_data_encoder = Box::pin(
             arrow_flight::encode::FlightDataEncoderBuilder::new()
                 .with_schema(encoder_schema)
@@ -810,25 +823,57 @@ async fn forward_batches_to_executor(
             tbl.schema.to_string(),
             tbl.table.to_string(),
         ]);
+
+        let keepalive_sleep = tokio::time::sleep(keepalive_interval);
+        tokio::pin!(keepalive_sleep);
+
         loop {
-            match flight_data_encoder.next().await {
-                Some(Ok(mut fdata)) => {
+            tokio::select! {
+                biased;
+                data = flight_data_encoder.next() => {
+                    match data {
+                        Some(Ok(mut fdata)) => {
+                            if is_first {
+                                fdata.flight_descriptor = Some(fd.clone());
+                                is_first = false;
+                            }
+                            // Reset keepalive timer after each real message.
+                            keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
+                            if tx.send(fdata).await.is_err() {
+                                let _ = encode_result_tx.send(Ok(()));
+                                return;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = encode_result_tx.send(Err(e.to_string()));
+                            return;
+                        }
+                        None => {
+                            let _ = encode_result_tx.send(Ok(()));
+                            return;
+                        }
+                    }
+                }
+                () = &mut keepalive_sleep => {
+                    // Only send keepalives after the first real FlightData
+                    // (which carries the schema/descriptor) has been sent.
+                    // Sending a keepalive before the schema would confuse
+                    // the executor's DoPut handler.
                     if is_first {
-                        fdata.flight_descriptor = Some(fd.clone());
-                        is_first = false;
+                        keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
+                        continue;
                     }
-                    if tx.send(fdata).await.is_err() {
+                    // No data for a while — send a keepalive to prevent the
+                    // executor's DoPut idle timeout from firing.
+                    let keepalive = arrow_flight::FlightData {
+                        app_metadata: bytes::Bytes::from_static(crate::flight::KEEPALIVE_APP_METADATA),
+                        ..Default::default()
+                    };
+                    if tx.send(keepalive).await.is_err() {
                         let _ = encode_result_tx.send(Ok(()));
-                        break;
+                        return;
                     }
-                }
-                Some(Err(e)) => {
-                    let _ = encode_result_tx.send(Err(e.to_string()));
-                    break;
-                }
-                None => {
-                    let _ = encode_result_tx.send(Ok(()));
-                    break;
+                    keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
                 }
             }
         }
@@ -845,12 +890,17 @@ async fn forward_batches_to_executor(
     let response = match inner_client.do_put(request).await {
         Ok(r) => r,
         Err(e) => {
+            // Abort the encoder task so its `rx` is dropped promptly.
+            // This prevents the routing loop from queuing data into a dead
+            // channel and eventually stalling.
+            encoder_handle.abort();
             tracing::error!("DoPut to executor failed: {e}");
             return Err(Error::DoPut { source: e });
         }
     };
 
     if let Err(e) = response.into_inner().try_collect::<Vec<_>>().await {
+        encoder_handle.abort();
         tracing::error!("Executor DoPut acknowledgement failed: {e}");
         return Err(Error::DoPutAck { source: e });
     }

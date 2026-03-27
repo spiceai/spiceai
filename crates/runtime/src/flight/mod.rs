@@ -66,6 +66,10 @@ mod do_exchange;
 mod do_get;
 mod do_put;
 mod flightsql;
+
+// Re-export only the symbols needed by `cluster::partition::write_through`
+// and integration tests, keeping the rest of `do_put` private.
+pub use do_put::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
 mod get_flight_info;
 mod get_schema;
 mod handshake;
