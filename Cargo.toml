@@ -360,7 +360,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "b082895b151a8a0cf65aaefc0994117ebb961295" }               # spiceai-51
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "b082895b151a8a0cf65aaefc0994117ebb961295" }                   # spiceai-51
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "801510b2d7e3c168780ad0e6c1c6b35b32baefde" } # spiceai-51
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "041235f84ba1cff205b6a5003695274627a5a504" } # spiceai-51
 
 # Spiceai fork of datafusion-ballista with Vortex shuffle format support and PollNow interrupt
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }      # branch: spiceai-51
