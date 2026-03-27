@@ -44,9 +44,7 @@ use tonic::transport::Channel;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{
-        register_test_connectors, runtime_ready_check, test_request_context, wait_until_true,
-    },
+    utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
