@@ -396,8 +396,8 @@ impl VisitorMut for TursoBetweenVisitor {
             low,
             high,
         } = expr
-        && Self::is_numeric_expr(low)
-        && Self::is_numeric_expr(high)
+            && Self::is_numeric_expr(low)
+            && Self::is_numeric_expr(high)
         {
             let negated = *negated;
             let cast_expr_left = Self::cast_to_real(*input_expr.clone());
