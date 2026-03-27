@@ -63,7 +63,7 @@ pub enum Error {
     UnsupportedType { ty: String },
 
     #[snafu(display(
-        "The table '{dataset_name}' has no column metadata registered in Unity Catalog. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+        "The table '{dataset_name}' has no column metadata registered. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
     ))]
     TableSchemaNotRegistered { dataset_name: String },
 
