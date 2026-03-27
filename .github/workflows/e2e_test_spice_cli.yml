@@ -230,8 +230,24 @@ jobs:
           fi
 
       - name: Run spice upgrade
+        shell: bash
         run: |
-          spice upgrade
+          spice upgrade 2>&1 | tee /tmp/upgrade_output.log
+
+      - name: Verify no models variant attempted for v2+
+        shell: bash
+        run: |
+          MAJOR=$(echo "${{ env.REL_VERSION }}" | cut -d. -f1)
+          if [[ "$MAJOR" -ge 2 ]]; then
+            if grep -q '_models_' /tmp/upgrade_output.log; then
+              echo "::error::v2+ upgrade should not attempt to download models variant"
+              cat /tmp/upgrade_output.log
+              exit 1
+            fi
+            echo "Confirmed: no models variant attempted for v${{ env.REL_VERSION }}"
+          else
+            echo "Skipping models variant check for v1.x"
+          fi
 
       - name: Check the temp directory (Windows)
         if: matrix.target.target_os == 'windows'
@@ -334,8 +350,24 @@ jobs:
           build-path: ./build
 
       - name: Run spice upgrade
+        shell: bash
         run: |
-          spice upgrade
+          spice upgrade 2>&1 | tee /tmp/upgrade_output.log
+
+      - name: Verify no models variant attempted for v2+
+        shell: bash
+        run: |
+          MAJOR=$(echo "${{ env.REL_VERSION }}" | cut -d. -f1)
+          if [[ "$MAJOR" -ge 2 ]]; then
+            if grep -q '_models_' /tmp/upgrade_output.log; then
+              echo "::error::v2+ upgrade should not attempt to download models variant"
+              cat /tmp/upgrade_output.log
+              exit 1
+            fi
+            echo "Confirmed: no models variant attempted for v${{ env.REL_VERSION }}"
+          else
+            echo "Skipping models variant check for v1.x"
+          fi
 
       - name: Check the temp directory (Windows)
         if: matrix.target.target_os == 'windows'
@@ -432,8 +464,25 @@ jobs:
 
       - name: Run spice install
         if: matrix.target.target_os != 'windows'
+        shell: bash
         run: |
-          spice install
+          spice install 2>&1 | tee /tmp/install_output.log
+
+      - name: Verify no models variant attempted for v2+
+        if: matrix.target.target_os != 'windows'
+        shell: bash
+        run: |
+          MAJOR=$(echo "${{ env.REL_VERSION }}" | cut -d. -f1)
+          if [[ "$MAJOR" -ge 2 ]]; then
+            if grep -q '_models_' /tmp/install_output.log; then
+              echo "::error::v2+ install should not attempt to download models variant"
+              cat /tmp/install_output.log
+              exit 1
+            fi
+            echo "Confirmed: no models variant attempted for v${{ env.REL_VERSION }}"
+          else
+            echo "Skipping models variant check for v1.x"
+          fi
 
       - name: Validate native Windows spice install guidance
         if: matrix.target.target_os == 'windows'
