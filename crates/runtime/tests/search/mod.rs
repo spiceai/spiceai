@@ -502,11 +502,9 @@ fn normalize_search_response(mut json: Value) -> String {
             if let Some(obj) = m.as_object_mut()
                 && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
-                && let Some(truncated_score) =
-                    serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
-            // Keep 4 decimals
             {
-                obj.insert("_score".to_string(), Value::Number(truncated_score));
+                let truncated = (100.0 * score).trunc() / 100.0;
+                obj.insert("_score".to_string(), Value::String(format!("{truncated:.2}")));
             }
         }
     }
