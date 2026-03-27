@@ -4,7 +4,7 @@
 # This file is kept only to prevent merge conflicts with upstream.
 # ============================================================================
 ---
-name: "integration tests (upstream - disabled)"
+name: 'integration tests (upstream - disabled)'
 
 on: [workflow_dispatch]
 
