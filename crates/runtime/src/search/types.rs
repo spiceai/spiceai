@@ -241,8 +241,113 @@ fn transpose_and_convert(
 mod tests {
     use super::*;
     use insta::assert_json_snapshot;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
+
+    // --- compare_primary_keys regression tests ---
+
+    fn make_pk(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_compare_pk_identical_single_key() {
+        let a = make_pk(&[("id", json!(42))]);
+        let b = make_pk(&[("id", json!(42))]);
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_pk_identical_multi_key() {
+        let a = make_pk(&[("id", json!(1)), ("name", json!("alice"))]);
+        let b = make_pk(&[("id", json!(1)), ("name", json!("alice"))]);
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_pk_different_values() {
+        let a = make_pk(&[("id", json!(1))]);
+        let b = make_pk(&[("id", json!(2))]);
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Less);
+        assert_eq!(compare_primary_keys(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_pk_different_keys() {
+        let a = make_pk(&[("alpha", json!(1))]);
+        let b = make_pk(&[("beta", json!(1))]);
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Less);
+        assert_eq!(compare_primary_keys(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_pk_different_key_count() {
+        let a = make_pk(&[("id", json!(1))]);
+        let b = make_pk(&[("id", json!(1)), ("name", json!("x"))]);
+        // a has fewer keys: ["id"] vs ["id", "name"] — "id" == "id", then a is shorter
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Less);
+        assert_eq!(compare_primary_keys(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_pk_empty_maps() {
+        let a: HashMap<String, Value> = HashMap::new();
+        let b: HashMap<String, Value> = HashMap::new();
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_pk_one_empty() {
+        let a: HashMap<String, Value> = HashMap::new();
+        let b = make_pk(&[("id", json!(1))]);
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Less);
+        assert_eq!(compare_primary_keys(&b, &a), Ordering::Greater);
+    }
+
+    /// Regression test: HashMap key ordering must not affect comparison.
+    /// Insert keys in different orders and verify identical maps always compare equal.
+    #[test]
+    fn test_compare_pk_insertion_order_independent() {
+        let mut a = HashMap::new();
+        a.insert("zebra".to_string(), json!(1));
+        a.insert("alpha".to_string(), json!(2));
+        a.insert("middle".to_string(), json!(3));
+
+        let mut b = HashMap::new();
+        b.insert("alpha".to_string(), json!(2));
+        b.insert("middle".to_string(), json!(3));
+        b.insert("zebra".to_string(), json!(1));
+
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Equal);
+    }
+
+    /// Regression test: the old serde_json::to_string approach was non-deterministic.
+    /// Verify that compare_primary_keys is deterministic over many iterations with
+    /// maps constructed fresh each time (which may have different internal hash state).
+    #[test]
+    fn test_compare_pk_deterministic_across_reconstructions() {
+        for _ in 0..100 {
+            let a = make_pk(&[("x", json!(1)), ("y", json!(2)), ("z", json!(3))]);
+            let b = make_pk(&[("x", json!(1)), ("y", json!(2)), ("z", json!(3))]);
+            assert_eq!(
+                compare_primary_keys(&a, &b),
+                Ordering::Equal,
+                "Identical maps must always compare equal"
+            );
+        }
+    }
+
+    /// Regression test: comparison on second key value when first key matches.
+    #[test]
+    fn test_compare_pk_multi_key_tiebreak_on_value() {
+        let a = make_pk(&[("id", json!(1)), ("version", json!(1))]);
+        let b = make_pk(&[("id", json!(1)), ("version", json!(2))]);
+        assert_eq!(compare_primary_keys(&a, &b), Ordering::Less);
+        assert_eq!(compare_primary_keys(&b, &a), Ordering::Greater);
+    }
 
     fn sort_result(v: Vec<HashMap<String, Vec<Value>>>) -> Vec<Vec<(String, Vec<Value>)>> {
         v.into_iter()
