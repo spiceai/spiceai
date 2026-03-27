@@ -415,9 +415,15 @@ async fn reciprocal_rank_fusion_plan(
 
     builder = builder.project(projection)?;
 
-    // 8) Sort by score descending and limit
+    // 8) Sort by score descending, then by primary key ascending for deterministic ordering on ties
+    let mut sort_exprs = vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)];
+    sort_exprs.extend(
+        primary_key
+            .iter()
+            .map(|pk| col(pk.clone()).sort(true, true)),
+    );
     builder = builder
-        .sort(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])?
+        .sort(sort_exprs)?
         .limit(0, Some(limit))?;
 
     builder.build()
