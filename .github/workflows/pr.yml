@@ -4,7 +4,7 @@
 # This file is kept only to prevent merge conflicts with upstream.
 # ============================================================================
 ---
-name: "pr (upstream - disabled)"
+name: 'pr (upstream - disabled)'
 
 on: [workflow_dispatch]
 
@@ -32,7 +32,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-macos
+    runs-on: spicehq-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:

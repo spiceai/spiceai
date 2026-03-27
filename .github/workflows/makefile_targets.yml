@@ -5,7 +5,9 @@ on:
     branches:
       - trunk
       - release/*
-
+  pull_request:
+    branches:
+      - trunk
   workflow_dispatch:
 
 concurrency:

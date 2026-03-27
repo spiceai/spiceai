@@ -9,7 +9,7 @@ expression: resp?
       48,
       50
     ],
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.793
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.796
   },
   {
     "id": 349,

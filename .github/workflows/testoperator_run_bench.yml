@@ -205,6 +205,10 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Install ADBC BigQuery Driver
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/setup-adbc-bigquery
+
       - name: Install PostgreSQL for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
         uses: ./.github/actions/install-postgres
@@ -337,6 +341,7 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'true' || '' }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
@@ -407,6 +412,7 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'true' || '' }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
