@@ -121,9 +121,8 @@ impl IcebergCatalog {
             if catalog_id.starts_with("gs://") || catalog_id.starts_with("gcs://") {
                 Arc::new(OpenDalStorageFactory::Gcs)
             } else if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
-                let scheme = catalog_id.split("://").next().unwrap_or("s3").to_string();
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: scheme,
+                    configured_scheme: s3_scheme_from_url(catalog_id),
                     customized_credential_load: None,
                 })
             } else {
@@ -255,6 +254,16 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
         .description("Set to 'true' to allow anonymous access to GCS (for public buckets)."),
 ];
 
+/// Returns the S3 scheme (`"s3a"` or `"s3"`) from a URL that is known to start with
+/// an S3-family scheme. Any non-`s3a://` prefix is treated as plain `"s3"`.
+pub(crate) fn s3_scheme_from_url(url: &str) -> String {
+    if url.starts_with("s3a://") {
+        "s3a".to_string()
+    } else {
+        "s3".to_string()
+    }
+}
+
 /// Maps a Spice parameter name to an Iceberg property name.
 pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
     match param_name {
@@ -367,15 +376,7 @@ impl CatalogConnector for IcebergCatalog {
                     })?
                     .into_custom_loader();
 
-                let configured_scheme =
-                    if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
-                        catalog_id
-                            .split_once("://")
-                            .map_or("s3", |(scheme, _)| scheme)
-                            .to_string()
-                    } else {
-                        "s3".to_string()
-                    };
+                let configured_scheme = s3_scheme_from_url(&catalog_id);
 
                 Some(Arc::new(OpenDalStorageFactory::S3 {
                     configured_scheme,
