@@ -546,17 +546,111 @@ mod tests {
     fn test_normalize_preserves_metadata() {
         let mut metadata = HashMap::new();
         metadata.insert("key".to_string(), "value".to_string());
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("custom_key".to_string(), "custom_value".to_string());
+
         let schema = Schema::new_with_metadata(
             vec![Field::new(
                 "col",
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                 false,
-            )],
+            )
+            .with_metadata(field_metadata.clone())],
             metadata.clone(),
         );
 
         let normalized = normalize_dictionary_types(&schema);
         assert_eq!(normalized.metadata(), &metadata);
         assert_eq!(normalized.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(
+            normalized.field(0).metadata(),
+            &field_metadata,
+            "field-level metadata must be preserved after normalization"
+        );
+    }
+
+    #[test]
+    fn test_normalize_nested_dictionary_in_list() {
+        let schema = Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ))),
+            false,
+        )]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        let expected = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        assert_eq!(normalized.field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn test_normalize_nested_dictionary_in_struct() {
+        let schema = Schema::new(vec![Field::new(
+            "record",
+            DataType::Struct(
+                vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new(
+                        "status",
+                        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            false,
+        )]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        let expected = DataType::Struct(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("status", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        assert_eq!(normalized.field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn test_has_dictionary_types_nested() {
+        // Dictionary inside List
+        let list_dict_schema = Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ))),
+            false,
+        )]);
+        assert!(has_dictionary_types(&list_dict_schema));
+
+        // Dictionary inside Struct
+        let struct_dict_schema = Schema::new(vec![Field::new(
+            "record",
+            DataType::Struct(
+                vec![Field::new(
+                    "status",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                )]
+                .into(),
+            ),
+            false,
+        )]);
+        assert!(has_dictionary_types(&struct_dict_schema));
+
+        // No dictionary in nested types
+        let no_dict_nested = Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        )]);
+        assert!(!has_dictionary_types(&no_dict_nested));
     }
 }
