@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display};
+use std::{cmp::Ordering, collections::HashMap, fmt::Display};
 
 use arrow::error::ArrowError;
 use arrow_tools::format::to_markdown_documents;
@@ -116,6 +116,34 @@ pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowErro
     Ok(doc_sets.join("\n"))
 }
 
+/// Compare two primary key maps deterministically by iterating keys in sorted order.
+/// `HashMap` iteration order is non-deterministic, so serializing via `serde_json::to_string`
+/// can produce different strings for identical maps across runs.
+fn compare_primary_keys(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> Ordering {
+    let mut a_keys: Vec<&String> = a.keys().collect();
+    let mut b_keys: Vec<&String> = b.keys().collect();
+    a_keys.sort();
+    b_keys.sort();
+
+    // First compare by sorted key lists
+    match a_keys.iter().cmp(b_keys.iter()) {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
+
+    // Keys are identical — compare values in sorted key order
+    for key in a_keys {
+        let a_val = a.get(key).map(ToString::to_string).unwrap_or_default();
+        let b_val = b.get(key).map(ToString::to_string).unwrap_or_default();
+        match a_val.cmp(&b_val) {
+            Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+
+    Ordering::Equal
+}
+
 pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Result<Vec<Match>> {
     let mut matches: Vec<Match> = Vec::new();
     for (a, b) in result {
@@ -127,13 +155,9 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
     matches.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| a.dataset.cmp(&b.dataset))
-            .then_with(|| {
-                let a_pk = serde_json::to_string(&a.primary_key).unwrap_or_default();
-                let b_pk = serde_json::to_string(&b.primary_key).unwrap_or_default();
-                a_pk.cmp(&b_pk)
-            })
+            .then_with(|| compare_primary_keys(&a.primary_key, &b.primary_key))
     });
 
     matches.truncate(limit);
