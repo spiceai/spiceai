@@ -78,3 +78,6 @@ data/
 
 # Cluster logs
 cluster_logs/
+
+# Claude worktrees
+.claude/worktrees/
