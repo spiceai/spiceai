@@ -4,16 +4,14 @@ on:
   pull_request_target:
     types:
       [labeled, unlabeled, opened, edited, synchronize, assigned, unassigned]
-  merge_group:
-    types: [checks_requested]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true
 
 jobs:
   enforce-pull-with-spice:
-    runs-on: self-hosted
+    runs-on: spiceai-macos
     permissions:
       contents: read
       pull-requests: write

@@ -606,6 +606,8 @@ async fn provision_spice_cloud_app(
         executor_cpu_request: args.executor_cpu_request.clone(),
         executor_memory_request: args.executor_memory_request.clone(),
         executor_storage_size_gb: args.executor_storage_size_gb,
+        ephemeral_storage_limit_gb: args.ephemeral_storage_limit_gb.clone(),
+        organization_tag: args.organization_tag.clone(),
     };
     let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
 
@@ -1141,11 +1143,13 @@ fn spawn_local_spiced(
         args.join(" ")
     );
 
+    let current_stderr = std::io::stderr();
+
     TokioCommand::new(spiced_path)
         .kill_on_drop(true)
         .args(args)
         .current_dir(current_dir)
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(current_stderr))
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| anyhow::anyhow!("Failed to start local {process_name} process: {error}"))
@@ -1591,6 +1595,8 @@ mod tests {
             aws_region: None,
             cayenne_data_dir: None,
             cayenne_metadata_dir: None,
+            ephemeral_storage_limit_gb: None,
+            organization_tag: None,
         }
     }
 

@@ -20,7 +20,7 @@ use aws_sdk_cognitoidentity as cognito_identity;
 use aws_sdk_cognitoidentityprovider as cognito_idp;
 use aws_sdk_cognitoidentityprovider::types::AuthFlowType;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
-use iceberg::io::AwsCredentialLoad;
+use iceberg_storage_opendal::AwsCredentialLoad;
 use object_store::CredentialProvider;
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
