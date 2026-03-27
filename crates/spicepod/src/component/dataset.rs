@@ -611,7 +611,7 @@ mod tests {
             time_format: invalid_format
         ";
         let result: Result<Dataset, _> = yaml::from_str(yaml);
-        result.unwrap_err();
+        result.expect_err("invalid time_format should fail to parse");
     }
 
     #[test]
