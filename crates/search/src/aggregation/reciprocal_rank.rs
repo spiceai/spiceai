@@ -422,9 +422,7 @@ async fn reciprocal_rank_fusion_plan(
             .iter()
             .map(|pk| col(pk.clone()).sort(true, true)),
     );
-    builder = builder
-        .sort(sort_exprs)?
-        .limit(0, Some(limit))?;
+    builder = builder.sort(sort_exprs)?.limit(0, Some(limit))?;
 
     builder.build()
 }
