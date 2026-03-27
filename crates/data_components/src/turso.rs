@@ -123,7 +123,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{
         TableReference,
-        sqlparser::ast::{self as sqlast, VisitMut},
+        sqlparser::ast::{self as sqlast, VisitMut, VisitorMut},
         unparser::{
             Unparser,
             dialect::{
@@ -1108,12 +1108,15 @@ impl TursoTableProvider {
     /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL literals to
     /// `CAST(date/datetime(col, modifier) AS TEXT)` calls.
     ///
-    /// Note: Unlike the SQLite accelerator, we do NOT run `SQLiteBetweenVisitor`
-    /// here. That visitor rewrites `BETWEEN` into `decimal_cmp()` calls which is not supported by Turso.
+    /// Also applies `TursoBetweenVisitor` to rewrite numeric `BETWEEN` expressions
+    /// into explicit `CAST(... AS REAL)` comparisons, since Turso does not have the
+    /// `decimal_cmp()` extension available in standard SQLite.
     fn turso_ast_analyzer() -> AstAnalyzerRule {
         Box::new(|mut ast| {
             let mut interval_visitor = SQLiteIntervalVisitor::default();
             let _ = ast.visit(&mut interval_visitor);
+            let mut between_visitor = TursoBetweenVisitor;
+            let _ = ast.visit(&mut between_visitor);
             Ok(ast)
         })
     }
@@ -2110,4 +2113,190 @@ fn scalar_value_to_turso(
     };
 
     Ok(turso_value)
+}
+
+/// An AST visitor that rewrites numeric `BETWEEN` expressions into explicit
+/// `CAST(... AS REAL)` comparisons.
+///
+/// Turso (libSQL) inherits SQLite's type affinity rules, which can cause
+/// text-based comparisons on decimal values stored as TEXT.  Standard SQLite
+/// solves this with the `decimal_cmp()` C extension, but Turso does not
+/// support loading C extensions.
+///
+/// This visitor rewrites:
+/// ```sql
+///   expr BETWEEN low AND high
+/// ```
+/// into:
+/// ```sql
+///   CAST(expr AS REAL) >= CAST(low AS REAL)
+///     AND CAST(expr AS REAL) <= CAST(high AS REAL)
+/// ```
+/// (with the obvious inversion for `NOT BETWEEN`).
+///
+/// Only expressions where *both* bounds appear numeric (literal numbers,
+/// unary-minus numbers, or arithmetic on numbers) are rewritten.
+struct TursoBetweenVisitor;
+
+impl TursoBetweenVisitor {
+    /// Wrap `expr` in `CAST(expr AS REAL)`.
+    fn cast_to_real(expr: sqlast::Expr) -> sqlast::Expr {
+        sqlast::Expr::Cast {
+            kind: sqlast::CastKind::Cast,
+            expr: Box::new(expr),
+            data_type: sqlast::DataType::Real,
+            format: None,
+        }
+    }
+
+    /// Returns `true` if the expression looks like a numeric value or
+    /// arithmetic expression that should use numeric comparison.
+    fn is_numeric_expr(expr: &sqlast::Expr) -> bool {
+        match expr {
+            sqlast::Expr::Value(v) => matches!(v.value, sqlast::Value::Number(_, _)),
+            sqlast::Expr::UnaryOp {
+                op: sqlast::UnaryOperator::Minus | sqlast::UnaryOperator::Plus,
+                expr,
+            } => Self::is_numeric_expr(expr),
+            sqlast::Expr::BinaryOp { left, right, .. } => {
+                Self::is_numeric_expr(left) || Self::is_numeric_expr(right)
+            }
+            sqlast::Expr::Nested(inner) => Self::is_numeric_expr(inner),
+            _ => false,
+        }
+    }
+}
+
+impl VisitorMut for TursoBetweenVisitor {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut sqlast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let sqlast::Expr::Between {
+            expr: between_expr,
+            negated,
+            low,
+            high,
+        } = expr
+        {
+            if Self::is_numeric_expr(low) && Self::is_numeric_expr(high) {
+                let negated = *negated;
+                let cast_expr_low = Self::cast_to_real(*between_expr.clone());
+                let cast_expr_high = Self::cast_to_real(*between_expr.clone());
+                let cast_low = Self::cast_to_real(*low.clone());
+                let cast_high = Self::cast_to_real(*high.clone());
+
+                if negated {
+                    // NOT BETWEEN  →  expr < low OR expr > high
+                    *expr = sqlast::Expr::BinaryOp {
+                        left: Box::new(sqlast::Expr::BinaryOp {
+                            left: Box::new(cast_expr_low),
+                            op: sqlast::BinaryOperator::Lt,
+                            right: Box::new(cast_low),
+                        }),
+                        op: sqlast::BinaryOperator::Or,
+                        right: Box::new(sqlast::Expr::BinaryOp {
+                            left: Box::new(cast_expr_high),
+                            op: sqlast::BinaryOperator::Gt,
+                            right: Box::new(cast_high),
+                        }),
+                    };
+                } else {
+                    // BETWEEN  →  expr >= low AND expr <= high
+                    *expr = sqlast::Expr::BinaryOp {
+                        left: Box::new(sqlast::Expr::BinaryOp {
+                            left: Box::new(cast_expr_low),
+                            op: sqlast::BinaryOperator::GtEq,
+                            right: Box::new(cast_low),
+                        }),
+                        op: sqlast::BinaryOperator::And,
+                        right: Box::new(sqlast::Expr::BinaryOp {
+                            left: Box::new(cast_expr_high),
+                            op: sqlast::BinaryOperator::LtEq,
+                            right: Box::new(cast_high),
+                        }),
+                    };
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    fn rewrite_between(sql: &str) -> String {
+        let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
+        let mut stmts = Parser::parse_sql(&dialect, sql).expect("valid SQL");
+        let mut visitor = TursoBetweenVisitor;
+        for stmt in &mut stmts {
+            let _ = stmt.visit(&mut visitor);
+        }
+        stmts[0].to_string()
+    }
+
+    #[test]
+    fn test_turso_between_numeric_rewrite() {
+        let input = "SELECT * FROM t WHERE x BETWEEN 0.05 AND 0.07";
+        let result = rewrite_between(input);
+        assert!(
+            !result.contains("BETWEEN"),
+            "BETWEEN should be rewritten, got: {result}"
+        );
+        assert!(
+            result.contains("CAST(x AS REAL) >= CAST(0.05 AS REAL)"),
+            "should cast to REAL: {result}"
+        );
+        assert!(
+            result.contains("CAST(x AS REAL) <= CAST(0.07 AS REAL)"),
+            "should cast to REAL: {result}"
+        );
+    }
+
+    #[test]
+    fn test_turso_between_arithmetic_bounds() {
+        let input = "SELECT * FROM t WHERE x BETWEEN 0.06 - 0.01 AND 0.06 + 0.01";
+        let result = rewrite_between(input);
+        assert!(
+            !result.contains("BETWEEN"),
+            "BETWEEN with arithmetic bounds should be rewritten, got: {result}"
+        );
+        assert!(result.contains("CAST"), "should contain CAST: {result}");
+    }
+
+    #[test]
+    fn test_turso_not_between_numeric_rewrite() {
+        let input = "SELECT * FROM t WHERE x NOT BETWEEN 1 AND 10";
+        let result = rewrite_between(input);
+        assert!(
+            !result.contains("BETWEEN"),
+            "NOT BETWEEN should be rewritten, got: {result}"
+        );
+        assert!(
+            result.contains(" OR "),
+            "NOT BETWEEN should use OR: {result}"
+        );
+    }
+
+    #[test]
+    fn test_turso_between_non_numeric_unchanged() {
+        let input = "SELECT * FROM t WHERE name BETWEEN 'a' AND 'z'";
+        let result = rewrite_between(input);
+        assert!(
+            result.contains("BETWEEN"),
+            "Non-numeric BETWEEN should be unchanged, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_turso_between_negative_bounds() {
+        let input = "SELECT * FROM t WHERE x BETWEEN -1.5 AND 1.5";
+        let result = rewrite_between(input);
+        assert!(
+            !result.contains("BETWEEN"),
+            "BETWEEN with negative bounds should be rewritten, got: {result}"
+        );
+    }
 }
