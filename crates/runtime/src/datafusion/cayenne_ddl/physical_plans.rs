@@ -43,7 +43,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
 use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
-use data_components::flightsql::FlightSqlClient;
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
