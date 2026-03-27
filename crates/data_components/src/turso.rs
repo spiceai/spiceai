@@ -1238,7 +1238,7 @@ impl TursoTableProvider {
         Box::new(|mut ast| {
             let mut interval_visitor = SQLiteIntervalVisitor::default();
             let _ = ast.visit(&mut interval_visitor);
-            let mut between_visitor = TursoBetweenVisitor::default();
+            let mut between_visitor = TursoBetweenVisitor;
             let _ = ast.visit(&mut between_visitor);
             Ok(ast)
         })
@@ -1574,7 +1574,7 @@ impl TursoExec {
         } else {
             let dialect = TursoDialect::new();
             let unparser = Unparser::new(&dialect);
-            let mut between_visitor = TursoBetweenVisitor::default();
+            let mut between_visitor = TursoBetweenVisitor;
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
@@ -1729,7 +1729,7 @@ impl DeletionSink for TursoDeletionSink {
         } else {
             let dialect = TursoDialect::new();
             let unparser = Unparser::new(&dialect);
-            let mut between_visitor = TursoBetweenVisitor::default();
+            let mut between_visitor = TursoBetweenVisitor;
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
@@ -2286,7 +2286,7 @@ mod tests {
             high: Box::new(num("0.08")),
         };
 
-        let mut visitor = TursoBetweenVisitor::default();
+        let mut visitor = TursoBetweenVisitor;
         let _ = expr.visit(&mut visitor);
 
         let expected = sqlast::Expr::BinaryOp {
@@ -2317,7 +2317,7 @@ mod tests {
             high: Box::new(num("3")),
         };
 
-        let mut visitor = TursoBetweenVisitor::default();
+        let mut visitor = TursoBetweenVisitor;
         let _ = expr.visit(&mut visitor);
 
         let expected = sqlast::Expr::BinaryOp {
@@ -2352,7 +2352,7 @@ mod tests {
         };
         let mut expr = original.clone();
 
-        let mut visitor = TursoBetweenVisitor::default();
+        let mut visitor = TursoBetweenVisitor;
         let _ = expr.visit(&mut visitor);
 
         // Should remain unchanged
@@ -2372,7 +2372,7 @@ mod tests {
         };
         let mut expr = original.clone();
 
-        let mut visitor = TursoBetweenVisitor::default();
+        let mut visitor = TursoBetweenVisitor;
         let _ = expr.visit(&mut visitor);
 
         assert_eq!(format!("{expr}"), format!("{original}"));
@@ -2396,7 +2396,7 @@ mod tests {
             }),
         };
 
-        let mut visitor = TursoBetweenVisitor::default();
+        let mut visitor = TursoBetweenVisitor;
         let _ = expr.visit(&mut visitor);
 
         // Should be rewritten (both bounds are numeric expressions)
@@ -2421,7 +2421,7 @@ mod tests {
             high: Box::new(num("0.08")),
         };
 
-        let mut visitor = TursoBetweenVisitor::default();
+        let mut visitor = TursoBetweenVisitor;
         let _ = expr.visit(&mut visitor);
 
         let sql = format!("{expr}");
