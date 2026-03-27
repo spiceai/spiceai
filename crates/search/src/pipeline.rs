@@ -138,7 +138,6 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                     tbl,
                     columns,
                     filters,
-                    &primary_keys,
                     Some(limit),
                 )
                 .context(SearchRequestConstructionSnafu)?;
@@ -175,7 +174,6 @@ fn construct_logical_plan(
     name: &TableReference,
     columns: Vec<Expr>,
     filters: Vec<Expr>,
-    primary_keys: &[Column],
     limit: Option<usize>,
 ) -> Result<LogicalPlan, DataFusionError> {
     let mut scan =

@@ -126,14 +126,8 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
     // Sort by score descending, then by dataset + primary key ascending for deterministic ordering on ties.
     matches.sort_by(|a, b| {
         b.score
-            .partial_cmp(&a.score)
+            .partial_cmp(&a.score())
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.dataset.cmp(&b.dataset))
-            .then_with(|| {
-                let a_pk = serde_json::to_string(&a.primary_key).unwrap_or_default();
-                let b_pk = serde_json::to_string(&b.primary_key).unwrap_or_default();
-                a_pk.cmp(&b_pk)
-            })
     });
 
     matches.truncate(limit);

@@ -564,21 +564,11 @@ impl TableProvider for SearchQueryProvider {
             }
         }
         .sort_with_limit(
-            {
-                let mut sort_exprs = vec![SortExpr::new(
-                    Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
-                    false, // descending
-                    true,  // nulls_first
-                )];
-                sort_exprs.extend(self.primary_key.iter().map(|pk| {
-                    SortExpr::new(
-                        Expr::Column(Column::new_unqualified(pk)),
-                        true, // ascending
-                        true, // nulls_first
-                    )
-                }));
-                sort_exprs
-            },
+            vec![SortExpr::new(
+                Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
+                false, // descending
+                true,  // nulls_first
+            )],
             limit,
         )?;
 
