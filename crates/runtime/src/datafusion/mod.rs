@@ -1640,6 +1640,37 @@ impl DataFusion {
                 );
             }
 
+            // Auto-configure cache retention when stale_if_error is disabled.
+            // Expired cache entries (past max_age + SWR) are never served and waste storage.
+            if !acceleration_settings.caching_stale_if_error.is_enabled() {
+                if dataset.retention_period().is_some() {
+                    tracing::warn!(
+                        dataset = dataset.name,
+                        "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                    );
+                }
+
+                let max_age = acceleration_settings
+                    .caching_ttl
+                    .unwrap_or(Duration::from_secs(30));
+                let swr = acceleration_settings
+                    .caching_stale_while_revalidate_ttl
+                    .unwrap_or_default();
+                let retention_period = max_age + swr;
+                let check_interval = retention_period.max(Duration::from_secs(30));
+
+                let cache_retention = Retention::builder()
+                    .time_column(Some(
+                        crate::accelerated_table::caching::CACHE_REFRESHED_AT_COLUMN,
+                    ))
+                    .time_period(Some(retention_period))
+                    .check_interval(Some(check_interval))
+                    .enabled(true)
+                    .build();
+
+                accelerated_table_builder.retention(cache_retention);
+            }
+
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
             accelerated_table_builder.caching_stale_while_revalidate_ttl(
                 acceleration_settings.caching_stale_while_revalidate_ttl,
