@@ -146,7 +146,7 @@ pub fn expand_views_schema(schema: &Schema) -> Schema {
 
 /// Replaces Arrow `Dictionary`-encoded fields with the dictionary's value type.
 ///
-/// Data accelerators such as DuckDB and SQLite do not natively support Arrow
+/// Data accelerators such as `DuckDB` and `SQLite` do not natively support Arrow
 /// Dictionary types.  By unpacking the dictionary encoding at the schema level
 /// (and later casting the data via `arrow_cast::cast`), the downstream
 /// accelerator receives only primitive types it can handle.
