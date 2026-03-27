@@ -2187,13 +2187,14 @@ impl SnapshotManager {
 
         let snapshots: Vec<api::SnapshotInfo> = windowed_entries
             .iter()
-            .map(|entry| {
+            .filter_map(|entry| {
                 let status = match existence_results.get(&entry.snapshot_id) {
                     Some(SnapshotFileStatus::Verified) => "verified".to_string(),
                     Some(SnapshotFileStatus::Unverified) => "unverified".to_string(),
-                    _ => String::new(),
+                    // Snapshot file not found in object store; omit from results.
+                    Some(SnapshotFileStatus::NotFound) | None => return None,
                 };
-                api::SnapshotInfo {
+                Some(api::SnapshotInfo {
                     snapshot_id: entry.snapshot_id,
                     timestamp_ms: entry.timestamp_ms,
                     location: entry.snapshot.clone(),
@@ -2204,7 +2205,7 @@ impl SnapshotManager {
                     row_count: entry.snapshot_row_count,
                     is_current: Some(entry.snapshot_id) == current_snapshot_id,
                     status,
-                }
+                })
             })
             .collect();
 
@@ -4362,7 +4363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_snapshot_summary_returns_missing_snapshot_with_empty_status() {
+    async fn get_snapshot_summary_omits_deleted_snapshots() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let metadata_path = base.child(METADATA_FILE_NAME);
@@ -4429,22 +4430,24 @@ mod tests {
             .await
             .expect("get_snapshot_summary should succeed");
 
-        // Both snapshots should be returned regardless of file existence
-        assert_eq!(summary.snapshots.len(), 2);
+        // Only snapshots that exist in object storage should be returned
+        assert_eq!(
+            summary.snapshots.len(),
+            1,
+            "deleted snapshots should be omitted from the summary"
+        );
 
         let s1 = summary
             .snapshots
             .iter()
             .find(|s| s.snapshot_id == 1)
             .expect("snapshot 1 should be present");
-        let s2 = summary
-            .snapshots
-            .iter()
-            .find(|s| s.snapshot_id == 2)
-            .expect("snapshot 2 should be present");
 
         assert_eq!(s1.status, "verified");
-        assert_eq!(s2.status, "", "missing file should have empty status");
+        assert!(
+            summary.snapshots.iter().all(|s| s.snapshot_id != 2),
+            "snapshot 2 (missing file) should not appear in results"
+        );
     }
 
     #[tokio::test]
