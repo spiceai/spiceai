@@ -23,7 +23,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 
-use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey};
+use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey, Sizeable};
 
 use async_stream::stream;
 
@@ -185,6 +185,7 @@ pub fn to_cached_record_batch_stream(
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
         let mut records_size: usize = 0;
+        let has_encoder = cache_provider.encoder().is_some();
         // moka-rs operates by `u32` for records size, so max single record size is `u32::MAX` / 4 GB
         let cache_max_size = usize::try_from(cache_provider.max_size().min(u64::from(u32::MAX))).unwrap_or_default();
 
@@ -192,9 +193,11 @@ pub fn to_cached_record_batch_stream(
             if records_size < cache_max_size && let Ok(batch) = &batch_result {
                 records.push(batch.clone());
                 records_size += batch.get_array_memory_size();
-            } else if !records.is_empty() && records_size >= cache_max_size {
-                // eagerly clear the cached records, as this result won't be cached anyway
-                // this allows some memory reclamation if the stream is very large
+            } else if !records.is_empty() && records_size >= cache_max_size && !has_encoder {
+                // Eagerly clear the cached records when there is no encoder, as
+                // the unencoded result won't fit in the cache. When an encoder is
+                // present, the encoded size may be much smaller than the raw size,
+                // so we keep accumulating and check the encoded size later.
                 records.clear();
                 records.shrink_to_fit();
             }
@@ -202,7 +205,9 @@ pub fn to_cached_record_batch_stream(
             yield batch_result;
         }
 
-        if records_size < cache_max_size {
+        // When an encoder is present, defer the size check until after encoding
+        // so that compressed results that fit in the cache are not prematurely rejected.
+        if records_size < cache_max_size || has_encoder {
             match batches_to_cache(&records) {
                 None if !records.is_empty() => {
                     tracing::debug!(
@@ -223,7 +228,15 @@ pub fn to_cached_record_batch_stream(
                     .await
                     {
                         Ok(cached_result) => {
-                            if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                            // Check the actual (possibly encoded) size before caching
+                            let actual_size = cached_result.get_memory_size();
+                            if actual_size > cache_max_size {
+                                tracing::debug!(
+                                    actual_size,
+                                    cache_max_size,
+                                    "Encoded query result still exceeds cache max size, skipping"
+                                );
+                            } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
                                 tracing::error!("Failed to cache query results: {e}");
                             }
                         }
@@ -865,5 +878,151 @@ pub(crate) mod tests {
             .expect("status column");
         assert_eq!(status.value(0), 499);
         assert_eq!(status.value(1), 600);
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/8508>.
+    ///
+    /// When the results cache uses zstd encoding, a result whose *uncompressed*
+    /// size exceeds the cache limit should still be cached if the *compressed*
+    /// size fits.
+    #[tokio::test]
+    async fn test_encoded_result_cached_when_compressed_fits() {
+        use arrow::array::Int32Array;
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        // Create a small cache (e.g., 2 KiB) with zstd encoding.
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("2KiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        // Build a batch of highly compressible data (repeated zeros) whose
+        // uncompressed memory size exceeds the 2 KiB cache limit but compresses
+        // well under zstd.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![col.clone(), col])
+            .expect("to create batch");
+
+        let raw_size = batch.get_array_memory_size();
+        let cache_max = cache_provider.max_size() as usize;
+        assert!(
+            raw_size > cache_max,
+            "Test precondition: raw size ({raw_size}) must exceed cache max ({cache_max})"
+        );
+
+        let raw_cache_key = crate::key::CacheKey::Query("zstd-compressible", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(batch)]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["test_table".into()])),
+        );
+
+        // Consume the stream to trigger caching.
+        let _output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+
+        // The encoded result should now be in the cache.
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_some(),
+            "Compressed result should be cached even though uncompressed size exceeds the limit"
+        );
+
+        let cached_batches = cached
+            .expect("must be Some")
+            .records()
+            .await
+            .expect("cached result should decode");
+        assert_eq!(cached_batches.len(), 1);
+        assert_eq!(cached_batches[0].num_rows(), n);
+    }
+
+    /// Verify that when there is no encoder and the result exceeds the cache
+    /// limit, it is correctly NOT cached (existing behavior preserved).
+    #[tokio::test]
+    async fn test_unencoded_oversized_result_not_cached() {
+        use arrow::array::Int32Array;
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("2KiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::None,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 300;
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![col.clone(), col])
+            .expect("to create batch");
+
+        let raw_cache_key = crate::key::CacheKey::Query("unencoded-oversized", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(batch)]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["test_table".into()])),
+        );
+
+        let _output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "Unencoded oversized result should NOT be cached"
+        );
     }
 }
