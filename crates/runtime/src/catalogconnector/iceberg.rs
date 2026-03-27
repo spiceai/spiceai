@@ -367,8 +367,18 @@ impl CatalogConnector for IcebergCatalog {
                     })?
                     .into_custom_loader();
 
+                let configured_scheme =
+                    if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
+                        catalog_id
+                            .split_once("://")
+                            .map_or("s3", |(scheme, _)| scheme)
+                            .to_string()
+                    } else {
+                        "s3".to_string()
+                    };
+
                 Some(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: "s3".to_string(),
+                    configured_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>)
             } else {
