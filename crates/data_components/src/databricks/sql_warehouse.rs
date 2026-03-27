@@ -62,8 +62,15 @@ pub enum Error {
     #[snafu(display("Databricks datatype {ty} not supported"))]
     UnsupportedType { ty: String },
 
-    #[snafu(display("Unable to retrieve schema: {reason}"))]
-    UnableToRetrieveSchema { reason: String },
+    #[snafu(display(
+        "The table '{dataset_name}' has no column metadata registered in Unity Catalog. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
+    TableSchemaNotRegistered { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to load the table '{dataset_name}' from Databricks: unexpected schema response format. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    UnexpectedSchemaResponse { dataset_name: String, reason: String },
 
     #[snafu(display(
         "The dataset '{dataset_name}' in Databricks has no columns. Verify the table exists and has at least one column."
@@ -562,11 +569,8 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
         .get("result")
         .and_then(|r| r.get("data_array"))
         .and_then(|d| d.as_array())
-        .ok_or_else(|| Error::UnableToRetrieveSchema {
-            reason: format!(
-                "The response for dataset '{dataset_name}' is missing 'result.data_array'. \
-                 Verify the table exists and the SQL warehouse is responding correctly."
-            ),
+        .ok_or_else(|| Error::TableSchemaNotRegistered {
+            dataset_name: dataset_name.to_string(),
         })?;
 
     let mut fields = Vec::new();
@@ -574,22 +578,25 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
     for (i, row) in data_array.iter().enumerate() {
         let row_array = row
             .as_array()
-            .ok_or_else(|| Error::UnableToRetrieveSchema {
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
                 reason: format!("data_array[{i}] is not an array"),
             })?;
 
         if row_array.len() < 3 {
-            return Err(Error::UnableToRetrieveSchema {
+            return Err(Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
                 reason: format!(
-                    "data_array[{i}] lacks column_name or full_data_type or is_nullable"
+                    "data_array[{i}] has fewer than 3 fields"
                 ),
             });
         }
 
         let col_name = row_array[0]
             .as_str()
-            .ok_or_else(|| Error::UnableToRetrieveSchema {
-                reason: format!("data_array[{i}][0] is not a string"),
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}][0] (column name) is not a string"),
             })?;
 
         // If we see #, DB is now providing the clustering metadata info and
@@ -600,8 +607,9 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
         let data_type_str = row_array[1]
             .as_str()
-            .ok_or_else(|| Error::UnableToRetrieveSchema {
-                reason: format!("data_array[{i}][1] is not a string"),
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}][1] (data type) is not a string"),
             })?;
 
         let data_type = datatypes::Parser::new(data_type_str)
@@ -611,8 +619,9 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
         let nullable = row_array[2]
             .as_str()
             .map(|s| s.to_lowercase() == "yes")
-            .ok_or_else(|| Error::UnableToRetrieveSchema {
-                reason: format!("data_array[{i}][2] is not a string"),
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}][2] (is_nullable) is not a string"),
             })?;
 
         let field: Field = Field::new(col_name, data_type, nullable);
@@ -911,7 +920,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
+            matches!(&err, Error::TableSchemaNotRegistered { dataset_name } if dataset_name == "test_table"),
             "unexpected error: {err}"
         );
     }
@@ -926,7 +935,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without data_array");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
+            matches!(&err, Error::TableSchemaNotRegistered { dataset_name } if dataset_name == "test_table"),
             "unexpected error: {err}"
         );
     }
@@ -941,7 +950,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail when data_array is string");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
+            matches!(&err, Error::TableSchemaNotRegistered { dataset_name } if dataset_name == "test_table"),
             "unexpected error: {err}"
         );
     }
@@ -953,7 +962,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail on non-array row");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("is not an array")),
+            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("is not an array")),
             "unexpected error: {err}"
         );
     }
@@ -964,7 +973,7 @@ mod tests {
 
         let err = schema_from_json(&response, "test_table").expect_err("should fail on short row");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("lacks column_name")),
+            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("fewer than 3 fields")),
             "unexpected error: {err}"
         );
     }
@@ -976,7 +985,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on non-string col name");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[0] is not a string")),
+            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("[0] (column name) is not a string")),
             "unexpected error: {err}"
         );
     }
@@ -988,7 +997,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on non-string data type");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[1] is not a string")),
+            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("[1] (data type) is not a string")),
             "unexpected error: {err}"
         );
     }
@@ -1000,7 +1009,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on non-string nullable");
         assert!(
-            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[2] is not a string")),
+            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("[2] (is_nullable) is not a string")),
             "unexpected error: {err}"
         );
     }
