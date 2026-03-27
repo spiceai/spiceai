@@ -473,9 +473,6 @@ impl DataFusionBuilder {
                 self.cluster_config.as_ref().is_some_and(|cfg| {
                     matches!(cfg.effective_role(), Some(ClusterRole::Scheduler))
                 }),
-                self.cluster_config
-                    .as_ref()
-                    .is_some_and(|cfg| cfg.effective_role().is_some()),
             ),
         ));
 
