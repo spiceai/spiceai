@@ -17,7 +17,7 @@ limitations under the License.
 //! Forwards writes to each relevant executor based on their assigned partitions.
 //! This is used for partitioned tables that are written to via the coordinator.
 
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
@@ -317,6 +317,13 @@ pub(crate) async fn forward_partitioned_batches(
 
     // Route each batch through partition filters to the appropriate executor.
     let mut routing_error: Option<Error> = None;
+    let mut routed_batches: u64 = 0;
+    let route_start = std::time::Instant::now();
+    tracing::info!(
+        table = %path,
+        executors = all_executor_ids.len(),
+        "Write-through routing started",
+    );
     while let Some(batch_result) = StreamExt::next(&mut batches).await {
         let batch = match batch_result {
             Ok(b) => b,
@@ -340,29 +347,71 @@ pub(crate) async fn forward_partitioned_batches(
             routing_error = Some(e);
             break;
         }
+        routed_batches += 1;
     }
+    let route_elapsed = route_start.elapsed();
+    tracing::info!(
+        table = %path,
+        routed_batches,
+        elapsed_ms = route_elapsed.as_millis() as u64,
+        error = routing_error.is_some(),
+        "Write-through routing finished",
+    );
 
     // Signal completion by dropping senders, then await all forwarding tasks.
     // Collect executor-side errors even when routing failed — the forwarding
     // tasks may hold the real error (e.g. DoPut rejection from the executor)
     // that caused the channel to close and triggered a SendBatch error.
     drop(senders);
+    let join_start = std::time::Instant::now();
+    tracing::info!(
+        table = %path,
+        tasks = join_handles.len(),
+        "Write-through awaiting executor forwarding tasks",
+    );
     let mut executor_error: Option<Error> = None;
-    for handle in join_handles {
+    for (i, handle) in join_handles.into_iter().enumerate() {
+        let task_start = std::time::Instant::now();
         match handle.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                tracing::info!(
+                    table = %path,
+                    task_index = i,
+                    elapsed_ms = task_start.elapsed().as_millis() as u64,
+                    "Executor forwarding task completed successfully",
+                );
+            }
             Ok(Err(e)) => {
+                tracing::info!(
+                    table = %path,
+                    task_index = i,
+                    elapsed_ms = task_start.elapsed().as_millis() as u64,
+                    error = %e,
+                    "Executor forwarding task completed with error",
+                );
                 if executor_error.is_none() {
                     executor_error = Some(e);
                 }
             }
             Err(e) => {
+                tracing::info!(
+                    table = %path,
+                    task_index = i,
+                    elapsed_ms = task_start.elapsed().as_millis() as u64,
+                    error = %e,
+                    "Executor forwarding task panicked",
+                );
                 if executor_error.is_none() {
                     executor_error = Some(Error::JoinTask { source: e });
                 }
             }
         }
     }
+    tracing::info!(
+        table = %path,
+        elapsed_ms = join_start.elapsed().as_millis() as u64,
+        "Write-through all executor tasks joined",
+    );
 
     // Prefer the executor-side error (root cause) over the routing error
     // (which is typically a SendBatch from a closed channel).
@@ -393,9 +442,13 @@ async fn route_batch_and_assign_unseen(
     partition_manager: &Arc<PartitionManager>,
     path: &TableReference,
 ) -> Result<()> {
-    // Route matched rows to known executors.
-    let unmatched = route_matched_and_collect_unmatched(batch, executor_filters, senders).await?;
+    // Partition rows by executor filter, collecting (executor_id, batch) pairs
+    // without sending yet. All sends happen concurrently at the end to avoid
+    // head-of-line blocking when one executor's channel is full.
+    let (unmatched, mut pending_sends) =
+        partition_matched_rows(batch, executor_filters, senders)?;
     if unmatched.num_rows() == 0 {
+        send_all_concurrent(senders, pending_sends, path).await?;
         return Ok(());
     }
 
@@ -519,17 +572,22 @@ async fn route_batch_and_assign_unseen(
             }
         }
 
-        // Forward the rows.
+        // Queue the rows for concurrent send.
         let tx = senders
             .get(&executor_id)
             .ok_or_else(|| Error::NoSenderForExecutor {
                 executor_id: executor_id.clone(),
                 table: path.to_string(),
             })?;
-        tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
-            executor_id: executor_id.clone(),
-        })?;
+
+        // Check if this executor already has a pending batch; if so, we need
+        // separate entries since we can't concatenate without schema validation.
+        let _ = tx; // just validate it exists
+        pending_sends.push((executor_id.clone(), sub_batch));
     }
+
+    // Send all pending batches (matched + newly assigned) concurrently.
+    send_all_concurrent(senders, pending_sends, path).await?;
 
     Ok(())
 }
@@ -549,17 +607,78 @@ fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
     }
 }
 
-/// Routes matched rows to known executors and returns the unmatched rows.
+/// Sends all pending `(executor_id, batch)` pairs concurrently so that one
+/// slow executor cannot block sends to the others (no head-of-line blocking).
+async fn send_all_concurrent(
+    senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+    pending: Vec<(ExecutorId, RecordBatch)>,
+    path: &TableReference,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let futures: Vec<_> = pending
+        .into_iter()
+        .map(|(executor_id, batch)| {
+            let tx = senders.get(&executor_id).cloned();
+            async move {
+                let Some(tx) = tx else {
+                    return Err(Error::NoSenderForExecutor {
+                        executor_id: executor_id.clone(),
+                        table: path.to_string(),
+                    });
+                };
+                let rows = batch.num_rows();
+                let capacity = tx.capacity();
+                if capacity <= 4 {
+                    tracing::info!(
+                        executor = %executor_id,
+                        rows,
+                        channel_remaining = capacity,
+                        channel_max = tx.max_capacity(),
+                        "Executor channel nearly full",
+                    );
+                }
+                let send_start = std::time::Instant::now();
+                tx.send(batch).await.map_err(|_| Error::SendBatch {
+                    executor_id: executor_id.clone(),
+                })?;
+                let send_elapsed = send_start.elapsed();
+                if send_elapsed > std::time::Duration::from_secs(5) {
+                    tracing::info!(
+                        executor = %executor_id,
+                        rows,
+                        send_ms = send_elapsed.as_millis() as u64,
+                        "Slow send to executor channel (>5s)",
+                    );
+                }
+                Ok(())
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+    for result in results {
+        result?;
+    }
+
+    Ok(())
+}
+
+/// Partitions rows by executor filter, returning `(unmatched_rows, pending_sends)`.
 ///
-/// Partitions are non-overlapping, so each row matches at most one executor.
-/// We progressively shrink the remaining batch as rows get matched, avoiding
-/// redundant filter evaluations and data copies on already-routed rows.
-async fn route_matched_and_collect_unmatched(
+/// Evaluates each executor's filter predicate against the batch and collects
+/// matched rows into `pending_sends` without sending them. This is a pure
+/// compute step — all sends happen concurrently afterwards in
+/// [`send_all_concurrent`] to avoid head-of-line blocking.
+fn partition_matched_rows(
     batch: &RecordBatch,
     executor_filters: &[ExecutorFilter],
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
-) -> Result<RecordBatch> {
+) -> Result<(RecordBatch, Vec<(ExecutorId, RecordBatch)>)> {
     let mut remaining = batch.clone();
+    let mut pending_sends: Vec<(ExecutorId, RecordBatch)> = Vec::new();
 
     for (executor_id, filter_expr) in executor_filters {
         if remaining.num_rows() == 0 {
@@ -596,24 +715,23 @@ async fn route_matched_and_collect_unmatched(
         // If there is no active sender for this executor (e.g. it disconnected),
         // leave the matched rows in `remaining` so they are treated as unmatched
         // and re-assigned to a connected executor. This prevents silent data loss.
-        let Some(tx) = senders.get(executor_id) else {
+        if !senders.contains_key(executor_id) {
             tracing::warn!(
                 executor_id,
                 rows = matched_count,
                 "Skipping send to disconnected executor; rows will be re-assigned"
             );
             continue;
-        };
+        }
 
         let filtered =
             arrow::compute::filter_record_batch(&remaining, mask).context(FilterBatchSnafu)?;
-        tx.send(filtered).await.map_err(|_| Error::SendBatch {
-            executor_id: executor_id.clone(),
-        })?;
+
+        pending_sends.push((executor_id.clone(), filtered));
 
         // If every remaining row was matched, nothing left to process.
         if matched_count == remaining.num_rows() {
-            return Ok(RecordBatch::new_empty(batch.schema()));
+            return Ok((RecordBatch::new_empty(batch.schema()), pending_sends));
         }
 
         // Shrink remaining to only unmatched rows for subsequent executors.
@@ -630,7 +748,7 @@ async fn route_matched_and_collect_unmatched(
         );
     }
 
-    Ok(remaining)
+    Ok((remaining, pending_sends))
 }
 
 /// Parses partition-by SQL expression strings into logical + physical expression pairs.
@@ -757,7 +875,7 @@ async fn spawn_executor_forwarding_tasks(
 
     for (executor_id, client) in executor_clients {
         let (tx, rx) = mpsc::channel::<RecordBatch>(64);
-        senders.insert(executor_id, tx);
+        senders.insert(executor_id.clone(), tx);
 
         join_handles.push(io_runtime.spawn(forward_batches_to_executor(
             client,
@@ -766,6 +884,7 @@ async fn spawn_executor_forwarding_tasks(
             tbl.clone(),
             auth_header.clone(),
             io_runtime.clone(),
+            executor_id,
         )));
     }
 
@@ -786,7 +905,17 @@ async fn forward_batches_to_executor(
     tbl: ResolvedTableReference,
     auth_header: Option<String>,
     io_runtime: tokio::runtime::Handle,
+    executor_id: String,
 ) -> Result<()> {
+    let forward_start = std::time::Instant::now();
+    let batches_forwarded = Arc::new(AtomicU64::new(0));
+    let keepalives_sent = Arc::new(AtomicU64::new(0));
+    let table_label = tbl.to_string();
+    tracing::info!(
+        executor = %executor_id,
+        table = %table_label,
+        "Executor forwarding task started",
+    );
     let (tx, flight_rx) = mpsc::channel::<arrow_flight::FlightData>(64);
     let (encode_result_tx, encode_result_rx) =
         tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
@@ -801,6 +930,8 @@ async fn forward_batches_to_executor(
     let keepalive_interval =
         (crate::flight::do_put_idle_timeout() / 3).max(std::time::Duration::from_millis(100));
 
+    let encoder_batches = Arc::clone(&batches_forwarded);
+    let encoder_keepalives = Arc::clone(&keepalives_sent);
     let encoder_handle = io_runtime.spawn(async move {
         let mut flight_data_encoder = Box::pin(
             arrow_flight::encode::FlightDataEncoderBuilder::new()
@@ -843,6 +974,7 @@ async fn forward_batches_to_executor(
                                 let _ = encode_result_tx.send(Ok(()));
                                 return;
                             }
+                            encoder_batches.fetch_add(1, Ordering::Relaxed);
                         }
                         Some(Err(e)) => {
                             let _ = encode_result_tx.send(Err(e.to_string()));
@@ -873,6 +1005,7 @@ async fn forward_batches_to_executor(
                         let _ = encode_result_tx.send(Ok(()));
                         return;
                     }
+                    encoder_keepalives.fetch_add(1, Ordering::Relaxed);
                     keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
                 }
             }
@@ -887,6 +1020,11 @@ async fn forward_batches_to_executor(
     }
 
     let mut inner_client = client.into_inner();
+    tracing::info!(
+        executor = %executor_id,
+        table = %table_label,
+        "Executor DoPut request starting",
+    );
     let response = match inner_client.do_put(request).await {
         Ok(r) => r,
         Err(e) => {
@@ -894,16 +1032,47 @@ async fn forward_batches_to_executor(
             // This prevents the routing loop from queuing data into a dead
             // channel and eventually stalling.
             encoder_handle.abort();
-            tracing::error!("DoPut to executor failed: {e}");
+            tracing::error!(
+                executor = %executor_id,
+                table = %table_label,
+                elapsed_ms = forward_start.elapsed().as_millis() as u64,
+                batches = batches_forwarded.load(Ordering::Relaxed),
+                keepalives = keepalives_sent.load(Ordering::Relaxed),
+                error = %e,
+                "`DoPut` to executor failed",
+            );
             return Err(Error::DoPut { source: e });
         }
     };
 
+    tracing::info!(
+        executor = %executor_id,
+        table = %table_label,
+        "`DoPut` stream established, collecting acknowledgements",
+    );
+
     if let Err(e) = response.into_inner().try_collect::<Vec<_>>().await {
         encoder_handle.abort();
-        tracing::error!("Executor DoPut acknowledgement failed: {e}");
+        tracing::error!(
+            executor = %executor_id,
+            table = %table_label,
+            elapsed_ms = forward_start.elapsed().as_millis() as u64,
+            batches = batches_forwarded.load(Ordering::Relaxed),
+            keepalives = keepalives_sent.load(Ordering::Relaxed),
+            error = %e,
+            "Executor `DoPut` acknowledgement failed",
+        );
         return Err(Error::DoPutAck { source: e });
     }
+
+    tracing::info!(
+        executor = %executor_id,
+        table = %table_label,
+        elapsed_ms = forward_start.elapsed().as_millis() as u64,
+        batches = batches_forwarded.load(Ordering::Relaxed),
+        keepalives = keepalives_sent.load(Ordering::Relaxed),
+        "Executor forwarding task completed successfully",
+    );
 
     match encode_result_rx.await {
         Ok(Ok(())) | Err(_) => Ok(()),
