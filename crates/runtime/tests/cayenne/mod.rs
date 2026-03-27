@@ -23,10 +23,7 @@ use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check_with_timeout;
 use crate::{
     RecordBatch, init_tracing,
-    utils::{
-        register_test_connectors, test_request_context, test_resolved_cluster_config,
-        wait_until_true,
-    },
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use app::AppBuilder;
 use arrow::array::{Int64Array, StringViewArray};
@@ -864,7 +861,6 @@ async fn test_cayenne_doput_upsert_cycle_stale() -> Result<(), String> {
                     )
                     .with_app(app)
                     .with_runtime_config(Config::default().with_caching_disabled())
-                    .with_resolved_cluster_config(test_resolved_cluster_config())
                     .build()
                     .await,
             );
@@ -1053,7 +1049,6 @@ impl CayenneTestHarness {
                 )
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await,
         );

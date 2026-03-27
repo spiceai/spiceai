@@ -25,10 +25,7 @@ use std::time::Duration;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{
-        register_test_connectors, runtime_ready_check_with_timeout, test_request_context,
-        test_resolved_cluster_config,
-    },
+    utils::{register_test_connectors, runtime_ready_check_with_timeout, test_request_context},
 };
 use app::AppBuilder;
 use arrow::array::{Float64Array, Int64Array, RecordBatch};
@@ -122,7 +119,6 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -542,7 +538,6 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -626,7 +621,6 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -779,7 +773,6 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -873,7 +866,6 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -1066,7 +1058,6 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_runtime_config(Config::default().with_caching_disabled())
-                .with_resolved_cluster_config(test_resolved_cluster_config())
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
