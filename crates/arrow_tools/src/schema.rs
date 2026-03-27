@@ -551,12 +551,14 @@ mod tests {
         field_metadata.insert("custom_key".to_string(), "custom_value".to_string());
 
         let schema = Schema::new_with_metadata(
-            vec![Field::new(
-                "col",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                false,
-            )
-            .with_metadata(field_metadata.clone())],
+            vec![
+                Field::new(
+                    "col",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    false,
+                )
+                .with_metadata(field_metadata.clone()),
+            ],
             metadata.clone(),
         );
 
