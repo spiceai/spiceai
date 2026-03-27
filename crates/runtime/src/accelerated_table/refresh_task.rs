@@ -1645,7 +1645,7 @@ pub fn max_timestamp_df(
     let schema = accelerator.schema();
     let needs_cast = schema
         .column_with_name(column)
-        .map(|(_, f)| {
+        .is_some_and(|(_, f)| {
             // Only CAST for native date/time/timestamp types that need precision normalization.
             // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
             // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
@@ -1658,8 +1658,7 @@ pub fn max_timestamp_df(
                     | DataType::Time64(_)
                     | DataType::Timestamp(_, _)
             )
-        })
-        .unwrap_or(false);
+        });
 
     let expr = if needs_cast {
         cast(
