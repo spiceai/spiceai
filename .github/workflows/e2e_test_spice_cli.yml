@@ -232,13 +232,15 @@ jobs:
       - name: Run spice upgrade
         shell: bash
         run: |
-          spice upgrade 2>&1 | tee /tmp/upgrade_output.log
+          spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
 
       - name: Verify no models variant attempted for v2+
         shell: bash
         run: |
-          MAJOR=$(echo "${{ env.REL_VERSION }}" | cut -d. -f1)
-          if [[ "$MAJOR" -ge 2 ]]; then
+          VERSION="${{ env.REL_VERSION }}"
+          VERSION="${VERSION#v}"
+          MAJOR="${VERSION%%.*}"
+          if [[ -n "$MAJOR" && "$MAJOR" -ge 2 ]]; then
             if grep -q '_models_' /tmp/upgrade_output.log; then
               echo "::error::v2+ upgrade should not attempt to download models variant"
               cat /tmp/upgrade_output.log
@@ -352,13 +354,15 @@ jobs:
       - name: Run spice upgrade
         shell: bash
         run: |
-          spice upgrade 2>&1 | tee /tmp/upgrade_output.log
+          spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
 
       - name: Verify no models variant attempted for v2+
         shell: bash
         run: |
-          MAJOR=$(echo "${{ env.REL_VERSION }}" | cut -d. -f1)
-          if [[ "$MAJOR" -ge 2 ]]; then
+          VERSION="${{ env.REL_VERSION }}"
+          VERSION="${VERSION#v}"
+          MAJOR="${VERSION%%.*}"
+          if [[ -n "$MAJOR" && "$MAJOR" -ge 2 ]]; then
             if grep -q '_models_' /tmp/upgrade_output.log; then
               echo "::error::v2+ upgrade should not attempt to download models variant"
               cat /tmp/upgrade_output.log
@@ -466,14 +470,16 @@ jobs:
         if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
-          spice install 2>&1 | tee /tmp/install_output.log
+          spice -v install 2>&1 | tee /tmp/install_output.log
 
       - name: Verify no models variant attempted for v2+
         if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
-          MAJOR=$(echo "${{ env.REL_VERSION }}" | cut -d. -f1)
-          if [[ "$MAJOR" -ge 2 ]]; then
+          VERSION="${{ env.REL_VERSION }}"
+          VERSION="${VERSION#v}"
+          MAJOR="${VERSION%%.*}"
+          if [[ -n "$MAJOR" && "$MAJOR" -ge 2 ]]; then
             if grep -q '_models_' /tmp/install_output.log; then
               echo "::error::v2+ install should not attempt to download models variant"
               cat /tmp/install_output.log
