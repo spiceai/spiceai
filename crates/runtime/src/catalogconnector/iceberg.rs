@@ -806,12 +806,13 @@ pub(crate) fn build_opendal_operator(
         if let Some(endpoint) = props.get("s3.endpoint") {
             config.endpoint = Some(endpoint.clone());
         }
-        if let Some(region) = props
-            .get("s3.region")
-            .or_else(|| props.get("client.region"))
-        {
-            config.region = Some(region.clone());
-        }
+        config.region = Some(
+            props
+                .get("s3.region")
+                .or_else(|| props.get("client.region"))
+                .cloned()
+                .unwrap_or_else(|| "us-east-1".to_string()),
+        );
         if let Some(key_id) = props.get("s3.access-key-id") {
             config.access_key_id = Some(key_id.clone());
         }
