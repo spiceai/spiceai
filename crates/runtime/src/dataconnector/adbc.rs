@@ -274,14 +274,13 @@ impl AdbcFactory {
         let join_context =
             build_join_context(&uri_str, username, catalog.as_deref(), schema.as_deref());
 
-        let federation_enabled =
-            is_query_federation_enabled(&params.parameters).map_err(|e| {
-                DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    message: e.to_string(),
-                }
-            })?;
+        let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
+            DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "adbc".to_string(),
+                connector_component: params.component.clone(),
+                message: e.to_string(),
+            }
+        })?;
 
         let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
             match params.parameters.get(name).expose().ok() {
