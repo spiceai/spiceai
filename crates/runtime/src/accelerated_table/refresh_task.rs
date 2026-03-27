@@ -2007,7 +2007,7 @@ mod tests {
         );
     }
 
-    /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (UnixSeconds).
+    /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (`UnixSeconds`).
     #[tokio::test]
     async fn test_max_timestamp_df_int64_no_cast() {
         use data_components::arrow::write::MemTable;
