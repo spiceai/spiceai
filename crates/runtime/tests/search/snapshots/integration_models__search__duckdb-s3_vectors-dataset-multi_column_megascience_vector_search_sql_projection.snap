@@ -8,27 +8,27 @@ description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score F
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
-    "_score": 0.539
+    "_score": "0.53"
   },
   {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
     "subject": "math",
-    "_score": 0.528
+    "_score": "0.52"
   },
   {
     "id": 191,
     "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]",
     "question": "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\).",
     "subject": "math",
-    "_score": 0.521
+    "_score": "0.52"
   },
   {
     "id": 41,
     "answer": "\\[\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024}\n\\]",
     "question": "Calculate the number of permutations of 14 items taken 4 at a time.",
     "subject": "math",
-    "_score": 0.501
+    "_score": "0.50"
   }
 ]
