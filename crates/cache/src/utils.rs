@@ -915,7 +915,7 @@ pub(crate) mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
-        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
             .expect("to create batch");
 
@@ -993,7 +993,7 @@ pub(crate) mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let n = 300;
-        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
             .expect("to create batch");
 
