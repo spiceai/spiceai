@@ -203,7 +203,7 @@ pub async fn start_executor_flight_server(
     }
 
     if !has_flight_auth {
-        tracing::warn!(
+        tracing::debug!(
             "Executor Flight API key auth is disabled; accepting scheduler-trusted DoPut requires cluster mTLS"
         );
     }
