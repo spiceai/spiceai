@@ -13,10 +13,10 @@ The Spicepod JSON schema (`spicepod.schema.json`) provides validation and IDE su
 
 ## Related Tools
 
-| Tool | Purpose | Output |
-|------|---------|--------|
-| `tools/spicepodschema` | Generate JSON Schema for spicepod.yaml | `.schema/spicepod.schema.json` |
-| `tools/spiceschema` | Generate OpenAPI schema for HTTP endpoints | stdout (JSON/YAML) |
+| Tool                   | Purpose                                    | Output                         |
+| ---------------------- | ------------------------------------------ | ------------------------------ |
+| `tools/spicepodschema` | Generate JSON Schema for spicepod.yaml     | `.schema/spicepod.schema.json` |
+| `tools/spiceschema`    | Generate OpenAPI schema for HTTP endpoints | stdout (JSON/YAML)             |
 
 ## Usage
 
@@ -61,18 +61,18 @@ uvx check-jsonschema --schemafile .schema/spicepod.schema.json tools/spicepodsch
 
 The `tests/` directory contains comprehensive test files for schema validation:
 
-| File | Purpose |
-|------|---------|
-| `spicepod.all.yaml` | Unified test with all components and parameters |
-| `spicepod.datasets.yaml` | Dataset connector tests |
-| `spicepod.accelerators.yaml` | Accelerator tests |
-| `spicepod.catalogs.yaml` | Catalog connector tests |
-| `spicepod.models.yaml` | Model source tests |
-| `spicepod.embeddings.yaml` | Embedding source tests |
-| `spicepod.tools.yaml` | Tool type tests |
-| `spicepod.secrets.yaml` | Secret store tests |
-| `spicepod.views.yaml` | View tests |
-| `spicepod.runtime.yaml` | Runtime configuration tests |
+| File                         | Purpose                                         |
+| ---------------------------- | ----------------------------------------------- |
+| `spicepod.all.yaml`          | Unified test with all components and parameters |
+| `spicepod.datasets.yaml`     | Dataset connector tests                         |
+| `spicepod.accelerators.yaml` | Accelerator tests                               |
+| `spicepod.catalogs.yaml`     | Catalog connector tests                         |
+| `spicepod.models.yaml`       | Model source tests                              |
+| `spicepod.embeddings.yaml`   | Embedding source tests                          |
+| `spicepod.tools.yaml`        | Tool type tests                                 |
+| `spicepod.secrets.yaml`      | Secret store tests                              |
+| `spicepod.views.yaml`        | View tests                                      |
+| `spicepod.runtime.yaml`      | Runtime configuration tests                     |
 
 ## Architecture
 
@@ -138,33 +138,33 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 ### ParameterSpec → JSON Schema Mapping
 
-| ParameterSpec Field | JSON Schema |
-|---------------------|-------------|
-| `name` | Property name (with prefix handling) |
-| `required: true` | Added to `required` array |
-| `default` | `default` value |
-| `secret: true` | `x-secret: true` extension |
-| `description` | `description` |
-| `help_link` | Appended to description |
-| `examples` | `examples` array |
-| `one_of` | `enum` array |
-| `deprecation_message` | `deprecated: true` + message in description |
-| `type: Component` | Prefixed property name (e.g., `pg_host`) |
-| `type: Runtime` | Unprefixed property name (e.g., `connection_pool_size`) |
+| ParameterSpec Field   | JSON Schema                                             |
+| --------------------- | ------------------------------------------------------- |
+| `name`                | Property name (with prefix handling)                    |
+| `required: true`      | Added to `required` array                               |
+| `default`             | `default` value                                         |
+| `secret: true`        | `x-secret: true` extension                              |
+| `description`         | `description`                                           |
+| `help_link`           | Appended to description                                 |
+| `examples`            | `examples` array                                        |
+| `one_of`              | `enum` array                                            |
+| `deprecation_message` | `deprecated: true` + message in description             |
+| `type: Component`     | Prefixed property name (e.g., `pg_host`)                |
+| `type: Runtime`       | Unprefixed property name (e.g., `connection_pool_size`) |
 
 ### Parameter Types
 
-| Type | Prefix | Purpose |
-|------|--------|---------|
-| `Component` | Yes (`{connector}_`) | Passed to underlying component (e.g., `pg_host`) |
-| `Runtime` | No | Controls Spice runtime behavior (e.g., `connection_pool_size`) |
+| Type        | Prefix               | Purpose                                                        |
+| ----------- | -------------------- | -------------------------------------------------------------- |
+| `Component` | Yes (`{connector}_`) | Passed to underlying component (e.g., `pg_host`)               |
+| `Runtime`   | No                   | Controls Spice runtime behavior (e.g., `connection_pool_size`) |
 
 ### Where Parameters Are Defined
 
-| Component Type | Location |
-|---------------|----------|
-| Data Connectors | `crates/runtime/src/dataconnector/*.rs` |
-| Data Accelerators | `crates/runtime/src/dataaccelerator/*.rs` |
+| Component Type     | Location                                   |
+| ------------------ | ------------------------------------------ |
+| Data Connectors    | `crates/runtime/src/dataconnector/*.rs`    |
+| Data Accelerators  | `crates/runtime/src/dataaccelerator/*.rs`  |
 | Catalog Connectors | `crates/runtime/src/catalogconnector/*.rs` |
 
 ## Feature Flags
@@ -254,18 +254,18 @@ The schema generator enriches the base Spicepod schema with connector-specific p
 
 ### Coverage Status
 
-| Component | Has `from` Field | Has Connectors/Sources | Has `params` | Schema Coverage |
-|-----------|------------------|------------------------|--------------|-----------------|
-| **Datasets** | ✅ | Data Connectors | ✅ | ✅ **Covered** |
-| **Datasets.acceleration** | - | Data Accelerators | ✅ | ✅ **Covered** |
-| **Catalogs** | ✅ | Catalog Connectors | ✅ | ✅ **Covered** |
-| **Models** | ✅ | Model Sources | ✅ | ✅ **Covered** |
-| **Embeddings** | ✅ | Embedding Sources | ✅ | ⚠️ No `ParameterSpec` defined |
-| **Tools** | ✅ | Tool Types | ✅ | ⚠️ No `ParameterSpec` defined |
-| **Secrets** | ✅ | Secret Stores | ✅ | ⚠️ No `ParameterSpec` defined |
-| **Views** | ❌ | None (SQL-based) | ❌ | N/A |
-| **Workers** | ❌ | None | ✅ (generic) | N/A |
-| **Evals** | ❌ | None | ❌ | N/A |
+| Component                 | Has `from` Field | Has Connectors/Sources | Has `params` | Schema Coverage              |
+| ------------------------- | ---------------- | ---------------------- | ------------ | ---------------------------- |
+| **Datasets**              | ✅                | Data Connectors        | ✅            | ✅ **Covered**                |
+| **Datasets.acceleration** | -                | Data Accelerators      | ✅            | ✅ **Covered**                |
+| **Catalogs**              | ✅                | Catalog Connectors     | ✅            | ✅ **Covered**                |
+| **Models**                | ✅                | Model Sources          | ✅            | ✅ **Covered**                |
+| **Embeddings**            | ✅                | Embedding Sources      | ✅            | ⚠️ No `ParameterSpec` defined |
+| **Tools**                 | ✅                | Tool Types             | ✅            | ⚠️ No `ParameterSpec` defined |
+| **Secrets**               | ✅                | Secret Stores          | ✅            | ⚠️ No `ParameterSpec` defined |
+| **Views**                 | ❌                | None (SQL-based)       | ❌            | N/A                          |
+| **Workers**               | ❌                | None                   | ✅ (generic)  | N/A                          |
+| **Evals**                 | ❌                | None                   | ❌            | N/A                          |
 
 ### Currently Covered
 
@@ -295,7 +295,6 @@ Model sources define `ParameterSpec` arrays in separate modules:
 - `openai` - OpenAI API parameters
 - `azure` - Azure OpenAI parameters
 - `anthropic` - Anthropic API parameters
-- `perplexity` - Perplexity API parameters
 - `xai` - xAI API parameters
 - `bedrock` - AWS Bedrock parameters
 - `databricks` - Databricks model parameters

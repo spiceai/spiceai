@@ -2,8 +2,6 @@
 name: ADBC integration tests
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - trunk
