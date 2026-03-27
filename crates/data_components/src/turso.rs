@@ -2177,45 +2177,45 @@ impl VisitorMut for TursoBetweenVisitor {
             low,
             high,
         } = expr
+            && Self::is_numeric_expr(low)
+            && Self::is_numeric_expr(high)
         {
-            if Self::is_numeric_expr(low) && Self::is_numeric_expr(high) {
-                let negated = *negated;
-                let cast_expr_low = Self::cast_to_real(*between_expr.clone());
-                let cast_expr_high = Self::cast_to_real(*between_expr.clone());
-                let cast_low = Self::cast_to_real(*low.clone());
-                let cast_high = Self::cast_to_real(*high.clone());
+            let negated = *negated;
+            let cast_expr_low = Self::cast_to_real(*between_expr.clone());
+            let cast_expr_high = Self::cast_to_real(*between_expr.clone());
+            let cast_low = Self::cast_to_real(*low.clone());
+            let cast_high = Self::cast_to_real(*high.clone());
 
-                if negated {
-                    // NOT BETWEEN  →  expr < low OR expr > high
-                    *expr = sqlast::Expr::BinaryOp {
-                        left: Box::new(sqlast::Expr::BinaryOp {
-                            left: Box::new(cast_expr_low),
-                            op: sqlast::BinaryOperator::Lt,
-                            right: Box::new(cast_low),
-                        }),
-                        op: sqlast::BinaryOperator::Or,
-                        right: Box::new(sqlast::Expr::BinaryOp {
-                            left: Box::new(cast_expr_high),
-                            op: sqlast::BinaryOperator::Gt,
-                            right: Box::new(cast_high),
-                        }),
-                    };
-                } else {
-                    // BETWEEN  →  expr >= low AND expr <= high
-                    *expr = sqlast::Expr::BinaryOp {
-                        left: Box::new(sqlast::Expr::BinaryOp {
-                            left: Box::new(cast_expr_low),
-                            op: sqlast::BinaryOperator::GtEq,
-                            right: Box::new(cast_low),
-                        }),
-                        op: sqlast::BinaryOperator::And,
-                        right: Box::new(sqlast::Expr::BinaryOp {
-                            left: Box::new(cast_expr_high),
-                            op: sqlast::BinaryOperator::LtEq,
-                            right: Box::new(cast_high),
-                        }),
-                    };
-                }
+            if negated {
+                // NOT BETWEEN  →  expr < low OR expr > high
+                *expr = sqlast::Expr::BinaryOp {
+                    left: Box::new(sqlast::Expr::BinaryOp {
+                        left: Box::new(cast_expr_low),
+                        op: sqlast::BinaryOperator::Lt,
+                        right: Box::new(cast_low),
+                    }),
+                    op: sqlast::BinaryOperator::Or,
+                    right: Box::new(sqlast::Expr::BinaryOp {
+                        left: Box::new(cast_expr_high),
+                        op: sqlast::BinaryOperator::Gt,
+                        right: Box::new(cast_high),
+                    }),
+                };
+            } else {
+                // BETWEEN  →  expr >= low AND expr <= high
+                *expr = sqlast::Expr::BinaryOp {
+                    left: Box::new(sqlast::Expr::BinaryOp {
+                        left: Box::new(cast_expr_low),
+                        op: sqlast::BinaryOperator::GtEq,
+                        right: Box::new(cast_low),
+                    }),
+                    op: sqlast::BinaryOperator::And,
+                    right: Box::new(sqlast::Expr::BinaryOp {
+                        left: Box::new(cast_expr_high),
+                        op: sqlast::BinaryOperator::LtEq,
+                        right: Box::new(cast_high),
+                    }),
+                };
             }
         }
         std::ops::ControlFlow::Continue(())
