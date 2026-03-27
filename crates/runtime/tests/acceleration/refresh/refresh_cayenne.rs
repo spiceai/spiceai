@@ -15,9 +15,9 @@ limitations under the License.
 */
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    get_dataset_no_time_column, initialize_postgres,
-    initialize_postgres_with_value_column, refresh_table, start_test_runtime, test_append_iso8601_for_engine, test_append_timestamp_for_engine,
-    test_append_unix_seconds_for_engine,
+    get_dataset_no_time_column, initialize_postgres, initialize_postgres_with_value_column,
+    refresh_table, start_test_runtime, test_append_iso8601_for_engine,
+    test_append_timestamp_for_engine, test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;

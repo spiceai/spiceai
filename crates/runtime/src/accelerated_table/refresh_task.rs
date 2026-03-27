@@ -1643,22 +1643,20 @@ pub fn max_timestamp_df(
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
     let schema = accelerator.schema();
-    let needs_cast = schema
-        .column_with_name(column)
-        .is_some_and(|(_, f)| {
-            // Only CAST for native date/time/timestamp types that need precision normalization.
-            // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
-            // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
-            // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
-            matches!(
-                f.data_type(),
-                DataType::Date32
-                    | DataType::Date64
-                    | DataType::Time32(_)
-                    | DataType::Time64(_)
-                    | DataType::Timestamp(_, _)
-            )
-        });
+    let needs_cast = schema.column_with_name(column).is_some_and(|(_, f)| {
+        // Only CAST for native date/time/timestamp types that need precision normalization.
+        // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
+        // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
+        // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
+        matches!(
+            f.data_type(),
+            DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+        )
+    });
 
     let expr = if needs_cast {
         cast(

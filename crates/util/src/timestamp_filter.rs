@@ -211,7 +211,7 @@ pub fn nanos_to_iso8601_string(nanos: u128) -> String {
 ///
 /// Tries RFC 3339 first, then `%Y-%m-%dT%H:%M:%S%.f` (no timezone).
 #[expect(clippy::cast_sign_loss)]
-#[must_use] 
+#[must_use]
 pub fn parse_iso8601_to_nanos(s: &str) -> Option<u128> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_nanos_opt()? as u128);
