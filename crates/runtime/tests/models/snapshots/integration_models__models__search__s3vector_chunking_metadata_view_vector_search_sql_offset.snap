@@ -4,22 +4,6 @@ expression: resp?
 ---
 [
   {
-    "id": 612,
-    "answer_offset": [
-      48,
-      50
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.793
-  },
-  {
-    "id": 349,
-    "answer_offset": [
-      103,
-      109
-    ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.785
-  },
-  {
     "id": 948,
     "answer_offset": [
       61,
@@ -34,5 +18,21 @@ expression: resp?
       95
     ],
     "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
+  },
+  {
+    "id": 708,
+    "answer_offset": [
+      61,
+      85
+    ],
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.539
+  },
+  {
+    "id": 189,
+    "answer_offset": [
+      0,
+      51
+    ],
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.538
   }
 ]

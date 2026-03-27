@@ -28,7 +28,6 @@ use llms::{
     embeddings::candle::link_files_into_tmp_dir,
     google::Google,
     openai::new_openai_client,
-    perplexity::PerplexitySonar,
     xai::Xai,
 };
 use secrecy::SecretString;
@@ -124,17 +123,6 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
         None,
     )
     .await
-}
-
-pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
-    let mut params: HashMap<String, SecretString> = HashMap::new();
-    if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
-        params.insert("auth_token".to_string(), SecretString::from(api_key));
-    }
-    let sonar = PerplexitySonar::from_unprefixed_params(None, &params)
-        .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
-
-    Ok(Arc::new(sonar))
 }
 
 pub(crate) fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
