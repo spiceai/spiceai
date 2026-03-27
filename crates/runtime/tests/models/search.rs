@@ -216,7 +216,10 @@ fn normalize_search_response(mut json: Value) -> String {
                 && let Some(score) = n.as_f64()
             {
                 let truncated = (100.0 * score).trunc() / 100.0;
-                obj.insert("_score".to_string(), Value::String(format!("{truncated:.2}")));
+                obj.insert(
+                    "_score".to_string(),
+                    Value::String(format!("{truncated:.2}")),
+                );
             }
         }
     }
