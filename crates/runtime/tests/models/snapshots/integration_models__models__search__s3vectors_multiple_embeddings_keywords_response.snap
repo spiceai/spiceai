@@ -21,21 +21,12 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.01,
+      "_score": 0.03,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 458
-      }
-    },
-    {
-      "_score": 0.01,
-      "dataset": "qs",
-      "matches": {
+          "The smallest number in the book is typically $\\boxed{1}$, as counting books usually start from this number."
+        ],
         "question": [
           "What is the smallest number in the book \"Things You Can Count in This Counting Book\"?"
         ]
@@ -45,15 +36,30 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.01,
+      "_score": 0.03,
       "dataset": "qs",
       "matches": {
+        "answer": [
+          "Since there are 50 equal numbers, each number is equal to \\(\\frac{100}{50} = \\boxed{2}\\)."
+        ],
         "question": [
           "If \\(a + b + c + \\ldots + z = 100\\), where \\(a, b, c, \\ldots, z\\) are 50 equal numbers, what is the value of each number?"
         ]
       },
       "primary_key": {
         "id": 507
+      }
+    },
+    {
+      "_score": 0.01,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "Yes, because the last two digits (48) form a number that is divisible by 4 (48 ÷ 4 = 12). $\\boxed{\\text{Yes}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 556
       }
     }
   ]

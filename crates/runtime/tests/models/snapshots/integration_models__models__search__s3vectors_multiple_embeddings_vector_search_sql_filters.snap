@@ -19,8 +19,8 @@ expression: resp?
     "_score": 0.205
   },
   {
-    "id": 551,
-    "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
-    "_score": 0.187
+    "id": 445,
+    "answer": "The probable route of infection is oral, and gerbils exposed to infected bedding contract the disease.",
+    "_score": 0.188
   }
 ]

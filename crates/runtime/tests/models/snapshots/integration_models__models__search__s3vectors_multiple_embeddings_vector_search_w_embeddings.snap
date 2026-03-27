@@ -18,17 +18,17 @@ expression: resp?
     "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.528
   },
   {
-    "id": 462,
-    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
+    "id": 465,
+    "answer": "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40.",
     "array_length(vector_search(qs, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.519
+    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.506
   },
   {
-    "id": 458,
-    "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\).",
+    "id": 708,
+    "answer": "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$",
     "array_length(vector_search(qs, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.504
+    "trunc(vector_search(qs, Utf8(\"second\"), question)._score,Int64(3))": 0.478
   }
 ]

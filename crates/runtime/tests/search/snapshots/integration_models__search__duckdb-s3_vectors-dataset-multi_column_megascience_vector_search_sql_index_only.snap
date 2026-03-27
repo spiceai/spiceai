@@ -12,11 +12,11 @@ description: "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'sec
     "_score": 0.528
   },
   {
-    "id": 191,
-    "_score": 0.521
+    "id": 465,
+    "_score": 0.506
   },
   {
-    "id": 41,
-    "_score": 0.501
+    "id": 470,
+    "_score": 0.504
   }
 ]

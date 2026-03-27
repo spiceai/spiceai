@@ -6,18 +6,18 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.79,
       "data": {
-        "question": "What is the fifth root of 32?"
+        "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
+          "\n2"
         ]
       },
       "primary_key": {
-        "id": 948
+        "id": 612
       }
     },
     {
@@ -38,21 +38,6 @@ expression: normalize_search_response(resp)
     {
       "_score": 0.53,
       "data": {
-        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
-      },
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\nd) $2-|-6| = 2 - 6 = -4"
-        ]
-      },
-      "primary_key": {
-        "id": 708
-      }
-    },
-    {
-      "_score": 0.53,
-      "data": {
         "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
       },
       "dataset": "qs_view",
@@ -63,6 +48,21 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 189
+      }
+    },
+    {
+      "_score": 0.53,
+      "data": {
+        "question": "Identify the given number as prime, composite, or neither: 36."
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
+        ]
+      },
+      "primary_key": {
+        "id": 484
       }
     }
   ]

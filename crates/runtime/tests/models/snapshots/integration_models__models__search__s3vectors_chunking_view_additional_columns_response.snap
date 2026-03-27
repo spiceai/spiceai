@@ -6,18 +6,18 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.79,
       "data": {
-        "question": "What is the fifth root of 32?"
+        "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
+          "\n2"
         ]
       },
       "primary_key": {
-        "id": 948
+        "id": 612
       }
     },
     {
@@ -36,33 +36,33 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.53,
       "data": {
-        "question": "What is 14 percent of 232?"
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\n\\( 232 \\times 0.14 = 32.48 \\)"
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24"
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 468
       }
     },
     {
       "_score": 0.51,
       "data": {
-        "question": "What is the fifth term and the nth term of the GP \\( 2, 4, 8, \\ldots \\)?"
+        "question": "Calculate the number of permutations of 14 items taken 4 at a time."
       },
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The fifth term is \\( 2 \\times 2^{4} = 32 \\)"
+          "\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024"
         ]
       },
       "primary_key": {
-        "id": 949
+        "id": 41
       }
     }
   ]

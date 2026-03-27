@@ -10,14 +10,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
+          "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation."
         ],
         "question": [
-          "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?"
+          "What is the primary effect of α₁-adrenergic blockers in the treatment of hypertension?"
         ]
       },
       "primary_key": {
-        "id": 1015
+        "id": 1035
       }
     },
     {
@@ -25,44 +25,38 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
+          "An ecosite that becomes pathogenic due to a weakened resistance on the part of its host."
         ],
         "question": [
-          "What causes dermatomycosis, and what are some examples of this condition?"
+          "What is a xenoparasite?"
         ]
       },
       "primary_key": {
-        "id": 821
+        "id": 861
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.01,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
-        ],
-        "question": [
-          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+          "The nurse would suspect **genital warts**, as HPV is the causative agent for this condition. $\\boxed{\\text{Genital warts}}$"
         ]
       },
       "primary_key": {
-        "id": 449
+        "id": 1274
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.01,
       "dataset": "qs_view",
       "matches": {
-        "answer": [
-          "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
-        ],
         "question": [
-          "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
+          "How many ways can you distribute 5 identical stars to 1 kid, where the kid can receive at most one star?"
         ]
       },
       "primary_key": {
-        "id": 1193
+        "id": 479
       }
     }
   ]

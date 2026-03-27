@@ -10,14 +10,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\)."
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "What is 14 percent of 232?"
+          "Which base number, when raised to the fifth power, equals thirty-two?"
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 1277
       }
     },
     {
@@ -25,14 +25,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+          "What is the fifth root of 32?"
         ]
       },
       "primary_key": {
-        "id": 449
+        "id": 948
       }
     },
     {
@@ -40,14 +40,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+          "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
         ],
         "question": [
-          "Find 100% of 732."
+          "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
         ]
       },
       "primary_key": {
-        "id": 291
+        "id": 191
       }
     },
     {
@@ -55,14 +55,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
+          "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25."
         ],
         "question": [
-          "Evaluate the following expression: \\(2^{2}\\)."
+          "How many groups of 5 are in 25?"
         ]
       },
       "primary_key": {
-        "id": 250
+        "id": 464
       }
     }
   ]

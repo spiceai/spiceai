@@ -40,29 +40,26 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
+          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
         ],
         "question": [
-          "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
+          "How many numbers between 0 and 60 are even multiples of 5?"
         ]
       },
       "primary_key": {
-        "id": 191
+        "id": 470
       }
     },
     {
-      "_score": 0.03,
+      "_score": 0.01,
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": [
-          "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
-        ],
         "question": [
-          "Calculate the product of $12 \\times 12$."
+          "How many groups of 5 are in 40?"
         ]
       },
       "primary_key": {
-        "id": 42
+        "id": 465
       }
     }
   ]

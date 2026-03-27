@@ -10,21 +10,6 @@ expression: normalize_search_response(resp)
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
-        ],
-        "question": [
-          "How many multiples of 4 are there between 1 and 30? List them and count the total."
-        ]
-      },
-      "primary_key": {
-        "id": 468
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
           "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
@@ -40,21 +25,6 @@ expression: normalize_search_response(resp)
       "dataset": "qs",
       "matches": {
         "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-        ],
-        "question": [
-          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 189
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
           "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
@@ -63,6 +33,36 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 948
+      }
+    },
+    {
+      "_score": 0.03,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40."
+        ],
+        "question": [
+          "How many groups of 5 are in 40?"
+        ]
+      },
+      "primary_key": {
+        "id": 465
+      }
+    },
+    {
+      "_score": 0.03,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
+        ],
+        "question": [
+          "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
+        ]
+      },
+      "primary_key": {
+        "id": 708
       }
     }
   ]

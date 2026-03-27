@@ -4,12 +4,12 @@ expression: resp?
 ---
 [
   {
-    "id": 349,
+    "id": 612,
     "answer_offset": [
-      103,
-      109
+      48,
+      50
     ],
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.785
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.796
   },
   {
     "id": 948,
@@ -28,11 +28,11 @@ expression: resp?
     "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
-    "id": 830,
+    "id": 949,
     "answer_offset": [
-      44,
-      74
+      0,
+      44
     ],
-    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.524
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.515
   }
 ]

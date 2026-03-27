@@ -6,15 +6,15 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": 0.79,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\\times 2 \\times 2 \\times 2 = 32\\)"
+          "\n2"
         ]
       },
       "primary_key": {
-        "id": 948
+        "id": 612
       }
     },
     {
@@ -42,15 +42,15 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.51,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "4, 2))^3 \\times 40}\\)"
+          "\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024"
         ]
       },
       "primary_key": {
-        "id": 450
+        "id": 41
       }
     }
   ]

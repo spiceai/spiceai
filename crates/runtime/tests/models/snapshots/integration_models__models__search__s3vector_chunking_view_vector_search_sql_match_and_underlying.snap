@@ -4,12 +4,6 @@ expression: resp?
 ---
 [
   {
-    "id": 948,
-    "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
-  },
-  {
     "id": 1277,
     "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
@@ -22,9 +16,15 @@ expression: resp?
     "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.538
   },
   {
-    "id": 450,
-    "_match": "4, 2))^3 \\times 40}\\)",
-    "answer": "The number of such 7-card hands is \\(\\boxed{C(13, 3) \\times (C(4, 2))^3 \\times 40}\\).",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.528
+    "id": 492,
+    "_match": "\n2b^{4} = 2(5)^{4} = 2(5 \\times 5 \\times 5 \\times 5) = 2(625) = ",
+    "answer": "\\[\n2b^{4} = 2(5)^{4} = 2(5 \\times 5 \\times 5 \\times 5) = 2(625) = \\boxed{1250}.\n\\]",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.512
+  },
+  {
+    "id": 1284,
+    "_match": " 2 = 8\\)",
+    "answer": "The cube root of 8 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 = 8\\).",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.504
   }
 ]

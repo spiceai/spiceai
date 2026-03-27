@@ -18,39 +18,39 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.52,
+      "_score": 0.44,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "4, 2))^3 \\times 40}\\)"
+          "To find the sum of 18 and 11, add the two numbers: \\(18 + 11 "
         ]
       },
       "primary_key": {
-        "id": 450
+        "id": 1168
       }
     },
     {
-      "_score": 0.51,
+      "_score": 0.43,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
+          " two places to the left. Thus, $31.5 \\div 100 = \\boxed{0.315}$"
         ]
       },
       "primary_key": {
-        "id": 362
+        "id": 1122
       }
     },
     {
-      "_score": 0.49,
+      "_score": 0.43,
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
+          "The five-digit number is $\\boxed{21780}$, because $4 \\time"
         ]
       },
       "primary_key": {
-        "id": 451
+        "id": 1280
       }
     }
   ]

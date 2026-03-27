@@ -25,10 +25,10 @@ description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score F
     "_score": 0.521
   },
   {
-    "id": 244,
-    "answer": "\\[\n-5 - 2(-3)^2 = -5 - 2(9) = -5 - 18 = \\boxed{-23}\n\\]",
-    "question": "Evaluate the expression: \\(-5 - 2x^2\\), where \\( x = -3 \\).",
+    "id": 464,
+    "answer": "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25.",
+    "question": "How many groups of 5 are in 25?",
     "subject": "math",
-    "_score": 0.493
+    "_score": 0.518
   }
 ]

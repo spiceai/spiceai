@@ -55,14 +55,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs",
       "matches": {
         "answer": [
-          "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$"
+          "The probable route of infection is oral, and gerbils exposed to infected bedding contract the disease."
         ],
         "question": [
-          "Is 5 years of follow-up sufficient for a patient treated for thymomas?"
+          "How is Tyzzer's disease transmitted in gerbils?"
         ]
       },
       "primary_key": {
-        "id": 551
+        "id": 445
       }
     }
   ]

@@ -16,15 +16,15 @@ description: "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3
     "_score": 0.528
   },
   {
-    "id": 191,
-    "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]",
+    "id": 465,
+    "answer": "To find how many groups of 5 are in 40, divide 40 by 5:  \n\\[ 40 \\div 5 = 8 \\]  \nThus, there are $\\boxed{8}$ groups of 5 in 40.",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.521
+    "_score": 0.506
   },
   {
-    "id": 41,
-    "answer": "\\[\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024}\n\\]",
+    "id": 470,
+    "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers.",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "_score": 0.501
+    "_score": 0.504
   }
 ]

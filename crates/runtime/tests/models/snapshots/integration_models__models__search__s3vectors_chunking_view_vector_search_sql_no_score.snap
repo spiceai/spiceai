@@ -4,8 +4,8 @@ expression: resp?
 ---
 [
   {
-    "id": 948,
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+    "id": 612,
+    "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\)."
   },
   {
     "id": 1277,
@@ -16,7 +16,7 @@ expression: resp?
     "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
   },
   {
-    "id": 450,
-    "answer": "The number of such 7-card hands is \\(\\boxed{C(13, 3) \\times (C(4, 2))^3 \\times 40}\\)."
+    "id": 41,
+    "answer": "\\[\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024}\n\\]"
   }
 ]

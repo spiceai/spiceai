@@ -11,13 +11,6 @@ description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score F
     "_score": 0.539
   },
   {
-    "id": 189,
-    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
-    "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
-    "subject": "math",
-    "_score": 0.537
-  },
-  {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
@@ -25,10 +18,17 @@ description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score F
     "_score": 0.528
   },
   {
-    "id": 191,
-    "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]",
-    "question": "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\).",
+    "id": 462,
+    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
+    "question": "How many groups of 2 are in 14?",
     "subject": "math",
-    "_score": 0.521
+    "_score": 0.519
+  },
+  {
+    "id": 470,
+    "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers.",
+    "question": "How many numbers between 0 and 60 are even multiples of 5?",
+    "subject": "math",
+    "_score": 0.504
   }
 ]
