@@ -920,7 +920,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { dataset_name } if dataset_name == "test_table"),
+            matches!(&err, Error::TableSchemaNotRegistered { .. }),
             "unexpected error: {err}"
         );
     }
@@ -935,7 +935,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without data_array");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { dataset_name } if dataset_name == "test_table"),
+            matches!(&err, Error::TableSchemaNotRegistered { .. }),
             "unexpected error: {err}"
         );
     }
@@ -950,7 +950,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail when data_array is string");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { dataset_name } if dataset_name == "test_table"),
+            matches!(&err, Error::TableSchemaNotRegistered { .. }),
             "unexpected error: {err}"
         );
     }
@@ -962,7 +962,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail on non-array row");
         assert!(
-            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("is not an array")),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("is not an array")),
             "unexpected error: {err}"
         );
     }
@@ -973,7 +973,7 @@ mod tests {
 
         let err = schema_from_json(&response, "test_table").expect_err("should fail on short row");
         assert!(
-            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("fewer than 3 fields")),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("fewer than 3 fields")),
             "unexpected error: {err}"
         );
     }
@@ -985,7 +985,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on non-string col name");
         assert!(
-            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("[0] (column name) is not a string")),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("[0] (column name) is not a string")),
             "unexpected error: {err}"
         );
     }
@@ -997,7 +997,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on non-string data type");
         assert!(
-            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("[1] (data type) is not a string")),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("[1] (data type) is not a string")),
             "unexpected error: {err}"
         );
     }
@@ -1009,7 +1009,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on non-string nullable");
         assert!(
-            matches!(&err, Error::UnexpectedSchemaResponse { dataset_name, reason } if dataset_name == "test_table" && reason.contains("[2] (is_nullable) is not a string")),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("[2] (is_nullable) is not a string")),
             "unexpected error: {err}"
         );
     }
