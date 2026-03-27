@@ -715,5 +715,3 @@ async fn do_register_test_connectors() {
 
     tracing::debug!("Completed connector registration for tests");
 }
-
-/// Creates a [`ResolvedClusterConfig`] suitable for integration tests that need
