@@ -630,7 +630,9 @@ mod tests {
             .await
             .expect("insert should succeed");
 
-        assert!(!result.is_empty());
+        // Verify the insertion reports the expected number of inserted rows.
+        let inserted_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert!(inserted_rows > 0, "insert result should contain row count");
 
         // Verify the data can be read back with the expected row count.
         let scan = table

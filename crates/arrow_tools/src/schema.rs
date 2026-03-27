@@ -191,6 +191,9 @@ fn data_type_contains_dictionary(data_type: &DataType) -> bool {
         DataType::Struct(fields) => fields
             .iter()
             .any(|f| data_type_contains_dictionary(f.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, f)| data_type_contains_dictionary(f.data_type())),
         _ => false,
     }
 }
@@ -231,6 +234,16 @@ fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
                 })
                 .collect();
             DataType::Struct(new_fields.into())
+        }
+        DataType::Union(fields, mode) => {
+            let new_fields: Vec<(i8, Arc<Field>)> = fields
+                .iter()
+                .map(|(type_id, f)| {
+                    let inner = normalize_dictionary_data_type(f.data_type());
+                    (type_id, Arc::new(f.as_ref().clone().with_data_type(inner)))
+                })
+                .collect();
+            DataType::Union(new_fields.into_iter().collect(), *mode)
         }
         other => other.clone(),
     }
@@ -654,5 +667,81 @@ mod tests {
             false,
         )]);
         assert!(!has_dictionary_types(&no_dict_nested));
+    }
+
+    #[test]
+    fn test_normalize_nested_dictionary_in_union() {
+        use arrow_schema::{UnionFields, UnionMode};
+
+        let union_fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("int_val", DataType::Int32, false),
+                Field::new(
+                    "dict_val",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ],
+        )
+        .expect("union fields");
+        let schema = Schema::new(vec![Field::new(
+            "mixed",
+            DataType::Union(union_fields, UnionMode::Dense),
+            false,
+        )]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        let expected_union = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("int_val", DataType::Int32, false),
+                Field::new("dict_val", DataType::Utf8, true),
+            ],
+        )
+        .expect("expected union fields");
+        assert_eq!(
+            normalized.field(0).data_type(),
+            &DataType::Union(expected_union, UnionMode::Dense)
+        );
+    }
+
+    #[test]
+    fn test_has_dictionary_types_in_union() {
+        use arrow_schema::{UnionFields, UnionMode};
+
+        let union_fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("int_val", DataType::Int32, false),
+                Field::new(
+                    "dict_val",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ],
+        )
+        .expect("union fields");
+        let schema = Schema::new(vec![Field::new(
+            "mixed",
+            DataType::Union(union_fields, UnionMode::Dense),
+            false,
+        )]);
+        assert!(has_dictionary_types(&schema));
+
+        let no_dict_union = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("int_val", DataType::Int32, false),
+                Field::new("str_val", DataType::Utf8, true),
+            ],
+        )
+        .expect("union fields");
+        let no_dict_schema = Schema::new(vec![Field::new(
+            "mixed",
+            DataType::Union(no_dict_union, UnionMode::Sparse),
+            false,
+        )]);
+        assert!(!has_dictionary_types(&no_dict_schema));
     }
 }
