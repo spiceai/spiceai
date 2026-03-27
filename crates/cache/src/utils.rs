@@ -916,11 +916,11 @@ pub(crate) mod tests {
         ]));
         let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
         let col = Arc::new(Int32Array::from(vec![0i32; n]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![col.clone(), col])
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
             .expect("to create batch");
 
         let raw_size = batch.get_array_memory_size();
-        let cache_max = cache_provider.max_size() as usize;
+        let cache_max = usize::try_from(cache_provider.max_size()).unwrap_or(usize::MAX);
         assert!(
             raw_size > cache_max,
             "Test precondition: raw size ({raw_size}) must exceed cache max ({cache_max})"
@@ -994,7 +994,7 @@ pub(crate) mod tests {
         ]));
         let n = 300;
         let col = Arc::new(Int32Array::from(vec![0i32; n]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![col.clone(), col])
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
             .expect("to create batch");
 
         let raw_cache_key = crate::key::CacheKey::Query("unencoded-oversized", None)
