@@ -64,6 +64,12 @@ impl FederationProvider for AcceleratedTableFederationProvider {
         if !self.enabled {
             return None;
         }
+        // Analyze plans (EXPLAIN ANALYZE) cannot be converted to SQL by the
+        // Unparser and must not be federated as a whole. Returning `Unable`
+        // causes the federation rule to federate only the inner query instead.
+        if matches!(plan, LogicalPlan::Analyze(_)) {
+            return Some(FederationAnalyzerForLogicalPlan::Unable);
+        }
         self.federation_provider()?.analyzer(plan)
     }
 }
