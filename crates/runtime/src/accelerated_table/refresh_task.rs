@@ -43,7 +43,7 @@ use crate::{
 };
 use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::{
-    array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    array::{Array, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
     datatypes::DataType,
 };
 use arrow_schema::SchemaRef;
@@ -1070,6 +1070,21 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
+        Self::build_filter_converter(schema, refresh)
+    }
+
+    fn get_accelerator_filter_converter(
+        &self,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
+        let schema = self.accelerator.schema();
+        Self::build_filter_converter(schema, refresh)
+    }
+
+    fn build_filter_converter(
+        schema: SchemaRef,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
         let time_partition_column = refresh.time_partition_column.as_deref();
@@ -1181,7 +1196,7 @@ impl RefreshTask {
         let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
             return Ok(update);
         };
-        let Some(filter_converter) = self.get_filter_converter(refresh) else {
+        let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
         };
 
@@ -1266,18 +1281,53 @@ impl RefreshTask {
             return Ok(None);
         };
 
-        let array = result.column(0)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
-            })?;
-
-        if array.is_empty() {
+        if result.num_rows() == 0 {
             return Ok(None);
         }
 
-        let mut value = array.value(0) as u128;
+        let col_array = result.column(0);
+
+        // Extract the max timestamp value based on the column's data type.
+        // - String columns (ISO8601): parse the ISO string back to nanos
+        // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
+        // - Timestamp columns: read as TimestampNanosecondArray (was CAST'd by max_timestamp_df)
+        let mut value: u128 = if let Some(string_array) = col_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>(
+        ) {
+            if string_array.is_null(0) {
+                return Ok(None);
+            }
+            let iso_str = string_array.value(0);
+            util::timestamp_filter::parse_iso8601_to_nanos(iso_str).context(
+                super::FailedToFindLatestTimestampSnafu {
+                    reason: format!(
+                        "Failed to parse ISO8601 timestamp '{iso_str}' from time column"
+                    ),
+                },
+            )?
+        } else if let Some(int_array) = col_array
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+        {
+            if int_array.is_null(0) {
+                return Ok(None);
+            }
+            int_array.value(0) as u128
+        } else {
+            let array = col_array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context(super::FailedToFindLatestTimestampSnafu {
+                    reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
+                })?;
+
+            if array.is_empty() {
+                return Ok(None);
+            }
+
+            array.value(0) as u128
+        };
 
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
@@ -1592,11 +1642,34 @@ pub fn max_timestamp_df(
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let expr = cast(
-        col(format!(r#""{column}""#)),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-    )
-    .alias("a");
+    let schema = accelerator.schema();
+    let needs_cast = schema
+        .column_with_name(column)
+        .map(|(_, f)| {
+            // Only CAST for native date/time/timestamp types that need precision normalization.
+            // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
+            // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
+            // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
+            matches!(
+                f.data_type(),
+                DataType::Date32
+                    | DataType::Date64
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+            )
+        })
+        .unwrap_or(false);
+
+    let expr = if needs_cast {
+        cast(
+            col(format!(r#""{column}""#)),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        )
+        .alias("a")
+    } else {
+        col(format!(r#""{column}""#)).alias("a")
+    };
 
     accelerator_df(accelerator, &ctx)?
         .select(vec![expr])?
@@ -1866,5 +1939,101 @@ mod tests {
         };
 
         assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
+    }
+
+    /// Verifies that `max_timestamp_df` uses sort+limit on raw string (no CAST)
+    /// for utf8 columns, which avoids the Vortex/Cayenne cast kernel issue.
+    #[tokio::test]
+    async fn test_max_timestamp_df_utf8_no_cast() {
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        // Verify the plan uses sort+limit on raw string, not Cast or MAX
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            !plan_str.contains("Cast("),
+            "utf8 column should NOT use Cast, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("Sort") && plan_str.contains("Limit"),
+            "utf8 column should use Sort+Limit, got: {plan_str}"
+        );
+    }
+
+    /// Verifies that `max_timestamp_df` still uses CAST+sort for non-string columns.
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_uses_cast() {
+        use arrow::array::TimestampNanosecondArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch");
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        // Verify the plan uses Cast, not MAX
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            plan_str.contains("Cast("),
+            "timestamp column should use Cast, got: {plan_str}"
+        );
+    }
+
+    /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (UnixSeconds).
+    #[tokio::test]
+    async fn test_max_timestamp_df_int64_no_cast() {
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            !plan_str.contains("Cast("),
+            "integer column should NOT use Cast, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("Sort") && plan_str.contains("Limit"),
+            "integer column should use Sort+Limit, got: {plan_str}"
+        );
     }
 }

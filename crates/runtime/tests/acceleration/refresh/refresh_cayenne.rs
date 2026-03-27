@@ -15,8 +15,10 @@ limitations under the License.
 */
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    get_dataset_no_time_column, initialize_postgres, initialize_postgres_with_value_column,
-    refresh_table, start_test_runtime,
+    get_dataset_no_time_column, initialize_postgres, initialize_postgres_iso8601,
+    initialize_postgres_with_value_column, refresh_table, start_test_runtime,
+    start_test_runtime_iso8601, test_append_iso8601_for_engine, test_append_timestamp_for_engine,
+    test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
@@ -376,4 +378,37 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
             Ok(())
         })
         .await
+}
+
+fn cayenne_params() -> (tempfile::TempDir, Params) {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let metadata_dir = temp_dir.path().join("cayenne_metadata");
+    std::fs::create_dir_all(&metadata_dir).expect("mkdir");
+    let mut map = HashMap::new();
+    map.insert(
+        "cayenne_metadata_dir".to_string(),
+        metadata_dir.to_str().expect("valid UTF-8 path").to_string(),
+    );
+    (temp_dir, Params::from_string_map(map))
+}
+
+#[tokio::test]
+async fn test_cayenne_append_mode_timestamp() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let (_td, params) = cayenne_params();
+    test_append_timestamp_for_engine("cayenne", Some(Mode::File), Some(params)).await
+}
+
+#[tokio::test]
+async fn test_cayenne_append_mode_unix_seconds() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let (_td, params) = cayenne_params();
+    test_append_unix_seconds_for_engine("cayenne", Some(Mode::File), Some(params)).await
+}
+
+#[tokio::test]
+async fn test_cayenne_append_mode_iso8601() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let (_td, params) = cayenne_params();
+    test_append_iso8601_for_engine("cayenne", Some(Mode::File), Some(params)).await
 }

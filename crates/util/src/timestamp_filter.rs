@@ -62,19 +62,24 @@ fn convert_timestamp_expr(
             op,
             lit((timestamp_in_nanos / scale) as u64),
         ),
-        TimestampFormat::Date | TimestampFormat::Timestamp | TimestampFormat::Iso8601 => {
-            binary_expr(
-                cast(
-                    col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                ),
-                op,
-                Expr::Literal(
-                    ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
-                    None,
-                ),
-            )
+        TimestampFormat::Iso8601 => {
+            // ISO8601 strings are lexicographically orderable — string comparison
+            // produces correct results without a CAST, which avoids issues with engines
+            // (e.g. Vortex/Cayenne) that lack a utf8→timestamp cast kernel.
+            let iso_string = nanos_to_iso8601_string(timestamp_in_nanos);
+            binary_expr(col(time_column), op, lit(iso_string))
         }
+        TimestampFormat::Date | TimestampFormat::Timestamp => binary_expr(
+            cast(
+                col(time_column),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            ),
+            op,
+            Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
+                None,
+            ),
+        ),
         TimestampFormat::Timestamptz(tz) => binary_expr(
             cast(
                 col(time_column),
@@ -188,6 +193,35 @@ impl TimestampFilterConvert {
     }
 }
 
+/// Convert nanoseconds since Unix epoch to an ISO 8601 string.
+///
+/// Returns a string like `2024-01-25T20:43:41.000000000`.
+#[must_use]
+#[expect(clippy::cast_possible_wrap)]
+pub fn nanos_to_iso8601_string(nanos: u128) -> String {
+    let secs = (nanos / 1_000_000_000) as i64;
+    let subsec_nanos = (nanos % 1_000_000_000) as u32;
+    chrono::DateTime::from_timestamp(secs, subsec_nanos)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%S%.9f")
+        .to_string()
+}
+
+/// Parse an ISO 8601 string back to nanoseconds since Unix epoch.
+///
+/// Tries RFC 3339 first, then `%Y-%m-%dT%H:%M:%S%.f` (no timezone).
+#[expect(clippy::cast_sign_loss)]
+#[must_use] 
+pub fn parse_iso8601_to_nanos(s: &str) -> Option<u128> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_nanos_opt()? as u128);
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(dt.and_utc().timestamp_nanos_opt()? as u128);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,7 +277,7 @@ mod tests {
             &DataType::Utf8,
             None,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+            r#"timestamp > Utf8("2021-05-03T00:00:00.000000000")"#,
         );
     }
 
@@ -315,5 +349,46 @@ mod tests {
     fn test_unsupported_type_returns_none() {
         let result = data_type_to_timestamp_format(&DataType::Boolean, None);
         assert!(result.is_none(), "Boolean should return None");
+    }
+
+    #[test]
+    fn test_nanos_to_iso8601_string() {
+        assert_eq!(
+            nanos_to_iso8601_string(1_620_000_000_000_000_000),
+            "2021-05-03T00:00:00.000000000"
+        );
+        assert_eq!(
+            nanos_to_iso8601_string(1_706_215_421_123_456_789),
+            "2024-01-25T20:43:41.123456789"
+        );
+    }
+
+    #[test]
+    fn test_parse_iso8601_to_nanos() {
+        // RFC 3339 with timezone
+        assert_eq!(
+            parse_iso8601_to_nanos("2021-05-03T00:00:00+00:00"),
+            Some(1_620_000_000_000_000_000)
+        );
+        // Naive format without timezone
+        assert_eq!(
+            parse_iso8601_to_nanos("2021-05-03T00:00:00.000000000"),
+            Some(1_620_000_000_000_000_000)
+        );
+        // With subsecond precision
+        assert_eq!(
+            parse_iso8601_to_nanos("2024-01-25T20:43:41.123456789"),
+            Some(1_706_215_421_123_456_789)
+        );
+        // Invalid string
+        assert_eq!(parse_iso8601_to_nanos("not-a-date"), None);
+    }
+
+    #[test]
+    fn test_nanos_roundtrip() {
+        let original: u128 = 1_706_215_421_123_456_789;
+        let iso = nanos_to_iso8601_string(original);
+        let parsed = parse_iso8601_to_nanos(&iso).expect("roundtrip should succeed");
+        assert_eq!(original, parsed);
     }
 }
