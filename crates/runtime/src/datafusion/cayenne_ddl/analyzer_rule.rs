@@ -96,10 +96,6 @@ pub struct CayenneDdlAnalyzerRule {
     /// extension nodes that forward operations to executors. Only `true` for the
     /// scheduler role.
     apply_distributed_nodes: bool,
-    /// When `true`, the runtime is running in some cluster role (Scheduler or
-    /// Executor). Cayenne catalogs require distributed mode — standalone
-    /// (non-distributed) Cayenne usage is not supported.
-    is_distributed: bool,
 }
 
 impl fmt::Debug for CayenneDdlAnalyzerRule {
@@ -117,7 +113,6 @@ impl CayenneDdlAnalyzerRule {
         ddl_enabled_catalogs: &Arc<RwLock<HashSet<String>>>,
         ddl_options: SharedDdlExtensionStore,
         apply_distributed_nodes: bool,
-        is_distributed: bool,
     ) -> Self {
         Self {
             session_state,
@@ -125,7 +120,6 @@ impl CayenneDdlAnalyzerRule {
             ddl_enabled_catalogs: Arc::downgrade(ddl_enabled_catalogs),
             ddl_options,
             apply_distributed_nodes,
-            is_distributed,
         }
     }
 
@@ -168,12 +162,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 if !self.is_cayenne_backed(&catalog_name) {
                     return Ok(plan);
-                }
-
-                if !self.is_distributed {
-                    return Err(DataFusionError::Plan(format!(
-                        "CREATE TABLE on Cayenne catalog '{catalog_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
-                    )));
                 }
 
                 let schema_name = create
@@ -221,12 +209,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     }
                 };
 
-                if partition_expr.is_none() {
-                    return Err(DataFusionError::Plan(format!(
-                        "CREATE TABLE on Cayenne catalog '{catalog_name}' requires a PARTITION BY clause. Example: CREATE TABLE {catalog_name}.{schema_name}.{table_name} (...) PARTITION BY column_name"
-                    )));
-                }
-
                 let node = CayenneCreateTableNode::builder(
                     table_name,
                     arrow_schema,
@@ -257,12 +239,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 if !self.is_cayenne_backed(&catalog_name) {
                     return Ok(plan);
-                }
-
-                if !self.is_distributed {
-                    return Err(DataFusionError::Plan(format!(
-                        "DROP TABLE on Cayenne catalog '{catalog_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
-                    )));
                 }
 
                 let schema_name = drop
@@ -299,12 +275,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     return Ok(plan);
                 }
 
-                if !self.is_distributed {
-                    return Err(DataFusionError::Plan(format!(
-                        "DELETE on Cayenne catalog table '{table_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
-                    )));
-                }
-
                 if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
@@ -334,12 +304,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
                     return Ok(plan);
-                }
-
-                if !self.is_distributed {
-                    return Err(DataFusionError::Plan(format!(
-                        "UPDATE on Cayenne catalog table '{table_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
-                    )));
                 }
 
                 if !self.apply_distributed_nodes {
@@ -377,12 +341,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     return Ok(plan);
                 }
 
-                if !self.is_distributed {
-                    return Err(DataFusionError::Plan(format!(
-                        "INSERT on Cayenne catalog table '{table_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
-                    )));
-                }
-
                 if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
@@ -405,12 +363,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 if !self.is_cayenne_backed(&catalog_name) {
                     return Ok(plan);
-                }
-
-                if !self.is_distributed {
-                    return Err(DataFusionError::Plan(format!(
-                        "CREATE SCHEMA on Cayenne catalog '{catalog_name}' requires distributed mode. Non-distributed Cayenne catalogs are not supported."
-                    )));
                 }
 
                 let node =
