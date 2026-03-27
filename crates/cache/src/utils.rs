@@ -887,7 +887,7 @@ pub(crate) mod tests {
     /// size fits.
     #[tokio::test]
     async fn test_encoded_result_cached_when_compressed_fits() {
-        use arrow::array::Int32Array;
+        use arrow::array::{Array, Int32Array};
         use datafusion::error::DataFusionError;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::TryStreamExt;
@@ -969,7 +969,7 @@ pub(crate) mod tests {
     /// limit, it is correctly NOT cached (existing behavior preserved).
     #[tokio::test]
     async fn test_unencoded_oversized_result_not_cached() {
-        use arrow::array::Int32Array;
+        use arrow::array::{Array, Int32Array};
         use datafusion::error::DataFusionError;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::TryStreamExt;
