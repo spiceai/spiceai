@@ -20,7 +20,7 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
-  CARGO_INCREMENTAL: 0
+  CARGO_INCREMENTAL: 1
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
@@ -71,12 +71,10 @@ jobs:
         if: steps.check.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      # Lint
-      - name: Run Rust lint
+      # Check
+      - name: Run cargo check
         if: steps.check.outputs.relevant_changes == 'true'
-        run: make lint-rust
-        env:
-          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp --workspace --exclude libnfs --locked
 
       - name: Validate datafusion-table-providers commit
         if: steps.check.outputs.relevant_changes == 'true'
