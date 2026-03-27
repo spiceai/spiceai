@@ -568,13 +568,22 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
     SqlWarehouseApi::verify_response_status(json_value)?;
 
-    let data_array = json_value
-        .get("result")
-        .and_then(|r| r.get("data_array"))
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| Error::TableSchemaNotRegistered {
-            dataset_name: dataset_name.to_string(),
-        })?;
+    let result = json_value.get("result");
+    let data_array_value = result.and_then(|r| r.get("data_array"));
+
+    let data_array = match data_array_value {
+        None => {
+            return Err(Error::TableSchemaNotRegistered {
+                dataset_name: dataset_name.to_string(),
+            });
+        }
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: "result.data_array is not an array".to_string(),
+            })?,
+    };
 
     let mut fields = Vec::new();
 
@@ -952,7 +961,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail when data_array is string");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { .. }),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("is not an array")),
             "unexpected error: {err}"
         );
     }
