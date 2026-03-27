@@ -235,16 +235,16 @@ fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
                 .collect();
             DataType::Struct(new_fields.into())
         }
-        DataType::Union(fields, mode) => {
-            let new_fields: Vec<(i8, Arc<Field>)> = fields
+        DataType::Union(fields, mode) => DataType::Union(
+            fields
                 .iter()
                 .map(|(type_id, f)| {
                     let inner = normalize_dictionary_data_type(f.data_type());
                     (type_id, Arc::new(f.as_ref().clone().with_data_type(inner)))
                 })
-                .collect();
-            DataType::Union(new_fields.into_iter().collect(), *mode)
-        }
+                .collect(),
+            *mode,
+        ),
         other => other.clone(),
     }
 }
