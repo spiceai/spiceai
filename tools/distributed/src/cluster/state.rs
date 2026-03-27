@@ -85,9 +85,10 @@ impl ClusterState {
 }
 
 /// Check if a cluster state file exists.
-#[must_use]
-pub fn state_exists(work_dir: &Path) -> bool {
-    work_dir.join(STATE_FILE_NAME).exists()
+pub async fn state_exists(work_dir: &Path) -> bool {
+    tokio::fs::try_exists(work_dir.join(STATE_FILE_NAME))
+        .await
+        .unwrap_or(false)
 }
 
 /// Load cluster state from file.
@@ -161,7 +162,7 @@ mod tests {
         save_state(&state, temp_dir.path())
             .await
             .expect("failed to save state");
-        assert!(state_exists(temp_dir.path()));
+        assert!(state_exists(temp_dir.path()).await);
 
         // Load state
         let loaded = load_state(temp_dir.path())
@@ -172,10 +173,10 @@ mod tests {
         assert_eq!(loaded.executors[0].name, "executor1");
     }
 
-    #[test]
-    fn test_state_exists_returns_false_initially() {
+    #[tokio::test]
+    async fn test_state_exists_returns_false_initially() {
         let temp_dir = TempDir::new().expect("failed to create temp directory");
-        assert!(!state_exists(temp_dir.path()));
+        assert!(!state_exists(temp_dir.path()).await);
     }
 
     #[tokio::test]
@@ -186,12 +187,12 @@ mod tests {
         save_state(&state, temp_dir.path())
             .await
             .expect("failed to save state");
-        assert!(state_exists(temp_dir.path()));
+        assert!(state_exists(temp_dir.path()).await);
 
         remove_state(temp_dir.path())
             .await
             .expect("failed to remove state");
-        assert!(!state_exists(temp_dir.path()));
+        assert!(!state_exists(temp_dir.path()).await);
     }
 
     #[test]

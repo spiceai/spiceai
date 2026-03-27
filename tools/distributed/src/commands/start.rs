@@ -24,7 +24,7 @@ use crate::cluster::{
     health::{HealthCheck, get_health_url},
     paths::expand_tilde,
     process,
-    state::{ClusterState, NodeState, remove_state, save_state, state_exists},
+    state::{ClusterState, NodeState, load_state, remove_state, save_state, state_exists},
     tls,
 };
 use crate::output;
@@ -91,9 +91,35 @@ pub async fn execute(args: StartArgs) -> Result<()> {
     let project_dir = expand_tilde(&args.project_dir);
 
     // Check if cluster already running
-    if state_exists(&work_dir) {
-        output::error("Cluster is already running. Use 'distributed stop' to stop it first.");
-        return Err(anyhow::anyhow!("Cluster already running"));
+    if state_exists(&work_dir).await {
+        // Validate that recorded processes are actually alive before refusing to start
+        if let Ok(state) = load_state(&work_dir).await {
+            let any_alive = process::is_process_alive(state.scheduler.pid)
+                || state
+                    .executors
+                    .iter()
+                    .any(|e| process::is_process_alive(e.pid));
+
+            if any_alive {
+                output::error(
+                    "Cluster is already running. Use 'distributed stop' to stop it first.",
+                );
+                return Err(anyhow::anyhow!("Cluster already running"));
+            }
+            // All recorded processes are dead — stale state file from a crash
+            output::warning(
+                "Found stale cluster state (all recorded processes are dead). Cleaning up...",
+            );
+            remove_state(&work_dir)
+                .await
+                .context("Failed to remove stale cluster state")?;
+        } else {
+            // Corrupt state file — remove it and proceed
+            output::warning("Found corrupt cluster state file. Cleaning up...");
+            remove_state(&work_dir)
+                .await
+                .context("Failed to remove corrupt cluster state")?;
+        }
     }
 
     // Build configuration
@@ -134,23 +160,36 @@ pub async fn execute(args: StartArgs) -> Result<()> {
     if config.skip_tls_init {
         // When skipping TLS initialization, validate that required files already exist
         output::info("Validating existing TLS certificates...");
-        tls::validate_tls_files(config.num_executors).context(
-            "TLS certificates not found. Please run TLS initialization or use 'spice cluster tls' commands",
-        )?;
+        let num_executors = config.num_executors;
+        tokio::task::spawn_blocking(move || tls::validate_tls_files(num_executors))
+            .await
+            .context("TLS validation task panicked or was cancelled")?
+            .context(
+                "TLS certificates not found. Please run TLS initialization or use 'spice cluster tls' commands",
+            )?;
     } else {
         output::info("Initializing TLS certificates...");
-        tls::ensure_tls_initialized().context("Failed to initialize TLS")?;
 
-        // Generate certificates for scheduler and executors
-        // Note: scheduler uses "scheduler1" as the cert name to match bash script convention
-        let mut node_names = vec!["scheduler1"];
+        // Precompute node names in the async context (cheap, non-blocking)
+        let mut node_names: Vec<String> = vec!["scheduler1".to_string()];
         let executor_names: Vec<String> = (0..config.num_executors)
             .map(|i| config.executor_name(i))
             .collect();
-        let executor_refs: Vec<&str> = executor_names.iter().map(String::as_str).collect();
-        node_names.extend(&executor_refs);
+        node_names.extend(executor_names);
 
-        tls::ensure_certificates(&node_names).context("Failed to generate certificates")?;
+        // Run TLS initialization and certificate generation in a blocking task to avoid
+        // blocking the Tokio runtime thread with process::Command invocations.
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            tls::ensure_tls_initialized().context("Failed to initialize TLS")?;
+
+            let node_name_refs: Vec<&str> = node_names.iter().map(String::as_str).collect();
+            tls::ensure_certificates(&node_name_refs)
+                .context("Failed to generate certificates")?;
+
+            Ok(())
+        })
+        .await
+        .context("TLS initialization task panicked or was cancelled")??;
     }
 
     // Start scheduler

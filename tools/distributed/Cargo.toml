@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 ansi_colors = { path = "../../crates/ansi_colors" }
 anyhow.workspace = true
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 dirs = "6.0.0"
 reqwest = { workspace = true, features = ["json"] }
@@ -24,4 +24,4 @@ tokio = { workspace = true, features = ["full"] }
 nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile.workspace = true

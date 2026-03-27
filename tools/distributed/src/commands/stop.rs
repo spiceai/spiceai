@@ -45,7 +45,7 @@ pub async fn execute(args: StopArgs) -> Result<()> {
     let work_dir = expand_tilde(&args.work_dir);
 
     // Check if cluster is running
-    if !state_exists(&work_dir) {
+    if !state_exists(&work_dir).await {
         output::error("No cluster is currently running.");
         return Err(anyhow::anyhow!("Cluster not running"));
     }

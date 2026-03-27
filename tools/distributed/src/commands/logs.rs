@@ -56,7 +56,7 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
     let log_dir = expand_tilde(&args.log_dir);
 
     // Check if cluster is running
-    if !state_exists(&work_dir) {
+    if !state_exists(&work_dir).await {
         output::error("No cluster is currently running.");
         output::info("Note: You can still view logs from the log directory if they exist.");
 
@@ -105,22 +105,33 @@ async fn show_logs_from_file(log_file: &PathBuf, follow: bool, tail_lines: usize
         // Follow mode: print initial tail, then poll for new content
         follow_log_file(log_file, tail_lines).await
     } else {
-        // Read last N lines
-        let tail =
-            process::read_log_tail(log_file, tail_lines).context("Failed to read log file")?;
+        // Read last N lines (offload blocking I/O to a blocking thread)
+        let log_path = log_file.clone();
+        let tail = tokio::task::spawn_blocking(move || {
+            process::read_log_tail(&log_path, tail_lines)
+        })
+        .await
+        .context("Failed to join log tail reader task")?
+        .context("Failed to read log file")?;
         println!("{tail}");
         Ok(())
     }
 }
 
 async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()> {
-    // Print initial tail
-    let tail =
-        process::read_log_tail(log_file, initial_lines).context("Failed to read log file")?;
+    // Print initial tail and get the actual file byte offset
+    let log_path = log_file.clone();
+    let (tail, file_offset) = tokio::task::spawn_blocking(move || {
+        process::read_log_tail_with_offset(&log_path, initial_lines)
+    })
+    .await
+    .context("Failed to join log tail reader task")?
+    .context("Failed to read log file")?;
+
     println!("{tail}");
 
-    // Track byte offset to avoid re-reading entire file
-    let mut byte_offset = tail.len();
+    // Track byte offset from the actual end-of-file position
+    let mut byte_offset = file_offset;
 
     println!("\n--- Following (Ctrl+C to stop) ---\n");
 
@@ -131,7 +142,7 @@ async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()>
             Ok(mut file) => {
                 // Seek to the last known position
                 match file
-                    .seek(std::io::SeekFrom::Start(byte_offset as u64))
+                    .seek(std::io::SeekFrom::Start(byte_offset))
                     .await
                 {
                     Ok(_) => {
@@ -146,7 +157,7 @@ async fn follow_log_file(log_file: &PathBuf, initial_lines: usize) -> Result<()>
                                     for line in new_content.lines() {
                                         println!("{line}");
                                     }
-                                    byte_offset += bytes_read;
+                                    byte_offset += bytes_read as u64;
                                 }
                             }
                             Err(e) => {

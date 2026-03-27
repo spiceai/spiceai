@@ -167,7 +167,7 @@ pub fn is_process_alive(_pid: u32) -> bool {
 /// Note: This function uses blocking operations and should be called from `spawn_blocking` context
 /// when used in async code.
 #[cfg(unix)]
-#[expect(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_wrap)]
 pub fn stop_process(pid: u32, timeout_secs: u64) -> Result<()> {
     let nix_pid = Pid::from_raw(pid as i32);
     let spid = sysinfo::Pid::from_u32(pid);
@@ -254,24 +254,73 @@ pub fn kill_process(_pid: u32) -> Result<()> {
 }
 
 /// Read the last N lines from a log file.
-/// Uses efficient bounded reading to avoid loading large files into memory.
+/// Uses a bounded tail implementation that seeks from the end of the file
+/// to avoid reading the entire file into memory.
 pub fn read_log_tail(log_file: &Path, lines: usize) -> Result<String> {
-    use std::collections::VecDeque;
-    use std::io::{BufRead, BufReader};
+    read_log_tail_with_offset(log_file, lines).map(|(content, _offset)| content)
+}
 
-    let file = fs::File::open(log_file).context("Failed to open log file")?;
-    let reader = BufReader::new(file);
+/// Read the last N lines from a log file and return the content along with
+/// the byte offset at end-of-file (for follow mode).
+pub fn read_log_tail_with_offset(log_file: &Path, lines: usize) -> Result<(String, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
 
-    // Use VecDeque for O(1) removal instead of Vec's O(n) remove(0)
-    let mut tail_lines: VecDeque<String> = VecDeque::with_capacity(lines);
-    for line in reader.lines() {
-        let line = line.context("Failed to read line from log file")?;
-        tail_lines.push_back(line);
-        if tail_lines.len() > lines {
-            tail_lines.pop_front();
+    // Chunk size for reading from end of file — 8KB balances syscall count and memory.
+    const CHUNK_SIZE: u64 = 8192;
+
+    let mut file = fs::File::open(log_file).context("Failed to open log file")?;
+    let file_len = file.metadata().context("Failed to read log file metadata")?.len();
+
+    if file_len == 0 || lines == 0 {
+        return Ok((String::new(), file_len));
+    }
+
+    // Read chunks from the end of the file, scanning backwards for newlines.
+    let mut remaining = file_len;
+    let mut tail_bytes: Vec<u8> = Vec::new();
+    // We need `lines` newlines to capture `lines` lines (the last line may not end with \n)
+    let target_newlines = lines;
+
+    while remaining > 0 {
+        let read_size = remaining.min(CHUNK_SIZE);
+        remaining -= read_size;
+
+        file.seek(SeekFrom::Start(remaining))
+            .context("Failed to seek in log file")?;
+
+        let mut chunk = vec![0u8; read_size as usize];
+        file.read_exact(&mut chunk)
+            .context("Failed to read chunk from log file")?;
+
+        // Prepend chunk to our accumulated bytes
+        chunk.append(&mut tail_bytes);
+        tail_bytes = chunk;
+
+        // Count newlines in accumulated buffer
+        #[allow(clippy::naive_bytecount)]
+        let newline_count = tail_bytes.iter().filter(|&&b| b == b'\n').count();
+
+        // If the buffer ends with \n, the last newline is a line terminator, not a separator,
+        // so we need one extra newline to have `lines` complete lines.
+        let ends_with_newline = tail_bytes.last() == Some(&b'\n');
+        let needed = if ends_with_newline {
+            target_newlines
+        } else {
+            // Last line has no trailing \n, so N newlines give us N+1 lines;
+            // we only need target_newlines - 1 newlines for target_newlines lines.
+            target_newlines.saturating_sub(1)
+        };
+
+        if newline_count >= needed {
+            break;
         }
     }
 
-    let result: Vec<String> = tail_lines.into_iter().collect();
-    Ok(result.join("\n"))
+    // Convert to string (lossy for safety) and take the last N lines
+    let content = String::from_utf8_lossy(&tail_bytes);
+    let all_lines: Vec<&str> = content.lines().collect();
+    let start = all_lines.len().saturating_sub(lines);
+    let result = all_lines[start..].join("\n");
+
+    Ok((result, file_len))
 }
