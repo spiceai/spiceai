@@ -772,13 +772,13 @@ async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference>
                 match cayenne_schema.metadata_catalog().list_table_names().await {
                     Ok(full_names) => {
                         for full_name in &full_names {
-                            let short_name =
-                                full_name.strip_prefix(&ns_prefix).unwrap_or(full_name);
-                            tables.push(TableReference::full(
-                                c_name.as_str(),
-                                s_name.as_str(),
-                                short_name,
-                            ));
+                            if let Some(short_name) = full_name.strip_prefix(&ns_prefix) {
+                                tables.push(TableReference::full(
+                                    c_name.as_str(),
+                                    s_name.as_str(),
+                                    short_name,
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
