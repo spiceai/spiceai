@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.99,
+      "_score": "0.99",
       "dataset": "spice.public.item",
       "matches": {
         "i_item_desc": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.98,
+      "_score": "0.98",
       "dataset": "spice.public.item",
       "matches": {
         "i_item_desc": [
