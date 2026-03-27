@@ -22,10 +22,11 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -38,6 +39,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
+use crate::parameters::Parameters;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -75,6 +77,11 @@ pub enum Error {
         uri: String,
         source: datafusion_table_providers::sql::db_connection_pool::Error,
     },
+
+    #[snafu(display(
+        "Invalid 'query_federation' value '{value}'. Expected 'enabled' or 'disabled'."
+    ))]
+    InvalidQueryFederation { value: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -206,6 +213,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
         .default("1"),
+    ParameterSpec::runtime("query_federation")
+        .description("Enable or disable query federation for this connector. Valid values: 'enabled' (default), 'disabled'.")
+        .default("enabled"),
 ];
 
 impl AdbcFactory {
@@ -260,6 +270,18 @@ impl AdbcFactory {
             .map(String::from);
 
         let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
+
+        let join_context =
+            build_join_context(&uri_str, username, catalog.as_deref(), schema.as_deref());
+
+        let federation_enabled =
+            is_query_federation_enabled(&params.parameters).map_err(|e| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: params.component.clone(),
+                    message: e.to_string(),
+                }
+            })?;
 
         let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
             match params.parameters.get(name).expose().ok() {
@@ -338,7 +360,8 @@ impl AdbcFactory {
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
-                .with_min_idle(pool_min_idle);
+                .with_min_idle(pool_min_idle)
+                .with_join_push_down(JoinPushDown::AllowedFor(join_context));
 
             if let Some(conn_opts) = conn_options {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
@@ -388,7 +411,7 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory = AdbcTableFactory::new(pool);
+        let adbc_factory = AdbcTableFactory::new(pool).with_federation_enabled(federation_enabled);
 
         Ok(Arc::new(Adbc {
             adbc_factory: Some(adbc_factory),
@@ -556,6 +579,45 @@ fn build_conn_options(
 
     if opts.is_empty() { None } else { Some(opts) }
 }
+
+/// Builds a hashed join-pushdown context identifier for ADBC connections.
+///
+/// ADBC URIs are driver-vendor-specific and can mix sensitive credentials
+/// with critical identity information (e.g. `bigquery:///project?DatasetId=x`)
+/// in ways that cannot be reliably parsed. We hash all identity-relevant
+/// parts together (similar to the ODBC connector approach) so that:
+///
+/// - No secrets are ever exposed in `EXPLAIN` plans (`compute_context=...`)
+/// - Two connections to the same database instance produce the same hash,
+///   enabling federated join pushdown
+/// - Different usernames, catalogs, or schemas produce different hashes,
+///   preventing incorrect cross-credential pushdown
+pub(crate) fn build_join_context(
+    uri: &str,
+    username: Option<&str>,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(uri.as_bytes());
+    hasher.update(b"\0");
+    if let Some(u) = username {
+        hasher.update(u.as_bytes());
+    }
+    hasher.update(b"\0");
+    if let Some(c) = catalog {
+        hasher.update(c.as_bytes());
+    }
+    hasher.update(b"\0");
+    if let Some(s) = schema {
+        hasher.update(s.as_bytes());
+    }
+    hasher.finalize().iter().fold(String::new(), |mut hash, b| {
+        let _ = write!(hash, "{b:02x}");
+        hash
+    })
+}
+
 pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         "bigquery" => Some(Arc::new(BigQueryDialect::new())),
@@ -683,6 +745,19 @@ impl DataConnector for Adbc {
                     })
                 }),
         )
+    }
+}
+
+/// Returns whether query federation is enabled based on the `query_federation` parameter.
+/// Defaults to `true` (enabled) when the parameter is absent.
+fn is_query_federation_enabled(params: &Parameters) -> Result<bool> {
+    match params.get("query_federation").expose().ok() {
+        None | Some("enabled") => Ok(true),
+        Some("disabled") => Ok(false),
+        Some(other) => InvalidQueryFederationSnafu {
+            value: other.to_string(),
+        }
+        .fail(),
     }
 }
 
@@ -1069,5 +1144,102 @@ mod tests {
             compute_adbc_cache_key(&params_a),
             compute_adbc_cache_key(&params_b)
         );
+    }
+
+    fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
+        use secrecy::SecretString;
+        Parameters::new(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), SecretString::from(v.to_string())))
+                .collect(),
+            "adbc",
+            PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn test_query_federation_enabled() {
+        let params = make_params(vec![("query_federation", "enabled")]);
+        assert!(is_query_federation_enabled(&params).expect("to parse"));
+    }
+
+    #[test]
+    fn test_query_federation_disabled() {
+        let params = make_params(vec![("query_federation", "disabled")]);
+        assert!(!is_query_federation_enabled(&params).expect("to parse"));
+    }
+
+    #[test]
+    fn test_query_federation_missing_defaults_enabled() {
+        let params = make_params(vec![]);
+        assert!(is_query_federation_enabled(&params).expect("to parse"));
+    }
+
+    #[test]
+    fn test_query_federation_invalid_value() {
+        let params = make_params(vec![("query_federation", "invalid")]);
+        is_query_federation_enabled(&params).expect_err("should error on invalid value");
+    }
+
+    #[test]
+    fn test_build_join_context_no_secrets_in_output() {
+        let ctx = build_join_context(
+            "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
+            Some("admin"),
+            Some("my_catalog"),
+            Some("my_schema"),
+        );
+        // Hash output must not contain any raw URI or credential fragments
+        assert!(
+            !ctx.contains("SECRET123"),
+            "context must not contain secrets from URI"
+        );
+        assert!(
+            !ctx.contains("bigquery:///"),
+            "context must not contain raw URI"
+        );
+        assert!(
+            !ctx.contains("admin"),
+            "context must not contain raw username"
+        );
+        assert!(
+            !ctx.contains("my_catalog"),
+            "context must not contain raw catalog"
+        );
+        // Must be a fixed-length hex string (SHA-256 = 64 hex chars)
+        assert_eq!(
+            ctx.len(),
+            64,
+            "context should be a 64-char SHA-256 hex digest"
+        );
+        assert!(
+            ctx.chars().all(|c| c.is_ascii_hexdigit()),
+            "context should be hex only"
+        );
+    }
+
+    #[test]
+    fn test_build_join_context_deterministic() {
+        let ctx1 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
+        let ctx2 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
+        assert_eq!(ctx1, ctx2, "same inputs must produce the same hash");
+    }
+
+    #[test]
+    fn test_build_join_context_differs_by_username() {
+        let ctx_a = build_join_context("postgresql://host/db", Some("alice"), None, None);
+        let ctx_b = build_join_context("postgresql://host/db", Some("bob"), None, None);
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different usernames must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_build_join_context_differs_by_uri() {
+        let ctx_a = build_join_context("bigquery:///project-a?DatasetId=ds1", None, None, None);
+        let ctx_b = build_join_context("bigquery:///project-b?DatasetId=ds1", None, None, None);
+        assert_ne!(ctx_a, ctx_b, "different URIs must produce different hashes");
     }
 }

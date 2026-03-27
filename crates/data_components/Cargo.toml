@@ -58,7 +58,7 @@ graphql-parser.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
-iceberg = { workspace = true, features = ["storage-gcs", "storage-s3"] }
+iceberg.workspace = true
 parquet = { workspace = true }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
@@ -69,7 +69,7 @@ mysql_async = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
-opendal = "0.55"
+opendal.workspace = true
 oracle = { version = "0.6", optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
@@ -112,7 +112,7 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
-adbc = ["datafusion-table-providers/adbc"]
+adbc = ["datafusion-table-providers/adbc-federation"]
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
 databricks = [
     "delta_lake",
@@ -173,6 +173,7 @@ aws-smithy-types = { workspace = true }
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.6.3"
+iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }

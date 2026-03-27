@@ -962,48 +962,29 @@ impl DataFusion {
         &self,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
-        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
-        if let Some(catalog) = self.resolve_catalog_provider(table_reference)
-            && let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref())
-            && let Some(expr_string) = aware
-                .table_partition_expr(schema_name, table_reference.table())
-                .await
-                .boxed()
-                .map_err(DataFusionError::External)?
-        {
-            let resolved = self
-                .resolve_partition_label(&expr_string, table_reference)
-                .await?
-                .unwrap_or(expr_string);
-            return Ok(Some(resolved));
-        }
-        Ok(None)
+        let catalog = self.resolve_catalog_provider(table_reference);
+        resolve_table_partition_expr(
+            catalog.as_deref(),
+            self.executor_registry.as_deref(),
+            table_reference,
+        )
+        .await
     }
 
-    /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
-    /// the original SQL expression string from the partition manager metadata.
-    async fn resolve_partition_label(
-        &self,
-        label: &str,
+    /// Returns the partition expression string for a table using only a `SessionContext`
+    /// and `ExecutorRegistry`, without requiring a full `DataFusion` reference.
+    ///
+    /// This is used by `DistributedCayenneInsertExec` which is constructed from the
+    /// extension planner and only has access to the session context.
+    pub async fn get_table_partition_expr_from_ctx(
+        ctx: &datafusion::prelude::SessionContext,
+        executor_registry: &ExecutorRegistry,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
-        let Some(Ok(idx)) = label.strip_prefix("expr").map(str::parse::<usize>) else {
-            return Ok(None);
-        };
-        let Some(ref executor_registry) = self.executor_registry else {
-            return Ok(None);
-        };
-
-        let Some(metadata) = executor_registry
-            .federated_partition_manager()
-            .get_table_metadata(table_reference)
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        let catalog = ctx.catalog(catalog_name);
+        resolve_table_partition_expr(catalog.as_deref(), Some(executor_registry), table_reference)
             .await
-            .boxed()
-            .map_err(DataFusionError::External)?
-        else {
-            return Ok(None);
-        };
-        Ok(metadata.partition_expressions.get(idx).cloned())
     }
 
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
@@ -2597,6 +2578,53 @@ impl DataFusion {
         self.ctx
             .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
     }
+}
+
+/// Shared implementation for resolving a table's partition expression from its catalog
+/// provider and optional [`ExecutorRegistry`] metadata.
+///
+/// When the catalog returns an auto-generated label like `"expr0"` (used for function
+/// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
+/// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
+async fn resolve_table_partition_expr(
+    catalog: Option<&dyn CatalogProvider>,
+    executor_registry: Option<&ExecutorRegistry>,
+    table_reference: &TableReference,
+) -> Result<Option<String>, DataFusionError> {
+    let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+
+    let Some(catalog) = catalog else {
+        return Ok(None);
+    };
+
+    let Some(aware) = cayenne_ddl::as_partition_aware(catalog) else {
+        return Ok(None);
+    };
+
+    let Some(expr_string) = aware
+        .table_partition_expr(schema_name, table_reference.table())
+        .await
+        .boxed()
+        .map_err(DataFusionError::External)?
+    else {
+        return Ok(None);
+    };
+
+    // Resolve auto-generated labels (e.g. "expr0") from partition manager metadata.
+    if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
+        && let Some(executor_registry) = executor_registry
+        && let Some(metadata) = executor_registry
+            .federated_partition_manager()
+            .get_table_metadata(table_reference)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+        && let Some(original) = metadata.partition_expressions.get(idx)
+    {
+        return Ok(Some(original.clone()));
+    }
+
+    Ok(Some(expr_string))
 }
 
 #[must_use]

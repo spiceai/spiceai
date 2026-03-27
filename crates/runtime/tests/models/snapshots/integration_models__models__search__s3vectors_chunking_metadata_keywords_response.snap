@@ -18,39 +18,39 @@ expression: normalize_search_response(resp)
       }
     },
     {
+      "_score": 0.53,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
+        ]
+      },
+      "primary_key": {
+        "id": 484
+      }
+    },
+    {
+      "_score": 0.52,
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "4, 2))^3 \\times 40}\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 450
+      }
+    },
+    {
       "_score": 0.51,
       "dataset": "qs",
       "matches": {
         "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {
-        "id": 362
-      }
-    },
-    {
-      "_score": 0.49,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The number of such arrangements is \\(10! - 2 \\times 9! + 8"
-        ]
-      },
-      "primary_key": {
-        "id": 451
-      }
-    },
-    {
-      "_score": 0.49,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "Yes, because the last two digits (48) form a number that i"
-        ]
-      },
-      "primary_key": {
-        "id": 556
+        "id": 507
       }
     }
   ]
