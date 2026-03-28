@@ -68,7 +68,7 @@ pub enum Error {
     TableSchemaNotRegistered { dataset_name: String },
 
     #[snafu(display(
-        "Failed to load the table '{dataset_name}' from Databricks: unexpected schema response format. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to infer schema for dataset '{dataset_name}' (databricks): unexpected schema response format. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedSchemaResponse {
         dataset_name: String,
