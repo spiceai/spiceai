@@ -350,7 +350,7 @@ lto = "thin"              # Keep prod-like LTO (thin is fast + optimized)
 
 [profile.lint]
 debug = "line-tables-only"
-incremental = false
+incremental = true
 inherits = "dev"
 lto = "off"
 

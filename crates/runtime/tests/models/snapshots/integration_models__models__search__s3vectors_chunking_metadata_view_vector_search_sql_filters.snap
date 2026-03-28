@@ -6,21 +6,21 @@ expression: resp?
   {
     "id": 1015,
     "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-    "_score": 0.306
+    "_score": "0.30"
   },
   {
     "id": 821,
     "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*).",
-    "_score": 0.229
+    "_score": "0.22"
   },
   {
     "id": 432,
     "answer": "Elands access high foliage by breaking off branches with their horns.",
-    "_score": 0.222
+    "_score": "0.22"
   },
   {
     "id": 8,
     "answer": "The prefix \"kilo-\" (k) represents a multiplier of 1000. Therefore, 2.2 kV is equal to \\(2.2 \\times 1000 = \\boxed{2200}\\) V.",
-    "_score": 0.214
+    "_score": "0.21"
   }
 ]
