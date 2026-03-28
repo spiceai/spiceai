@@ -153,7 +153,7 @@ pub struct Schema {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     #[serde(rename = "type")]
     pub field_type: String,
@@ -164,4 +164,140 @@ pub struct Field {
     pub version: Option<i64>,
     pub parameters: Option<HashMap<String, String>>,
     pub items: Option<Box<Field>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_field(name: &str, field_type: &str) -> Field {
+        Field {
+            field_type: field_type.to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some(name.to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        }
+    }
+
+    #[test]
+    fn test_field_equality_same_fields() {
+        let f1 = make_field("id", "int32");
+        let f2 = make_field("id", "int32");
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn test_field_equality_different_name() {
+        let f1 = make_field("id", "int32");
+        let f2 = make_field("user_id", "int32");
+        assert_ne!(f1, f2);
+    }
+
+    #[test]
+    fn test_field_equality_different_type() {
+        let f1 = make_field("id", "int32");
+        let f2 = make_field("id", "int64");
+        assert_ne!(f1, f2);
+    }
+
+    #[test]
+    fn test_schema_evolution_detects_added_column() {
+        let old_schema = vec![make_field("id", "int32"), make_field("name", "string")];
+        let new_schema = vec![
+            make_field("id", "int32"),
+            make_field("name", "string"),
+            make_field("resources", "string"),
+        ];
+        assert_ne!(old_schema, new_schema);
+    }
+
+    #[test]
+    fn test_schema_evolution_detects_removed_column() {
+        let old_schema = vec![
+            make_field("id", "int32"),
+            make_field("name", "string"),
+            make_field("old_col", "string"),
+        ];
+        let new_schema = vec![make_field("id", "int32"), make_field("name", "string")];
+        assert_ne!(old_schema, new_schema);
+    }
+
+    #[test]
+    fn test_schema_evolution_same_schema() {
+        let old_schema = vec![make_field("id", "int32"), make_field("name", "string")];
+        let new_schema = vec![make_field("id", "int32"), make_field("name", "string")];
+        assert_eq!(old_schema, new_schema);
+    }
+
+    #[test]
+    fn test_get_schema_fields_extracts_after_fields() {
+        let json = r#"{
+            "schema": {
+                "type": "struct",
+                "fields": [
+                    {
+                        "type": "struct",
+                        "fields": [
+                            {"type": "int32", "optional": false, "field": "id"},
+                            {"type": "string", "optional": true, "field": "name"}
+                        ],
+                        "optional": true,
+                        "name": "test.Value",
+                        "field": "before"
+                    },
+                    {
+                        "type": "struct",
+                        "fields": [
+                            {"type": "int32", "optional": false, "field": "id"},
+                            {"type": "string", "optional": true, "field": "name"}
+                        ],
+                        "optional": true,
+                        "name": "test.Value",
+                        "field": "after"
+                    },
+                    {"type": "struct", "fields": [{"type": "string", "optional": false, "field": "version"}], "optional": false, "name": "source", "field": "source"},
+                    {"type": "string", "optional": false, "field": "op"},
+                    {"type": "int64", "optional": false, "field": "ts_ms"}
+                ],
+                "optional": false,
+                "name": "test.Envelope"
+            },
+            "payload": {
+                "before": null,
+                "after": {"id": 1, "name": "test"},
+                "source": {"version": "2.0", "connector": "postgresql", "name": "test", "ts_ms": 1000, "snapshot": "false", "db": "testdb", "table": "users"},
+                "op": "c",
+                "ts_ms": 1000
+            }
+        }"#;
+
+        let event: ChangeEvent = serde_json::from_str(json).unwrap();
+        let fields = event.get_schema_fields().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].field.as_deref(), Some("id"));
+        assert_eq!(fields[1].field.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn test_get_primary_key_from_key_schema() {
+        let json = r#"{
+            "schema": {
+                "type": "struct",
+                "fields": [
+                    {"type": "int32", "optional": false, "field": "id"}
+                ],
+                "optional": false,
+                "name": "test.Key"
+            },
+            "payload": {"id": 1}
+        }"#;
+
+        let key: ChangeEventKey = serde_json::from_str(json).unwrap();
+        let pks = key.get_primary_key();
+        assert_eq!(pks, vec!["id".to_string()]);
+    }
 }
