@@ -377,7 +377,24 @@ pub(crate) async fn run_search_w_explain(
                             continue;
                         }
 
-                        insta::assert_json_snapshot!(test_name.clone(), resp?);
+                        let mut resp_val = resp?;
+                        // Normalize _score fields in SQL responses to match HTTP
+                        // test normalization (2-decimal padded strings).
+                        if let Some(rows) = resp_val.as_array_mut() {
+                            for row in rows {
+                                if let Some(obj) = row.as_object_mut()
+                                    && let Some(Value::Number(n)) = obj.get("_score")
+                                    && let Some(score) = n.as_f64()
+                                {
+                                    let truncated = (100.0 * score).trunc() / 100.0;
+                                    obj.insert(
+                                        "_score".to_string(),
+                                        Value::String(format!("{truncated:.2}")),
+                                    );
+                                }
+                            }
+                        }
+                        insta::assert_json_snapshot!(test_name.clone(), resp_val);
 
                         if explain_sql {
                             let c: Vec<arrow::record_batch::RecordBatch> = client
