@@ -845,6 +845,11 @@ impl GraphQLClient {
         })
     }
 
+    #[must_use]
+    pub(crate) fn configured_schema(&self) -> Option<SchemaRef> {
+        self.schema.as_ref().map(Arc::clone)
+    }
+
     #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
@@ -1325,6 +1330,16 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         .unwrap_or("No message provided")
         .to_string();
 
+        let message_lower = message.to_ascii_lowercase();
+
+        if status == StatusCode::TOO_MANY_REQUESTS || message_lower.contains("rate limit") {
+            return Err(Error::RateLimited {
+                message: format!(
+                    "The API rate limited the request (HTTP {status}). Retry later or reduce request concurrency. Details: {message}"
+                ),
+            });
+        }
+
         return match status {
             StatusCode::UNAUTHORIZED => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
@@ -1448,7 +1463,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             if error_type.to_lowercase() == "not_found" {
                 return Err(Error::ResourceNotFound {
                     message: format!(
-                        "The API returned a 'NOT_FOUND' error. Verify the requsted resource exists and is accessible. {message}"
+                        "The API returned a 'NOT_FOUND' error. Verify the requested resource exists and is accessible. {message}"
                     ),
                 });
             }
@@ -1872,6 +1887,18 @@ mod tests {
             Err(e) => {
                 assert!(e.to_string().contains(message));
             }
+        }
+
+        let rate_limited_response = serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
+            .expect("Failed to construct json");
+        let rate_limited_result = handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response);
+        match rate_limited_result {
+            Ok(()) => panic!("Expected rate-limited error"),
+            Err(super::Error::RateLimited { message }) => {
+                assert!(message.contains("rate limited"));
+                assert!(message.contains("HTTP 403"));
+            }
+            Err(other) => panic!("Expected rate-limited error, got {other}"),
         }
     }
 

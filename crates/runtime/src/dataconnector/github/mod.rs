@@ -84,6 +84,8 @@ static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
     RwLock<HashMap<String, Arc<RateController>>>,
 > = LazyLock::new(|| RwLock::new(HashMap::new()));
 static UNAUTHENTICATED_AUTH_CONTEXT: &str = "unauthenticated";
+const GITHUB_CONNECTOR_DOCS_URL: &str =
+    "https://spiceai.org/docs/components/data-connectors/github";
 
 async fn get_github_auth_context_rate_controller(auth_context: String) -> Arc<RateController> {
     let rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.read().await;
@@ -183,7 +185,7 @@ impl Github {
         match response {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!(
-                    "GitHub App installation ID '{installation_id}' has access to '{target}'"
+                    "GitHub App installation {installation_id} has access to {target}"
                 );
                 Ok(())
             }
@@ -196,24 +198,26 @@ impl Github {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                    .unwrap_or_else(|_| "Unable to read response body".to_string())
+                    .replace('\n', " ");
                 tracing::error!(
-                    "GitHub App installation does not have access to '{target}' (HTTP {status}). Response: {body}"
+                    "GitHub App installation validation failed for {target} (resource: {resource_type}, installation_id: {installation_id}, status: {status}): {body}"
                 );
                 Err(format!(
-                    "GitHub App installation ID '{installation_id}' does not have permission to access '{resource_type}' for '{target}' (HTTP {status}). Verify the GitHub App has the required permissions and is correctly installed into {target}."
+                    "Failed to validate GitHub App installation {installation_id} for {target}: permission denied (HTTP {status}). Verify the app is installed on the target and has access to {resource_type}."
                 ))
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                    .unwrap_or_else(|_| "Unable to read response body".to_string())
+                    .replace('\n', " ");
                 tracing::error!(
-                    "Target '{target}' not found or GitHub App installation does not have access (HTTP 404). Response: {body}"
+                    "GitHub App installation validation could not find {target} (installation_id: {installation_id}): {body}"
                 );
                 Err(format!(
-                    "Resource '{target}' not found or GitHub App installation ID '{installation_id}' does not have access to it."
+                    "Failed to validate GitHub App installation {installation_id} for {target}: the resource was not found or is not accessible (HTTP 404)."
                 ))
             }
             Ok(resp) => {
@@ -221,20 +225,21 @@ impl Github {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                    .unwrap_or_else(|_| "Unable to read response body".to_string())
+                    .replace('\n', " ");
                 tracing::error!(
-                    "GitHub App installation validation failed for '{target}' (HTTP {status}). Response: {body}"
+                    "GitHub App installation validation failed for {target} (installation_id: {installation_id}, status: {status}): {body}"
                 );
                 Err(format!(
-                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}' (HTTP {status})."
+                    "Failed to validate GitHub App installation {installation_id} for {target} (HTTP {status})."
                 ))
             }
             Err(e) => {
                 tracing::error!(
-                    "GitHub App installation validation request failed for '{target}': {e}"
+                    "GitHub App installation validation request failed for {target} (installation_id: {installation_id}): {e}"
                 );
                 Err(format!(
-                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}': {e}"
+                    "Failed to validate GitHub App installation {installation_id} for {target}: {e}"
                 ))
             }
         }
@@ -252,7 +257,7 @@ impl Github {
 
         // If no installation ID is provided, validation passes
         let Some(installation_id) = installation_id else {
-            tracing::debug!("No GitHub App installation ID provided, skipping validation");
+            tracing::debug!("Skipping GitHub App access validation because no installation_id was configured");
             return Ok(());
         };
 
@@ -263,7 +268,7 @@ impl Github {
         };
 
         tracing::debug!(
-            "Validating GitHub App installation ID '{installation_id}' has access to '{target}'"
+            "Validating GitHub App installation {installation_id} for {target}"
         );
 
         // If there's an installation ID, we need to validate it by checking if we can get a token
@@ -273,7 +278,7 @@ impl Github {
             let token = token_provider.get_token();
             if token.is_empty() {
                 return Err(format!(
-                    "Failed to authenticate with GitHub App installation ID '{installation_id}'. The installation ID may be invalid or the app may not be installed."
+                    "Failed to authenticate with GitHub App installation {installation_id}. The installation ID may be invalid or the app may not be installed."
                 ));
             }
 
@@ -343,7 +348,10 @@ impl Github {
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
-            return Err("Github 'endpoint' not provided".into());
+            return Err(
+                "GitHub endpoint not provided. Set github_endpoint or use the default https://api.github.com."
+                    .into(),
+            );
         };
 
         let token = self
@@ -404,6 +412,8 @@ impl Github {
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let connector_component_name = format!("{}", table_args.get_component());
+        let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
             super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
@@ -414,8 +424,8 @@ impl Github {
         let provider_builder = GraphQLTableProviderBuilder::new(client)
             .with_schema_transform(github_gql_raw_schema_cast);
 
-        let provider_builder = if let Some(context) = context {
-            provider_builder.with_context(context)
+        let provider_builder = if let Some(context) = context.as_ref() {
+            provider_builder.with_context(Arc::clone(context))
         } else {
             provider_builder
         };
@@ -429,27 +439,61 @@ impl Github {
             })?
             .with_json_pointer(Arc::from("/data/githubHealthCheck"));
 
-        Ok(Arc::new(
-            provider_builder
-                .with_health_check_query(health_check_query)
-                .build(table_args.get_graphql_values().query.as_ref())
-                .await
-                .map_err(|e| {
-                    if matches!(e, graphql::Error::RateLimited { .. }) {
-                        DataConnectorError::RateLimited {
-                            dataconnector: "github".to_string(),
-                            connector_component: table_args.get_component(),
-                            source: e.into(),
-                        }
-                    } else {
-                        DataConnectorError::UnableToGetReadProvider {
-                            dataconnector: "github".to_string(),
-                            connector_component: table_args.get_component(),
-                            source: e.into(),
-                        }
-                    }
-                })?,
-        ))
+        let initial_build_error = match provider_builder
+            .with_health_check_query(health_check_query)
+            .build(graphql_values.query.as_ref())
+            .await
+        {
+            Ok(provider) => return Ok(Arc::new(provider) as Arc<dyn TableProvider>),
+            Err(e) => e,
+        };
+
+        if graphql_values.schema.is_some()
+            && (matches!(initial_build_error, graphql::Error::RateLimited { .. })
+                || graphql::is_retriable_error(&initial_build_error))
+        {
+            tracing::warn!(
+                "GitHub GraphQL preflight validation failed for {connector_component_name}; continuing with the configured schema so the dataset can recover on a later refresh: {initial_build_error}"
+            );
+
+            let fallback_client = self.create_graphql_client(&table_args).await.context(
+                super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                    connector_component: table_args.get_component(),
+                },
+            )?;
+
+            let fallback_builder = GraphQLTableProviderBuilder::new(fallback_client)
+                .with_schema_transform(github_gql_raw_schema_cast);
+            let fallback_builder = if let Some(context) = context {
+                fallback_builder.with_context(context)
+            } else {
+                fallback_builder
+            };
+
+            return fallback_builder
+                .build_without_validation(graphql_values.query.as_ref())
+                .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
+                .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    connector_component: table_args.get_component(),
+                    source: e.into(),
+                });
+        }
+
+        Err(if matches!(initial_build_error, graphql::Error::RateLimited { .. }) {
+            DataConnectorError::RateLimited {
+                dataconnector: "github".to_string(),
+                connector_component: table_args.get_component(),
+                source: initial_build_error.into(),
+            }
+        } else {
+            DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                connector_component: table_args.get_component(),
+                source: initial_build_error.into(),
+            }
+        })
     }
 
     pub(crate) fn create_rest_client(
@@ -460,31 +504,23 @@ impl Github {
             .as_ref()
             .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
-        match token {
-            Some(token) => GithubRestClient::new(
-                token,
-                Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>,
-            )
-            .map_err(Into::into),
-            None => Err("Github token not provided".into()),
+        if token.is_none() {
+            tracing::debug!(
+                "No GitHub token configured; using unauthenticated GitHub REST API access with public rate limits"
+            );
         }
+
+        GithubRestClient::new(token, Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>)
+            .map_err(Into::into)
     }
 
     async fn create_files_table_provider(
         &self,
         owner: &str,
         repo: &str,
-        tree_sha: Option<&str>,
+        requested_ref: Option<&str>,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
-            return Err(DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#querying-github-files").into(),
-                connector_component: ConnectorComponent::from(dataset),
-            });
-        };
-
         let client = self
             .create_rest_client()
             .context(super::UnableToGetReadProviderSnafu {
@@ -507,7 +543,7 @@ impl Github {
                 client,
                 owner,
                 repo,
-                tree_sha,
+                requested_ref,
                 include,
                 dataset.is_accelerated(),
                 include_commits,
@@ -878,7 +914,10 @@ impl DataConnector for Github {
             DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: format!("Invalid query mode: {e}.\nEnsure a valid query mode is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-parameters").into(),
+                source: format!(
+                    "Invalid GitHub query mode '{e}'. Use one of: auto, search. See {GITHUB_CONNECTOR_DOCS_URL}#common-parameters."
+                )
+                .into(),
             }
         })?;
 
@@ -925,7 +964,10 @@ impl DataConnector for Github {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: component,
-                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
+                source: format!(
+                    "Invalid GitHub dataset path '{path}'. Use github:github.com/<owner>/<repo>/<resource> or github:github.com/<owner>/<resource>. See {GITHUB_CONNECTOR_DOCS_URL}#common-configuration."
+                )
+                .into(),
             });
         };
 
@@ -962,6 +1004,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
+                    requested_ref: parsed.remaining.clone(),
                     component,
                 });
                 self.create_gql_table_provider(
@@ -1048,7 +1091,10 @@ impl DataConnector for Github {
                         if parts.len() != 2 || parts[1] != "runs" {
                             return Err(DataConnectorError::UnableToGetReadProvider {
                                 dataconnector: "github".to_string(),
-                                source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
+                                source: format!(
+                                    "Invalid GitHub workflow path '{path}'. Expected format: github.com/<owner>/<repo>/workflows/<workflow_file.yml>/runs. See {GITHUB_CONNECTOR_DOCS_URL}."
+                                )
+                                .into(),
                                 connector_component: component,
                             });
                         }
@@ -1118,7 +1164,10 @@ impl DataConnector for Github {
             (resource_type, _) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                    source: format!("Invalid GitHub table type: {resource_type}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
+                    source: format!(
+                        "Invalid GitHub table type '{resource_type}'. See {GITHUB_CONNECTOR_DOCS_URL}#common-configuration for supported resources."
+                    )
+                    .into(),
                     connector_component: component,
                 })
             }
@@ -1309,7 +1358,7 @@ static GITHUB_FILTER_PUSHDOWNS_SUPPORTED: LazyLock<HashMap<&'static str, GitHubP
         m
     });
 
-fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
+pub(crate) fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
             match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
@@ -1609,4 +1658,31 @@ where
     query.json_pointer = json_pointer.map(Arc::from);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_github_path;
+
+    #[test]
+    fn test_parse_github_path_preserves_commits_ref_suffix() {
+        let parsed = parse_github_path("github.com/spiceai/spiceai/commits/feature/ref-test")
+            .expect("path should parse");
+
+        assert_eq!(parsed.owner, "spiceai");
+        assert_eq!(parsed.repo, Some("spiceai"));
+        assert_eq!(parsed.resource_type, "commits");
+        assert_eq!(parsed.remaining.as_deref(), Some("feature/ref-test"));
+    }
+
+    #[test]
+    fn test_parse_github_path_allows_files_without_explicit_ref() {
+        let parsed = parse_github_path("github.com/spiceai/spiceai/files")
+            .expect("path should parse");
+
+        assert_eq!(parsed.owner, "spiceai");
+        assert_eq!(parsed.repo, Some("spiceai"));
+        assert_eq!(parsed.resource_type, "files");
+        assert!(parsed.remaining.is_none());
+    }
 }

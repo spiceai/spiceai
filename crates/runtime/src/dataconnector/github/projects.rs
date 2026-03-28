@@ -33,11 +33,23 @@ pub struct ProjectsTableArgs {
 
 impl GraphQLContext for ProjectsTableArgs {
     fn error_checker(&self) -> Option<ErrorChecker> {
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+
         Some(Arc::new(
-            |headers: &HeaderMap<HeaderValue>, response: &Value| {
+            move |headers: &HeaderMap<HeaderValue>, response: &Value| {
+                let target = repo
+                    .as_ref()
+                    .map_or_else(|| owner.clone(), |repo| format!("{owner}/{repo}"));
+                let target_kind = if repo.is_some() {
+                    "repository projects"
+                } else {
+                    "organization projects"
+                };
+
                 // Trace the response for debugging
                 tracing::trace!(
-                    "GitHub Projects GraphQL response: {}",
+                    "GitHub projects GraphQL response for {target}: {}",
                     serde_json::to_string_pretty(response)
                         .unwrap_or_else(|_| "Unable to serialize response".to_string())
                 );
@@ -50,19 +62,21 @@ impl GraphQLContext for ProjectsTableArgs {
                 // permission error. This appears to be a GitHub API bug where lack of permissions
                 // triggers an internal error rather than returning a proper authorization error.
                 if let Some(errors) = response.get("errors") {
-                    tracing::debug!("GitHub Projects query returned errors: {:?}", errors);
+                    tracing::debug!(
+                        "GitHub projects query for {target} returned errors: {:?}",
+                        errors
+                    );
                     if let Some(errors_array) = errors.as_array() {
                         for error in errors_array {
                             if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
-                                tracing::debug!("Checking error message: {}", message);
                                 if message
                                     .contains("Something went wrong while executing your query")
                                 {
                                     tracing::error!(
-                                        "Detected GitHub permission error for projects access"
+                                        "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
                                     );
                                     return Err(data_components::graphql::Error::InvalidCredentialsOrPermissions {
-                                    message: "GitHub App does not have permission to access projects. Verify the app has 'Read access to organization projects' or 'Read access to repository projects' permission.".to_string(),
+                                    message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
                                 });
                                 }
                             }

@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::github::GithubRestClient;
+use data_components::github::{Error as GithubError, GithubRestClient};
 use datafusion::{
     catalog::Session,
     common::{Column, Statistics},
@@ -247,10 +247,11 @@ impl WorkflowRunsTableProvider {
         }
 
         let schema = Arc::new(Schema::new(fields));
+        let component = ConnectorComponent::from(dataset);
 
         // Validate access by fetching a limited set of workflow runs
         let client = Arc::new(client);
-        Arc::clone(&client)
+        if let Err(e) = Arc::clone(&client)
             .fetch_workflow_runs(
                 owner.into(),
                 repo.into(),
@@ -260,11 +261,21 @@ impl WorkflowRunsTableProvider {
                 false,
             )
             .await
-            .map_err(|e| super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
-            })?;
+        {
+            if e.downcast_ref::<GithubError>()
+                .is_some_and(data_components::github::Error::is_transient)
+            {
+                tracing::warn!(
+                    "GitHub workflow runs provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."
+                );
+            } else {
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    connector_component: component,
+                    source: e,
+                });
+            }
+        }
 
         Ok(Self {
             client,
@@ -327,8 +338,14 @@ impl TableProvider for WorkflowRunsTableProvider {
 
         let query_params = workflow_filters.to_query_params();
 
-        tracing::debug!("Pushing down filters to GitHub API: {query_params:?}");
-        tracing::debug!("Remaining filters after pushdown: {remaining_filters:?}");
+        tracing::debug!(
+            owner = %self.owner,
+            repo = %self.repo,
+            workflow_id = %self.workflow_id,
+            pushed_down_filters = ?query_params,
+            remaining_filters = ?remaining_filters,
+            "Computed GitHub workflow run filter pushdown"
+        );
 
         let github_plan = Arc::new(WorkflowRunsExecutionPlan {
             owner: Arc::clone(&self.owner),

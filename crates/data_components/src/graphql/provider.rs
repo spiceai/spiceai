@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow::{array::{RecordBatch, new_empty_array}, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -35,11 +35,33 @@ use futures::StreamExt;
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
-use super::{ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient};
+use super::{
+    ArrowInternalSnafu, ErrorChecker, GraphQLContext, ResultTransformSnafu,
+    client::GraphQLClient,
+};
 use super::{Result, client::GraphQLQuery};
 
 pub type TransformFn =
     fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
+
+fn derive_table_schema(gql_schema: &SchemaRef, transform_fn: Option<TransformFn>) -> Result<SchemaRef> {
+    match transform_fn {
+        Some(transform_fn) => {
+            let empty_columns = gql_schema
+                .fields()
+                .iter()
+                .map(|field| new_empty_array(field.data_type()))
+                .collect();
+            let empty_batch = RecordBatch::try_new(Arc::clone(gql_schema), empty_columns)
+                .context(ArrowInternalSnafu)?;
+
+            Ok(transform_fn(&empty_batch)
+                .context(ResultTransformSnafu)?
+                .schema())
+        }
+        None => Ok(Arc::clone(gql_schema)),
+    }
+}
 
 pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
@@ -112,17 +134,45 @@ impl GraphQLTableProviderBuilder {
             )
             .await?;
 
+        let gql_schema = Arc::clone(&result.schema);
+
         let table_schema = match (self.transform_fn, result.records.first()) {
             (Some(transform_fn), Some(record_batch)) => transform_fn(record_batch)
                 .context(ResultTransformSnafu)?
                 .schema(),
-            _ => Arc::clone(&result.schema),
+            _ => derive_table_schema(&gql_schema, self.transform_fn)?,
         };
 
         Ok(GraphQLTableProvider {
             client: Arc::new(self.client),
             base_query: query_string,
-            gql_schema: Arc::clone(&result.schema),
+            gql_schema,
+            table_schema,
+            transform_fn: self.transform_fn,
+            context: self.context,
+        })
+    }
+
+    pub fn build_without_validation(self, query_string: &str) -> Result<GraphQLTableProvider> {
+        let query_string: Arc<str> = Arc::from(query_string);
+        let query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
+
+        if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
+            return Err(super::Error::NoJsonPointerFound {});
+        }
+
+        let gql_schema = self
+            .client
+            .configured_schema()
+            .ok_or_else(|| super::Error::InternalError {
+                message: "GraphQL provider fallback requires a configured schema".to_string(),
+            })?;
+        let table_schema = derive_table_schema(&gql_schema, self.transform_fn)?;
+
+        Ok(GraphQLTableProvider {
+            client: Arc::new(self.client),
+            base_query: query_string,
+            gql_schema,
             table_schema,
             transform_fn: self.transform_fn,
             context: self.context,
@@ -317,6 +367,67 @@ impl DisplayAs for GraphQLTableProviderExec {
             String::new()
         };
         write!(f, "GraphQLTableProviderExec {limit_str}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graphql::builder::GraphQLClientBuilder;
+    use crate::graphql::client::UnnestBehavior;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::TableProvider;
+    use url::Url;
+
+    fn rename_first_column(
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "renamed_id",
+            batch.schema().field(0).data_type().clone(),
+            true,
+        )]));
+
+        RecordBatch::try_new(schema, vec![Arc::clone(batch.column(0))]).map_err(Into::into)
+    }
+
+    #[test]
+    fn build_without_validation_uses_configured_schema() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let client = GraphQLClientBuilder::new(
+            Url::parse("https://example.com/graphql").expect("valid URL"),
+            UnnestBehavior::Depth(0),
+        )
+        .with_json_pointer(Some("/data/view/nodes"))
+        .with_schema(Some(Arc::clone(&schema)))
+        .build(reqwest::Client::new())
+        .expect("client to build");
+
+        let provider = GraphQLTableProviderBuilder::new(client)
+            .build_without_validation("query { view { nodes { id } } }")
+            .expect("provider to build without validation");
+
+        assert_eq!(TableProvider::schema(&provider), schema);
+    }
+
+    #[test]
+    fn build_without_validation_derives_transformed_schema_without_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let client = GraphQLClientBuilder::new(
+            Url::parse("https://example.com/graphql").expect("valid URL"),
+            UnnestBehavior::Depth(0),
+        )
+        .with_json_pointer(Some("/data/view/nodes"))
+        .with_schema(Some(schema))
+        .build(reqwest::Client::new())
+        .expect("client to build");
+
+        let provider = GraphQLTableProviderBuilder::new(client)
+            .with_schema_transform(rename_first_column)
+            .build_without_validation("query { view { nodes { id } } }")
+            .expect("provider to build without validation");
+
+        assert_eq!(TableProvider::schema(&provider).field(0).name(), "renamed_id");
     }
 }
 

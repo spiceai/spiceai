@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::github::GithubRestClient;
+use data_components::github::{Error as GithubError, GithubRestClient};
 use datafusion::{
     catalog::Session,
     common::Statistics,
@@ -81,17 +81,36 @@ impl WorkflowsTableProvider {
         ];
 
         let schema = Arc::new(Schema::new(fields));
+        let component = ConnectorComponent::from(dataset);
 
         // Validate access by fetching a limited set of workflows
         let client = Arc::new(client);
-        Arc::clone(&client)
+        if let Err(e) = Arc::clone(&client)
             .fetch_workflows(owner.into(), repo.into(), Some(1))
             .await
-            .map_err(|e| super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
-            })?;
+        {
+            if e.downcast_ref::<GithubError>()
+                .is_some_and(data_components::github::Error::is_transient)
+            {
+                tracing::warn!(
+                    "GitHub workflows provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."
+                );
+            } else if e.downcast_ref::<GithubError>()
+                .is_some_and(|err| matches!(err, GithubError::RateLimited { .. }))
+            {
+                return Err(super::DataConnectorError::RateLimited {
+                    dataconnector: "github".to_string(),
+                    connector_component: component,
+                    source: e,
+                });
+            } else {
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    connector_component: component,
+                    source: e,
+                });
+            }
+        }
 
         Ok(Self {
             client,
