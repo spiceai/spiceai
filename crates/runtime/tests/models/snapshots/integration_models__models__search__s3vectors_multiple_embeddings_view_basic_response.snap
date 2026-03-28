@@ -10,14 +10,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\)."
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
         ],
         "question": [
-          "What is 14 percent of 232?"
+          "How many multiples of 4 are there between 1 and 30? List them and count the total."
         ]
       },
       "primary_key": {
-        "id": 830
+        "id": 468
       }
     },
     {
@@ -25,14 +25,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+          "Which base number, when raised to the fifth power, equals thirty-two?"
         ]
       },
       "primary_key": {
-        "id": 449
+        "id": 1277
       }
     },
     {
@@ -40,14 +40,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
         ],
         "question": [
-          "Find 100% of 732."
+          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
         ]
       },
       "primary_key": {
-        "id": 291
+        "id": 189
       }
     },
     {
@@ -55,14 +55,14 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]"
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "Evaluate the following expression: \\(2^{2}\\)."
+          "What is the fifth root of 32?"
         ]
       },
       "primary_key": {
-        "id": 250
+        "id": 948
       }
     }
   ]
