@@ -6,21 +6,21 @@ expression: resp?
   {
     "id": 1015,
     "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-    "_score": 0.286
+    "_score": "0.28"
   },
   {
     "id": 821,
     "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*).",
-    "_score": 0.247
+    "_score": "0.24"
   },
   {
     "id": 1193,
     "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour.",
-    "_score": 0.205
+    "_score": "0.20"
   },
   {
     "id": 551,
     "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
-    "_score": 0.187
+    "_score": "0.18"
   }
 ]
