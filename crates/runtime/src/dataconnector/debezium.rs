@@ -29,8 +29,8 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{self, ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
 use data_components::kafka::rdkafka;
+use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -352,11 +352,8 @@ impl DataConnector for Debezium {
 
                 // Check for schema evolution by peeking at the latest Kafka message.
                 // If the schema has changed since we last cached it, update the metadata.
-                let (metadata, schema) = match peek_latest_schema_fields(
-                    topic,
-                    &self.kafka_config,
-                )
-                .await
+                let (metadata, schema) = match peek_latest_schema_fields(topic, &self.kafka_config)
+                    .await
                 {
                     Some((latest_fields, latest_pks))
                         if latest_fields != metadata.schema_fields =>
@@ -365,15 +362,14 @@ impl DataConnector for Debezium {
                             "Detected schema evolution for dataset {dataset_name}, updating cached schema"
                         );
 
-                        let updated_schema =
-                            debezium::arrow::convert_fields_to_arrow_schema(
-                                latest_fields.iter().collect(),
-                            )
-                            .boxed()
-                            .context(super::UnableToGetReadProviderSnafu {
-                                dataconnector: "debezium",
-                                connector_component: ConnectorComponent::from(dataset),
-                            })?;
+                        let updated_schema = debezium::arrow::convert_fields_to_arrow_schema(
+                            latest_fields.iter().collect(),
+                        )
+                        .boxed()
+                        .context(super::UnableToGetReadProviderSnafu {
+                            dataconnector: "debezium",
+                            connector_component: ConnectorComponent::from(dataset),
+                        })?;
 
                         let updated_metadata = DebeziumKafkaMetadata {
                             consumer_group_id: metadata.consumer_group_id,
@@ -390,24 +386,21 @@ impl DataConnector for Debezium {
                             if let Err(e) =
                                 set_metadata_to_accelerator(dataset, &updated_metadata).await
                             {
-                                tracing::warn!(
-                                    "Failed to persist updated schema metadata: {e}"
-                                );
+                                tracing::warn!("Failed to persist updated schema metadata: {e}");
                             }
                         }
 
                         (updated_metadata, Arc::new(updated_schema))
                     }
                     _ => {
-                        let cached_schema =
-                            debezium::arrow::convert_fields_to_arrow_schema(
-                                metadata.schema_fields.iter().collect(),
-                            )
-                            .boxed()
-                            .context(super::UnableToGetReadProviderSnafu {
-                                dataconnector: "debezium",
-                                connector_component: ConnectorComponent::from(dataset),
-                            })?;
+                        let cached_schema = debezium::arrow::convert_fields_to_arrow_schema(
+                            metadata.schema_fields.iter().collect(),
+                        )
+                        .boxed()
+                        .context(super::UnableToGetReadProviderSnafu {
+                            dataconnector: "debezium",
+                            connector_component: ConnectorComponent::from(dataset),
+                        })?;
                         (metadata, Arc::new(cached_schema))
                     }
                 };
@@ -520,8 +513,8 @@ async fn peek_latest_schema_fields(
     kafka_config: &KafkaConfig,
 ) -> Option<(Vec<change_event::Field>, Vec<String>)> {
     use rdkafka::{
-        consumer::{BaseConsumer, Consumer},
         ClientConfig, Message, Offset, TopicPartitionList,
+        consumer::{BaseConsumer, Consumer},
     };
 
     let peek_result: Option<(Vec<change_event::Field>, Vec<String>)> =
@@ -588,12 +581,8 @@ async fn peek_latest_schema_fields(
                         .fetch_watermarks(&topic, partition.id(), Duration::from_secs(10))
                         .ok()?;
                     if high > 0 {
-                        tpl.add_partition_offset(
-                            &topic,
-                            partition.id(),
-                            Offset::Offset(high - 1),
-                        )
-                        .ok()?;
+                        tpl.add_partition_offset(&topic, partition.id(), Offset::Offset(high - 1))
+                            .ok()?;
                         has_messages = true;
                     }
                 }
