@@ -568,11 +568,17 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
     SqlWarehouseApi::verify_response_status(json_value)?;
 
-    let result = json_value.get("result");
-    let data_array_value = result.and_then(|r| r.get("data_array"));
+    let result = json_value
+        .get("result")
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "response is missing the 'result' field".to_string(),
+        })?;
+
+    let data_array_value = result.get("data_array");
 
     let data_array = match data_array_value {
-        None => {
+        None | Some(serde_json::Value::Null) => {
             return Err(Error::TableSchemaNotRegistered {
                 dataset_name: dataset_name.to_string(),
             });
@@ -931,7 +937,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { .. }),
+            matches!(&err, Error::UnexpectedSchemaResponse { .. }),
             "unexpected error: {err}"
         );
     }
