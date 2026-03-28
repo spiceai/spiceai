@@ -195,14 +195,21 @@ pub(crate) async fn forward_federated_partitioned_write(
 
     // Decode the first message and build a streaming iterator that yields
     // each subsequent FlightData message as a RecordBatch without buffering.
-    let first_batch =
-        flight_data_to_arrow_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id).ok();
+    let first_batch = flight_data_to_arrow_batch(
+        &first_message,
+        Arc::clone(&schema),
+        &dictionaries_by_id,
+    )
+    .context(DecodeBatchSnafu)?;
+    let first_batch = if first_batch.num_rows() > 0 {
+        Some(first_batch)
+    } else {
+        None
+    };
 
     let decode_schema = Arc::clone(&schema);
     let batch_stream = async_stream::try_stream! {
-        if let Some(batch) = first_batch
-            && batch.num_rows() > 0
-        {
+        if let Some(batch) = first_batch {
             yield batch;
         }
         while let Some(result) = streaming_flight.next().await {
