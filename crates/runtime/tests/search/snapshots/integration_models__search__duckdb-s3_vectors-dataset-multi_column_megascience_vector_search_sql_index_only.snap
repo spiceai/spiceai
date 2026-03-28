@@ -8,15 +8,15 @@ description: "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'sec
     "_score": 0.539
   },
   {
+    "id": 468,
+    "_score": 0.539
+  },
+  {
+    "id": 189,
+    "_score": 0.537
+  },
+  {
     "id": 948,
     "_score": 0.528
-  },
-  {
-    "id": 191,
-    "_score": 0.521
-  },
-  {
-    "id": 41,
-    "_score": 0.501
   }
 ]

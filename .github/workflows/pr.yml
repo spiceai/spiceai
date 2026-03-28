@@ -8,6 +8,7 @@ on:
       - release-*
       - release/*
       - feature-*
+  merge_group:
   workflow_dispatch:
     inputs:
       profile_option:
@@ -52,7 +53,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -65,10 +66,15 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
+      - name: Validate datafusion-table-providers commit
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
   # Run Rust linting
   lint-rust:
     name: Rust Lint
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     needs: check_changes
 
     steps:
@@ -122,12 +128,6 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
-      - name: Validate datafusion-table-providers commit
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: bash .github/scripts/validate_table_providers_commit.sh
-        env:
-          BRANCH: spiceai-52
-
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
@@ -135,7 +135,7 @@ jobs:
   # Build and test
   build-test:
     name: Build and Test
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-dev-large-runners
     needs: [check_changes]
 
     steps:

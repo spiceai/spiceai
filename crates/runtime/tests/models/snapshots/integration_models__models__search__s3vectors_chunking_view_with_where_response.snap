@@ -6,7 +6,43 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.29,
+      "_score": "0.34",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "The presence of fibrinolysin in the reagents can partially o"
+        ]
+      },
+      "primary_key": {
+        "id": 938
+      }
+    },
+    {
+      "_score": "0.30",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " properties, possibly due to their high tannin content"
+        ]
+      },
+      "primary_key": {
+        "id": 1015
+      }
+    },
+    {
+      "_score": "0.29",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " Late recurrences can occur beyond 10 years, so patients requir"
+        ]
+      },
+      "primary_key": {
+        "id": 551
+      }
+    },
+    {
+      "_score": "0.29",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -15,42 +51,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1035
-      }
-    },
-    {
-      "_score": 0.21,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "A \"sequence\" implies a cascade of events traced to a singl"
-        ]
-      },
-      "primary_key": {
-        "id": 922
-      }
-    },
-    {
-      "_score": 0.16,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " been established and should, therefore, be avoided"
-        ]
-      },
-      "primary_key": {
-        "id": 1143
-      }
-    },
-    {
-      "_score": 0.16,
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "The nurse would suspect **genital warts**, as HPV is th"
-        ]
-      },
-      "primary_key": {
-        "id": 1274
       }
     }
   ]
