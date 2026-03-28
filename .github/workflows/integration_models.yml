@@ -68,7 +68,7 @@ env:
 jobs:
   build:
     name: Build Test Binary (macOS)
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -116,7 +116,7 @@ jobs:
   test-openai:
     name: Test OpenAI Models
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -167,7 +167,7 @@ jobs:
   test-ai-udf:
     name: Test AI UDFs
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -257,7 +257,7 @@ jobs:
     name: Test Hugging Face Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -304,7 +304,7 @@ jobs:
   test-local:
     name: Test Local Models
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -347,7 +347,7 @@ jobs:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -380,7 +380,7 @@ jobs:
   test-workers:
     name: Test Workers
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -419,7 +419,7 @@ jobs:
 
   build-extended:
     name: Build Test Binary (Extended)
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -464,7 +464,7 @@ jobs:
   test-search:
     name: Test Search
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
