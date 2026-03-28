@@ -8,6 +8,10 @@ inputs:
     description: 'Title for the PR created in this action'
     required: false
     default: 'fix: Update test snapshots'
+  description:
+    description: 'Body description for the PR created in this action'
+    required: false
+    default: ''
 runs:
   using: 'composite'
   steps:
@@ -40,7 +44,7 @@ runs:
         if git diff --cached --quiet; then
           echo "No changes to commit"
         else
-          git commit -m "fix: Update the test snapshots"
+          git commit -m "${{ inputs.title }}"
           if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
             git pull --rebase origin ${BRANCH_NAME}
           fi
@@ -51,7 +55,11 @@ runs:
             echo "PR already exists -> ${PR_URL}"
             exit 0
           else
-            gh pr create --title "${{ inputs.title }}" --body "Updates some test snapshots" --base develop --head ${BRANCH_NAME} --label kind/bug
+            BODY="${{ inputs.description }}"
+            if [[ -z "${BODY}" ]]; then
+              BODY="Automated snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+            fi
+            gh pr create --title "${{ inputs.title }}" --body "${BODY}" --base develop --head ${BRANCH_NAME} --label kind/bug
           fi
         fi
       env:

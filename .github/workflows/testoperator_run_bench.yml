@@ -477,7 +477,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "fix: Update the ${{ github.event.inputs.query_set }} benchmark snapshots for: ${{ github.event.inputs.spicepod_path }}"
+            git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
             if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
               git pull --rebase origin ${BRANCH_NAME}
             fi
@@ -488,7 +488,15 @@ jobs:
               echo "PR already exists -> ${PR_URL}"
               exit 0
             else
-              gh pr create --title "fix: Update benchmark snapshots" --body "Updates some benchmark snapshots" --base trunk --head ${BRANCH_NAME} --label kind/bug
+              BODY=$(cat <<EOF
+          Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+          **Query set:** \`${{ github.event.inputs.query_set }}\`
+          **Spicepod:** \`${{ github.event.inputs.spicepod_path }}\`
+          **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
+          EOF
+          )
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base trunk --head ${BRANCH_NAME} --label kind/bug
             fi
           fi
         env:
