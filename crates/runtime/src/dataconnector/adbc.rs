@@ -479,6 +479,7 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         "driver_options",
         "driver_path",
         "password",
+        "query_federation",
         "schema",
         "uri",
         "username",
@@ -497,10 +498,10 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         let v = params.parameters.get(k).expose().ok().unwrap_or("");
         key.push_str(k);
         key.push('\0');
-        if secret_params.contains(k) || *k == "driver_options" {
-            // Use BLAKE3 for secret values and driver_options (which can
-            // contain sensitive values like tokens) so plaintext credentials
-            // are not retained in memory and the digest is not reversible.
+        if secret_params.contains(k) || *k == "driver_options" || *k == "uri" {
+            // Use BLAKE3 for secret values, driver_options (which can contain
+            // sensitive values like tokens), and URIs (which frequently embed
+            // credentials) so plaintext secrets are not retained in memory.
             let digest = blake3::hash(v.as_bytes());
             let _ = write!(key, "{digest}");
         } else {
