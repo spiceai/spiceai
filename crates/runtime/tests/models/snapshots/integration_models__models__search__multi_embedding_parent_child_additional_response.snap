@@ -12,12 +12,12 @@ expression: normalize_search_response(resp)
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": [
-          "DEPARTMENT"
+        "cp_description": [
+          "Programmes receive just likely, key homes. Relevant,"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
+        "cp_catalog_page_sk": 11
       }
     },
     {
@@ -27,12 +27,12 @@ expression: normalize_search_response(resp)
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_description": [
-          "Programmes receive just likely, key homes. Relevant,"
+        "cp_department": [
+          "DEPARTMENT"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 11
+        "cp_catalog_page_sk": 1
       }
     }
   ]
