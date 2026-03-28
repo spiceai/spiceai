@@ -1,0 +1,105 @@
+---
+name: pr-develop
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches:
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'develop' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  RUST_PROFILE: lint
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 1
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  pr-develop:
+    name: Lint, Build, and Test (Develop)
+    runs-on: spiceai-macos
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
+      - name: Cache Cargo registry
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-nextest
+
+      - name: Install Protoc
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up make
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-cc
+
+      # Check
+      - name: Run cargo check
+        if: steps.check.outputs.relevant_changes == 'true'
+        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp --workspace --exclude libnfs --locked
+
+      - name: Validate datafusion-table-providers commit
+        if: steps.check.outputs.relevant_changes == 'true'
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
+      # Build and Test (exclude nfs and secret-dependent packages)
+      - name: Build CLI and run nextest
+        if: steps.check.outputs.relevant_changes == 'true'
+        run: make build-cli nextest
+        env:
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+          NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
+
+      - name: Build testoperator
+        if: steps.check.outputs.relevant_changes == 'true'
+        run: cargo build -p testoperator --all-features --locked
+
+      - name: Check if Cargo.lock is updated
+        if: steps.check.outputs.relevant_changes == 'true'
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
