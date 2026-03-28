@@ -263,13 +263,6 @@ impl WorkflowRunsTableProvider {
             .await
         {
             if e.downcast_ref::<GithubError>()
-                .is_some_and(data_components::github::Error::is_transient)
-            {
-                tracing::warn!(
-                    "GitHub workflow runs provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."
-                );
-            } else if e
-                .downcast_ref::<GithubError>()
                 .is_some_and(|err| matches!(err, GithubError::RateLimited { .. }))
             {
                 return Err(super::DataConnectorError::RateLimited {
@@ -277,6 +270,13 @@ impl WorkflowRunsTableProvider {
                     connector_component: component,
                     source: e,
                 });
+            } else if e
+                .downcast_ref::<GithubError>()
+                .is_some_and(data_components::github::Error::is_transient)
+            {
+                tracing::warn!(
+                    "GitHub workflow runs provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."
+                );
             } else {
                 return Err(super::DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),

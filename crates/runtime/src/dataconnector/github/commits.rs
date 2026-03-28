@@ -57,7 +57,10 @@ impl GraphQLContext for CommitsTableArgs {
         filters: &[FilterPushdownResult],
         query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
-        if let Some(ref_name) = ref_from_filters(filters).or(self.requested_ref.as_deref()) {
+        let requested_ref =
+            requested_ref_from_filters(filters)?.or_else(|| self.requested_ref.clone());
+
+        if let Some(ref_name) = requested_ref.as_deref() {
             inject_commit_ref_parameter(query, ref_name)?;
         }
 
@@ -212,12 +215,62 @@ fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     filter_pushdown(expr)
 }
 
-fn ref_from_filters(filters: &[FilterPushdownResult]) -> Option<&str> {
-    filters.iter().find_map(|filter| {
-        filter
-            .context
-            .as_deref()
-            .and_then(|context| context.strip_prefix("ref:"))
+fn expr_references_ref(expr: &Expr) -> bool {
+    expr.column_refs().iter().any(|column| column.name == "ref")
+}
+
+fn unsupported_ref_filter_error() -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(
+        "GitHub commits only support a single non-empty ref = '<value>' predicate. Queries using ref with OR, IN, inequality, or multiple values are not supported because they can return incorrect results.".to_string(),
+    )
+}
+
+fn merge_requested_refs(
+    current: Option<String>,
+    next: Option<String>,
+) -> Result<Option<String>, datafusion::error::DataFusionError> {
+    match (current, next) {
+        (Some(current), Some(next)) if current != next => Err(unsupported_ref_filter_error()),
+        (Some(current), _) => Ok(Some(current)),
+        (None, Some(next)) => Ok(Some(next)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn requested_ref_from_filter(
+    expr: &Expr,
+) -> Result<Option<String>, datafusion::error::DataFusionError> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => merge_requested_refs(
+            requested_ref_from_filter(binary_expr.left.as_ref())?,
+            requested_ref_from_filter(binary_expr.right.as_ref())?,
+        ),
+        _ => {
+            if let Some((column, value, op)) = expr_to_match(expr)
+                && column.name == "ref"
+            {
+                return match (op, value) {
+                    (Operator::Eq, ScalarValue::Utf8(Some(value))) if !value.is_empty() => {
+                        Ok(Some(value))
+                    }
+                    _ => Err(unsupported_ref_filter_error()),
+                };
+            }
+
+            if expr_references_ref(expr) {
+                return Err(unsupported_ref_filter_error());
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+fn requested_ref_from_filters(
+    filters: &[FilterPushdownResult],
+) -> Result<Option<String>, datafusion::error::DataFusionError> {
+    filters.iter().try_fold(None, |current, filter| {
+        merge_requested_refs(current, requested_ref_from_filter(&filter.expr)?)
     })
 }
 
@@ -501,5 +554,56 @@ mod tests {
             datafusion::logical_expr::TableProviderFilterPushDown::Inexact
         );
         assert_eq!(result.context.as_deref(), Some("ref:trunk"));
+    }
+
+    #[test]
+    fn test_requested_ref_from_filters_supports_conjunctive_filter() {
+        let filters = vec![FilterPushdownResult {
+            filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
+            expr: datafusion::prelude::col("ref")
+                .eq(datafusion::prelude::lit("trunk"))
+                .and(datafusion::prelude::col("sha").eq(datafusion::prelude::lit("abc123"))),
+            context: None,
+        }];
+
+        assert_eq!(
+            requested_ref_from_filters(&filters)
+                .expect("conjunctive ref filter should be supported")
+                .as_deref(),
+            Some("trunk")
+        );
+    }
+
+    #[test]
+    fn test_requested_ref_from_filters_rejects_multiple_ref_values() {
+        let filters = vec![
+            FilterPushdownResult {
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+                expr: datafusion::prelude::col("ref").eq(datafusion::prelude::lit("trunk")),
+                context: Some("ref:trunk".to_string()),
+            },
+            FilterPushdownResult {
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+                expr: datafusion::prelude::col("ref").eq(datafusion::prelude::lit("main")),
+                context: Some("ref:main".to_string()),
+            },
+        ];
+
+        let _ = requested_ref_from_filters(&filters)
+            .expect_err("multiple ref values should be rejected");
+    }
+
+    #[test]
+    fn test_requested_ref_from_filters_rejects_unsupported_ref_or_predicate() {
+        let filters = vec![FilterPushdownResult {
+            filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
+            expr: datafusion::prelude::col("ref")
+                .eq(datafusion::prelude::lit("trunk"))
+                .or(datafusion::prelude::col("ref").eq(datafusion::prelude::lit("main"))),
+            context: None,
+        }];
+
+        let _ = requested_ref_from_filters(&filters)
+            .expect_err("unsupported ref OR predicates should be rejected");
     }
 }

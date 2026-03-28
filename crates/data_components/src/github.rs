@@ -210,8 +210,52 @@ fn ref_from_filter(expr: &Expr) -> Option<String> {
     }
 }
 
-fn requested_ref_from_filters(filters: &[Expr]) -> Option<String> {
-    filters.iter().find_map(ref_from_filter)
+fn expr_references_ref(expr: &Expr) -> bool {
+    expr.column_refs().iter().any(|column| column.name == "ref")
+}
+
+fn unsupported_ref_filter_error() -> DataFusionError {
+    DataFusionError::Execution(
+        "GitHub files only support a single non-empty ref = '<value>' predicate. Queries using ref with OR, IN, inequality, or multiple values are not supported because they can return incorrect results.".to_string(),
+    )
+}
+
+fn merge_requested_refs(
+    current: Option<String>,
+    next: Option<String>,
+) -> datafusion::error::Result<Option<String>> {
+    match (current, next) {
+        (Some(current), Some(next)) if current != next => Err(unsupported_ref_filter_error()),
+        (Some(current), _) => Ok(Some(current)),
+        (None, Some(next)) => Ok(Some(next)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn requested_ref_from_filter(expr: &Expr) -> datafusion::error::Result<Option<String>> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => merge_requested_refs(
+            requested_ref_from_filter(binary_expr.left.as_ref())?,
+            requested_ref_from_filter(binary_expr.right.as_ref())?,
+        ),
+        _ => {
+            if let Some(value) = ref_from_filter(expr) {
+                return Ok(Some(value));
+            }
+
+            if expr_references_ref(expr) {
+                return Err(unsupported_ref_filter_error());
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+fn requested_ref_from_filters(filters: &[Expr]) -> datafusion::error::Result<Option<String>> {
+    filters.iter().try_fold(None, |current, filter| {
+        merge_requested_refs(current, requested_ref_from_filter(filter)?)
+    })
 }
 
 #[async_trait]
@@ -251,7 +295,7 @@ impl TableProvider for GithubFilesTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let requested_ref = if let Some(requested_ref) = requested_ref_from_filters(filters)
+        let requested_ref = if let Some(requested_ref) = requested_ref_from_filters(filters)?
             .or_else(|| self.requested_ref.as_deref().map(ToString::to_string))
         {
             requested_ref
@@ -562,6 +606,35 @@ fn format_github_request_error(
     format!("Failed to {action} for GitHub repository {repo_name}: {error}")
 }
 
+fn github_api_error_from_message(message: String) -> Error {
+    Error::GithubApiError {
+        source: message.into(),
+    }
+}
+
+fn boxed_github_request_error(
+    action: &str,
+    owner: &str,
+    repo: &str,
+    error: &reqwest::Error,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(github_api_error_from_message(format_github_request_error(
+        action, owner, repo, error,
+    )))
+}
+
+fn boxed_github_status_error(
+    action: &str,
+    owner: &str,
+    repo: &str,
+    status: StatusCode,
+    detail: Option<&str>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(github_api_error_from_message(format_github_status_error(
+        action, owner, repo, status, detail,
+    )))
+}
+
 async fn read_github_error_response(
     response: reqwest::Response,
 ) -> (HeaderMap, StatusCode, Option<Value>, Option<String>) {
@@ -822,7 +895,7 @@ impl GithubRestClient {
         })
         .await
         .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
-            format_github_request_error(&action, owner, repo, &e).into()
+            boxed_github_request_error(&action, owner, repo, &e)
         })?;
 
         rate_limiter.update_from_headers(response.headers()).await;
@@ -852,10 +925,13 @@ impl GithubRestClient {
             })?;
         }
 
-        Err(
-            format_github_status_error(&action, owner, repo, response_status, detail.as_deref())
-                .into(),
-        )
+        Err(boxed_github_status_error(
+            &action,
+            owner,
+            repo,
+            response_status,
+            detail.as_deref(),
+        ))
     }
 
     async fn fetch_default_branch(&self, owner: &str, repo: &str) -> Result<String> {
@@ -952,7 +1028,7 @@ impl GithubRestClient {
         .await
         .map_err(
             |e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
-                format_github_request_error(&action, owner, repo, &e).into()
+                boxed_github_request_error(&action, owner, repo, &e)
             },
         )?;
 
@@ -975,14 +1051,13 @@ impl GithubRestClient {
                 })?;
             }
 
-            Err(format_github_status_error(
+            Err(boxed_github_status_error(
                 &action,
                 owner,
                 repo,
                 response_status,
                 detail.as_deref(),
-            )
-            .into())
+            ))
         }
     }
 
@@ -1117,7 +1192,7 @@ impl GithubRestClient {
             })
             .await
             .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
-                format_github_request_error(&action, &owner, &repo, &e).into()
+                boxed_github_request_error(&action, &owner, &repo, &e)
             })?;
 
             rate_limiter.update_from_headers(response.headers()).await;
@@ -1136,14 +1211,13 @@ impl GithubRestClient {
                     })?;
                 }
 
-                return Err(format_github_status_error(
+                return Err(boxed_github_status_error(
                     &action,
                     &owner,
                     &repo,
                     response_status,
                     detail.as_deref(),
-                )
-                .into());
+                ));
             }
 
             let runs_response: WorkflowRunsResponse = response.json().await?;
@@ -1368,7 +1442,7 @@ impl GithubRestClient {
         })
         .await
         .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
-            format_github_request_error(&action, owner, repo, &e).into()
+            boxed_github_request_error(&action, owner, repo, &e)
         })?;
 
         rate_limiter.update_from_headers(response.headers()).await;
@@ -1475,7 +1549,7 @@ impl GithubRestClient {
             .await
             .map_err(
                 |e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
-                    format_github_request_error(&action, &owner, &repo, &e).into()
+                    boxed_github_request_error(&action, &owner, &repo, &e)
                 },
             )?;
 
@@ -1495,14 +1569,13 @@ impl GithubRestClient {
                     })?;
                 }
 
-                return Err(format_github_status_error(
+                return Err(boxed_github_status_error(
                     &action,
                     &owner,
                     &repo,
                     response_status,
                     detail.as_deref(),
-                )
-                .into());
+                ));
             }
 
             let workflows_response: WorkflowsResponse = response.json().await?;
@@ -1728,8 +1801,8 @@ pub fn error_checker(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_github_status_error, github_response_message, github_response_message_from_text,
-        ref_from_filter, requested_ref_from_filters,
+        Error, boxed_github_status_error, format_github_status_error, github_response_message,
+        github_response_message_from_text, ref_from_filter, requested_ref_from_filters,
     };
     use datafusion::prelude::{col, lit};
     use reqwest::StatusCode;
@@ -1750,9 +1823,43 @@ mod tests {
         ];
 
         assert_eq!(
-            requested_ref_from_filters(&filters).as_deref(),
+            requested_ref_from_filters(&filters)
+                .expect("simple ref filter should be supported")
+                .as_deref(),
             Some("release/v1")
         );
+    }
+
+    #[test]
+    fn test_requested_ref_from_filters_supports_conjunctive_filter() {
+        let filters = vec![
+            col("ref")
+                .eq(lit("trunk"))
+                .and(col("path").eq(lit("README.md"))),
+        ];
+
+        assert_eq!(
+            requested_ref_from_filters(&filters)
+                .expect("conjunctive ref filter should be supported")
+                .as_deref(),
+            Some("trunk")
+        );
+    }
+
+    #[test]
+    fn test_requested_ref_from_filters_rejects_multiple_ref_values() {
+        let filters = vec![col("ref").eq(lit("trunk")), col("ref").eq(lit("main"))];
+
+        let _ = requested_ref_from_filters(&filters)
+            .expect_err("multiple ref values should be rejected");
+    }
+
+    #[test]
+    fn test_requested_ref_from_filters_rejects_unsupported_ref_or_predicate() {
+        let filters = vec![col("ref").eq(lit("trunk")).or(col("ref").eq(lit("main")))];
+
+        let _ = requested_ref_from_filters(&filters)
+            .expect_err("unsupported ref OR predicates should be rejected");
     }
 
     #[test]
@@ -1790,5 +1897,21 @@ mod tests {
             github_response_message_from_text("first line\nsecond line\r\nthird line").as_deref(),
             Some("first line second line third line")
         );
+    }
+
+    #[test]
+    fn test_boxed_github_status_error_preserves_github_error_type() {
+        let err = boxed_github_status_error(
+            "retrieve workflows",
+            "spiceai",
+            "spiceai",
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("GitHub is down"),
+        );
+
+        assert!(matches!(
+            err.downcast_ref::<Error>(),
+            Some(Error::GithubApiError { .. })
+        ));
     }
 }
