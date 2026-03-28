@@ -60,6 +60,7 @@ runs:
               BODY="Automated snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
             fi
             gh pr create --title "${{ inputs.title }}" --body "${BODY}" --base develop --head ${BRANCH_NAME} --label kind/bug
+            gh pr merge --squash --auto ${BRANCH_NAME}
           fi
         fi
       env:
