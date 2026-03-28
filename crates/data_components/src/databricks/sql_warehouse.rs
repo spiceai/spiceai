@@ -63,7 +63,7 @@ pub enum Error {
     UnsupportedType { ty: String },
 
     #[snafu(display(
-        "The table '{dataset_name}' has no column metadata registered. Verify the table exists and run 'SELECT * FROM {dataset_name} LIMIT 1' in Databricks to populate the schema. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+        "The table '{dataset_name}' has no column metadata registered in Unity Catalog. Run 'SELECT * FROM {dataset_name} LIMIT 1' in Databricks SQL to populate the schema, then retry. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
     ))]
     TableSchemaNotRegistered { dataset_name: String },
 
@@ -570,8 +570,9 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
     let result = json_value
         .get("result")
-        .ok_or_else(|| Error::TableSchemaNotRegistered {
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
             dataset_name: dataset_name.to_string(),
+            reason: "missing result object in response".to_string(),
         })?;
 
     let data_array_value = result.get("data_array");
@@ -589,6 +590,12 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
                 reason: "result.data_array is not an array".to_string(),
             })?,
     };
+
+    if data_array.is_empty() {
+        return Err(Error::TableSchemaNotRegistered {
+            dataset_name: dataset_name.to_string(),
+        });
+    }
 
     let mut fields = Vec::new();
 
@@ -936,7 +943,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { .. }),
+            matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("missing result")),
             "unexpected error: {err}"
         );
     }
@@ -967,6 +974,21 @@ mod tests {
             .expect_err("should fail when data_array is string");
         assert!(
             matches!(&err, Error::UnexpectedSchemaResponse { reason, .. } if reason.contains("is not an array")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_empty_data_array() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "result": { "data_array": [] }
+        });
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on empty data_array");
+        assert!(
+            matches!(&err, Error::TableSchemaNotRegistered { .. }),
             "unexpected error: {err}"
         );
     }
