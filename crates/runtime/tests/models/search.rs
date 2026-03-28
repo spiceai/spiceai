@@ -195,10 +195,14 @@ fn normalize_search_response(mut json: Value) -> String {
                 return Ordering::Less;
             };
 
-            // Opposite because we want to order descendingly
-            if score_a > score_b {
+            // Compare truncated scores (matching the display precision) to ensure
+            // deterministic ordering when displayed scores are the same, regardless
+            // of minor floating-point differences across different machines.
+            let truncated_a = (100.0 * score_a).trunc() / 100.0;
+            let truncated_b = (100.0 * score_b).trunc() / 100.0;
+            if truncated_a > truncated_b {
                 return Ordering::Less;
-            } else if score_a < score_b {
+            } else if truncated_a < truncated_b {
                 return Ordering::Greater;
             }
 
