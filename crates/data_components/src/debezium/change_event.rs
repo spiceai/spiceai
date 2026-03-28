@@ -275,8 +275,10 @@ mod tests {
             }
         }"#;
 
-        let event: ChangeEvent = serde_json::from_str(json).unwrap();
-        let fields = event.get_schema_fields().unwrap();
+        let event: ChangeEvent = serde_json::from_str(json).expect("valid change event JSON");
+        let fields = event
+            .get_schema_fields()
+            .expect("schema fields should be present");
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].field.as_deref(), Some("id"));
         assert_eq!(fields[1].field.as_deref(), Some("name"));
@@ -296,7 +298,7 @@ mod tests {
             "payload": {"id": 1}
         }"#;
 
-        let key: ChangeEventKey = serde_json::from_str(json).unwrap();
+        let key: ChangeEventKey = serde_json::from_str(json).expect("valid change event key JSON");
         let pks = key.get_primary_key();
         assert_eq!(pks, vec!["id".to_string()]);
     }
