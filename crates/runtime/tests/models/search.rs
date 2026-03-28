@@ -164,17 +164,127 @@ pub async fn run_search_test(
     }
 
     let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
-    insta::assert_snapshot!(
-        format!("{}_response", ts.name),
-        normalize_search_response(resp)
-    );
+    assert_search_response_primary_keys(base_url, &ts.name, &resp).await?;
+    assert_search_response_snapshot(&ts.name, resp);
 
     Ok(())
 }
 
+async fn assert_search_response_primary_keys(
+    base_url: &str,
+    test_name: &str,
+    resp: &Value,
+) -> Result<(), anyhow::Error> {
+    if !matches!(
+        test_name,
+        "multi_embedding_parent_child_basic" | "multi_embedding_parent_child_additional"
+    ) {
+        return Ok(());
+    }
+
+    let results = resp
+        .get("results")
+        .and_then(Value::as_array)
+        .context("Search response missing results array")?;
+
+    for result in results {
+        assert_search_result_primary_key_matches(base_url, test_name, result).await?;
+    }
+
+    Ok(())
+}
+
+async fn assert_search_result_primary_key_matches(
+    base_url: &str,
+    test_name: &str,
+    result: &Value,
+) -> Result<(), anyhow::Error> {
+    let dataset = result
+        .get("dataset")
+        .and_then(Value::as_str)
+        .context("Search result missing dataset")?;
+    let primary_key = result
+        .get("primary_key")
+        .and_then(Value::as_object)
+        .context("Search result missing primary_key")?;
+    let matches = result
+        .get("matches")
+        .and_then(Value::as_object)
+        .context("Search result missing matches")?;
+
+    let select_list = matches
+        .keys()
+        .map(|column| quote_sql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicates = primary_key
+        .iter()
+        .map(|(column, value)| {
+            if value.is_null() {
+                Ok(format!("{} IS NULL", quote_sql_identifier(column)))
+            } else {
+                Ok(format!(
+                    "{} = {}",
+                    quote_sql_identifier(column),
+                    sql_literal(value)?
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, anyhow::Error>>()?
+        .join(" AND ");
+    let sql = format!(
+        "SELECT {select_list} FROM {} WHERE {predicates} LIMIT 1",
+        quote_sql_path(dataset)
+    );
+    let rows = http_sql(base_url, &sql)
+        .await
+        .with_context(|| format!("Failed to validate primary key for {test_name}"))?;
+    let rows = rows
+        .as_array()
+        .context("Primary key lookup did not return an array")?;
+    let row = rows
+        .first()
+        .and_then(Value::as_object)
+        .context("Primary key lookup did not return a matching row")?;
+
+    for (column, expected_matches) in matches {
+        let actual_value = row
+            .get(column)
+            .with_context(|| format!("Primary key lookup row missing column {column}"))?;
+        let actual_text = json_value_to_text(actual_value)?;
+
+        for expected in expected_matches
+            .as_array()
+            .context("Search result match values were not an array")?
+        {
+            let expected_text = json_value_to_text(expected)?;
+            anyhow::ensure!(
+                actual_text.contains(&expected_text) || expected_text.contains(&actual_text),
+                "Search result primary key lookup did not match result content for {test_name}: dataset={dataset}, column={column}, primary_key={primary_key:?}, actual={actual_text:?}, expected={expected_text:?}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn assert_search_response_snapshot(test_name: &str, resp: Value) {
+    match test_name {
+        "multi_embedding_parent_child_basic" | "multi_embedding_parent_child_additional" => {
+            insta::assert_json_snapshot!(
+                format!("{test_name}_response"),
+                normalize_search_response_json(resp, true)
+            );
+        }
+        _ => {
+            insta::assert_snapshot!(format!("{test_name}_response"), normalize_search_response(resp));
+        }
+    }
+}
+
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
 /// values such as duration with placeholder.
-fn normalize_search_response(mut json: Value) -> String {
+fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -> Value {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
@@ -202,6 +312,21 @@ fn normalize_search_response(mut json: Value) -> String {
                 return Ordering::Greater;
             }
 
+            if sort_ties_by_matches {
+                let matches_a = a
+                    .get("matches")
+                    .map(|value| serde_json::to_string(value).unwrap_or_default())
+                    .unwrap_or_default();
+                let matches_b = b
+                    .get("matches")
+                    .map(|value| serde_json::to_string(value).unwrap_or_default())
+                    .unwrap_or_default();
+                let matches_cmp = matches_a.cmp(&matches_b);
+                if matches_cmp != Ordering::Equal {
+                    return matches_cmp;
+                }
+            }
+
             let Some(Value::Object(a_pks)) = a.get("primary_key") else {
                 return Ordering::Equal;
             };
@@ -210,22 +335,62 @@ fn normalize_search_response(mut json: Value) -> String {
             };
             format!("{b_pks:?}").cmp(&format!("{a_pks:?}"))
         });
+
         for m in matches {
             if let Some(obj) = m.as_object_mut()
                 && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
-                && let Some(truncated_score) =
-                    serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
-            // Keep 4 decimals
             {
-                obj.insert("_score".to_string(), Value::Number(truncated_score));
+                let truncated = (100.0 * score).trunc() / 100.0;
+                obj.insert(
+                    "_score".to_string(),
+                    Value::String(format!("{truncated:.2}")),
+                );
             }
         }
     }
 
     sort_json_keys(&mut json);
 
-    serde_json::to_string_pretty(&json).unwrap_or_default()
+    json
+}
+
+fn normalize_search_response(json: Value) -> String {
+    serde_json::to_string_pretty(&normalize_search_response_json(json, false)).unwrap_or_default()
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn quote_sql_path(path: &str) -> String {
+    path.split('.')
+        .map(quote_sql_identifier)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn sql_literal(value: &Value) -> Result<String, anyhow::Error> {
+    match value {
+        Value::Null => Ok("NULL".to_string()),
+        Value::Bool(boolean) => Ok(boolean.to_string()),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::String(string) => Ok(format!("'{}'", string.replace('\'', "''"))),
+        _ => Err(anyhow::anyhow!(
+            "Unsupported SQL literal value in primary key: {value}"
+        )),
+    }
+}
+
+fn json_value_to_text(value: &Value) -> Result<String, anyhow::Error> {
+    match value {
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(boolean) => Ok(boolean.to_string()),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::String(string) => Ok(string.clone()),
+        _ => serde_json::to_string(value)
+            .map_err(|source| anyhow::anyhow!("Failed to stringify JSON value: {source}")),
+    }
 }
 
 pub(crate) fn item_tpcds_dataset_w_embeddings(
@@ -1476,12 +1641,14 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     run_search(
         app2,
         vec![
+            // Constrain the search space so the parent/child test can assert exact row IDs.
             SearchTestCase::new(
                 "multi_embedding_parent_child_basic",
                 SearchTestType::Http(json!({
                     "text": "new patient",
                     "limit": 2,
-                    "datasets": ["multiple_columns"]
+                    "datasets": ["multiple_columns"],
+                    "where": "cp_catalog_page_sk = 1 OR cp_catalog_page_sk = 11"
                 })),
             ),
             SearchTestCase::new(
@@ -1490,6 +1657,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                     "text": "new patient",
                     "limit": 2,
                     "datasets": ["multiple_columns"],
+                    "where": "cp_catalog_page_sk = 1 OR cp_catalog_page_sk = 11",
                     "additional_columns": ["cp_catalog_number"],
                 })),
             ),
