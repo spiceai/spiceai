@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # CLI framework
 clap.workspace = true
+clap_complete = "4"
 
 # Async runtime
 tokio.workspace = true
