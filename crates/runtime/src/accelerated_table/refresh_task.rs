@@ -1266,19 +1266,6 @@ impl RefreshTask {
             return Ok(None);
         };
 
-        let array = result.column(0)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
-            })?;
-
-        if array.is_empty() {
-            return Ok(None);
-        }
-
-        let mut value = array.value(0) as u128;
-
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {
@@ -1287,15 +1274,54 @@ impl RefreshTask {
             });
         };
 
-        if let arrow::datatypes::DataType::Int8
-        | arrow::datatypes::DataType::Int16
-        | arrow::datatypes::DataType::Int32
-        | arrow::datatypes::DataType::Int64
-        | arrow::datatypes::DataType::UInt8
-        | arrow::datatypes::DataType::UInt16
-        | arrow::datatypes::DataType::UInt32
-        | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
-        {
+        let is_integer_time_column = matches!(
+            accelerated_field.data_type(),
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        );
+
+        let mut value: u128 = if is_integer_time_column {
+            // Integer time columns are returned as-is (not cast to Timestamp)
+            // to avoid DuckDB cast errors. Extract the integer value directly.
+            let col = result.column(0);
+            if col.is_empty() {
+                return Ok(None);
+            }
+            let int_val = arrow::compute::cast(col, &DataType::Int64)
+                .ok()
+                .and_then(|a| {
+                    a.as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .map(|arr| arr.value(0))
+                });
+            let Some(int_val) = int_val else {
+                return Err(super::Error::FailedToFindLatestTimestamp {
+                    reason: "Failed to convert integer time column value to i64.".to_string(),
+                });
+            };
+            u128::try_from(int_val).unwrap_or(0)
+        } else {
+            let array = result.column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context(super::FailedToFindLatestTimestampSnafu {
+                    reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
+                })?;
+
+            if array.is_empty() {
+                return Ok(None);
+            }
+
+            array.value(0) as u128
+        };
+
+        if is_integer_time_column {
             match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
@@ -1592,11 +1618,38 @@ pub fn max_timestamp_df(
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let expr = cast(
-        col(format!(r#""{column}""#)),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-    )
-    .alias("a");
+    let col_type = accelerator
+        .schema()
+        .field_with_name(column)
+        .map(|f| f.data_type().clone())
+        .ok();
+
+    let is_integer_time_column = matches!(
+        col_type,
+        Some(
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        )
+    );
+
+    // For integer time columns (e.g. unix_seconds, unix_millis), sorting as-is
+    // avoids DuckDB cast errors when converting integers to timestamps directly.
+    // The caller handles the conversion from integer to nanoseconds.
+    let expr = if is_integer_time_column {
+        col(format!(r#""{column}""#)).alias("a")
+    } else {
+        cast(
+            col(format!(r#""{column}""#)),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        )
+        .alias("a")
+    };
 
     accelerator_df(accelerator, &ctx)?
         .select(vec![expr])?
