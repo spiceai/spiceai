@@ -1,13 +1,10 @@
 name: Enforce Pulls with Spice
 
 on:
+  merge_group:
   pull_request_target:
     types:
       [labeled, unlabeled, opened, edited, synchronize, assigned, unassigned]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
-  cancel-in-progress: true
 
 jobs:
   enforce-pull-with-spice:
