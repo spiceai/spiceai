@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::{RecordBatch, new_empty_array}, datatypes::SchemaRef};
+use arrow::{
+    array::{RecordBatch, new_empty_array},
+    datatypes::SchemaRef,
+};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -36,15 +39,17 @@ use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
 use super::{
-    ArrowInternalSnafu, ErrorChecker, GraphQLContext, ResultTransformSnafu,
-    client::GraphQLClient,
+    ArrowInternalSnafu, ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient,
 };
 use super::{Result, client::GraphQLQuery};
 
 pub type TransformFn =
     fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
 
-fn derive_table_schema(gql_schema: &SchemaRef, transform_fn: Option<TransformFn>) -> Result<SchemaRef> {
+fn derive_table_schema(
+    gql_schema: &SchemaRef,
+    transform_fn: Option<TransformFn>,
+) -> Result<SchemaRef> {
     match transform_fn {
         Some(transform_fn) => {
             let empty_columns = gql_schema
@@ -161,12 +166,12 @@ impl GraphQLTableProviderBuilder {
             return Err(super::Error::NoJsonPointerFound {});
         }
 
-        let gql_schema = self
-            .client
-            .configured_schema()
-            .ok_or_else(|| super::Error::InternalError {
-                message: "GraphQL provider fallback requires a configured schema".to_string(),
-            })?;
+        let gql_schema =
+            self.client
+                .configured_schema()
+                .ok_or_else(|| super::Error::InternalError {
+                    message: "GraphQL provider fallback requires a configured schema".to_string(),
+                })?;
         let table_schema = derive_table_schema(&gql_schema, self.transform_fn)?;
 
         Ok(GraphQLTableProvider {
@@ -370,6 +375,62 @@ impl DisplayAs for GraphQLTableProviderExec {
     }
 }
 
+impl ExecutionPlan for GraphQLTableProviderExec {
+    fn name(&self) -> &'static str {
+        "GraphQLTableProviderExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.table_schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let mut stream = Arc::clone(&self.client).execute_paginated(
+            self.query.clone(),
+            Arc::clone(&self.gql_schema),
+            Arc::clone(&self.table_schema),
+            self.limit,
+            self.error_checker.clone(),
+            self.query_cost,
+        );
+
+        if let Some(transform_fn) = &self.transform_fn {
+            let transform_fn = *transform_fn;
+            let schema = stream.schema();
+            let tx_stream = stream.map(move |batch| {
+                batch.and_then(|b| transform_fn(&b).map_err(DataFusionError::External))
+            });
+
+            stream = Box::pin(RecordBatchStreamAdapter::new(schema, tx_stream));
+        }
+
+        Ok(stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,62 +488,9 @@ mod tests {
             .build_without_validation("query { view { nodes { id } } }")
             .expect("provider to build without validation");
 
-        assert_eq!(TableProvider::schema(&provider).field(0).name(), "renamed_id");
-    }
-}
-
-impl ExecutionPlan for GraphQLTableProviderExec {
-    fn name(&self) -> &'static str {
-        "GraphQLTableProviderExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.table_schema)
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut stream = Arc::clone(&self.client).execute_paginated(
-            self.query.clone(),
-            Arc::clone(&self.gql_schema),
-            Arc::clone(&self.table_schema),
-            self.limit,
-            self.error_checker.clone(),
-            self.query_cost,
+        assert_eq!(
+            TableProvider::schema(&provider).field(0).name(),
+            "renamed_id"
         );
-
-        if let Some(transform_fn) = &self.transform_fn {
-            let transform_fn = *transform_fn;
-            let schema = stream.schema();
-            let tx_stream = stream.map(move |batch| {
-                batch.and_then(|b| transform_fn(&b).map_err(DataFusionError::External))
-            });
-
-            stream = Box::pin(RecordBatchStreamAdapter::new(schema, tx_stream));
-        }
-
-        Ok(stream)
     }
 }

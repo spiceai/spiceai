@@ -184,9 +184,7 @@ impl Github {
     ) -> Result<(), String> {
         match response {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(
-                    "GitHub App installation {installation_id} has access to {target}"
-                );
+                tracing::debug!("GitHub App installation {installation_id} has access to {target}");
                 Ok(())
             }
             Ok(resp)
@@ -257,7 +255,9 @@ impl Github {
 
         // If no installation ID is provided, validation passes
         let Some(installation_id) = installation_id else {
-            tracing::debug!("Skipping GitHub App access validation because no installation_id was configured");
+            tracing::debug!(
+                "Skipping GitHub App access validation because no installation_id was configured"
+            );
             return Ok(());
         };
 
@@ -267,9 +267,7 @@ impl Github {
             format!("{owner}/{resource_type}")
         };
 
-        tracing::debug!(
-            "Validating GitHub App installation {installation_id} for {target}"
-        );
+        tracing::debug!("Validating GitHub App installation {installation_id} for {target}");
 
         // If there's an installation ID, we need to validate it by checking if we can get a token
         // The token provider should already be initialized at this point
@@ -481,19 +479,21 @@ impl Github {
                 });
         }
 
-        Err(if matches!(initial_build_error, graphql::Error::RateLimited { .. }) {
-            DataConnectorError::RateLimited {
-                dataconnector: "github".to_string(),
-                connector_component: table_args.get_component(),
-                source: initial_build_error.into(),
-            }
-        } else {
-            DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: table_args.get_component(),
-                source: initial_build_error.into(),
-            }
-        })
+        Err(
+            if matches!(initial_build_error, graphql::Error::RateLimited { .. }) {
+                DataConnectorError::RateLimited {
+                    dataconnector: "github".to_string(),
+                    connector_component: table_args.get_component(),
+                    source: initial_build_error.into(),
+                }
+            } else {
+                DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    connector_component: table_args.get_component(),
+                    source: initial_build_error.into(),
+                }
+            },
+        )
     }
 
     pub(crate) fn create_rest_client(
@@ -510,8 +510,11 @@ impl Github {
             );
         }
 
-        GithubRestClient::new(token, Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>)
-            .map_err(Into::into)
+        GithubRestClient::new(
+            token,
+            Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>,
+        )
+        .map_err(Into::into)
     }
 
     async fn create_files_table_provider(
@@ -1677,8 +1680,8 @@ mod tests {
 
     #[test]
     fn test_parse_github_path_allows_files_without_explicit_ref() {
-        let parsed = parse_github_path("github.com/spiceai/spiceai/files")
-            .expect("path should parse");
+        let parsed =
+            parse_github_path("github.com/spiceai/spiceai/files").expect("path should parse");
 
         assert_eq!(parsed.owner, "spiceai");
         assert_eq!(parsed.repo, Some("spiceai"));

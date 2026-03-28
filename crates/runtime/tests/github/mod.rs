@@ -163,7 +163,10 @@ fn assert_github_file_ref_results(result_batches: &[RecordBatch], expected_ref: 
         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
     }
 
-    let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let row_count = result_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
     assert_eq!(row_count, 1, "num_rows: {row_count}");
 
     assert_all_string_values(result_batches, 0, expected_ref);

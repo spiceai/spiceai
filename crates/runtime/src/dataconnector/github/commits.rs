@@ -72,8 +72,13 @@ impl GraphQLContext for CommitsTableArgs {
             .cloned()
             .collect::<Vec<_>>();
 
-        inject_parameters("history", commits_inject_parameters, &history_filters, query)
-            .map_err(find_datafusion_root)
+        inject_parameters(
+            "history",
+            commits_inject_parameters,
+            &history_filters,
+            query,
+        )
+        .map_err(find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {
@@ -92,22 +97,12 @@ impl GitHubTableArgs for CommitsTableArgs {
     }
 
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
-        let selected_ref_query = if let Some(requested_ref) = &self.requested_ref {
-            format!(
-                r#"selected_ref: ref(qualifiedName: "{requested_ref}") {{
+        let selected_ref_query = format!(
+            r"selected_ref: defaultBranchRef {{
                         {selected_ref_fields}
-                    }}"#,
-                requested_ref = requested_ref,
-                selected_ref_fields = selected_ref_fields(),
-            )
-        } else {
-            format!(
-                r#"selected_ref: defaultBranchRef {{
-                        {selected_ref_fields}
-                    }}"#,
-                selected_ref_fields = selected_ref_fields(),
-            )
-        };
+                    }}",
+            selected_ref_fields = selected_ref_fields(),
+        );
 
         let query = format!(
             r#"{{
@@ -130,7 +125,7 @@ impl GitHubTableArgs for CommitsTableArgs {
 
 fn selected_ref_fields() -> String {
     format!(
-        r#"
+        r"
             ref: name
             target {{
                 ... on Commit {{
@@ -144,13 +139,13 @@ fn selected_ref_fields() -> String {
                     }}
                 }}
             }}
-        "#,
+        ",
         history_query = history_query(),
     )
 }
 
 fn history_query() -> &'static str {
-    r#"
+    r"
         history(first: 100) {
             pageInfo {
                 hasNextPage
@@ -191,7 +186,7 @@ fn history_query() -> &'static str {
                 }
             }
         }
-    "#
+    "
 }
 
 fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
@@ -233,12 +228,10 @@ fn inject_commit_ref_parameter(
     let mut all_selections: Vec<&mut Selection<'_, String>> = Vec::new();
     for def in &mut query.ast_mut().definitions {
         let selections = match def {
-            Definition::Operation(OperationDefinition::Query(Query { selection_set, .. })) => {
-                &mut selection_set.items
-            }
-            Definition::Operation(OperationDefinition::SelectionSet(selection_set)) => {
-                &mut selection_set.items
-            }
+            Definition::Operation(
+                OperationDefinition::Query(Query { selection_set, .. })
+                | OperationDefinition::SelectionSet(selection_set),
+            ) => &mut selection_set.items,
             _ => continue,
         };
 
@@ -313,15 +306,12 @@ fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
         if let Some(pr_value) = commit.remove("associated_pull_request_number") {
             commit.insert(
                 "associated_pull_request_number".to_string(),
-                extract_associated_pull_request_number(pr_value),
+                extract_associated_pull_request_number(&pr_value),
             );
         }
 
-        let flattened = unnest_json_object_to_depth(
-            &Value::Object(commit),
-            1,
-            &DuplicateBehavior::Error,
-        )?;
+        let flattened =
+            unnest_json_object_to_depth(&Value::Object(commit), 1, &DuplicateBehavior::Error)?;
         commits.extend(flattened);
     }
 
@@ -336,7 +326,7 @@ fn commit_history_from_target(target: &Value) -> Option<&Value> {
     })
 }
 
-fn extract_associated_pull_request_number(value: Value) -> Value {
+fn extract_associated_pull_request_number(value: &Value) -> Value {
     value
         .get("nodes")
         .and_then(Value::as_array)
@@ -429,7 +419,10 @@ mod tests {
         assert!(query.contains("associated_pull_request_number: associatedPullRequests(first: 1)"));
         assert!(query.contains("status: statusCheckRollup"));
         assert_eq!(graphql_params.json_pointer, Some(COMMITS_JSON_POINTER));
-        assert!(matches!(graphql_params.unnest_behavior, UnnestBehavior::Custom(_)));
+        assert!(matches!(
+            graphql_params.unnest_behavior,
+            UnnestBehavior::Custom(_)
+        ));
     }
 
     #[test]
@@ -443,8 +436,18 @@ mod tests {
 
         let graphql_params = args.get_graphql_values();
         let query = graphql_params.query.as_ref();
+        let mut query_ast =
+            GraphQLQuery::try_from(Arc::clone(&graphql_params.query)).expect("query should parse");
 
-        assert!(query.contains("selected_ref: ref(qualifiedName: \"trunk\")"));
+        args.inject_parameters(&[], &mut query_ast)
+            .expect("requested ref should be injected into the query AST");
+        let injected_query = query_ast
+            .to_string(None, None)
+            .expect("query string should serialize");
+
+        assert!(query.contains("selected_ref: defaultBranchRef"));
+        assert!(!query.contains("qualifiedName: \"trunk\""));
+        assert!(injected_query.contains("selected_ref: ref(qualifiedName: \"trunk\")"));
     }
 
     #[test]
@@ -477,8 +480,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let row = rows[0].as_object().expect("row should be an object");
         assert_eq!(row.get("ref"), Some(&Value::String("trunk".to_string())));
-        assert_eq!(row.get("author_name"), Some(&Value::String("Alice".to_string())));
-        assert_eq!(row.get("status"), Some(&Value::String("SUCCESS".to_string())));
+        assert_eq!(
+            row.get("author_name"),
+            Some(&Value::String("Alice".to_string()))
+        );
+        assert_eq!(
+            row.get("status"),
+            Some(&Value::String("SUCCESS".to_string()))
+        );
         assert_eq!(row.get("associated_pull_request_number"), Some(&json!(42)));
     }
 

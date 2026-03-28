@@ -1889,8 +1889,9 @@ mod tests {
             }
         }
 
-        let rate_limited_response = serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
-            .expect("Failed to construct json");
+        let rate_limited_response =
+            serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
+                .expect("Failed to construct json");
         let rate_limited_result = handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response);
         match rate_limited_result {
             Ok(()) => panic!("Expected rate-limited error"),

@@ -68,17 +68,16 @@ impl GraphQLContext for ProjectsTableArgs {
                     );
                     if let Some(errors_array) = errors.as_array() {
                         for error in errors_array {
-                            if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
-                                if message
+                            if let Some(message) = error.get("message").and_then(|m| m.as_str())
+                                && message
                                     .contains("Something went wrong while executing your query")
-                                {
-                                    tracing::error!(
-                                        "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
-                                    );
-                                    return Err(data_components::graphql::Error::InvalidCredentialsOrPermissions {
-                                    message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
-                                });
-                                }
+                            {
+                                tracing::error!(
+                                    "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
+                                );
+                                return Err(data_components::graphql::Error::InvalidCredentialsOrPermissions {
+                                message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
+                            });
                             }
                         }
                     }

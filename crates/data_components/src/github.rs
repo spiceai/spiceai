@@ -468,7 +468,7 @@ fn github_response_message_from_text(response_text: &str) -> Option<String> {
         .ok()
         .as_ref()
         .and_then(github_response_message)
-        .or_else(|| Some(trimmed.to_string()))
+        .or_else(|| Some(sanitize_github_error_detail(trimmed)))
 }
 
 fn github_is_rate_limit_message(message: &str) -> bool {
@@ -476,12 +476,18 @@ fn github_is_rate_limit_message(message: &str) -> bool {
     message.contains("rate limit") || message.contains("secondary rate")
 }
 
+fn sanitize_github_error_detail(detail: &str) -> String {
+    detail.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn append_github_error_detail(mut message: String, detail: Option<&str>) -> String {
-    if let Some(detail) = detail.map(str::trim).filter(|detail| !detail.is_empty())
-        && !message.contains(detail)
+    if let Some(detail) = detail
+        .map(sanitize_github_error_detail)
+        .filter(|detail| !detail.is_empty())
+        && !message.contains(&detail)
     {
         message.push_str(" Details: ");
-        message.push_str(detail);
+        message.push_str(&detail);
     }
 
     message
@@ -517,9 +523,7 @@ fn format_github_status_error(
         _ if status.is_server_error() => format!(
             "Failed to {action} for GitHub repository {repo_name}: GitHub is temporarily unavailable (HTTP {status}). Spice retried automatically."
         ),
-        _ => format!(
-            "Failed to {action} for GitHub repository {repo_name} (HTTP {status})."
-        ),
+        _ => format!("Failed to {action} for GitHub repository {repo_name} (HTTP {status})."),
     };
 
     append_github_error_detail(message, detail)
@@ -555,9 +559,7 @@ fn format_github_request_error(
         );
     }
 
-    format!(
-        "Failed to {action} for GitHub repository {repo_name}: {error}"
-    )
+    format!("Failed to {action} for GitHub repository {repo_name}: {error}")
 }
 
 async fn read_github_error_response(
@@ -827,7 +829,13 @@ impl GithubRestClient {
 
         if response.status().is_success() {
             let git_tree = response.json::<GitTree>().await?;
-            tracing::trace!(owner, repo, ref_name = tree_sha, entries = git_tree.tree.len(), "Received GitHub file tree");
+            tracing::trace!(
+                owner,
+                repo,
+                ref_name = tree_sha,
+                entries = git_tree.tree.len(),
+                "Received GitHub file tree"
+            );
             return Ok(git_tree);
         }
 
@@ -844,21 +852,13 @@ impl GithubRestClient {
             })?;
         }
 
-        Err(format_github_status_error(
-            &action,
-            owner,
-            repo,
-            response_status,
-            detail.as_deref(),
+        Err(
+            format_github_status_error(&action, owner, repo, response_status, detail.as_deref())
+                .into(),
         )
-        .into())
     }
 
-    async fn fetch_default_branch(
-        &self,
-        owner: &str,
-        repo: &str,
-    ) -> Result<String> {
+    async fn fetch_default_branch(&self, owner: &str, repo: &str) -> Result<String> {
         self.rate_limiter
             .check_rate_limit()
             .await
@@ -950,9 +950,11 @@ impl GithubRestClient {
             client.get(&download_url).headers(headers).send().await
         })
         .await
-        .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
-            format_github_request_error(&action, owner, repo, &e).into()
-        })?;
+        .map_err(
+            |e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
+                format_github_request_error(&action, owner, repo, &e).into()
+            },
+        )?;
 
         rate_limiter.update_from_headers(response.headers()).await;
 
@@ -1387,10 +1389,7 @@ impl GithubRestClient {
                     message
                 );
             } else {
-                tracing::warn!(
-                    "{} Workflow logs will be omitted for this run.",
-                    message
-                );
+                tracing::warn!("{} Workflow logs will be omitted for this run.", message);
             }
 
             // Return empty map if logs aren't available
@@ -1729,8 +1728,8 @@ pub fn error_checker(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_github_status_error, github_response_message, ref_from_filter,
-        requested_ref_from_filters,
+        format_github_status_error, github_response_message, github_response_message_from_text,
+        ref_from_filter, requested_ref_from_filters,
     };
     use datafusion::prelude::{col, lit};
     use reqwest::StatusCode;
@@ -1745,7 +1744,10 @@ mod tests {
 
     #[test]
     fn test_requested_ref_from_filters_uses_first_supported_ref_filter() {
-        let filters = vec![col("ref").eq(lit("release/v1")), col("path").eq(lit("README.md"))];
+        let filters = vec![
+            col("ref").eq(lit("release/v1")),
+            col("path").eq(lit("README.md")),
+        ];
 
         assert_eq!(
             requested_ref_from_filters(&filters).as_deref(),
@@ -1780,5 +1782,13 @@ mod tests {
         assert!(message.contains("required permissions"));
         assert!(message.contains("Resource not accessible by integration"));
         assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn test_github_response_message_from_text_sanitizes_newlines() {
+        assert_eq!(
+            github_response_message_from_text("first line\nsecond line\r\nthird line").as_deref(),
+            Some("first line second line third line")
+        );
     }
 }
