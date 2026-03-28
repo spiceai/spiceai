@@ -1,0 +1,111 @@
+---
+name: pr-develop
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches:
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'develop' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  RUST_PROFILE: lint
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 1
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  check_changes:
+    name: Check for code changes
+    runs-on: spiceai-macos
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
+  check:
+    name: Check (Develop)
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    runs-on: spiceai-macos
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Run cargo check
+        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp --workspace --exclude libnfs --locked
+
+      - name: Validate datafusion-table-providers commit
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
+  build-and-test:
+    name: Build and Test (Develop)
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    runs-on: spiceai-macos
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Build CLI and run nextest
+        run: make build-cli nextest
+        env:
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+          NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
+
+      - name: Build testoperator
+        run: cargo build -p testoperator --all-features --locked
+
+      - name: Check if Cargo.lock is updated
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
