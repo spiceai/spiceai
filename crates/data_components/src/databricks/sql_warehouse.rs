@@ -63,7 +63,7 @@ pub enum Error {
     UnsupportedType { ty: String },
 
     #[snafu(display(
-        "The table '{dataset_name}' has no column metadata registered. Run 'SELECT * FROM {dataset_name} LIMIT 1' in Databricks to populate the schema. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+        "The table '{dataset_name}' has no column metadata registered. Verify the table exists and run 'SELECT * FROM {dataset_name} LIMIT 1' in Databricks to populate the schema. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
     ))]
     TableSchemaNotRegistered { dataset_name: String },
 
@@ -570,9 +570,8 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
     let result = json_value
         .get("result")
-        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+        .ok_or_else(|| Error::TableSchemaNotRegistered {
             dataset_name: dataset_name.to_string(),
-            reason: "response is missing the 'result' field".to_string(),
         })?;
 
     let data_array_value = result.get("data_array");
@@ -937,7 +936,7 @@ mod tests {
         let err =
             schema_from_json(&response, "test_table").expect_err("should fail without result");
         assert!(
-            matches!(&err, Error::UnexpectedSchemaResponse { .. }),
+            matches!(&err, Error::TableSchemaNotRegistered { .. }),
             "unexpected error: {err}"
         );
     }
