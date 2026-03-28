@@ -6,7 +6,31 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": "0.79",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "\n2"
+        ]
+      },
+      "primary_key": {
+        "id": 612
+      }
+    },
+    {
+      "_score": "0.78",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          " is 2."
+        ]
+      },
+      "primary_key": {
+        "id": 349
+      }
+    },
+    {
+      "_score": "0.55",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -18,7 +42,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.55,
+      "_score": "0.55",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -27,30 +51,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      }
-    },
-    {
-      "_score": 0.53,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24"
-        ]
-      },
-      "primary_key": {
-        "id": 468
-      }
-    },
-    {
-      "_score": 0.51,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "\n_{14}P_{4} = 14 \\times 13 \\times 12 \\times 11 = \\boxed{24,\\!024"
-        ]
-      },
-      "primary_key": {
-        "id": 41
       }
     }
   ]

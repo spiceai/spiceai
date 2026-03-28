@@ -972,6 +972,10 @@ fn get_responses_model_with_tools(
     model
         .params
         .insert("tools".into(), serde_json::Value::String("auto".into()));
+    model.params.insert(
+        "responses_api".into(),
+        serde_json::Value::String("enabled".into()),
+    );
     model
 }
 
