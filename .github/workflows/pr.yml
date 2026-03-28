@@ -8,6 +8,7 @@ on:
       - release-*
       - release/*
       - feature-*
+  merge_group:
   workflow_dispatch:
     inputs:
       profile_option:
@@ -65,10 +66,15 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
+      - name: Validate datafusion-table-providers commit
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
   # Run Rust linting
   lint-rust:
     name: Rust Lint
-    runs-on: spiceai-dev-large-runners
+    runs-on: spiceai-dev-runners
     needs: check_changes
 
     steps:
@@ -121,12 +127,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-
-      - name: Validate datafusion-table-providers commit
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: bash .github/scripts/validate_table_providers_commit.sh
-        env:
-          BRANCH: spiceai-52
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
