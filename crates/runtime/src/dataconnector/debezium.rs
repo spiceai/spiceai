@@ -382,12 +382,11 @@ impl DataConnector for Debezium {
                             schema_fields: latest_fields,
                         };
 
-                        if dataset.is_file_accelerated() {
-                            if let Err(e) =
+                        if dataset.is_file_accelerated()
+                            && let Err(e) =
                                 set_metadata_to_accelerator(dataset, &updated_metadata).await
-                            {
-                                tracing::warn!("Failed to persist updated schema metadata: {e}");
-                            }
+                        {
+                            tracing::warn!("Failed to persist updated schema metadata: {e}");
                         }
 
                         (updated_metadata, Arc::new(updated_schema))
