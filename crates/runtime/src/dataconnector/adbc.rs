@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -144,21 +144,55 @@ fn adbc_cleanup_sender()
     })
 }
 
-type ConnectorCache =
-    parking_lot::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>>>;
+type ConnectorCache = parking_lot::Mutex<HashMap<String, Arc<ConnectorCacheEntry>>>;
+
+#[derive(Default)]
+enum ConnectorCacheState {
+    #[default]
+    Vacant,
+    Initializing,
+    Ready(Weak<dyn DataConnector>),
+}
+
+struct ConnectorCacheEntry {
+    state: parking_lot::Mutex<ConnectorCacheState>,
+    notify: tokio::sync::Notify,
+}
+
+impl ConnectorCacheState {
+    fn should_retain(&self) -> bool {
+        match self {
+            Self::Vacant => false,
+            Self::Initializing => true,
+            Self::Ready(connector) => connector.upgrade().is_some(),
+        }
+    }
+}
+
+impl ConnectorCacheEntry {
+    fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(ConnectorCacheState::Vacant),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn should_retain(&self) -> bool {
+        self.state.lock().should_retain()
+    }
+}
 
 pub struct AdbcFactory {
-    /// Cache of in-flight or completed ADBC connector initializations keyed by
-    /// a deterministic representation of their configuration. Datasets with
-    /// identical ADBC config share a single connector instance and connection pool.
+    /// Cache of per-config ADBC connector entries keyed by a deterministic
+    /// representation of their configuration. Datasets with identical ADBC
+    /// config share a single connector initialization and connection pool while
+    /// they remain in use.
     ///
-    /// Each entry is an `Arc<tokio::sync::OnceCell<Arc<dyn DataConnector>>>` so only
-    /// one initialization runs per key — concurrent callers await the same future
-    /// instead of racing. Because the cache holds a strong `Arc` to the connector,
-    /// connectors and their pools are kept alive for as long as this factory
-    /// instance is alive (typically the lifetime of the process). Cache entries
-    /// are not evicted automatically; each distinct ADBC config will remain
-    /// cached, trading higher memory usage for connector and pool reuse.
+    /// Each entry tracks whether initialization is in-flight or a ready
+    /// connector is currently alive. Ready entries store a `Weak` reference so
+    /// unused connectors and their pools can be dropped after dataset removal,
+    /// reload, or credential rotation. Stale and failed entries are pruned
+    /// opportunistically on subsequent creates.
     cache: ConnectorCache,
 }
 
@@ -430,27 +464,63 @@ impl DataConnectorFactory for AdbcFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let cache_key = compute_adbc_cache_key(&params);
 
-        // Get or insert a OnceCell for this key. This ensures only one
-        // initialization runs per key — concurrent callers share the cell.
-        // Note: we intentionally do NOT evict entries here. Calling
-        // `cell.get().is_some()` would remove cells where initialization is
-        // still in-flight (`OnceCell` not yet set), breaking the single-init
-        // guarantee and causing duplicate connector/pool initializations.
-        let cell = {
+        let entry = {
             let mut cache = self.cache.lock();
+            cache.retain(|_, entry| entry.should_retain());
             Arc::clone(
                 cache
                     .entry(cache_key)
-                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+                    .or_insert_with(|| Arc::new(ConnectorCacheEntry::new())),
             )
         };
 
         Box::pin(async move {
-            // get_or_try_init ensures only one initialization runs at a time
-            // per key — concurrent callers await the same future.
-            let result = cell.get_or_try_init(|| Self::init_connector(params)).await;
+            enum CacheAction {
+                Return(Arc<dyn DataConnector>),
+                Initialize,
+                Wait,
+            }
 
-            result.map(Arc::clone)
+            loop {
+                let notified = entry.notify.notified();
+                let action = {
+                    let mut state = entry.state.lock();
+                    match &*state {
+                        ConnectorCacheState::Ready(connector) => {
+                            if let Some(connector) = connector.upgrade() {
+                                CacheAction::Return(connector)
+                            } else {
+                                *state = ConnectorCacheState::Initializing;
+                                CacheAction::Initialize
+                            }
+                        }
+                        ConnectorCacheState::Vacant => {
+                            *state = ConnectorCacheState::Initializing;
+                            CacheAction::Initialize
+                        }
+                        ConnectorCacheState::Initializing => CacheAction::Wait,
+                    }
+                };
+
+                match action {
+                    CacheAction::Return(connector) => return Ok(connector),
+                    CacheAction::Initialize => {
+                        let result = Self::init_connector(params.clone()).await;
+                        {
+                            let mut state = entry.state.lock();
+                            *state = match &result {
+                                Ok(connector) => {
+                                    ConnectorCacheState::Ready(Arc::downgrade(connector))
+                                }
+                                Err(_) => ConnectorCacheState::Vacant,
+                            };
+                        }
+                        entry.notify.notify_waiters();
+                        return result;
+                    }
+                    CacheAction::Wait => notified.await,
+                }
+            }
         })
     }
     fn prefix(&self) -> &'static str {
@@ -1144,6 +1214,43 @@ mod tests {
             compute_adbc_cache_key(&params_a),
             compute_adbc_cache_key(&params_b)
         );
+    }
+
+    #[derive(Debug)]
+    struct TestConnector;
+
+    #[async_trait]
+    impl DataConnector for TestConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> crate::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
+            unreachable!("test connector is not used to read data")
+        }
+    }
+
+    #[test]
+    fn test_connector_cache_state_prunes_expired_ready_entries() {
+        let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
+        let state = ConnectorCacheState::Ready(Arc::downgrade(&connector));
+
+        assert!(state.should_retain());
+
+        drop(connector);
+
+        assert!(!state.should_retain());
+    }
+
+    #[test]
+    fn test_connector_cache_entry_retains_inflight_initialization() {
+        let entry = ConnectorCacheEntry::new();
+        *entry.state.lock() = ConnectorCacheState::Initializing;
+
+        assert!(entry.should_retain());
     }
 
     fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
