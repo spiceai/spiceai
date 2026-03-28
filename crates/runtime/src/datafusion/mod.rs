@@ -1645,7 +1645,7 @@ impl DataFusion {
             if !acceleration_settings.caching_stale_if_error.is_enabled() {
                 if dataset.retention_period().is_some() {
                     tracing::warn!(
-                        dataset = dataset.name,
+                        dataset = %dataset.name,
                         "User-specified retention_period is overridden by automatic cache retention in caching mode",
                     );
                 }
