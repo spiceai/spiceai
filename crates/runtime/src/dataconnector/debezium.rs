@@ -26,10 +26,11 @@ use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
-use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
-use data_components::debezium::{self, change_event};
+use data_components::debezium::change_event::{self, ChangeEvent, ChangeEventKey};
+use data_components::debezium::{self};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
+use data_components::kafka::rdkafka;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -349,14 +350,67 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                    metadata.schema_fields.iter().collect(),
+                // Check for schema evolution by peeking at the latest Kafka message.
+                // If the schema has changed since we last cached it, update the metadata.
+                let (metadata, schema) = match peek_latest_schema_fields(
+                    topic,
+                    &self.kafka_config,
                 )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+                .await
+                {
+                    Some((latest_fields, latest_pks))
+                        if latest_fields != metadata.schema_fields =>
+                    {
+                        tracing::info!(
+                            "Detected schema evolution for dataset {dataset_name}, updating cached schema"
+                        );
+
+                        let updated_schema =
+                            debezium::arrow::convert_fields_to_arrow_schema(
+                                latest_fields.iter().collect(),
+                            )
+                            .boxed()
+                            .context(super::UnableToGetReadProviderSnafu {
+                                dataconnector: "debezium",
+                                connector_component: ConnectorComponent::from(dataset),
+                            })?;
+
+                        let updated_metadata = DebeziumKafkaMetadata {
+                            consumer_group_id: metadata.consumer_group_id,
+                            topic: metadata.topic,
+                            primary_keys: if latest_pks.is_empty() {
+                                metadata.primary_keys
+                            } else {
+                                latest_pks
+                            },
+                            schema_fields: latest_fields,
+                        };
+
+                        if dataset.is_file_accelerated() {
+                            if let Err(e) =
+                                set_metadata_to_accelerator(dataset, &updated_metadata).await
+                            {
+                                tracing::warn!(
+                                    "Failed to persist updated schema metadata: {e}"
+                                );
+                            }
+                        }
+
+                        (updated_metadata, Arc::new(updated_schema))
+                    }
+                    _ => {
+                        let cached_schema =
+                            debezium::arrow::convert_fields_to_arrow_schema(
+                                metadata.schema_fields.iter().collect(),
+                            )
+                            .boxed()
+                            .context(super::UnableToGetReadProviderSnafu {
+                                dataconnector: "debezium",
+                                connector_component: ConnectorComponent::from(dataset),
+                            })?;
+                        (metadata, Arc::new(cached_schema))
+                    }
+                };
 
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
@@ -365,7 +419,7 @@ impl DataConnector for Debezium {
                     },
                 )?;
 
-                (kafka_consumer, metadata, Arc::new(schema))
+                (kafka_consumer, metadata, schema)
             }
             None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
@@ -453,6 +507,124 @@ async fn set_metadata_to_accelerator(
     let debezium_kafka_sys =
         DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     debezium_kafka_sys.upsert(metadata).await
+}
+
+/// Peeks at the latest Kafka message in the topic to detect schema evolution.
+///
+/// Creates a temporary consumer with a unique group ID, seeks to the last
+/// message in each partition, and reads it to extract the current schema fields.
+/// Returns `None` if no messages are available or on any error (fails silently
+/// since this is a best-effort schema evolution check).
+async fn peek_latest_schema_fields(
+    topic: &str,
+    kafka_config: &KafkaConfig,
+) -> Option<(Vec<change_event::Field>, Vec<String>)> {
+    use rdkafka::{
+        consumer::{BaseConsumer, Consumer},
+        ClientConfig, Message, Offset, TopicPartitionList,
+    };
+
+    let peek_result: Option<(Vec<change_event::Field>, Vec<String>)> =
+        tokio::task::spawn_blocking({
+            let brokers = kafka_config.brokers.clone();
+            let security_protocol = kafka_config.security_protocol.clone();
+            let sasl_mechanism = kafka_config.sasl_mechanism.clone();
+            let sasl_username = kafka_config.sasl_username.clone();
+            let sasl_password = kafka_config.sasl_password.clone();
+            let ssl_ca_location = kafka_config.ssl_ca_location.clone();
+            let enable_ssl_cert_verification = kafka_config.enable_ssl_certificate_verification;
+            let ssl_endpoint_id_algo = kafka_config.ssl_endpoint_identification_algorithm;
+            let topic = topic.to_string();
+
+            move || {
+                let mut config = ClientConfig::new();
+                config
+                    .set(
+                        "group.id",
+                        format!("spice-schema-check-{}", uuid::Uuid::new_v4()),
+                    )
+                    .set("bootstrap.servers", &brokers)
+                    .set("security.protocol", &security_protocol)
+                    .set("enable.auto.commit", "false");
+
+                if security_protocol.to_lowercase() != "plaintext" {
+                    config.set("sasl.mechanism", &sasl_mechanism);
+                }
+                if let Some(ref username) = sasl_username {
+                    config.set("sasl.username", username);
+                }
+                if let Some(ref password) = sasl_password {
+                    config.set("sasl.password", password);
+                }
+                if let Some(ref ca_location) = ssl_ca_location {
+                    config.set("ssl.ca.location", ca_location);
+                }
+                config
+                    .set(
+                        "enable.ssl.certificate.verification",
+                        if enable_ssl_cert_verification {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    )
+                    .set(
+                        "ssl.endpoint.identification.algorithm",
+                        ssl_endpoint_id_algo.to_string(),
+                    );
+
+                let consumer: BaseConsumer = config.create().ok()?;
+
+                let metadata = consumer
+                    .fetch_metadata(Some(&topic), Duration::from_secs(10))
+                    .ok()?;
+
+                let topic_metadata = metadata.topics().iter().find(|t| t.name() == topic)?;
+
+                let mut tpl = TopicPartitionList::new();
+                let mut has_messages = false;
+                for partition in topic_metadata.partitions() {
+                    let (_, high) = consumer
+                        .fetch_watermarks(&topic, partition.id(), Duration::from_secs(10))
+                        .ok()?;
+                    if high > 0 {
+                        tpl.add_partition_offset(
+                            &topic,
+                            partition.id(),
+                            Offset::Offset(high - 1),
+                        )
+                        .ok()?;
+                        has_messages = true;
+                    }
+                }
+
+                if !has_messages {
+                    return None;
+                }
+
+                consumer.assign(&tpl).ok()?;
+
+                // Poll for the latest message with a 10-second timeout
+                let msg = consumer.poll(Duration::from_secs(10))?.ok()?;
+
+                let primary_keys = msg
+                    .key()
+                    .and_then(|key_bytes| serde_json::from_slice::<ChangeEventKey>(key_bytes).ok())
+                    .map(|key| key.get_primary_key())
+                    .unwrap_or_default();
+
+                let payload = msg.payload()?;
+                let event: ChangeEvent = serde_json::from_slice(payload).ok()?;
+                let schema_fields: Vec<change_event::Field> =
+                    event.get_schema_fields()?.into_iter().cloned().collect();
+
+                Some((schema_fields, primary_keys))
+            }
+        })
+        .await
+        .ok()?;
+
+    peek_result
 }
 
 async fn get_metadata_from_kafka(
