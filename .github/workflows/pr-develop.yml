@@ -24,7 +24,7 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
-  check-changes:
+  check_changes:
     name: Check for code changes
     runs-on: spiceai-macos
     outputs:
@@ -40,8 +40,8 @@ jobs:
 
   check:
     name: Check (Develop)
-    needs: check-changes
-    if: needs.check-changes.outputs.relevant_changes == 'true'
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
 
     steps:
@@ -68,8 +68,8 @@ jobs:
 
   build-and-test:
     name: Build and Test (Develop)
-    needs: check-changes
-    if: needs.check-changes.outputs.relevant_changes == 'true'
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
 
     steps:
