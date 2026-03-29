@@ -37,7 +37,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionTableProvider};
+use data_components::delete::DeletionExec;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -4093,26 +4093,74 @@ impl TableProvider for CayenneTableProvider {
 
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
-}
 
-// Implement DeletionTableProvider for Cayenne
-#[async_trait]
-impl DeletionTableProvider for CayenneTableProvider {
     async fn delete_from(
         &self,
         _state: &dyn Session,
-        filters: &[Expr],
+        filters: Vec<Expr>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        if self.file_based_deletes_preferred(filters) {
+        if self.file_based_deletes_preferred(&filters) {
             tracing::debug!(
                 "Table '{}': using file-based retention delete path",
                 self.table_metadata.table_name,
             );
-            return self.delete_using_files(filters);
+            return self.delete_using_files(&filters);
         }
 
         // Default path: deletion vectors via CayenneDeletionSink
-        self.delete_using_deletion_vectors(filters)
+        self.delete_using_deletion_vectors(&filters)
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let schema = self.schema();
+        let table_source = Arc::new(datafusion::datasource::DefaultTableSource::new(Arc::new(
+            self.clone_for_write(),
+        )));
+        let mut plan =
+            datafusion_expr::LogicalPlanBuilder::scan("__update_source", table_source, None)?
+                .build()?;
+
+        if let Some(combined) = filters.clone().into_iter().reduce(Expr::and) {
+            plan = datafusion_expr::LogicalPlanBuilder::from(plan)
+                .filter(combined)?
+                .build()?;
+        }
+
+        let mut proj_exprs = Vec::new();
+        for field in schema.fields() {
+            let col_name = field.name();
+            if let Some((_, expr)) = assignments.iter().find(|(name, _)| name == col_name) {
+                proj_exprs.push(expr.clone().alias(col_name));
+            } else {
+                proj_exprs.push(datafusion_expr::col(col_name));
+            }
+        }
+        plan = datafusion_expr::LogicalPlanBuilder::from(plan)
+            .project(proj_exprs)?
+            .build()?;
+
+        let source_plan = state.create_physical_plan(&plan).await?;
+        let session_state = state
+            .as_any()
+            .downcast_ref::<datafusion::execution::SessionState>()
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "Session is not a SessionState".to_string(),
+                )
+            })?
+            .clone();
+
+        Ok(Arc::new(data_components::update::UpdateExec::new(
+            source_plan,
+            Arc::new(self.clone_for_write()),
+            session_state,
+            filters,
+        )))
     }
 }
 
@@ -4142,8 +4190,8 @@ impl CayenneTableProvider {
             Some(self.build_protected_snapshot_listing_tables()?)
         };
 
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(FileBasedDeletionSink::new(
+        Ok(Arc::new(DeletionExec::new(Arc::new(
+            FileBasedDeletionSink::new(
                 Arc::clone(&self.listing_table),
                 protected_snapshot_tables,
                 filter.clone(),
@@ -4154,9 +4202,8 @@ impl CayenneTableProvider {
                 self.table_metadata.path.clone(),
                 Arc::clone(self.context.runtime_env()),
                 Arc::clone(&self.write_lock),
-            )),
-            &self.table_metadata.schema,
-        )))
+            ),
+        ))))
     }
 
     /// Main deletion-vector path via [`CayenneDeletionSink`].
@@ -4170,8 +4217,8 @@ impl CayenneTableProvider {
             .map(|(_, table)| table)
             .collect();
 
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(CayenneDeletionSink::new(
+        Ok(Arc::new(DeletionExec::new(Arc::new(
+            CayenneDeletionSink::new(
                 self.table_metadata.clone(),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.listing_table),
@@ -4183,9 +4230,8 @@ impl CayenneTableProvider {
                 snapshot_tables,
                 Arc::clone(self.context.runtime_env()),
                 Some(Arc::clone(&self.write_lock)),
-            )),
-            &self.table_metadata.schema,
-        )))
+            ),
+        ))))
     }
 
     /// Build listing tables for all protected snapshots.
