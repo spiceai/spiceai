@@ -64,7 +64,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::common::ToDFSchema;
+use datafusion::common::{Constraint, Constraints, ToDFSchema};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
@@ -434,6 +434,57 @@ fn validate_distributed_engine(
         .fail();
     }
     Ok(())
+}
+
+/// Remap constraint column indices from the source schema to the refresh schema.
+///
+/// When `refresh_sql` selects a subset or reordered set of columns, the primary key
+/// column indices in the source constraints no longer match the refresh schema.
+/// This function maps column names from source indices to their positions in the
+/// refresh schema. Returns `None` if any primary key column is missing from the
+/// refresh schema.
+fn remap_constraints_to_refresh_schema(
+    source_constraints: &Constraints,
+    source_schema: &SchemaRef,
+    refresh_schema: &SchemaRef,
+) -> Option<Constraints> {
+    // Helper to remap column indices from source to refresh schema using bounds-checked lookups.
+    let remap_indices = |indices: &[usize]| -> Option<Vec<usize>> {
+        indices
+            .iter()
+            .map(|&idx| {
+                let field = source_schema.fields().get(idx)?;
+                refresh_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == field.name())
+            })
+            .collect()
+    };
+
+    // If any PrimaryKey constraint cannot be fully remapped, return None entirely
+    // to avoid creating a table with Unique-only constraints that downstream code
+    // might incorrectly treat as having upsert (on_conflict) capability.
+    let has_unmappable_pk = source_constraints
+        .iter()
+        .any(|c| matches!(c, Constraint::PrimaryKey(indices) if remap_indices(indices).is_none()));
+    if has_unmappable_pk {
+        return None;
+    }
+
+    let remapped: Vec<Constraint> = source_constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            Constraint::PrimaryKey(indices) => remap_indices(indices).map(Constraint::PrimaryKey),
+            Constraint::Unique(indices) => remap_indices(indices).map(Constraint::Unique),
+        })
+        .collect();
+
+    if remapped.is_empty() {
+        None
+    } else {
+        Some(Constraints::new_unverified(remapped))
+    }
 }
 
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
@@ -911,48 +962,29 @@ impl DataFusion {
         &self,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
-        let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
-        if let Some(catalog) = self.resolve_catalog_provider(table_reference)
-            && let Some(aware) = cayenne_ddl::as_partition_aware(catalog.as_ref())
-            && let Some(expr_string) = aware
-                .table_partition_expr(schema_name, table_reference.table())
-                .await
-                .boxed()
-                .map_err(DataFusionError::External)?
-        {
-            let resolved = self
-                .resolve_partition_label(&expr_string, table_reference)
-                .await?
-                .unwrap_or(expr_string);
-            return Ok(Some(resolved));
-        }
-        Ok(None)
+        let catalog = self.resolve_catalog_provider(table_reference);
+        resolve_table_partition_expr(
+            catalog.as_deref(),
+            self.executor_registry.as_deref(),
+            table_reference,
+        )
+        .await
     }
 
-    /// If `label` is an auto-generated partition label like `"expr0"`, resolve it to
-    /// the original SQL expression string from the partition manager metadata.
-    async fn resolve_partition_label(
-        &self,
-        label: &str,
+    /// Returns the partition expression string for a table using only a `SessionContext`
+    /// and `ExecutorRegistry`, without requiring a full `DataFusion` reference.
+    ///
+    /// This is used by `DistributedCayenneInsertExec` which is constructed from the
+    /// extension planner and only has access to the session context.
+    pub async fn get_table_partition_expr_from_ctx(
+        ctx: &datafusion::prelude::SessionContext,
+        executor_registry: &ExecutorRegistry,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
-        let Some(Ok(idx)) = label.strip_prefix("expr").map(str::parse::<usize>) else {
-            return Ok(None);
-        };
-        let Some(ref executor_registry) = self.executor_registry else {
-            return Ok(None);
-        };
-
-        let Some(metadata) = executor_registry
-            .federated_partition_manager()
-            .get_table_metadata(table_reference)
+        let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+        let catalog = ctx.catalog(catalog_name);
+        resolve_table_partition_expr(catalog.as_deref(), Some(executor_registry), table_reference)
             .await
-            .boxed()
-            .map_err(DataFusionError::External)?
-        else {
-            return Ok(None);
-        };
-        Ok(metadata.partition_expressions.get(idx).cloned())
     }
 
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
@@ -1391,12 +1423,12 @@ impl DataFusion {
             let (parsed, schema) = refresh_sql::parse_refresh_sql(
                 dataset.name.clone(),
                 sql_str.as_str(),
-                source_schema,
+                Arc::clone(&source_schema),
             )
             .context(RefreshSqlSnafu)?;
             (Some(parsed), schema)
         } else {
-            (None, source_schema)
+            (None, Arc::clone(&source_schema))
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1414,20 +1446,24 @@ impl DataFusion {
             );
         }
 
-        // Determine if we should pass constraints to the accelerator
-        // Only pass constraints if not using refresh_sql (schema might have different column ordering)
+        // Get source constraints (primary keys) for upsert behavior.
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
         // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
-        let use_constraints = parsed_refresh_sql.is_none();
+        let source_constraints = match &*source_table_provider {
+            FederatedTable::Immediate(table_provider) => table_provider.constraints(),
+            FederatedTable::Deferred(_) => None,
+        };
 
-        let constraints = if use_constraints {
-            match &*source_table_provider {
-                FederatedTable::Immediate(table_provider) => table_provider.constraints(),
-                FederatedTable::Deferred(_) => None,
-            }
+        // When refresh_sql is used, the accelerated table has a different schema than
+        // the source. Remap constraint column indices from the source schema to the
+        // refresh schema so that upsert/on_conflict still works correctly.
+        let constraints = if parsed_refresh_sql.is_some() {
+            source_constraints.and_then(|c| {
+                remap_constraints_to_refresh_schema(c, &source_schema, &refresh_schema)
+            })
         } else {
-            None
+            source_constraints.cloned()
         };
 
         // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
@@ -1442,7 +1478,7 @@ impl DataFusion {
             .create_accelerator_table(
                 dataset.name.clone(),
                 Arc::clone(&refresh_schema),
-                constraints,
+                constraints.as_ref(),
                 &acceleration_settings,
                 secrets,
                 Some(dataset),
@@ -2544,6 +2580,53 @@ impl DataFusion {
     }
 }
 
+/// Shared implementation for resolving a table's partition expression from its catalog
+/// provider and optional [`ExecutorRegistry`] metadata.
+///
+/// When the catalog returns an auto-generated label like `"expr0"` (used for function
+/// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
+/// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
+async fn resolve_table_partition_expr(
+    catalog: Option<&dyn CatalogProvider>,
+    executor_registry: Option<&ExecutorRegistry>,
+    table_reference: &TableReference,
+) -> Result<Option<String>, DataFusionError> {
+    let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+
+    let Some(catalog) = catalog else {
+        return Ok(None);
+    };
+
+    let Some(aware) = cayenne_ddl::as_partition_aware(catalog) else {
+        return Ok(None);
+    };
+
+    let Some(expr_string) = aware
+        .table_partition_expr(schema_name, table_reference.table())
+        .await
+        .boxed()
+        .map_err(DataFusionError::External)?
+    else {
+        return Ok(None);
+    };
+
+    // Resolve auto-generated labels (e.g. "expr0") from partition manager metadata.
+    if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
+        && let Some(executor_registry) = executor_registry
+        && let Some(metadata) = executor_registry
+            .federated_partition_manager()
+            .get_table_metadata(table_reference)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+        && let Some(original) = metadata.partition_expressions.get(idx)
+    {
+        return Ok(Some(original.clone()));
+    }
+
+    Ok(Some(expr_string))
+}
+
 #[must_use]
 pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
     match (dataset.catalog(), dataset.schema()) {
@@ -3348,6 +3431,190 @@ mod tests {
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
                 .expect("cayenne should be allowed when not in distributed mode");
+        }
+    }
+
+    mod remap_constraints_tests {
+        use super::*;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{Constraint, Constraints};
+
+        fn schema(fields: &[&str]) -> SchemaRef {
+            Arc::new(Schema::new(
+                fields
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Utf8, true))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        #[test]
+        fn remap_pk_with_reordered_columns() {
+            // Source: id(0), created_at(1), email(2)
+            // Refresh: email(0), id(1)
+            // Source PK: [0] (id) → Refresh PK: [1] (id)
+            let source = schema(&["id", "created_at", "email"]);
+            let refresh = schema(&["email", "id"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![1]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_composite_pk() {
+            // Source: id(0), org_id(1), name(2), email(3)
+            // Refresh: name(0), id(1), org_id(2)
+            // Source PK: [0, 1] (id, org_id) → Refresh PK: [1, 2]
+            let source = schema(&["id", "org_id", "name", "email"]);
+            let refresh = schema(&["name", "id", "org_id"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![1, 2]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_pk_missing_column_returns_none() {
+            // Source: id(0), name(1), email(2)
+            // Refresh: name(0), email(1) — PK column "id" is missing
+            let source = schema(&["id", "name", "email"]);
+            let refresh = schema(&["name", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn remap_same_schema_preserves_indices() {
+            // Source and refresh have the same schema
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_unique_constraint() {
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["name", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![1])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    1
+                ])]))
+            );
+        }
+
+        #[test]
+        fn remap_no_constraints_returns_none() {
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints = Constraints::new_unverified(vec![]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn remap_debezium_refresh_sql_scenario() {
+            // Simulates the exact scenario from issue #9035:
+            // Debezium source: users table with all columns
+            // refresh_sql: SELECT id, email FROM users
+            let source = schema(&[
+                "id",
+                "created_at",
+                "updated_at",
+                "name",
+                "email",
+                "password_hash",
+            ]);
+            let refresh = schema(&["id", "email"]);
+            // Debezium sets PK on "id" column, index 0 in source schema
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            // "id" is at index 0 in the refresh schema too
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0]
+                )]))
+            );
+        }
+
+        #[test]
+        fn remap_mixed_pk_and_unique_with_missing_pk_returns_none() {
+            // If PK can't be remapped, return None even if Unique can be remapped.
+            // This prevents downstream code from seeing Unique-only constraints
+            // and incorrectly deriving on_conflict upsert behavior.
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["email", "name"]);
+            let constraints = Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]), // "id" - missing from refresh
+                Constraint::Unique(vec![1]),     // "email" - present in refresh
+            ]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result, None,
+                "Should return None when PK cannot be remapped"
+            );
+        }
+
+        #[test]
+        fn remap_out_of_bounds_index_returns_none() {
+            // Constraint with out-of-bounds index should not panic
+            let source = schema(&["id", "email"]);
+            let refresh = schema(&["id", "email"]);
+            let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![99])]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result, None,
+                "Out-of-bounds index should return None, not panic"
+            );
+        }
+
+        #[test]
+        fn remap_mixed_pk_and_unique_both_present() {
+            // When both PK and Unique can be remapped, both should be preserved
+            let source = schema(&["id", "email", "name"]);
+            let refresh = schema(&["name", "id", "email"]);
+            let constraints = Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]), // "id" → index 1 in refresh
+                Constraint::Unique(vec![1]),     // "email" → index 2 in refresh
+            ]);
+
+            let result = remap_constraints_to_refresh_schema(&constraints, &source, &refresh);
+            assert_eq!(
+                result,
+                Some(Constraints::new_unverified(vec![
+                    Constraint::PrimaryKey(vec![1]),
+                    Constraint::Unique(vec![2]),
+                ]))
+            );
         }
     }
 }

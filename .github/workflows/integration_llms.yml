@@ -9,7 +9,7 @@ on:
       - release/*
     paths:
       - 'crates/llms/**'
-
+  merge_group:
   workflow_dispatch:
     inputs:
       run:
@@ -59,7 +59,7 @@ jobs:
                 name: 'hosted',
                 needs_env: true,
                 runner: 'spiceai-macos',
-                model_allowlist: 'anthropic,bedrock,openai,xai,perplexity'
+                model_allowlist: 'anthropic,bedrock,openai,xai'
               }
             ];
 
@@ -72,11 +72,17 @@ jobs:
 
               return matrix.filter(m => m.name === name);
             }
+
+            // On pull_request, only run tests that don't require secrets
+            if (context.eventName === 'pull_request') {
+              return matrix.filter(m => !m.needs_env);
+            }
+
             return matrix;
 
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -114,7 +120,7 @@ jobs:
           retention-days: 1
 
   test:
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: spiceai-dev-runners
     needs: [build, setup-matrix]
     strategy:
       matrix:
@@ -138,7 +144,6 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
-          SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
@@ -153,10 +158,6 @@ jobs:
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
               echo "Error: 'SPICE_XAI_API_KEY' is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
               exit 1
             fi
             export SPICE_BEDROCK_REGION="us-east-1"

@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.65,
+      "_score": "0.65",
       "data": {
         "question": "<refined question>"
       },
@@ -21,7 +21,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.64,
+      "_score": "0.64",
       "data": {
         "question": "Compare the fractions and write the appropriate sign ('<', '>', or '=') between them:  \n$\\frac{5}{6} \\square \\frac{5}{5}$"
       },
@@ -36,7 +36,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.63,
+      "_score": "0.63",
       "data": {
         "question": "Is $\\frac{7 \\text { erasers }}{12 \\text { pencils }}$ an example of a ratio or a rate?"
       },
@@ -51,7 +51,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.63,
+      "_score": "0.63",
       "data": {
         "question": "Write the decimal `2.3` in words and then express it as a fraction or mixed number."
       },

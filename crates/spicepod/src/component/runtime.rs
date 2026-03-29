@@ -344,16 +344,22 @@ pub struct TaskHistory {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub captured_output: Arc<str>,
     #[serde(default = "default_retention_period")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub retention_period: Arc<str>,
     #[serde(default = "default_retention_check_interval")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub retention_check_interval: Arc<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub min_sql_duration: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub captured_plan: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub min_plan_duration: Option<Arc<str>>,
 }
 
