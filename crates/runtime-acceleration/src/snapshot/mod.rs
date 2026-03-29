@@ -3706,11 +3706,7 @@ mod tests {
             last_updated_ms: Utc::now().timestamp_millis(),
             datasets: HashMap::from([(
                 DATASET_NAME.to_string(),
-                dataset_metadata(
-                    &schema,
-                    vec![wrong_snapshot, good_snapshot],
-                    Some(2),
-                ),
+                dataset_metadata(&schema, vec![wrong_snapshot, good_snapshot], Some(2)),
             )]),
         };
 
