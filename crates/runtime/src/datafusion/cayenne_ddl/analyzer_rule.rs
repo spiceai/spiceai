@@ -41,7 +41,7 @@ use runtime_table_partition::expression::validate_partition_expression;
 use super::is_cayenne_catalog;
 use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-    DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
 };
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -92,6 +92,9 @@ pub struct CayenneDdlAnalyzerRule {
     ddl_enabled_catalogs: Weak<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     ddl_options: SharedDdlExtensionStore,
+    /// When `true`, DML targeting Cayenne catalogs is rewritten into distributed
+    /// extension nodes that forward operations to executors. Only `true` for the
+    /// scheduler role.
     apply_distributed_nodes: bool,
 }
 
@@ -263,16 +266,16 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 output_schema,
                 ..
             }) => {
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
                 let catalog_name = table_name
                     .catalog()
                     .unwrap_or(SPICE_DEFAULT_CATALOG)
                     .to_string();
 
                 if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
 
@@ -294,16 +297,16 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 output_schema,
                 ..
             }) => {
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
                 let catalog_name = table_name
                     .catalog()
                     .unwrap_or(SPICE_DEFAULT_CATALOG)
                     .to_string();
 
                 if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.apply_distributed_nodes {
                     return Ok(plan);
                 }
 
@@ -320,6 +323,34 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
 
                 Ok(LogicalPlan::Extension(Extension {
                     node: Arc::new(node),
+                }))
+            }
+            LogicalPlan::Dml(DmlStatement {
+                input,
+                table_name,
+                op: WriteOp::Insert(_),
+                output_schema,
+                ..
+            }) => {
+                let catalog_name = table_name
+                    .catalog()
+                    .unwrap_or(SPICE_DEFAULT_CATALOG)
+                    .to_string();
+
+                if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                if !self.apply_distributed_nodes {
+                    return Ok(plan);
+                }
+
+                Ok(LogicalPlan::Extension(Extension {
+                    node: Arc::new(DistributedCayenneInsertNode::new(
+                        table_name.clone(),
+                        Arc::clone(input),
+                        Arc::clone(output_schema),
+                    )),
                 }))
             }
             LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(create)) => {

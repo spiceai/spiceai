@@ -6,57 +6,57 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.03,
+      "_score": "0.03",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The first four prime numbers are 2, 3, 5, and 7. Their sum is \\(2 + 3 + 5 + 7 = \\boxed{17}\\)."
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "Find the sum of the first 4 prime numbers."
+          "Which base number, when raised to the fifth power, equals thirty-two?"
         ]
       },
       "primary_key": {
-        "id": 385
+        "id": 1277
       }
     },
     {
-      "_score": 0.03,
+      "_score": "0.03",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The least whole number greater than 95,999 is obtained by adding 1 to 95,999, which gives $\\boxed{96,\\!000}$."
+          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
         ],
         "question": [
-          "What is the least whole number that is greater than 95,999?"
+          "How many numbers between 0 and 60 are even multiples of 5?"
         ]
       },
       "primary_key": {
-        "id": 973
+        "id": 470
       }
     },
     {
-      "_score": 0.01,
+      "_score": "0.01",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$."
+          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
         ]
       },
       "primary_key": {
-        "id": 291
+        "id": 458
       }
     },
     {
-      "_score": 0.01,
+      "_score": "0.01",
       "dataset": "qs_view",
       "matches": {
-        "answer": [
-          "To find the sum of 47 and 21, add the two numbers together:  \n47 + 21 = 68.  \nThus, the sum is \\(\\boxed{68}\\)."
+        "question": [
+          "Calculate the number of permutations of 14 items taken 4 at a time."
         ]
       },
       "primary_key": {
-        "id": 1170
+        "id": 41
       }
     }
   ]

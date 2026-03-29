@@ -41,8 +41,7 @@ use cayenne::metadata::CreateTableOptions;
 
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 
-use data_components::delete::DeletionTableProvider;
-
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::{col, lit, Expr, SessionContext};
 
 use datafusion_table_providers::util::{
@@ -59,13 +58,13 @@ async fn insert_batch(
         .map_err(Into::into)
 }
 
-/// Helper to delete records from a table using the `DeletionTableProvider` API
+/// Helper to delete records from a table using the `delete_from` API
 async fn delete_records(
     table: &Arc<CayenneTableProvider>,
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
+    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
