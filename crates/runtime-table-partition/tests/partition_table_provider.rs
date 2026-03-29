@@ -17,9 +17,7 @@ limitations under the License.
 use arrow_schema::TimeUnit;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone as _, Utc};
-use data_components::delete::{
-    DeletionExec, DeletionSink, DeletionTableProvider, DeletionTableProviderAdapter,
-};
+use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
 };
@@ -1464,10 +1462,10 @@ async fn test_bucket_partition_inequality_snapshot() -> Result<(), Box<dyn std::
 }
 
 // ============================================================================
-// Deletion Tests for PartitionTableProvider implementing DeletionTableProvider
+// Deletion Tests for PartitionTableProvider
 // ============================================================================
 
-/// A `MemTable` wrapper that implements `DeletionTableProvider` for testing purposes
+/// A `MemTable` wrapper that implements `TableProvider::delete_from` for testing purposes
 #[derive(Debug)]
 struct DeletablePartitionMemTable {
     mem_table: Arc<MemTable>,
@@ -1525,6 +1523,20 @@ impl TableProvider for DeletablePartitionMemTable {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         self.mem_table.insert_into(state, input, insert_op).await
     }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Simulate deleting 10 rows per partition
+        let deletion_sink = Arc::new(MockDeletionSink {
+            deleted_count: Arc::clone(&self.deleted_count),
+            count_to_delete: 10,
+        });
+
+        Ok(Arc::new(DeletionExec::new(deletion_sink)))
+    }
 }
 
 /// Mock deletion sink that simulates deletion and tracks deleted count
@@ -1539,26 +1551,6 @@ impl DeletionSink for MockDeletionSink {
         let mut guard = self.deleted_count.write().await;
         *guard += self.count_to_delete;
         Ok(self.count_to_delete)
-    }
-}
-
-#[async_trait]
-impl DeletionTableProvider for DeletablePartitionMemTable {
-    async fn delete_from(
-        &self,
-        _state: &dyn Session,
-        _filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Simulate deleting 10 rows per partition
-        let deletion_sink = Arc::new(MockDeletionSink {
-            deleted_count: Arc::clone(&self.deleted_count),
-            count_to_delete: 10,
-        });
-
-        Ok(Arc::new(DeletionExec::new(
-            deletion_sink,
-            &self.mem_table.schema(),
-        )))
     }
 }
 
@@ -1617,12 +1609,9 @@ impl PartitionCreator for DeletableTestPartitionCreator {
             partition_value.to_string(),
             Arc::clone(&deletable_mem_table),
         );
-        // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
-        let adapted_table: Arc<dyn TableProvider> =
-            Arc::new(DeletionTableProviderAdapter::new(deletable_mem_table));
         Ok(Partition {
             partition_values: vec![partition_value],
-            table_provider: adapted_table,
+            table_provider: deletable_mem_table,
         })
     }
 
@@ -1687,7 +1676,7 @@ async fn test_deletion_table_provider_single_partition() -> Result<(), Box<dyn s
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
-    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+    let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -1761,7 +1750,7 @@ async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dy
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
-    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+    let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -1829,8 +1818,7 @@ async fn test_deletion_table_provider_with_filters() -> Result<(), Box<dyn std::
     let state = ctx.state();
     // Filter: value > 100 (this filter is passed to delete_from but currently mock doesn't use it)
     let filters = vec![col("value").gt(lit(100i64))];
-    let delete_plan =
-        DeletionTableProvider::delete_from(partition_provider, &state, &filters).await?;
+    let delete_plan = partition_provider.delete_from(&state, filters).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -1885,7 +1873,7 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
-    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+    let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -1913,7 +1901,7 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
 // ============================================================================
 
 /// Test that a partition provider without deletion support logs a warning and continues
-/// (non-deletable partition creator that returns regular `MemTable` without `DeletionTableProviderAdapter`)
+/// (non-deletable partition creator that returns regular `MemTable` without `delete_from`)
 #[derive(Debug)]
 struct NonDeletablePartitionCreator {
     schema: SchemaRef,
@@ -1971,9 +1959,10 @@ impl PartitionCreator for NonDeletablePartitionCreator {
     }
 }
 
-/// Test deletion with partitions that don't support deletion (should return 0 and log warning)
+/// Test deletion with empty filters deletes all rows (`DataFusion`'s `MemTable` treats
+/// empty filters as "match all").
 #[tokio::test]
-async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_deletion_with_empty_filters_deletes_all() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("region", DataType::Utf8, false),
@@ -2005,7 +1994,7 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
     df.write_table("test_table", DataFrameWriteOptions::new())
         .await?;
 
-    // Get the table provider and call delete_from
+    // Get the table provider and call delete_from with empty filters
     let table = ctx.table_provider("test_table").await?;
     let partition_provider = table
         .as_any()
@@ -2013,12 +2002,12 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
-    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+    let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
 
-    // Should return 0 since the partition doesn't support deletion
+    // Empty filters = delete all rows
     assert_eq!(result.len(), 1, "Expected 1 result batch");
     let count_col = result[0]
         .column_by_name("count")
@@ -2029,8 +2018,8 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
         .expect("Expected UInt64Array");
     assert_eq!(
         count_array.value(0),
-        0,
-        "Expected 0 deleted rows from non-deletable partition"
+        3,
+        "Expected all 3 rows deleted with empty filters"
     );
 
     Ok(())
@@ -2092,7 +2081,7 @@ async fn test_deletion_many_partitions() -> Result<(), Box<dyn std::error::Error
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
-    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+    let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -2168,8 +2157,7 @@ async fn test_deletion_complex_filters() -> Result<(), Box<dyn std::error::Error
             .and(col("status").eq(lit("active")))
             .or(col("id").eq(lit(1i64))),
     ];
-    let delete_plan =
-        DeletionTableProvider::delete_from(partition_provider, &state, &filters).await?;
+    let delete_plan = partition_provider.delete_from(&state, filters).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -2238,7 +2226,7 @@ async fn test_deletion_with_null_partition_value() -> Result<(), Box<dyn std::er
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
-    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+    let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -2304,8 +2292,7 @@ async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>
 
     // Call delete_from multiple times
     for i in 0..3 {
-        let delete_plan =
-            DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+        let delete_plan = partition_provider.delete_from(&state, vec![]).await?;
         let result = collect(delete_plan, ctx.task_ctx()).await?;
 
         assert_eq!(result.len(), 1, "Iteration {i}: Expected 1 result batch");
