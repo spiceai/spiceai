@@ -903,7 +903,7 @@ pub(crate) mod search {
         index_name: &str,
         predelete_index: bool,
     ) -> Result<VectorStore, anyhow::Error> {
-        let mut param_entries = vec![
+        let mut param_map = vec![
             ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
             ("s3_vectors_bucket".to_string(), bucket_name.to_string()),
             ("s3_vectors_index".to_string(), index_name.to_string()),
@@ -917,13 +917,12 @@ pub(crate) mod search {
             ),
         ];
         if std::env::var("AWS_SESSION_TOKEN").is_ok() {
-            param_entries.push((
+            param_map.push((
                 "s3_vectors_aws_session_token".to_string(),
                 "${env:AWS_SESSION_TOKEN}".to_string(),
             ));
         }
-        let params =
-            spicepod::param::Params::from_string_map(param_entries.into_iter().collect());
+        let params = spicepod::param::Params::from_string_map(param_map.into_iter().collect());
 
         let store = VectorStore {
             enabled: true,
