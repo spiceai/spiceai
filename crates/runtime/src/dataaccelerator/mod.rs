@@ -227,6 +227,29 @@ impl AcceleratorEngineRegistry {
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
 
+        // Normalize Dictionary-encoded types to their value types only for
+        // accelerator engines that do not natively support Arrow Dictionary
+        // encoding (DuckDB, SQLite, Turso).  Other engines (Arrow, Cayenne,
+        // PostgreSQL) handle Dictionary types natively and benefit from the
+        // compact encoding.
+        let needs_dictionary_normalization = matches!(
+            engine.to_unpartitioned(),
+            acceleration::Engine::DuckDB
+                | acceleration::Engine::Sqlite
+                | acceleration::Engine::Turso
+        );
+        let schema = if needs_dictionary_normalization
+            && arrow_tools::schema::has_dictionary_types(&schema)
+        {
+            let normalized = arrow_tools::schema::normalize_dictionary_types(&schema);
+            tracing::debug!(
+                "Normalized Arrow Dictionary types in schema for {engine} acceleration"
+            );
+            Arc::new(normalized)
+        } else {
+            schema
+        };
+
         let accelerator = self
             .get_accelerator_engine(acceleration_settings.engine)
             .await
@@ -898,7 +921,6 @@ mod accelerator_compat_tests {
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
@@ -2139,12 +2161,10 @@ mod accelerator_compat_tests {
             let data = generate_test_data(Arc::clone(&schema), 50, 0);
             insert_test_data(&table, &ctx, data).await;
 
-            // Get deletion provider
-            let table = get_deletion_provider(table).expect("should support deletion");
-
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
-            let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
+            let plan = table
+                .delete_from(&ctx.state(), vec![filter])
                 .await
                 .expect("deletion should be successful");
 
