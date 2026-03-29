@@ -4,31 +4,31 @@ expression: resp?
 ---
 [
   {
-    "id": 830,
-    "answer": "To find 14% of 232, multiply 232 by 0.14:  \n\\( 232 \\times 0.14 = 32.48 \\).  \n\nThe correct answer is \\(\\boxed{32.48}\\).",
+    "id": 468,
+    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.476
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.541
   },
   {
-    "id": 449,
-    "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
+    "id": 1277,
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.446
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.538
   },
   {
-    "id": 291,
-    "answer": "Since 100% of any number is the number itself, 100% of 732 is $\\boxed{732}$.",
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.438
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.537
   },
   {
-    "id": 250,
-    "answer": "To evaluate \\(2^{2}\\), we multiply the base \\(2\\) by itself \\(2\\) times:\n\\[\n2^{2} = 2 \\times 2 = \\boxed{4}\n\\]",
+    "id": 948,
+    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).question_embedding)": 64,
     "array_length(vector_search(qs_view, Utf8(\"second\"), question).answer_embedding)": 64,
-    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.424
+    "trunc(vector_search(qs_view, Utf8(\"second\"), question)._score,Int64(3))": 0.529
   }
 ]

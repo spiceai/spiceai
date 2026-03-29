@@ -871,7 +871,11 @@ pub(crate) mod search {
         store: &VectorStore,
         predelete_index: bool,
     ) -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        for env_var in [
+            "AWS_S3_VECTORS_KEY",
+            "AWS_S3_VECTORS_SECRET",
+            "AWS_SESSION_TOKEN",
+        ] {
             verify_env_secret_exists(env_var)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -915,6 +919,10 @@ pub(crate) mod search {
                 (
                     "s3_vectors_aws_secret_access_key".to_string(),
                     "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                ),
+                (
+                    "s3_vectors_aws_session_token".to_string(),
+                    "${env:AWS_SESSION_TOKEN}".to_string(),
                 ),
             ]
             .into_iter()
@@ -1038,7 +1046,7 @@ async fn delete_index(
             std::env::var("AWS_S3_VECTORS_SECRET")
                 .ok()
                 .unwrap_or_default(),
-            None,
+            std::env::var("AWS_SESSION_TOKEN").ok(),
             None,
             "S3Vectors",
         ))

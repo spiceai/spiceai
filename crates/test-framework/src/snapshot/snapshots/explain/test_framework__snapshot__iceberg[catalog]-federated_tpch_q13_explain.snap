@@ -29,12 +29,12 @@ description: "Query: tpch_q13"
 |               |                   RepartitionExec: partitioning=Hash([c_custkey@0], 32), input_partitions=1                                                                                           |
 |               |                     CooperativeExec                                                                                                                                                   |
 |               |                       BytesProcessedExec                                                                                                                                              |
-|               |                         IcebergTableScan projection:[c_custkey] predicate:[] limit:[]                                                                                                 |
+|               |                         IcebergTableScan projection:[c_custkey] predicate:[]                                                                                                          |
 |               |                   RepartitionExec: partitioning=Hash([o_custkey@1], 32), input_partitions=32                                                                                          |
 |               |                     FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]                                                                       |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                           |
 |               |                         CooperativeExec                                                                                                                                               |
 |               |                           BytesProcessedExec                                                                                                                                          |
-|               |                             IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[] limit:[]                                                                        |
+|               |                             IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[]                                                                                 |
 |               |                                                                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
