@@ -8,10 +8,10 @@ on:
       - release/*
   pull_request:
     branches:
-      - trunk
       - release-*
       - release/*
       - feature-*
+  merge_group:
 
   workflow_dispatch:
     inputs:
