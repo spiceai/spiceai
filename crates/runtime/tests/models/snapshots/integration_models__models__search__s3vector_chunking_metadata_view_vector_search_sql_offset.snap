@@ -25,7 +25,7 @@ expression: resp?
       61,
       94
     ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.557
   },
   {
     "id": 1277,
