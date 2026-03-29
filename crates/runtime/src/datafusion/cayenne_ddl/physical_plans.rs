@@ -51,7 +51,9 @@ use datafusion::logical_expr::{Expr, ExprSchemable};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
+};
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -1429,6 +1431,14 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
         vec![&self.input]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // The INSERT forwarding path reads from a single stream (partition 0).
+        // Require the input to be coalesced into a single partition so that all
+        // rows are forwarded — without this, data from input partitions > 0
+        // would be silently dropped.
+        vec![Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1574,6 +1584,7 @@ fn dml_count_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use datafusion::logical_expr::col;
+    use datafusion::physical_plan::Distribution;
 
     use super::partition_label_for_expr;
 
@@ -1593,5 +1604,42 @@ mod tests {
     fn partition_label_for_expr_sanitizes_unsafe_column_names() {
         let expr = col("tenant/../id");
         assert_eq!(partition_label_for_expr(&expr), "tenant____id");
+    }
+
+    /// Regression test: `DistributedCayenneInsertExec` must require its input
+    /// to be coalesced into a single partition. Without this, multi-partition
+    /// inputs would silently lose data from partitions > 0 because `execute()`
+    /// only reads from partition 0.
+    #[tokio::test]
+    async fn distributed_insert_requires_single_partition_input() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let empty_input = Arc::new(EmptyExec::new(schema));
+
+        let ctx = Arc::new(datafusion::prelude::SessionContext::new());
+        let io_runtime = tokio::runtime::Handle::current();
+
+        let exec = super::DistributedCayenneInsertExec::new(
+            datafusion::sql::TableReference::bare("test_table"),
+            None,
+            ctx,
+            io_runtime,
+            empty_input,
+        );
+
+        let distributions = exec.required_input_distribution();
+        assert_eq!(distributions.len(), 1);
+        assert!(
+            matches!(distributions[0], Distribution::SinglePartition),
+            "DistributedCayenneInsertExec must require SinglePartition input to prevent data loss from multi-partition inputs"
+        );
     }
 }
