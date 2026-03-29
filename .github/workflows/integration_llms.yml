@@ -95,18 +95,6 @@ jobs:
         with:
           fetch-depth: 1 # Shallow clone for faster checkout
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
