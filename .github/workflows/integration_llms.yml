@@ -9,6 +9,13 @@ on:
       - release/*
     paths:
       - 'crates/llms/**'
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - 'crates/llms/**'
   merge_group:
   workflow_dispatch:
     inputs:
