@@ -20,8 +20,7 @@ limitations under the License.
 //! metadata catalog via `metadata_catalog.create_table(...)`, then opens and
 //! registers the corresponding `TableProvider` in the `DataFusion` catalog.
 //! Depending on the presence of a `PARTITION BY` expression, it constructs
-//! either a partitioned `PartitionTableProvider` wrapped in
-//! `DeletionTableProviderAdapter` or a non-partitioned provider, with data
+//! either a partitioned `PartitionTableProvider` or a non-partitioned provider, with data
 //! stored in Vortex columnar format on local filesystem paths managed by the
 //! Cayenne catalog provider. S3 Express One Zone applies to the Cayenne
 //! accelerator path, not Cayenne DDL catalog storage.
@@ -42,7 +41,6 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -535,10 +533,8 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             Arc::clone(&runtime_env),
                         );
                         if let Ok(provider) = builder.open(&metadata_table_name).await {
-                            let provider = Arc::new(provider);
-                            let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
                             let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
-                                Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
+                                Arc::new(provider);
                             if let Err(e) =
                                 schema_provider.register_table(table_name.clone(), wrapped_provider)
                             {
@@ -655,10 +651,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         ))
                     })?;
 
-                    let partition_provider = Arc::new(partition_provider);
-                    let deletion_provider: Arc<dyn DeletionTableProvider> = partition_provider;
-                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
-                        as Arc<dyn datafusion::catalog::TableProvider>
+                    Arc::new(partition_provider) as Arc<dyn datafusion::catalog::TableProvider>
                 } else {
                     // Non-partitioned: open the table we just created
                     let builder = CayenneTableProviderBuilder::new(
@@ -670,10 +663,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             "Failed to open Cayenne table '{table_name}': {e}"
                         ))
                     })?;
-                    let provider = Arc::new(provider);
-                    let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
-                        as Arc<dyn datafusion::catalog::TableProvider>
+                    Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>
                 };
 
             // Ensure the schema exists, creating it on demand if needed

@@ -9,6 +9,13 @@ on:
       - release/*
     paths:
       - 'crates/llms/**'
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - 'crates/llms/**'
   merge_group:
   workflow_dispatch:
     inputs:
@@ -82,7 +89,7 @@ jobs:
 
   build:
     name: Build Test Binary
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -120,7 +127,7 @@ jobs:
           retention-days: 1
 
   test:
-    runs-on: spiceai-dev-runners
+    runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
     strategy:
       matrix:

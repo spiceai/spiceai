@@ -8,6 +8,7 @@ on:
       - release/*
   pull_request:
     branches:
+      - trunk
       - release-*
       - release/*
       - feature-*
