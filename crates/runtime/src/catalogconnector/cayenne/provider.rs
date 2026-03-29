@@ -39,7 +39,6 @@ use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 
 use crate::catalogconnector::PartitionAwareCatalog;
 
@@ -343,7 +342,9 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
                     .as_any()
                     .downcast_ref::<CayenneSchemaProvider>()
             {
-                existing_cayenne_schema.refresh_from(&refreshed_schema);
+                existing_cayenne_schema
+                    .refresh_from(&refreshed_schema)
+                    .await;
                 new_schemas.insert(ns.clone(), Arc::clone(existing_schema));
             } else {
                 new_schemas.insert(ns.clone(), Arc::new(refreshed_schema));
@@ -471,7 +472,7 @@ impl CayenneSchemaProvider {
         }
     }
 
-    fn refresh_from(&self, source: &Self) {
+    async fn refresh_from(&self, source: &Self) {
         let existing_tables = self.tables_snapshot();
         let refreshed_tables = source.tables_snapshot();
         let mut merged_tables = HashMap::with_capacity(refreshed_tables.len());
@@ -479,7 +480,9 @@ impl CayenneSchemaProvider {
         for (table_name, refreshed_provider) in refreshed_tables {
             let provider_to_use = if let Some(existing_provider) = existing_tables.get(&table_name)
             {
-                if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider) {
+                if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider)
+                    .await
+                {
                     Arc::clone(existing_provider)
                 } else {
                     refreshed_provider
@@ -494,7 +497,7 @@ impl CayenneSchemaProvider {
         self.replace_tables(merged_tables);
     }
 
-    fn refresh_table_provider_in_place(
+    async fn refresh_table_provider_in_place(
         existing_provider: &Arc<dyn TableProvider>,
         refreshed_provider: &Arc<dyn TableProvider>,
     ) -> bool {
@@ -505,7 +508,7 @@ impl CayenneSchemaProvider {
             return false;
         };
 
-        if let Err(err) = existing_cayenne.refresh_from(refreshed_cayenne) {
+        if let Err(err) = existing_cayenne.refresh(refreshed_cayenne).await {
             tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
             return false;
         }
@@ -516,13 +519,7 @@ impl CayenneSchemaProvider {
     fn cayenne_table_from_provider(
         provider: &Arc<dyn TableProvider>,
     ) -> Option<&CayenneTableProvider> {
-        let adapter = provider
-            .as_any()
-            .downcast_ref::<DeletionTableProviderAdapter>()?;
-        adapter
-            .source()
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        provider.as_any().downcast_ref::<CayenneTableProvider>()
     }
 
     fn clear_tables(&self) {
@@ -559,13 +556,7 @@ impl CayenneSchemaProvider {
                     CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env));
 
                 match builder.open(table_name).await {
-                    Ok(provider) => {
-                        let provider = Arc::new(provider);
-                        let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                        Ok(Some(Arc::new(DeletionTableProviderAdapter::new(
-                            deletion_provider,
-                        ))))
-                    }
+                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
                     Err(e) => {
                         tracing::warn!("Failed to open Cayenne table '{table_name}': {e}");
                         Ok(None)

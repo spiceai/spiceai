@@ -16,7 +16,7 @@ expression: resp?
   {
     "id": 449,
     "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
-    "_score": 0.235
+    "_score": 0.24
   },
   {
     "id": 1193,

@@ -30,7 +30,6 @@ use crate::{
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
-use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::TableReference;
@@ -80,6 +79,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+use util::session_state::builder_from_existing;
 use x509_certificate::CapturedX509Certificate;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -1587,7 +1587,7 @@ async fn create_scheduler_server(
                 .map(Arc::clone)
                 .collect();
 
-            Ok(SessionStateBuilder::new_from_existing(spice_state)
+            Ok(builder_from_existing(&spice_state)
                 .with_config(cfg)
                 .with_runtime_env(default_runtime_env(io_runtime.clone()))
                 .with_analyzer_rules(distributed_analyzer_rules)

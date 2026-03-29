@@ -20,8 +20,7 @@ limitations under the License.
 //! metadata catalog via `metadata_catalog.create_table(...)`, then opens and
 //! registers the corresponding `TableProvider` in the `DataFusion` catalog.
 //! Depending on the presence of a `PARTITION BY` expression, it constructs
-//! either a partitioned `PartitionTableProvider` wrapped in
-//! `DeletionTableProviderAdapter` or a non-partitioned provider, with data
+//! either a partitioned `PartitionTableProvider` or a non-partitioned provider, with data
 //! stored in Vortex columnar format on local filesystem paths managed by the
 //! Cayenne catalog provider. S3 Express One Zone applies to the Cayenne
 //! accelerator path, not Cayenne DDL catalog storage.
@@ -42,7 +41,6 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -125,14 +123,34 @@ fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
     }
 }
 
-/// Forwards a DDL SQL statement to connected executor nodes.
+/// Forward a DDL statement (CREATE/DROP TABLE) to all connected executors.
 ///
-/// Iterates over [`ExecutorRegistry::flight_sql_clients`] and sends the SQL
-/// via `FlightSqlClient::execute`, then drains returned endpoints with `do_get`
-/// so the statement is actually executed on the remote executor.
-///
-/// Returns an error when at least one executor was targeted but all forwards failed.
+/// Succeeds as long as at least one executor processes the statement.
+/// DDL is idempotent and self-heals via periodic catalog refresh.
 async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
+    forward_to_executors(executor_registry, sql, false).await
+}
+
+/// Forward a DML statement (DELETE/UPDATE) to all connected executors,
+/// requiring every executor to succeed (with retries for transient failures).
+async fn forward_dml_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
+    forward_to_executors(executor_registry, sql, true).await
+}
+
+/// Maximum number of retry attempts for DML forwarding per executor.
+const MAX_DML_RETRIES: u32 = 3;
+
+/// Forward a SQL statement to all connected executors.
+///
+/// When `require_all` is `false`, succeeds if at least one executor processes
+/// the statement. When `true`, **every** executor must succeed; transient
+/// failures are retried up to [`MAX_DML_RETRIES`] times with exponential
+/// back-off.
+async fn forward_to_executors(
+    executor_registry: &ExecutorRegistry,
+    sql: &str,
+    require_all: bool,
+) -> DFResult<()> {
     let clients = executor_registry.flight_sql_clients.read().await;
     if clients.is_empty() {
         tracing::debug!(
@@ -145,44 +163,60 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
     let futures: Vec<_> = clients
         .iter()
         .map(|(executor_id, client)| {
-            let mut client = client.clone();
+            let client = client.clone();
             let sql = sql.to_string();
             let executor_id = executor_id.clone();
             async move {
-                use futures::StreamExt;
+                let max_attempts = if require_all { MAX_DML_RETRIES + 1 } else { 1 };
+                let mut last_err: Option<String> = None;
 
-                let result: Result<(), String> = async {
-                    let flight_info = client
-                        .execute(sql.clone(), None)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                for attempt in 0..max_attempts {
+                    if attempt > 0 {
+                        let backoff = std::time::Duration::from_millis(100 * 2u64.pow(attempt - 1));
+                        tracing::debug!(
+                            executor_id,
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                            "Retrying DML forward to executor"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
 
-                    for endpoint in flight_info.endpoint {
-                        let Some(ticket) = endpoint.ticket else {
-                            continue;
-                        };
-
-                        let mut stream =
-                            client.do_get(ticket).await.map_err(|e| e.to_string())?;
-                        while let Some(batch) = stream.next().await {
-                            batch.map_err(|e| e.to_string())?;
+                    let result = forward_sql_to_executor(client.clone(), &sql).await;
+                    match result {
+                        Ok(()) => {
+                            if attempt > 0 {
+                                tracing::info!(
+                                    executor_id,
+                                    attempt,
+                                    sql,
+                                    "DML forwarded to executor after retry"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    executor_id,
+                                    sql,
+                                    "Forwarded Cayenne DDL/DML to executor"
+                                );
+                            }
+                            return (executor_id, Ok(()));
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
                         }
                     }
-
-                    Ok(())
-                }
-                .await;
-
-                match &result {
-                    Ok(()) => {
-                        tracing::debug!(executor_id, sql, "Forwarded Cayenne DDL to executor");
-                    }
-                    Err(e) => {
-                        tracing::warn!(executor_id, sql, error = %e, "Failed to forward Cayenne DDL to executor");
-                    }
                 }
 
-                result.is_ok()
+                let err_msg = last_err.unwrap_or_else(|| "unknown error".to_string());
+                tracing::warn!(
+                    executor_id,
+                    sql,
+                    error = %err_msg,
+                    attempts = max_attempts,
+                    require_all,
+                    "Failed to forward Cayenne DDL/DML to executor"
+                );
+                (executor_id, Err(err_msg))
             }
         })
         .collect();
@@ -191,12 +225,61 @@ async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &st
     drop(clients);
 
     let results = futures::future::join_all(futures).await;
-    let success_count = results.iter().filter(|&&ok| ok).count();
+    let total = results.len();
+    let mut failed_executors: Vec<(String, String)> = Vec::new();
+    let mut success_count = 0usize;
 
-    if success_count == 0 && !results.is_empty() {
+    for (executor_id, result) in results {
+        match result {
+            Ok(()) => success_count += 1,
+            Err(e) => failed_executors.push((executor_id, e)),
+        }
+    }
+
+    if require_all && !failed_executors.is_empty() {
+        let executor_errors: Vec<String> = failed_executors
+            .iter()
+            .map(|(id, e)| format!("{id}: {e}"))
+            .collect();
+        return Err(DataFusionError::Execution(format!(
+            "DML forwarding failed on {}/{} executor(s): [{}]. SQL: {}",
+            failed_executors.len(),
+            total,
+            executor_errors.join("; "),
+            sql
+        )));
+    }
+
+    if success_count == 0 && total > 0 {
         return Err(DataFusionError::Execution(format!(
             "Failed to forward Cayenne DDL to any executor: {sql}"
         )));
+    }
+
+    Ok(())
+}
+
+/// Send a single SQL statement to one executor via `FlightSQL` execute + `do_get`.
+async fn forward_sql_to_executor(
+    mut client: data_components::flightsql::FlightSqlClient,
+    sql: &str,
+) -> Result<(), String> {
+    use futures::StreamExt;
+
+    let flight_info = client
+        .execute(sql.to_string(), None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for endpoint in flight_info.endpoint {
+        let Some(ticket) = endpoint.ticket else {
+            continue;
+        };
+
+        let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
+        while let Some(batch) = stream.next().await {
+            batch.map_err(|e| e.to_string())?;
+        }
     }
 
     Ok(())
@@ -450,10 +533,8 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             Arc::clone(&runtime_env),
                         );
                         if let Ok(provider) = builder.open(&metadata_table_name).await {
-                            let provider = Arc::new(provider);
-                            let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
                             let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
-                                Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
+                                Arc::new(provider);
                             if let Err(e) =
                                 schema_provider.register_table(table_name.clone(), wrapped_provider)
                             {
@@ -570,10 +651,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         ))
                     })?;
 
-                    let partition_provider = Arc::new(partition_provider);
-                    let deletion_provider: Arc<dyn DeletionTableProvider> = partition_provider;
-                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
-                        as Arc<dyn datafusion::catalog::TableProvider>
+                    Arc::new(partition_provider) as Arc<dyn datafusion::catalog::TableProvider>
                 } else {
                     // Non-partitioned: open the table we just created
                     let builder = CayenneTableProviderBuilder::new(
@@ -585,10 +663,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                             "Failed to open Cayenne table '{table_name}': {e}"
                         ))
                     })?;
-                    let provider = Arc::new(provider);
-                    let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
-                        as Arc<dyn datafusion::catalog::TableProvider>
+                    Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>
                 };
 
             // Ensure the schema exists, creating it on demand if needed
@@ -656,6 +731,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
+                let ddl_sql = if let Some(ref partition_sql) = partition_expr_sql {
+                    format!("{ddl_sql} PARTITION BY {partition_sql}")
+                } else {
+                    ddl_sql
+                };
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
             }
 
@@ -1111,7 +1191,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
             if let Some(ref filter) = filter_sql {
                 let _ = write!(sql, " WHERE {filter}");
             }
-            forward_ddl_to_executors(registry, &sql).await?;
+            forward_dml_to_executors(registry, &sql).await?;
 
             RecordBatch::try_new(
                 result_schema,
@@ -1232,23 +1312,26 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
-            if let Some(ref registry) = executor_registry {
-                if assignments_sql.is_empty() {
-                    return Err(DataFusionError::Execution(format!(
-                        "UPDATE on '{table_name}' has no SET assignments"
-                    )));
-                }
-                let set_clause = assignments_sql
-                    .iter()
-                    .map(|(col, val)| format!("\"{col}\" = {val}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut sql = format!("UPDATE {table_name} SET {set_clause}");
-                if let Some(ref filter) = filter_sql {
-                    let _ = write!(sql, " WHERE {filter}");
-                }
-                forward_ddl_to_executors(registry, &sql).await?;
+            let Some(ref registry) = executor_registry else {
+                return Err(DataFusionError::Execution(format!(
+                    "UPDATE on '{table_name}' cannot be forwarded: no executor registry available"
+                )));
+            };
+            if assignments_sql.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "UPDATE on '{table_name}' has no SET assignments"
+                )));
             }
+            let set_clause = assignments_sql
+                .iter()
+                .map(|(col, val)| format!("\"{col}\" = {val}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut sql = format!("UPDATE {table_name} SET {set_clause}");
+            if let Some(ref filter) = filter_sql {
+                let _ = write!(sql, " WHERE {filter}");
+            }
+            forward_dml_to_executors(registry, &sql).await?;
 
             RecordBatch::try_new(
                 result_schema,
@@ -1264,6 +1347,221 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
             stream,
         )))
     }
+}
+
+/// Physical plan to forward `INSERT` DML operations to a Cayenne table across
+/// relevant executors in distributed mode, using partition-aware batch routing.
+///
+/// Materializes the input source plan into [`RecordBatch`]es and routes them
+/// to executors via the same partition write-through path used by Flight `DoPut`.
+pub struct DistributedCayenneInsertExec {
+    table_name: datafusion::sql::TableReference,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    ctx: Arc<datafusion::prelude::SessionContext>,
+    io_runtime: tokio::runtime::Handle,
+    /// The child physical plan producing the rows to insert.
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for DistributedCayenneInsertExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CayenneInsertExec")
+            .field("table_name", &self.table_name.to_string())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DistributedCayenneInsertExec {
+    #[must_use]
+    pub fn new(
+        table_name: datafusion::sql::TableReference,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
+        ctx: Arc<datafusion::prelude::SessionContext>,
+        io_runtime: tokio::runtime::Handle,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let schema = dml_count_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            table_name,
+            executor_registry,
+            ctx,
+            io_runtime,
+            input,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for DistributedCayenneInsertExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "CayenneInsertExec: {}", self.table_name)
+    }
+}
+
+impl ExecutionPlan for DistributedCayenneInsertExec {
+    fn name(&self) -> &'static str {
+        "CayenneInsertExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let input = children.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal("CayenneInsertExec requires exactly one child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(
+            self.table_name.clone(),
+            self.executor_registry.clone(),
+            Arc::clone(&self.ctx),
+            self.io_runtime.clone(),
+            input,
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let executor_registry = self.executor_registry.clone();
+        let ctx = Arc::clone(&self.ctx);
+        let io_runtime = self.io_runtime.clone();
+        let input = Arc::clone(&self.input);
+        let result_schema = dml_count_schema();
+        let task_ctx = context;
+
+        let stream = futures::stream::once(async move {
+            let Some(ref registry) = executor_registry else {
+                return Err(DataFusionError::Execution(format!(
+                    "INSERT on '{table_name}' cannot be forwarded: no executor registry available"
+                )));
+            };
+
+            if registry.flight_sql_clients.read().await.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "INSERT on '{table_name}' cannot be forwarded: no executors are currently connected"
+                )));
+            }
+
+            // Resolve the partition expression for this table.
+            let partition_expr = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
+                &ctx,
+                registry,
+                &table_name,
+            )
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to resolve partition expression for table '{table_name}': {e}"
+                ))
+            })?;
+
+            let Some(partition_expr) = partition_expr else {
+                return Err(DataFusionError::Execution(format!(
+                    "INSERT on '{table_name}' cannot be forwarded: table has no partition expression. Cayenne tables require PARTITION BY for distributed writes."
+                )));
+            };
+
+            // Stream batches from the INSERT source plan directly through
+            // the partition write-through path, counting rows as they flow.
+            let input_schema = input.schema();
+            let child_stream = input.execute(partition, task_ctx)?;
+            let row_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let row_counter = Arc::clone(&row_count);
+            let counting_stream: std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = std::result::Result<
+                                RecordBatch,
+                                crate::cluster::partition::write_through::Error,
+                            >,
+                        > + Send,
+                >,
+            > = Box::pin(futures::StreamExt::filter_map(
+                child_stream,
+                move |result| {
+                    let counter = Arc::clone(&row_counter);
+                    async move {
+                        match result {
+                            Ok(batch) if batch.num_rows() > 0 => {
+                                counter.fetch_add(
+                                    batch.num_rows() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                Some(Ok(batch))
+                            }
+                            Ok(_) => None,
+                            Err(e) => Some(Err(
+                                crate::cluster::partition::write_through::Error::UpstreamExecution {
+                                    source: e,
+                                },
+                            )),
+                        }
+                    }
+                },
+            ));
+
+            // Route batches through the partition write-through path.
+            crate::cluster::partition::write_through::forward_partitioned_batches(
+                registry,
+                Arc::clone(&ctx),
+                io_runtime,
+                &table_name,
+                &input_schema,
+                counting_stream,
+                &[partition_expr],
+            )
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to forward INSERT batches for table '{table_name}': {e}"
+                ))
+            })?;
+
+            let total_rows = row_count.load(std::sync::atomic::Ordering::Relaxed);
+            RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(arrow::array::UInt64Array::from(vec![total_rows]))],
+            )
+            .map_err(Into::into)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            dml_count_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Schema for DML count results — single `count` column with `UInt64` type,
+/// matching `DataFusion`'s standard DML output format.
+fn dml_count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
 }
 
 #[cfg(test)]
