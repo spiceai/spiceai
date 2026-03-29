@@ -6,51 +6,51 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.22,
+      "_score": "0.34",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          " various forms of *tinea*, such as athlete's foot (*tinea pedis*"
+          "The presence of fibrinolysin in the reagents can partially o"
         ]
       },
       "primary_key": {
-        "id": 821
+        "id": 938
       }
     },
     {
-      "_score": 0.22,
+      "_score": "0.30",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Elands access high foliage by breaking off branches with thei"
+          " properties, possibly due to their high tannin content"
         ]
       },
       "primary_key": {
-        "id": 432
+        "id": 1015
       }
     },
     {
-      "_score": 0.21,
+      "_score": "0.29",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          " V"
+          " Late recurrences can occur beyond 10 years, so patients requir"
         ]
       },
       "primary_key": {
-        "id": 8
+        "id": 551
       }
     },
     {
-      "_score": 0.18,
+      "_score": "0.29",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The body profile of Menidae is very deep and resembles a fla"
+          "stemic vascular resistance (SVR) by causing vasodilation."
         ]
       },
       "primary_key": {
-        "id": 1193
+        "id": 1035
       }
     }
   ]

@@ -45,6 +45,12 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
+      - name: Validate datafusion-table-providers commit
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
+  # Run Rust linting
   lint-rust:
     name: ${{ matrix.variant.name }}
     runs-on: spiceai-macos
@@ -111,11 +117,11 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
-      - name: Validate datafusion-table-providers commit
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.variant.command == 'lint-rust'
-        run: bash .github/scripts/validate_table_providers_commit.sh
+      - name: Cancel workflow on failure
+        if: failure()
+        run: gh run cancel ${{ github.run_id }}
         env:
-          BRANCH: spiceai-52
+          GH_TOKEN: ${{ github.token }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
@@ -208,6 +214,12 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
+
+      - name: Cancel workflow on failure
+        if: failure()
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
