@@ -8,7 +8,6 @@ on:
       - release/*
   pull_request:
     branches:
-      - trunk
       - release-*
       - release/*
       - feature-*
@@ -31,6 +30,8 @@ on:
       - 'acknowledgements.md'
       - 'Dockerfile*'
       - 'bin/spice/**'
+
+  merge_group:
 
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
@@ -113,59 +114,8 @@ jobs:
           path: ./integration.tar.zst
           retention-days: 1
 
-  test-openai:
-    name: Test OpenAI Models
-    needs: build
-    runs-on: spiceai-macos
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-
-      - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
-
-      - name: Download test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Set up Open.ai API Key
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Run integration test
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
-
-      - name: Run Beta functionality embeddings test
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-ai-udf:
-    name: Test AI UDFs
+  test-models:
+    name: Test Models, AI & Search
     needs: build
     runs-on: spiceai-macos
     steps:
@@ -189,6 +139,30 @@ jobs:
           echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
           echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' >> .env
 
+      # OpenAI tests
+      - name: Run OpenAI integration test
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
+
+      - name: Run OpenAI Beta functionality embeddings test
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
+
+      # AI UDF tests
       - name: Run AI UDF basic test
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
@@ -247,6 +221,50 @@ jobs:
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
 
+      # Local model tests
+      - name: Run local embeddings Beta functionality test
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
+
+      - name: Run AI UDF with local model test
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          if [ -z "$SPICE_HF_TOKEN" ] ; then
+            echo "Error: Hugging Face API Token is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
+
+      # Workers tests
+      - name: Run workers integration test
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
+
+      # Search tests
+      - name: Run search integration test
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
@@ -301,48 +319,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  test-local:
-    name: Test Local Models
-    needs: build
-    runs-on: spiceai-macos
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-
-      - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
-
-      - name: Download test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Run Beta functionality embedding tests
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-        run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
-
-      - name: Run AI UDF with local model test
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-        run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
   test-bedrock:
     name: Test Bedrock Models
     needs: build
@@ -370,46 +346,6 @@ jobs:
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-workers:
-    name: Test Workers
-    needs: build
-    runs-on: spiceai-macos
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-
-      - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
-
-      - name: Download test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Set up Open.ai API Key
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Run integration test
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
@@ -460,45 +396,3 @@ jobs:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
           retention-days: 1
-
-  test-search:
-    name: Test Search
-    needs: build
-    runs-on: spiceai-macos
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-
-      - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
-
-      - name: Download test archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Set up Open.ai API Key
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Run integration test
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
