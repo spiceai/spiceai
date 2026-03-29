@@ -25,6 +25,6 @@ description: "SELECT subject FROM vector_search(qs_view, 'second', answer) order
 |               |                           S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                             |
 |               |         SchemaCastScanExec                                                                                                                         |
 |               |           BytesProcessedExec                                                                                                                       |
-|               |             DataSourceExec: partitions=1, partition_sizes=[3]                                                                                      |
+|               |             DataSourceExec: partitions=1, partition_sizes=[1]                                                                                      |
 |               |                                                                                                                                                    |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+
