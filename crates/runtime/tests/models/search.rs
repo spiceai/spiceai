@@ -277,7 +277,10 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value) {
             );
         }
         _ => {
-            insta::assert_snapshot!(format!("{test_name}_response"), normalize_search_response(resp));
+            insta::assert_snapshot!(
+                format!("{test_name}_response"),
+                normalize_search_response(resp)
+            );
         }
     }
 }
