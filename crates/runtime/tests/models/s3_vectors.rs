@@ -922,8 +922,7 @@ pub(crate) mod search {
                 "${env:AWS_SESSION_TOKEN}".to_string(),
             ));
         }
-        let params =
-            spicepod::param::Params::from_string_map(param_map.into_iter().collect());
+        let params = spicepod::param::Params::from_string_map(param_map.into_iter().collect());
 
         let store = VectorStore {
             enabled: true,
