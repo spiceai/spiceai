@@ -68,7 +68,7 @@ pub enum Error {
     TableSchemaNotRegistered { dataset_name: String },
 
     #[snafu(display(
-        "Failed to infer schema for dataset '{dataset_name}' (databricks): unexpected schema response format. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to infer schema for dataset '{dataset_name}' (databricks): unexpected schema response format. Verify the table exists and is accessible, or report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedSchemaResponse {
         dataset_name: String,
@@ -592,7 +592,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
     };
 
     if data_array.is_empty() {
-        return Err(Error::TableSchemaNotRegistered {
+        return Err(Error::NoColumnsInDataset {
             dataset_name: dataset_name.to_string(),
         });
     }
@@ -988,7 +988,7 @@ mod tests {
         let err = schema_from_json(&response, "test_table")
             .expect_err("should fail on empty data_array");
         assert!(
-            matches!(&err, Error::TableSchemaNotRegistered { .. }),
+            matches!(&err, Error::NoColumnsInDataset { .. }),
             "unexpected error: {err}"
         );
     }
