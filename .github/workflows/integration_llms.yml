@@ -9,11 +9,7 @@ on:
       - release/*
     paths:
       - 'crates/llms/**'
-  pull_request:
-    branches:
-      - trunk
-    paths:
-      - 'crates/llms/**'
+  merge_group:
   workflow_dispatch:
     inputs:
       run:
@@ -86,7 +82,7 @@ jobs:
 
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -124,7 +120,7 @@ jobs:
           retention-days: 1
 
   test:
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: spiceai-dev-runners
     needs: [build, setup-matrix]
     strategy:
       matrix:
