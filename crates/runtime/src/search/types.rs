@@ -296,7 +296,7 @@ mod tests {
     }
 
     /// Regression test: sorting matches with composite primary keys must produce
-    /// deterministic ordering regardless of HashMap iteration order.
+    /// deterministic ordering regardless of `HashMap` iteration order.
     #[test]
     fn test_sort_matches_deterministic_composite_pk() {
         let make_match = |score: f64, dataset: &str, pk: Vec<(&str, Value)>| Match {
@@ -328,7 +328,7 @@ mod tests {
             ],
         );
 
-        let mut matches = vec![m2.clone(), m1.clone()];
+        let mut matches = [m2, m1];
 
         // Sort multiple times to verify stability across runs
         for _ in 0..10 {
