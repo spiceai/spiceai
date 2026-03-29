@@ -32,6 +32,8 @@ on:
       - 'Dockerfile*'
       - 'bin/spice/**'
 
+  merge_group:
+
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
 
@@ -114,7 +116,7 @@ jobs:
           retention-days: 1
 
   test-models:
-    name: Test Models
+    name: Test Models, AI & Search
     needs: build
     runs-on: spiceai-macos
     steps:
