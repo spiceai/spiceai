@@ -218,6 +218,8 @@ impl CayenneCatalog {
                     return Ok(stored_metadata);
                 }
 
+                log_configuration_differences(table_name, &stored_metadata, options);
+
                 Err(CatalogError::ChangedConfiguration {
                     table_name: table_name.to_string(),
                 })
@@ -328,11 +330,19 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .ok();
 
-        if existing_table_id.is_some() {
-            return self
+        if let Some(ref existing_id) = existing_table_id {
+            return match self
                 .validate_existing_table_configuration(table_name.as_str(), &options)
                 .await
-                .map(|stored_metadata| stored_metadata.table_id);
+            {
+                Ok(stored_metadata) => Ok(stored_metadata.table_id),
+                Err(CatalogError::ChangedConfiguration { .. }) => {
+                    // Fall back to stored config — the warning was already logged by
+                    // validate_existing_table_configuration.
+                    Ok(existing_id.clone())
+                }
+                Err(e) => Err(e),
+            };
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -414,13 +424,22 @@ impl MetadataCatalog for CayenneCatalog {
         match insert_result {
             Ok(()) => {}
             Err(CatalogError::ConstraintViolation { .. }) => {
-                let existing_table = self
+                match self
                     .validate_existing_table_configuration(table_name.as_str(), &options)
-                    .await?;
-
-                ensure_snapshot_directory_exists(&existing_table).await?;
-
-                return Ok(existing_table.table_id);
+                    .await
+                {
+                    Ok(existing_table) => {
+                        ensure_snapshot_directory_exists(&existing_table).await?;
+                        return Ok(existing_table.table_id);
+                    }
+                    Err(CatalogError::ChangedConfiguration { .. }) => {
+                        // Fall back to stored config — the warning was already logged.
+                        let stored = self.get_table(&table_name).await?;
+                        ensure_snapshot_directory_exists(&stored).await?;
+                        return Ok(stored.table_id);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         }
@@ -1488,7 +1507,77 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
     true
 }
 
-/// Logs the specific configuration differences between stored and new options at debug level.
+/// Logs a warning describing exactly which configuration fields differ between the
+/// stored table metadata and the newly requested [`CreateTableOptions`].
+///
+/// Called when [`validate_existing_table_configuration`] detects a mismatch so the
+/// user can see *what* changed and how to resolve it.
+fn log_configuration_differences(
+    table_name: &str,
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) {
+    let mut differences = Vec::new();
+
+    if stored.primary_key != options.primary_key {
+        differences.push(format!(
+            "primary_key: {:?} -> {:?}",
+            stored.primary_key, options.primary_key
+        ));
+    }
+
+    let stored_oc = stored.on_conflict.as_ref().map(ToString::to_string);
+    let new_oc = options.on_conflict.as_ref().map(ToString::to_string);
+    if stored_oc != new_oc {
+        differences.push(format!(
+            "on_conflict: {} -> {}",
+            stored_oc.as_deref().unwrap_or("none"),
+            new_oc.as_deref().unwrap_or("none"),
+        ));
+    }
+
+    if stored.partition_column != options.partition_column {
+        differences.push(format!(
+            "partition_column: {:?} -> {:?}",
+            stored.partition_column, options.partition_column
+        ));
+    }
+
+    if stored.schema.as_ref() != options.schema.as_ref() {
+        differences.push("schema: <changed>".to_string());
+    }
+
+    if stored.vortex_config.sort_columns != options.vortex_config.sort_columns {
+        differences.push(format!(
+            "sort_columns: {:?} -> {:?}",
+            stored.vortex_config.sort_columns, options.vortex_config.sort_columns
+        ));
+    }
+
+    if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
+        differences.push(format!(
+            "compression_strategy: {:?} -> {:?}",
+            stored.vortex_config.compression_strategy, options.vortex_config.compression_strategy
+        ));
+    }
+
+    if stored.path != options.base_path {
+        differences.push(format!(
+            "base_path: {:?} -> {:?}",
+            stored.path, options.base_path
+        ));
+    }
+
+    tracing::warn!(
+        table = table_name,
+        "Configuration for table '{table_name}' has changed but the existing acceleration was not recreated. \
+         Changed fields: [{}]. \
+         The acceleration will continue using the previously stored configuration. \
+         To apply the new configuration, delete the existing acceleration and restart.",
+        differences.join(", ")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2450,7 +2539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_returns_error_on_config_change() {
+    async fn test_create_table_falls_back_on_config_change() {
         let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -2483,7 +2572,8 @@ mod tests {
         assert!(metadata.primary_key.is_empty());
         assert_eq!(metadata.table_id, table_id_1);
 
-        // Now try to create with a primary key change — should get ChangedConfiguration error
+        // Now try to create with a primary key change — should fall back to stored config
+        // (a warning is logged, but create_table succeeds with the original table_id)
         let options_changed = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema: Arc::clone(&schema),
@@ -2493,10 +2583,13 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        let result = catalog.create_table(options_changed).await;
-        assert!(
-            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
-            "Expected ChangedConfiguration error, got: {result:?}"
+        let table_id_2 = catalog
+            .create_table(options_changed)
+            .await
+            .expect("Config change should fall back gracefully");
+        assert_eq!(
+            table_id_1, table_id_2,
+            "Should return the original table_id when config changes"
         );
 
         // Original table should still be intact with original config
@@ -2533,7 +2626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_returns_error_on_sort_columns_change() {
+    async fn test_create_table_falls_back_on_sort_columns_change() {
         let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -2553,12 +2646,12 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        catalog
+        let table_id_1 = catalog
             .create_table(options)
             .await
             .expect("Failed to create table");
 
-        // Add sort columns — should return ChangedConfiguration error
+        // Add sort columns — should fall back to stored config with a warning
         let vortex_config = crate::metadata::VortexConfig {
             sort_columns: vec!["ts".to_string()],
             ..Default::default()
@@ -2572,10 +2665,13 @@ mod tests {
             partition_column: None,
             vortex_config,
         };
-        let result = catalog.create_table(options_sorted).await;
-        assert!(
-            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
-            "Expected ChangedConfiguration error, got: {result:?}"
+        let table_id_2 = catalog
+            .create_table(options_sorted)
+            .await
+            .expect("Sort column change should fall back gracefully");
+        assert_eq!(
+            table_id_1, table_id_2,
+            "Should return the original table_id when sort columns change"
         );
 
         // Cleanup
@@ -2835,6 +2931,392 @@ mod tests {
             .await
             .expect("Expected rollback helper to clear the failed SQLite transaction");
 
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Helper to create a [`TableMetadata`] for unit tests.
+    fn make_test_metadata(
+        primary_key: Vec<String>,
+        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+        partition_column: Option<String>,
+        path: &str,
+        vortex_config: crate::metadata::VortexConfig,
+        schema: arrow_schema::SchemaRef,
+    ) -> TableMetadata {
+        TableMetadata {
+            table_id: "test-id".to_string(),
+            table_name: "test_table".to_string(),
+            path: path.to_string(),
+            path_is_relative: false,
+            schema,
+            primary_key,
+            on_conflict,
+            current_snapshot_id: "snap-1".to_string(),
+            partition_column,
+            vortex_config,
+            current_sequence_number: 0,
+        }
+    }
+
+    #[test]
+    fn test_configuration_matches_identical() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            configuration_matches(&stored, &options),
+            "Identical configurations should match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_primary_key_differs() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different primary_key should not match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_on_conflict_differs() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different on_conflict should not match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_sort_columns_differ() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let mut changed_vortex = crate::metadata::VortexConfig::default();
+        changed_vortex.sort_columns = vec!["id".to_string()];
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: changed_vortex,
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different sort_columns should not match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_base_path_differs() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/old_path",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/new_path".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different base_path should not match"
+        );
+    }
+
+    #[test]
+    fn test_log_configuration_differences_primary_key_change() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        // Should not panic; exercises the logging path for primary_key change.
+        log_configuration_differences("test_table", &stored, &options);
+    }
+
+    #[test]
+    fn test_log_configuration_differences_on_conflict_change() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        // Should not panic; exercises the logging path for on_conflict change.
+        log_configuration_differences("test_table", &stored, &options);
+    }
+
+    #[test]
+    fn test_log_configuration_differences_multiple_fields() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/old",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let mut changed_vortex = crate::metadata::VortexConfig::default();
+        changed_vortex.sort_columns = vec!["id".to_string()];
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/new".to_string(),
+            partition_column: Some("region".to_string()),
+            vortex_config: changed_vortex,
+        };
+        // Should not panic; exercises the logging path when many fields change at once.
+        log_configuration_differences("test_table", &stored, &options);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_on_conflict_change_falls_back() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_change_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        // Create table without on_conflict
+        let options = CreateTableOptions {
+            table_name: "oc_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_oc_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_1 = catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        // Now try to add on_conflict — should fall back gracefully
+        let options_changed = CreateTableOptions {
+            table_name: "oc_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/cayenne_oc_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_2 = catalog
+            .create_table(options_changed)
+            .await
+            .expect("on_conflict change should fall back gracefully");
+        assert_eq!(
+            table_id_1, table_id_2,
+            "Should return the original table_id when on_conflict changes"
+        );
+
+        // Stored metadata should still have original config (no on_conflict)
+        let metadata = catalog
+            .get_table("oc_table")
+            .await
+            .expect("Failed to get table");
+        assert!(
+            metadata.on_conflict.is_none(),
+            "Stored on_conflict should remain None"
+        );
+
+        // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_existing_table_configuration_returns_error_on_mismatch() {
+        let test_db = format!(
+            "sqlite://./.test_validate_mismatch_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+
+        // Create table with no primary key
+        let options = CreateTableOptions {
+            table_name: "validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        // validate_existing_table_configuration should return ChangedConfiguration
+        let changed_options = CreateTableOptions {
+            table_name: "validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let result = catalog
+            .validate_existing_table_configuration("validate_table", &changed_options)
+            .await;
+        assert!(
+            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
+            "Expected ChangedConfiguration error from validate, got: {result:?}"
+        );
+
+        // validate_existing_table_configuration should return Ok when config matches
+        let same_options = CreateTableOptions {
+            table_name: "validate_table".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let result = catalog
+            .validate_existing_table_configuration("validate_table", &same_options)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Expected Ok when config matches, got: {result:?}"
+        );
+
+        // Cleanup
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
