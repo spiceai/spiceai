@@ -1656,4 +1656,100 @@ mod tests {
         drop(table);
         drop(temp_dir);
     }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.
+    ///
+    /// Arrow Dictionary-encoded columns (enums) must be transparently unpacked
+    /// to their value types before reaching the `DuckDB` accelerator.
+    #[tokio::test]
+    async fn test_duckdb_dictionary_type_round_trip() {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+
+        // Build a schema containing a Dictionary(Int32, Utf8) column.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+
+        // Normalize the schema (Dictionary -> Utf8).
+        let accel_schema = Arc::new(arrow_tools::schema::normalize_dictionary_types(
+            &source_schema,
+        ));
+        assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&accel_schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("dict_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let table = duckdb_accelerator
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("DuckDB table with normalized Dictionary types should be created");
+
+        // Build a record batch with Dictionary-encoded data.
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let mut status_builder = StringDictionaryBuilder::<Int32Type>::new();
+        status_builder.append_value("active");
+        status_builder.append_value("inactive");
+        status_builder.append_value("active");
+        let statuses = status_builder.finish();
+
+        let data = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![Arc::new(ids), Arc::new(statuses)],
+        )
+        .expect("record batch");
+
+        // Cast from Dictionary to the normalized schema before inserting.
+        let casted = arrow_tools::record_batch::try_cast_to(data, Arc::clone(&accel_schema))
+            .expect("cast Dictionary to Utf8");
+
+        let exec = MockExec::new(vec![Ok(casted)], accel_schema);
+        let ctx = SessionContext::new();
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion of Dictionary data into DuckDB should succeed");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        assert!(!result.is_empty());
+
+        // Verify the data can be read back.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back data");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "should have 3 rows");
+    }
 }
