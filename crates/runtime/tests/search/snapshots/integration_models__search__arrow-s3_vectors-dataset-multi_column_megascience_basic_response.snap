@@ -6,7 +6,22 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.03,
+      "_score": "0.03",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        ],
+        "question": [
+          "How many multiples of 4 are there between 1 and 30? List them and count the total."
+        ]
+      },
+      "primary_key": {
+        "id": 468
+      }
+    },
+    {
+      "_score": "0.03",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -21,7 +36,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.03,
+      "_score": "0.03",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -36,7 +51,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.03,
+      "_score": "0.03",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -48,21 +63,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 948
-      }
-    },
-    {
-      "_score": 0.03,
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
-        ],
-        "question": [
-          "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 191
       }
     }
   ]

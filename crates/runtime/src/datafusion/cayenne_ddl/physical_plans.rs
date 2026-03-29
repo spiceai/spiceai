@@ -1324,23 +1324,26 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
-            if let Some(ref registry) = executor_registry {
-                if assignments_sql.is_empty() {
-                    return Err(DataFusionError::Execution(format!(
-                        "UPDATE on '{table_name}' has no SET assignments"
-                    )));
-                }
-                let set_clause = assignments_sql
-                    .iter()
-                    .map(|(col, val)| format!("\"{col}\" = {val}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut sql = format!("UPDATE {table_name} SET {set_clause}");
-                if let Some(ref filter) = filter_sql {
-                    let _ = write!(sql, " WHERE {filter}");
-                }
-                forward_dml_to_executors(registry, &sql).await?;
+            let Some(ref registry) = executor_registry else {
+                return Err(DataFusionError::Execution(format!(
+                    "UPDATE on '{table_name}' cannot be forwarded: no executor registry available"
+                )));
+            };
+            if assignments_sql.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "UPDATE on '{table_name}' has no SET assignments"
+                )));
             }
+            let set_clause = assignments_sql
+                .iter()
+                .map(|(col, val)| format!("\"{col}\" = {val}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut sql = format!("UPDATE {table_name} SET {set_clause}");
+            if let Some(ref filter) = filter_sql {
+                let _ = write!(sql, " WHERE {filter}");
+            }
+            forward_dml_to_executors(registry, &sql).await?;
 
             RecordBatch::try_new(
                 result_schema,

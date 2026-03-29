@@ -12,7 +12,7 @@ description: "SELECT subject FROM vector_search(qs_view, 'second', answer) order
 | physical_plan | ProjectionExec: expr=[subject@0 as subject]                                                                                   |
 |               |   SortPreservingMergeExec: [_score@1 DESC], fetch=4                                                                           |
 |               |     SortExec: TopK(fetch=4), expr=[_score@1 DESC], preserve_partitioning=[true]                                               |
-|               |       ProjectionExec: expr=[subject@0 as subject, 1 - distance@1 as _score]                                                   |
+|               |       ProjectionExec: expr=[subject@0 as subject, 1 - distance@2 as _score]                                                   |
 |               |         CooperativeExec                                                                                                       |
 |               |           BytesProcessedExec                                                                                                  |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                              |
