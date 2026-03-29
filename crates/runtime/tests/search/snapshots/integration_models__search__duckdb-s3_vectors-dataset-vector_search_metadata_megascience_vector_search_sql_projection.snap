@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/search/mod.rs
-description: "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4"
-snapshot_kind: text
+description: "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4"
 ---
 [
   {
