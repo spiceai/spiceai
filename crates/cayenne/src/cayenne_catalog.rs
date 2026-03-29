@@ -2963,9 +2963,11 @@ mod tests {
 
     #[test]
     fn test_configuration_matches_identical() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec!["id".to_string()],
             None,
@@ -2991,9 +2993,11 @@ mod tests {
 
     #[test]
     fn test_configuration_matches_primary_key_differs() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec![],
             None,
@@ -3020,9 +3024,11 @@ mod tests {
     #[test]
     fn test_configuration_matches_on_conflict_differs() {
         use datafusion_table_providers::util::on_conflict::OnConflict;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec!["id".to_string()],
             None,
@@ -3048,9 +3054,11 @@ mod tests {
 
     #[test]
     fn test_configuration_matches_sort_columns_differ() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec![],
             None,
@@ -3078,9 +3086,11 @@ mod tests {
 
     #[test]
     fn test_configuration_matches_base_path_differs() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec![],
             None,
@@ -3106,9 +3116,11 @@ mod tests {
 
     #[test]
     fn test_log_configuration_differences_primary_key_change() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec![],
             None,
@@ -3133,9 +3145,11 @@ mod tests {
     #[test]
     fn test_log_configuration_differences_on_conflict_change() {
         use datafusion_table_providers::util::on_conflict::OnConflict;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec!["id".to_string()],
             None,
@@ -3160,9 +3174,11 @@ mod tests {
     #[test]
     fn test_log_configuration_differences_multiple_fields() {
         use datafusion_table_providers::util::on_conflict::OnConflict;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let stored = make_test_metadata(
             vec![],
             None,
@@ -3261,9 +3277,11 @@ mod tests {
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
 
         // Create table with no primary key
         let options = CreateTableOptions {
