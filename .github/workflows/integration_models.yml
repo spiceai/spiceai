@@ -32,6 +32,8 @@ on:
       - 'Dockerfile*'
       - 'bin/spice/**'
 
+  merge_group:
+
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
 

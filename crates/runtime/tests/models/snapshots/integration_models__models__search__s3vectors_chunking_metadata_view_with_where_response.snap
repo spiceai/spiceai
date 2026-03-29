@@ -34,23 +34,23 @@ expression: normalize_search_response(resp)
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "stemic vascular resistance (SVR) by causing vasodilation."
-        ]
-      },
-      "primary_key": {
-        "id": 1035
-      }
-    },
-    {
-      "_score": "0.28",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
           " Late recurrences can occur beyond 10 years, so patients requir"
         ]
       },
       "primary_key": {
         "id": 551
+      }
+    },
+    {
+      "_score": "0.29",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "stemic vascular resistance (SVR) by causing vasodilation."
+        ]
+      },
+      "primary_key": {
+        "id": 1035
       }
     }
   ]
