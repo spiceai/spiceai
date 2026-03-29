@@ -24,8 +24,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
-use datafusion::{assert_batches_eq, physical_plan::collect, prelude::*, sql::TableReference};
+use datafusion::{
+    assert_batches_eq, datasource::TableProvider, physical_plan::collect, prelude::*,
+    sql::TableReference,
+};
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
@@ -495,7 +497,7 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
             let expected = ["+-----+", "| cnt |", "+-----+", "| 5   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
-            // Delete by primary key using DeletionTableProvider::delete_from
+            // Delete by primary key using TableProvider::delete_from
             // (SQL DELETE is not supported through the runtime's SQL interface)
             let table_ref = TableReference::bare("pk_test");
             let table = rt
@@ -511,14 +513,10 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
                 .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
 
             let accelerator = accelerated_table.get_accelerator();
-            let deletion_provider = get_deletion_provider(Arc::clone(&accelerator))
-                .ok_or_else(|| anyhow::anyhow!("Accelerator does not support deletion"))?;
 
             let ctx = rt.datafusion().ctx.state();
             let filter = col("id").eq(lit(3i64));
-            let delete_plan =
-                DeletionTableProvider::delete_from(deletion_provider.as_ref(), &ctx, &[filter])
-                    .await?;
+            let delete_plan = accelerator.delete_from(&ctx, vec![filter]).await?;
             collect(delete_plan, rt.datafusion().ctx.task_ctx()).await?;
 
             // Verify deletion
@@ -1676,10 +1674,9 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
             let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
-            // Delete row with id=2 using DeletionTableProvider
+            // Delete row with id=2
             let filter = col("id").eq(lit(2i64));
-            let delete_plan =
-                DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
+            let delete_plan = table.delete_from(&ctx.state(), vec![filter]).await?;
             collect(delete_plan, ctx.task_ctx()).await?;
 
             // Verify deletion
