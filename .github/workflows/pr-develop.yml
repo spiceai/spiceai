@@ -59,6 +59,7 @@ jobs:
           path: .spiceio
           sparse-checkout: .github/actions/setup
           token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Set up spiceio
         uses: ./.spiceio/.github/actions/setup
@@ -113,6 +114,7 @@ jobs:
           path: .spiceio
           sparse-checkout: .github/actions/setup
           token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Set up spiceio
         uses: ./.spiceio/.github/actions/setup
