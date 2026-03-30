@@ -1317,14 +1317,17 @@ impl RefreshTask {
                     ),
                 },
             )?
-        } else if let Some(int_array) = col_array
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
+        } else if let Some(v) = arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
+            .ok()
+            .and_then(|arr| {
+                let int_array = arr.as_any().downcast_ref::<arrow::array::Int64Array>()?;
+                if int_array.is_null(0) {
+                    return None;
+                }
+                Some(int_array.value(0) as u128)
+            })
         {
-            if int_array.is_null(0) {
-                return Ok(None);
-            }
-            int_array.value(0) as u128
+            v
         } else {
             let array = col_array
                 .as_any()
@@ -2145,6 +2148,139 @@ mod tests {
         assert!(
             plan_str.contains("Sort") && plan_str.contains("Limit"),
             "integer column should use Sort+Limit, got: {plan_str}"
+        );
+    }
+
+    /// Helper: run `max_timestamp_df` on a numeric accelerator and extract the max
+    /// value using the same `arrow::compute::cast` to `Int64` path as
+    /// `timestamp_nanos_for_append_query`.
+    async fn collect_numeric_from_max_df(
+        accelerator: &Arc<dyn TableProvider>,
+        col: &str,
+    ) -> Option<i64> {
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(accelerator, ctx, col).expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first()?;
+        if result.num_rows() == 0 {
+            return None;
+        }
+        let col_array = result.column(0);
+        arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
+            .ok()
+            .and_then(|arr| {
+                let int_array = arr.as_any().downcast_ref::<arrow::array::Int64Array>()?;
+                if int_array.is_null(0) {
+                    return None;
+                }
+                Some(int_array.value(0))
+            })
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_int64_extraction() {
+        use arrow::array::Int64Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![100, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_uint64_extraction() {
+        use arrow::array::UInt64Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![100u64, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_int32_extraction() {
+        use arrow::array::Int32Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![100, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_uint32_extraction() {
+        use arrow::array::UInt32Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt32Array::from(vec![100u32, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_float64_extraction() {
+        use arrow::array::Float64Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![100.0, 300.0, 200.0]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_ns_extraction() {
+        use arrow::array::TimestampNanosecondArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        assert_eq!(
+            collect_numeric_from_max_df(&mem, "t").await,
+            Some(3_000_000_000)
         );
     }
 }
