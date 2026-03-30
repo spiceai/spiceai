@@ -245,6 +245,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum NextRefresh {
     WaitFor(Duration),
     Disabled,
@@ -1196,8 +1197,6 @@ impl Refresher {
         })
     }
 }
-
-
 
 impl Drop for Refresher {
     fn drop(&mut self) {
