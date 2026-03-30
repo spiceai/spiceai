@@ -1,0 +1,45 @@
+name: Setup spiceio
+description: 'Build and install spiceio (S3-to-SMB proxy) from spiceai/spiceio'
+
+inputs:
+  github_token:
+    description: 'GitHub token for cloning the private spiceai/spiceio repo'
+    required: true
+
+outputs:
+  spiceio_bin:
+    description: 'Path to the spiceio binary'
+    value: ${{ steps.setup.outputs.spiceio_bin }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup spiceio
+      id: setup
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        # Use pre-installed binary if available
+        if command -v spiceio &> /dev/null; then
+          echo "spiceio already installed: $(which spiceio)"
+          echo "spiceio_bin=$(which spiceio)" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "Building spiceio from source..."
+        SPICEIO_DIR="/tmp/spiceio-build"
+        rm -rf "$SPICEIO_DIR"
+        git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/spiceai/spiceio.git" "$SPICEIO_DIR"
+        pushd "$SPICEIO_DIR"
+        cargo build --release --locked 2>&1
+        popd
+
+        SPICEIO_BIN="$SPICEIO_DIR/target/release/spiceio"
+        if [ -f "$SPICEIO_BIN" ]; then
+          echo "spiceio built successfully"
+          echo "spiceio_bin=$SPICEIO_BIN" >> $GITHUB_OUTPUT
+        else
+          echo "::warning::Failed to build spiceio"
+          echo "spiceio_bin=" >> $GITHUB_OUTPUT
+        fi

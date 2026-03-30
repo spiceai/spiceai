@@ -8,8 +8,8 @@ inputs:
   unas_smb_pass:
     description: 'SMB password for UNAS share (used by spiceio on macOS)'
     required: false
-  github_token:
-    description: 'GitHub token for cloning private repos (used to build spiceio on macOS)'
+  spiceio_bin:
+    description: 'Path to spiceio binary (from setup-spiceio action)'
     required: false
 
 runs:
@@ -50,7 +50,7 @@ runs:
       shell: bash
       env:
         UNAS_SMB_PASS: ${{ inputs.unas_smb_pass }}
-        GH_TOKEN: ${{ inputs.github_token }}
+        SPICEIO_BIN: ${{ inputs.spiceio_bin }}
       run: |
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
@@ -61,28 +61,6 @@ runs:
         SCCACHE_ENDPOINT="http://localhost:9000"
         SCCACHE_REGION="us-east-1"
         SCCACHE_NO_CREDS="false"
-
-        # Build spiceio from source if not already installed
-        if ! command -v spiceio &> /dev/null && [ -n "$UNAS_SMB_PASS" ] && [ -n "$GH_TOKEN" ]; then
-          echo "spiceio not found, building from source..."
-          SPICEIO_DIR="/tmp/spiceio-build"
-          rm -rf "$SPICEIO_DIR"
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/spiceai/spiceio.git" "$SPICEIO_DIR"
-          pushd "$SPICEIO_DIR"
-          cargo build --release --locked 2>&1
-          popd
-          SPICEIO_BIN="$SPICEIO_DIR/target/release/spiceio"
-          if [ -f "$SPICEIO_BIN" ]; then
-            echo "spiceio built successfully"
-          else
-            echo "Failed to build spiceio"
-            SPICEIO_BIN=""
-          fi
-        elif command -v spiceio &> /dev/null; then
-          SPICEIO_BIN="spiceio"
-        else
-          SPICEIO_BIN=""
-        fi
 
         # Try to start spiceio (S3-to-SMB proxy) if available
         if [ -n "$SPICEIO_BIN" ] && [ -n "$UNAS_SMB_PASS" ]; then

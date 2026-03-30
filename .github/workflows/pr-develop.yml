@@ -51,11 +51,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: ./.github/actions/setup-spiceio
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
           unas_smb_pass: ${{ secrets.UNAS_SMB_PASS }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          spiceio_bin: ${{ steps.setup-spiceio.outputs.spiceio_bin }}
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -90,11 +96,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: ./.github/actions/setup-spiceio
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
           unas_smb_pass: ${{ secrets.UNAS_SMB_PASS }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          spiceio_bin: ${{ steps.setup-spiceio.outputs.spiceio_bin }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
