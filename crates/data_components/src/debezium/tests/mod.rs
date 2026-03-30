@@ -349,16 +349,10 @@ fn detect_schema_evolution_added_column() {
     assert!(!original_names.contains("resources"));
     assert!(evolved_names.contains("resources"));
 
-    let added: Vec<&str> = evolved_names
-        .difference(&original_names)
-        .copied()
-        .collect();
+    let added: Vec<&str> = evolved_names.difference(&original_names).copied().collect();
     assert_eq!(added, vec!["resources"]);
 
-    let removed: Vec<&str> = original_names
-        .difference(&evolved_names)
-        .copied()
-        .collect();
+    let removed: Vec<&str> = original_names.difference(&evolved_names).copied().collect();
     assert!(removed.is_empty());
 
     // Verify the evolved schema can be converted to an Arrow schema
@@ -376,10 +370,8 @@ fn no_false_schema_evolution_detection() {
         serde_json::from_str(change_event_json).expect("to deserialize change event");
 
     let fields = event.get_schema_fields().expect("to get schema fields");
-    let names_a: std::collections::BTreeSet<&str> = fields
-        .iter()
-        .filter_map(|f| f.field.as_deref())
-        .collect();
+    let names_a: std::collections::BTreeSet<&str> =
+        fields.iter().filter_map(|f| f.field.as_deref()).collect();
 
     // Clone and compare - should be identical
     let fields_copy: Vec<crate::debezium::change_event::Field> =
@@ -409,7 +401,10 @@ fn detect_schema_evolution_removed_column() {
     let mut reduced_fields: Vec<crate::debezium::change_event::Field> =
         original_fields.iter().map(|f| (*f).clone()).collect();
     let removed_field = reduced_fields.pop().expect("at least one field");
-    let removed_name = removed_field.field.as_deref().expect("field has column name");
+    let removed_name = removed_field
+        .field
+        .as_deref()
+        .expect("field has column name");
 
     let reduced_names: std::collections::BTreeSet<&str> = reduced_fields
         .iter()
@@ -418,10 +413,7 @@ fn detect_schema_evolution_removed_column() {
 
     assert_ne!(original_names, reduced_names);
 
-    let removed: Vec<&str> = original_names
-        .difference(&reduced_names)
-        .copied()
-        .collect();
+    let removed: Vec<&str> = original_names.difference(&reduced_names).copied().collect();
     assert_eq!(removed, vec![removed_name]);
 }
 
@@ -518,10 +510,7 @@ fn evolved_schema_passes_refresh_sql_validation() {
 
     // Verify that the evolved schema includes the new column that would have
     // caused the refresh SQL error "The column 'resources' is not present..."
-    let added: Vec<&str> = evolved_names
-        .difference(&cached_names)
-        .copied()
-        .collect();
+    let added: Vec<&str> = evolved_names.difference(&cached_names).copied().collect();
     assert_eq!(added, vec!["resources"]);
 }
 

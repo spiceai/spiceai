@@ -434,8 +434,7 @@ impl KafkaConsumer {
                 topic: topic.to_string(),
             })?;
 
-        match tokio::time::timeout(Duration::from_secs(10), temp_consumer.next_json::<K, V>())
-            .await
+        match tokio::time::timeout(Duration::from_secs(10), temp_consumer.next_json::<K, V>()).await
         {
             Ok(Ok(Some(msg))) => Ok(Some(msg.into_parts())),
             Ok(Ok(None)) => Ok(None),

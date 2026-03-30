@@ -593,7 +593,9 @@ async fn refresh_schema_from_kafka(
         Ok(Some((_, event))) => event,
         Ok(None) => return,
         Err(e) => {
-            tracing::debug!("Could not fetch latest Kafka message for schema detection on dataset {dataset_name}: {e}");
+            tracing::debug!(
+                "Could not fetch latest Kafka message for schema detection on dataset {dataset_name}: {e}"
+            );
             return;
         }
     };
@@ -638,9 +640,7 @@ async fn refresh_schema_from_kafka(
 
     if dataset.is_file_accelerated() {
         if let Err(e) = set_metadata_to_accelerator(dataset, metadata).await {
-            tracing::warn!(
-                "Failed to persist updated schema for dataset {dataset_name}: {e}"
-            );
+            tracing::warn!("Failed to persist updated schema for dataset {dataset_name}: {e}");
         }
     }
 }
