@@ -41,7 +41,7 @@ datasets:
           "CounterID" = 62 AND date_trunc('day', from_unixtime("EventTime")) >= '2013-07-01' AND date_trunc('day', from_unixtime("EventTime")) <= '2013-07-31' AND "IsRefresh" = 0 AND "IsLink" <> 0 AND "IsDownload" = 0
         )
         -- q43
-        -- OR (
-        --   "CounterID" = 62 AND to_timestamp("EventDate" * 86400) >= '2013-07-14' AND to_timestamp("EventDate" * 86400) <= '2013-07-15' AND "IsRefresh" = 0 AND "DontCountHits" = 0
-        -- )
+        OR (
+          "CounterID" = 62 AND to_timestamp("EventDate" * 86400) >= '2013-07-14' AND to_timestamp("EventDate" * 86400) <= '2013-07-15' AND "IsRefresh" = 0 AND "DontCountHits" = 0
+        )
         LIMIT 10000000
