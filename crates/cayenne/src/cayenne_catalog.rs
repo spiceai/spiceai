@@ -3067,8 +3067,10 @@ mod tests {
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
-        let mut changed_vortex = crate::metadata::VortexConfig::default();
-        changed_vortex.sort_columns = vec!["id".to_string()];
+        let changed_vortex = crate::metadata::VortexConfig {
+            sort_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
         let options = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema,
@@ -3187,8 +3189,10 @@ mod tests {
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
-        let mut changed_vortex = crate::metadata::VortexConfig::default();
-        changed_vortex.sort_columns = vec!["id".to_string()];
+        let changed_vortex = crate::metadata::VortexConfig {
+            sort_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
         let options = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema,
