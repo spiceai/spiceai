@@ -30,6 +30,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::time::Duration;
 
 use app::AppBuilder;
@@ -94,10 +95,11 @@ fn explain_to_string(batches: &[RecordBatch]) -> String {
 ///
 /// Panics inside `f` are caught, the harness is shut down, and the panic is then
 /// re-raised so the test still fails with the original message.
-async fn run_with_harness<F, Fut>(harness: ClusterHarness, f: F) -> Result<(), anyhow::Error>
+async fn run_with_harness<F>(harness: ClusterHarness, f: F) -> Result<(), anyhow::Error>
 where
-    F: FnOnce(&ClusterHarness) -> Fut,
-    Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
+    F: for<'a> FnOnce(
+        &'a ClusterHarness,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + 'a>>,
 {
     let result = AssertUnwindSafe(f(&harness)).catch_unwind().await;
     harness.shutdown().await;
@@ -150,7 +152,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| async move {
+            run_with_harness(harness, |harness| Box::pin(async move {
                 harness.wait_for_executors(Duration::from_secs(15)).await?;
 
                 // -----------------------------------------------------------------
@@ -446,7 +448,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                 insta::assert_snapshot!(plan, @"");
 
                 Ok(())
-            })
+            }))
             .await
         })
         .await
@@ -493,7 +495,7 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| async move {
+            run_with_harness(harness, |harness| Box::pin(async move {
                 harness.wait_for_executors(Duration::from_secs(15)).await?;
 
                 // Create schema and two related tables.
@@ -609,7 +611,7 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                 );
 
                 Ok(())
-            })
+            }))
             .await
         })
         .await
@@ -652,7 +654,7 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| async move {
+            run_with_harness(harness, |harness| Box::pin(async move {
                 harness.wait_for_executors(Duration::from_secs(15)).await?;
 
                 // Create two separate schemas.
@@ -740,7 +742,7 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                 insta::assert_snapshot!(plan, @"");
 
                 Ok(())
-            })
+            }))
             .await
         })
         .await
@@ -786,7 +788,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| async move {
+            run_with_harness(harness, |harness| Box::pin(async move {
                 harness.wait_for_executors(Duration::from_secs(15)).await?;
 
                 harness.query("CREATE SCHEMA pkcat.myschema").await?;
@@ -917,7 +919,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                 insta::assert_snapshot!(plan, @"");
 
                 Ok(())
-            })
+            }))
             .await
         })
         .await
@@ -963,7 +965,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| async move {
+            run_with_harness(harness, |harness| Box::pin(async move {
                 harness.wait_for_executors(Duration::from_secs(15)).await?;
 
                 harness.query("CREATE SCHEMA ncat.ns").await?;
@@ -1059,7 +1061,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                 insta::assert_snapshot!(plan, @"");
 
                 Ok(())
-            })
+            }))
             .await
         })
         .await
