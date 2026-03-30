@@ -57,7 +57,6 @@ jobs:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
-          version: v0.1.0
           bucket: sccache
           region: us-west-1
 
@@ -103,7 +102,6 @@ jobs:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
-          version: v0.1.0
           bucket: sccache
           region: us-west-1
 
