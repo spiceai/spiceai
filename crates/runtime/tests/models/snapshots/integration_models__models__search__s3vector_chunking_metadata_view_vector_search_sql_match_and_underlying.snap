@@ -19,7 +19,7 @@ expression: resp?
     "id": 948,
     "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.557
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
     "id": 1277,
