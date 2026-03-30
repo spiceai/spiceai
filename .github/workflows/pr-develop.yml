@@ -51,8 +51,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Checkout spiceio setup action
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          repository: spiceai/spiceio
+          ref: 9dc5609b96e95789dd3cb2f25fecd18c55e25d36 # trunk
+          path: .spiceio
+          sparse-checkout: .github/actions/setup
+          token: ${{ github.token }}
+
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@9dc5609b96e95789dd3cb2f25fecd18c55e25d36 # trunk
+        uses: ./.spiceio/.github/actions/setup
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -96,8 +105,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Checkout spiceio setup action
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          repository: spiceai/spiceio
+          ref: 9dc5609b96e95789dd3cb2f25fecd18c55e25d36 # trunk
+          path: .spiceio
+          sparse-checkout: .github/actions/setup
+          token: ${{ github.token }}
+
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@9dc5609b96e95789dd3cb2f25fecd18c55e25d36 # trunk
+        uses: ./.spiceio/.github/actions/setup
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
