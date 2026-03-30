@@ -149,6 +149,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("lag_exceeds_shard_retention_behavior")
         .description("Behavior when stream lag exceeds shard retention (24h). 'error' marks dataset as Error, 'ready_before_load' marks Ready then re-bootstraps, 'ready_after_load' re-bootstraps then marks Ready")
         .default("error"),
+    ParameterSpec::runtime("write_parallelism")
+        .description("Number of parallel operations for writing and deleting data to DynamoDB")
+        .default("10"),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -249,6 +252,13 @@ fn parse_json_nesting_static_fields(
 impl DataConnector for DynamoDB {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<Result<Arc<dyn TableProvider>, DataConnectorError>> {
+        Some(self.read_provider(dataset).await)
     }
 
     async fn read_provider(
@@ -371,6 +381,14 @@ impl DataConnector for DynamoDB {
             .and_then(|v| fundu::parse_duration(v).ok())
             .unwrap_or(Duration::from_secs(2));
 
+        let write_parallelism = self
+            .params
+            .get("write_parallelism")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(data_components::dynamodb::dml::DEFAULT_WRITE_PARALLELISM);
+
         let provider = DynamoDBTableProvider::try_new(
             config,
             Arc::from(table_name),
@@ -382,6 +400,7 @@ impl DataConnector for DynamoDB {
             ready_lag,
             Arc::clone(&self.metrics_collector),
             parse_json_nesting_static_fields(dataset)?.as_ref(),
+            write_parallelism,
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {

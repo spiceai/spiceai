@@ -103,7 +103,8 @@ impl DynamoDBTableSchema {
             .iter()
             .map(|&expr| {
                 if self.is_filter_supported(expr, false) {
-                    TableProviderFilterPushDown::Exact
+                    // Should be Exact once we switch to DF53
+                    TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -396,7 +397,7 @@ mod tests {
         let result = schema.supports_filters_pushdown(&filters);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
     }
 
     #[test]
@@ -420,8 +421,8 @@ mod tests {
         let result = schema.supports_filters_pushdown(&filters);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
-        assert_eq!(result[1], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
     }
 
     #[test]
@@ -435,7 +436,7 @@ mod tests {
         let filters = vec![&f1];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
 
         let f2 = lit(ScalarValue::TimestampMillisecond(
             Some(1_725_366_896_155),
@@ -445,7 +446,7 @@ mod tests {
         let filters = vec![&f2];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
     }
 
     #[test]
@@ -462,7 +463,7 @@ mod tests {
         let filters = vec![&f2, &f3];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
-        assert_eq!(result[1], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
     }
 }
