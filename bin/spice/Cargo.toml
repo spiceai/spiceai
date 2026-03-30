@@ -116,6 +116,9 @@ release = []
 
 [dev-dependencies]
 assert_cmd = "2"
+insta = { workspace = true, features = ["filters", "json"] }
 predicates = "3"
 rstest = "0.26.1"
+serde_json.workspace = true
 tempfile.workspace = true
+uuid = { version = "1", features = ["v4"] }
