@@ -53,6 +53,8 @@ jobs:
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          unas_smb_pass: ${{ secrets.UNAS_SMB_PASS }}
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -89,6 +91,8 @@ jobs:
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          unas_smb_pass: ${{ secrets.UNAS_SMB_PASS }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
