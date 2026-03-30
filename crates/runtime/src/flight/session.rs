@@ -57,6 +57,7 @@ use moka::sync::Cache;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::metadata::MetadataMap;
+use util::session_state::builder_from_existing;
 use uuid::Uuid;
 
 /// Default session time-to-live in seconds (1 hour)
@@ -131,12 +132,10 @@ impl SessionStore {
         // This is critical for session isolation - each session needs its own session_id
         // so that prepared statements stored in SessionState.prepared_plans are isolated.
         //
-        // Note: We use new_from_existing() which copies all catalog/function registrations
-        // but sets session_id to None, allowing build() to generate a new unique ID.
-        let new_state =
-            datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
-                base_ctx.state(),
-            )
+        // Note: We clone the existing state into a new builder so catalog/function
+        // registrations and custom analyzer/optimizer rules are preserved, while
+        // `session_id` remains unset until we assign a unique one below.
+        let new_state = builder_from_existing(&base_ctx.state())
             .with_session_id(session_id.clone())
             .build();
         let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
@@ -199,10 +198,7 @@ impl SessionStore {
             // Create new session with the provided ID (from auth token)
             // Use SessionStateBuilder to ensure the session has its own unique session_id
             // for proper prepared statement isolation
-            let new_state =
-                datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
-                    base_ctx.state(),
-                )
+            let new_state = builder_from_existing(&base_ctx.state())
                 .with_session_id(session_id.clone())
                 .build();
             let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
@@ -244,10 +240,7 @@ impl SessionStore {
             // Create new session with the provided ID (from auth token)
             // Use SessionStateBuilder to ensure the session has its own unique session_id
             // for proper prepared statement isolation
-            let new_state =
-                datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
-                    base_ctx.state(),
-                )
+            let new_state = builder_from_existing(&base_ctx.state())
                 .with_session_id(session_id.clone())
                 .build();
             let session_ctx = Arc::new(SessionContext::new_with_state(new_state));

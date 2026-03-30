@@ -200,6 +200,10 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Install ADBC BigQuery Driver
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/setup-adbc-bigquery
+
       - name: Install PostgreSQL for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
         uses: ./.github/actions/install-postgres
@@ -332,6 +336,7 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'true' || '' }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
@@ -402,6 +407,7 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'true' || '' }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
@@ -471,7 +477,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "fix: Update the ${{ github.event.inputs.query_set }} benchmark snapshots for: ${{ github.event.inputs.spicepod_path }}"
+            git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
             if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
               git pull --rebase origin ${BRANCH_NAME}
             fi
@@ -482,7 +488,16 @@ jobs:
               echo "PR already exists -> ${PR_URL}"
               exit 0
             else
-              gh pr create --title "fix: Update benchmark snapshots" --body "Updates some benchmark snapshots" --base trunk --head ${BRANCH_NAME} --label kind/bug
+              BODY=$(cat <<EOF
+          Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+          **Query set:** \`${{ github.event.inputs.query_set }}\`
+          **Spicepod:** \`${{ github.event.inputs.spicepod_path }}\`
+          **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
+          EOF
+          )
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base develop --head ${BRANCH_NAME} --label kind/bug
+              gh pr merge --squash --auto ${BRANCH_NAME}
             fi
           fi
         env:

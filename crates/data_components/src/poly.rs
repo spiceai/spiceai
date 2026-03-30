@@ -32,25 +32,17 @@ use datafusion_federation::{
 use std::collections::HashMap;
 use std::{any::Any, borrow::Cow, sync::Arc};
 
-use crate::delete::DeletionTableProvider;
-
 #[derive(Debug, Clone)]
 pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
-    delete: Arc<dyn DeletionTableProvider>,
     fed: Arc<dyn TableProvider>,
     schema_metadata: HashMap<String, String>,
 }
 
 impl PolyTableProvider {
-    pub fn new(
-        write: Arc<dyn TableProvider>,
-        delete: Arc<dyn DeletionTableProvider>,
-        fed: Arc<dyn TableProvider>,
-    ) -> Self {
+    pub fn new(write: Arc<dyn TableProvider>, fed: Arc<dyn TableProvider>) -> Self {
         PolyTableProvider {
             write,
-            delete,
             fed,
             schema_metadata: HashMap::new(),
         }
@@ -58,13 +50,11 @@ impl PolyTableProvider {
 
     pub fn new_with_schema_metadata(
         write: Arc<dyn TableProvider>,
-        delete: Arc<dyn DeletionTableProvider>,
         fed: Arc<dyn TableProvider>,
         schema_metadata: HashMap<String, String>,
     ) -> Self {
         PolyTableProvider {
             write,
-            delete,
             fed,
             schema_metadata,
         }
@@ -95,17 +85,6 @@ impl PolyTableProvider {
     #[must_use]
     pub fn writer(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.write)
-    }
-}
-
-#[async_trait]
-impl DeletionTableProvider for PolyTableProvider {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        DeletionTableProvider::delete_from(&*self.delete, state, filters).await
     }
 }
 
@@ -171,5 +150,22 @@ impl TableProvider for PolyTableProvider {
         overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.write.insert_into(state, input, overwrite).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.update(state, assignments, filters).await
     }
 }

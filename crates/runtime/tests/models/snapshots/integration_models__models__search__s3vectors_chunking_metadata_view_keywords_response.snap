@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.55,
+      "_score": "0.55",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,39 +18,39 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.51,
+      "_score": "0.53",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "Since there are 4 distinct letters, the number of arrangement"
+          " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
         ]
       },
       "primary_key": {
-        "id": 362
+        "id": 484
       }
     },
     {
-      "_score": 0.48,
+      "_score": "0.52",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The even multiples of 5 between 0 and 60 are the multiples of 1"
+          "4, 2))^3 \\times 40}\\)"
         ]
       },
       "primary_key": {
-        "id": 470
+        "id": 450
       }
     },
     {
-      "_score": 0.47,
+      "_score": "0.51",
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "\n$28 - 14 = 14$  \nThus, the missing number is $\\boxed{14}$"
+          "Since there are 50 equal numbers, each number is equal to \\("
         ]
       },
       "primary_key": {
-        "id": 622
+        "id": 507
       }
     }
   ]

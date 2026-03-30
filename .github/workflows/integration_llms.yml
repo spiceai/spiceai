@@ -9,7 +9,18 @@ on:
       - release/*
     paths:
       - 'crates/llms/**'
-
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - 'crates/llms/**'
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
   workflow_dispatch:
     inputs:
       run:
@@ -72,11 +83,17 @@ jobs:
 
               return matrix.filter(m => m.name === name);
             }
+
+            // On pull_request, only run tests that don't require secrets
+            if (context.eventName === 'pull_request') {
+              return matrix.filter(m => !m.needs_env);
+            }
+
             return matrix;
 
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -114,7 +131,7 @@ jobs:
           retention-days: 1
 
   test:
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
     strategy:
       matrix:

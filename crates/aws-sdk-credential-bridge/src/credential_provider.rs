@@ -35,7 +35,7 @@ use aws_smithy_runtime_api::client::{
     identity::SharedIdentityResolver,
     runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
 };
-use iceberg::io::{
+use iceberg_storage_opendal::{
     AwsCredential as IcebergAwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader,
 };
 use object_store::{CredentialProvider, aws::AwsCredential as ObjectStoreAwsCredential};

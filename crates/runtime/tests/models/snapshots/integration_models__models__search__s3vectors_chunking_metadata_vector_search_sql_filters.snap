@@ -19,8 +19,8 @@ expression: resp?
     "_score": 0.291
   },
   {
-    "id": 1268,
-    "answer": "The gall bladder is stimulated to empty by the release of cholecystokinin (CCK) from the duodenum in response to food entry.",
-    "_score": 0.28
+    "id": 551,
+    "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
+    "_score": 0.288
   }
 ]

@@ -2,13 +2,17 @@
 name: ADBC integration tests
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - trunk
       - release/*
   pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
     branches:
       - trunk
       - release-*
@@ -31,7 +35,7 @@ env:
 
 jobs:
   check_changes:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:

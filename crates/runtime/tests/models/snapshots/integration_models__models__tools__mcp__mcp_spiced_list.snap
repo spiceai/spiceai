@@ -20,8 +20,22 @@ expression: tools_list
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "last": {
-          "description": "Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: \"1h\", \"2m30s\".",
+          "description": "Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. \"1h\", \"2m30s\".",
           "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum number of memories to return.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Number of memories to skip for pagination.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -60,8 +74,22 @@ expression: tools_list
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "last": {
-          "description": "Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: \"1h\", \"2m30s\".",
+          "description": "Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. \"1h\", \"2m30s\".",
           "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum number of memories to return.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Number of memories to skip for pagination.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [

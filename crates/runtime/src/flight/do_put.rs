@@ -238,6 +238,19 @@ pub(crate) async fn handle(
         return response.map_err(Into::into);
     }
 
+    // In distributed mode, the scheduler must NEVER write data locally.
+    // Writes should always be forwarded to executors via the partitioned write path above.
+    // If we reached this point on the scheduler, the table is either not partitioned
+    // or partition resolution failed — reject the write to prevent silent data misrouting.
+    if matches!(
+        datafusion.cluster_config.effective_role(),
+        Some(ClusterRole::Scheduler)
+    ) {
+        return Err(Status::failed_precondition(format!(
+            "Cannot write data to table `{path}` on the scheduler. Ensure the table has a partition expression configured for distributed writes.",
+        )));
+    }
+
     let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);

@@ -4,23 +4,23 @@ expression: resp?
 ---
 [
   {
-    "id": 922,
-    "answer": "A \"sequence\" implies a cascade of events traced to a single abnormality.",
-    "_score": 0.21
+    "id": 938,
+    "answer": "The presence of fibrinolysin in the reagents can partially or totally dissolve the clot, leading to erroneous results.",
+    "_score": 0.344
   },
   {
-    "id": 1143,
-    "answer": "The safety of valerian during pregnancy and lactation has not been established and should, therefore, be avoided.",
-    "_score": 0.169
+    "id": 1015,
+    "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
+    "_score": 0.303
   },
   {
-    "id": 944,
-    "answer": "The larger the area through which force is transmitted, the less the intensity and potential for injury.",
-    "_score": 0.149
+    "id": 551,
+    "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
+    "_score": 0.292
   },
   {
-    "id": 1191,
-    "answer": "The hybridization in `[Pa(NH₃)₄]³⁺` is $\\boxed{sp^3}$, as it forms a tetrahedral complex with four monodentate ammonia ligands.",
-    "_score": 0.148
+    "id": 1035,
+    "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
+    "_score": 0.291
   }
 ]

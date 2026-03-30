@@ -29,7 +29,7 @@ use datafusion::{
     common::{Column, Constraints, JoinType},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{SessionState, SessionStateBuilder},
+    execution::SessionState,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
     sql::TableReference,
@@ -38,6 +38,7 @@ use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
 
 use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
 use itertools::Itertools;
+use util::session_state::builder_from_existing;
 
 use crate::index::VectorIndex;
 
@@ -312,11 +313,9 @@ impl TableProvider for VectorScanTableProvider {
 /// Datafusion does not propagate [`SessionState::physical_optimizers`] into [`TableProvider::scan`].
 fn with_join_optimization(state: &dyn Session) -> Option<Arc<dyn Session>> {
     Some(Arc::new(
-        SessionStateBuilder::new_from_existing(
-            state.as_any().downcast_ref::<SessionState>()?.clone(),
-        )
-        .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-        .build(),
+        builder_from_existing(state.as_any().downcast_ref::<SessionState>()?)
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .build(),
     ) as Arc<dyn Session>)
 }
 

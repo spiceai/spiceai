@@ -29,6 +29,7 @@ use iceberg_catalog_glue::{
     GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::sync::LazyLock;
@@ -442,7 +443,23 @@ async fn create_iceberg_provider(
         props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), catalog_id);
     }
 
+    // Derive the S3 scheme from the metadata location (e.g. "s3://" or "s3a://").
+    // The Glue catalog's default StorageFactory uses "s3a" as the configured scheme,
+    // but AWS Glue metadata locations typically use "s3://", causing a scheme mismatch.
+    let s3_scheme = metadata_location
+        .split("://")
+        .next()
+        .unwrap_or("s3")
+        .to_string();
+
+    let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+        Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: s3_scheme,
+            customized_credential_load: None,
+        });
+
     let catalog = GlueCatalogBuilder::default()
+        .with_storage_factory(storage_factory)
         .load("glue", props)
         .await
         .map_err(|e| {

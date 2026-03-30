@@ -27,10 +27,12 @@ use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuil
 use futures::TryStreamExt;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::{Catalog, NamespaceIdent};
+use iceberg_storage_opendal::OpenDalStorageFactory;
 #[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::docker::DockerCompose;
 #[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::normalize_test_name;
+use opendal::Configurator;
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 const MINIO_PORT: u16 = 9000;
@@ -39,8 +41,18 @@ const MINIO_PORT: u16 = 9000;
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
+#[expect(clippy::expect_used)]
 fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
-    HadoopCatalogBuilder::default().with_warehouse_root("file:///tmp/hadoop_warehouse")
+    let mut fs_config = opendal::services::FsConfig::default();
+    fs_config.root = Some("/tmp/hadoop_warehouse".to_string());
+    let operator = opendal::Operator::new(fs_config.into_builder())
+        .expect("Should build FS operator")
+        .finish();
+
+    HadoopCatalogBuilder::default()
+        .with_warehouse_root("file:///tmp/hadoop_warehouse")
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+        .with_operator(operator)
 }
 
 #[expect(clippy::expect_used)]
@@ -63,8 +75,25 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
     let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
 
+    let mut s3_config = opendal::services::S3Config::default();
+    s3_config.bucket = "hadoop".to_string();
+    s3_config.root = Some("/".to_string());
+    s3_config.endpoint = Some(minio_endpoint.clone());
+    s3_config.region = Some("us-east-1".to_string());
+    s3_config.access_key_id = Some(access_key.clone());
+    s3_config.secret_access_key = Some(secret_key.clone());
+
+    let operator = opendal::Operator::new(s3_config.into_builder())
+        .expect("Should build S3 operator")
+        .finish();
+
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3a".to_string(),
+            customized_credential_load: None,
+        }))
+        .with_operator(operator)
         .set_property(S3_REGION, "us-east-1")
         .set_property(S3_ENDPOINT, minio_endpoint)
         .set_property(S3_ACCESS_KEY_ID, access_key)
