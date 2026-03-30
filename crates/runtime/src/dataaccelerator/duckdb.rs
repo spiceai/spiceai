@@ -470,10 +470,11 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                // Use ALL configured datasets and views (not just initialized ones)
-                // to compute the attach_databases list. This ensures that when datasets
-                // are initialized sequentially, the first table's pool includes all
-                // other DuckDB files, enabling cross-table joins immediately.
+                // Use all configured datasets and views to compute the
+                // attach_databases list, but only include files that already exist
+                // on disk. This enables cross-table joins for datasets that have
+                // already been initialized while avoiding cascading failures from
+                // datasets that haven't been created yet.
                 let app = source.app();
                 let self_path = self.file_path(source)?;
                 let source_name = source.name().to_string();
@@ -499,7 +500,10 @@ impl DataAccelerator for DuckDBAccelerator {
                             && name != source_name
                         {
                             duckdb_file_path_from_params(&self.duckdb_factory, accel)
-                                .filter(|p| p != &self_path)
+                                .filter(|p| {
+                                    p != &self_path
+                                        && std::path::Path::new(p).exists()
+                                })
                         } else {
                             None
                         }
