@@ -3,7 +3,7 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint (used for Linux and Windows)'
+    description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
     required: false
 
 runs:
@@ -43,25 +43,23 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        set -euo pipefail
-
-        cache_dir="${SCCACHE_DIR:-$HOME/.cache/sccache}"
-
-        # Use the runner-local cache directory instead of an S3-backed config.
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
           exit 1
         fi
         sccache --version
 
-        mkdir -p "$cache_dir"
-        probe_file="$cache_dir/.sccache-probe-$$"
-        touch "$probe_file"
-        rm -f "$probe_file"
-
-        rm -f ~/.config/sccache/config
-
-        echo "SCCACHE_DIR=$cache_dir" >> $GITHUB_ENV
+        rm -rf ~/.config/sccache/config
+        mkdir -p ~/.config/sccache
+        cat <<EOF > ~/.config/sccache/config
+        [cache.s3]
+        bucket = "sccache"
+        endpoint = "http://localhost:9000"
+        use_ssl = false
+        server_side_encryption = false
+        no_credentials = false
+        region = "us-east-1"
+        EOF
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
