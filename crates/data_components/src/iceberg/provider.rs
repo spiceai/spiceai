@@ -324,7 +324,7 @@ impl IcebergSchemaProvider {
         .await
         {
             Ok(provider) => {
-                // Wrap in IcebergDeletionProvider + DeletionTableProviderAdapter so that
+                // Wrap in IcebergDeletionProvider so that
                 // catalog tables support DELETE FROM via equality delete files.
                 // Access control is handled by the SQL validator, not here.
                 let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
@@ -333,9 +333,7 @@ impl IcebergSchemaProvider {
                     table_name.name().to_string(),
                     Arc::new(provider),
                 );
-                let adapted: Arc<dyn TableProvider> = Arc::new(
-                    crate::delete::DeletionTableProviderAdapter::new(Arc::new(deletion_provider)),
-                );
+                let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
                 Ok(Some(adapted))
             }
             Err(e) => {

@@ -78,7 +78,7 @@ jobs:
             git add .schema/spicepod.schema.json
             git commit -m "Update spicepod.schema.json"
             git push origin schema/${GITHUB_RUN_ID}
-            gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
+            gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base develop --head schema/${GITHUB_RUN_ID}
           else
             echo "No changes detected"
           fi

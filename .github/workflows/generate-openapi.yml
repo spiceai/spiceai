@@ -25,7 +25,7 @@ jobs:
         id: check_pr
         run: |
           existing_pr=$(gh pr list \
-            --base trunk \
+            --base develop \
             --json title,headRefName \
             --jq '.[] | select(.title=="Update openapi.json")')
 

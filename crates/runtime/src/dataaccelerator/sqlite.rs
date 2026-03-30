@@ -359,17 +359,13 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
             sqlite_writer,
             &cmd.options,
             cmd.constraints.clone(),
         );
 
-        let table_provider = Arc::new(PolyTableProvider::new(
-            write_provider,
-            delete_provider,
-            read_provider,
-        ));
+        let table_provider = Arc::new(PolyTableProvider::new(write_provider, read_provider));
 
         Ok(table_provider)
     }
@@ -394,7 +390,6 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
-    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -459,9 +454,6 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let table =
-            get_deletion_provider(table).expect("table should be returned as deletion provider");
-
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -470,7 +462,8 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -490,7 +483,8 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -546,5 +540,105 @@ mod tests {
 
         // cleanup
         std::fs::remove_file(&path).expect("file should be removed");
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/2891>.
+    ///
+    /// Arrow Dictionary-encoded columns (used for enums/categoricals) must be
+    /// transparently unpacked to their value types before reaching the `SQLite`
+    /// accelerator, which does not support Dictionary encoding.
+    #[tokio::test]
+    async fn test_sqlite_dictionary_type_round_trip() {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+
+        // Build a schema with a Dictionary(Int32, Utf8) column -- the Arrow
+        // representation of an enum/categorical.
+        let source_schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+
+        // Normalize the schema so the accelerator sees plain Utf8 instead of Dictionary.
+        let accel_schema = Arc::new(arrow_tools::schema::normalize_dictionary_types(
+            &source_schema,
+        ));
+        assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&accel_schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("dict_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("SQLite table with normalized Dictionary types should be created");
+
+        // Build a record batch with Dictionary-encoded data.
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let mut status_builder = StringDictionaryBuilder::<Int32Type>::new();
+        status_builder.append_value("active");
+        status_builder.append_value("inactive");
+        status_builder.append_value("active");
+        let statuses = status_builder.finish();
+
+        let data = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![Arc::new(ids), Arc::new(statuses)],
+        )
+        .expect("record batch should be created");
+
+        // Cast to the accelerator schema (Dictionary -> Utf8) before inserting,
+        // mimicking what `SchemaCastScanExec` does at runtime.
+        let casted =
+            arrow_tools::record_batch::try_cast_to(data, Arc::clone(&accel_schema)).expect("cast");
+
+        let exec = MockExec::new(vec![Ok(casted)], accel_schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion of Dictionary data into SQLite should succeed");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        // Verify the insertion reports the expected number of inserted rows.
+        let inserted_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert!(inserted_rows > 0, "insert result should contain row count");
+
+        // Verify the data can be read back with the expected row count.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back data");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "should have 3 rows");
     }
 }
