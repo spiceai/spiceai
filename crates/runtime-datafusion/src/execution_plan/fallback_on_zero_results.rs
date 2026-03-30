@@ -403,6 +403,7 @@ mod tests {
 
     mod optimize_physical_plan_tests {
         use super::*;
+        use datafusion::config::TableParquetOptions;
         use datafusion::datasource::listing::PartitionedFile;
         use datafusion::datasource::physical_plan::{
             FileGroup, FileScanConfigBuilder, ParquetSource,
@@ -426,10 +427,10 @@ mod tests {
                 })
                 .collect();
 
-            let table_schema = datafusion_datasource::TableSchema::new(schema(), Vec::new());
-            let parquet_source = ParquetSource::new(table_schema);
+            let parquet_source = ParquetSource::new(TableParquetOptions::default());
             let config = FileScanConfigBuilder::new(
                 ObjectStoreUrl::parse("file:///").expect("valid url"),
+                schema(),
                 Arc::new(parquet_source),
             )
             .with_file_group(FileGroup::new(files))

@@ -330,7 +330,6 @@ async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
 #[tokio::test]
 async fn query_delta_lake_with_timestamp_pruning() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
