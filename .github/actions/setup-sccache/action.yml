@@ -3,15 +3,14 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
+    description: 'MinIO endpoint (used for Linux and Windows)'
     required: false
-    type: string
 
 runs:
   using: 'composite'
   steps:
     - name: Set sccache environment variables
-      if: inputs.minio_endpoint != ''
+      if: runner.os == 'macOS' || inputs.minio_endpoint != ''
       shell: bash
       run: |
         echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
@@ -40,31 +39,29 @@ runs:
         region = "us-east-1"
         EOF
 
-    - name: Set up sccache (macOS - self-hosted only)
-      if: runner.os == 'macOS' && inputs.minio_endpoint != ''
+    - name: Set up sccache (macOS)
+      if: runner.os == 'macOS'
       shell: bash
       run: |
-        # Only self-hosted macOS runners use sccache (with localhost MinIO)
-        # GitHub-hosted macOS runners use actions cache instead
+        set -euo pipefail
 
-        # Verify sccache is installed
+        cache_dir="${SCCACHE_DIR:-$HOME/.cache/sccache}"
+
+        # Use the runner-local cache directory instead of an S3-backed config.
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
           exit 1
         fi
         sccache --version
 
-        rm -rf ~/.config/sccache/config
-        mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "http://localhost:9000"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        EOF
+        mkdir -p "$cache_dir"
+        probe_file="$cache_dir/.sccache-probe-$$"
+        touch "$probe_file"
+        rm -f "$probe_file"
+
+        rm -f ~/.config/sccache/config
+
+        echo "SCCACHE_DIR=$cache_dir" >> $GITHUB_ENV
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
