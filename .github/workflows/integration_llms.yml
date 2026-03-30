@@ -17,6 +17,10 @@ on:
     paths:
       - 'crates/llms/**'
   merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
   workflow_dispatch:
     inputs:
       run:
