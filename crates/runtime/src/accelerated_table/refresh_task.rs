@@ -1291,15 +1291,26 @@ impl RefreshTask {
         // - String columns (ISO8601): parse the ISO string back to nanos
         // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
         // - Timestamp columns: read as TimestampNanosecondArray (was CAST'd by max_timestamp_df)
-        let mut value: u128 = if let Some(string_array) = col_array
+        // Handle all string array types (Utf8, LargeUtf8, Utf8View) for ISO8601 columns.
+        let iso_str_value = col_array
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>(
-        ) {
-            if string_array.is_null(0) {
-                return Ok(None);
-            }
-            let iso_str = string_array.value(0);
-            util::timestamp_filter::parse_iso8601_to_nanos(iso_str).context(
+            .downcast_ref::<arrow::array::StringArray>()
+            .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            });
+
+        let mut value: u128 = if let Some(iso_str) = iso_str_value {
+            util::timestamp_filter::parse_iso8601_to_nanos(&iso_str).context(
                 super::FailedToFindLatestTimestampSnafu {
                     reason: format!(
                         "Failed to parse ISO8601 timestamp '{iso_str}' from time column"
@@ -2003,6 +2014,109 @@ mod tests {
             plan_str.contains("Cast("),
             "timestamp column should use Cast, got: {plan_str}"
         );
+    }
+
+    /// Helper: run `max_timestamp_df` on an accelerator and extract the ISO string
+    /// from the result, using the same downcast chain as `timestamp_nanos_for_append_query`.
+    async fn collect_iso_string_from_max_df(
+        accelerator: &Arc<dyn TableProvider>,
+        col: &str,
+    ) -> Option<String> {
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(accelerator, ctx, col).expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first()?;
+        if result.num_rows() == 0 {
+            return None;
+        }
+        let col_array = result.column(0);
+        col_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_utf8() {
+        use arrow::array::StringArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_large_utf8() {
+        use arrow::array::LargeStringArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(LargeStringArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_utf8_view() {
+        use arrow::array::StringViewArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringViewArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
     }
 
     /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (`UnixSeconds`).
