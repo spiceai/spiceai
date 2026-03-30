@@ -590,7 +590,7 @@ pub(crate) async fn create_table_provider(
     };
 
     // Wrap with upsert deduplication if needed
-    let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+    let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
         duckdb_writer,
         &cmd.options,
         cmd.constraints.clone(),
@@ -615,7 +615,6 @@ pub(crate) async fn create_table_provider(
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,
-        delete_provider,
         read_provider,
         schema_metadata,
     ));
@@ -801,7 +800,6 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -1164,9 +1162,6 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -1175,10 +1170,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1194,10 +1189,10 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1225,17 +1220,14 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1259,17 +1251,14 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan =
-            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
-                .await
-                .expect("deletion should be successful");
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1666,5 +1655,101 @@ mod tests {
         // cleanup
         drop(table);
         drop(temp_dir);
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.
+    ///
+    /// Arrow Dictionary-encoded columns (enums) must be transparently unpacked
+    /// to their value types before reaching the `DuckDB` accelerator.
+    #[tokio::test]
+    async fn test_duckdb_dictionary_type_round_trip() {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+
+        // Build a schema containing a Dictionary(Int32, Utf8) column.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+
+        // Normalize the schema (Dictionary -> Utf8).
+        let accel_schema = Arc::new(arrow_tools::schema::normalize_dictionary_types(
+            &source_schema,
+        ));
+        assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&accel_schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("dict_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let table = duckdb_accelerator
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("DuckDB table with normalized Dictionary types should be created");
+
+        // Build a record batch with Dictionary-encoded data.
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let mut status_builder = StringDictionaryBuilder::<Int32Type>::new();
+        status_builder.append_value("active");
+        status_builder.append_value("inactive");
+        status_builder.append_value("active");
+        let statuses = status_builder.finish();
+
+        let data = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![Arc::new(ids), Arc::new(statuses)],
+        )
+        .expect("record batch");
+
+        // Cast from Dictionary to the normalized schema before inserting.
+        let casted = arrow_tools::record_batch::try_cast_to(data, Arc::clone(&accel_schema))
+            .expect("cast Dictionary to Utf8");
+
+        let exec = MockExec::new(vec![Ok(casted)], accel_schema);
+        let ctx = SessionContext::new();
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion of Dictionary data into DuckDB should succeed");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        assert!(!result.is_empty());
+
+        // Verify the data can be read back.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back data");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "should have 3 rows");
     }
 }

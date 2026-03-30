@@ -27,7 +27,6 @@ use crate::{
 };
 use arrow::array::UInt64Array;
 use cache::Caching;
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use datafusion::{
     catalog::TableProvider,
     logical_expr::Operator,
@@ -57,7 +56,7 @@ impl super::AcceleratedTable {
             // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
             let _lock_guard = accelerator_write_mutex.lock().await;
 
-            if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
+            {
                 let mut exprs = Vec::new();
 
                 // convert retention filters into data eviction expressions
@@ -137,12 +136,7 @@ impl super::AcceleratedTable {
                     default_runtime_env(io_runtime.clone()),
                 );
 
-                let plan = DeletionTableProvider::delete_from(
-                    deleted_table_provider.as_ref(),
-                    &ctx.state(),
-                    &[expr],
-                )
-                .await;
+                let plan = accelerator.delete_from(&ctx.state(), vec![expr]).await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {
                         Err(e) => {
@@ -174,8 +168,6 @@ impl super::AcceleratedTable {
                         tracing::error!("[retention] Error running retention check: {e}");
                     }
                 }
-            } else {
-                tracing::error!("[retention] Accelerated table does not support delete");
             }
         }
     }
@@ -236,8 +228,8 @@ mod tests {
         array::{BooleanArray, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::{arrow::write::MemTable, delete::DeletionTableProviderAdapter};
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use data_components::arrow::write::MemTable;
+    use datafusion::{catalog::TableProvider, physical_plan::collect, prelude::SessionContext};
     use tokio::time::{Duration, sleep};
 
     fn create_test_schema() -> Arc<Schema> {
@@ -311,8 +303,7 @@ mod tests {
         let mem_table =
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
-        let accelerator = Arc::new(DeletionTableProviderAdapter::new(Arc::new(mem_table)))
-            as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
 
         // Create retention configuration
         let retention_delete_expr = retention_sql.map(|sql| {
