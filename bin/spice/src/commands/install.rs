@@ -120,11 +120,13 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         return Ok(());
     }
 
+    let accelerator = if args.cpu { None } else { detect_accelerator() };
+
     // Get possible runtime asset names (handles version-specific naming)
     let asset_names = SystemType::this_pc().runtime_asset_names(
         parsed.flavor.as_str(),
         &release.tag_name,
-        detect_accelerator().as_deref(),
+        accelerator.as_deref(),
     );
     tracing::info!("Installing Spice.ai runtime {}...", release.tag_name);
 
