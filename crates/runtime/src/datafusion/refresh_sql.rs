@@ -643,4 +643,79 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Reproduces the schema evolution bug from issue #9782:
+    /// Refresh SQL referencing a new column fails validation against a stale schema,
+    /// but succeeds after the schema is updated with the evolved fields.
+    #[test]
+    fn test_schema_evolution_refresh_sql_validation() {
+        // Stale cached schema: missing the "resources" column
+        let stale_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+
+        let table = TableReference::parse_str("spicepod_deployments");
+        let sql = "SELECT id, name, status, resources FROM spicepod_deployments";
+
+        // Validation should fail with the stale schema: "resources" not found
+        let result = parse_refresh_sql(table.clone(), sql, Arc::clone(&stale_schema));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("resources"),
+            "Expected error about 'resources' column, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("not present in the source table"),
+            "Expected 'not present in the source table' error, got: {err_msg}"
+        );
+
+        // Evolved schema: includes the "resources" column (as if updated by
+        // refresh_schema_from_kafka after detecting schema evolution)
+        let evolved_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("resources", DataType::Utf8, true),
+        ]));
+
+        // Validation should succeed with the evolved schema
+        let result = parse_refresh_sql(table, sql, evolved_schema);
+        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+        let (_, result_schema) = result.unwrap();
+        assert_eq!(result_schema.fields().len(), 4);
+        assert!(result_schema.field_with_name("resources").is_ok());
+    }
+
+    /// Test that wildcard refresh SQL works with both stale and evolved schemas.
+    #[test]
+    fn test_schema_evolution_wildcard_refresh_sql() {
+        let stale_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT * FROM test_table";
+
+        // Wildcard should pass with stale schema (2 columns)
+        let result = parse_refresh_sql(table.clone(), sql, Arc::clone(&stale_schema));
+        assert!(result.is_ok());
+        let (_, schema) = result.unwrap();
+        assert_eq!(schema.fields().len(), 2);
+
+        // Wildcard should also pass with evolved schema (3 columns)
+        let evolved_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("resources", DataType::Utf8, true),
+        ]));
+
+        let result = parse_refresh_sql(table, sql, evolved_schema);
+        assert!(result.is_ok());
+        let (_, schema) = result.unwrap();
+        assert_eq!(schema.fields().len(), 3);
+    }
 }

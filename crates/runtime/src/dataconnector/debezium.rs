@@ -312,7 +312,7 @@ impl DataConnector for Debezium {
 
         let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
-            Some(metadata) => {
+            Some(mut metadata) => {
                 if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
                     ensure!(
                         config_consumer_group_id == &metadata.consumer_group_id,
@@ -348,6 +348,18 @@ impl DataConnector for Debezium {
                         connector_component: ConnectorComponent::from(dataset),
                     }
                 );
+
+                // Detect schema evolution by peeking at the latest Kafka message.
+                // The cached schema may be stale if the source table schema changed
+                // since the metadata was last persisted.
+                refresh_schema_from_kafka(
+                    &mut metadata,
+                    &dataset_name,
+                    topic,
+                    dataset,
+                    &self.kafka_config,
+                )
+                .await;
 
                 let schema = debezium::arrow::convert_fields_to_arrow_schema(
                     metadata.schema_fields.iter().collect(),
@@ -560,4 +572,75 @@ async fn get_metadata_from_kafka(
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
+}
+
+/// Detect schema evolution by fetching the latest Kafka message and comparing
+/// its schema fields with the cached metadata. If new fields are found, the
+/// metadata is updated in place and re-persisted to the accelerator.
+async fn refresh_schema_from_kafka(
+    metadata: &mut DebeziumKafkaMetadata,
+    dataset_name: &str,
+    topic: &str,
+    dataset: &Dataset,
+    kafka_config: &KafkaConfig,
+) {
+    let latest = match KafkaConsumer::fetch_latest_json::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+    )
+    .await
+    {
+        Ok(Some((_, event))) => event,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!("Could not fetch latest Kafka message for schema detection on dataset {dataset_name}: {e}");
+            return;
+        }
+    };
+
+    let Some(latest_fields) = latest.get_schema_fields() else {
+        return;
+    };
+
+    let cached_names: std::collections::BTreeSet<&str> = metadata
+        .schema_fields
+        .iter()
+        .filter_map(|f| f.field.as_deref())
+        .collect();
+    let latest_names: std::collections::BTreeSet<&str> = latest_fields
+        .iter()
+        .filter_map(|f| f.field.as_deref())
+        .collect();
+
+    if cached_names == latest_names {
+        return;
+    }
+
+    let added: Vec<&str> = latest_names.difference(&cached_names).copied().collect();
+    let removed: Vec<&str> = cached_names.difference(&latest_names).copied().collect();
+
+    tracing::info!(
+        "Schema evolution detected for dataset {dataset_name}. \
+         Added columns: [{}], Removed columns: [{}]. Updating cached schema.",
+        if added.is_empty() {
+            "none".to_string()
+        } else {
+            added.join(", ")
+        },
+        if removed.is_empty() {
+            "none".to_string()
+        } else {
+            removed.join(", ")
+        },
+    );
+
+    metadata.schema_fields = latest_fields.into_iter().cloned().collect();
+
+    if dataset.is_file_accelerated() {
+        if let Err(e) = set_metadata_to_accelerator(dataset, metadata).await {
+            tracing::warn!(
+                "Failed to persist updated schema for dataset {dataset_name}: {e}"
+            );
+        }
+    }
 }

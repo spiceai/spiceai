@@ -369,6 +369,86 @@ impl KafkaConsumer {
         Ok(())
     }
 
+    /// Fetch the latest JSON message from a Kafka topic using a temporary consumer.
+    ///
+    /// Creates a short-lived consumer with a unique group ID, seeks to the end of
+    /// each partition, and reads the most recent message. The temporary consumer is
+    /// dropped after reading.
+    ///
+    /// This is useful for peeking at the latest schema in Debezium change events
+    /// without affecting the main consumer's offsets.
+    pub async fn fetch_latest_json<K: DeserializeOwned, V: DeserializeOwned>(
+        topic: &str,
+        kafka_config: &KafkaConfig,
+    ) -> Result<Option<(Option<K>, V)>> {
+        let temp_group_id = format!("spice-schema-detect-{}", uuid::Uuid::new_v4());
+        let temp_consumer = Self::create(temp_group_id, kafka_config)?;
+
+        let metadata = temp_consumer
+            .consumer
+            .fetch_metadata(Some(topic), Duration::from_secs(5))
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to fetch metadata for schema detection".to_string(),
+            })?;
+
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .context(MetadataTopicNotFoundSnafu {
+                topic: topic.to_string(),
+            })?;
+
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        let mut has_messages = false;
+
+        for partition in topic_metadata.partitions() {
+            let (low, high) = temp_consumer
+                .consumer
+                .fetch_watermarks(topic, partition.id(), Duration::from_secs(5))
+                .context(UnableToRestartTopicSnafu {
+                    message: format!(
+                        "Failed to fetch watermarks for partition {}",
+                        partition.id()
+                    ),
+                })?;
+
+            if high > low {
+                tpl.add_partition_offset(topic, partition.id(), Offset::Offset(high - 1))
+                    .context(UnableToRestartTopicSnafu {
+                        message: "Failed to set partition offset for schema detection".to_string(),
+                    })?;
+                has_messages = true;
+            }
+        }
+
+        if !has_messages {
+            return Ok(None);
+        }
+
+        // Use manual partition assignment (bypasses consumer group protocol)
+        temp_consumer
+            .consumer
+            .assign(&tpl)
+            .context(UnableToSubscribeToTopicSnafu {
+                topic: topic.to_string(),
+            })?;
+
+        match tokio::time::timeout(Duration::from_secs(10), temp_consumer.next_json::<K, V>())
+            .await
+        {
+            Ok(Ok(Some(msg))) => Ok(Some(msg.into_parts())),
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                tracing::debug!(
+                    "Timeout while fetching latest message from topic {topic} for schema detection"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     #[must_use]
     pub fn metrics(&self) -> &Arc<KafkaMetrics> {
         &self.metrics
@@ -495,6 +575,11 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
         self.consumer
             .store_offset_from_message(&self.msg)
             .context(UnableToCommitMessageSnafu)
+    }
+
+    /// Consume the message and return owned key and value.
+    pub fn into_parts(self) -> (Option<K>, V) {
+        (self.key, self.value)
     }
 }
 
