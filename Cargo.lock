@@ -5323,7 +5323,7 @@ dependencies = [
  "url",
  "util",
  "uuid 1.21.0",
- "zip 7.4.0",
+ "zip 8.3.0",
 ]
 
 [[package]]
@@ -6620,7 +6620,7 @@ dependencies = [
 [[package]]
 name = "docx-rs"
 version = "0.4.17"
-source = "git+https://github.com/spiceai/docx-rs?rev=508456cf36bbc1ae5f381d24b03f0a993703e3ee#508456cf36bbc1ae5f381d24b03f0a993703e3ee"
+source = "git+https://github.com/spiceai/docx-rs?rev=2a85dce57d0128e2cd7c369545516c347cb8c529#2a85dce57d0128e2cd7c369545516c347cb8c529"
 dependencies = [
  "base64 0.13.1",
  "image 0.24.9",
@@ -6628,7 +6628,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "xml-rs",
- "zip 7.4.0",
+ "zip 8.3.0",
 ]
 
 [[package]]
@@ -10953,6 +10953,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1670343e58806300d87950e3401e820b519b9384281bbabfb15e3636689ffd69"
 dependencies = [
  "crc",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47bb1e988e6fb779cf720ad431242d3f03167c1b3f2b1aae7f1a94b2495b36ae"
+dependencies = [
  "sha2 0.10.9",
 ]
 
@@ -23475,7 +23484,34 @@ dependencies = [
  "getrandom 0.4.1",
  "hmac 0.12.1",
  "indexmap 2.13.0",
- "lzma-rust2",
+ "lzma-rust2 0.15.7",
+ "memchr",
+ "pbkdf2 0.12.2",
+ "ppmd-rust",
+ "sha1 0.10.6",
+ "time",
+ "typed-path",
+ "zeroize",
+ "zopfli",
+ "zstd",
+]
+
+[[package]]
+name = "zip"
+version = "8.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a243cfad17427fc077f529da5a95abe4e94fd2bfdb601611870a6557cc67657"
+dependencies = [
+ "aes 0.8.4",
+ "bzip2",
+ "constant_time_eq",
+ "crc32fast",
+ "deflate64",
+ "flate2",
+ "getrandom 0.4.1",
+ "hmac 0.12.1",
+ "indexmap 2.13.0",
+ "lzma-rust2 0.16.2",
  "memchr",
  "pbkdf2 0.12.2",
  "ppmd-rust",

@@ -68,6 +68,12 @@ fn derive_table_schema(
     }
 }
 
+fn apply_client_json_pointer(client: &GraphQLClient, query: &mut GraphQLQuery) {
+    if let Some(json_pointer) = client.json_pointer.as_ref() {
+        query.json_pointer = Some(Arc::clone(json_pointer));
+    }
+}
+
 pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
     transform_fn: Option<TransformFn>,
@@ -106,7 +112,8 @@ impl GraphQLTableProviderBuilder {
 
     pub async fn build(self, query_string: &str) -> Result<GraphQLTableProvider> {
         let query_string: Arc<str> = Arc::from(query_string);
-        let query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
+        let mut query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
+        apply_client_json_pointer(&self.client, &mut query);
 
         if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
             return Err(super::Error::NoJsonPointerFound {});
@@ -258,6 +265,8 @@ impl TableProvider for GraphQLTableProvider {
         } else {
             (None, None)
         };
+
+        apply_client_json_pointer(self.client.as_ref(), &mut query);
 
         let graphql_exec = Arc::new(
             GraphQLTableProviderExec::new(
@@ -492,5 +501,25 @@ mod tests {
             TableProvider::schema(&provider).field(0).name(),
             "renamed_id"
         );
+    }
+
+    #[test]
+    fn configured_json_pointer_overrides_inferred_query_pointer() {
+        let client = GraphQLClientBuilder::new(
+            Url::parse("https://example.com/graphql").expect("valid URL"),
+            UnnestBehavior::Depth(0),
+        )
+        .with_json_pointer(Some("/data/view"))
+        .build(reqwest::Client::new())
+        .expect("client to build");
+
+        let mut query = GraphQLQuery::try_from(Arc::<str>::from("query { view { nodes { id } } }"))
+            .expect("query to parse");
+
+        query.json_pointer = Some(Arc::from("/data/view/nodes"));
+
+        apply_client_json_pointer(&client, &mut query);
+
+        assert_eq!(query.json_pointer.as_deref(), Some("/data/view"));
     }
 }
