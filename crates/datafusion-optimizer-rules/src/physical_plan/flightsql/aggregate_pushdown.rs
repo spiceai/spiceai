@@ -571,8 +571,8 @@ mod tests {
         let optimized = optimize(agg)?;
         insta::assert_snapshot!(plan_display(&optimized), @r#"
         UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE "l_shipdate" > 100 GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE ("l_shipdate" > 100) GROUP BY "l_returnflag"
+          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE ("l_shipdate" > 100) GROUP BY "l_returnflag"
         "#);
 
         Ok(())
