@@ -1,9 +1,9 @@
 name: Setup spiceio
-description: 'Build and install spiceio (S3-to-SMB proxy) from spiceai/spiceio'
+description: 'Download and install spiceio (S3-to-SMB proxy) from spiceai/spiceio releases'
 
 inputs:
   github_token:
-    description: 'GitHub token for cloning the private spiceai/spiceio repo'
+    description: 'GitHub token for downloading from the private spiceai/spiceio repo'
     required: true
 
 outputs:
@@ -27,19 +27,21 @@ runs:
           exit 0
         fi
 
-        echo "Building spiceio from source..."
-        SPICEIO_DIR="/tmp/spiceio-build"
-        rm -rf "$SPICEIO_DIR"
-        git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/spiceai/spiceio.git" "$SPICEIO_DIR"
-        pushd "$SPICEIO_DIR"
-        cargo build --release --locked 2>&1
-        popd
+        echo "Downloading latest spiceio release..."
+        INSTALL_DIR="/usr/local/bin"
+        TEMP_DIR=$(mktemp -d)
 
-        SPICEIO_BIN="$SPICEIO_DIR/target/release/spiceio"
+        # Download the latest release asset
+        gh release download --repo spiceai/spiceio --pattern "spiceio-macOS-ARM64.tar.gz" --dir "$TEMP_DIR"
+
+        # Extract and install
+        tar -xzf "$TEMP_DIR/spiceio-macOS-ARM64.tar.gz" -C "$TEMP_DIR"
+        SPICEIO_BIN="$TEMP_DIR/spiceio"
         if [ -f "$SPICEIO_BIN" ]; then
-          echo "spiceio built successfully"
+          chmod +x "$SPICEIO_BIN"
+          echo "spiceio downloaded successfully"
           echo "spiceio_bin=$SPICEIO_BIN" >> $GITHUB_OUTPUT
         else
-          echo "::warning::Failed to build spiceio"
+          echo "::warning::Failed to download spiceio"
           echo "spiceio_bin=" >> $GITHUB_OUTPUT
         fi
