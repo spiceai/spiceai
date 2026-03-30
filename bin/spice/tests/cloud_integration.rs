@@ -537,14 +537,14 @@ fn test_cloud_multiple_secrets() {
         .success();
     let list_output: serde_json::Value = serde_json::from_slice(&list_assert.get_output().stdout)
         .expect("list secrets should produce valid JSON");
-    let secret_count = list_output
+    let entries_count = list_output
         .as_array()
-        .expect("secrets should be an array")
+        .expect("listed items should be an array")
         .len();
     assert!(
-        secret_count >= 3,
-        "should have at least 3 secrets, got {}",
-        secret_count
+        entries_count >= 3,
+        "should have at least 3 entries, got {}",
+        entries_count
     );
 
     for i in 0..3 {
