@@ -150,9 +150,9 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                 .start()
                 .await?;
 
-            harness.wait_for_executors(Duration::from_secs(15)).await?;
-
             run_with_harness(harness, |harness| async move {
+                harness.wait_for_executors(Duration::from_secs(15)).await?;
+
                 // -----------------------------------------------------------------
                 // Step 1: CREATE SCHEMA + CREATE TABLE
                 // -----------------------------------------------------------------
@@ -493,9 +493,9 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                 .start()
                 .await?;
 
-            harness.wait_for_executors(Duration::from_secs(15)).await?;
-
             run_with_harness(harness, |harness| async move {
+                harness.wait_for_executors(Duration::from_secs(15)).await?;
+
                 // Create schema and two related tables.
                 harness.query("CREATE SCHEMA jcat.store").await?;
 
@@ -652,23 +652,19 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                 .start()
                 .await?;
 
-            harness.wait_for_executors(Duration::from_secs(15)).await?;
-
             run_with_harness(harness, |harness| async move {
+                harness.wait_for_executors(Duration::from_secs(15)).await?;
+
                 // Create two separate schemas.
                 harness.query("CREATE SCHEMA scat.finance").await?;
                 harness.query("CREATE SCHEMA scat.hr").await?;
 
                 // Create tables with the same name in different schemas.
                 harness
-                    .query(
-                        "CREATE TABLE scat.finance.records (id BIGINT NOT NULL, amount DOUBLE)",
-                    )
+                    .query("CREATE TABLE scat.finance.records (id BIGINT NOT NULL, amount DOUBLE)")
                     .await?;
                 harness
-                    .query(
-                        "CREATE TABLE scat.hr.records (id BIGINT NOT NULL, employee VARCHAR)",
-                    )
+                    .query("CREATE TABLE scat.hr.records (id BIGINT NOT NULL, employee VARCHAR)")
                     .await?;
 
                 // Insert data into both.
@@ -680,8 +676,7 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                     .await?;
 
                 // Validate isolation — each schema has its own data and columns.
-                let select_finance =
-                    "SELECT id, amount FROM scat.finance.records ORDER BY id";
+                let select_finance = "SELECT id, amount FROM scat.finance.records ORDER BY id";
                 let batches = harness.query(select_finance).await?;
                 assert_batches_eq!(
                     &[
@@ -791,9 +786,9 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                 .start()
                 .await?;
 
-            harness.wait_for_executors(Duration::from_secs(15)).await?;
-
             run_with_harness(harness, |harness| async move {
+                harness.wait_for_executors(Duration::from_secs(15)).await?;
+
                 harness.query("CREATE SCHEMA pkcat.myschema").await?;
 
                 harness
@@ -904,8 +899,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                 )?;
                 assert_eq!(count, 3, "expected 3 rows after delete");
 
-                let select_pk_after_del =
-                    "SELECT id, name FROM pkcat.myschema.users ORDER BY id";
+                let select_pk_after_del = "SELECT id, name FROM pkcat.myschema.users ORDER BY id";
                 let batches = harness.query(select_pk_after_del).await?;
                 assert_batches_eq!(
                     &[
@@ -969,9 +963,9 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                 .start()
                 .await?;
 
-            harness.wait_for_executors(Duration::from_secs(15)).await?;
-
             run_with_harness(harness, |harness| async move {
+                harness.wait_for_executors(Duration::from_secs(15)).await?;
+
                 harness.query("CREATE SCHEMA ncat.ns").await?;
 
                 harness
@@ -1043,8 +1037,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                 insta::assert_snapshot!(plan, @"");
 
                 // WHERE IS NULL / IS NOT NULL.
-                let select_null =
-                    "SELECT id FROM ncat.ns.metrics WHERE label IS NULL ORDER BY id";
+                let select_null = "SELECT id FROM ncat.ns.metrics WHERE label IS NULL ORDER BY id";
                 let batches = harness.query(select_null).await?;
                 assert_batches_eq!(
                     &["+----+", "| id |", "+----+", "| 3  |", "| 5  |", "+----+",],
