@@ -143,7 +143,8 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     id BIGINT NOT NULL,
                     name VARCHAR NOT NULL,
                     email VARCHAR,
-                    age BIGINT
+                    age BIGINT,
+                    PRIMARY KEY (id)
                 )",
             )
             .await?;
