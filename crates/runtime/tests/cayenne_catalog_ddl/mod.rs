@@ -40,9 +40,10 @@ use spicepod::param::Params;
 
 /// Creates a [`ResolvedClusterConfig`] with Executor role for tests.
 ///
-/// Cayenne catalogs require distributed mode. Using Executor role allows DDL
-/// operations via the custom analyzer rule while letting DML pass through to
-/// the native Cayenne table provider.
+/// Cayenne catalogs require distributed mode. Using the Executor role enables
+/// distributed-mode checks in the planner while avoiding scheduler-only
+/// distributed DML rewrites in these tests; Cayenne DDL rewriting via
+/// `CayenneDdlAnalyzerRule` is not gated on the cluster role.
 fn test_cluster_config() -> ResolvedClusterConfig {
     ResolvedClusterConfig::try_new(ClusterConfig {
         role: Some(ClusterRole::Executor),
@@ -50,7 +51,10 @@ fn test_cluster_config() -> ResolvedClusterConfig {
         node_advertise_address: Some("127.0.0.1".to_string()),
         ..Default::default()
     })
-    .expect("test cluster config")
+    .expect(
+        "failed to build Cayenne catalog DDL test ResolvedClusterConfig; expected Executor role, \
+         allow_insecure_connections = true, and node_advertise_address to be set",
+    )
 }
 
 /// Helper to run a SQL query against the runtime and collect results.
