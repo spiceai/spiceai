@@ -75,10 +75,15 @@ pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn Partiti
 
 /// Constructs a `CREATE TABLE IF NOT EXISTS` DDL SQL query for the provided [`TableReference`].
 ///
+/// If `partition_expr` is provided, a `PARTITION BY <expr>` clause is appended after the
+/// column definitions. This ensures executors receiving the DDL will create the table with
+/// the same partition layout as the scheduler.
+///
 /// Identifier quoting escapes embedded double-quotes to prevent SQL injection.
 pub fn create_table_if_not_exists(
     tbl: &TableReference,
     provider: &Arc<dyn TableProvider>,
+    partition_expr: Option<&str>,
 ) -> Result<String, DataFusionError> {
     let ResolvedTableReference {
         catalog,
@@ -131,8 +136,13 @@ pub fn create_table_if_not_exists(
         table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
     }
 
+    let partition_clause = match partition_expr {
+        Some(expr) if !expr.is_empty() => format!(" PARTITION BY {expr}"),
+        _ => String::new(),
+    };
+
     Ok(format!(
-        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({})",
+        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({}){partition_clause}",
         quote_identifier(&catalog),
         quote_identifier(&schema),
         quote_identifier(&table),

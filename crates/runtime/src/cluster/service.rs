@@ -604,11 +604,45 @@ impl ClusterService for ClusterServiceImpl {
             flight_client_registry.insert(executor_id.to_string(), client.clone());
         }
 
-        // Forward `CREATE TABLE IF NOT EXISTS` DDL to executor.
+        // Forward `CREATE TABLE IF NOT EXISTS` DDL to executor, including PARTITION BY
+        // when the table has a partition expression in the Cayenne metadata catalog.
         #[cfg(not(windows))]
         for table_ref in discover_cayenne_tables(&self.datafusion).await {
             if let Some(table) = self.datafusion.get_table(&table_ref).await {
-                let ddl_sql = create_table_if_not_exists(&table_ref, &table).map_err(|e| {
+                let resolved = table_ref.clone().resolve(
+                    crate::datafusion::SPICE_DEFAULT_CATALOG,
+                    crate::datafusion::SPICE_DEFAULT_SCHEMA,
+                );
+                let partition_expr_str = match self.datafusion.ctx.catalog(&resolved.catalog) {
+                    Some(cat) => {
+                        if let Some(pa) =
+                            crate::datafusion::cayenne_ddl::as_partition_aware(cat.as_ref())
+                        {
+                            match pa
+                                .table_partition_expr(&resolved.schema, &resolved.table)
+                                .await
+                            {
+                                Ok(expr) => expr,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to read partition expression for {table_ref}: {e}"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+
+                let ddl_sql = create_table_if_not_exists(
+                    &table_ref,
+                    &table,
+                    partition_expr_str.as_deref(),
+                )
+                .map_err(|e| {
                     Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
                 })?;
                 forward_sql_to_executor(client.clone(), &ddl_sql)

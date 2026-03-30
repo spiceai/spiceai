@@ -708,7 +708,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             // Forward the CREATE TABLE DDL to executor nodes
             if let Some(ref registry) = executor_registry {
-                let ddl_sql = create_table_if_not_exists(&table_ref, &wrapped_provider)?;
+                let ddl_sql = create_table_if_not_exists(
+                    &table_ref,
+                    &wrapped_provider,
+                    partition_expr_sql.as_deref(),
+                )?;
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
             }
 

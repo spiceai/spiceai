@@ -1306,8 +1306,10 @@ pub async fn initialize_cluster_executor(
     Ok(async move {
         let flight_addr = rt.datafusion().cluster_config.node_advertise_url();
         // Wait for our own flight service to be operational.
+        // Bound retries to avoid blocking forever if the Flight service never starts.
+        // 10 retries with fibonacci backoff totals ~2.5 minutes of waiting.
         util::retry(
-            FibonacciBackoffBuilder::new().max_retries(None).build(),
+            FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
             || {
                 let addr = flight_addr.clone();
                 let creds = creds.clone();
@@ -1315,7 +1317,7 @@ pub async fn initialize_cluster_executor(
                     flight_client::can_connect(addr.clone(), Some(creds))
                         .await
                         .map_err(|e| {
-                            tracing::warn!("FDailed {addr:?}");
+                            tracing::warn!("Failed to connect to local Flight service at {addr:?}");
                             util::RetryError::Transient {
                                 err: e,
                                 retry_after: None,
