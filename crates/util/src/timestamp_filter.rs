@@ -197,10 +197,13 @@ impl TimestampFilterConvert {
 ///
 /// Returns a string like `2024-01-25T20:43:41.000000000`.
 #[must_use]
-#[expect(clippy::cast_possible_wrap)]
 pub fn nanos_to_iso8601_string(nanos: u128) -> String {
-    let secs = (nanos / 1_000_000_000) as i64;
-    let subsec_nanos = (nanos % 1_000_000_000) as u32;
+    let Ok(secs) = i64::try_from(nanos / 1_000_000_000) else {
+        return chrono::DateTime::<chrono::Utc>::default()
+            .format("%Y-%m-%dT%H:%M:%S%.9f")
+            .to_string();
+    };
+    let subsec_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or_default();
     chrono::DateTime::from_timestamp(secs, subsec_nanos)
         .unwrap_or_default()
         .format("%Y-%m-%dT%H:%M:%S%.9f")
