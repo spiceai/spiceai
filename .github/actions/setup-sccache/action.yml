@@ -3,7 +3,7 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint (used for Linux)'
+    description: 'MinIO endpoint (used for Linux and Windows)'
     required: false
 
 runs:
@@ -54,7 +54,7 @@ runs:
         SCCACHE_NO_CREDS="false"
 
         # Use spiceio if it's running (started by setup-spiceio action)
-        if curl -s -o /dev/null "http://127.0.0.1:8333/" 2>/dev/null; then
+        if curl -sf -o /dev/null --connect-timeout 1 --max-time 2 "http://127.0.0.1:8333/" 2>/dev/null; then
           SCCACHE_ENDPOINT="http://127.0.0.1:8333"
           SCCACHE_REGION="us-west-1"
           SCCACHE_NO_CREDS="true"
