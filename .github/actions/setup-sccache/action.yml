@@ -5,12 +5,6 @@ inputs:
   minio_endpoint:
     description: 'MinIO endpoint (used for Linux)'
     required: false
-  unas_smb_pass:
-    description: 'SMB password for UNAS share (used by spiceio on macOS)'
-    required: false
-  spiceio_bin:
-    description: 'Path to spiceio binary (from setup-spiceio action)'
-    required: false
 
 runs:
   using: 'composite'
@@ -48,9 +42,6 @@ runs:
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      env:
-        UNAS_SMB_PASS: ${{ inputs.unas_smb_pass }}
-        SPICEIO_BIN: ${{ inputs.spiceio_bin }}
       run: |
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
@@ -62,49 +53,16 @@ runs:
         SCCACHE_REGION="us-east-1"
         SCCACHE_NO_CREDS="false"
 
-        # Try to start spiceio (S3-to-SMB proxy) if available
-        if [ -n "$SPICEIO_BIN" ] && [ -n "$UNAS_SMB_PASS" ]; then
-          echo "Starting spiceio S3-to-SMB proxy..."
-          SPICEIO_LOG="/tmp/spiceio.log"
-          SPICEIO_BIND="127.0.0.1:8333" \
-          SPICEIO_SMB_SERVER="192.168.3.148" \
-          SPICEIO_SMB_USER="runner" \
-          SPICEIO_SMB_PASS="$UNAS_SMB_PASS" \
-          SPICEIO_SMB_SHARE="ai_platform_dev" \
-          SPICEIO_BUCKET="sccache" \
-          SPICEIO_REGION="us-west-1" \
-          "$SPICEIO_BIN" > "$SPICEIO_LOG" 2>&1 &
-          SPICEIO_PID=$!
-
-          SPICEIO_READY=false
-          for i in $(seq 1 30); do
-            if curl -s -o /dev/null "http://127.0.0.1:8333/" 2>/dev/null; then
-              SPICEIO_READY=true
-              echo "spiceio is ready (PID: $SPICEIO_PID)"
-              break
-            fi
-            if ! kill -0 "$SPICEIO_PID" 2>/dev/null; then
-              echo "spiceio exited unexpectedly"
-              break
-            fi
-            sleep 0.5
-          done
-
-          if [ "$SPICEIO_READY" = true ]; then
-            SCCACHE_ENDPOINT="http://127.0.0.1:8333"
-            SCCACHE_REGION="us-west-1"
-            SCCACHE_NO_CREDS="true"
-            echo "Using spiceio at $SCCACHE_ENDPOINT"
-          else
-            echo "Failed to start spiceio, falling back to local MinIO"
-            echo "--- spiceio log ---"
-            cat "$SPICEIO_LOG" 2>/dev/null || true
-            echo "--- end spiceio log ---"
-            kill "$SPICEIO_PID" 2>/dev/null || true
-          fi
+        # Use spiceio if it's running (started by setup-spiceio action)
+        if curl -s -o /dev/null "http://127.0.0.1:8333/" 2>/dev/null; then
+          SCCACHE_ENDPOINT="http://127.0.0.1:8333"
+          SCCACHE_REGION="us-west-1"
+          SCCACHE_NO_CREDS="true"
+          echo "Using spiceio at $SCCACHE_ENDPOINT"
         else
-          echo "spiceio not available or SMB password not set, using local MinIO"
+          echo "spiceio not available, using local MinIO"
         fi
+
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
         cat <<EOF > ~/.config/sccache/config
