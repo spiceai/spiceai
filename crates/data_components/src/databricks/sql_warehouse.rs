@@ -985,8 +985,8 @@ mod tests {
             "result": { "data_array": [] }
         });
 
-        let err =
-            schema_from_json(&response, "test_table").expect_err("should fail on empty data_array");
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on empty data_array");
         assert!(
             matches!(&err, Error::NoColumnsInDataset { .. }),
             "unexpected error: {err}"
