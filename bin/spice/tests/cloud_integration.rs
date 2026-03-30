@@ -104,8 +104,8 @@ fn cleanup_app(org_app: &str) {
 /// Common insta settings: redact dynamic fields so snapshots are stable.
 fn insta_settings() -> insta::Settings {
     let mut settings = insta::Settings::clone_current();
-    // Numeric IDs
-    settings.add_filter(r#""id": \d+"#, r#""id": "<redacted>""#);
+    // Numeric IDs (e.g., "id": 123 -> "id": 0)
+    settings.add_filter(r#""id": \d+"#, r#""id": 0"#);
     // ISO-8601 timestamps
     settings.add_filter(
         r#""\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^"]*""#,

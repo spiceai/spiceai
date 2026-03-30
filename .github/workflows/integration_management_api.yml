@@ -57,14 +57,7 @@ jobs:
             echo "Error: SPICE_SPICEAI_TOKEN is not set. Management login may have failed."
             exit 1
           fi
-          cargo test -p spice --test cloud_integration -- --test-threads=1 || {
-            if [ "$INSTA_UPDATE" == "always" ]; then
-              echo "Warning: Tests failed but INSTA_UPDATE is enabled. Continuing."
-              exit 0
-            else
-              exit 1
-            fi
-          }
+          cargo test -p spice --test cloud_integration -- --test-threads=1
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
