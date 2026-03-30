@@ -260,8 +260,10 @@ impl RuntimeBuilder {
                     .await
                     {
                         Ok(store) => {
-                            let partition_manager =
-                                Arc::new(PartitionManager::new(Arc::clone(&store)));
+                            let partition_manager = Arc::new(PartitionManager::new(
+                                Arc::clone(&store),
+                                "accelerations/partitions/",
+                            ));
 
                             Some(DistributedNode::Scheduler {
                                 peers: Arc::new(RwLock::new(HashMap::new())),
@@ -269,10 +271,10 @@ impl RuntimeBuilder {
                                 job_executor: Arc::new(RwLock::new(None)),
                                 executor_registry: Arc::new(ExecutorRegistry::new(
                                     Arc::clone(&partition_manager),
-                                    Arc::new(
-                                        PartitionManager::new(Arc::clone(&store))
-                                            .with_prefix("catalog/partitions/"),
-                                    ),
+                                    Arc::new(PartitionManager::new(
+                                        Arc::clone(&store),
+                                        "catalog/partitions/",
+                                    )),
                                 )),
                                 partition_manager,
                             })
@@ -290,16 +292,19 @@ impl RuntimeBuilder {
                     );
                     let store: Arc<dyn object_store::ObjectStore> =
                         Arc::new(object_store::memory::InMemory::new());
-                    let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
+                    let partition_manager = Arc::new(PartitionManager::new(
+                        Arc::clone(&store),
+                        "accelerations/partitions/",
+                    ));
                     Some(DistributedNode::Scheduler {
                         peers: Arc::new(RwLock::new(HashMap::new())),
                         job_executor: Arc::new(RwLock::new(None)),
                         executor_registry: Arc::new(ExecutorRegistry::new(
                             Arc::clone(&partition_manager),
-                            Arc::new(
-                                PartitionManager::new(Arc::clone(&store))
-                                    .with_prefix("catalog/partitions/"),
-                            ),
+                            Arc::new(PartitionManager::new(
+                                Arc::clone(&store),
+                                "catalog/partitions/",
+                            )),
                         )),
                         partition_manager,
                     })

@@ -808,6 +808,9 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 .await,
         )];
 
+    // Handles for partition change watchers, kept alive in the returned future.
+    let mut change_watch_handles: Vec<object_store_occ::ChangeWatchHandle> = Vec::new();
+
     let Some(app) = rt.read_app().await else {
         tracing::warn!(
             "No app found in runtime during cluster scheduler initialization; skipping scheduler registry and partition manager setup"
@@ -884,6 +887,16 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     )
                     .await,
             ));
+
+            // Start partition change watchers for fast cross-scheduler metadata propagation.
+            // Polls lightweight signal files to detect partition changes made by peer schedulers.
+            change_watch_handles
+                .push(partition_manager.spawn_change_watcher(Duration::from_secs(3)));
+            change_watch_handles.push(
+                scheduler_executor_registry
+                    .federated_partition_manager()
+                    .spawn_change_watcher(Duration::from_secs(3)),
+            );
         }
 
         let registry_shutdown = CancellationToken::new();
@@ -907,6 +920,9 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     }
 
     Ok(Some(Box::pin(async move {
+        // Keep change watchers alive until all futures complete or are cancelled.
+        // Dropping the handles cancels the watcher tasks.
+        let _watchers = change_watch_handles;
         try_join_all(futures).await.map(|_| ())
     })))
 }

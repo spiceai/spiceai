@@ -14,17 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{collections::HashMap, sync::Arc};
 
 use datafusion::sql::TableReference;
 use object_store::ObjectStore;
-use object_store_occ::{InsertResult, ObjectState, WriteResult};
+use object_store_occ::{ChangeWatchHandle, InsertResult, ObjectState, WriteResult};
 use snafu::prelude::*;
 
-use crate::cluster::partition::metadata::PartitionValue;
-
-use super::metadata::{PartitionMetadata, TablePartitionMetadata};
+use super::metadata::{PartitionMetadata, PartitionValue, TablePartitionMetadata};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,15 +47,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-static PARTITION_PREFIX: &str = "accelerations/partitions/";
-
 /// Manages partition metadata for accelerated tables in object storage.
 ///
 /// Uses optimistic concurrency control to safely coordinate partition assignments
 /// across multiple schedulers without locks.
 #[derive(Debug)]
 pub struct PartitionManager {
-    state: ObjectState<TablePartitionMetadata>,
+    state: Arc<ObjectState<TablePartitionMetadata>>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,20 +77,23 @@ impl AllocationResult {
 }
 
 impl PartitionManager {
-    /// Creates a new partition manager with the given object store.
-    ///
-    /// All partition metadata will be stored under the "partitions/" prefix.
+    /// Creates a new partition manager with the given object store and key prefix.
     #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
         Self {
-            state: ObjectState::new(store).with_prefix(PARTITION_PREFIX),
+            state: Arc::new(ObjectState::new(store).with_prefix(prefix)),
         }
     }
 
-    #[must_use]
-    pub fn with_prefix(mut self, prefix: &str) -> Self {
-        self.state = self.state.with_prefix(prefix);
-        self
+    /// Spawns a background change watcher that polls a signal file and conditionally
+    /// refreshes the local cache when changes are detected by peer schedulers.
+    ///
+    /// This also **enables change signaling**: subsequent writes will auto-publish
+    /// a signal to `{prefix}__signal.json` so other watchers can detect the change.
+    ///
+    /// Returns a [`ChangeWatchHandle`] that cancels the watcher when dropped.
+    pub fn spawn_change_watcher(&self, poll_interval: Duration) -> ChangeWatchHandle {
+        self.state.spawn_change_watcher(poll_interval)
     }
 
     /// Get partition metadata for a table from object store.
@@ -310,6 +309,17 @@ impl PartitionManager {
         })
     }
 
+    /// Conditionally refresh the local cache: only fetch entries whose remote
+    /// ETag differs from the cached version (uses `HEAD` for change detection).
+    pub async fn conditional_refresh(&self) -> Result<()> {
+        self.state
+            .conditional_refresh()
+            .await
+            .context(MetadataAccessSnafu {
+                table: String::from("<conditional_refresh>"),
+            })
+    }
+
     /// Adds new partitions to a table's metadata and assigns each to its
     /// respective executor in a single OCC write. If a partition already exists,
     /// it is assigned (or left as-is if already assigned to the same executor).
@@ -378,6 +388,8 @@ impl PartitionManager {
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.
+    ///
+    /// Change signals are published automatically by `ObjectState` on successful writes.
     pub(crate) async fn write_metadata(
         &self,
         key: &str,

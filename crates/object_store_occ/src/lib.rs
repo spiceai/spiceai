@@ -25,7 +25,7 @@ mod state;
 use snafu::Snafu;
 
 pub use local_conditional_put::LocalConditionalPut;
-pub use state::{InsertResult, ObjectState, UpdateResult, WriteResult};
+pub use state::{ChangeWatchHandle, InsertResult, ObjectState, UpdateResult, WriteResult};
 
 /// Errors that can occur during object state operations.
 #[derive(Debug, Snafu)]

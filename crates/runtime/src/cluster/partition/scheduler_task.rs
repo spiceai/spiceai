@@ -168,7 +168,7 @@ impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionMan
 impl Default for PartitionManagementConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(30),
+            interval: Duration::from_secs(10),
             max_assignments_per_cycle: 100,
             max_partitions_per_executor: 1000,
             discovery_timeout: Duration::from_secs(60),

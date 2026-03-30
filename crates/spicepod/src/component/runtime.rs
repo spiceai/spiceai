@@ -743,7 +743,7 @@ pub struct PartitionManagement {
 }
 
 fn default_partition_management_interval() -> String {
-    "30s".to_string()
+    "10s".to_string()
 }
 
 fn default_max_assignments_per_cycle() -> usize {

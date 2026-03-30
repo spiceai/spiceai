@@ -528,8 +528,14 @@ mod tests {
     #[tokio::test]
     async fn test_register_unregister() {
         let registry = ExecutorRegistry::new(
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
         );
         let (tx, _rx) = mpsc::channel(1);
 
@@ -547,8 +553,14 @@ mod tests {
     #[tokio::test]
     async fn test_reconnect_replaces_connection() {
         let registry = ExecutorRegistry::new(
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
         );
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
@@ -563,8 +575,14 @@ mod tests {
     #[tokio::test]
     async fn test_request_metrics_empty_registry() {
         let registry = ExecutorRegistry::new(
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
         );
         let result = registry.request_metrics_from_all().await;
         assert!(result.is_ok());
@@ -574,8 +592,14 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_executors() {
         let registry = ExecutorRegistry::new(
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
         );
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
@@ -604,8 +628,14 @@ mod tests {
     #[tokio::test]
     async fn test_unregister_nonexistent() {
         let registry = ExecutorRegistry::new(
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
-            Arc::new(PartitionManager::new(Arc::new(InMemory::new()))),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
+            Arc::new(PartitionManager::new(
+                Arc::new(InMemory::new()),
+                "test/partitions/",
+            )),
         );
         let (tx, _rx) = mpsc::channel(1);
 

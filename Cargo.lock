@@ -12678,6 +12678,9 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -19946,6 +19949,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
