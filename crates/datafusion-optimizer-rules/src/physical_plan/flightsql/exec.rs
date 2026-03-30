@@ -41,7 +41,7 @@ use datafusion::physical_plan::{
 use datafusion::sql::TableReference;
 
 use data_components::flightsql::{FlightSqlClient, FlightSqlExec, query_to_stream};
-use datafusion_table_providers::sql::sql_provider_datafusion::expr as expr_to_sql;
+use data_components::sql_expr::to_sql_preserving_precedence;
 use flight_client::cookie::CookieStore;
 use futures::StreamExt;
 
@@ -470,7 +470,7 @@ fn build_aggregate_sql(
     let where_clauses: Vec<String> = source_filters
         .iter()
         .map(|f| {
-            expr_to_sql::to_sql_preserving_precedence(f)
+            to_sql_preserving_precedence(f)
                 .map_err(|e| DataFusionError::Internal(e.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
