@@ -316,15 +316,19 @@ fn remap_batch(
 // ─── SQL generation ──────────────────────────────────────────────────
 
 /// Build a SQL string from structured fields, deduplicating aggregate expressions
-/// that would produce the same remote column name.
+/// that are *exactly* identical as remote expressions (including any explicit CASTs)
+/// and would therefore produce the same remote column name.
 ///
 /// Returns the SQL and a column mapping from output position → remote column index.
 ///
-/// `DataFusion` normalises `SUM(col)` and `SUM(CAST(col AS DOUBLE))` to the same
-/// internal aggregate name, causing a "duplicate field name" error on the remote
-/// side.  To avoid this we strip outer CASTs when computing a dedup key, emit
-/// each unique aggregate only once, and let [`remap_batch`] cast the result to
-/// the correct target type locally.
+/// `DataFusion` normalises aggregate names (for example `SUM(col)` and
+/// `SUM(CAST(col AS DOUBLE))` may share the same internal name), which can cause
+/// "duplicate field name" errors on the remote side. To avoid this, we compute
+/// a deduplication key from the full remote aggregate expression, including CASTs,
+/// and emit each unique remote aggregate expression only once. When multiple local
+/// aggregates share the same remote expression, they are mapped to that single
+/// remote column, and [`remap_batch`] is responsible for casting the resulting
+/// column to the correct local target type when necessary.
 fn build_aggregate_sql(
     table_reference: &TableReference,
     source_filters: &[Expr],
