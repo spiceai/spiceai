@@ -160,7 +160,7 @@ fn convert_details_to_csv(
 }
 
 async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
-    match flight_client::can_connect(format!("http://{flight_addr}")).await {
+    match flight_client::can_connect(format!("http://{flight_addr}"), None).await {
         Ok(()) => ComponentStatus::Ready,
         Err(e) => ComponentStatus::error_with_message(e.to_string()),
     }
