@@ -313,7 +313,7 @@ impl Runtime {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
-        let shutdown_token = runtime.status.shutdown_token().clone();
+        let shutdown_token = runtime.status.shutdown_token();
         let retry_fut = retry(retry_strategy, || async {
             // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
             if runtime.status.is_shutdown() {
@@ -406,7 +406,7 @@ impl Runtime {
                     Arc::clone(&ds),
                     provider,
                     Arc::clone(&data_connector),
-                    self.status.shutdown_token().clone(),
+                    self.status.shutdown_token(),
                 )
                 .await
             }
@@ -416,7 +416,7 @@ impl Runtime {
                 if let Some(federated_table) = FederatedTable::new_deferred(
                     Arc::clone(&ds),
                     Arc::clone(&data_connector),
-                    self.status.shutdown_token().clone(),
+                    self.status.shutdown_token(),
                 )
                 .await
                 {
@@ -671,7 +671,7 @@ impl Runtime {
             Arc::clone(&ds),
             read_table,
             Arc::clone(&connector),
-            self.status.shutdown_token().clone(),
+            self.status.shutdown_token(),
         )
         .await;
 
