@@ -80,14 +80,35 @@ pub fn scalar_to_attribute_value(
                 let divisor = 10_i128.pow(scale_u32);
                 let whole = v / divisor;
                 let frac = (v % divisor).unsigned_abs();
-                format!("{whole}.{frac:0>width$}", width = scale_u32 as usize)
+                // When the value is negative but |v| < divisor, whole is 0 and
+                // the sign would be lost. Emit an explicit "-" prefix.
+                let sign = if *v < 0 && whole == 0 { "-" } else { "" };
+                format!("{sign}{whole}.{frac:0>width$}", width = scale_u32 as usize)
             } else {
                 v.to_string()
             };
             Ok(AttributeValue::N(s))
         }
-        ScalarValue::Decimal256(Some(v), _precision, _scale) => {
-            Ok(AttributeValue::N(format!("{v}")))
+        ScalarValue::Decimal256(Some(v), _precision, scale) => {
+            let scale = *scale;
+            let s = if scale > 0 {
+                let scale_u32 = u32::try_from(scale).unwrap_or(0);
+                let divisor = arrow::datatypes::i256::from_i128(10_i128.pow(scale_u32));
+                let whole = v.wrapping_div(divisor);
+                let frac = v.wrapping_rem(divisor).wrapping_abs();
+                // Same sign-loss fix as Decimal128.
+                let sign = if v.is_negative() && whole == arrow::datatypes::i256::ZERO {
+                    "-"
+                } else {
+                    ""
+                };
+                // i256::Display does not forward fill/width, so convert first.
+                let frac_str = format!("{frac}");
+                format!("{sign}{whole}.{frac_str:0>width$}", width = scale_u32 as usize)
+            } else {
+                format!("{v}")
+            };
+            Ok(AttributeValue::N(s))
         }
         ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
         ScalarValue::Date32(Some(days)) => {
@@ -248,5 +269,113 @@ impl<'n> TreeNodeVisitor<'n> for FilterStringVisitor<'_> {
                 Ok(TreeNodeRecursion::Stop)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    fn assert_number(scalar: &ScalarValue, expected: &str) {
+        let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z").unwrap();
+        match result {
+            AttributeValue::N(n) => assert_eq!(n, expected, "for scalar {scalar:?}"),
+            other => panic!("Expected AttributeValue::N, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Decimal128 regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decimal128_positive_whole_and_fraction() {
+        // 12345 with scale 2 → 123.45
+        let scalar = ScalarValue::Decimal128(Some(12345), 10, 2);
+        assert_number(&scalar, "123.45");
+    }
+
+    #[test]
+    fn decimal128_negative_whole_and_fraction() {
+        // -12345 with scale 2 → -123.45
+        let scalar = ScalarValue::Decimal128(Some(-12345), 10, 2);
+        assert_number(&scalar, "-123.45");
+    }
+
+    #[test]
+    fn decimal128_negative_fraction_only() {
+        // Regression: -5 with scale 1 → -0.5 (sign must not be lost)
+        let scalar = ScalarValue::Decimal128(Some(-5), 10, 1);
+        assert_number(&scalar, "-0.5");
+    }
+
+    #[test]
+    fn decimal128_negative_small_fraction() {
+        // -1 with scale 2 → -0.01
+        let scalar = ScalarValue::Decimal128(Some(-1), 10, 2);
+        assert_number(&scalar, "-0.01");
+    }
+
+    #[test]
+    fn decimal128_positive_fraction_only() {
+        // 5 with scale 1 → 0.5
+        let scalar = ScalarValue::Decimal128(Some(5), 10, 1);
+        assert_number(&scalar, "0.5");
+    }
+
+    #[test]
+    fn decimal128_zero() {
+        let scalar = ScalarValue::Decimal128(Some(0), 10, 2);
+        assert_number(&scalar, "0.00");
+    }
+
+    #[test]
+    fn decimal128_no_scale() {
+        let scalar = ScalarValue::Decimal128(Some(42), 10, 0);
+        assert_number(&scalar, "42");
+    }
+
+    // -----------------------------------------------------------------------
+    // Decimal256 regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decimal256_positive_with_scale() {
+        // 12345 with scale 2 → 123.45
+        let v = arrow::datatypes::i256::from_i128(12345);
+        let scalar = ScalarValue::Decimal256(Some(v), 20, 2);
+        assert_number(&scalar, "123.45");
+    }
+
+    #[test]
+    fn decimal256_negative_with_scale() {
+        // -12345 with scale 2 → -123.45
+        let v = arrow::datatypes::i256::from_i128(-12345);
+        let scalar = ScalarValue::Decimal256(Some(v), 20, 2);
+        assert_number(&scalar, "-123.45");
+    }
+
+    #[test]
+    fn decimal256_negative_fraction_only() {
+        // -5 with scale 1 → -0.5
+        let v = arrow::datatypes::i256::from_i128(-5);
+        let scalar = ScalarValue::Decimal256(Some(v), 20, 1);
+        assert_number(&scalar, "-0.5");
+    }
+
+    #[test]
+    fn decimal256_no_scale() {
+        // No scale → raw integer
+        let v = arrow::datatypes::i256::from_i128(42);
+        let scalar = ScalarValue::Decimal256(Some(v), 20, 0);
+        assert_number(&scalar, "42");
+    }
+
+    #[test]
+    fn decimal256_zero_with_scale() {
+        let v = arrow::datatypes::i256::from_i128(0);
+        let scalar = ScalarValue::Decimal256(Some(v), 20, 3);
+        assert_number(&scalar, "0.000");
     }
 }

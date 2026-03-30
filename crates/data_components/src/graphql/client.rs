@@ -416,7 +416,12 @@ impl PaginationParameters {
                 }
                 graphql_parser::query::Selection::Field(field) => {
                     let field_name = field.name.as_ref();
-                    let new_path = format!("{current_path}/{field_name}");
+                    // Use alias when present — the JSON response uses aliases as keys.
+                    let response_key = field
+                        .alias
+                        .as_ref()
+                        .map_or_else(|| field_name, |a| a.as_ref());
+                    let new_path = format!("{current_path}/{response_key}");
 
                     // End of recursion, `pageInfo` field found
                     if field_name == "pageInfo" {
@@ -444,8 +449,13 @@ impl PaginationParameters {
                             );
                         }
 
-                        let json_pointer =
-                            data_field.map(|f| format!("/data{current_path}/{}", f.name.as_ref()));
+                        let json_pointer = data_field.map(|f| {
+                            let key = f
+                                .alias
+                                .as_ref()
+                                .map_or_else(|| f.name.as_ref(), |a| a.as_ref());
+                            format!("/data{current_path}/{key}")
+                        });
 
                         let pagination_argument =
                             match TryInto::<PaginationArgument>::try_into(parent_field) {
@@ -1662,6 +1672,42 @@ mod tests {
                         ],
                     }),
                     Some("/data/paginatedUsers/users".into()),
+                ),
+            },
+            TestPaginationParseCase {
+                name: "Aliased field with pageInfo uses alias in path",
+                query: r#"
+                    query {
+                        repository(owner: "org", name: "repo") {
+                            selected_ref: defaultBranchRef {
+                                target {
+                                    ... on Commit {
+                                        history(first: 100) {
+                                            pageInfo {
+                                                hasNextPage
+                                                endCursor
+                                            }
+                                            nodes {
+                                                oid
+                                                message
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                "#,
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "history".to_owned(),
+                        pagination_argument: super::PaginationArgument::First(100),
+                        page_info_path: Some(
+                            "/repository/selected_ref/target/history/pageInfo".to_owned(),
+                        ),
+                        other_arguments: vec![],
+                    }),
+                    Some("/data/repository/selected_ref/target/history/nodes".into()),
                 ),
             },
         ];
