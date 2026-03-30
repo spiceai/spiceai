@@ -133,6 +133,29 @@ pub async fn download_release_asset(
     Ok(())
 }
 
+/// Download a release asset with fallback to alternative asset names.
+///
+/// Tries each asset name in order until one succeeds.
+/// Returns the name of the asset that was successfully downloaded.
+pub async fn download_release_asset_with_fallback(
+    client: &GitHubClient,
+    release: &RepoRelease,
+    asset_names: &[String],
+    download_dir: &Path,
+) -> Result<String, GitHubError> {
+    for asset_name in asset_names {
+        if release.has_asset(asset_name) {
+            download_release_asset(client, release, asset_name, download_dir).await?;
+            return Ok(asset_name.clone());
+        }
+        tracing::debug!("Asset not found: {asset_name}, trying next...");
+    }
+
+    // None of the asset names were found
+    let tried = asset_names.join(", ");
+    Err(GitHubError::AssetNotFound { name: tried })
+}
+
 /// Extract a tar.gz archive to a directory.
 fn extract_tar_gz(data: &[u8], dest: &Path) -> Result<(), GitHubError> {
     let decoder = GzDecoder::new(data);
@@ -218,30 +241,60 @@ impl SystemType {
         }
     }
 
-    /// Get the runtime asset name for the current platform.
-    /// Flavor has no affect as we do not currently publish different runtime flavors.
-    pub fn runtime_asset_name(&self, flavor: &str, allow_accelerator: bool) -> String {
-        let accelerator_suffix = if allow_accelerator {
-            if let Some(accelerator) = detect_accelerator() {
-                format!("_{accelerator}")
-            } else {
-                String::new()
+    /// Get the runtime asset names for the current platform, with fallback options.
+    ///
+    /// Returns a list of possible asset names to try, in order of preference.
+    /// For v2.0+, the `_models` variant is skipped since models are built-in.
+    ///
+    /// # Arguments
+    /// * `flavor` - The flavor to install: "default" or "ai"
+    /// * `target_version` - The release tag (e.g. "v2.0.0") to determine naming strategy
+    /// * `accelerator` - Detected hardware accelerator (e.g. "metal", "`cuda_86`")
+    pub fn runtime_asset_names(
+        &self,
+        flavor: &str,
+        target_version: &str,
+        accelerator: Option<&str>,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+
+        if let Some(accel) = accelerator {
+            // With accelerator and models suffix (v1.x naming)
+            if !is_v2_or_later(target_version) && matches!(flavor, "ai" | "default") {
+                names.push(format!(
+                    "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
+                    prefix = self.runtime_asset_prefix(),
+                    os = self.os_type_name(),
+                    arch = self.arch()
+                ));
             }
-        } else {
-            String::new()
-        };
 
-        let flavor_suffix = match flavor {
-            "ai" | "default" => "_models".to_string(),
-            _ => String::new(),
-        };
+            // With accelerator, no models suffix (v2+ naming)
+            names.push(format!(
+                "{prefix}_{accel}_{os}_{arch}.tar.gz",
+                prefix = self.runtime_asset_prefix(),
+                os = self.os_type_name(),
+                arch = self.arch()
+            ));
+        } else if !is_v2_or_later(target_version) && matches!(flavor, "ai" | "default") {
+            // No accelerator, with models suffix (v1.x naming)
+            names.push(format!(
+                "{prefix}_models_{os}_{arch}.tar.gz",
+                prefix = self.runtime_asset_prefix(),
+                os = self.os_type_name(),
+                arch = self.arch()
+            ));
+        }
 
-        format!(
-            "{prefix}{flavor_suffix}{accelerator_suffix}_{os}_{arch}.tar.gz",
+        // Fallback: base runtime without accelerator or models suffix
+        names.push(format!(
+            "{prefix}_{os}_{arch}.tar.gz",
             prefix = self.runtime_asset_prefix(),
             os = self.os_type_name(),
             arch = self.arch()
-        )
+        ));
+
+        names
     }
 
     /// Get the CLI asset name for the current platform.
@@ -255,6 +308,19 @@ impl SystemType {
     }
 }
 
+/// Check if a version tag represents v2.0 or later.
+///
+/// Parses the major version from tags like "v2.0.0", "v2.0.0-rc.1", "v10.1.0".
+/// Returns `false` for unparseable tags (conservative fallback keeps old behavior).
+fn is_v2_or_later(tag: &str) -> bool {
+    let version_str = tag.strip_prefix('v').unwrap_or(tag);
+    version_str
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
 /// Map Go arch names to Rust target names.
 fn get_rust_arch() -> &'static str {
     match std::env::consts::ARCH {
@@ -265,7 +331,7 @@ fn get_rust_arch() -> &'static str {
 }
 
 /// Detect hardware accelerator (Metal on macOS, CUDA on Linux).
-fn detect_accelerator() -> Option<String> {
+pub fn detect_accelerator() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         if has_metal_device() {
@@ -389,65 +455,70 @@ mod tests {
     }
 
     #[rstest]
-    // ai and default flavors on x86
-    #[case(
-        SystemType::linux_x86(),
-        "default",
-        "spiced_models_linux_x86_64.tar.gz"
-    )]
-    #[case(
-        SystemType::darwin_x86(),
-        "default",
-        "spiced_models_darwin_x86_64.tar.gz"
-    )]
-    #[case(
-        SystemType::windows_x86(),
-        "default",
-        "spiced.exe_models_windows_x86_64.tar.gz"
-    )]
-    #[case(SystemType::linux_x86(), "ai", "spiced_models_linux_x86_64.tar.gz")]
-    #[case(SystemType::darwin_x86(), "ai", "spiced_models_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "ai",
-        "spiced.exe_models_windows_x86_64.tar.gz"
-    )]
-    // ai and default flavors on arm
-    #[case(
-        SystemType::linux_arm(),
-        "default",
-        "spiced_models_linux_aarch64.tar.gz"
-    )]
-    #[case(
-        SystemType::darwin_arm(),
-        "default",
-        "spiced_models_darwin_aarch64.tar.gz"
-    )]
-    #[case(
-        SystemType::windows_arm(),
-        "default",
-        "spiced.exe_models_windows_aarch64.tar.gz"
-    )]
-    #[case(SystemType::linux_arm(), "ai", "spiced_models_linux_aarch64.tar.gz")]
-    #[case(SystemType::darwin_arm(), "ai", "spiced_models_darwin_aarch64.tar.gz")]
-    #[case(
-        SystemType::windows_arm(),
-        "ai",
-        "spiced.exe_models_windows_aarch64.tar.gz"
-    )]
-    // random flavor on x86
-    #[case(SystemType::linux_x86(), "random", "spiced_linux_x86_64.tar.gz")]
-    #[case(SystemType::darwin_x86(), "random", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "random",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
-    fn test_runtime_asset_name(
+    // v1.x default/ai: first choice should be _models variant
+    #[case(SystemType::linux_x86(), "default", "v1.11.5", vec!["spiced_models_linux_x86_64.tar.gz", "spiced_linux_x86_64.tar.gz"])]
+    #[case(SystemType::darwin_x86(), "default", "v1.11.5", vec!["spiced_models_darwin_x86_64.tar.gz", "spiced_darwin_x86_64.tar.gz"])]
+    #[case(SystemType::windows_x86(), "default", "v1.11.5", vec!["spiced.exe_models_windows_x86_64.tar.gz", "spiced.exe_windows_x86_64.tar.gz"])]
+    #[case(SystemType::linux_x86(), "ai", "v1.11.5", vec!["spiced_models_linux_x86_64.tar.gz", "spiced_linux_x86_64.tar.gz"])]
+    #[case(SystemType::darwin_x86(), "ai", "v1.11.5", vec!["spiced_models_darwin_x86_64.tar.gz", "spiced_darwin_x86_64.tar.gz"])]
+    #[case(SystemType::windows_x86(), "ai", "v1.11.5", vec!["spiced.exe_models_windows_x86_64.tar.gz", "spiced.exe_windows_x86_64.tar.gz"])]
+    #[case(SystemType::linux_arm(), "default", "v1.11.5", vec!["spiced_models_linux_aarch64.tar.gz", "spiced_linux_aarch64.tar.gz"])]
+    #[case(SystemType::darwin_arm(), "default", "v1.11.5", vec!["spiced_models_darwin_aarch64.tar.gz", "spiced_darwin_aarch64.tar.gz"])]
+    #[case(SystemType::windows_arm(), "default", "v1.11.5", vec!["spiced.exe_models_windows_aarch64.tar.gz", "spiced.exe_windows_aarch64.tar.gz"])]
+    #[case(SystemType::linux_arm(), "ai", "v1.11.5", vec!["spiced_models_linux_aarch64.tar.gz", "spiced_linux_aarch64.tar.gz"])]
+    #[case(SystemType::darwin_arm(), "ai", "v1.11.5", vec!["spiced_models_darwin_aarch64.tar.gz", "spiced_darwin_aarch64.tar.gz"])]
+    #[case(SystemType::windows_arm(), "ai", "v1.11.5", vec!["spiced.exe_models_windows_aarch64.tar.gz", "spiced.exe_windows_aarch64.tar.gz"])]
+    // v1.x random flavor: no models suffix, just base
+    #[case(SystemType::linux_x86(), "random", "v1.11.5", vec!["spiced_linux_x86_64.tar.gz"])]
+    #[case(SystemType::darwin_x86(), "random", "v1.11.5", vec!["spiced_darwin_x86_64.tar.gz"])]
+    #[case(SystemType::windows_x86(), "random", "v1.11.5", vec!["spiced.exe_windows_x86_64.tar.gz"])]
+    // v2+: should skip _models variant, only base
+    #[case(SystemType::linux_x86(), "default", "v2.0.0", vec!["spiced_linux_x86_64.tar.gz"])]
+    #[case(SystemType::darwin_x86(), "default", "v2.0.0", vec!["spiced_darwin_x86_64.tar.gz"])]
+    #[case(SystemType::linux_x86(), "default", "v2.0.0-rc.1", vec!["spiced_linux_x86_64.tar.gz"])]
+    fn test_runtime_asset_names(
         #[case] os_type: SystemType,
         #[case] flavor: &str,
-        #[case] expected: &str,
+        #[case] target_version: &str,
+        #[case] expected: Vec<&str>,
     ) {
-        assert_eq!(os_type.runtime_asset_name(flavor, false), expected);
+        let names = os_type.runtime_asset_names(flavor, target_version, None);
+        assert_eq!(names, expected);
+    }
+
+    #[rstest]
+    // Metal + v1.x: models_metal, metal, base
+    #[case(SystemType::darwin_arm(), "default", "v1.11.5", Some("metal"), vec!["spiced_models_metal_darwin_aarch64.tar.gz", "spiced_metal_darwin_aarch64.tar.gz", "spiced_darwin_aarch64.tar.gz"])]
+    // Metal + v2.0: metal, base (no _models)
+    #[case(SystemType::darwin_arm(), "default", "v2.0.0", Some("metal"), vec!["spiced_metal_darwin_aarch64.tar.gz", "spiced_darwin_aarch64.tar.gz"])]
+    // CUDA + v1.x: models_cuda_86, cuda_86, base
+    #[case(SystemType::linux_x86(), "default", "v1.11.5", Some("cuda_86"), vec!["spiced_models_cuda_86_linux_x86_64.tar.gz", "spiced_cuda_86_linux_x86_64.tar.gz", "spiced_linux_x86_64.tar.gz"])]
+    // CUDA + v2.0: cuda_86, base (no _models)
+    #[case(SystemType::linux_x86(), "default", "v2.0.0", Some("cuda_86"), vec!["spiced_cuda_86_linux_x86_64.tar.gz", "spiced_linux_x86_64.tar.gz"])]
+    // Metal + v1.x + random flavor: no _models, just accelerator + base
+    #[case(SystemType::darwin_arm(), "random", "v1.11.5", Some("metal"), vec!["spiced_metal_darwin_aarch64.tar.gz", "spiced_darwin_aarch64.tar.gz"])]
+    // Metal + v2.0 + random flavor: metal, base
+    #[case(SystemType::darwin_arm(), "random", "v2.0.0", Some("metal"), vec!["spiced_metal_darwin_aarch64.tar.gz", "spiced_darwin_aarch64.tar.gz"])]
+    fn test_runtime_asset_names_with_accelerator(
+        #[case] os_type: SystemType,
+        #[case] flavor: &str,
+        #[case] target_version: &str,
+        #[case] accelerator: Option<&str>,
+        #[case] expected: Vec<&str>,
+    ) {
+        let names = os_type.runtime_asset_names(flavor, target_version, accelerator);
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn test_is_v2_or_later() {
+        assert!(!is_v2_or_later("v1.0.0"));
+        assert!(!is_v2_or_later("v1.11.0"));
+        assert!(!is_v2_or_later("v1.99.9-rc.1"));
+        assert!(is_v2_or_later("v2.0.0"));
+        assert!(is_v2_or_later("v2.0.0-rc.1"));
+        assert!(is_v2_or_later("v2.1.0"));
+        assert!(is_v2_or_later("v10.0.0"));
+        assert!(!is_v2_or_later("invalid"));
     }
 }
