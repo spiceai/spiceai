@@ -30,10 +30,10 @@ use data_components::{
 };
 use datafusion::{logical_expr::Operator, prelude::Expr, scalar::ScalarValue};
 use graphql_parser::query::{Definition, InlineFragment, OperationDefinition, Query, Selection};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 
-const COMMITS_JSON_POINTER: &str = "/data/repository/selected_ref";
+const COMMITS_JSON_POINTER: &str = "/data/repository";
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 #[derive(Debug)]
@@ -110,6 +110,9 @@ impl GitHubTableArgs for CommitsTableArgs {
         let query = format!(
             r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
+                    default_ref: defaultBranchRef {{
+                        ref: name
+                    }}
                     {selected_ref_query}
                 }}
             }}"#,
@@ -325,7 +328,11 @@ fn inject_commit_ref_parameter(
 }
 
 fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
-    let Value::Object(selected_ref) = object else {
+    let Value::Object(repository) = object else {
+        return Ok(Vec::new());
+    };
+
+    let Some(selected_ref) = selected_ref_from_repository(repository)? else {
         return Ok(Vec::new());
     };
 
@@ -369,6 +376,20 @@ fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
     }
 
     Ok(commits)
+}
+
+fn selected_ref_from_repository(
+    repository: &Map<String, Value>,
+) -> Result<Option<&Map<String, Value>>> {
+    match repository.get("selected_ref") {
+        Some(Value::Object(selected_ref)) => Ok(Some(selected_ref)),
+        Some(Value::Null) if repository.get("default_ref").is_some_and(Value::is_object) => {
+            Err(data_components::graphql::Error::ResourceNotFound {
+                message: "GitHub commits ref was not found or is not accessible. Verify the requested ref exists and is readable.".to_string(),
+            })
+        }
+        _ => Ok(None),
+    }
 }
 
 fn commit_history_from_target(target: &Value) -> Option<&Value> {
@@ -467,6 +488,7 @@ mod tests {
         let graphql_params = args.get_graphql_values();
         let query = graphql_params.query.as_ref();
 
+        assert!(query.contains("default_ref: defaultBranchRef"));
         assert!(query.contains("selected_ref: defaultBranchRef"));
         assert!(query.contains("changed_files: changedFilesIfAvailable"));
         assert!(query.contains("associated_pull_request_number: associatedPullRequests(first: 1)"));
@@ -506,25 +528,30 @@ mod tests {
     #[test]
     fn test_custom_unnester_inserts_ref_and_flattens_pr_number() {
         let rows = custom_unnestter(&json!({
-            "ref": "trunk",
-            "target": {
-                "history": {
-                    "nodes": [
-                        {
-                            "sha": "abc123",
-                            "status": {
-                                "status": "SUCCESS"
-                            },
-                            "authorName": {
-                                "author_name": "Alice"
-                            },
-                            "associated_pull_request_number": {
-                                "nodes": [
-                                    { "number": 42 }
-                                ]
+            "default_ref": {
+                "ref": "main"
+            },
+            "selected_ref": {
+                "ref": "trunk",
+                "target": {
+                    "history": {
+                        "nodes": [
+                            {
+                                "sha": "abc123",
+                                "status": {
+                                    "status": "SUCCESS"
+                                },
+                                "authorName": {
+                                    "author_name": "Alice"
+                                },
+                                "associated_pull_request_number": {
+                                    "nodes": [
+                                        { "number": 42 }
+                                    ]
+                                }
                             }
-                        }
-                    ]
+                        ]
+                    }
                 }
             }
         }))
@@ -542,6 +569,22 @@ mod tests {
             Some(&Value::String("SUCCESS".to_string()))
         );
         assert_eq!(row.get("associated_pull_request_number"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn test_custom_unnester_rejects_missing_requested_ref() {
+        let err = custom_unnestter(&json!({
+            "default_ref": {
+                "ref": "main"
+            },
+            "selected_ref": null
+        }))
+        .expect_err("missing requested ref should fail");
+
+        assert!(
+            err.to_string()
+                .contains("GitHub commits ref was not found or is not accessible")
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl GraphQLContext for ProjectsTableArgs {
                 // Trace the response for debugging
                 tracing::trace!(
                     "GitHub projects GraphQL response for {target}: {}",
-                    serde_json::to_string_pretty(response)
+                    serde_json::to_string(response)
                         .unwrap_or_else(|_| "Unable to serialize response".to_string())
                 );
 
